@@ -354,11 +354,11 @@ struct MissingCase {
 
 /// DescribeOffering refuses an ARN the catalogue publishes no offering under with the
 /// modelled `NotFoundException` (404) — never with a 501, never with a success and never
-/// with another offering. The rows are the ways an identifier can resolve nothing: an
-/// amount of bandwidth and a term the ladder does not offer, an offering id of another
-/// form, an ARN carrying an account-id field the published form does not have, another
-/// service's ARN, another resource type of this service, an ARN with a segment appended or
-/// a character changed, and a string that is no ARN at all.
+/// with another offering. The rows are the ways an identifier can resolve nothing: a
+/// catalogue id the price list does not hold (one of the published width, and one wider), an
+/// offering id of another form, an ARN carrying an account-id field the published form does
+/// not have, another service's ARN, another resource type of this service, an ARN with a
+/// segment appended or a character changed, and a string that is no ARN at all.
 #[tokio::test]
 async fn an_unpublished_offering_is_refused_as_not_found() {
     let emulator = Emulator::new();
@@ -368,33 +368,26 @@ async fn an_unpublished_offering_is_refused_as_not_found() {
         .and_then(|offering| offering["offeringArn"].as_str())
         .unwrap_or_default()
         .to_string();
-    let published_bitrate = catalogue
-        .first()
-        .and_then(|offering| offering["resourceSpecification"]["reservedBitrate"].as_i64())
-        .unwrap_or_default();
-    let published_duration = catalogue
-        .first()
-        .and_then(|offering| offering["duration"].as_i64())
-        .unwrap_or_default();
-    // An amount the ladder does not hold: one Mbps below its smallest tier.
-    let unoffered_bitrate = i32::try_from(published_bitrate - 1).unwrap_or_default();
-    let offered_duration = i32::try_from(published_duration).unwrap_or_default();
+    // A catalogue id of the published FORM that names no entry of the price list: the
+    // published id of the first entry with one more digit on it, and an id of the published
+    // width that the catalogue does not assign.
+    let published_id = published_arn
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let unpublished_id = format!("{published_id}0");
+    let unassigned_id = "0".repeat(published_id.len().max(1));
 
     let offering_arn_of = |fragment: String| mc::offering_arn(REGION, &fragment);
     let missing = vec![
         MissingCase {
-            case: "an amount of bandwidth the catalogue does not offer",
-            arn: offering_arn_of(mc::offering_resource_fragment(
-                unoffered_bitrate,
-                offered_duration,
-            )),
+            case: "a catalogue id wider than the published ones",
+            arn: offering_arn_of(mc::offering_resource_fragment(&unpublished_id)),
         },
         MissingCase {
-            case: "a term the catalogue does not offer",
-            arn: offering_arn_of(mc::offering_resource_fragment(
-                i32::try_from(published_bitrate).unwrap_or_default(),
-                offered_duration + 1,
-            )),
+            case: "a catalogue id of the published width that names no entry",
+            arn: offering_arn_of(mc::offering_resource_fragment(&unassigned_id)),
         },
         MissingCase {
             case: "an offering id of another form",

@@ -46,9 +46,27 @@ pub const OFFERING_DURATION_MONTHS: i32 = 12;
 /// own.
 const PRICE_THOUSANDTHS_PER_DOLLAR: i64 = 1_000;
 
-/// One entry of the reservation catalogue this service publishes.
+/// One entry of the reservation catalogue this service publishes: the amount of outbound
+/// bandwidth it reserves, the rate that amount is sold at, and the catalogue identifier
+/// that names the entry.
+///
+/// All three are DATA. None of them is computed from another: a published rate is not a
+/// multiple of the bandwidth it reserves (the rate per Mbps FALLS as the tier rises, which
+/// is what makes a reservation a savings plan — "a savings plan that reserves a certain
+/// amount of outbound bandwidth usage at a discounted rate",
+/// `smithy_query(query="shape",shape="Offering")`), and an offering id names a catalogue
+/// entry rather than encoding its terms.
 #[derive(Debug, Clone, Copy)]
 pub struct PublishedOffering {
+    /// The catalogue identifier of this entry: the last field of its [`offering_arn`], and
+    /// the whole of its identity to a client, which reads it from a listing and hands it
+    /// back to DescribeOffering or PurchaseOffering.
+    ///
+    /// NUMERIC and opaque — the catalogue assigns it, so it is held here rather than minted
+    /// from the entry's terms, and it is the same for every caller and in every process.
+    /// Every id is quoted at the same width, so the ARNs sort in the order the catalogue
+    /// publishes its entries in, which is also the order a `NextToken` pages from.
+    pub offering_id: &'static str,
     /// `ResourceSpecification$ReservedBitrate`, "the amount of outbound bandwidth that is
     /// discounted in the offering", in Mbps.
     pub reserved_bitrate: i32,
@@ -65,27 +83,27 @@ pub struct PublishedOffering {
 /// (ListOfferings "displays a list of all offerings that are available to this account",
 /// and nothing in the model creates one), and the model carries no price list — it fixes
 /// only what an entry MEANS: outbound bandwidth in Mbps, priced per hour
-/// ([`PRICE_UNITS_HOURLY`]) in US dollars ([`CURRENCY_CODE_USD`]). The amounts below are
-/// therefore this emulator's catalogue, as a published reservation price list is shaped:
-/// each entry prices its own amount of bandwidth, with the rate per Mbps falling as the
-/// amount rises (a reservation is a volume commitment), so no entry's price is a
-/// multiplication of another's.
+/// ([`PRICE_UNITS_HOURLY`]) in US dollars ([`CURRENCY_CODE_USD`]). The catalogue is
+/// therefore a PRICE LIST held as data: a quoted rate and a catalogue id per tier, the same
+/// list for every account in the Region, which is why a client may pin a tier's id and the
+/// rate it is quoted. The tiers are the increments outbound bandwidth is reserved in: 50
+/// Mbps steps to 500 Mbps, then 1 Gbps and 1.5 Gbps.
 ///
-/// Ordered by the amount reserved, which [`offering_id`] also makes the order of their
-/// ARNs.
+/// Ordered by offering id, which is the order [`published_offerings`] reports the entries
+/// in and the order a `NextToken` resumes at.
 pub const OFFERING_CATALOGUE: &[PublishedOffering] = &[
-    PublishedOffering { reserved_bitrate: 50, price_per_hour: 1_200 },
-    PublishedOffering { reserved_bitrate: 100, price_per_hour: 2_300 },
-    PublishedOffering { reserved_bitrate: 200, price_per_hour: 4_400 },
-    PublishedOffering { reserved_bitrate: 300, price_per_hour: 6_300 },
-    PublishedOffering { reserved_bitrate: 500, price_per_hour: 10_000 },
-    PublishedOffering { reserved_bitrate: 750, price_per_hour: 14_250 },
-    PublishedOffering { reserved_bitrate: 1_000, price_per_hour: 18_000 },
-    PublishedOffering { reserved_bitrate: 1_500, price_per_hour: 25_500 },
-    PublishedOffering { reserved_bitrate: 2_000, price_per_hour: 32_000 },
-    PublishedOffering { reserved_bitrate: 3_000, price_per_hour: 45_000 },
-    PublishedOffering { reserved_bitrate: 5_000, price_per_hour: 70_000 },
-    PublishedOffering { reserved_bitrate: 10_000, price_per_hour: 130_000 },
+    PublishedOffering { offering_id: "80246697", reserved_bitrate: 50, price_per_hour: 1_161 },
+    PublishedOffering { offering_id: "80248314", reserved_bitrate: 1_500, price_per_hour: 11_444 },
+    PublishedOffering { offering_id: "80248601", reserved_bitrate: 150, price_per_hour: 2_834 },
+    PublishedOffering { offering_id: "80249012", reserved_bitrate: 100, price_per_hour: 2_039 },
+    PublishedOffering { offering_id: "80249113", reserved_bitrate: 200, price_per_hour: 3_374 },
+    PublishedOffering { offering_id: "80249214", reserved_bitrate: 250, price_per_hour: 3_863 },
+    PublishedOffering { offering_id: "80249315", reserved_bitrate: 300, price_per_hour: 4_313 },
+    PublishedOffering { offering_id: "80249416", reserved_bitrate: 350, price_per_hour: 4_737 },
+    PublishedOffering { offering_id: "80249517", reserved_bitrate: 400, price_per_hour: 5_136 },
+    PublishedOffering { offering_id: "80249618", reserved_bitrate: 450, price_per_hour: 5_516 },
+    PublishedOffering { offering_id: "80249719", reserved_bitrate: 500, price_per_hour: 5_879 },
+    PublishedOffering { offering_id: "80249820", reserved_bitrate: 1_000, price_per_hour: 8_949 },
 ];
 
 /// `Offering$PricePerUnit` for a price held in thousandths of a dollar
@@ -115,29 +133,15 @@ pub fn offering_description(reserved_bitrate: i32, price_per_unit: &str) -> Stri
     format!("Reserved outbound bandwidth of {reserved_bitrate}Mbps at ${price_per_unit}/hour")
 }
 
-/// The offering id an offering ARN ends in: the digits that name one catalogue entry.
-///
-/// An offering id is NUMERIC, and it is minted from the entry's own terms — the term in
-/// months, then the amount of bandwidth reserved, each zero-padded — so it is stable: an
-/// offering is a catalogue entry rather than a record a request mints, so its id must be
-/// the same for every caller and in every process, which is also what lets a `NextToken`
-/// naming one resume a listing. The fixed width keeps the ids', and so the ARNs',
-/// lexicographic order the ascending order of the amounts they reserve.
-pub fn offering_id(reserved_bitrate: i32, duration_months: i32) -> String {
-    format!("{duration_months:02}{reserved_bitrate:06}")
-}
-
 /// The resource fragment of an offering ARN: `offering:<offering id>`.
 ///
 /// The model puts no pattern on `OfferingArn`
 /// (`smithy_query(query="shape",shape="OfferingArn")`: a plain string carrying an
 /// `@arnReference` to `AWS::MediaConnect::Offering`), so the form is the one this service
-/// publishes its catalogue under: the resource type, then the numeric [`offering_id`].
-pub fn offering_resource_fragment(reserved_bitrate: i32, duration_months: i32) -> String {
-    format!(
-        "{OFFERING_RESOURCE_TYPE}:{}",
-        offering_id(reserved_bitrate, duration_months)
-    )
+/// publishes its catalogue under: the resource type, then the catalogue entry's numeric
+/// [`PublishedOffering::offering_id`].
+pub fn offering_resource_fragment(offering_id: &str) -> String {
+    format!("{OFFERING_RESOURCE_TYPE}:{offering_id}")
 }
 
 /// The resource type of an offering ARN.
@@ -160,8 +164,7 @@ pub fn offering_arn(region: &str, resource_fragment: &str) -> String {
 
 /// Whether `arn` is an offering ARN this service could have minted: the account-less
 /// prefix [`offering_arn`] mints — the `arn` prefix, an `aws*` partition, this service's
-/// namespace, a region token and the `offering` resource type — then a numeric
-/// [`offering_id`].
+/// namespace, a region token and the `offering` resource type — then a numeric offering id.
 ///
 /// ListOfferings' `NextToken` is the ARN its next page resumes at, so a token the service
 /// never minted is a semantic error in the request rather than a key to page from. The
@@ -187,8 +190,11 @@ pub fn is_mintable_offering_arn(arn: &str) -> bool {
 ///
 /// The ONE projection of the catalogue, so the operations that read an offering — the
 /// listing, and a purchase copying its terms onto the reservation it mints — cannot report
-/// one entry differently. The Region is a field of every offering ARN, so the catalogue is
-/// projected for the Region the request was signed for.
+/// one entry differently. Every member a response carries is read out of that entry: its
+/// own catalogue id, its own reserved bitrate and its own rate, with the description
+/// rendered from the last two, so what an offering costs, what it reserves and how it
+/// describes itself cannot disagree. The Region is a field of every offering ARN, so the
+/// catalogue is projected for the Region the request was signed for.
 pub fn published_offerings(region: &str) -> Vec<Offering> {
     let mut offerings: Vec<Offering> = OFFERING_CATALOGUE
         .iter()
@@ -197,7 +203,7 @@ pub fn published_offerings(region: &str) -> Vec<Offering> {
             Offering {
                 offering_arn: offering_arn(
                     region,
-                    &offering_resource_fragment(entry.reserved_bitrate, OFFERING_DURATION_MONTHS),
+                    &offering_resource_fragment(entry.offering_id),
                 ),
                 offering_description: offering_description(entry.reserved_bitrate, &price_per_unit),
                 currency_code: CURRENCY_CODE_USD.to_string(),

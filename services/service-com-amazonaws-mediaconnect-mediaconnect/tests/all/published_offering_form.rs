@@ -17,6 +17,11 @@
 //!   catalogue publishes, and the entries are a price list rather than one rate multiplied
 //!   by each bandwidth.
 //!
+//! The entries themselves are data — the published rate and catalogue id of each tier — so
+//! two cases below pin a spread of those tiers as a client reads them, through the listing
+//! and through DescribeOffering, and one asserts the discount a savings plan IS: the rate
+//! per Mbps falls at every larger tier.
+//!
 //! The cases vary what the rule generalises over: every entry of the catalogue (not one
 //! tier), the Region the request is signed for, and whether the entry is reached through
 //! the listing or through DescribeOffering. The entries themselves are read from the
@@ -216,6 +221,182 @@ async fn a_published_offering_arn_round_trips_and_its_form_is_its_identity() {
         assert!(
             !mc::is_mintable_offering_arn(&arn),
             "case {case:?}: {arn:?} is not an offering ARN this service could mint"
+        );
+    }
+}
+
+/// One tier of the published price list, as a client reads it off the catalogue: the amount
+/// of outbound bandwidth it reserves, the rate it is quoted at, and the catalogue id that
+/// names it.
+struct PublishedTier {
+    /// `ResourceSpecification$ReservedBitrate`, in Mbps.
+    reserved_bitrate: i64,
+    /// `Offering$PricePerUnit` for one hour of that bandwidth.
+    price_per_unit: &'static str,
+    /// The last field of `Offering$OfferingArn`: the catalogue identifier of the entry.
+    offering_id: &'static str,
+}
+
+/// Rows from the reservation price list this service publishes
+/// (`service_com_amazonaws_mediaconnect_mediaconnect::state::OFFERING_CATALOGUE`, the
+/// catalogue ListOfferings reports and DescribeOffering resolves): the tiers at both ends of
+/// the list and three from the middle of it, so what is pinned here is the published rate
+/// and id of a tier rather than one entry.
+///
+/// Nothing about a row is derivable from another: the rate is not a multiple of the
+/// bandwidth, and the id is not an encoding of it — which is exactly why the catalogue is
+/// data and these values are written down.
+const PUBLISHED_TIERS: &[PublishedTier] = &[
+    PublishedTier { reserved_bitrate: 50, price_per_unit: "1.161", offering_id: "80246697" },
+    PublishedTier { reserved_bitrate: 150, price_per_unit: "2.834", offering_id: "80248601" },
+    PublishedTier { reserved_bitrate: 300, price_per_unit: "4.313", offering_id: "80249315" },
+    PublishedTier { reserved_bitrate: 500, price_per_unit: "5.879", offering_id: "80249719" },
+    PublishedTier { reserved_bitrate: 1_000, price_per_unit: "8.949", offering_id: "80249820" },
+    PublishedTier { reserved_bitrate: 1_500, price_per_unit: "11.444", offering_id: "80248314" },
+];
+
+/// Each tier of the price list is quoted the rate the catalogue publishes for it, under the
+/// catalogue id that names it — through the listing and through DescribeOffering alike, with
+/// the description stating that entry's own terms.
+///
+/// This is what a client computes over: the cheapest tier that covers N Mbps, the projected
+/// monthly cost, the rate per Mbps. A rate the service made up from the bandwidth, or an id
+/// minted from it, answers every one of those questions differently from the catalogue.
+#[tokio::test]
+async fn each_published_tier_is_quoted_the_catalogue_rate_under_its_catalogue_id() {
+    let emulator = Emulator::new();
+    let offerings = published(&emulator, REGION).await;
+
+    for tier in PUBLISHED_TIERS {
+        let PublishedTier {
+            reserved_bitrate,
+            price_per_unit,
+            offering_id,
+        } = tier;
+        let case = format!("the {reserved_bitrate} Mbps tier");
+        let listed = offerings
+            .iter()
+            .find(|offering| {
+                offering["resourceSpecification"]["reservedBitrate"].as_i64()
+                    == Some(*reserved_bitrate)
+            })
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the catalogue publishes this tier, got {offerings:?}")
+            });
+
+        let arn = listed["offeringArn"].as_str().unwrap_or_default();
+        assert_eq!(
+            arn.rsplit(':').next(),
+            Some(*offering_id),
+            "case {case:?}: the ARN ends in the catalogue id of this tier, got {arn:?}"
+        );
+        assert_eq!(
+            listed["pricePerUnit"].as_str(),
+            Some(*price_per_unit),
+            "case {case:?}: expected the published rate {price_per_unit:?}, got {listed}"
+        );
+        assert_eq!(
+            listed["offeringDescription"].as_str(),
+            Some(
+                format!(
+                    "Reserved outbound bandwidth of {reserved_bitrate}Mbps at \
+                     ${price_per_unit}/hour"
+                )
+                .as_str()
+            ),
+            "case {case:?}: the description states this tier's own terms, got {listed}"
+        );
+        assert_eq!(
+            (
+                listed["duration"].as_i64(),
+                listed["durationUnits"].as_str(),
+                listed["priceUnits"].as_str(),
+                listed["currencyCode"].as_str(),
+                listed["resourceSpecification"]["resourceType"].as_str(),
+            ),
+            (
+                Some(i64::from(mc::OFFERING_DURATION_MONTHS)),
+                Some(mc::DURATION_UNITS_MONTHS),
+                Some(mc::PRICE_UNITS_HOURLY),
+                Some(mc::CURRENCY_CODE_USD),
+                Some(mc::RESOURCE_TYPE_MBPS_OUTBOUND_BANDWIDTH),
+            ),
+            "case {case:?}: the terms the modelled enums fix, got {listed}"
+        );
+
+        // The id a client pins is the one it hands back: the same entry resolves through
+        // DescribeOffering, member for member.
+        let (status, code, body) = emulator
+            .send(
+                "GET",
+                &format!(
+                    "/v1/offerings/{}",
+                    mc::offering_arn(REGION, &mc::offering_resource_fragment(offering_id))
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (200, None),
+            "case {case:?}: the catalogue id resolves, got {status} {code:?}: {body}"
+        );
+        assert_eq!(
+            &body["offering"], listed,
+            "case {case:?}: the described entry is the listed one, member for member"
+        );
+    }
+}
+
+/// A reservation is "a savings plan that reserves a certain amount of outbound bandwidth
+/// usage at a discounted rate" (`smithy_query(query="shape",shape="Offering")`), so the
+/// published rate per Mbps FALLS at every larger tier — no tier is quoted another tier's
+/// rate, which is what a single rate multiplied by each bandwidth would do.
+#[tokio::test]
+async fn the_catalogue_discounts_every_larger_tier() {
+    let emulator = Emulator::new();
+    let offerings = published(&emulator, REGION).await;
+
+    // (reserved bitrate, price in thousandths of a dollar), ascending by bandwidth.
+    let mut priced: Vec<(i64, i64)> = offerings
+        .iter()
+        .map(|offering| {
+            let bitrate = offering["resourceSpecification"]["reservedBitrate"]
+                .as_i64()
+                .unwrap_or_default();
+            let price = offering["pricePerUnit"].as_str().unwrap_or_default();
+            let thousandths = price
+                .split_once('.')
+                .and_then(|(dollars, fraction)| {
+                    Some(dollars.parse::<i64>().ok()? * 1_000 + fraction.parse::<i64>().ok()?)
+                })
+                .unwrap_or_else(|| panic!("a price is a decimal string, got {price:?}"));
+            (bitrate, thousandths)
+        })
+        .collect();
+    priced.sort_unstable();
+
+    for pair in priced.windows(2) {
+        let [(smaller, cheaper), (larger, dearer)] = pair else {
+            continue;
+        };
+        let case = format!("the {smaller} Mbps and {larger} Mbps tiers");
+        assert!(
+            dearer * smaller < cheaper * larger,
+            "case {case:?}: the rate per Mbps falls at the larger tier, got {cheaper} \
+             thousandths for {smaller} Mbps and {dearer} for {larger}"
+        );
+    }
+
+    // And no tier is priced off the cheapest tier's rate: a price list is not one rate.
+    let (base_bitrate, base_price) = priced.first().copied().unwrap_or_default();
+    for (bitrate, price) in priced.iter().skip(1) {
+        let case = format!("the {bitrate} Mbps tier");
+        let at_base_rate = base_price * bitrate / base_bitrate.max(1);
+        assert_ne!(
+            *price, at_base_rate,
+            "case {case:?}: the tier is quoted its own rate, not {base_price} thousandths \
+             per {base_bitrate} Mbps applied to it"
         );
     }
 }

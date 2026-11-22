@@ -206,20 +206,22 @@ pub(crate) fn seed_reservation(
         REGION,
         &mc::reservation_resource_fragment(suffix, case.name),
     );
+    // The offering a reservation was bought from, in the form this service publishes its
+    // catalogue in: an offering ARN carries no account-id field and ends in a numeric
+    // catalogue id. One id per row, so two seeded reservations name two offerings; the entry
+    // need not still be in the price list, because a reservation holds the terms it was
+    // struck on rather than a pointer into the catalogue.
+    let offering_id = format!(
+        "{:02}{:06}",
+        case.duration,
+        case.reserved_bitrate.unwrap_or_default()
+    );
     store.reservations.insert(
         reservation_arn.clone(),
         mc::StoredReservation {
             reservation_arn: reservation_arn.clone(),
             reservation_name: case.name.to_string(),
-            // The offering a reservation was bought from, in the form this service
-            // publishes its catalogue in: an offering ARN carries no account-id field.
-            offering_arn: mc::offering_arn(
-                REGION,
-                &mc::offering_resource_fragment(
-                    case.reserved_bitrate.unwrap_or_default(),
-                    case.duration,
-                ),
-            ),
+            offering_arn: mc::offering_arn(REGION, &mc::offering_resource_fragment(&offering_id)),
             offering_description: mc::offering_description(
                 case.reserved_bitrate.unwrap_or_default(),
                 case.price_per_unit,
@@ -466,7 +468,8 @@ async fn listed_instants_are_rendered_in_the_documented_format() {
                 reservation_name: "res-documented-instants".to_string(),
                 offering_arn: mc::offering_arn(
                     REGION,
-                    &mc::offering_resource_fragment(100, 1),
+                    // A catalogue id of the published form: numeric, and nothing beyond that.
+                    &mc::offering_resource_fragment("01000100"),
                 ),
                 offering_description: mc::offering_description(100, "0.150"),
                 currency_code: CURRENCY_CODE.to_string(),
