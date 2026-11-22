@@ -2228,6 +2228,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVerifiedAccessGroup` `ClientToken` and the group id it minted, so a repeat
     /// of the same request answers with that group instead of creating a second one.
     pub verified_access_group_client_tokens: HashMap<String, String>,
+    /// A `ModifyVerifiedAccessGroup` `ClientToken` and the modification it made, so a repeat
+    /// of the same request applies nothing further and the same token carrying a different
+    /// request is refused instead of modifying the group twice. Separate from
+    /// [`Self::verified_access_group_client_tokens`] for the reason the modify of an instance
+    /// keeps its own map: a token names the request it was given with, so a modification
+    /// carrying the token some create was given is a modification, not a replay of that
+    /// create.
+    pub verified_access_group_modification_client_tokens:
+        HashMap<String, VerifiedAccessGroupModification>,
     /// A `DeleteVerifiedAccessGroup` `ClientToken` and the group that call removed, newest
     /// LAST, so a retry of the same delete answers what the first one answered instead of an
     /// id that names nothing. The record itself is kept, because the group is gone from
@@ -3942,6 +3951,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_instance_deletions: VecDeque::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
+            verified_access_group_modification_client_tokens: HashMap::new(),
             verified_access_group_deletions: VecDeque::new(),
             verified_access_endpoints: BTreeMap::new(),
             verified_access_endpoint_client_tokens: HashMap::new(),

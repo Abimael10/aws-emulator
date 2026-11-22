@@ -394,10 +394,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // A report of the STORED group reports the record, in which "A description for the
         // Amazon Web Services Verified Access group" (`VerifiedAccessGroup$Description`) a
         // caller never set is empty text rather than an absent member — the create is what
-        // echoes the request it was given, and this is a report of what was held.
-        if record.view.description.is_none() {
-            record.view.description = Some(String::new());
-        }
+        // echoes the request it was given, and this is a report of what was held. Read through
+        // the ONE reading of a stored group, so the delete and the modify cannot report one
+        // record two ways.
+        record.view = verified_access_group_reported(&record.view);
         if let Some(token) = client_token {
             // One token names ONE delete, so a token used again replaces what it named
             // rather than leaving the history two entries to answer with.

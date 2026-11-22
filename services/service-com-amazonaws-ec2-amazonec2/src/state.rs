@@ -455,7 +455,20 @@
 //! ([`ComAmazonawsEc2Amazonec2State::verified_access_group_deletion`]) so a retried delete
 //! answers what the first one answered. That report is of the group as the store HELD it, so
 //! a description no caller ever set reads as empty text there rather than as an absent
-//! member, while the create answers the request it was given.
+//! member, while the create answers the request it was given. That reading of a stored group
+//! is [`verified_access_group_reported`], the one every report of a group answers through.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::modify_verified_access_group`] is the one way a stored
+//! group CHANGES, on the same terms a stored instance changes: the members a
+//! `ModifyVerifiedAccessGroup` request carried
+//! ([`VerifiedAccessGroupModification::applied_to`]) replace the stored ones, every other
+//! member stays as it was, the group's `LastUpdatedTime` is stamped with the instant the
+//! modification was applied, and the request is kept under the idempotency token it was given
+//! ([`ComAmazonawsEc2Amazonec2State::verified_access_group_modification_for_token`]) so a
+//! repeat of it applies nothing further and the same token carrying a different request is
+//! refused. Moving a group to another instance brings that group's endpoints back in step with
+//! it ([`ComAmazonawsEc2Amazonec2State::resync_verified_access_group_endpoints`]), because the
+//! instance an endpoint reports is a copy of a fact the group owns.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_endpoints`] holds the account's Verified
 //! Access endpoints as [`VerifiedAccessEndpointRecord`]s, keyed by
@@ -3090,6 +3103,13 @@ mod verified_access_trust_provider_attachments;
 /// it as `crate::state::VerifiedAccessTrustProviderModification` like any primitive of this
 /// module.
 mod verified_access_trust_provider_modifications;
+/// What one `ModifyVerifiedAccessGroup` request changes about a stored Verified Access group:
+/// the record of that request its idempotency token is kept under, the one definition of what
+/// applying it leaves behind, the one writer that applies it, and the one reading of a stored
+/// group a report of one answers with — in a file of its own rather than as more lines here.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::VerifiedAccessGroupModification` like any primitive of this module.
+mod verified_access_group_modifications;
 mod verified_access_endpoint_deletion;
 /// Proving that the owner of an endpoint service owns the private DNS name assigned to it:
 /// the verification a start begins, and the state the clock owes that name once the
@@ -3182,6 +3202,7 @@ pub use import_image_tasks_and_verified_access::*;
 pub use export_image_tasks::*;
 pub use verified_access_trust_provider_attachments::*;
 pub use verified_access_trust_provider_modifications::*;
+pub use verified_access_group_modifications::*;
 pub use verified_access_endpoint_deletion::*;
 pub use vpc_endpoint_service_private_dns_verification::*;
 pub use images_and_zone_facts::*;
