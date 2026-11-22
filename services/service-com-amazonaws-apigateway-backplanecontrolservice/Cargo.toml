@@ -268,6 +268,13 @@ service-com-amazonaws-acm-certificatemanager = { workspace = true }
 # is mounted beside this one too and every truststore a case names is staged through Amazon
 # S3's own `PutObject` — the very seam the front door reads it over.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# A certificate Certificate Manager ISSUES reaches `ISSUED` only once the challenge CNAME it
+# handed out is published in one of the account's public hosted zones, which is Amazon Route
+# 53's fact: that service is mounted beside this one so the suite that fronts a custom domain
+# with an ISSUED (rather than imported) certificate publishes the challenge through Route
+# 53's OWN `ChangeResourceRecordSets`
+# (`tests/all/issued_certificate_fronts_a_mutual_tls_domain.rs`).
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 [lints]
 workspace = true

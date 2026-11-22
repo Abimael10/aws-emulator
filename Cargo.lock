@@ -9605,6 +9605,7 @@ dependencies = [
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
+ "service-com-amazonaws-route53-awsdnsv20130401",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",

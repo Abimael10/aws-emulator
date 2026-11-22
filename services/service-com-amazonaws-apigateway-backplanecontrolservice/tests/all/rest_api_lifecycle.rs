@@ -261,6 +261,24 @@ pub(crate) fn gateway_with_acm_and_s3() -> Gateway {
     gateway
 }
 
+/// One emulator with this service, Certificate Manager, Amazon S3 AND Amazon Route 53
+/// mounted on ONE shared engine.
+///
+/// A certificate Certificate Manager ISSUES is validated against the DNS: whether the
+/// challenge CNAME it handed out is published in one of the account's public hosted zones is
+/// Route 53's fact, read through the shared engine, so a suite that brings a custom domain's
+/// certificate in through `RequestCertificate` rather than `ImportCertificate` needs that
+/// service on the same router too. Built on [`gateway_with_acm_and_s3`], so there is still
+/// one place each of those services is mounted.
+pub(crate) fn gateway_with_acm_s3_and_dns() -> Gateway {
+    let mut gateway = gateway_with_acm_and_s3();
+    let engine = Arc::clone(&gateway.engine);
+    gateway.router.register_service(
+        service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(engine),
+    );
+    gateway
+}
+
 /// `CreateRestApi` for `name`, returning the API id and its root resource id.
 pub(crate) async fn create_api(gateway: &Gateway, name: &str) -> (String, String) {
     let answer = gateway
