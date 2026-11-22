@@ -14,13 +14,15 @@
 //!    bucket under `<S3Prefix>/<ExportTaskIdentifier>/`. A client that polls
 //!    `DescribeExportTasks`, which is what the CLI's and the SDKs' waiters do, therefore ends
 //!    its loop.
-//! 2. **An export writes the SOURCE'S OWN data and nothing else.** The relations the ENGINE
-//!    owns are not the customer's data and are not exported: on the MySQL engines its catalog
-//!    lives in system DATABASES of its own, and on the PostgreSQL engines it lives beside the
-//!    customer's tables INSIDE every database, under the `pg_` prefix PostgreSQL reserves for
-//!    it — so an export writes a Parquet object for each of the customer's tables and none
-//!    for `pg_class`, `pg_settings` or any other catalog relation, whether or not a session
-//!    materialised them by reading them. `ExportOnly` then narrows that set further.
+//! 2. **An export writes what the source's STORAGE holds and nothing else.** The relations a
+//!    server MATERIALISES from its own state are not stored, so they are not exported: on the
+//!    PostgreSQL engines its catalog lives beside the customer's tables INSIDE every database,
+//!    under the `pg_` prefix PostgreSQL reserves for it — so an export writes a Parquet object
+//!    for each of the customer's tables and none for `pg_class`, `pg_settings` or any other
+//!    catalog relation, whether or not a session materialised them by reading them. A
+//!    MySQL-family server, by contrast, keeps its grant and help tables in the `mysql` schema
+//!    ON DISK, so those are part of what the snapshot carries and are exported with the rest
+//!    ([`crate::snapshot_export_server_schema`]). `ExportOnly` then narrows that set further.
 //!
 //! The PostgreSQL rows span what the second rule generalises over: the whole snapshot written
 //! at the root of the bucket, the whole snapshot under a prefix, a database named by itself,
@@ -45,6 +47,7 @@ use crate::db_instance_engine_endpoint::{
 };
 use crate::db_instances::{call, expect_ok, optional_text, text, REGION};
 use crate::rds_s3_integration::{create_bucket, emulator, export_role_policy, kms, role, s3};
+use crate::snapshot_export_server_schema::server_table_prefixes;
 
 /// How long a poll loop here is given before it calls a state unreachable: generous next to
 /// the span this service owes a transition in, so a loaded machine cannot fail the suite,
@@ -390,10 +393,12 @@ async fn a_postgres_snapshot_export_writes_the_user_tables_and_settles_complete(
     }
 }
 
-/// The same rules on the other engine family the export supports, whose catalog lives in
-/// system DATABASES of the server's own rather than inside the customer's: the export writes
-/// the table the session created and nothing out of `mysql`, `information_schema`,
-/// `performance_schema` or `sys`.
+/// The same rules on the other engine family the export supports, whose server keeps tables
+/// of its OWN in the `mysql` schema beside the client's databases: the export writes the table
+/// the session created and the server's stored schema
+/// ([`crate::snapshot_export_server_schema::MYSQL_SERVER_TABLES`]), and nothing out of the
+/// schemas that server materialises rather than stores (`information_schema`,
+/// `performance_schema`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mysql_snapshot_export_writes_the_user_tables_and_settles_complete() {
     const CASE: &str = "a wire-seeded MySQL instance";
@@ -434,7 +439,9 @@ async fn a_mysql_snapshot_export_writes_the_user_tables_and_settles_complete() {
     let objects = exported_objects(&router, CASE, SLUG, &snapshot_arn, PREFIX, &[]).await;
     let export_prefix = st::export_prefix(PREFIX, SLUG);
     // On a MySQL source the schema segment is the database's own name, since the engine has
-    // no schema layer of its own.
-    let table_prefixes = vec![format!("{export_prefix}{DATABASE}/{DATABASE}.orders/")];
+    // no schema layer of its own — and the server's own stored tables are written beside the
+    // session's, because they are part of what the snapshot carries.
+    let mut table_prefixes = vec![format!("{export_prefix}{DATABASE}/{DATABASE}.orders/")];
+    table_prefixes.extend(server_table_prefixes(&export_prefix));
     wrote_exactly(CASE, SLUG, PREFIX, &objects, &table_prefixes);
 }

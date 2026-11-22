@@ -45,6 +45,8 @@
 //! * [`mysql_accounts`] — the accounts a MySQL client creates, the authentication plugin each
 //!   of them authenticates with and the privileges granted to them, and the catalog they live
 //!   in;
+//! * [`mysql_system_tables`] — the rest of the schema a MySQL server comes up with on disk,
+//!   which a snapshot of the instance carries and an export of that snapshot writes out;
 //! * [`mysql_s3_load`] — `LOAD DATA FROM S3`, the Amazon S3 import the MySQL engines serve
 //!   under the IAM role their parameter group names;
 //! * [`pg_aws_s3`] — the `aws_s3` extension's import and export, the Amazon S3 integration
@@ -95,6 +97,9 @@ pub mod mysql_insert_id;
 pub mod mysql_s3_load;
 pub mod mysql_server;
 pub mod mysql_strict_mode;
+/// The system schema a MySQL server comes up WITH, held on disk like any other table: the
+/// grant tables and the help tables, created where that server starts.
+pub mod mysql_system_tables;
 pub mod mysql_wire;
 pub mod pg_aws_s3;
 pub mod pg_binary;
@@ -699,6 +704,10 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
     let listeners = shared_engine(engine)
         .ok_or_else(|| "this emulator's engine has no listener surface".to_string())?
         .listeners();
+    // Whether this call STARTS the engine behind the endpoint, rather than opening a second
+    // address onto storage that is already running: what a server comes up with is created
+    // once, where it comes up.
+    let starting = storage.is_none();
     let database = match storage {
         Some(shared) => shared,
         None => {
@@ -725,6 +734,11 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             )
         }
     };
+    // A MySQL server's own schema is on its disk before any client connects, so it is created
+    // with the server rather than when a statement first names it.
+    if starting && wire == EngineWire::MySql {
+        mysql_system_tables::start_system_schema(&database);
+    }
     let (generation, generation_rx) = watch::channel(0u64);
     let sessions = pg_sessions::SessionRegistry::default();
     let next_connection_id = Arc::new(AtomicU32::new(1));

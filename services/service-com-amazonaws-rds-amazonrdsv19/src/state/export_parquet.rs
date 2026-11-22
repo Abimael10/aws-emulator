@@ -39,6 +39,17 @@ use super::data_plane::sql_engine::{Cell, ColumnInfo, ResultSet};
 /// a precision and a scale, which is what the export has to carry.
 const DECIMAL_TYPE_NAMES: [&str; 4] = ["DECIMAL", "NUMERIC", "DEC", "FIXED"];
 
+/// The declared type names of a column holding an INSTANT: `DATETIME` and `TIMESTAMP` of the
+/// MySQL engines ("the DATE, DATETIME, and TIMESTAMP types are related", MySQL date and time
+/// data types) and `timestamp`/`timestamp with time zone` of PostgreSQL, whose spelling
+/// `timestamptz` also contains the name. The published conversion of an export writes such a
+/// column as a 64-bit Parquet TIMESTAMP in microseconds rather than as the text the engine
+/// happens to store it as, so a reader of the exported file reads an instant.
+///
+/// A `DATE` or a `TIME` column is NOT one of these: neither denotes an instant, and each is
+/// exported as the value it holds.
+const TIMESTAMP_TYPE_NAMES: [&str; 2] = ["DATETIME", "TIMESTAMP"];
+
 /// The precision a column declared an exact numeric type WITHOUT one has: "DECIMAL(M,D)
 /// ... if M is omitted, the default is 10" (MySQL numeric type syntax).
 const DEFAULT_DECIMAL_PRECISION: u32 = 10;
@@ -78,6 +89,10 @@ enum ColumnType {
     /// the DIGITS of each of its values, which hold every one of them, rather than as a
     /// decimal or a floating-point type that would drop some.
     ExactDigits,
+    /// A column of INSTANTS, written as the microseconds since the epoch each of its values
+    /// denotes: the type a source column declared `DATETIME` or `TIMESTAMP` is exported as
+    /// ([`TIMESTAMP_TYPE_NAMES`]).
+    Timestamp,
     /// A UTF-8 string column: SQLite's TEXT affinity, and what a column carrying values of
     /// more than one type is widened to.
     Text,
@@ -115,6 +130,15 @@ impl ColumnType {
                 scale,
                 width: decimal_byte_width(precision),
             };
+        }
+        // Before the affinity rules below, which would read a declared instant as a numeric
+        // column: the exported type of such a column is the instant type, whatever affinity
+        // the engine stores its values under.
+        if TIMESTAMP_TYPE_NAMES
+            .iter()
+            .any(|instant| declared.contains(instant))
+        {
+            return Self::Timestamp;
         }
         if declared.contains("INT") {
             return Self::Integer;
@@ -159,6 +183,15 @@ impl ColumnType {
             });
             return if carried { declared } else { Self::ExactDigits };
         }
+        // A column DECLARED an instant keeps that type as long as every value it holds reads
+        // as one; a value that denotes no instant is no value a timestamp column can carry, so
+        // such a column is exported as the strings that carry every one of its values instead.
+        if declared == Self::Timestamp {
+            return match present.iter().all(|cell| epoch_micros(cell).is_some()) {
+                true => Self::Timestamp,
+                false => Self::Text,
+            };
+        }
         if present.is_empty() {
             return declared;
         }
@@ -185,6 +218,7 @@ impl ColumnType {
     fn physical(self) -> (PhysicalType, ConvertedType) {
         match self {
             Self::Integer => (PhysicalType::INT64, ConvertedType::NONE),
+            Self::Timestamp => (PhysicalType::INT64, ConvertedType::TIMESTAMP_MICROS),
             Self::Double => (PhysicalType::DOUBLE, ConvertedType::NONE),
             Self::Decimal { .. } => (PhysicalType::FIXED_LEN_BYTE_ARRAY, ConvertedType::DECIMAL),
             Self::ExactDigits | Self::Text => (PhysicalType::BYTE_ARRAY, ConvertedType::UTF8),
@@ -382,6 +416,19 @@ fn message_type(
                     ::parquet::basic::DecimalType { scale, precision },
                 )));
         }
+        // An instant column carries the unit its values are written in — microseconds — in
+        // the logical type beside the converted one, which is how a current reader reads the
+        // leaf as a timestamp rather than as a bare 64-bit integer.
+        if *column_type == ColumnType::Timestamp {
+            field = field.with_logical_type(Some(LogicalType::Timestamp(
+                ::parquet::basic::TimestampType {
+                    // The exported value is the instant itself, counted from the epoch, so it
+                    // is normalized rather than a local reading of a clock.
+                    is_adjusted_to_u_t_c: true,
+                    unit: ::parquet::basic::TimeUnit::MICROS,
+                },
+            )));
+        }
         let field = field.build().map_err(|error| error.to_string())?;
         fields.push(::std::sync::Arc::new(field));
     }
@@ -411,6 +458,20 @@ fn write_column(
                     _ => None,
                 })
                 .collect();
+            column
+                .typed::<Int64Type>()
+                .write_batch(&present, Some(&definitions), None)?;
+        }
+        ColumnType::Timestamp => {
+            // Each value as the microseconds it denotes, and a null for one that denotes no
+            // instant: the definition levels of THIS column come from that reading, exactly
+            // as they do for a decimal the column cannot carry.
+            let carried: Vec<Option<i64>> = values.iter().map(epoch_micros).collect();
+            let definitions: Vec<i16> = carried
+                .iter()
+                .map(|value| i16::from(value.is_some()))
+                .collect();
+            let present: Vec<i64> = carried.into_iter().flatten().collect();
             column
                 .typed::<Int64Type>()
                 .write_batch(&present, Some(&definitions), None)?;
@@ -475,6 +536,41 @@ fn write_column(
         }
     }
     Ok(())
+}
+
+/// One value as the MICROSECONDS SINCE THE EPOCH it denotes, and `None` for a value that
+/// denotes no instant at all — a null, a number, or text that is no date and time.
+///
+/// The forms read are the ones an engine renders an instant in: the ISO 8601 instant with an
+/// offset, the date and time a MySQL or PostgreSQL client writes (`2026-01-02 03:04:05`, with
+/// or without a fractional second and with either separator) and a bare date, which denotes
+/// midnight of that day. A value with no offset is the instant it names in UTC, which is how
+/// the engine stores one.
+fn epoch_micros(cell: &Cell) -> Option<i64> {
+    let text = match cell {
+        Cell::Text(text) => text.clone(),
+        // A byte string that is UTF-8 is the same text; one that is not denotes no instant.
+        Cell::Blob(bytes) => String::from_utf8(bytes.clone()).ok()?,
+        Cell::Null | Cell::Integer(_) | Cell::Real(_) => return None,
+    };
+    let text = text.trim();
+    if let Ok(offset) = ::chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(offset.timestamp_micros());
+    }
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(naive) = ::chrono::NaiveDateTime::parse_from_str(text, format) {
+            return Some(naive.and_utc().timestamp_micros());
+        }
+    }
+    ::chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|midnight| midnight.and_utc().timestamp_micros())
 }
 
 /// One value as the text a string column carries it as: the engine's own rendering of a

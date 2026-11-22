@@ -14,6 +14,11 @@
 //! back still sees the derivative in its transient status and gets the state errors that go
 //! with it.
 //!
+//! An export TASK is the one piece of WORK here rather than a resource provisioned from
+//! another: the source it reads is already available when the export is accepted, so its
+//! progression is charged from the CALL that started it — one span per step of it — which is
+//! what leaves a client polling the task a transient status to see.
+//!
 //! Beside them, the two reports a client reads a settled resource's own outcome off:
 //!
 //! * `PendingModifiedValues` is reported on EVERY DB instance, carrying what the instance
@@ -633,13 +638,13 @@ async fn a_cluster_a_client_failed_over_converges_back_to_available() {
     available_cluster(&router, case, "emu-failover-chain").await;
 }
 
-/// Rule: an export task's first step is the one it WAITS ON — the readiness of the snapshot
-/// it reads — so its span runs from the instant that snapshot became ready, while the step it
-/// then takes on its own (writing the objects out, which ends in `COMPLETE`) runs from the
-/// instant the task started. A client polling the task therefore reaches a status it can act
-/// on without paying a poll interval for the start.
+/// Rule: an export task's progression runs on the clock of the CALL that started it — the
+/// step that has the task writing is due one span after `StartExportTask`, and the `COMPLETE`
+/// it ends in one span after that — so a client that polls `DescribeExportTasks` straight
+/// after the start still finds the task on its way rather than already finished, which is what
+/// the progression a client polls for is for.
 #[tokio::test]
-async fn an_export_task_charges_its_first_step_from_the_snapshot_it_reads() {
+async fn an_export_task_charges_its_steps_from_the_call_that_started_it() {
     let case = "an export of a settled snapshot";
     let (router, engine) = crate::rds_s3_integration::emulator();
     let bucket = "emu-derived-export-bucket";
@@ -683,6 +688,9 @@ async fn an_export_task_charges_its_first_step_from_the_snapshot_it_reads() {
         "emu-derived-export-snapshot",
     );
 
+    // The call is BRACKETED, so the instant its step is due is read against the instants the
+    // call itself lies between rather than against a clock reading taken elsewhere.
+    let before_the_call = Instant::now();
     let started = expect_ok(
         case,
         call(
@@ -700,6 +708,7 @@ async fn an_export_task_charges_its_first_step_from_the_snapshot_it_reads() {
         )
         .await,
     );
+    let after_the_call = Instant::now();
     let answered = text(&started, "Status");
     assert_eq!(
         answered,
@@ -708,8 +717,9 @@ async fn an_export_task_charges_its_first_step_from_the_snapshot_it_reads() {
         st::EXPORT_TASK_STATUS_STARTING
     );
 
-    // The step the task waits on is due one span after the snapshot it reads became ready,
-    // which is what the recorded transition says.
+    // The step the task waits on is due one span after the CALL that started it — not after
+    // the snapshot it reads became ready, which is already behind it, and which would leave a
+    // client that takes a span to ask its first question no transient status to see.
     let due_at = {
         let state = store(&engine);
         let store = state.lock();
@@ -723,12 +733,17 @@ async fn an_export_task_charges_its_first_step_from_the_snapshot_it_reads() {
             .map(|pending| pending.due_at)
             .unwrap_or_else(|| panic!("case {case:?}: the started task owes the clock a step"))
     };
-    assert_eq!(
-        due_at,
-        snapshot_ready + st::STATUS_TRANSITION_DELAY,
-        "case {case:?}: the task's first step must be due one span after the snapshot it \
-         reads became ready ({snapshot_ready:?} + {:?}), got {due_at:?}",
+    assert!(
+        due_at >= before_the_call + st::STATUS_TRANSITION_DELAY
+            && due_at <= after_the_call + st::STATUS_TRANSITION_DELAY,
+        "case {case:?}: the task's first step must be due one span ({:?}) after the call that \
+         started it, which ran between {before_the_call:?} and {after_the_call:?}, got {due_at:?}",
         st::STATUS_TRANSITION_DELAY
+    );
+    assert!(
+        due_at > snapshot_ready + st::STATUS_TRANSITION_DELAY,
+        "case {case:?}: the step is charged from the call and not from the readiness of the \
+         snapshot it reads ({snapshot_ready:?}), got {due_at:?}"
     );
 
     // And a client that only REPORTS reaches a status it can act on.

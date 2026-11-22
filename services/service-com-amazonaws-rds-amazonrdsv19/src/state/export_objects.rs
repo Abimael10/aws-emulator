@@ -11,6 +11,13 @@
 //! store on this same engine ([`::service_com_amazonaws_s3_amazons3::state`]) rather than
 //! reported as written.
 //!
+//! What is exported is what the source's STORAGE holds, whoever wrote it: the tables a client
+//! created and the server's own stored tables alike — a MySQL server's `mysql` schema is
+//! ordinary stored tables ([`super::data_plane::mysql_system_tables`]), so a snapshot of an
+//! instance no client has yet written to still carries them and the export writes them out.
+//! Left out are only the schemas a server MATERIALISES from its own state
+//! ([`MATERIALISED_SCHEMAS`]), which hold nothing on disk to export.
+//!
 //! The DATA is the source's own. A DB snapshot carries a copy of the source instance's
 //! storage, taken by the engine when the snapshot was taken
 //! ([`super::DbSnapshotRecord::storage`]), and a DB cluster that serves a database carries
@@ -22,7 +29,6 @@ use ::std::collections::BTreeMap;
 use ::std::time::SystemTime;
 
 use super::data_plane::sql_engine::{Cell, InstanceDatabase, ResultSet};
-use super::data_plane::wire_session::MYSQL_SYSTEM_DATABASES;
 use super::data_plane::EngineWire;
 use super::export_parquet::table_parquet_bytes;
 
@@ -56,6 +62,17 @@ pub struct ExportedObject {
     /// The object's bytes.
     pub body: Vec<u8>,
 }
+
+/// The schemas of a MySQL-family server an export leaves out: the two it MATERIALISES rather
+/// than stores.
+///
+/// `information_schema`'s tables are "views" the server builds from its own state and
+/// `performance_schema`'s "tables use no persistent on-disk storage" (MySQL Reference
+/// Manual), so neither holds stored data for a snapshot to carry or an export to write. The
+/// server's OWN schema, `mysql`, is stored like any other — its grant and help tables are
+/// ordinary tables ([`super::data_plane::mysql_system_tables`]) — so it is exported with the
+/// rest of what the source holds.
+const MATERIALISED_SCHEMAS: [&str; 2] = ["information_schema", "performance_schema"];
 
 /// The PostgreSQL schema the tables of a database created without one live in: `public`,
 /// the schema in every database's default `search_path`.
@@ -137,8 +154,9 @@ pub fn exported_tables(
 ) -> Vec<ExportedTable> {
     let mut exported = Vec::new();
     for database_name in database.database_names() {
-        // The engine's own system schemas are not the customer's data and are not exported.
-        if MYSQL_SYSTEM_DATABASES.contains(&database_name.as_str()) {
+        // A schema the server materialises from its own state holds no stored data, so it is
+        // not part of what an export writes.
+        if MATERIALISED_SCHEMAS.contains(&database_name.as_str()) {
             continue;
         }
         let schema = match wire {
@@ -186,15 +204,16 @@ pub fn exported_tables(
 }
 
 /// Whether the relation `table` of a database on the `wire` engine belongs to the ENGINE
-/// rather than to the customer, so an export leaves it out.
+/// rather than to the stored data, so an export leaves it out.
 ///
-/// An export writes the data of the source — "the data to be exported from the snapshot or
-/// cluster" (`ExportOnly`) — and a server's own system catalog is not that data. On the MySQL
-/// engines it lives in the system DATABASES [`MYSQL_SYSTEM_DATABASES`], which the walk above
-/// skips whole; on the PostgreSQL engines it lives beside the customer's tables INSIDE every
-/// database, under the `pg_` prefix PostgreSQL reserves for it ("Table names beginning with
-/// `pg_` are reserved for system catalogs", System Catalogs, PostgreSQL documentation). So a
-/// relation under that prefix is the server's, whichever database it is read in.
+/// An export writes what the source's storage holds. On the MySQL engines the server's own
+/// tables are stored, so they are written out; what is not is the two schemas it materialises
+/// instead ([`MATERIALISED_SCHEMAS`], which the walk above skips whole). On the PostgreSQL
+/// engines the system catalog lives beside the customer's tables INSIDE every database, under
+/// the `pg_` prefix PostgreSQL reserves for it ("Table names beginning with `pg_` are reserved
+/// for system catalogs", System Catalogs, PostgreSQL documentation) and is rebuilt by the
+/// server rather than carried: so a relation under that prefix is left out, whichever database
+/// it is read in.
 #[must_use]
 pub fn is_engine_catalog_relation(wire: EngineWire, table: &str) -> bool {
     match wire {

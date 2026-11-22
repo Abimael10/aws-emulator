@@ -56,6 +56,7 @@ use crate::db_instances::{
     REGION,
 };
 use crate::lifecycle_poll_loops::poll_until;
+use crate::snapshot_export_server_schema::MYSQL_SERVER_TABLES;
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -1020,15 +1021,33 @@ async fn an_export_writes_its_objects_and_completes() {
         // The objects the export wrote, read back through Amazon S3's own listing: one part
         // file per exported table under `<prefix>/<task>/<db>/<schema>.<table>/`, and the
         // file that says what was exported beside them.
+        //
+        // An export that names no `ExportOnly` covers the WHOLE source, and a MySQL source's
+        // storage includes the server's own `mysql` schema
+        // ([`crate::snapshot_export_server_schema`]), so those tables are written and counted
+        // too; an `ExportOnly` naming the client's database leaves them out.
+        let server_tables: &[&str] = match export_only.is_empty() {
+            true => &MYSQL_SERVER_TABLES,
+            false => &[],
+        };
+        let written_tables = expected_tables.len() + server_tables.len();
         let export_prefix = st::export_prefix(prefix, identifier);
         let keys = listed_keys(&fixture, &export_prefix).await;
-        let manifest_key = st::tables_info_key(&export_prefix, identifier, expected_tables.len());
+        let manifest_key = st::tables_info_key(&export_prefix, identifier, written_tables);
         assert!(
             keys.contains(&manifest_key),
             "case {case:?}: expected the export's own JSON file at {manifest_key}, got {keys:?}"
         );
         for table in expected_tables {
             let table_prefix = format!("{export_prefix}{DATABASE}/{DATABASE}.{table}/");
+            assert!(
+                keys.iter().any(|key| key.starts_with(&table_prefix)
+                    && key.ends_with(".gz.parquet")),
+                "case {case:?}: expected a Parquet object under {table_prefix}, got {keys:?}"
+            );
+        }
+        for table in server_tables {
+            let table_prefix = format!("{export_prefix}mysql/mysql.{table}/");
             assert!(
                 keys.iter().any(|key| key.starts_with(&table_prefix)
                     && key.ends_with(".gz.parquet")),
@@ -1046,9 +1065,12 @@ async fn an_export_writes_its_objects_and_completes() {
             .iter()
             .filter(|key| {
                 key.ends_with(".gz.parquet")
-                    && !expected_tables.iter().any(|table| {
-                        key.contains(&format!("{DATABASE}.{table}/"))
-                    })
+                    && !expected_tables
+                        .iter()
+                        .any(|table| key.contains(&format!("{DATABASE}.{table}/")))
+                    && !server_tables
+                        .iter()
+                        .any(|table| key.contains(&format!("mysql.{table}/")))
             })
             .collect();
         assert!(
@@ -1068,10 +1090,10 @@ async fn an_export_writes_its_objects_and_completes() {
             .unwrap_or_else(|| panic!("case {case:?}: expected perTableStatus in {document}"));
         assert_eq!(
             entries.len(),
-            expected_tables.len(),
+            written_tables,
             "case {case:?}: expected one entry per exported table, got {document}"
         );
-        for table in expected_tables {
+        for table in expected_tables.iter().chain(server_tables) {
             assert!(
                 entries.iter().any(|entry| entry.get("table")
                     == Some(&Value::String((*table).to_string()))),

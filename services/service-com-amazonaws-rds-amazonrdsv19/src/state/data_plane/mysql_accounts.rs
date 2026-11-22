@@ -48,7 +48,11 @@ const ACCOUNT_DATABASE: &str = "mysql";
 /// (`GRANTEE`, `PRIVILEGE_TYPE`, `IS_GRANTABLE`), reduced to the columns this server has
 /// state behind. `scope` carries the `ON` clause of the grant that wrote the row, which is
 /// what `SHOW GRANTS` renders the statement back from.
-const CATALOG_SCHEMA: [&str; 2] = [
+///
+/// The server CREATES them where it starts, with the rest of the schema it comes up with
+/// ([`super::mysql_system_tables`]); they are created here too, so a server whose schema was
+/// restored from storage that predates them still records an account.
+pub(super) const CATALOG_SCHEMA: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS user (\
        User text NOT NULL, Host text NOT NULL, plugin text, authentication_string text, \
        PRIMARY KEY (User, Host))",

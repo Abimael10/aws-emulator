@@ -48,6 +48,7 @@ use tokio::time::sleep;
 
 use crate::db_instances::{call, expect_error, expect_ok, subtrees, text, texts, REGION};
 use crate::rds_s3_integration::{create_bucket, emulator, export_role_policy, kms, role, s3};
+use crate::snapshot_export_server_schema::MYSQL_SERVER_TABLES;
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -564,8 +565,11 @@ async fn an_export_writes_a_parquet_object_for_every_table_of_every_source_kind(
                 "case {case:?}: expected the source's own rows in {table_prefix}, got {rows}"
             );
         }
-        // Beside the data, the two JSON files an export writes.
-        let tables_info = st::tables_info_key(&export_prefix, &identifier, SEEDED.len());
+        // Beside the data, the two JSON files an export writes. Every source here is a
+        // MySQL-family one, so what it wrote is the seeded tables plus the server's own
+        // stored schema ([`crate::snapshot_export_server_schema`]).
+        let written_tables = SEEDED.len() + MYSQL_SERVER_TABLES.len();
+        let tables_info = st::tables_info_key(&export_prefix, &identifier, written_tables);
         let export_info = st::export_info_key(&export_prefix, &identifier);
         for expected in [&tables_info, &export_info] {
             assert!(
@@ -653,10 +657,16 @@ async fn the_export_summary_object_describes_the_export_that_ran() {
                 "case {case:?}: expected {member} to be {expected}, got {document}"
             );
         }
-        // One entry per table the export really wrote, each naming the rows it carried.
+        // One entry per table the export really wrote, each naming the rows it carried: the
+        // seeded tables, plus the MySQL server's own stored schema for an export that covers
+        // the whole source.
         let exported: Vec<&str> = match export_only {
             Some(entry) => vec![entry.rsplit('.').next().expect("a table name")],
-            None => SEEDED.iter().map(|table| table.table).collect(),
+            None => SEEDED
+                .iter()
+                .map(|table| table.table)
+                .chain(MYSQL_SERVER_TABLES)
+                .collect(),
         };
         let tables = document
             .get("tables")
@@ -672,10 +682,11 @@ async fn the_export_summary_object_describes_the_export_that_ran() {
                 .iter()
                 .find(|entry| entry.get("table") == Some(&Value::String((*table).to_string())))
                 .unwrap_or_else(|| panic!("case {case:?}: expected {table} in {document}"));
-            let seeded = SEEDED
-                .iter()
-                .find(|seeded| seeded.table == *table)
-                .expect("a seeded table");
+            // The rows a SEEDED table contributed; a table of the server's own schema holds
+            // none of this suite's rows, and its own entry above is what it is asserted by.
+            let Some(seeded) = SEEDED.iter().find(|seeded| seeded.table == *table) else {
+                continue;
+            };
             assert_eq!(
                 entry.get("rowsExported").and_then(Value::as_u64),
                 Some(seeded.rows.len() as u64),
@@ -1522,7 +1533,13 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
             );
         }
         for expected in [
-            st::tables_info_key(export_prefix, identifier, SEEDED.len()),
+            st::tables_info_key(
+                export_prefix,
+                identifier,
+                // The whole source: the seeded tables plus the MySQL server's own stored
+                // schema, which is part of what the snapshot carries.
+                SEEDED.len() + MYSQL_SERVER_TABLES.len(),
+            ),
             st::export_info_key(export_prefix, identifier),
         ] {
             assert!(
