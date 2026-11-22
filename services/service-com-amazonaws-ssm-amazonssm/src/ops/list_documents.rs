@@ -16,9 +16,9 @@
 //!
 //! "You can limit the results of this request by using a filter": a filter narrows the
 //! listing by one attribute of a document, filters are ANDed and the values of one filter
-//! ORed, and a key naming no attribute of a document is refused as `InvalidFilterKey`. The
-//! page is bounded by `MaxResults` and resumed by `NextToken`, which is the NAME the next
-//! page starts at — so a token this service did not issue is refused as
+//! ORed, and a key naming no attribute of a document is refused as a `ValidationException`
+//! naming the key. The page is bounded by `MaxResults` and resumed by `NextToken`, which is
+//! the NAME the next page starts at — so a token this service did not issue is refused as
 //! `InvalidNextToken`.
 //!
 //! ## Shape of an operation
@@ -168,10 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::document_listing::{
             document_page_size, invalid_owner_message, is_document_filter_key, is_document_name,
-            is_document_owner, DocumentListingFilter, DOCUMENT_KEY_VALUES_FILTER_KEYS,
+            is_document_owner, unknown_document_filter_key_message, DocumentListingFilter,
             FILTER_KEY_OWNER, ONE_OWNER_PER_REQUEST, ONE_TAG_KEY_PER_REQUEST,
         };
-        use crate::state::{invalid_filter_key_message, request_region, INVALID_NEXT_TOKEN};
+        use crate::state::{request_region, INVALID_NEXT_TOKEN};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListDocumentsErrorModeled::InternalServerError(
@@ -192,8 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // arm's key check is a backstop.
         for filter in input.document_filter_list.as_deref().unwrap_or_default() {
             if !DOCUMENT_FILTER_KEY_VALUES.contains(&filter.key.as_str()) {
-                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
-                    invalid_filter_key_message(&filter.key, DOCUMENT_FILTER_KEY_VALUES),
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    unknown_document_filter_key_message(&filter.key),
                 ));
             }
             filters.push(DocumentListingFilter::new(
@@ -205,13 +205,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `Filters` entry names one of the Amazon Web Services-provided keys or a tag
         // ("To specify a custom key-value pair, use the format
         // Key=tag:tagName,Values=valueName"); anything else names no attribute of a
-        // document, which is what `InvalidFilterKey` reports. The modelled member is
-        // optional, so an entry that names no key at all is refused the same way.
+        // document at all, which is a request this listing cannot serve rather than a key
+        // whose values matched nothing: it is refused as a `ValidationException` naming the
+        // key ([`unknown_document_filter_key_message`]). The modelled member is optional,
+        // so an entry that names no key at all is refused the same way.
+        //
+        // The modelled `InvalidFilterKey` shape declares no member at all, so a refusal
+        // answered through it could not say WHICH key was wrong — and this refusal does say
+        // so, which is why the class is the validation one.
         for filter in input.filters.as_deref().unwrap_or_default() {
             let key = filter.key.as_deref().unwrap_or_default();
             if !is_document_filter_key(key) {
-                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
-                    invalid_filter_key_message(key, DOCUMENT_KEY_VALUES_FILTER_KEYS),
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    unknown_document_filter_key_message(key),
                 ));
             }
             let values = filter.values.as_deref().unwrap_or_default();

@@ -2681,7 +2681,11 @@ impl ComAmazonawsSsmAmazonssmState {
                 display_name: None,
                 version_name: None,
                 document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
-                target_type: None,
+                // The target type is the catalogue's own
+                // ([`PublishedDocument::target_type`]): Amazon declares what kinds of
+                // resource a document it publishes runs on, so a read reports it and the
+                // listing's `TargetType` filter selects on it.
+                target_type: published.target_type.map(str::to_string),
                 content: published.content.to_string(),
                 hash: hash.to_string(),
                 parsed: parsed.clone(),

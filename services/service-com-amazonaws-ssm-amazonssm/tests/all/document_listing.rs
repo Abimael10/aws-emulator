@@ -11,9 +11,9 @@
 //! 2. A filter narrows that listing by one attribute of a document: a `Name` prefix, an
 //!    owner class, a platform, a document type, a target type or a tag. Filters are ANDed
 //!    and the values of one filter ORed, and a key naming no attribute of a document is
-//!    refused as `InvalidFilterKey`, as is an `Owner` value that names no owner class at
-//!    all (a `ValidationException`) — a published class that nothing belongs to reports an
-//!    empty page instead.
+//!    refused as a `ValidationException` naming the key, as is an `Owner` value that names
+//!    no owner class at all — a published class that nothing belongs to reports an empty
+//!    page instead.
 //! 3. A page holds at most `MaxResults` documents and the token hands back the name the
 //!    next page resumes at, so paging walks every document once however small the page; a
 //!    token this service did not issue is refused as `InvalidNextToken`.
@@ -52,9 +52,21 @@ const OTHER_REGION: &str = "eu-central-1";
 /// body restricts it to no platform is compatible with.
 const PLATFORM_TYPES: &[&str] = &["Windows", "Linux", "MacOS"];
 
-/// The published `Automation` runbooks, in name order. Checked below to partition the
-/// catalogue with [`PUBLISHED_COMMANDS`], [`PUBLISHED_POLICIES`] and
-/// [`PUBLISHED_SESSIONS`], so a new entry has to be given its place here.
+/// The `DocumentType` values the published catalogue holds, which the suites below check
+/// to cover every entry of it — so a new catalogue entry has to be of a type named here.
+const CATALOGUE_DOCUMENT_TYPES: &[&str] = &[
+    "Automation",
+    "Automation.ChangeTemplate",
+    "CloudFormation",
+    "Command",
+    "ConformancePackTemplate",
+    "Package",
+    "Policy",
+    "QuickSetup",
+    "Session",
+];
+
+/// The published `Automation` runbooks whose bodies this crate authors, in name order.
 const PUBLISHED_AUTOMATIONS: &[&str] = &[
     "AWS-ConfigureS3BucketPublicAccessBlock",
     "AWS-ConfigureS3BucketVersioning",
@@ -73,7 +85,7 @@ const PUBLISHED_AUTOMATIONS: &[&str] = &[
     "AWS-UpdateLinuxAmi",
 ];
 
-/// The published `Command` documents, in name order.
+/// The published `Command` documents whose bodies this crate authors, in name order.
 const PUBLISHED_COMMANDS: &[&str] = &[
     "AWS-ApplyAnsiblePlaybooks",
     "AWS-ConfigureAWSPackage",
@@ -398,11 +410,67 @@ fn every_name() -> Vec<String> {
     all
 }
 
-/// `names` sorted, as owned strings — the expected side of a set assertion.
-fn sorted(names: &[&str]) -> Vec<String> {
-    let mut sorted: Vec<String> = names.iter().map(|name| name.to_string()).collect();
-    sorted.sort();
-    sorted
+/// The upper bound of the modelled `MaxResults` of a document listing
+/// (`ListDocumentsRequest$MaxResults`, range 1..50), which is the largest page a walk of
+/// the catalogue can ask for.
+const MAX_PAGE_SIZE: i64 = 50;
+
+/// How many pages a walk of one listing may take before the test calls the token broken:
+/// the catalogue is hundreds of documents and a page holds up to [`MAX_PAGE_SIZE`], so this
+/// is generous.
+const MAX_PAGES: usize = 200;
+
+/// Every document a listing of `region` narrowed by `body` reports, walked page by page.
+///
+/// The catalogue is larger than the modelled `MaxResults` bound, so a COMPLETE listing is a
+/// walk rather than one page. The value handed back is the last page with the whole walk's
+/// `DocumentIdentifiers` in it, so an assertion about the set a listing reports reads the
+/// same as it would of a single page.
+async fn list_every_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    body: &Value,
+) -> Value {
+    let mut identifiers: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut last = json!({});
+    for _ in 0..MAX_PAGES {
+        let mut page_body = body.clone();
+        page_body["MaxResults"] = json!(MAX_PAGE_SIZE);
+        if let Some(token) = &token {
+            page_body["NextToken"] = json!(token);
+        }
+        let (status, page) = list_in(router, region, &page_body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListDocuments {page_body} must succeed, got {status} {page}"
+        );
+        identifiers.extend(reported(&page));
+        token = page["NextToken"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        last = page;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert!(
+        token.is_none(),
+        "case {case}: the walk must end within {MAX_PAGES} pages, got a token after \
+         {} documents",
+        identifiers.len()
+    );
+    let mut merged = last;
+    merged["DocumentIdentifiers"] = Value::Array(identifiers);
+    merged
+}
+
+/// Every document a listing of [`REGION`] narrowed by `body` reports (see
+/// [`list_every_in`]).
+async fn list_every(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+    list_every_in(router, REGION, case, body).await
 }
 
 /// The catalogue's own names, sorted.
@@ -412,12 +480,62 @@ fn catalogue_names() -> Vec<String> {
     names
 }
 
+/// The catalogue's names of one `DocumentType`, sorted — what a `DocumentType` filter for
+/// that type must report of the catalogue.
+fn catalogue_names_of_type(document_type: &str) -> Vec<String> {
+    let mut names: Vec<String> = CATALOGUE
+        .iter()
+        .filter(|entry| entry.document_type == document_type)
+        .map(|entry| entry.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The catalogue's names carrying one `TargetType`, sorted.
+fn catalogue_names_of_target_type(target_type: &str) -> Vec<String> {
+    let mut names: Vec<String> = CATALOGUE
+        .iter()
+        .filter(|entry| entry.target_type == Some(target_type))
+        .map(|entry| entry.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The catalogue's names starting with `prefix`, sorted — what a `Name` filter for that
+/// prefix must report of the catalogue.
+fn catalogue_names_with_prefix(prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = CATALOGUE
+        .iter()
+        .filter(|entry| entry.name.starts_with(prefix))
+        .map(|entry| entry.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `names` sorted, as owned strings — the expected side of a set assertion.
+fn sorted(names: &[&str]) -> Vec<String> {
+    let mut sorted: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    sorted.sort();
+    sorted
+}
+
+/// `expected` and `extra` as one sorted set of owned names.
+fn sorted_with(expected: Vec<String>, extra: &[&str]) -> Vec<String> {
+    let mut all = expected;
+    all.extend(extra.iter().map(|name| name.to_string()));
+    all.sort();
+    all
+}
+
 /// A listing with no filter reports every document the Region holds — the creates beside
 /// the catalogue — once each, and each one by its stored identity.
 #[tokio::test]
 async fn a_listing_reports_every_document_the_region_holds() {
     let router = router_with_documents().await;
-    let response = list_ok(&router, "a listing with no filter", &json!({})).await;
+    let response = list_every(&router, "a listing with no filter", &json!({})).await;
 
     assert_eq!(
         names(&response),
@@ -535,7 +653,7 @@ async fn a_listing_reports_every_document_the_region_holds() {
     }
 
     // A listing is a REPORT: a second one reports what the first did.
-    let again = list_ok(&router, "a repeated listing", &json!({})).await;
+    let again = list_every(&router, "a repeated listing", &json!({})).await;
     assert_eq!(
         reported(&again),
         reported(&response),
@@ -548,7 +666,7 @@ async fn a_listing_reports_every_document_the_region_holds() {
 #[tokio::test]
 async fn a_listing_agrees_with_a_read_of_each_document() {
     let router = router_with_documents().await;
-    let response = list_ok(&router, "a listing to cross-check", &json!({})).await;
+    let response = list_every(&router, "a listing to cross-check", &json!({})).await;
 
     for name in every_name() {
         let identifier = identifier("cross-check", &response, &name);
@@ -683,26 +801,30 @@ async fn a_document_is_reported_at_its_default_version() {
 /// filter are ORed, and two filters are ANDed.
 #[tokio::test]
 async fn filters_narrow_the_listing_by_one_attribute() {
-    // The name lists below have to partition the catalogue, so a new published document
-    // cannot silently fall out of the expectations.
+    // Every catalogue entry is of one of the types the expectations below are derived by,
+    // so a new published document cannot silently fall out of them.
     for entry in CATALOGUE {
         assert!(
-            PUBLISHED_AUTOMATIONS.contains(&entry.name)
-                || PUBLISHED_COMMANDS.contains(&entry.name)
-                || PUBLISHED_POLICIES.contains(&entry.name)
-                || PUBLISHED_SESSIONS.contains(&entry.name),
-            "the expectations must carry published document {}",
+            CATALOGUE_DOCUMENT_TYPES.contains(&entry.document_type),
+            "the expectations must carry the DocumentType {} of published document {}",
+            entry.document_type,
             entry.name
         );
     }
-    assert_eq!(
-        PUBLISHED_AUTOMATIONS.len()
-            + PUBLISHED_COMMANDS.len()
-            + PUBLISHED_POLICIES.len()
-            + PUBLISHED_SESSIONS.len(),
-        CATALOGUE.len(),
-        "the expectations must name only documents the service publishes"
-    );
+    // The documents whose bodies this crate authors are the ones whose platform
+    // compatibility the suite names by hand, so they have to be catalogue entries.
+    for name in PUBLISHED_AUTOMATIONS
+        .iter()
+        .chain(PUBLISHED_COMMANDS)
+        .chain(PUBLISHED_POLICIES)
+        .chain(PUBLISHED_SESSIONS)
+        .chain(PUBLISHED_COMMANDS_WITHOUT_WINDOWS)
+    {
+        assert!(
+            CATALOGUE.iter().any(|entry| entry.name == *name),
+            "{name} must be a document the service publishes"
+        );
+    }
 
     let router = router_with_documents().await;
     let created_names: Vec<&str> = vec![
@@ -712,28 +834,19 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         "EchoOnWindows",
         "RemediateBucket",
     ];
-    let every_command: Vec<&str> = PUBLISHED_COMMANDS
-        .iter()
-        .copied()
-        .chain(["EchoOnLinux", "EchoOnWindows"])
-        .collect();
+    let every_command: Vec<String> =
+        sorted_with(catalogue_names_of_type("Command"), &["EchoOnLinux", "EchoOnWindows"]);
     // A document is compatible with Windows when its body's preconditions and its steps'
     // plugins do not restrict it to another platform: everything that restricts itself to
     // no platform, the Windows-only documents, and nothing whose steps are Unix-only or
     // that carries no tree.
-    let windows: Vec<&str> = PUBLISHED_AUTOMATIONS
-        .iter()
-        .copied()
-        .chain(PUBLISHED_POLICIES.iter().copied())
-        .chain(PUBLISHED_SESSIONS.iter().copied())
-        .chain(
-            PUBLISHED_COMMANDS
-                .iter()
-                .copied()
-                .filter(|name| !PUBLISHED_COMMANDS_WITHOUT_WINDOWS.contains(name)),
-        )
-        .chain(["ApproveNodeAccess", "EchoOnWindows", "RemediateBucket"])
-        .collect();
+    let windows: Vec<String> = sorted_with(
+        catalogue_names()
+            .into_iter()
+            .filter(|name| !PUBLISHED_COMMANDS_WITHOUT_WINDOWS.contains(&name.as_str()))
+            .collect(),
+        &["ApproveNodeAccess", "EchoOnWindows", "RemediateBucket"],
+    );
 
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
@@ -774,14 +887,7 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         (
             "a prefix of the published catalogue",
             json!({ "Filters": [{ "Key": "Name", "Values": ["AWS-Run"] }] }),
-            sorted(&[
-                "AWS-RunDocument",
-                "AWS-RunInspecChecks",
-                "AWS-RunPatchBaseline",
-                "AWS-RunPowerShellScript",
-                "AWS-RunRemoteScript",
-                "AWS-RunShellScript",
-            ]),
+            catalogue_names_with_prefix("AWS-Run"),
         ),
         (
             "two prefixes are ORed",
@@ -796,7 +902,7 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         (
             "DocumentType spans the created and the published documents of that type",
             json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Command"] }] }),
-            sorted(&every_command),
+            every_command,
         ),
         (
             "two document types are ORed",
@@ -806,17 +912,22 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         (
             "the published Session documents are the documents of that type",
             json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Session"] }] }),
-            sorted(PUBLISHED_SESSIONS),
+            catalogue_names_of_type("Session"),
+        ),
+        (
+            "the published Distributor packages are the documents of that type",
+            json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Package"] }] }),
+            catalogue_names_of_type("Package"),
         ),
         (
             "a document type nothing holds names nothing",
-            json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Package"] }] }),
+            json!({ "Filters": [{ "Key": "DocumentType", "Values": ["DeploymentStrategy"] }] }),
             Vec::new(),
         ),
         (
             "PlatformTypes names every document compatible with that platform",
             json!({ "Filters": [{ "Key": "PlatformTypes", "Values": ["Windows"] }] }),
-            sorted(&windows),
+            windows,
         ),
         (
             "a platform a Linux-only document is not compatible with",
@@ -835,7 +946,10 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         (
             "TargetType matches the whole value",
             json!({ "Filters": [{ "Key": "TargetType", "Values": ["/AWS::EC2::Instance"] }] }),
-            sorted(&["EchoOnLinux"]),
+            sorted_with(
+                catalogue_names_of_target_type("/AWS::EC2::Instance"),
+                &["EchoOnLinux"],
+            ),
         ),
         (
             "the target type that names every resource type",
@@ -914,12 +1028,12 @@ async fn filters_narrow_the_listing_by_one_attribute() {
                 "DocumentFilterList": [{ "key": "DocumentType", "value": "Command" }],
                 "Filters": [{ "Key": "Owner", "Values": ["Amazon"] }],
             }),
-            sorted(PUBLISHED_COMMANDS),
+            catalogue_names_of_type("Command"),
         ),
     ];
 
     for (case, body, expected) in cases {
-        let response = list_ok(&router, case, &body).await;
+        let response = list_every(&router, case, &body).await;
         assert_eq!(
             names(&response),
             expected,
@@ -934,9 +1048,9 @@ async fn filters_narrow_the_listing_by_one_attribute() {
 async fn a_listing_pages_by_document_name() {
     let router = router_with_documents().await;
     let every = every_name();
-    // Page sizes that divide the holding and ones that do not, each published bound of the
-    // modelled range (1..50), and one that holds everything.
-    for page_size in [1usize, 2, 3, 5, 7, every.len(), 50] {
+    // Page sizes that divide the holding and ones that do not, and each published bound of
+    // the modelled range (1..50).
+    for page_size in [1usize, 2, 3, 5, 7, 49, 50] {
         let case = format!("MaxResults={page_size}");
         let mut walked: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -1032,11 +1146,7 @@ async fn a_listing_reports_only_the_region_it_is_signed_for() {
             there.name,
         ),
     ] {
-        let (status, response) = list_in(&router, region, &json!({})).await;
-        assert_eq!(
-            status, 200,
-            "case {case}: ListDocuments in {region} must succeed, got {status} {response}"
-        );
+        let response = list_every_in(&router, region, case, &json!({})).await;
         let mut expected = catalogue_names();
         expected.push(created.to_string());
         expected.sort();
@@ -1058,22 +1168,22 @@ async fn a_listing_refuses_a_request_it_cannot_serve() {
         (
             "a filter key naming no attribute of a document",
             json!({ "Filters": [{ "Key": "DocumentName", "Values": ["Echo"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "a filter key differing from a valid one only in case",
             json!({ "Filters": [{ "Key": "owner", "Values": ["Self"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "the tag prefix with no tag key after it",
             json!({ "Filters": [{ "Key": "tag:", "Values": ["Production"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "a filter naming no key at all",
             json!({ "Filters": [{ "Values": ["Self"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "a filter carrying no value to search for",
@@ -1208,27 +1318,19 @@ async fn a_listing_refuses_a_request_it_cannot_serve() {
 async fn a_fresh_account_holds_the_published_catalogue_only() {
     let router = router();
     for region in [REGION, OTHER_REGION] {
-        let (status, response) = list_in(&router, region, &json!({})).await;
-        assert_eq!(
-            status, 200,
-            "case {region}: ListDocuments must succeed on a fresh account, got {status} \
-             {response}"
-        );
+        let response = list_every_in(&router, region, region, &json!({})).await;
         assert_eq!(
             names(&response),
             catalogue_names(),
             "case {region}: a fresh account holds the published catalogue only, got {response}"
         );
-        let (status, own) = list_in(
+        let own = list_every_in(
             &router,
+            region,
             region,
             &json!({ "Filters": [{ "Key": "Owner", "Values": ["Self"] }] }),
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {region}: the owned listing must succeed, got {status} {own}"
-        );
         assert_eq!(
             names(&own),
             Vec::<String>::new(),

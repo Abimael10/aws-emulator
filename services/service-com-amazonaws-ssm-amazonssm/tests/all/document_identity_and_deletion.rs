@@ -142,22 +142,47 @@ fn is_shaped_id(id: &str) -> bool {
             .all(|group| group.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
 }
 
-/// The names a listing of this Region's documents reports.
+/// The names a listing of this Region's documents reports, walked page by page.
+///
+/// The published catalogue is larger than the modelled `MaxResults` bound
+/// (`ListDocumentsRequest$MaxResults`, range 1..50), so the names a Region holds are a walk
+/// of the listing rather than one page of it.
 async fn listed_names(router: &MultiServiceRouter, case: &str) -> Vec<String> {
-    let (status, response) = call(router, "ListDocuments", &json!({ "MaxResults": 50 })).await;
-    assert_eq!(
-        status, 200,
-        "case {case}: ListDocuments must succeed, got {status} {response}"
+    let mut names: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    // Generous: the catalogue is hundreds of documents and a page holds up to 50, so a walk
+    // that has not ended by here is a broken token rather than a long listing.
+    for _ in 0..200 {
+        let mut body = json!({ "MaxResults": 50 });
+        if let Some(token) = &token {
+            body["NextToken"] = json!(token);
+        }
+        let (status, response) = call(router, "ListDocuments", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListDocuments must succeed, got {status} {response}"
+        );
+        if let Some(identifiers) = response["DocumentIdentifiers"].as_array() {
+            names.extend(
+                identifiers
+                    .iter()
+                    .map(|identifier| identifier["Name"].as_str().unwrap_or_default().to_string()),
+            );
+        }
+        token = response["NextToken"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert!(
+        token.is_none(),
+        "case {case}: the walk of the listing must end, got a token after {} names",
+        names.len()
     );
-    response["DocumentIdentifiers"]
-        .as_array()
-        .map(|identifiers| {
-            identifiers
-                .iter()
-                .map(|identifier| identifier["Name"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    names
 }
 
 /// The platforms a listing reports for one document.

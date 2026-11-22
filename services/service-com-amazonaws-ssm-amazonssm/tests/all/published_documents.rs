@@ -507,15 +507,23 @@ fn string_list(document: &Value, member: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every document in the published catalogue resolves on a FRESH emulator, with no
-/// create of any kind, and reports what its own body declares.
+/// Every document in the published catalogue whose body this crate AUTHORS resolves on a
+/// FRESH emulator, with no create of any kind, and reports what its own body declares.
+///
+/// The catalogue's other entries carry the stand-in body of their family rather than a body
+/// declaring parameters one by one, so what they report is pinned by the catalogue suite in
+/// `all/published_catalogue.rs` instead.
 #[tokio::test]
 async fn every_published_document_resolves_without_a_create() {
     let router = router();
     let rows = catalogue_rows();
-    // The table is the whole catalogue, not a sample of it: a new entry has to be given
-    // its row here, and a row may not name an entry the service does not serve.
-    for entry in CATALOGUE {
+    // The table is every authored-body entry of the catalogue, not a sample of them: a new
+    // one has to be given its row here, and a row may not name an entry the service does
+    // not serve.
+    for entry in CATALOGUE
+        .iter()
+        .filter(|entry| entry.body == service_com_amazonaws_ssm_amazonssm::state::PublishedBody::Authored)
+    {
         assert!(
             rows.iter().any(|row| row.name == entry.name),
             "the table must carry a row for published document {}",

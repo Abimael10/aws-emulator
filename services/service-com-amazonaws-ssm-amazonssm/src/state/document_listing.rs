@@ -23,8 +23,10 @@
 //! documents that are identified by any of the values are returned in the results"
 //! (`DocumentKeyValuesFilter`). The keys are the Amazon Web Services-provided ones that
 //! same doc lists ([`DOCUMENT_KEY_VALUES_FILTER_KEYS`]) and the `tag:tagName` form; a key
-//! outside them names no attribute of a document, which is what `InvalidFilterKey` ("The
-//! specified key isn't valid") reports.
+//! outside them names no attribute of a document at all, which is refused as a
+//! `ValidationException` naming the key ([`unknown_document_filter_key_message`]) rather
+//! than through the member-less modelled `InvalidFilterKey` shape, which could not say
+//! which key was wrong.
 //!
 //! The other listing of this slice walks the versions of ONE document rather than the
 //! documents of a Region, and is held beside this one in
@@ -97,6 +99,16 @@ pub const DOCUMENT_OWNER_VALUES: &[&str] = &[
 /// How this service states a request naming more than one owner class: "Note that only one
 /// `Owner` can be specified in a request" (`DocumentKeyValuesFilter`).
 pub const ONE_OWNER_PER_REQUEST: &str = "Only one Owner can be specified in a request.";
+
+/// How this service states a `Filters` key that names no attribute a document listing can
+/// search on: the rejected key, then the fixed sentence Systems Manager words this class
+/// with.
+///
+/// The key is the caller's own value, echoed back so a client can see WHICH of the keys it
+/// sent was refused; nothing of the store is in the sentence.
+pub fn unknown_document_filter_key_message(key: &str) -> String {
+    format!("{key} is not a known filter key.")
+}
 
 /// Whether `value` names one of the owner classes an `Owner` filter may name.
 pub fn is_document_owner(value: &str) -> bool {
@@ -284,7 +296,13 @@ pub fn document_identifier(
         schema_version: version.parsed.schema_version.clone(),
         document_format: Some(version.document_format.clone()),
         target_type: version.target_type.clone(),
-        tags: (!record.tags.is_empty()).then(|| tagging::to_tag_list(&record.tags)),
+        // "The tags, or metadata, that have been applied to the document"
+        // (`DocumentIdentifier$Tags`, a `TagList` of length 0..1000): a document carrying
+        // none has an EMPTY tag list rather than no list at all — the same way
+        // [`DocumentRecord::description_of`] reports it — so a caller iterating `Tags`
+        // never has to tell a missing member from an empty one, and the two reads of one
+        // document cannot disagree.
+        tags: Some(tagging::to_tag_list(&record.tags)),
         requires: version.requires.clone(),
         review_status: record.review_status(),
         // "The user in your organization who created the document": the emulator
