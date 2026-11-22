@@ -21,7 +21,9 @@
 //! distinguished-name field (the subject, the issuer) takes an attribute type while the
 //! subject-alternative name takes one of the general-name forms that extension holds. A
 //! specifier the field does not carry is refused 400 `ValidationException` naming the
-//! specifier and the field's target, and nothing is mapped.
+//! specifier and the field's target, and nothing is mapped. The rule holds for EACH entry
+//! of the `mappingRules` list one call carries, so one unusable entry refuses the whole
+//! call and the entries beside it are not mapped either.
 //!
 //! Every expectation below is the rule applied to the mappings the profile held BEFORE the
 //! call, read back over the wire — never a literal list of mappings — so the suite states
@@ -1082,6 +1084,171 @@ async fn a_put_refuses_a_specifier_the_certificate_field_cannot_carry() {
             specifiers_in(&after, field).as_ref(),
             Some(&expected),
             "case {case:?}: expected {field:?} to map {expected:?}, got {after:?}"
+        );
+    }
+}
+
+/// One row of the multi-rule table: the certificate field written, the specifiers the ONE
+/// request carries, and the specifier the field cannot carry that decides the refusal —
+/// `None` when the field carries every specifier of the row.
+type MultiRuleCase = (&'static str, &'static str, Vec<String>, Option<String>);
+
+/// A request carries a LIST of mapping rules, and the specifier rule holds for each entry
+/// of it: one entry the field cannot carry refuses the whole request, so the rules beside
+/// it are not mapped either, and the first such entry in request order is the one the
+/// refusal words.
+///
+/// The rows differ along how many rules the request carries, where the unusable entry sits
+/// in it (alone, first, last, between usable ones), how many entries are unusable, whether
+/// an unusable entry repeats, which field is written, and how long the specifier is (the
+/// modelled `MappingRule$specifier` bound of 60).
+fn multi_rule_cases() -> Vec<MultiRuleCase> {
+    // An attribute type at the modelled length bound: a distinguished-name field carries
+    // it, the subject-alternative name does not.
+    let longest_attribute_type = "C".repeat(MAX_SPECIFIER_LEN);
+    vec![
+        // The recorded refusal: one rule, naming a distinguished name's attribute type on
+        // the subject-alternative name.
+        ("unusable-alone-on-san", "x509SAN", owned(&["CN"]), Some("CN".to_string())),
+        (
+            "usable-then-unusable-on-san",
+            "x509SAN",
+            owned(&["DNS", "CN"]),
+            Some("CN".to_string()),
+        ),
+        (
+            "unusable-then-usable-on-san",
+            "x509SAN",
+            owned(&["CN", "DNS"]),
+            Some("CN".to_string()),
+        ),
+        // Several unusable entries: the FIRST in request order words the refusal.
+        (
+            "two-unusable-first-decides-on-san",
+            "x509SAN",
+            owned(&["OU", "CN"]),
+            Some("OU".to_string()),
+        ),
+        (
+            "unusable-between-usable-on-issuer",
+            "x509Issuer",
+            owned(&["O", "Name/CN", "C"]),
+            Some("Name/CN".to_string()),
+        ),
+        (
+            "repeated-unusable-on-subject",
+            "x509Subject",
+            owned(&["CN", "cn=example", "cn=example"]),
+            Some("cn=example".to_string()),
+        ),
+        (
+            "longest-unusable-on-san",
+            "x509SAN",
+            vec![longest_attribute_type.clone()],
+            Some(longest_attribute_type.clone()),
+        ),
+        // The same shape of request with every specifier usable is mapped in full.
+        (
+            "all-usable-on-san",
+            "x509SAN",
+            owned(&["DNS", "URI", "Name/CN"]),
+            None,
+        ),
+        (
+            "all-usable-on-subject",
+            "x509Subject",
+            owned(&["CN", "2.5.4.3", "*"]),
+            None,
+        ),
+        (
+            "longest-usable-on-issuer",
+            "x509Issuer",
+            vec![longest_attribute_type],
+            None,
+        ),
+    ]
+}
+
+/// One unusable rule refuses the whole request: nothing it carried is mapped, what the
+/// field already mapped is untouched, and the profile is not touched at all — while a
+/// request whose every rule is usable maps all of them.
+#[tokio::test]
+async fn one_unusable_rule_refuses_the_whole_request_and_maps_nothing() {
+    let client = Client::new();
+    for (case, field, submitted, unusable) in multi_rule_cases() {
+        let id = profile_id(&client, case).await;
+        // Seed the addressed field with the whole-field specifier, which every field
+        // carries, so a refusal is shown to leave what the field already maps alone.
+        let seeded = client.put_mapping(&id, field, &owned(&["*"])).await;
+        assert_eq!(
+            seeded.status, 200,
+            "case {case:?}: expected the seeding put to be stored, got {seeded:?}"
+        );
+        let read_before = client.get_profile(&id).await;
+        assert_eq!(
+            read_before.status, 200,
+            "case {case:?}: expected GetProfile 200, got {read_before:?}"
+        );
+        let before = mappings_of(read_before.profile());
+        let updated_before = instant(case, read_before.profile(), "updatedAt");
+
+        let answer = client.put_mapping(&id, field, &submitted).await;
+
+        let Some(unusable) = unusable else {
+            let after = written_mappings(case, &client, &id, &answer).await;
+            let expected =
+                specifiers_after_put(specifiers_in(&before, field).as_ref(), &submitted);
+            assert_eq!(
+                specifiers_in(&after, field).as_ref(),
+                Some(&expected),
+                "case {case:?}: expected {field:?} to map {expected:?}, got {after:?}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: one rule the field cannot carry must refuse the request with \
+             HTTP 400, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ValidationException",
+            "case {case:?}: the refusal must be the operation's modelled error, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            Some(unvalidatable_specifier_message(&unusable, target_of(field)).as_str()),
+            "case {case:?}: expected the refusal to word {unusable:?} on {field:?}, got \
+             {answer:?}"
+        );
+
+        let read_after = client.get_profile(&id).await;
+        assert_eq!(
+            read_after.status, 200,
+            "case {case:?}: expected GetProfile 200, got {read_after:?}"
+        );
+        let after = mappings_of(read_after.profile());
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused put must map nothing, mappings went from {before:?} to \
+             {after:?}"
+        );
+        // Not even the usable rules the SAME request carried beside the refused one: a
+        // specifier the field did not map before the call is not mapped after it.
+        let mapped_before = specifiers_in(&before, field).unwrap_or_default();
+        let mapped = specifiers_in(&after, field).unwrap_or_default();
+        for specifier in submitted.iter().filter(|s| !mapped_before.contains(s)) {
+            assert!(
+                !mapped.contains(specifier),
+                "case {case:?}: a refused put must not map {specifier:?}, got {mapped:?}"
+            );
+        }
+        // The profile was not written at all, so the instant it was last updated stands.
+        let updated_after = instant(case, read_after.profile(), "updatedAt");
+        assert_eq!(
+            updated_after, updated_before,
+            "case {case:?}: a refused put must not update the profile, updatedAt went from \
+             {updated_before} to {updated_after}"
         );
     }
 }
