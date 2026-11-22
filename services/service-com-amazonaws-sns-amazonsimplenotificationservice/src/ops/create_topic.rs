@@ -345,6 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name,
                     &attributes[name],
                     subject,
+                    // This call carried the write in its `Attributes` MAP, so a refusal SNS
+                    // states as a sentence of its own names that member
+                    // ([`state::AttributeMember`]).
+                    state::AttributeMember::Map,
                 ) {
                     return Err(match refusal {
                         state::topic_attributes::TopicAttributeRefusal::InvalidParameter(

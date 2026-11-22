@@ -12,6 +12,11 @@
 
 use super::*;
 
+/// What a stack whose own DELETION is in flight reports per resource
+/// ([`StoredStack::under_a_deletion_in_flight`]), in its own file so this one stays inside the
+/// length the build holds every file to.
+mod deletion_view;
+
 /// One stack, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct StoredStack {
@@ -2721,8 +2726,11 @@ impl StoredStack {
             }
             // The resource was being DELETED, and what the owning service answered about
             // that delete was recorded when it answered: what did not happen is the removal,
-            // so no event of the resource is rewritten.
+            // so no event of the resource is rewritten — and the resource is STILL THERE,
+            // which the stack holds again
+            // ([`Self::keeps_the_resource_whose_removal_failed`]).
             stabilising::Awaited::Gone => {
+                self.keeps_the_resource_whose_removal_failed(logical_id);
                 (failed_action::DELETE, resource_status::DELETE_FAILED)
             }
         };
@@ -3247,7 +3255,19 @@ impl StoredStack {
     /// while the stack goes on waiting for it, and never reads it as complete before it is.
     /// A wait for a resource the operation DELETED reports nothing here: the stack stopped
     /// recording that physical resource when its owning service accepted the delete.
+    ///
+    /// For a stack whose own DELETION is in flight, every record that deletion is responsible
+    /// for reports `DELETE_IN_PROGRESS` ([`Self::under_a_deletion_in_flight`]), whatever a
+    /// create or an update had last left it at.
     pub fn reported_resources(&self) -> Vec<DeployedResource> {
+        let mut deployed = self.reported_deployment_resources();
+        self.under_a_deletion_in_flight(&mut deployed);
+        deployed
+    }
+
+    /// The resources a read reports as the DEPLOYMENT in flight — or the last completed one —
+    /// left them, which is what [`Self::reported_resources`] then reads under a deletion.
+    fn reported_deployment_resources(&self) -> Vec<DeployedResource> {
         let Some(opened_at) = self
             .wait_conditions
             .iter()

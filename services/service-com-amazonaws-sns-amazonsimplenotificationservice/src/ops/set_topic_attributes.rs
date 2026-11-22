@@ -254,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.attribute_name,
                     value,
                     state::topic_attributes::TopicSubject::of(&topic, &protocols),
+                    // This call was given the attribute BY NAME, so a refusal names that
+                    // attribute alone ([`state::AttributeMember`]).
+                    state::AttributeMember::Named,
                 )
                 // …and against the value the topic already holds, since an attribute
                 // whose value SNS only moves one way takes a value the domain admits

@@ -162,10 +162,20 @@ impl TopicAttributeRefusal {
 /// Each message is the whole sentence SNS states for that condition — the attribute as
 /// the service names it, and the value and the bounds only where that sentence carries
 /// them — rather than a diagnostic a caller wraps.
+///
+/// `member` is the input member the write arrived in ([`AttributeMember`]), which is what
+/// frames a condition SNS states as a SENTENCE OF ITS OWN: such a sentence names no
+/// attribute, so a write carried in an `Attributes` MAP is told which member of the request
+/// holds the value at fault, while one that was given the attribute BY NAME needs no such
+/// frame — the name being the whole input. Recorded evidence: a `TracingConfig` of `Sampled`
+/// answers `400 InvalidParameter` with `Invalid parameter: Attributes Reason: Invalid tracing
+/// config value: Sampled` through `CreateTopic`, and with `Invalid parameter: Invalid tracing
+/// config value: Sampled` through `SetTopicAttributes`.
 pub fn topic_attribute_refusal(
     name: &str,
     value: &str,
     subject: TopicSubject<'_>,
+    member: AttributeMember,
 ) -> Option<TopicAttributeRefusal> {
     if let Some(message) = kind_refusal(name, subject.is_fifo) {
         return Some(TopicAttributeRefusal::InvalidParameter(message));
@@ -173,7 +183,7 @@ pub fn topic_attribute_refusal(
     if name.ends_with(FEEDBACK_ROLE_ARN_SUFFIX) {
         return feedback_role_refusal(name, value);
     }
-    value_refusal(name, value, subject).map(TopicAttributeRefusal::InvalidParameter)
+    value_refusal(name, value, subject, member).map(TopicAttributeRefusal::InvalidParameter)
 }
 
 /// The sentence SNS refuses a value CHANGE it does not perform with: the attribute, the
@@ -210,7 +220,17 @@ pub fn topic_attribute_change_refusal(
 
 /// The sentence a value outside the attribute's own documented domain is refused with,
 /// or `None` when the attribute accepts it.
-fn value_refusal(name: &str, value: &str, subject: TopicSubject<'_>) -> Option<String> {
+///
+/// A sentence that NAMES the attribute states which input is at fault itself and stands as
+/// SNS words it, whichever call carried the write; one SNS states as a sentence of its own
+/// names none, so it is framed by the member the value arrived in
+/// ([`AttributeMember::whole_sentence_refusal`], and see [`topic_attribute_refusal`]).
+fn value_refusal(
+    name: &str,
+    value: &str,
+    subject: TopicSubject<'_>,
+    member: AttributeMember,
+) -> Option<String> {
     match name {
         // SNS reports a `Policy` it cannot read as a policy document by naming the
         // attribute and the parse that failed, not the document the caller sent.
@@ -246,13 +266,14 @@ fn value_refusal(name: &str, value: &str, subject: TopicSubject<'_>) -> Option<S
         MAXIMUM_MESSAGE_SIZE_ATTRIBUTE => maximum_message_size_refusal(name, value, subject),
         DISPLAY_NAME_ATTRIBUTE => (value.chars().count() > MAX_DISPLAY_NAME_CHARS)
             .then(|| format!("Invalid parameter: {name}")),
-        TRACING_CONFIG_ATTRIBUTE => (!TRACING_CONFIG_VALUES.contains(&value))
-            .then(|| format!("Invalid parameter: Invalid tracing config value: {value}")),
+        TRACING_CONFIG_ATTRIBUTE => (!TRACING_CONFIG_VALUES.contains(&value)).then(|| {
+            member.whole_sentence_refusal(&format!("Invalid tracing config value: {value}"))
+        }),
         SIGNATURE_VERSION_ATTRIBUTE => (!SIGNATURE_VERSION_VALUES.contains(&value)).then(|| {
             format!("Invalid parameter: {name}: Invalid value '[{value}]'. Must be 1 or 2.")
         }),
         FIFO_THROUGHPUT_SCOPE_ATTRIBUTE => (!FIFO_THROUGHPUT_SCOPE_VALUES.contains(&value))
-            .then(|| format!("Invalid parameter: Invalid {name}: {value}")),
+            .then(|| member.whole_sentence_refusal(&format!("Invalid {name}: {value}"))),
         // The two flag-valued attributes: a word, in either case, because SNS carries
         // every attribute value as a string. The sentence is the one every flag-valued
         // attribute of either record kind is refused with

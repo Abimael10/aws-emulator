@@ -567,8 +567,16 @@ impl DesiredModel {
         // of them whichever order the model's own properties arrived in.
         let judged: BTreeMap<&String, &String> = self.supplied.iter().collect();
         for (name, value) in judged {
-            if let Some(refusal) = sns::topic_attributes::topic_attribute_refusal(name, value, subject)
-            {
+            // A resource MODEL names each attribute as a property of its own, so the owning
+            // service's refusal is the one it states for a write that was given the attribute
+            // BY NAME: naming its `Attributes` map here would name a member no caller of this
+            // service sent.
+            if let Some(refusal) = sns::topic_attributes::topic_attribute_refusal(
+                name,
+                value,
+                subject,
+                sns::AttributeMember::Named,
+            ) {
                 return Err(NativeRefusal::Rejected(refusal.message().to_string()));
             }
         }
