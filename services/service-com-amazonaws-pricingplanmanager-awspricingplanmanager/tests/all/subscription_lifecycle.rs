@@ -654,6 +654,174 @@ async fn cancel_schedules_for_an_active_subscription_and_deletes_a_pending_one()
     }
 }
 
+/// A cancellation ENDS the subscription, and it ends on the service's own clock: a client
+/// that cancels and then waits for the resource to disappear sees it disappear, with no
+/// further call of its own making that happen. Once it is gone `GetSubscription` answers
+/// the modelled `ResourceNotFoundException` (HTTP 404) naming the ARN the request carried,
+/// `ListSubscriptions` stops reporting it, and the resources it covered are free for
+/// another subscription.
+///
+/// This is the one thing the backdating tests of this suite cannot show: nothing here
+/// writes a stored instant, so what is asserted is that the transition the cancellation
+/// owes really becomes due.
+///
+/// The rows differ along what the rule generalises over — the plan family, the tier (the
+/// free one, which carries no billing commitment, and a paid one), how many resources are
+/// covered, the approval mode, and so the status the cancellation acts on: `ACTIVE`, where
+/// a `CANCELLATION` is scheduled first, and `PENDING_APPROVAL`, which is deleted outright.
+#[tokio::test]
+async fn a_cancelled_subscription_disappears_without_another_call() {
+    struct Case {
+        family: &'static str,
+        tier: &'static str,
+        resources: usize,
+        approval: Option<&'static str>,
+        /// Whether the cancellation leaves a pending `CANCELLATION` change behind, which
+        /// is what cancelling a subscription that is already active does.
+        schedules: bool,
+    }
+
+    let cases = [
+        Case {
+            family: "CloudFront",
+            tier: "FREE",
+            resources: 2,
+            approval: None,
+            schedules: true,
+        },
+        Case {
+            family: "CloudFront",
+            tier: "FREE",
+            resources: 1,
+            approval: Some("MANUAL"),
+            schedules: true,
+        },
+        Case {
+            family: "Route53",
+            tier: "PRO",
+            resources: 3,
+            approval: Some("IMMEDIATE"),
+            schedules: true,
+        },
+        Case {
+            family: "CloudFront",
+            tier: "PREMIUM",
+            resources: 1,
+            approval: Some("MANUAL"),
+            schedules: false,
+        },
+    ];
+
+    let router = router();
+    for case in &cases {
+        let label = format!(
+            "{}/{}/{} resources/{:?}",
+            case.family, case.tier, case.resources, case.approval
+        );
+        // The SAME body is sent again at the end of the row: a resource is covered by at
+        // most one subscription, so a second create over these resources can only succeed
+        // once the first subscription has really ended.
+        let body = create_body(case.family, case.tier, case.resources, case.approval);
+        let created = create(&router, body.clone()).await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(&label);
+
+        let cancelled = call(
+            &router,
+            "CancelSubscription",
+            json!({"arn": arn.clone()}),
+            Some(&etag),
+        )
+        .await;
+        assert_eq!(
+            cancelled.status, 200,
+            "case {label}: CancelSubscription must succeed, got {} {:?}",
+            cancelled.status, cancelled.body
+        );
+        // The answer to the cancelling call itself, so nothing here depends on how much
+        // of the span has passed by the time a later call is made.
+        let scheduled = cancelled
+            .body
+            .get("scheduledChange")
+            .and_then(|change| change.get("changeType"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        assert_eq!(
+            scheduled.as_deref(),
+            if case.schedules {
+                Some("CANCELLATION")
+            } else {
+                None
+            },
+            "case {label}: unexpected pending change in {:?}",
+            cancelled.body
+        );
+
+        // The wait every teardown written against AWS makes: look again until the
+        // subscription is gone, for a deadline far past the span the service takes.
+        let absent = poll_until_absent(&router, &arn, &label).await;
+        assert_eq!(
+            absent.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {label}: unexpected error class for {:?}",
+            absent.body
+        );
+        assert_eq!(
+            absent.message(&label),
+            format!(
+                "Subscription not found: {arn}. Verify the ARN is correct and the \
+                 subscription exists in your account."
+            ),
+            "case {label}: unexpected message for {:?}",
+            absent.body
+        );
+        assert_eq!(
+            absent.opt_string("resourceId"),
+            Some(arn.clone()),
+            "case {label}: the refusal must name the subscription, got {:?}",
+            absent.body
+        );
+
+        let listed = all_arns(&router).await;
+        assert!(
+            !listed.contains(&arn),
+            "case {label}: a cancelled subscription must not be listed, got {listed:?}"
+        );
+
+        // Everything keyed on "a live subscription covers this resource" is released with
+        // the record: the same request is admitted again, as its own subscription.
+        let again = create(&router, body).await;
+        let second = again.string("arn");
+        assert_ne!(
+            second, arn,
+            "case {label}: the second create must mint a subscription of its own"
+        );
+    }
+}
+
+/// Poll `GetSubscription` until the subscription is gone — HTTP 404, the terminal state a
+/// cancellation leads to.
+///
+/// Waits for the CONDITION, not for a time: how long a cancellation takes to be processed
+/// is the service's business, so this looks again until the answer is a 404 or a deadline
+/// far past it passes.
+async fn poll_until_absent(router: &MultiServiceRouter, arn: &str, case: &str) -> Answer {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let fetched = call(router, "GetSubscription", json!({"arn": arn}), None).await;
+        if fetched.status == 404 {
+            return fetched;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the subscription never went away, last answer {} {:?}",
+            fetched.status,
+            fetched.body
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Approve
 // ---------------------------------------------------------------------------
