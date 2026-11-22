@@ -76,10 +76,10 @@ pub struct PreparedStatementRecord {
     /// The query string the statement stands for, reported as
     /// `PreparedStatement$QueryStatement`.
     pub query_statement: String,
-    /// The description the last write carried, reported as
-    /// `PreparedStatement$Description`. `None` for a write that carried none, which is
-    /// what keeps an absent description absent on the way back out rather than reported as
-    /// an empty one.
+    /// The description the last write that CARRIED one stored, reported as
+    /// `PreparedStatement$Description`. `None` until some write carries one, which is what
+    /// keeps an absent description absent on the way back out rather than reported as an
+    /// empty one.
     pub description: Option<String>,
     /// When the statement was last written — the create's instant until an update changes
     /// it. Reported as `PreparedStatement$LastModifiedTime` ("The last modified time of
@@ -108,9 +108,11 @@ impl PreparedStatementRecord {
     /// Write `query_statement` and `description` onto the statement at `now`, as an update
     /// does.
     ///
-    /// The description is REPLACED rather than merged: `UpdatePreparedStatement` carries
-    /// the whole statement, so one called without a description leaves the statement with
-    /// none, exactly as a create without one does.
+    /// `description` is the description the statement is to HOLD once the write is applied,
+    /// which for an update that carried none is the one it already holds: a member a request
+    /// leaves out is not a member that request changes, so no write clears a description by
+    /// omitting it. The caller resolves that before it measures what the write will hold
+    /// (`crate::ops::update_prepared_statement`).
     pub fn revise(
         &mut self,
         query_statement: String,

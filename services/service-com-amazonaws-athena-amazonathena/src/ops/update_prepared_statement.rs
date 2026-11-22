@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePreparedStatement
-//! IMPLEMENTED: writes the submitted query statement and description onto the prepared
-//! statement the named workgroup holds, moving its last modified time to this call's
-//! instant, and reports a workgroup or a statement this account does not hold as not
-//! found.
+//! IMPLEMENTED: writes the members the request carries — the query statement, and the
+//! description when it carries one, an omitted description leaving the statement's own one
+//! standing — onto the prepared statement the named workgroup holds, moving its last
+//! modified time to this call's instant, and reports a workgroup or a statement this
+//! account does not hold as not found.
 //!
 //! ## Shape of an operation
 //!
@@ -175,13 +176,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // What the statement will DESCRIBE once this update is applied: the description
+        // this request carries, and otherwise the one the statement already holds — a
+        // member the request leaves out is not a member this write changes. Read here so
+        // the bytes measured below are the bytes the write will actually hold.
+        let description = match input.description {
+            Some(description) => Some(description),
+            None => store
+                .prepared_statements
+                .statement(&input.work_group, &input.statement_name)
+                .and_then(|record| record.description.clone()),
+        };
+
         // Measured before anything is written: the bytes of prepared statements this
         // account holds are bounded, and an update that would take it past that bound is
         // refused rather than stored. What this write overwrites is freed by it.
         let statement_bytes = crate::state::prepared_statement_bytes(
             &input.statement_name,
             &input.query_statement,
-            input.description.as_deref(),
+            description.as_deref(),
         );
         if store
             .prepared_statements
@@ -207,11 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // The update carries the whole statement, so the description is replaced rather
-        // than merged: one called without a description leaves the statement with none.
+        // Only what this request names is written: the query statement it carries, and the
+        // description resolved above — which is the statement's own one for an update that
+        // carried none, so a rewrite of the query text alone leaves the description a
+        // later read reports exactly as it was.
         record.revise(
             input.query_statement,
-            input.description,
+            description,
             ::std::time::SystemTime::now(),
         );
 

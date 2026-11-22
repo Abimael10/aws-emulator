@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNamedQuery
-//! IMPLEMENTED: writes the name, the query text and the description the request carries onto
-//! the saved query its `NamedQueryId` names, leaving the database and the workgroup that
-//! query was created in untouched, so `GetNamedQuery` reads the revised query back under the
-//! same id. An id this account minted no query under is refused with the same miss the read
-//! of one reports.
+//! IMPLEMENTED: writes the members the request carries — the name, the query text and, when
+//! it carries one, the description, an omitted description leaving the query's own one
+//! standing — onto the saved query its `NamedQueryId` names, leaving the database and the
+//! workgroup that query was created in untouched, so `GetNamedQuery` reads the revised query
+//! back under the same id. An id this account minted no query under is refused with the same
+//! miss the read of one reports.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
+        // What the query will DESCRIBE once this update is applied: the description this
+        // request carries, and otherwise the one the query already holds — a member the
+        // request leaves out is not a member this write changes. Read here so the bytes
+        // measured below are the bytes the write will actually hold.
+        let description = match input.description {
+            Some(description) => Some(description),
+            None => store
+                .named_queries
+                .query(&input.named_query_id)
+                .and_then(|record| record.description.clone()),
+        };
+
         // Measured before anything is written: the bytes of named queries this account holds
         // are bounded, and a write that would take it past that bound is refused rather than
         // stored. What this write overwrites is freed by it.
@@ -168,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.name,
             &database,
             &input.query_string,
-            input.description.as_deref(),
+            description.as_deref(),
         );
         if store
             .named_queries
@@ -184,12 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Updates a NamedQuery object. The database or workgroup cannot be updated": the
-        // three members the update carries are written and the rest of the record stands, so
-        // the query keeps the id it was minted under and stays in the database and the
-        // workgroup it was created in. The description is REPLACED rather than merged — the
-        // update carries the whole query — so one sent without a description leaves the query
-        // with none.
-        record.revise(input.name, input.query_string, input.description);
+        // members the update carries are written and the rest of the record stands, so the
+        // query keeps the id it was minted under and stays in the database and the workgroup
+        // it was created in. The description written is the one resolved above — the query's
+        // own for an update that carried none — so a rewrite of the name and the text alone
+        // leaves the description a later read reports exactly as it was.
+        record.revise(input.name, input.query_string, description);
 
         // `UpdateNamedQueryOutput` models no members: the revised query is read back through
         // `GetNamedQuery`.

@@ -53,9 +53,9 @@ pub struct NamedQueryRecord {
     pub id: String,
     /// The query name the create carried, reported as `NamedQuery$Name`.
     pub name: String,
-    /// The description the create carried, if any, reported as `NamedQuery$Description`.
-    /// `None` for a create that carried none, which is what keeps an absent description
-    /// absent on the way back out rather than reported as an empty one.
+    /// The description the last write that CARRIED one stored, if any, reported as
+    /// `NamedQuery$Description`. `None` until some write carries one, which is what keeps an
+    /// absent description absent on the way back out rather than reported as an empty one.
     pub description: Option<String>,
     /// The database the query belongs to, reported as `NamedQuery$Database`.
     pub database: String,
@@ -71,9 +71,11 @@ impl NamedQueryRecord {
     ///
     /// The database and the workgroup are NOT touched: "The database or workgroup cannot be
     /// updated" (`UpdateNamedQuery`), so a query stays in the database and the workgroup its
-    /// create put it in. The description is REPLACED rather than merged, because the update
-    /// carries the whole query: one called without a description leaves the query with none,
-    /// exactly as a create without one does.
+    /// create put it in. `description` is the description the query is to HOLD once the write
+    /// is applied, which for an update that carried none is the one it already holds: a
+    /// member a request leaves out is not a member that request changes. The caller resolves
+    /// that before it measures what the write will hold
+    /// (`crate::ops::update_named_query`).
     pub fn revise(&mut self, name: String, query_string: String, description: Option<String>) {
         self.name = name;
         self.query_string = query_string;

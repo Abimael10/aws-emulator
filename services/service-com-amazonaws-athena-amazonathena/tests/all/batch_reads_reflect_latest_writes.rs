@@ -19,10 +19,10 @@
 //! carries `WorkGroup`, `StatementName` and `QueryStatement` with an optional `Description`.
 //!
 //! Each test asserts the rule over a TABLE rather than one request: the records differ along
-//! which members a write changed, whether a description was added, replaced or dropped, how
-//! many writes a record took and which workgroup holds it, and the batch rows differ along how
-//! many addresses they carry, in which order, whether an address repeats and whether one of
-//! them resolves to nothing.
+//! which members a write changed, whether a description was added, replaced or left standing,
+//! how many writes a record took and which workgroup holds it, and the batch rows differ along
+//! how many addresses they carry, in which order, whether an address repeats and whether one
+//! of them resolves to nothing.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -113,8 +113,8 @@ fn named_query_members(found: &Value) -> Value {
 /// answering with each record as its last write left it.
 ///
 /// The rows differ along which members the write changed, whether the description was added,
-/// replaced or dropped, how many writes the record took, and whether it lives in the account's
-/// default workgroup or in one of its own.
+/// replaced or left standing, how many writes the record took, and whether it lives in the
+/// account's default workgroup or in one of its own.
 async fn given_written_named_queries(router: &MultiServiceRouter) -> Vec<Record> {
     create_work_group(router, NAMED_QUERY_WORK_GROUP).await;
 
@@ -145,7 +145,7 @@ async fn given_written_named_queries(router: &MultiServiceRouter) -> Vec<Record>
             })],
         ),
         (
-            "a query whose description an update dropped",
+            "a query whose description an update left standing",
             json!({
                 "Name": "described-on-create",
                 "Database": "logs",
@@ -234,7 +234,11 @@ async fn given_written_named_queries(router: &MultiServiceRouter) -> Vec<Record>
             );
             expected["Name"] = update["Name"].clone();
             expected["QueryString"] = update["QueryString"].clone();
-            expected["Description"] = update.get("Description").cloned().unwrap_or(Value::Null);
+            // An update that carries no description leaves the one that stands, so the
+            // expectation only moves when the request named the member.
+            if let Some(description) = update.get("Description") {
+                expected["Description"] = description.clone();
+            }
         }
         records.push(Record {
             case,
@@ -467,7 +471,7 @@ async fn given_written_prepared_statements(router: &MultiServiceRouter) -> Vec<R
             vec![(query_text(4), Some("written by the update"))],
         ),
         (
-            "a statement whose description an update dropped",
+            "a statement whose description an update left standing",
             "alpha_statement",
             Some("as created"),
             vec![(query_text(2), None)],
@@ -516,7 +520,11 @@ async fn given_written_prepared_statements(router: &MultiServiceRouter) -> Vec<R
                  with {body:?}"
             );
             expected["QueryStatement"] = json!(query_statement);
-            expected["Description"] = description.map_or(Value::Null, |text| json!(text));
+            // An update that carries no description leaves the one that stands, so the
+            // expectation only moves when the request named the member.
+            if let Some(description) = description {
+                expected["Description"] = json!(description);
+            }
         }
         records.push(Record {
             case,

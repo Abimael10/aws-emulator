@@ -393,11 +393,11 @@ async fn a_statement_name_is_unique_within_its_work_group_only() {
     }
 }
 
-/// An update writes the whole statement: the query string and the description it carries
-/// replace what the statement held, its last modified time moves to the update, and an
-/// update that carries no description leaves the statement with none.
+/// An update writes the members it carries: the query string replaces what the statement
+/// held, its last modified time moves to the update, and an update that carries no
+/// description leaves the description the statement already held standing.
 #[tokio::test]
-async fn an_update_replaces_the_query_statement_and_the_description() {
+async fn an_update_writes_the_members_it_carries_and_leaves_the_rest() {
     let router = router();
     const WORK_GROUP: &str = "prepared-statement-update";
     create_work_group(&router, WORK_GROUP).await;
@@ -412,7 +412,7 @@ async fn an_update_replaces_the_query_statement_and_the_description() {
             Some("the second"),
         ),
         (
-            "a described statement rewritten without a description",
+            "a described statement whose rewrite carries no description",
             Some("the only one"),
             "SELECT 1",
             None,
@@ -471,10 +471,13 @@ async fn an_update_replaces_the_query_statement_and_the_description() {
             Some(new_query),
             "case {case:?}: expected the query string the update carried, got {after:?}"
         );
+        // The description a read must report: the one the update carried, and otherwise the
+        // one the statement already held — an omitted member is not one the update changes.
+        let expected_description = new_description.or(created_description);
         assert_eq!(
             after["Description"].as_str(),
-            new_description,
-            "case {case:?}: expected the description {new_description:?}, got {after:?}"
+            expected_description,
+            "case {case:?}: expected the description {expected_description:?}, got {after:?}"
         );
         let updated_at = after["LastModifiedTime"].as_f64().unwrap_or_default();
         assert!(

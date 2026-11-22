@@ -6,16 +6,17 @@
 //! Driven over the wire (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`) through the
 //! same router the emulator boots, so every assertion is about what an SDK client observes.
 //!
-//! THE RULE UNDER TEST: an update of a saved query replaces that query's name, its query
-//! text and its description with the ones the request carries — a request carrying no
-//! description leaving it with none — while its id, its database and its workgroup stay the
-//! ones the create minted and stored, and a request naming an id this account holds no query
-//! under is refused with `InvalidRequestException` (HTTP 400) and writes nothing.
+//! THE RULE UNDER TEST: an update of a saved query writes the members the request carries
+//! — that query's name, its query text and, when the request carries one, its description,
+//! an omitted description leaving the one the query already holds standing — while its id,
+//! its database and its workgroup stay the ones the create minted and stored, and a request
+//! naming an id this account holds no query under is refused with `InvalidRequestException`
+//! (HTTP 400) and writes nothing.
 //!
 //! Each test asserts that rule over a TABLE rather than one request: the rows differ along
-//! which members the update changes, whether the description is added, replaced or dropped,
-//! how long the query text is, how many statements it holds, and whether the query lives in
-//! the account's default workgroup or in one the test created.
+//! which members the update changes, whether the description is added, replaced or left to
+//! stand, how long the query text is, how many statements it holds, and whether the query
+//! lives in the account's default workgroup or in one the test created.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -157,15 +158,29 @@ fn update_cases() -> Vec<UpdateCase> {
             description: Some("a description the create did not carry".to_string()),
         },
         UpdateCase {
-            case: "no description, where the create stored one",
+            case: "an update carrying no description, where the create stored one",
             create: json!({
                 "Database": "logs",
                 "QueryString": query_text(3),
                 "Description": "the created description",
             }),
             update: json!({
-                "Name": "undescribed-now",
+                "Name": "undescribed-update",
                 "QueryString": query_text(3),
+            }),
+            created_name: "created-query",
+            // The update carried no description, so the one the create stored stands.
+            description: Some("the created description".to_string()),
+        },
+        UpdateCase {
+            case: "an update carrying no description, where the create stored none either",
+            create: json!({
+                "Database": "logs",
+                "QueryString": query_text(2),
+            }),
+            update: json!({
+                "Name": "still-undescribed",
+                "QueryString": query_text(4),
             }),
             created_name: "created-query",
             description: None,
