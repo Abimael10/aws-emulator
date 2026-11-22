@@ -385,6 +385,284 @@ fn reported_windows(case: &str, body: &Value) -> Vec<i64> {
         .collect()
 }
 
+/// `GET /properties/aggregates?...` for the stream `stream` spells — either
+/// `assetId=…&propertyId=…` or `propertyAlias=…` — over `(start, end]` at
+/// `resolution`, asking for `types`.
+///
+/// The aggregate SELECTION is a parameter here where [`aggregates_query`] fixes it
+/// at one function: `aggregateTypes` decides what each window reports and therefore
+/// which windows are reported at all, so it is part of what a token is bound to. A
+/// list bound to the query string travels as its name repeated once per entry.
+fn aggregates_selection(
+    stream: &str,
+    resolution: &str,
+    start: i64,
+    end: i64,
+    types: &[&str],
+) -> String {
+    let selection: String = types
+        .iter()
+        .map(|aggregate| format!("&aggregateTypes={aggregate}"))
+        .collect();
+    format!(
+        "{stream}&resolution={resolution}&startDate={}&endDate={}{selection}",
+        query_date(start),
+        query_date(end)
+    )
+}
+
+#[tokio::test]
+async fn an_aggregates_token_is_bound_to_the_selection_and_the_stream_it_names() {
+    let router = crate::asset_lifecycle::router();
+    let (asset_id, speed, torque) =
+        asset_with_two_properties(&router, "Press1", "Speed", "Torque").await;
+    let (other_asset, other_speed, _) =
+        asset_with_two_properties(&router, "Press2", "Speed", "Torque").await;
+
+    // The same instants in every stream, in three distinct `1m` windows, plus one BAD
+    // reading so a quality-filtered enumeration of the same stream exists too. The
+    // window grid is aligned to the epoch, so each of these streams enumerates exactly
+    // the same window starts — which is what puts a foreign token's resume point in
+    // every one of them.
+    let written: [(i64, Option<&str>); 4] =
+        [(0, None), (120, None), (180, Some("BAD")), (240, None)];
+    write_to_each(
+        &router,
+        &[
+            (&asset_id, &speed),
+            (&asset_id, &torque),
+            (&other_asset, &other_speed),
+        ],
+        &written,
+    )
+    .await;
+
+    // An alias is another SPELLING of one stream, not another stream: bound to this
+    // property through `UpdateAssetProperty`, it asks for the same enumeration the
+    // ids do.
+    let alias = "/company/press/1/speed";
+    let (status, bound) = call(
+        &router,
+        "PUT",
+        &format!("/assets/{asset_id}/properties/{speed}"),
+        Some(json!({"propertyAlias": alias})),
+    )
+    .await;
+    assert_eq!(status, 200, "binding the alias: got {status} {bound}");
+
+    let ids = format!("assetId={asset_id}&propertyId={speed}");
+    let minted = aggregates_selection(&ids, "1m", -60, 300, &["COUNT", "AVERAGE"]);
+
+    // What the whole enumeration is, so a resumed page can be checked against the
+    // window that really follows the first one.
+    let (status, whole) = call(
+        &router,
+        "GET",
+        &format!("/properties/aggregates?{minted}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "the unpaginated read: got {status} {whole}");
+    let windows = reported_windows("the unpaginated read", &whole);
+    assert_eq!(
+        windows.len(),
+        3,
+        "the unpaginated read: expected the three windows the GOOD readings fall in, \
+         got {windows:?}"
+    );
+
+    let (status, first) = call(
+        &router,
+        "GET",
+        &format!("/properties/aggregates?{minted}&maxResults=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "minting the token: got {status} {first}");
+    let token = first["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("minting the token: expected a nextToken, got {first}"))
+        .to_string();
+
+    // Rows asking for the SAME enumeration, spelled differently: the token resumes at
+    // the window after the first page, whatever page size the request names, however
+    // it names the stream, and whether it restates a default or leaves it out.
+    let honoured: Vec<(&str, String)> = vec![
+        ("the request that minted it", format!("{minted}&maxResults=1")),
+        ("a wider page", format!("{minted}&maxResults=2")),
+        ("no page size at all", minted.clone()),
+        (
+            "the ordering named explicitly, as the default",
+            format!("{minted}&timeOrdering=ASCENDING"),
+        ),
+        (
+            "the quality named explicitly, as the default",
+            format!("{minted}&qualities=GOOD"),
+        ),
+        (
+            "the selection repeating a function it already names",
+            aggregates_selection(&ids, "1m", -60, 300, &["COUNT", "AVERAGE", "COUNT"]),
+        ),
+        (
+            "the same stream by its alias",
+            aggregates_selection(
+                &format!("propertyAlias={alias}"),
+                "1m",
+                -60,
+                300,
+                &["COUNT", "AVERAGE"],
+            ),
+        ),
+    ];
+    for (case, query) in honoured {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/properties/aggregates?{query}&nextToken={token}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+        let resumed = reported_windows(case, &body);
+        assert_eq!(
+            resumed.first().copied(),
+            windows.get(1).copied(),
+            "case {case:?}: expected the page to resume at the second window {:?}, \
+             got {resumed:?}",
+            windows.get(1)
+        );
+    }
+
+    // Rows asking for ANOTHER enumeration. Every one of them holds a window at the
+    // resume point the token carries, so each would be served from that offset —
+    // dropping every earlier window of it — were the token not bound to the request
+    // that minted it. The selection rows span a narrower, a wider and a differently
+    // named one; the resolution rows every other value the modelled pattern
+    // `^1m|15m|1h|1d$` admits.
+    let refused: Vec<(&str, String)> = vec![
+        (
+            "a selection naming fewer functions",
+            aggregates_selection(&ids, "1m", -60, 300, &["COUNT"]),
+        ),
+        (
+            "a selection naming more functions",
+            aggregates_selection(&ids, "1m", -60, 300, &["COUNT", "AVERAGE", "SUM"]),
+        ),
+        (
+            "a selection naming another function",
+            aggregates_selection(&ids, "1m", -60, 300, &["COUNT", "SUM"]),
+        ),
+        (
+            "another property of the same asset",
+            aggregates_selection(
+                &format!("assetId={asset_id}&propertyId={torque}"),
+                "1m",
+                -60,
+                300,
+                &["COUNT", "AVERAGE"],
+            ),
+        ),
+        (
+            "the same property name on another asset",
+            aggregates_selection(
+                &format!("assetId={other_asset}&propertyId={other_speed}"),
+                "1m",
+                -60,
+                300,
+                &["COUNT", "AVERAGE"],
+            ),
+        ),
+        (
+            "the resolution 15m",
+            aggregates_selection(&ids, "15m", -60, 300, &["COUNT", "AVERAGE"]),
+        ),
+        (
+            "the resolution 1h",
+            aggregates_selection(&ids, "1h", -60, 300, &["COUNT", "AVERAGE"]),
+        ),
+        (
+            "the resolution 1d",
+            aggregates_selection(&ids, "1d", -60, 300, &["COUNT", "AVERAGE"]),
+        ),
+        (
+            "the ordering flipped",
+            format!("{minted}&timeOrdering=DESCENDING"),
+        ),
+        (
+            "a quality filter the minting read did not carry",
+            format!("{minted}&qualities=BAD"),
+        ),
+        (
+            "a start bound the minting read did not carry",
+            aggregates_selection(&ids, "1m", -120, 300, &["COUNT", "AVERAGE"]),
+        ),
+        (
+            "an end bound the minting read did not carry",
+            aggregates_selection(&ids, "1m", -60, 360, &["COUNT", "AVERAGE"]),
+        ),
+    ];
+    for (case, query) in refused {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/properties/aggregates?{query}&nextToken={token}"),
+            None,
+        )
+        .await;
+        assert_token_refused(case, status, &body);
+    }
+
+    // A refusal costs the enumeration it was replayed against nothing: walked from
+    // its own start it still reports every window, the ones BEFORE the resume point
+    // that foreign token carried included.
+    let other = aggregates_selection(
+        &format!("assetId={asset_id}&propertyId={torque}"),
+        "1m",
+        -60,
+        300,
+        &["COUNT", "AVERAGE"],
+    );
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/properties/aggregates?{other}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "the other enumeration: got {status} {body}");
+    let expected = reported_windows("the other enumeration", &body);
+    let mut walked: Vec<i64> = Vec::new();
+    let mut resume: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let uri = match resume.as_deref() {
+            Some(resume) => format!(
+                "/properties/aggregates?{other}&maxResults=1&nextToken={resume}"
+            ),
+            None => format!("/properties/aggregates?{other}&maxResults=1"),
+        };
+        let (status, page) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "walking the other enumeration: got {status} {page}"
+        );
+        walked.extend(reported_windows("walking the other enumeration", &page));
+        resume = page["nextToken"].as_str().map(str::to_string);
+        pages += 1;
+        assert!(
+            pages <= expected.len() + 1,
+            "walking the other enumeration: the walk must terminate, got {walked:?}"
+        );
+        if resume.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        walked, expected,
+        "walking the other enumeration: expected {expected:?}, got {walked:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_aggregates_token_is_honoured_only_by_the_request_that_minted_it() {
     let router = crate::asset_lifecycle::router();
