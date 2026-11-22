@@ -35,24 +35,21 @@ pub fn db_cluster_endpoint_arn(region: &str, identifier: &str) -> String {
 
 /// The immutable id RDS reports as `DBClusterEndpointResourceIdentifier`: "a unique
 /// system-generated identifier for an endpoint. It remains the same for the whole life of
-/// the endpoint", written `cluster-endpoint-` followed by an opaque token of the width
-/// Amazon RDS writes that member in, minted once per endpoint and never reused
+/// the endpoint", written `cluster-endpoint-` followed by an opaque token of the width every
+/// server-assigned id of a REGIONAL resource of this service carries
+/// ([`RESOURCE_ID_TOKEN_LEN`] — the width a DB cluster's own `DbClusterResourceId` and a DB
+/// instance's `DbiResourceId` are written in), minted once per endpoint and never reused
 /// ([`minted_token`]).
+///
+/// One width for every resource id this service mints, rather than one per resource kind: a
+/// custom endpoint's id is a server-assigned id of a regional resource exactly as those two
+/// are, and a client that validates the form it holds for one holds it for all three.
 pub fn mint_db_cluster_endpoint_resource_id(mint: u64) -> String {
     format!(
         "cluster-endpoint-{}",
-        minted_token(
-            "db-cluster-endpoint",
-            mint,
-            DB_CLUSTER_ENDPOINT_RESOURCE_ID_TOKEN_LEN
-        )
+        minted_token("db-cluster-endpoint", mint, RESOURCE_ID_TOKEN_LEN)
     )
 }
-
-/// How many characters the token of a custom endpoint's resource id carries after its
-/// `cluster-endpoint-` prefix: the width of the server-assigned unique ids Amazon RDS
-/// documents this member's values in (`cluster-endpoint-ANPAJ4AE5446DAEXAMPLE`).
-const DB_CLUSTER_ENDPOINT_RESOURCE_ID_TOKEN_LEN: usize = 21;
 
 /// How many custom endpoints one DB cluster may carry: the allowance Amazon Aurora
 /// publishes ("Custom endpoints per DB cluster": 5). A create past it is the modelled
@@ -419,8 +416,8 @@ impl DbClusterEndpointRecord {
 /// connection endpoint for the primary instance" and the reader endpoint that
 /// "load-balances connections across the Aurora Replicas".
 ///
-/// `DescribeDBClusterEndpoints` reports them beside the custom endpoints — its `Filters`
-/// member publishes `reader`, `writer` and `custom` as the values of
+/// `DescribeDBClusterEndpoints` reports them AFTER the custom endpoints created for the
+/// cluster — its `Filters` member publishes `reader`, `writer` and `custom` as the values of
 /// `db-cluster-endpoint-type`, and only these two are of the first two types — each with
 /// the four members a cluster's own endpoint has: the cluster it belongs to, the address it
 /// publishes, its state and its type. It carries no identifier, no immutable id, no ARN and

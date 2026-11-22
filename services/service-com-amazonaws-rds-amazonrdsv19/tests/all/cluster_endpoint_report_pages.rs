@@ -3,8 +3,9 @@
 //! End-to-end tests for HOW `DescribeDBClusterEndpoints` serves the report in PAGES.
 //!
 //! RULE: the report of the endpoints of the Aurora DB clusters of the request's region is
-//! served in one stable order — each cluster in identifier order, its own writer and reader
-//! endpoints, then its custom endpoints in identifier order — cut into pages of at most
+//! served in one stable order — each cluster in identifier order, its CUSTOM endpoints in
+//! identifier order, then the two endpoints it has without a create, writer and reader — cut
+//! into pages of at most
 //! `MaxRecords` entries; a page carries a `Marker` exactly while entries beyond it remain,
 //! and a request carrying that `Marker` serves "only records beyond the marker"
 //! (`DescribeDBClusterEndpointsMessage$Marker`), so looping over the pages visits every
@@ -116,13 +117,6 @@ async fn seeded() -> (MultiServiceRouter, Vec<Reported>) {
             )
             .await,
         );
-        for endpoint_type in BUILTIN_TYPES {
-            expected.push(Reported {
-                cluster: cluster.clone(),
-                endpoint_type: endpoint_type.to_string(),
-                identifier: None,
-            });
-        }
         for position in 0..CUSTOM_PER_CLUSTER {
             let identifier = endpoint_name(index, position);
             // The requested type varies over every value the create publishes, so no page
@@ -145,6 +139,15 @@ async fn seeded() -> (MultiServiceRouter, Vec<Reported>) {
                 cluster: cluster.clone(),
                 endpoint_type: CUSTOM.to_string(),
                 identifier: Some(identifier),
+            });
+        }
+        // The cluster's own two endpoints are reported BEHIND every custom endpoint created
+        // for it, which is the order the report serves them in.
+        for endpoint_type in BUILTIN_TYPES {
+            expected.push(Reported {
+                cluster: cluster.clone(),
+                endpoint_type: endpoint_type.to_string(),
+                identifier: None,
             });
         }
     }
@@ -242,8 +245,8 @@ async fn the_report_pages_every_endpoint_of_its_scope_exactly_once_in_one_order(
     let whole = whole_report(&router, "every endpoint of the region", &[]).await;
     assert_eq!(
         whole, expected,
-        "case {:?}: the report serves each cluster's own two endpoints and then its custom \
-         ones, in identifier order; expected {expected:#?}, got {whole:#?}",
+        "case {:?}: the report serves each cluster's custom endpoints, in identifier order, \
+         and then its own two; expected {expected:#?}, got {whole:#?}",
         "every endpoint of the region"
     );
 

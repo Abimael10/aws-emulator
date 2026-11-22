@@ -12,6 +12,7 @@
 //! signing name `neptune-db`), which has no regional endpoint of its own and is addressed at
 //! the cluster's connection endpoint and nowhere else — and this emulator serves that API on
 //! its own endpoint. Such a cluster therefore publishes the HOST this process is reached at,
+//! for every one of its endpoints — its two members and each custom endpoint in front of it —
 //! because a name published under the engine's AWS DNS domain
 //! ([`super::endpoint_domain`]) resolves to nothing here and would be no connection endpoint
 //! at all.

@@ -76,7 +76,8 @@ pub struct DbClusterRecord {
     /// path from a write path. This address also decides the zone a minted name is announced
     /// in ([`Self::endpoint_dns_suffix`]) and the `Port` published beside both
     /// ([`Self::published_port`]). A cluster whose plane is served as an API is addressed at
-    /// this host for both members, because that plane answers HTTP there and nowhere else.
+    /// this host for every one of its endpoints — the two members and each CUSTOM endpoint in
+    /// front of it — because that plane answers HTTP there and nowhere else.
     pub served_endpoint: Option<ServedEndpoint>,
     /// `Status`.
     pub status: String,
@@ -550,6 +551,11 @@ impl DbClusterRecord {
     ///
     /// Composed here, from the cluster's own fields, so a custom endpoint cannot sit in
     /// another zone than the cluster it fronts.
+    ///
+    /// A cluster whose data plane is an AWS API this emulator serves at its own endpoint is
+    /// read as [`Self::endpoint_name`] reads it, for the same reason: that plane answers on
+    /// this process's address and nowhere else, so a custom endpoint in front of it is
+    /// reached there too.
     pub fn custom_endpoint_host(&self, named: &str) -> String {
         if let Some(served) = &self.served_endpoint {
             if engine_data_plane_is_an_api(&self.engine) {

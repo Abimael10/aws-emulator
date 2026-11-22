@@ -195,12 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => store.clusters_in(&region),
         };
 
-        // Every endpoint of each cluster in scope, in one order: the cluster's own writer
-        // and reader endpoints — which exist without a create and are what the
-        // `db-cluster-endpoint-type` filter's `writer` and `reader` values select — and
-        // then the custom endpoints created for it, in identifier order. The keys the page
-        // is cut on ascend in that same order, so a marker resumes where the caller left
-        // off ([`crate::state::paginate`]).
+        // Every endpoint of each cluster in scope, in the order Amazon RDS reports them: the
+        // CUSTOM endpoints created for the cluster first, in identifier order, and then the
+        // two endpoints the cluster has without a create — its writer and its reader, which
+        // are what the `db-cluster-endpoint-type` filter's `writer` and `reader` values
+        // select. The keys the page is cut on ascend in that same order, so a marker resumes
+        // where the caller left off ([`crate::state::paginate`]).
         let mut reported: Vec<(String, CreateDBClusterEndpointOutput)> = Vec::new();
         for cluster in clusters {
             // "This action only applies to Aurora DB clusters": a Multi-AZ DB cluster has
@@ -208,16 +208,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::ClusterKind::Aurora.holds_for(&cluster.engine) {
                 continue;
             }
+            for record in store.cluster_endpoints_of(&region, &cluster.identifier) {
+                reported.push((
+                    format!(
+                        "{}#{CUSTOM_ENDPOINTS_RANK}#{}",
+                        cluster.identifier, record.identifier
+                    ),
+                    store.cluster_endpoint_to_wire(record),
+                ));
+            }
             for (rank, endpoint) in crate::state::builtin_cluster_endpoints(cluster)
                 .into_iter()
                 .enumerate()
             {
-                reported.push((format!("{}#{rank}#", cluster.identifier), endpoint));
-            }
-            for record in store.cluster_endpoints_of(&region, &cluster.identifier) {
                 reported.push((
-                    format!("{}#{}#{}", cluster.identifier, BUILTIN_ENDPOINTS, record.identifier),
-                    store.cluster_endpoint_to_wire(record),
+                    format!("{}#{BUILTIN_ENDPOINTS_RANK}#{rank}", cluster.identifier),
+                    endpoint,
                 ));
             }
         }
@@ -246,10 +252,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How many endpoints a cluster has without a create — the writer and the reader — which is
-/// where the page keys of its CUSTOM endpoints start, so the keys of one cluster's
-/// endpoints ascend in the order the report serves them.
-const BUILTIN_ENDPOINTS: usize = 2;
+/// Where a cluster's CUSTOM endpoints sit in the page keys of its endpoints: ahead of the
+/// two it has without a create, which is the order this report serves them in, so the keys
+/// of one cluster's endpoints ascend in that same order.
+const CUSTOM_ENDPOINTS_RANK: usize = 0;
+
+/// Where the two endpoints a cluster has without a create — its writer and its reader — sit
+/// in those keys: behind every custom endpoint of the cluster ([`CUSTOM_ENDPOINTS_RANK`]).
+const BUILTIN_ENDPOINTS_RANK: usize = 1;
 
 /// The filter names this report supports, as its `Filters` member publishes them: "`Name`
 /// can be one of: `db-cluster-endpoint-type`, `db-cluster-endpoint-custom-type`,

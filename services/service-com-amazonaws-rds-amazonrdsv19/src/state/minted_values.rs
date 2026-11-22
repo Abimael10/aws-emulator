@@ -15,9 +15,13 @@
 use super::*;
 
 /// How many characters a REGIONAL resource id of this service carries after its `<kind>-`
-/// prefix: the width AWS writes `DbiResourceId` and `DbClusterResourceId` in. A global
-/// database's id has its own width ([`mint_global_cluster_resource_id`]).
-const RESOURCE_ID_TOKEN_LEN: usize = 26;
+/// prefix: the width AWS writes `DbiResourceId`, `DbClusterResourceId` and every other
+/// server-assigned id of a regional resource in — a custom endpoint's
+/// `DBClusterEndpointResourceIdentifier` included
+/// ([`mint_db_cluster_endpoint_resource_id`]), so the service mints one width rather than
+/// one per resource kind. A global database's id has its own width
+/// ([`mint_global_cluster_resource_id`]).
+pub(crate) const RESOURCE_ID_TOKEN_LEN: usize = 26;
 
 /// One minting of a server-assigned, opaque token: `width` characters of the
 /// digits-and-uppercase alphabet AWS writes a server-assigned id in.

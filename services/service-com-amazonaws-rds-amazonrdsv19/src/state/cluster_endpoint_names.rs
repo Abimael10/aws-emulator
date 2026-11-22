@@ -38,12 +38,13 @@
 //!
 //! A cluster whose data plane is an AWS API served at this emulator's own endpoint
 //! ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune graph cluster) publishes no
-//! minted name at all, for either member: that plane is HTTP on this emulator's own front
-//! door, which admits a request only when its `Host` names the interface the core bound
+//! minted name at all, for either member, nor for a CUSTOM endpoint created in front of it
+//! ([`CLUSTER_CUSTOM_LABEL`]): that plane is HTTP on this emulator's own front door, which
+//! admits a request only when its `Host` names the interface the core bound
 //! (`emulator_server::is_loopback_host`, the DNS-rebinding guard), so a name of this
 //! emulator's own — in any zone — is refused there and would be no connection endpoint at
-//! all. Such a cluster therefore publishes the HOST this process is reached at for both of its
-//! endpoint members, which is the only address its plane answers on
+//! all. Such a cluster therefore publishes the HOST this process is reached at for every one
+//! of its endpoints, which is the only address its plane answers on
 //! ([`super::api_plane_address`]).
 
 /// The label a cluster's WRITER endpoint carries in front of its server-assigned one:
