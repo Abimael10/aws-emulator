@@ -46,6 +46,15 @@ pub fn view_already_exists_message(name: &str) -> String {
     already_exists_message(super::resource_not_found::VIEW_NOT_FOUND_RESOURCE, name)
 }
 
+/// The whole message a start that names a session the caller already holds open earns.
+///
+/// Recorded behavior, and the one place this service's conflict wording does NOT follow
+/// the kind-and-identifier template above: wholly FIXED text, a sentence with a trailing
+/// period, naming the member that collided rather than interpolating the name the request
+/// carried — so a refused start discloses nothing of what the caller already holds beyond
+/// that the name is taken.
+pub const SESSION_NAME_ALREADY_EXISTS_MESSAGE: &str = "A session with this name already exists.";
+
 /// How a name already taken inside a SPACE is worded: the kind the name would have
 /// identified, and that the space the request addressed already holds one under it.
 ///

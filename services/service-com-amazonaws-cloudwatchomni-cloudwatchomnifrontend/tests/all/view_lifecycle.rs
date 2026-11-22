@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for CloudWatchOmni's views.
+//! End-to-end cover for CloudWatchOmni's telemetry query surface: the views a query
+//! binds to, and the query SESSIONS a query runs in.
 //!
 //! Every call goes through a real operation handler holding the SAME shared engine the
 //! router hands every service, so a create is observable by the reader that runs next.
@@ -36,6 +37,22 @@
 //!   all, and a name the store holds nothing under is the 404. These rows are driven over
 //!   the rpcv2Cbor wire, so what a real client reads is what is asserted.
 //!
+//! The query-session half asserts its own rules, at the end of this file:
+//!
+//! * `StartTelemetryQuerySession` mints a session the caller owns, whatever name the
+//!   model admits for it (and none at all), persists it and answers with the id it
+//!   minted, in the form the model fixes for a `sessionId`;
+//! * `ListTelemetryQuerySessions` reads those records back — the id, the name, the
+//!   activity instants — in start order, paged at `maxResults` with a `nextToken` that
+//!   resumes where the page stopped, and refuses a token it did not mint;
+//! * a session name identifies a session among the ones ONE caller holds, so a second
+//!   start under a name the caller holds is a `ConflictException` (409) stating that a
+//!   session of that name already exists, and mints nothing, while another caller may
+//!   hold a session under the same name;
+//! * a name in the `/aws/` namespace is reserved for service integrations, so a caller
+//!   asking for one is refused with `ValidationException` (400) and nothing is recorded;
+//! * a listing reports only the sessions the calling principal started.
+//!
 //! Each assertion names its case and the actual value, so a failure identifies the row
 //! of the table that broke.
 
@@ -54,17 +71,27 @@ use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 use omni::ops::create_view::{CreateView, CreateViewError, CreateViewErrorModeled};
 use omni::ops::delete_view::{DeleteView, DeleteViewError};
 use omni::ops::get_view::{GetView, GetViewError};
+use omni::ops::list_telemetry_query_sessions::{
+    ListTelemetryQuerySessions, ListTelemetryQuerySessionsError,
+};
 use omni::ops::list_views::{ListViews, ListViewsError};
+use omni::ops::start_telemetry_query_session::{
+    StartTelemetryQuerySession, StartTelemetryQuerySessionError,
+};
 use omni::ops::types::{
     CreateViewInput, CreateViewOutput, DeleteViewInput, DeleteViewOutput, GetViewInput,
-    GetViewOutput, ListViewsInput, ListViewsOutput, UpdateViewInput, UpdateViewOutput,
-    CREATE_VIEW_INPUT_SCHEMA, GET_VIEW_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA,
-    UPDATE_VIEW_INPUT_SCHEMA, VIEW_TYPE_VALUES,
+    GetViewOutput, ListTelemetryQuerySessionsInput, ListTelemetryQuerySessionsOutput,
+    ListViewsInput, ListViewsOutput, StartTelemetryQuerySessionInput,
+    StartTelemetryQuerySessionOutput, UpdateViewInput, UpdateViewOutput, CREATE_VIEW_INPUT_SCHEMA,
+    GET_VIEW_INPUT_SCHEMA, LIST_TELEMETRY_QUERY_SESSIONS_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA,
+    START_TELEMETRY_QUERY_SESSION_INPUT_SCHEMA, UPDATE_VIEW_INPUT_SCHEMA, VIEW_TYPE_VALUES,
 };
 use omni::scaffolded::Scaffolded;
 use omni::state::{
-    view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_ARN_RESOURCE_TYPE,
-    VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY, VIEW_DEFINITION_MUST_BE_ONE_STATEMENT, VIEW_TYPE_USER,
+    view_definition_rejection, INVALID_VIEW_DEFINITION, SESSION_NAME_ALREADY_EXISTS_MESSAGE,
+    SESSION_NAME_NOT_VALID_MESSAGE, VIEW_ARN_RESOURCE_TYPE,
+    VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY, VIEW_DEFINITION_MUST_BE_ONE_STATEMENT,
+    VIEW_TYPE_USER,
 };
 
 use super::validation_message_wording::error_envelope;
@@ -79,13 +106,19 @@ const ACCESS_KEY_ID: &str = "AKIDEMULATOR";
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (the router's routing key), the region the handlers record and `ACCESS_KEY_ID`.
 fn signed_request_parts() -> http::request::Parts {
+    signed_request_parts_for(ACCESS_KEY_ID)
+}
+
+/// The same request metadata, signed by `access_key_id`: a caller's identity is read off
+/// the SigV4 credential scope, so this is how a second principal calls.
+fn signed_request_parts_for(access_key_id: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -995,6 +1028,516 @@ async fn a_deleted_view_resolves_to_nothing_and_frees_its_name() {
         omni.delete_view(&view_name("never-created")).await,
         404,
         "ResourceNotFoundException",
+    );
+}
+
+// --- telemetry query sessions ------------------------------------------------------
+
+/// A second principal: the access key id a request signs with is what this service reads
+/// the caller's identity from, so this is a different owner of sessions.
+const OTHER_ACCESS_KEY_ID: &str = "AKIDSECONDCALLER";
+
+impl Omni {
+    /// The request metadata of a call another principal signed, as a context the
+    /// operations take.
+    fn ctx_with<'a>(&'a self, parts: &'a http::request::Parts) -> OperationContext<'a> {
+        OperationContext::new(
+            parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        )
+    }
+
+    /// `StartTelemetryQuerySession`, signed by `access_key_id`.
+    async fn start_session_signed_by(
+        &self,
+        access_key_id: &str,
+        session_name: Option<&str>,
+    ) -> Result<StartTelemetryQuerySessionOutput, StartTelemetryQuerySessionError> {
+        let parts = signed_request_parts_for(access_key_id);
+        StartTelemetryQuerySession::new(Arc::clone(&self.engine))
+            .handle(
+                StartTelemetryQuerySessionInput {
+                    session_name: session_name.map(str::to_string),
+                },
+                &self.ctx_with(&parts),
+            )
+            .await
+    }
+
+    /// `StartTelemetryQuerySession`, signed by the suite's own principal.
+    async fn start_session(
+        &self,
+        session_name: Option<&str>,
+    ) -> Result<StartTelemetryQuerySessionOutput, StartTelemetryQuerySessionError> {
+        self.start_session_signed_by(ACCESS_KEY_ID, session_name)
+            .await
+    }
+
+    /// `ListTelemetryQuerySessions`, signed by `access_key_id`.
+    async fn list_sessions_signed_by(
+        &self,
+        access_key_id: &str,
+        input: &ListTelemetryQuerySessionsInput,
+    ) -> Result<ListTelemetryQuerySessionsOutput, ListTelemetryQuerySessionsError> {
+        let parts = signed_request_parts_for(access_key_id);
+        ListTelemetryQuerySessions::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx_with(&parts))
+            .await
+    }
+
+    /// `ListTelemetryQuerySessions`, signed by the suite's own principal.
+    async fn list_sessions(
+        &self,
+        input: &ListTelemetryQuerySessionsInput,
+    ) -> Result<ListTelemetryQuerySessionsOutput, ListTelemetryQuerySessionsError> {
+        self.list_sessions_signed_by(ACCESS_KEY_ID, input).await
+    }
+}
+
+/// Whether `session_id` has the form the model fixes for a session id:
+/// `@length(1..64)` and `^[a-z0-9-]+$` on `StartTelemetryQuerySessionResponse$sessionId`,
+/// from `smithy_query(query="operation",operation="StartTelemetryQuerySession")`.
+fn is_modelled_session_id(session_id: &str) -> bool {
+    (1..=64).contains(&session_id.len())
+        && session_id
+            .chars()
+            .all(|character| matches!(character, 'a'..='z' | '0'..='9' | '-'))
+}
+
+/// The names a start may carry, spanning the `sessionName` class the model admits —
+/// `@length(1..128)` and
+/// `^([a-zA-Z0-9_-]+|/aws/[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)?)$`, from
+/// `smithy_query(query="shape",shape="StartTelemetryQuerySessionRequest")` — minus the
+/// `/aws/` namespace the member's doc reserves for service integrations (asserted on its
+/// own below), plus the start that names no session at all, which the member being
+/// optional admits.
+///
+/// The rows differ along what a name can differ in: whether there is one, its length at
+/// both published bounds, its case, and the punctuation its pattern admits.
+fn session_name_cases() -> Vec<(String, Option<String>)> {
+    [
+        ("no name at all", None),
+        ("the shortest name the model admits", Some("s".to_string())),
+        ("a digits-only name", Some("20260101".to_string())),
+        (
+            "a name carrying the punctuation its pattern admits",
+            Some("nightly_error-scan-7".to_string()),
+        ),
+        ("a mixed-case name", Some("NightlyErrorScan".to_string())),
+        (
+            "a name that merely mentions aws",
+            Some("aws-nightly-scan".to_string()),
+        ),
+        ("the longest name the model admits", Some("s".repeat(128))),
+    ]
+    .into_iter()
+    .map(|(case, name)| (case.to_string(), name))
+    .collect()
+}
+
+/// The names reserved for service integrations, in both the forms the member's pattern
+/// allows, so a caller may take none of them.
+fn reserved_session_name_cases() -> Vec<(String, String)> {
+    [
+        (
+            "the shortest reserved name the pattern allows",
+            "/aws/a".to_string(),
+        ),
+        (
+            "a one-segment reserved name",
+            "/aws/incident-detection".to_string(),
+        ),
+        (
+            "a two-segment reserved name",
+            "/aws/incident-detection/triage".to_string(),
+        ),
+        (
+            "the longest reserved name the model admits",
+            format!("/aws/{}", "s".repeat(123)),
+        ),
+    ]
+    .into_iter()
+    .map(|(case, name)| (case.to_string(), name))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_started_session_is_persisted_and_the_listing_reads_it_back() {
+    let omni = Omni::new();
+
+    // (case, the id the start minted, the name it was started under)
+    let mut started: Vec<(String, String, Option<String>)> = Vec::new();
+    for (case, session_name) in session_name_cases() {
+        let out = omni
+            .start_session(session_name.as_deref())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: StartTelemetryQuerySession failed: {error:?}")
+            });
+        assert!(
+            is_modelled_session_id(&out.session_id),
+            "case {case:?}: the minted session id must have the form the model fixes, got {:?}",
+            out.session_id
+        );
+        assert!(
+            started.iter().all(|(_, id, _)| *id != out.session_id),
+            "case {case:?}: every start mints its own session id, got the repeated {:?}",
+            out.session_id
+        );
+        started.push((case, out.session_id, session_name));
+    }
+
+    let listed = omni
+        .list_sessions(&ListTelemetryQuerySessionsInput::default())
+        .await
+        .unwrap_or_else(|error| panic!("ListTelemetryQuerySessions failed: {error:?}"));
+    assert_eq!(
+        listed.sessions.len(),
+        started.len(),
+        "the listing must report every started session, got {listed:?}"
+    );
+    assert_eq!(
+        listed.next_token, None,
+        "a listing that reported everything carries no resume token, got {:?}",
+        listed.next_token
+    );
+
+    for (index, (case, session_id, session_name)) in started.iter().enumerate() {
+        let summary = &listed.sessions[index];
+        assert_eq!(
+            &summary.session_id, session_id,
+            "case {case:?}: the listing reports the sessions in start order, got {:?} at \
+             position {index}",
+            summary.session_id
+        );
+        assert_eq!(
+            summary.session_name.as_deref(),
+            session_name.as_deref(),
+            "case {case:?}: the listing must report the name the start carried, got {:?}",
+            summary.session_name
+        );
+        let created_at = summary
+            .created_at
+            .unwrap_or_else(|| panic!("case {case:?}: the summary must report createdAt"));
+        let last_activity_at = summary
+            .last_activity_at
+            .unwrap_or_else(|| panic!("case {case:?}: the summary must report lastActivityAt"));
+        assert_eq!(
+            created_at, last_activity_at,
+            "case {case:?}: starting a session is the first activity in it, so the two \
+             instants are one until something moves it, got {created_at:?} and \
+             {last_activity_at:?}"
+        );
+        assert!(
+            created_at.secs() > 0,
+            "case {case:?}: the session must be recorded at the instant it started, got \
+             {created_at:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_name_reserved_for_service_integrations_is_refused_and_mints_nothing() {
+    let omni = Omni::new();
+    for (case, session_name) in reserved_session_name_cases() {
+        // Over the wire, so the status, the error code AND the message are the facts a
+        // client reads.
+        let (status, body) = omni
+            .over_the_wire(
+                "StartTelemetryQuerySession",
+                START_TELEMETRY_QUERY_SESSION_INPUT_SCHEMA,
+                &StartTelemetryQuerySessionInput {
+                    session_name: Some(session_name.clone()),
+                },
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a reserved session name must be refused with 400, got {status}"
+        );
+        let (code, message) = error_envelope(&case, &body);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected the modelled ValidationException, got {code:?}"
+        );
+        assert_eq!(
+            message, SESSION_NAME_NOT_VALID_MESSAGE,
+            "case {case:?}: expected the refusal to name the parameter that was wrong, \
+             got {message:?}"
+        );
+        // The sentence itself, spelled out once rather than only compared against the
+        // constant the handler carries, so the WORDING is a checked fact.
+        assert_eq!(
+            message, "The specified session name is not valid.",
+            "case {case:?}: expected the service's own wording, got {message:?}"
+        );
+    }
+
+    // Nothing was recorded for any of them: the refusals left the caller with no session.
+    let listed = omni
+        .list_sessions(&ListTelemetryQuerySessionsInput::default())
+        .await
+        .unwrap_or_else(|error| panic!("ListTelemetryQuerySessions failed: {error:?}"));
+    assert!(
+        listed.sessions.is_empty(),
+        "a refused start persists nothing, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_name_the_caller_already_holds_is_refused_and_mints_nothing() {
+    let omni = Omni::new();
+
+    for (case, session_name) in session_name_cases() {
+        let Some(session_name) = session_name else {
+            // A start that names no session has no identity to collide with: two of them
+            // both mint, which is the other half of this rule.
+            let first = omni
+                .start_session(None)
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: the first start failed: {error:?}"));
+            let second = omni
+                .start_session(None)
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: the second start failed: {error:?}"));
+            assert_ne!(
+                first.session_id, second.session_id,
+                "case {case:?}: an unnamed start cannot conflict, so it mints another session"
+            );
+            continue;
+        };
+
+        let held = omni
+            .start_session(Some(&session_name))
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the first start failed: {error:?}"));
+
+        // Over the wire, so the status, the error code AND the message are the facts a
+        // client reads.
+        let (status, body) = omni
+            .over_the_wire(
+                "StartTelemetryQuerySession",
+                START_TELEMETRY_QUERY_SESSION_INPUT_SCHEMA,
+                &StartTelemetryQuerySessionInput {
+                    session_name: Some(session_name.clone()),
+                },
+            )
+            .await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a second start under a name the caller holds must be refused \
+             with 409, got {status}"
+        );
+        let (code, message) = error_envelope(&case, &body);
+        assert_eq!(
+            code, "ConflictException",
+            "case {case:?}: expected the modelled ConflictException, got {code:?}"
+        );
+        assert_eq!(
+            message, SESSION_NAME_ALREADY_EXISTS_MESSAGE,
+            "case {case:?}: expected the refusal to state that the name is taken, \
+             got {message:?}"
+        );
+        // The sentence itself, spelled out once rather than only compared against the
+        // constant the handler carries, so the WORDING is a checked fact.
+        assert_eq!(
+            message, "A session with this name already exists.",
+            "case {case:?}: expected the service's own wording, got {message:?}"
+        );
+
+        // And nothing was minted: the caller still holds exactly the first session under
+        // that name.
+        let listed = omni
+            .list_sessions(&ListTelemetryQuerySessionsInput::default())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the listing failed: {error:?}"));
+        let holders: Vec<&str> = listed
+            .sessions
+            .iter()
+            .filter(|summary| summary.session_name.as_deref() == Some(session_name.as_str()))
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(
+            holders,
+            vec![held.session_id.as_str()],
+            "case {case:?}: the refused start must leave the one session the caller held, \
+             got {holders:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_listing_reports_only_the_callers_own_sessions() {
+    let omni = Omni::new();
+    // The same name for both callers: a session name identifies a session among the ones
+    // ONE caller holds, so it is free for another.
+    let shared_name = "shared-session-name";
+
+    let mine = omni
+        .start_session(Some(shared_name))
+        .await
+        .unwrap_or_else(|error| panic!("the first caller's start failed: {error:?}"));
+    let theirs = omni
+        .start_session_signed_by(OTHER_ACCESS_KEY_ID, Some(shared_name))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("another caller must be able to hold a session under the same name: {error:?}")
+        });
+    assert_ne!(
+        mine.session_id, theirs.session_id,
+        "two callers' sessions are two sessions, got the same id {:?}",
+        mine.session_id
+    );
+
+    for (case, access_key_id, expected) in [
+        ("the caller that started the first", ACCESS_KEY_ID, &mine),
+        (
+            "the caller that started the second",
+            OTHER_ACCESS_KEY_ID,
+            &theirs,
+        ),
+    ] {
+        let listed = omni
+            .list_sessions_signed_by(access_key_id, &ListTelemetryQuerySessionsInput::default())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the listing failed: {error:?}"));
+        let ids: Vec<&str> = listed
+            .sessions
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![expected.session_id.as_str()],
+            "case {case:?}: a listing reports the caller's own sessions and no other's, \
+             got {ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_listing_pages_at_max_results_and_resumes_at_its_token() {
+    let omni = Omni::new();
+    let mut ids: Vec<String> = Vec::new();
+    for index in 0..5 {
+        ids.push(
+            omni.start_session(Some(&format!("paged-session-{index}")))
+                .await
+                .unwrap_or_else(|error| panic!("the start of session {index} failed: {error:?}"))
+                .session_id,
+        );
+    }
+
+    // The rows differ along the page bound: smaller than the set, a divisor of it, the
+    // whole set, and larger than it.
+    for (case, page_size) in [
+        ("one at a time", 1),
+        ("two at a time", 2),
+        ("the whole set in one page", 5),
+        ("a page larger than the set", 100),
+    ] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        // Bounded by the number of sessions: one page per session is the most a correct
+        // listing can take, so a token that never ends fails here rather than hanging.
+        for step in 0..=ids.len() {
+            let page = omni
+                .list_sessions(&ListTelemetryQuerySessionsInput {
+                    max_results: Some(page_size),
+                    next_token: next_token.clone(),
+                })
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: page {step} failed: {error:?}"));
+            assert!(
+                page.sessions.len() <= page_size as usize,
+                "case {case:?}: a page must hold at most {page_size} sessions, got {}",
+                page.sessions.len()
+            );
+            walked.extend(
+                page.sessions
+                    .iter()
+                    .map(|summary| summary.session_id.clone()),
+            );
+            next_token = page.next_token;
+            if next_token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            next_token, None,
+            "case {case:?}: the walk must end, got the further token {next_token:?}"
+        );
+        assert_eq!(
+            walked, ids,
+            "case {case:?}: the pages must walk every session once, in start order, got \
+             {walked:?}"
+        );
+    }
+
+    // A token this service did not mint for a session listing names no resume point.
+    expect_modelled_error(
+        "a token this service did not mint",
+        omni.list_sessions(&ListTelemetryQuerySessionsInput {
+            next_token: Some("not-a-token".to_string()),
+            max_results: None,
+        })
+        .await,
+        400,
+        "ValidationException",
+    );
+}
+
+#[tokio::test]
+async fn the_query_session_lifecycle_over_the_rpcv2cbor_wire() {
+    let omni = Omni::new();
+    let session_name = "over-the-wire-session";
+
+    let (status, body) = omni
+        .over_the_wire(
+            "StartTelemetryQuerySession",
+            START_TELEMETRY_QUERY_SESSION_INPUT_SCHEMA,
+            &StartTelemetryQuerySessionInput {
+                session_name: Some(session_name.to_string()),
+            },
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "StartTelemetryQuerySession over the wire: expected 200, got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let codec = CborCodec::default();
+    let mut deserializer = codec.create_deserializer(&body);
+    let started = StartTelemetryQuerySessionOutput::deserialize(&mut deserializer)
+        .expect("the StartTelemetryQuerySession response deserializes");
+    assert!(
+        is_modelled_session_id(&started.session_id),
+        "the minted session id must have the form the model fixes, got {:?}",
+        started.session_id
+    );
+
+    let (status, body) = omni
+        .over_the_wire(
+            "ListTelemetryQuerySessions",
+            LIST_TELEMETRY_QUERY_SESSIONS_INPUT_SCHEMA,
+            &ListTelemetryQuerySessionsInput::default(),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "ListTelemetryQuerySessions over the wire: expected 200, got {status}"
+    );
+    let mut deserializer = codec.create_deserializer(&body);
+    let listed = ListTelemetryQuerySessionsOutput::deserialize(&mut deserializer)
+        .expect("the ListTelemetryQuerySessions response deserializes");
+    assert!(
+        listed.sessions.iter().any(|summary| summary.session_id
+            == started.session_id
+            && summary.session_name.as_deref() == Some(session_name)),
+        "the listing over the wire must report the session the start persisted, got \
+         {listed:?}"
     );
 }
 

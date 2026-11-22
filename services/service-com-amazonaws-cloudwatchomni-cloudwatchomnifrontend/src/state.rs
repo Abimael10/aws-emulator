@@ -357,7 +357,8 @@ pub struct StoredView {
 /// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
 /// dashboard) by [`OMNI_DASHBOARD_QUOTA`], `alerts` (and the token map keyed to a live
 /// alert) by [`ALERT_QUOTA`], `views` (and the token map keyed to a live view) by
-/// [`VIEW_QUOTA`]. The quota-bounded creates refuse with the modelled
+/// [`VIEW_QUOTA`], and `query_sessions` by [`QUERY_SESSION_QUOTA`]. The quota-bounded
+/// creates refuse with the modelled
 /// `ServiceQuotaExceededException` once their bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 /// `deep_link_codes` is bounded by the LIFETIME of what it holds instead: every mint drops
@@ -397,6 +398,10 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub views: HashMap<String, StoredView>,
     /// `CreateView` `clientToken` -> the view name that token created.
     pub create_view_tokens: HashMap<String, String>,
+    /// Every telemetry query session the store holds, keyed by the `sessionId` the
+    /// backend minted for it — which is what `StartTelemetryQuery` and
+    /// `StopTelemetryQuerySession` address a session by.
+    pub query_sessions: HashMap<String, StoredQuerySession>,
     /// The LIVE one-time deep-link codes, keyed by
     /// [`deep_link_code_digest`] of the code handed to the caller — never by the code. A
     /// code expires, and a mint drops every record whose expiry has passed, so this map
@@ -1490,6 +1495,17 @@ mod resource_not_found;
 /// operation that mints that resource reports the same conflict for it.
 mod resource_conflict;
 
+/// The telemetry query session record, the bound on how many of them the store holds,
+/// and how a listing walks the ones one caller owns. It lives beside the store because
+/// the start that mints a session and the listing that reports it read the same record.
+mod query_session;
+
+pub use query_session::{
+    decode_query_session_page_token, encode_query_session_page_token, mint_query_session_id,
+    session_name_rejection, StoredQuerySession, QUERY_SESSION_QUOTA,
+    RESERVED_SESSION_NAME_PREFIX, SESSION_NAME_NOT_VALID_MESSAGE,
+};
+
 /// The rules a domain create is admitted under, and the text each refusal carries. It
 /// lives beside the store because both rules are facts about the ACCOUNT's domain
 /// rather than about one request.
@@ -1515,7 +1531,7 @@ pub use resource_not_found::{
 
 pub use resource_conflict::{
     domain_holds_spaces_message, view_already_exists_message, ACCESS_GRANT_NAME_TAKEN,
-    ACCESS_PROFILE_NAME_TAKEN,
+    ACCESS_PROFILE_NAME_TAKEN, SESSION_NAME_ALREADY_EXISTS_MESSAGE,
 };
 
 pub use view_definition::{
