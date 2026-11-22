@@ -46,6 +46,72 @@ pub fn invalid_security_group_message(group_id: &str) -> String {
     format!("Invalid security group , groupId= {group_id}, groupName=.")
 }
 
+/// The `DescribeSecurityGroups` filter that selects the groups of ONE VPC (`vpc-id`, listed
+/// by that operation's own `Filters` documentation).
+const VPC_ID_FILTER: &str = "vpc-id";
+
+/// The `DescribeSecurityGroups` filter that selects groups by NAME (`group-name`, listed by
+/// the same documentation).
+const GROUP_NAME_FILTER: &str = "group-name";
+
+/// The name EC2 gives the one security group it creates WITH a VPC: "your VPC automatically
+/// comes with a default security group" (Amazon VPC User Guide, "Default security groups for
+/// your VPCs"), named `default`, which is the group a resource placed in that VPC without
+/// any named group belongs to.
+const DEFAULT_SECURITY_GROUP_NAME: &str = "default";
+
+/// The DEFAULT security group of `vpc_id`, as the service that owns security groups reports
+/// it: the group named [`DEFAULT_SECURITY_GROUP_NAME`] in that VPC.
+///
+/// It is what a resource RDS places in a VPC belongs to when the request names no
+/// `VpcSecurityGroupIds` of its own, so the identifier a resource then reports is the one EC2
+/// minted for that group rather than a value this service chose — a client cross-checking it
+/// against `ec2:DescribeSecurityGroups` reads one answer, and a group this service named
+/// nobody minted would resolve to nothing.
+///
+/// `None` where the hop could not be made or EC2 answered with no such group: this service
+/// then knows of no group to place the resource in, and reports none rather than one of its
+/// own choosing.
+pub async fn default_vpc_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    let client = super::ec2_subnets::ec2(ctx, region)?;
+    let of_vpc = ::aws_sdk_ec2::types::Filter::builder()
+        .name(VPC_ID_FILTER)
+        .values(vpc_id)
+        .build();
+    let named_default = ::aws_sdk_ec2::types::Filter::builder()
+        .name(GROUP_NAME_FILTER)
+        .values(DEFAULT_SECURITY_GROUP_NAME)
+        .build();
+    match client
+        .describe_security_groups()
+        .filters(of_vpc)
+        .filters(named_default)
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .security_groups()
+            .iter()
+            .find_map(|group| group.group_id().map(str::to_string)),
+        Err(error) => {
+            // At `warn` for the same reason the other hops log one: a deployment where this
+            // one fails is one where a resource placed in a VPC can name no group, and it IS
+            // why the membership is empty.
+            ::tracing::warn!(
+                %region,
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the default security group of the VPC could not be resolved against EC2"
+            );
+            None
+        }
+    }
+}
+
 /// The identifiers among `group_ids` that EC2 ANSWERED it has no security group for, in
 /// `region`, in the order the request named them.
 ///

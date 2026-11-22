@@ -424,7 +424,9 @@ pub use data_plane::{
 };
 pub use ec2_subnets::{invalid_subnets_message, subnet_zones, SubnetZones};
 pub use default_subnet_group::{default_vpc_network, DefaultSubnetGroupNetwork};
-pub use ec2_security_groups::{invalid_security_group_message, unresolved_vpc_security_groups};
+pub use ec2_security_groups::{
+    default_vpc_security_group, invalid_security_group_message, unresolved_vpc_security_groups,
+};
 pub use ec2_images::{image_ownership, ImageOwnership};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].

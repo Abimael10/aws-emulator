@@ -279,7 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // groups for the DBProxy": each REPLACES what the proxy held rather than adding to
         // it, so a request stating an empty list leaves the proxy holding none.
         if let Some(auth) = input.auth {
-            record.auth = crate::state::user_auth_config_to_info(auth);
+            // The `EngineFamily` a proxy was created with is not modifiable, so the
+            // authentication settings a modification replaces are projected with the family
+            // the proxy already runs: an entry that states no `ClientPasswordAuthType` keeps
+            // reporting that family's default.
+            let engine_family = record.engine_family.clone();
+            record.auth = crate::state::user_auth_config_to_info(&engine_family, auth);
         }
         if let Some(security_groups) = input.security_groups {
             record.vpc_security_group_ids = security_groups;

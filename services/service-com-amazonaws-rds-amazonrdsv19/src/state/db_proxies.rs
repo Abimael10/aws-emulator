@@ -346,13 +346,56 @@ pub fn check_user_auth_config(entries: &[UserAuthConfig]) -> Result<(), String> 
     Ok(())
 }
 
+/// `ClientPasswordAuthType` — how clients of a MySQL-family proxy authenticate when the
+/// request states no type of its own, the first of the three defaults
+/// `UserAuthConfig$ClientPasswordAuthType` publishes ("The following values are defaults for
+/// the corresponding engines: RDS for MySQL: `MYSQL_CACHING_SHA2_PASSWORD`; RDS for SQL
+/// Server: `SQL_SERVER_AUTHENTICATION`; RDS for PostgreSQL: `POSTGRES_SCRAM_SHA2_256`").
+pub const CLIENT_PASSWORD_AUTH_TYPE_MYSQL: &str = "MYSQL_CACHING_SHA2_PASSWORD";
+
+/// The same for a SQL Server proxy (same sentence).
+pub const CLIENT_PASSWORD_AUTH_TYPE_SQLSERVER: &str = "SQL_SERVER_AUTHENTICATION";
+
+/// The same for a PostgreSQL proxy, spelled as the `ClientPasswordAuthType` ENUM publishes
+/// the value (`POSTGRES_SCRAM_SHA_256`, `smithy_query(query="shape",
+/// shape="ClientPasswordAuthType")`): the enum is what goes on the wire, and the sentence
+/// above writes the same value with the digits of the hash family placed differently.
+pub const CLIENT_PASSWORD_AUTH_TYPE_POSTGRESQL: &str = "POSTGRES_SCRAM_SHA_256";
+
+/// The `ClientPasswordAuthType` a proxy of `engine_family` authenticates its clients with
+/// when an `Auth` entry states none: the default that member publishes for the engines of
+/// that family.
+///
+/// The family is read the way the data plane reads it to pick a proxy's wire
+/// ([`super::data_plane::proxy_endpoint::proxy_engine_wire`]) — folded to the case
+/// `EngineFamily` publishes its values in — so one spelling of a family cannot answer a
+/// different default from another.
+pub fn default_client_password_auth_type(engine_family: &str) -> &'static str {
+    match engine_family.to_ascii_uppercase().as_str() {
+        ENGINE_FAMILY_SQLSERVER => CLIENT_PASSWORD_AUTH_TYPE_SQLSERVER,
+        ENGINE_FAMILY_POSTGRESQL => CLIENT_PASSWORD_AUTH_TYPE_POSTGRESQL,
+        // The third value `EngineFamily` publishes covers "Aurora MySQL, RDS for MariaDB,
+        // and RDS for MySQL databases" ([`ENGINE_FAMILY_MYSQL`]), whose clients authenticate
+        // with the MySQL default.
+        _ => CLIENT_PASSWORD_AUTH_TYPE_MYSQL,
+    }
+}
+
 /// Project the authentication settings a request carries onto the ones a proxy reports
 /// back: `UserAuthConfigInfo` "returns the details of authentication used by a proxy", one
 /// entry per `UserAuthConfig` the request stated, member for member.
 ///
+/// `ClientPasswordAuthType` is "the type of authentication the proxy uses for connections
+/// from clients", and a proxy authenticates its clients whether or not the request spelled
+/// the type out: an entry that states none reports the default its ENGINE FAMILY publishes
+/// ([`default_client_password_auth_type`]) rather than no type at all.
+///
 /// One projection for the create that sets a proxy's authentication settings and the
-/// modification that replaces them.
-pub fn user_auth_config_to_info(entries: Vec<UserAuthConfig>) -> Vec<UserAuthConfigInfo> {
+/// modification that replaces them, so neither can report a different type for one entry.
+pub fn user_auth_config_to_info(
+    engine_family: &str,
+    entries: Vec<UserAuthConfig>,
+) -> Vec<UserAuthConfigInfo> {
     entries
         .into_iter()
         .map(|entry| UserAuthConfigInfo {
@@ -361,7 +404,9 @@ pub fn user_auth_config_to_info(entries: Vec<UserAuthConfig>) -> Vec<UserAuthCon
             auth_scheme: entry.auth_scheme,
             secret_arn: entry.secret_arn,
             iam_auth: entry.iam_auth,
-            client_password_auth_type: entry.client_password_auth_type,
+            client_password_auth_type: Some(entry.client_password_auth_type.unwrap_or_else(
+                || default_client_password_auth_type(engine_family).to_string(),
+            )),
         })
         .collect()
 }

@@ -252,13 +252,20 @@ struct Row {
     class: &'static str,
     /// The storage types a modification of it can choose, in sorted order.
     storage_types: &'static [&'static str],
+    /// The storage type the instance RUNS: no row names one, so it is the type its create
+    /// defaults to — General Purpose SSD for an engine whose storage is its own, and the
+    /// cluster-managed type for an engine whose cluster carries it.
+    storage_type: &'static str,
     /// The largest `AllocatedStorage` the engine accepts, in GiB — the cap every
     /// per-instance storage type's reported range is held to, or `None` for an engine
     /// whose storage its CLUSTER manages, which reports no size range at all.
     max_storage_size: Option<i64>,
     /// Whether the class exposes configurable processor features.
     processor_features: bool,
-    /// Whether the engine takes a dedicated log volume.
+    /// Whether the storage the instance runs takes a dedicated log volume: a DLV is
+    /// available to an instance on Provisioned IOPS SSD storage (the "Dedicated log volume
+    /// (DLV)" section of the Amazon RDS User Guide), which no row's DEFAULT storage type is —
+    /// `dedicated_log_volume_support.rs` is the table over the types themselves.
     dedicated_log_volume: bool,
     /// Whether `DescribeOrderableDBInstanceOptions` publishes this class for this engine:
     /// a class outside the published family table is still a class an instance can run,
@@ -286,18 +293,20 @@ const ROWS: &[Row] = &[
         engine: "mysql",
         class: "db.t3.micro",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         max_storage_size: Some(65_536),
         processor_features: false,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
         engine: "postgres",
         class: "db.m5.large",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         max_storage_size: Some(65_536),
         processor_features: false,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
@@ -307,53 +316,59 @@ const ROWS: &[Row] = &[
         // published form), reported as a standard class with no configurable processor.
         class: "db.m5.24xlarge",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         max_storage_size: Some(65_536),
         processor_features: false,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: false,
     },
     Row {
         engine: "oracle-se2",
         class: "db.m5.2xlarge",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         max_storage_size: Some(65_536),
         processor_features: true,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
         engine: "sqlserver-ee",
         class: "db.r5.xlarge",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         // Microsoft SQL Server caps allocated storage below what the storage types reach.
         max_storage_size: Some(16_384),
         processor_features: true,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
         engine: "sqlserver-ex",
         class: "db.t3.small",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         max_storage_size: Some(16_384),
         processor_features: false,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
         engine: "db2-se",
         class: "db.m5.large",
         storage_types: &["gp2", "gp3", "io1", "io2"],
+        storage_type: "gp2",
         // Db2 caps allocated storage at its own value.
         max_storage_size: Some(64_000),
         processor_features: false,
-        dedicated_log_volume: true,
+        dedicated_log_volume: false,
         published_class: true,
     },
     Row {
         engine: "aurora-mysql",
         class: "db.r5.large",
         storage_types: &["aurora", "aurora-iopt1"],
+        storage_type: "aurora",
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,
@@ -363,6 +378,7 @@ const ROWS: &[Row] = &[
         engine: "docdb",
         class: "db.r5.large",
         storage_types: &["standard", "iopt1"],
+        storage_type: "standard",
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,
@@ -372,6 +388,7 @@ const ROWS: &[Row] = &[
         engine: "neptune",
         class: "db.t3.medium",
         storage_types: &["standard", "iopt1"],
+        storage_type: "standard",
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,
@@ -510,19 +527,29 @@ async fn the_reported_bounds_are_the_orderable_options_of_the_instances_engine_a
             );
         }
 
-        // The remaining two members are the CLASS's and the ENGINE's, so they are checked
-        // against any one option of that engine and class.
+        // The remaining two members are the instance's STORAGE TYPE's and the CLASS's.
+        // `SupportsDedicatedLogVolume` is the answer the type the instance RUNS publishes, so
+        // it is compared against the orderable option for that very type; the processor
+        // features are the class's, so any one option of that engine and class carries them.
+        let own_storage = orderable.get(row.storage_type).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: no orderable option for the storage type {:?} the instance \
+                 runs",
+                row.storage_type
+            )
+        });
+        assert_eq!(
+            report.supports_dedicated_log_volume,
+            optional_text(own_storage, "SupportsDedicatedLogVolume"),
+            "case {case:?}: SupportsDedicatedLogVolume disagrees with the orderable \
+             option for {:?}, got {:?} against {own_storage}",
+            row.storage_type,
+            report.supports_dedicated_log_volume
+        );
         let option = orderable
             .values()
             .next()
             .unwrap_or_else(|| panic!("case {case:?}: no orderable option to compare against"));
-        assert_eq!(
-            report.supports_dedicated_log_volume,
-            optional_text(option, "SupportsDedicatedLogVolume"),
-            "case {case:?}: SupportsDedicatedLogVolume disagrees with the orderable \
-             option, got {:?} against {option}",
-            report.supports_dedicated_log_volume
-        );
         let offered_features: Vec<ReportedFeature> = subtrees(option, "AvailableProcessorFeature")
             .into_iter()
             .map(|feature| {

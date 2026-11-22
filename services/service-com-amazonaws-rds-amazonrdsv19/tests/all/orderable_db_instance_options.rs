@@ -525,6 +525,12 @@ pub(crate) struct StorageRule {
     /// `SupportsStorageThroughput`, and `MinStorageThroughputPerDbInstance` in MiB/s when
     /// the type takes provisioned throughput.
     min_storage_throughput: Option<i32>,
+    /// `SupportsDedicatedLogVolume`: a dedicated log volume is available to a DB instance
+    /// that uses Provisioned IOPS SSD storage (the "Dedicated log volume (DLV)" section of
+    /// the Amazon RDS User Guide), so it is this TYPE's answer rather than the engine's or
+    /// the class's — and cluster-managed storage, which is not ordered with the instance at
+    /// all, takes none.
+    pub(crate) dedicated_log_volume: bool,
 }
 
 /// The published storage types, one row each.
@@ -534,30 +540,35 @@ pub(crate) const STORAGE_RULES: &[StorageRule] = &[
         min_storage_size: Some(20),
         max_iops_per_gib: None,
         min_storage_throughput: None,
+        dedicated_log_volume: false,
     },
     StorageRule {
         storage_type: "gp3",
         min_storage_size: Some(20),
         max_iops_per_gib: Some(500.0),
         min_storage_throughput: Some(125),
+        dedicated_log_volume: false,
     },
     StorageRule {
         storage_type: "io1",
         min_storage_size: Some(100),
         max_iops_per_gib: Some(50.0),
         min_storage_throughput: None,
+        dedicated_log_volume: true,
     },
     StorageRule {
         storage_type: "io2",
         min_storage_size: Some(100),
         max_iops_per_gib: Some(1000.0),
         min_storage_throughput: None,
+        dedicated_log_volume: true,
     },
     StorageRule {
         storage_type: "aurora",
         min_storage_size: None,
         max_iops_per_gib: None,
         min_storage_throughput: None,
+        dedicated_log_volume: false,
     },
     // Aurora I/O-Optimized, the second value `CreateDBCluster$StorageType` publishes for an
     // Aurora cluster ("Aurora DB clusters - aurora | aurora-iopt1"): the same
@@ -567,6 +578,7 @@ pub(crate) const STORAGE_RULES: &[StorageRule] = &[
         min_storage_size: None,
         max_iops_per_gib: None,
         min_storage_throughput: None,
+        dedicated_log_volume: false,
     },
     // The DocumentDB and Neptune models' `CreateDBCluster$StorageType`: "Valid values for
     // storage type - standard | iopt1 … Default value is standard" — both carried by the
@@ -576,12 +588,14 @@ pub(crate) const STORAGE_RULES: &[StorageRule] = &[
         min_storage_size: None,
         max_iops_per_gib: None,
         min_storage_throughput: None,
+        dedicated_log_volume: false,
     },
     StorageRule {
         storage_type: "iopt1",
         min_storage_size: None,
         max_iops_per_gib: None,
         min_storage_throughput: None,
+        dedicated_log_volume: false,
     },
 ];
 
@@ -777,6 +791,15 @@ async fn a_class_is_offered_once_per_storage_type_it_can_be_ordered_with() {
                 option.storage_type,
                 option.xml
             );
+            // A dedicated log volume carries the instance's transaction logs, so it is
+            // offered on the storage type the option names.
+            assert_eq!(
+                text(&option.xml, "SupportsDedicatedLogVolume"),
+                rule.dedicated_log_volume.to_string(),
+                "case {case:?}: {} SupportsDedicatedLogVolume, got {}",
+                option.storage_type,
+                option.xml
+            );
         }
     }
 }
@@ -805,9 +828,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
         /// serves alike), and for the MySQL and PostgreSQL engines, which can back a
         /// Multi-AZ DB cluster, on a class that is not burstable.
         supports_clusters: bool,
-        /// `SupportsDedicatedLogVolume` — a volume ordered with the instance, which
-        /// Aurora's cluster-managed storage does not take.
-        supports_dedicated_log_volume: bool,
     }
 
     const CASES: &[CapabilityCase] = &[
@@ -817,7 +837,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &["sync", "async"],
             core_count: None,
             supports_clusters: true,
-            supports_dedicated_log_volume: false,
         },
         CapabilityCase {
             engine: "aurora-mysql",
@@ -825,7 +844,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &["async"],
             core_count: None,
             supports_clusters: true,
-            supports_dedicated_log_volume: false,
         },
         CapabilityCase {
             engine: "oracle-se2",
@@ -834,7 +852,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // 16 vCPUs at two threads per core: eight cores, disabled in pairs.
             core_count: Some(("8", "2,4,6,8")),
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "oracle-se2",
@@ -843,7 +860,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // A Graviton core is not multithreaded and its count is not configurable.
             core_count: None,
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "oracle-se2",
@@ -852,7 +868,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // A burstable class shares its vCPUs.
             core_count: None,
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "sqlserver-se",
@@ -860,7 +875,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &[],
             core_count: Some(("4", "2,4")),
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "mysql",
@@ -869,7 +883,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // Not a core-licensed engine: no processor feature to configure.
             core_count: None,
             supports_clusters: true,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "mysql",
@@ -877,7 +890,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &[],
             core_count: None,
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "postgres",
@@ -885,7 +897,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &[],
             core_count: None,
             supports_clusters: true,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "db2-se",
@@ -894,7 +905,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // Two vCPUs are ONE core, which leaves nothing to configure.
             core_count: None,
             supports_clusters: false,
-            supports_dedicated_log_volume: true,
         },
         CapabilityCase {
             engine: "docdb",
@@ -903,7 +913,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             // Not a core-licensed engine, and its storage is cluster-managed.
             core_count: None,
             supports_clusters: true,
-            supports_dedicated_log_volume: false,
         },
         CapabilityCase {
             engine: "neptune",
@@ -912,7 +921,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             core_count: None,
             // A cluster member whatever its class, burstable included.
             supports_clusters: true,
-            supports_dedicated_log_volume: false,
         },
     ];
 
@@ -989,12 +997,6 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
                 text(&option.xml, "SupportsClusters"),
                 expected.supports_clusters.to_string(),
                 "case {case:?}: SupportsClusters, got {}",
-                option.xml
-            );
-            assert_eq!(
-                text(&option.xml, "SupportsDedicatedLogVolume"),
-                expected.supports_dedicated_log_volume.to_string(),
-                "case {case:?}: SupportsDedicatedLogVolume, got {}",
                 option.xml
             );
         }

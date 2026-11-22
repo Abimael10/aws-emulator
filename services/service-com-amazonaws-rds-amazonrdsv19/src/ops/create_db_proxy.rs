@@ -239,6 +239,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let vpc_id = vpcs.into_iter().next();
 
+        // "One or more VPC security group IDs to associate with the new proxy": a request
+        // that names NONE does not leave the proxy outside every security group. A resource
+        // RDS places in a VPC belongs to at least one group, and the one it is placed in is
+        // that VPC's DEFAULT security group — the group the owner of security groups creates
+        // with the VPC — so that is the group the proxy reports. WHICH group it is is that
+        // service's own fact, read off its records like the VPC above
+        // (`crate::state::ec2_security_groups`), so the identifier the proxy reports is one
+        // EC2 minted. A VPC this service could not establish has no default group to read,
+        // and the proxy then reports the groups the request named — none.
+        let security_groups = match (security_groups.is_empty(), vpc_id.as_deref()) {
+            (true, Some(vpc_id)) => {
+                crate::state::default_vpc_security_group(ctx, &region, vpc_id)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            _ => security_groups,
+        };
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
         // 501 is the honest answer, never a fabricated proxy.
@@ -264,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 default_auth_scheme: input
                     .default_auth_scheme
                     .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
-                auth: crate::state::user_auth_config_to_info(auth),
+                auth: crate::state::user_auth_config_to_info(&engine_family, auth),
                 role_arn: input.role_arn,
                 vpc_subnet_ids: input.vpc_subnet_ids,
                 vpc_id,

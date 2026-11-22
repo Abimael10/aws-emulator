@@ -213,6 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             valid_db_instance_modifications_message: Some(valid_modifications(
                 &instance.engine,
                 &instance.db_instance_class,
+                &instance.storage_type,
                 instance.allocated_storage,
             )),
         })
@@ -285,16 +286,18 @@ fn growth_floor(engine: &str, current: i32) -> i32 {
 }
 
 /// What a caller can modify a DB instance of `engine`, running DB instance class
-/// `class_name` on `allocated_storage` GiB, to.
+/// `class_name` on `allocated_storage` GiB of `storage_type` storage, to.
 ///
 /// Every bound is a property of the instance's ENGINE and CLASS, read from the published
 /// catalogue `DescribeOrderableDBInstanceOptions` orders against: the storage types that
 /// engine can carry, each type's own size, provisioned-IOPS and provisioned-throughput
 /// ranges and ratios, and the processor features the class exposes. The storage SIZES are
-/// cut by what the instance runs now ([`storage_size_ranges`]).
+/// cut by what the instance runs now ([`storage_size_ranges`]), and the dedicated-log-volume
+/// answer is the one the type the instance runs NOW carries.
 fn valid_modifications(
     engine: &str,
     class_name: &str,
+    storage_type: &str,
     allocated_storage: Option<i32>,
 ) -> ValidDBInstanceModificationsMessage {
     let class = instance_class_profile(engine, class_name);
@@ -309,11 +312,15 @@ fn valid_modifications(
         // member is reported either way, so a caller reads "none are configurable" rather
         // than "this emulator did not say".
         valid_processor_features: Some(available_processor_features(engine, &class)),
-        // A dedicated log volume is a volume carried WITH the instance, so it is offered
-        // exactly where storage is the instance's rather than its cluster's — the same
-        // rule `DescribeOrderableDBInstanceOptions` reports `SupportsDedicatedLogVolume`
-        // by.
-        supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
+        // A dedicated log volume carries the instance's own transaction logs, so whether one
+        // is supported is a property of the storage the instance RUNS: the answer the type it
+        // carries now publishes ([`StorageProfile::dedicated_log_volume`]), which is the same
+        // answer the orderable option for that type reports. A type this engine publishes no
+        // bounds for supports none.
+        supports_dedicated_log_volume: Some(
+            storage_bounds(engine, storage_type)
+                .is_some_and(|profile| profile.dedicated_log_volume),
+        ),
         // `AdditionalStorage` describes additional storage VOLUMES, which this service
         // does not model for any instance (`DescribeOrderableDBInstanceOptions` reports
         // none either); the member is left absent rather than claiming volume options

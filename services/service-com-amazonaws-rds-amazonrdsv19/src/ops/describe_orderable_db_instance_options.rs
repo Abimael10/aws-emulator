@@ -907,6 +907,15 @@ pub struct StorageProfile {
     /// The provisioned throughput this type takes, which is also
     /// `SupportsStorageThroughput`.
     pub throughput: Option<ProvisionedThroughput>,
+    /// Whether a DB instance whose transaction logs sit on this type of storage can carry
+    /// them on a DEDICATED LOG VOLUME, which is what `SupportsDedicatedLogVolume` reports.
+    ///
+    /// Source: the "Dedicated log volume (DLV)" section of the Amazon RDS User Guide — a DLV
+    /// is available to a DB instance that uses Provisioned IOPS SSD storage, so it is a
+    /// property of the instance's STORAGE TYPE rather than of its engine or its class.
+    /// Storage a CLUSTER manages takes none either, for the same reason it takes no size and
+    /// no IOPS of the instance's own: nothing about that volume is ordered with the instance.
+    pub dedicated_log_volume: bool,
 }
 
 /// General Purpose SSD `gp2`: 20 GiB upwards, with IOPS and throughput derived from the
@@ -916,6 +925,7 @@ const GP2: StorageProfile = StorageProfile {
     size_range: Some((20, 65_536)),
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// General Purpose SSD `gp3`: 20 GiB upwards, with a 3,000 IOPS / 125 MiB/s baseline that
@@ -936,6 +946,7 @@ const GP3: StorageProfile = StorageProfile {
         min_per_iops: 0.0,
         max_per_iops: 0.25,
     }),
+    dedicated_log_volume: false,
 };
 
 /// Provisioned IOPS SSD `io1`: from 100 GiB, 1,000 to 256,000 provisioned IOPS, at a
@@ -951,6 +962,7 @@ const IO1: StorageProfile = StorageProfile {
         max_per_gib: 50.0,
     }),
     throughput: None,
+    dedicated_log_volume: true,
 };
 
 /// Provisioned IOPS SSD `io2` Block Express: the same sizes and IOPS as `io1` at a ratio
@@ -965,6 +977,7 @@ const IO2: StorageProfile = StorageProfile {
         max_per_gib: 1_000.0,
     }),
     throughput: None,
+    dedicated_log_volume: true,
 };
 
 /// Aurora storage, which the CLUSTER manages: it is not ordered per instance, so the
@@ -976,6 +989,7 @@ const AURORA: StorageProfile = StorageProfile {
     size_range: None,
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// Aurora I/O-Optimized storage, the second type an Aurora cluster is created with
@@ -988,6 +1002,7 @@ const AURORA_IO_OPTIMIZED: StorageProfile = StorageProfile {
     size_range: None,
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// The storage an Amazon DocumentDB or Amazon Neptune cluster member reports.
@@ -1001,6 +1016,7 @@ const CLUSTER_STANDARD: StorageProfile = StorageProfile {
     size_range: None,
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// The IO-OPTIMIZED storage of an Amazon DocumentDB or Amazon Neptune cluster member: the
@@ -1014,6 +1030,7 @@ const CLUSTER_IO_OPTIMIZED: StorageProfile = StorageProfile {
     size_range: None,
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// The storage types an Aurora DB instance is offered with: one option per type the
@@ -1064,6 +1081,7 @@ const MAGNETIC: StorageProfile = StorageProfile {
     size_range: Some((20, 3_072)),
     iops: None,
     throughput: None,
+    dedicated_log_volume: false,
 };
 
 /// The storage types a DB instance of `engine` can be ordered with.
@@ -1417,9 +1435,11 @@ fn to_wire(
             is_cluster_engine(engine)
                 || (!class.burstable && matches!(engine, "mysql" | "postgres")),
         ),
-        // A dedicated log volume is offered on the RDS engines, whose log volume is
-        // ordered with the instance; a cluster engine's storage is cluster-managed.
-        supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
+        // A dedicated log volume carries the instance's transaction logs, so it is offered
+        // on the storage type the ORDER names rather than per engine: the Provisioned IOPS
+        // SSD types take one ([`StorageProfile::dedicated_log_volume`]), and a cluster
+        // engine's cluster-managed storage takes none.
+        supports_dedicated_log_volume: Some(storage.dedicated_log_volume),
         supported_activity_stream_modes: Some(activity_stream_modes(engine, class)),
         // `AvailableProcessorFeatures` is "a list of the available processor features for the
         // DB instance class", and a class that exposes none has an EMPTY list of them rather
