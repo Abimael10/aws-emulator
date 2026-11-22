@@ -67,6 +67,12 @@ type Pair = (String, Value);
 /// `(FeatureGroupName, RecordIdentifierValueAsString, the record's pairs)`.
 type BulkCase<'a> = (&'a str, Value, Vec<(&'a str, String, Vec<Pair>)>);
 
+/// One row of the event-time ordering table: the case name, the event time the record
+/// already stored states (`None` for a record stored without one), the event time the
+/// second write states (`None` for a write that omits the group's event-time feature),
+/// and which of the two writes the OnlineStore must hold afterwards.
+type OrderingCase = (&'static str, Option<String>, Option<String>, &'static str);
+
 /// One row of the per-entry failure table: the case name, the defective entry, the
 /// `ErrorCode` it must be reported with and the part of the refusal its `ErrorMessage`
 /// must state.
@@ -156,6 +162,13 @@ impl Emulator {
 
     async fn batch_write_record(&self, body: Value) -> (u16, Value) {
         self.send("POST", "/BatchWriteRecord", Some(body)).await
+    }
+
+    /// The SINGLE-record writer, so a rule about the ingestion both whole-record writers
+    /// share can be driven through either one.
+    async fn put_record(&self, group: &str, body: Value) -> (u16, Value) {
+        self.send("PUT", &format!("/FeatureGroup/{group}"), Some(body))
+            .await
     }
 
     async fn get_record(&self, group: &str, identifier: &str) -> (u16, Value) {
@@ -263,6 +276,65 @@ fn iso(at: f64) -> String {
         .expect("format an ISO-8601 event time")
 }
 
+/// Which of the two WHOLE-record writers a row is driven through. Both post a whole
+/// record and share one ingestion, so a rule about that ingestion has to answer the same
+/// through either.
+#[derive(Debug, Clone, Copy)]
+enum Writer {
+    PutRecord,
+    BatchWriteRecord,
+}
+
+/// A whole record for [`GROUP`]: the group's record-identifier feature, its event-time
+/// feature when `event_time` states one, and a `city` feature that tells the two writes
+/// of one row apart.
+fn record_of(city: &str, event_time: Option<&str>) -> Value {
+    let mut features = vec![feature(IDENTIFIER_FEATURE, "C1")];
+    if let Some(at) = event_time {
+        features.push(feature(EVENT_TIME_FEATURE, at));
+    }
+    features.push(feature("city", city));
+    Value::Array(features)
+}
+
+/// Write one whole record into [`GROUP`] through `writer`, under a 52-week
+/// `TtlDuration`, and assert the writer answered 200 and reported no failure for it.
+///
+/// Neither writer reports a HISTORIC write as a failure — "it is written only to the
+/// OfflineStore" — so the answer is the same whether the online store took the record or
+/// left the stored one standing; what the record reads back as is what the rows assert.
+async fn write_record(emulator: &Emulator, writer: Writer, record: Value, case: &str, which: &str) {
+    let ttl = json!({ "Unit": "Weeks", "Value": 52 });
+    let (status, reply) = match writer {
+        Writer::PutRecord => {
+            emulator
+                .put_record(GROUP, json!({ "Record": record, "TtlDuration": ttl }))
+                .await
+        }
+        Writer::BatchWriteRecord => {
+            emulator
+                .batch_write_record(json!({ "Entries": [{
+                    "FeatureGroupName": GROUP,
+                    "Record": record,
+                    "TtlDuration": ttl
+                }] }))
+                .await
+        }
+    };
+    assert_eq!(
+        (status, error_code(&reply).as_str()),
+        (200, ""),
+        "case {case:?}: expected {which} to answer HTTP 200, got {status} with body {reply:?}"
+    );
+    if matches!(writer, Writer::BatchWriteRecord) {
+        assert_eq!(
+            (reply["Errors"].clone(), reply["UnprocessedEntries"].clone()),
+            (json!([]), json!([])),
+            "case {case:?}: expected {which} to report no failure, got {reply:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn every_entry_of_a_batch_is_ingested_into_the_feature_group_it_names() {
     // The class the rule spans: how many entries a batch carries, how many feature
@@ -358,7 +430,8 @@ async fn every_entry_of_a_batch_is_ingested_into_the_feature_group_it_names() {
         ),
         (
             // A record with no value for the group's event-time feature has no event
-            // time to order against, and is stored all the same.
+            // time to be ordered by, and is stored all the same where the group holds no
+            // record under its identifier to be ordered against.
             "an entry whose record carries no event time",
             json!({ "Entries": [{ "FeatureGroupName": GROUP, "Record": [
                 feature(IDENTIFIER_FEATURE, "C5"),
@@ -758,6 +831,142 @@ async fn a_historic_entry_leaves_the_stored_record_standing() {
             "case {case:?}: expected the record to hold city {expected_city:?}, got {city:?} \
              in {body:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_whole_record_write_replaces_the_stored_record_only_with_a_greater_event_time() {
+    // "If a new record's EventTime is greater, the new record is written to both the
+    // OnlineStore and OfflineStore. Otherwise, the record is a historic record and it is
+    // written only to the OfflineStore" (`PutRecord`, Smithy model doc): a whole-record
+    // write replaces the record the group holds under the same identifier only when its
+    // own event time is GREATER than that record's. The class the rule spans is every
+    // pairing of what the two sides state — an event time in either accepted format, and
+    // NO event time at all, which is not greater than any and so replaces nothing. Both
+    // whole-record writers share the one ingestion, so every row is driven through each.
+    //
+    // 52 weeks, the `TtlDuration` every write of this test states: `ExpiresAt =
+    // EventTime + TtlDuration`, so the expiry that is read back says which record stands
+    // and which event time it was derived from.
+    const TTL_SECS: f64 = 52.0 * 604_800.0;
+    let stored = secs(EVENT_TIME);
+    let cases: Vec<OrderingCase> = vec![
+        (
+            "a stored record with an ISO-8601 event time, a write stating none",
+            Some(EVENT_TIME.to_owned()),
+            None,
+            "first",
+        ),
+        (
+            "a stored record with an epoch-seconds event time, a write stating none",
+            Some(format!("{stored}")),
+            None,
+            "first",
+        ),
+        (
+            "a stored record with no event time, a write stating none",
+            None,
+            None,
+            "first",
+        ),
+        (
+            // Nothing orders before an event time a stored record does not state, so the
+            // first write that states one replaces it.
+            "a stored record with no event time, a write stating one",
+            None,
+            Some(EVENT_TIME.to_owned()),
+            "second",
+        ),
+        (
+            "a stored record with an event time, a write stating a later one",
+            Some(EVENT_TIME.to_owned()),
+            Some(iso(stored + 86_400.0)),
+            "second",
+        ),
+        (
+            "a stored record with an event time, a write stating an earlier one",
+            Some(EVENT_TIME.to_owned()),
+            Some(iso(stored - 86_400.0)),
+            "first",
+        ),
+        (
+            "a stored record with an event time, a write stating the same one",
+            Some(EVENT_TIME.to_owned()),
+            Some(EVENT_TIME.to_owned()),
+            "first",
+        ),
+    ];
+
+    for (row, stored_event_time, posted_event_time, winner) in cases {
+        for writer in [Writer::PutRecord, Writer::BatchWriteRecord] {
+            let case = format!("{row} through {writer:?}");
+            let emulator = Emulator::new();
+            write_record(
+                &emulator,
+                writer,
+                record_of("first", stored_event_time.as_deref()),
+                &case,
+                "the seeding write",
+            )
+            .await;
+            write_record(
+                &emulator,
+                writer,
+                record_of("second", posted_event_time.as_deref()),
+                &case,
+                "the second write",
+            )
+            .await;
+
+            // The record that stands, as a full over-write would have left it: its own
+            // feature values and its own event time, never a mixture of the two writes.
+            let surviving_event_time = if winner == "first" {
+                stored_event_time.clone()
+            } else {
+                posted_event_time.clone()
+            };
+            let mut expected: Vec<Pair> = vec![(IDENTIFIER_FEATURE.to_owned(), json!("C1"))];
+            if let Some(at) = surviving_event_time.as_deref() {
+                expected.push((EVENT_TIME_FEATURE.to_owned(), json!(at)));
+            }
+            expected.push(("city".to_owned(), json!(winner)));
+
+            let (status, body) = emulator.get_record(GROUP, "C1").await;
+            let served = record_pairs(&body);
+            assert_eq!(
+                (status, served.clone()),
+                (200, expected.clone()),
+                "case {case:?}: expected the OnlineStore to hold {expected:?}, got {status} \
+                 with {served:?} in {body:?}"
+            );
+
+            // And the expiry of the record that stands is still derived from ITS event
+            // time: a write that does not replace the record does not reset the TTL the
+            // record is under either, and a record standing without an event time has no
+            // expiry to report at all.
+            let reported = body.get("ExpiresAt").and_then(Value::as_str).map(str::to_owned);
+            match surviving_event_time.as_deref() {
+                None => assert!(
+                    reported.is_none(),
+                    "case {case:?}: expected no ExpiresAt for a record with no event time, \
+                     got {reported:?}"
+                ),
+                Some(at) => {
+                    let Some(expires_at) = reported.clone() else {
+                        panic!(
+                            "case {case:?}: expected an ExpiresAt derived from the event time \
+                             {at:?}, got none in {body:?}"
+                        )
+                    };
+                    let delta = secs(&expires_at) - secs(at);
+                    assert!(
+                        (delta - TTL_SECS).abs() < 0.001,
+                        "case {case:?}: expected ExpiresAt {TTL_SECS} s after the event time \
+                         {at:?}, got {delta} s (ExpiresAt {reported:?})"
+                    );
+                }
+            }
+        }
     }
 }
 

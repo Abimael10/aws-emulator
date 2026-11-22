@@ -195,13 +195,19 @@ impl FeatureGroupStore {
     /// ([`Ingested::Historic`]) while the caller still replicates it into the group's
     /// offline store ([`offline_store`]). A record the group does not hold yet is
     /// stored unless the group is full ([`Ingested::AtCapacity`]).
+    ///
+    /// The comparison is made whenever the group HOLDS a record under the same
+    /// identifier, whatever event time either side states: the write replaces that record
+    /// only when its own event time is GREATER, so a write that states no event time —
+    /// which is not greater than any — is historic as well and leaves the stored record,
+    /// its event time and its expiry standing. An event time a record does not state
+    /// orders before every event time a write can state ([`event_time_order`]), so a
+    /// record stored without one is replaced by the first write that states one.
     pub fn ingest(&mut self, prepared: PreparedRecord) -> Ingested {
-        if let (Some(posted), Some(stored)) = (
-            prepared.event_time_secs,
-            self.record(&prepared.record.identifier)
-                .and_then(StoredRecord::event_time_secs),
-        ) {
-            if posted <= stored {
+        if let Some(stored) = self.record(&prepared.record.identifier) {
+            if event_time_order(prepared.event_time_secs)
+                <= event_time_order(stored.event_time_secs())
+            {
                 return Ingested::Historic;
             }
         }
@@ -469,8 +475,10 @@ pub fn prepare_record(
         }
     };
 
-    // A record that carries no value for the group's event-time feature has no event
-    // time, so neither the historic-record rule nor a TTL has anything to compute from.
+    // A record that carries no value for the group's event-time feature has no event time
+    // to compute an expiry from, and none to be ordered by either: such a write is not
+    // greater than any record the group holds, so [`FeatureGroupStore::ingest`] treats it
+    // as historic rather than letting it replace one.
     let event_time_feature_name = &definition.event_time_feature_name;
     let event_time = held
         .iter()
@@ -625,6 +633,20 @@ pub fn parse_event_time_secs(event_time: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|secs| secs.is_finite())
+}
+
+/// An event time as the historic-record comparison orders it: the instant it states, and
+/// the instant before every other one for a record or a write that states none.
+///
+/// A whole-record write is ordered against the record the group already holds by their
+/// event times, so a side without one needs a PLACE in that order rather than an
+/// exemption from the comparison: it sorts earliest. A write that states no event time is
+/// therefore never greater than the record it would replace (so it is historic and
+/// replaces nothing), and a record stored without one is less than every write that
+/// states an event time. [`parse_event_time_secs`] only ever yields a FINITE instant, so
+/// no event time a request can state collides with this ordering.
+fn event_time_order(event_time_secs: Option<f64>) -> f64 {
+    event_time_secs.unwrap_or(f64::NEG_INFINITY)
 }
 
 /// `secs` as the ISO-8601 string an `ExpiresAt` carries.
