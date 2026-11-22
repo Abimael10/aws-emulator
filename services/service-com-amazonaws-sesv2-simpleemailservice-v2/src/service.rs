@@ -487,7 +487,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol: the model's own `restJson1`, with the error
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
-    protocol: wire::NullMessageRestJson,
+    protocol: wire::MessagePresentRestJson,
     /// Every API call this service serves, behind IAM's authorization of the action
     /// ([`AuthorizedRoute`]): the media-type wrapper over the model's own routing table and
     /// the listings of [`SDK_COLLECTION_LISTINGS`]. Held in a field because
@@ -505,7 +505,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            protocol: wire::NullMessageRestJson::new(),
+            protocol: wire::MessagePresentRestJson::new(),
             authorized: AuthorizedRoute::new(Arc::clone(&engine)),
             export_file: export_download::ExportFileRoute::new(engine),
         }

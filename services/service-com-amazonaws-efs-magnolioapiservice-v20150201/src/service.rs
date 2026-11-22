@@ -61,7 +61,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol: the model's own `restJson1`, with the error
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
-    protocol: wire::NullMessageRestJson,
+    protocol: wire::MessagePresentRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -71,7 +71,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            protocol: wire::NullMessageRestJson::new(),
+            protocol: wire::MessagePresentRestJson::new(),
         }
     }
 }

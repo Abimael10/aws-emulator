@@ -489,6 +489,11 @@ pub mod email_address;
 /// service whose wire form reports that text under a different member name from the one its
 /// model declares — so a client reads one member whichever layer answered.
 pub mod error_detail_member;
+/// The ONE `restJson1` codec whose error document CARRIES the error shape's own MESSAGE
+/// member — the message the service supplied, or JSON `null` where it supplied none — for
+/// every service of that class, so a client reads "no message was supplied" the same way
+/// whichever of them answered.
+pub mod error_message_member;
 /// The TWO places a rendered JSON failure names its error SHAPE — the body's `__type` and
 /// the `x-amzn-errortype` header — and the ONE restatement of that shape, for a service
 /// whose wire names a different one there from the one the rendering layer wrote.

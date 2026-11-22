@@ -69,14 +69,17 @@
 //! issues, and each is covered by its own suite. Nothing new should inline the rule again —
 //! call this module.
 //!
-//! The null half of the rule above has its own copies, each at the SERIALIZER seam rather
-//! than over the rendered body —
-//! `grep -rln 'fn message_member\|fn message_member_name' services/*/src/service/wire.rs`
-//! lists, today: `efs`, `polly` and `sesv2`, which write the member through the error
-//! shape's own schema, and `chatbot`, `customerprofiles` and `iotmanagedintegrations`, which
-//! rewrite the rendered body as this module does. They are to be MIGRATED onto
-//! [`with_renamed_detail_member_always_present`] for the same reason, and a seventh copy
-//! should not be written.
+//! The null half of the rule above, where it is taken WITHOUT a rename, is
+//! [`crate::error_message_member`]: the same member kept present, written at the SERIALIZER
+//! seam through the error shape's own member schema rather than over the rendered body, which
+//! is what a service whose wire reports the text under the member its model already declares
+//! needs. `efs`, `polly` and `sesv2` take it there.
+//!
+//! The services that rewrite the rendered body themselves still carry their own copy —
+//! `grep -rln 'fn message_member_name' services/*/src/service/wire.rs` lists, today:
+//! `chatbot`, `customerprofiles` and `iotmanagedintegrations`. They are to be MIGRATED onto
+//! [`with_renamed_detail_member_always_present`] or onto [`crate::error_message_member`] for
+//! the same reason, and a fourth copy should not be written.
 //!
 //! # A member only the SERVICE knows
 //!
