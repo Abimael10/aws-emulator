@@ -664,9 +664,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .filter(|stream| !stream.is_empty())
                     .map(str::to_string),
-                include_authorization_policy_context: input
-                    .connection_log_options
-                    .include_authorization_policy_context,
+                // "Specifies whether the authorization policy evaluation context is included
+                // in the connection logs for the Client VPN endpoint"
+                // (`ConnectionLogResponseOptions$IncludeAuthorizationPolicyContext`): an
+                // on/off setting the endpoint always has, so the value the endpoint IS
+                // configured with is stored — the one the request asked for, or the setting's
+                // own off state when it asked for none. A flag a request left unset is the
+                // flag being off, which is a value to report rather than a member to leave
+                // out of the endpoint every later describe reads.
+                include_authorization_policy_context: Some(
+                    input
+                        .connection_log_options
+                        .include_authorization_policy_context
+                        .unwrap_or(false),
+                ),
             }),
             tags: Some(tags),
             security_group_ids: (!security_group_ids.is_empty()).then_some(security_group_ids),

@@ -68,14 +68,17 @@ type ExpectingRow = (&'static str, Params, Vec<&'static str>);
 type RefusalRow = (&'static str, Params, &'static str);
 
 /// A `(key, value)` request parameter.
-fn p(key: &str, value: impl Into<String>) -> (String, String) {
+///
+/// Shared with the sibling suites of this operation's family (every suite is one module of the
+/// same test binary), so a Client VPN request is spelled one way.
+pub fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
 }
 
 /// EC2 and Certificate Manager over ONE shared engine, exactly as the assembled router mounts
 /// them: the certificate an endpoint presents is a resource of that service, created through
 /// its own API.
-fn emulator() -> MultiServiceRouter {
+pub fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's own concern and is exercised elsewhere; these
@@ -89,7 +92,7 @@ fn emulator() -> MultiServiceRouter {
 /// One certificate created through Certificate Manager's OWN `RequestCertificate`, answering
 /// the ARN that service minted for it — so what a create resolves is a certificate the owning
 /// service holds, not one this suite made up.
-async fn certificate(router: &MultiServiceRouter, case: &str, domain: &str) -> String {
+pub async fn certificate(router: &MultiServiceRouter, case: &str, domain: &str) -> String {
     let body = ::serde_json::json!({ "DomainName": domain, "ValidationMethod": "DNS" });
     let request = ::http::Request::builder()
         .method("POST")
