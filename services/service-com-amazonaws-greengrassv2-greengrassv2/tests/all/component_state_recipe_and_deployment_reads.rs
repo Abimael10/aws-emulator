@@ -27,7 +27,11 @@
 //!   artifact URIs that same stored recipe declares, answering a pre-signed URL for the
 //!   object the matching URI names and refusing a name it declares no object artifact
 //!   under — and every name, when the ARN names no stored version — with the one
-//!   sentence AWS words both halves of that search with.
+//!   sentence AWS words both halves of that search with; and
+//! * that same read judges its `arn` against the component-version ARN SHAPE first, so a
+//!   value outside that shape is refused with the sentence naming the shape while any
+//!   value inside it that names no stored version is refused with the does-not-exist
+//!   sentence — two client refusals, never a server fault.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the
 //! way an SDK builds it, dispatched through [`MultiServiceRouter`], and judged on
@@ -758,5 +762,217 @@ async fn an_artifact_read_answers_from_the_recipe_the_create_persisted() {
             && document.contains(&format!("s3://{OTHER_BUCKET}/{PLAIN_KEY}")),
         "case \"after the reads\": the stored recipe must still declare both object \
          artifacts, got {document:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Which component-version ARN an artifact read takes, and how it refuses the rest
+// ---------------------------------------------------------------------------
+
+/// The sentence AWS refuses a value outside the component-version ARN shape with.
+fn invalid_component_version_arn(arn: &str) -> String {
+    format!("Invalid Input: Component version ARN {arn} is invalid")
+}
+
+/// A component-version ARN with every field spelled out, so a row below can vary any one
+/// of them independently of the ARNs this emulator happens to mint.
+fn spelled_arn(partition: &str, region: &str, account: &str, name: &str, version: &str) -> String {
+    format!("arn:{partition}:greengrass:{region}:{account}:components:{name}:versions:{version}")
+}
+
+/// RULE: an artifact read judges its `arn` against the component-version ARN shape alone —
+/// a value outside that shape is refused with the sentence naming that shape and echoing
+/// the value, and a value INSIDE it that names no stored version is refused with the one
+/// sentence about the component and the artifact not existing, never with a server fault.
+///
+/// The shape is `ComponentVersionARN`'s `@pattern`
+/// `^arn:[^:]*:greengrass:[^:]*:(aws|[0-9]+):components:[^:]+:versions:[^:]+$`
+/// (`smithy_query(query="shape",shape="ComponentVersionARN")`), so the rows span what that
+/// pattern generalises over: any partition and any region (including empty ones), an
+/// account field that is `aws` or digits, and any colon-free name and version — beside
+/// values the pattern admits nowhere.
+#[tokio::test]
+async fn an_artifact_read_separates_a_value_outside_the_arn_shape_from_one_that_names_nothing() {
+    let router = emulator();
+    let (status, body) = publish(&router, &artifact_recipe()).await;
+    assert_eq!(
+        status, 201,
+        "publishing the artifact fixture must succeed, got {status} {body}"
+    );
+
+    // (case, partition, region, account field, component name, version, artifact name) —
+    // every row matches the pattern, and none of them names a version this account
+    // published, so every one is the "does not exist" refusal.
+    let unknown: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+        (
+            "another partition",
+            "aws-cn",
+            REGION,
+            ACCOUNT,
+            "com.example.Elsewhere",
+            "1.0.0",
+            "payload.zip",
+        ),
+        (
+            "an empty partition, which the pattern admits",
+            "",
+            REGION,
+            ACCOUNT,
+            "com.example.Elsewhere",
+            "1.0.0",
+            "payload.zip",
+        ),
+        (
+            "another region",
+            "aws",
+            "eu-central-1",
+            ACCOUNT,
+            "com.example.Elsewhere",
+            "2.3.4",
+            "payload.zip",
+        ),
+        (
+            "an empty region, which the pattern admits",
+            "aws",
+            "",
+            ACCOUNT,
+            "com.example.Elsewhere",
+            "2.3.4",
+            "payload.zip",
+        ),
+        (
+            "the `aws` account field an AWS-published component's ARN carries",
+            "aws",
+            REGION,
+            "aws",
+            "aws.greengrass.Nucleus",
+            "2.9.1",
+            "nucleus.zip",
+        ),
+        (
+            "another account's digits",
+            "aws",
+            REGION,
+            "123456789012",
+            "com.example.Elsewhere",
+            "1.0.0",
+            "payload.zip",
+        ),
+        (
+            "a prerelease version this account never published",
+            "aws",
+            REGION,
+            ACCOUNT,
+            ARTIFACT_COMPONENT,
+            "1.0.0-beta.2",
+            "payload.zip",
+        ),
+        (
+            "a name that differs from the published one only in case",
+            "aws",
+            REGION,
+            ACCOUNT,
+            "COM.EXAMPLE.WITHARTIFACTS",
+            ARTIFACT_VERSION,
+            "payload.zip",
+        ),
+        (
+            "the published version addressed in another region, which is another resource",
+            "aws",
+            "us-east-1",
+            ACCOUNT,
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            "payload.zip",
+        ),
+        (
+            "an artifact named by a nested path, which the greedy label carries",
+            "aws",
+            REGION,
+            ACCOUNT,
+            "com.example.Elsewhere",
+            "1.0.0",
+            "releases/1.0.0/payload.zip",
+        ),
+    ];
+
+    for (case, partition, region, account, name, version, artifact_name) in unknown {
+        let arn = spelled_arn(partition, region, account, name, version);
+        let (status, body) = artifact_read(&router, &arn, artifact_name).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a well-formed ARN naming no stored version must answer 400, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            artifact_not_found(name, version, artifact_name),
+            "case {case:?}: expected the sentence AWS states for a search that found \
+             neither, got {body}"
+        );
+    }
+
+    // (case, the value the request carries) — none matches the pattern, so each is refused
+    // with the sentence about the SHAPE rather than about what exists.
+    let malformed: &[(&str, String)] = &[
+        ("no ARN at all", "not-an-arn".to_string()),
+        (
+            "another vendor's ARN",
+            format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/Core"),
+        ),
+        (
+            "an account field that is neither `aws` nor digits",
+            spelled_arn("aws", REGION, "my-account", ARTIFACT_COMPONENT, "1.0.0"),
+        ),
+        (
+            "no version after `versions`",
+            spelled_arn("aws", REGION, ACCOUNT, ARTIFACT_COMPONENT, ""),
+        ),
+        (
+            "a name carrying a colon, which the pattern forbids",
+            spelled_arn("aws", REGION, ACCOUNT, "com.example:Colon", "1.0.0"),
+        ),
+        (
+            "the component ARN rather than the component-version ARN",
+            format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:components:{ARTIFACT_COMPONENT}"),
+        ),
+    ];
+
+    for (case, arn) in malformed {
+        let (status, body) = artifact_read(&router, arn, "payload.zip").await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a value outside the ARN shape must answer 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            invalid_component_version_arn(arn),
+            "case {case:?}: expected the sentence naming the shape, got {body}"
+        );
+    }
+
+    // None of those refusals changed what the ONE published version answers: the read is a
+    // report, and the version that does exist still hands out its artifact's URL.
+    let arn = version_arn(ARTIFACT_COMPONENT, ARTIFACT_VERSION);
+    let (status, body) = artifact_read(&router, &arn, PLAIN_KEY).await;
+    assert_eq!(
+        status, 200,
+        "case \"the published version after the refusals\": expected 200, got {status} {body}"
+    );
+    let url = text(&body, "preSignedUrl");
+    assert!(
+        url.contains(&format!("/{OTHER_BUCKET}/{PLAIN_KEY}")) && url.contains("X-Amz-Signature="),
+        "case \"the published version after the refusals\": expected a pre-signed URL \
+         addressing the declared object, got {url:?}"
     );
 }
