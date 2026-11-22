@@ -4,9 +4,10 @@
 //!
 //! Stores the ACCOUNT-WIDE default of one account setting in this service's
 //! account-settings store — the value every principal with no explicit setting of that
-//! name gets from `ListAccountSettings`, and the one a cluster that set no
-//! `containerInsights` of its own inherits
-//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`]).
+//! name gets from `ListAccountSettings`, and the one a cluster created AFTER it with no
+//! `containerInsights` of its own captures
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`]).
+//! A cluster that already exists keeps the settings it was created with.
 //!
 //! ## Shape of an operation
 //!

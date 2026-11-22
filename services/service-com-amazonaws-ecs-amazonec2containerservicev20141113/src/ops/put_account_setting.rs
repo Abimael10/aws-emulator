@@ -3,9 +3,10 @@
 //! @op PutAccountSetting
 //!
 //! Stores one account setting for ONE principal in this service's account-settings
-//! store, which `ListAccountSettings` reports and a cluster that set no
-//! `containerInsights` of its own inherits
-//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`]).
+//! store, which `ListAccountSettings` reports and a cluster created AFTER it with no
+//! `containerInsights` of its own captures
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`]).
+//! A cluster that already exists keeps the settings it was created with.
 //!
 //! ## Shape of an operation
 //!

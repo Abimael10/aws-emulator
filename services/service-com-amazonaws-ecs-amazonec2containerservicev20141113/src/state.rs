@@ -328,6 +328,11 @@ pub use host_port_bindings::*;
 mod load_balancer_targets;
 pub use load_balancer_targets::*;
 
+/// The settings a cluster carries: the account setting a create CAPTURES for a name it
+/// names no value for, and the list every reader of a stored cluster reports. The module
+/// adds methods to the store, so there is nothing to re-export from it.
+mod cluster_settings;
+
 /// The Container Insights metrics a cluster the `containerInsights` setting is ON for
 /// publishes into CloudWatch.
 mod container_insights;
@@ -582,10 +587,10 @@ pub const DEFAULT_CLUSTER_NAME: &str = "default";
 /// account default a cluster inherits here is `disabled`.
 ///
 /// It is the SERVICE default for the `containerInsights` account setting (see
-/// [`ACCOUNT_SETTINGS`]): a cluster that set nothing reports the account setting in
-/// effect, which falls back to this value until `PutAccountSetting` or
+/// [`ACCOUNT_SETTINGS`]): a create that names no value for the setting captures the
+/// account setting in effect, which falls back to this value until `PutAccountSetting` or
 /// `PutAccountSettingDefault` stores one — see
-/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`].
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`].
 pub const CLUSTER_SETTING_DEFAULT_VALUE: &str = "disabled";
 
 /// One Amazon ECS ACCOUNT SETTING: the name `SettingName` defines, the value in effect
@@ -3579,10 +3584,10 @@ impl ClusterRecord {
 }
 
 impl ClusterRecord {
-    /// The value stored for one setting NAME on this cluster, or `None` when the cluster
-    /// never set it — in which case the cluster inherits the account setting of that
-    /// name (see
-    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`]).
+    /// The value stored for one setting NAME on this cluster, or `None` when the record
+    /// carries none of that name — which a created cluster does not, since a create
+    /// captures the account setting of every name it leaves out (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`]).
     pub fn setting_value(&self, name: &str) -> Option<String> {
         self.settings
             .iter()

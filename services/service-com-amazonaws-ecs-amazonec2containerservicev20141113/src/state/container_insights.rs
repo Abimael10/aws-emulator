@@ -273,12 +273,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         )
     }
 
-    /// Whether Container Insights is ON for `cluster`: the EFFECTIVE value of its
-    /// `containerInsights` setting — the cluster's own when it set one, and the account
-    /// setting in force otherwise, exactly as `Cluster$settings` reports it
-    /// ([`Self::cluster_effective_settings`]).
+    /// Whether Container Insights is ON for `cluster`: the value of its
+    /// `containerInsights` setting as the cluster CARRIES it — the one its create named or
+    /// captured and its own updates wrote — exactly as `Cluster$settings` reports it
+    /// ([`Self::cluster_settings_view`]).
     fn container_insights_on(&self, cluster: &ClusterRecord) -> bool {
-        self.cluster_effective_settings(cluster)
+        self.cluster_settings_view(cluster)
             .iter()
             .filter(|setting| setting.name.as_deref() == Some(CONTAINER_INSIGHTS_SETTING))
             .any(|setting| {

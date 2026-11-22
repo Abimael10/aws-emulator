@@ -33,7 +33,9 @@
 //!   `PutAccountSettingDefault`, which names no principal.
 //! * `ClusterSetting$value`: "If a cluster value is specified, it will override the
 //!   `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault" —
-//!   so a cluster that set nothing reports the account setting in effect.
+//!   so a cluster that set nothing takes the account setting in effect, and takes it when
+//!   it is CREATED: a later account-setting change decides what the next cluster inherits
+//!   and leaves the clusters that already exist reporting what they were created with.
 //! * `ListAccountSettings$maxResults`: "This value can be between 1 and 10. If this
 //!   parameter isn't used, then ListAccountSettings returns up to 10 results and a
 //!   nextToken value if applicable."
@@ -539,6 +541,236 @@ async fn a_cluster_that_sets_nothing_inherits_the_account_setting() {
             vec![json!({ "name": "containerInsights", "value": expected })],
             "case {case:?}: a described cluster must report the setting in effect for it, \
              got {described}"
+        );
+    }
+}
+
+/// The setting name a cluster inherits, by the name the model gives it
+/// (`smithy_query(query="shape", shape="ClusterSettingName")` -> values).
+const CONTAINER_INSIGHTS: &str = "containerInsights";
+
+/// The values `ClusterSetting$value` documents: "The supported values are `enhanced`,
+/// `enabled`, and `disabled`" — the catalog every value below is one of.
+const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
+
+/// The `settings` list a cluster reports, read back through `DescribeClusters` with
+/// `include: ["SETTINGS"]` — the answer a client watching a cluster's setting gets.
+async fn cluster_settings(router: &MultiServiceRouter, cluster: &str, case: &str) -> Vec<Value> {
+    let described = ok(
+        router,
+        "DescribeClusters",
+        json!({ "clusters": [cluster], "include": ["SETTINGS"] }),
+        case,
+    )
+    .await;
+    let clusters = list(&described, "clusters", case);
+    assert_eq!(
+        clusters.len(),
+        1,
+        "case {case:?}: expected exactly one described cluster, got {described}"
+    );
+    list(&clusters[0], "settings", case)
+}
+
+/// A change to what `containerInsights` is in EFFECT for the caller: one of the three
+/// operations that can make one.
+#[derive(Debug)]
+enum AccountChange {
+    /// `PutAccountSettingDefault` — the account-wide default.
+    Default(&'static str),
+    /// `PutAccountSetting` — the caller's own setting, which shadows that default.
+    Principal(&'static str),
+    /// `DeleteAccountSetting` — the caller's own setting stops applying.
+    Disable,
+}
+
+/// Make `change` to the account's `containerInsights` setting.
+async fn change_account_setting(
+    router: &MultiServiceRouter,
+    change: &AccountChange,
+    case: &str,
+) {
+    match change {
+        AccountChange::Default(value) => {
+            ok(
+                router,
+                "PutAccountSettingDefault",
+                json!({ "name": CONTAINER_INSIGHTS, "value": value }),
+                case,
+            )
+            .await;
+        }
+        AccountChange::Principal(value) => {
+            ok(
+                router,
+                "PutAccountSetting",
+                json!({ "name": CONTAINER_INSIGHTS, "value": value }),
+                case,
+            )
+            .await;
+        }
+        AccountChange::Disable => {
+            disable(router, json!({ "name": CONTAINER_INSIGHTS }), case).await;
+        }
+    }
+}
+
+/// One row: what the account setting was when the cluster was created, what the cluster
+/// itself named, and what happens to the account setting afterwards.
+struct CaptureRow {
+    case: &'static str,
+    /// The account setting written BEFORE the cluster is created, and `None` for an
+    /// account that has written none.
+    before: Option<AccountChange>,
+    /// The cluster's own `containerInsights`, and `None` for a cluster that inherits.
+    own: Option<&'static str>,
+    /// What changes the account setting once that cluster exists.
+    after: AccountChange,
+    /// What the cluster created BEFORE that change keeps reporting.
+    captured: &'static str,
+    /// What a cluster created AFTER it inherits instead.
+    inherited_later: &'static str,
+}
+
+#[tokio::test]
+async fn a_clusters_inherited_setting_is_captured_when_it_is_created() {
+    // The rows differ along what the rule generalises over: which operation changes the
+    // account setting afterwards (the account-wide default, the caller's own setting, and
+    // a disable that clears one), which of the three documented values it changes to, and
+    // whether the cluster named a value of its own or inherited one.
+    let rows = [
+        CaptureRow {
+            case: "the account default is restored after the cluster is created",
+            before: Some(AccountChange::Default("enabled")),
+            own: None,
+            after: AccountChange::Default("disabled"),
+            captured: "enabled",
+            inherited_later: "disabled",
+        },
+        CaptureRow {
+            case: "an untouched account default moves on to enhanced",
+            before: None,
+            own: None,
+            after: AccountChange::Default("enhanced"),
+            captured: "disabled",
+            inherited_later: "enhanced",
+        },
+        CaptureRow {
+            case: "the caller's own setting is cleared afterwards",
+            before: Some(AccountChange::Principal("enhanced")),
+            own: None,
+            after: AccountChange::Disable,
+            captured: "enhanced",
+            inherited_later: "disabled",
+        },
+        CaptureRow {
+            case: "the caller's own setting shadows the default afterwards",
+            before: Some(AccountChange::Default("enhanced")),
+            own: None,
+            after: AccountChange::Principal("disabled"),
+            captured: "enhanced",
+            inherited_later: "disabled",
+        },
+        CaptureRow {
+            case: "a cluster that named enhanced while the account was off",
+            before: Some(AccountChange::Default("disabled")),
+            own: Some("enhanced"),
+            after: AccountChange::Default("enabled"),
+            captured: "enhanced",
+            inherited_later: "enabled",
+        },
+        CaptureRow {
+            case: "a cluster that named disabled while the account was on",
+            before: Some(AccountChange::Default("enabled")),
+            own: Some("disabled"),
+            after: AccountChange::Default("enhanced"),
+            captured: "disabled",
+            inherited_later: "enhanced",
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        for value in [row.captured, row.inherited_later] {
+            assert!(
+                CLUSTER_SETTING_VALUES.contains(&value),
+                "case {case:?}: {value:?} is not one of the documented setting values"
+            );
+        }
+        // A fresh engine per row, so one row's account setting cannot leak into another.
+        let router = service();
+        if let Some(before) = &row.before {
+            change_account_setting(&router, before, case).await;
+        }
+
+        let cluster = format!("captured-{index}");
+        let mut request = json!({ "clusterName": cluster });
+        if let Some(own) = row.own {
+            request["settings"] = json!([{ "name": CONTAINER_INSIGHTS, "value": own }]);
+        }
+        let created = ok(&router, "CreateCluster", request, case).await;
+        assert_eq!(
+            list(&created["cluster"], "settings", case),
+            vec![json!({ "name": CONTAINER_INSIGHTS, "value": row.captured })],
+            "case {case:?}: the create must report the setting the cluster is created \
+             with, got {created}"
+        );
+
+        // The account setting moves. Nothing has acted on the cluster, so the cluster's
+        // own settings are what they were.
+        change_account_setting(&router, &row.after, case).await;
+        let after_the_change = cluster_settings(&router, &cluster, case).await;
+        assert_eq!(
+            after_the_change,
+            vec![json!({ "name": CONTAINER_INSIGHTS, "value": row.captured })],
+            "case {case:?}: an account-setting change must leave the cluster's captured \
+             {CONTAINER_INSIGHTS} at {:?}, got {after_the_change:?}",
+            row.captured
+        );
+
+        // A cluster created AFTER the change inherits the value now in effect, which is
+        // what makes the one above a CAPTURE rather than the account being ignored.
+        let later = format!("later-{index}");
+        let created_later = ok(
+            &router,
+            "CreateCluster",
+            json!({ "clusterName": later }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            list(&created_later["cluster"], "settings", case),
+            vec![json!({ "name": CONTAINER_INSIGHTS, "value": row.inherited_later })],
+            "case {case:?}: a cluster created after the change must inherit the setting \
+             now in effect, got {created_later}"
+        );
+        let after_the_second_create = cluster_settings(&router, &cluster, case).await;
+        assert_eq!(
+            after_the_second_create,
+            vec![json!({ "name": CONTAINER_INSIGHTS, "value": row.captured })],
+            "case {case:?}: creating another cluster must leave the first one's settings \
+             alone, got {after_the_second_create:?}"
+        );
+
+        // What the cluster carries is still the cluster's to change: an operation that
+        // acts on THAT cluster writes over the captured value, leaving one entry for the
+        // name rather than a second one beside it.
+        ok(
+            &router,
+            "UpdateClusterSettings",
+            json!({
+                "cluster": cluster,
+                "settings": [{ "name": CONTAINER_INSIGHTS, "value": "enhanced" }],
+            }),
+            case,
+        )
+        .await;
+        let after_the_update = cluster_settings(&router, &cluster, case).await;
+        assert_eq!(
+            after_the_update,
+            vec![json!({ "name": CONTAINER_INSIGHTS, "value": "enhanced" })],
+            "case {case:?}: the cluster's own update must replace the captured value, got \
+             {after_the_update:?}"
         );
     }
 }

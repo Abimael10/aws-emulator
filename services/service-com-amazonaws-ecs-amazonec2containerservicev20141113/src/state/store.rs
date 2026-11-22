@@ -898,6 +898,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if self.clusters.contains_key(DEFAULT_CLUSTER_NAME) {
             return;
         }
+        let settings = self.captured_cluster_settings(&[]);
         self.clusters.insert(
             DEFAULT_CLUSTER_NAME.to_string(),
             ClusterRecord {
@@ -907,7 +908,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // Nothing created it, so nothing has tagged, configured or associated
                 // anything with it.
                 tags: Vec::new(),
-                settings: Vec::new(),
+                // Nothing named a setting for it either, so it carries the account
+                // settings in force at the instant it is materialised — the instant it
+                // comes into being ([`Self::captured_cluster_settings`]).
+                settings,
                 configuration: None,
                 capacity_providers: Vec::new(),
                 default_capacity_provider_strategy: Vec::new(),
@@ -4580,31 +4584,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .remove(&(principal_arn.to_string(), name.to_string()))
     }
 
-    /// The cluster's EFFECTIVE settings: one entry for every setting name the model
-    /// defines (`ClusterSettingName`), carrying the value stored for this cluster when
-    /// one was set and the account setting of that name otherwise.
-    ///
-    /// `ClusterSetting$value`: "If a cluster value is specified, it will override the
-    /// `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault"
-    /// — so what a cluster that set nothing reports is exactly the account setting in
-    /// effect for the caller this emulator authenticates every request as
-    /// ([`caller_identity_arn`]), which falls back to the account-wide default and then
-    /// to the setting's own default. `Cluster$settings` "indicates whether CloudWatch
-    /// Container Insights is on or off for a cluster", so a cluster that set nothing
-    /// still has an answer to that question and reports it.
-    pub fn cluster_effective_settings(&self, cluster: &ClusterRecord) -> Vec<ClusterSetting> {
-        let principal_arn = caller_identity_arn();
-        CLUSTER_SETTING_NAME_VALUES
-            .iter()
-            .map(|name| ClusterSetting {
-                name: Some((*name).to_string()),
-                value: Some(cluster.setting_value(name).unwrap_or_else(|| {
-                    self.effective_account_setting(&principal_arn, name).value
-                })),
-            })
-            .collect()
-    }
-
     /// The `Cluster` a cluster-returning operation reports.
     ///
     /// The counters are COMPUTED from the task, container-instance and service maps, so
@@ -4648,7 +4627,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // rather than absent and a client cannot mistake "not asked for" for "none
             // stored".
             settings: Some(if fields.settings {
-                self.cluster_effective_settings(cluster)
+                self.cluster_settings_view(cluster)
             } else {
                 Vec::new()
             }),
@@ -4688,7 +4667,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// What the cluster is CONFIGURED to be is always materialised: `settings` (the
     /// effective value of every setting name the model defines, see
-    /// [`Self::cluster_effective_settings`] — `Cluster$settings` "indicates whether
+    /// [`Self::cluster_settings_view`] — `Cluster$settings` "indicates whether
     /// CloudWatch Container Insights is on or off for a cluster", which is true of a
     /// cluster whoever reads it) and `configuration` ("the execute command and managed
     /// storage configuration for the cluster"), so a client can read back the cluster it

@@ -419,7 +419,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::cluster_arn(&region, &name),
             status: crate::state::CLUSTER_ACTIVE.to_string(),
             tags: input.tags.clone().unwrap_or_default(),
-            settings: input.settings.clone().unwrap_or_default(),
+            // The settings the request named, and the account setting of every name it
+            // left out as it stands RIGHT NOW: a cluster inherits an account setting when
+            // it is created and keeps the value it was created with, so a later
+            // `PutAccountSetting`/`PutAccountSettingDefault` write cannot reconfigure it
+            // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`]).
+            settings: guard.captured_cluster_settings(
+                input.settings.as_deref().unwrap_or_default(),
+            ),
             configuration: input.configuration.clone(),
             capacity_providers: input.capacity_providers.clone().unwrap_or_default(),
             default_capacity_provider_strategy: input

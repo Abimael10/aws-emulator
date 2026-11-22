@@ -64,9 +64,11 @@ impl RequestedClusterArguments<'_> {
         let tags_differ =
             !self.tags.is_empty() && tag_pairs(self.tags) != tag_pairs(&existing.tags);
         // `settings` is keyed by name and carries only the settings a request speaks
-        // about, so each one is weighed against the value stored under that NAME; a name
-        // the stored cluster never set holds no value, which is not the value this repeat
-        // asks for.
+        // about, so each one is weighed against the value stored under that NAME — the
+        // value this cluster's create named or captured
+        // ([`super::ComAmazonawsEcsAmazonec2containerservicev20141113State::captured_cluster_settings`]),
+        // so a repeat that spells out the value the cluster carries is the same create and
+        // one that asks for another value is not.
         let settings_differ = self.settings.iter().any(|setting| {
             let stored = setting
                 .name
