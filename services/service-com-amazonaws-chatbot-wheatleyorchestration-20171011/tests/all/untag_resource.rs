@@ -15,6 +15,16 @@
 //! in one request — crossed with every kind of chatbot resource that carries tags (a Slack
 //! channel configuration, an Amazon Chime webhook configuration and a custom action). The
 //! recorded case is one row.
+//!
+//! The REFUSAL half of that rule has a table of its own: an `AmazonResourceName` this
+//! account's store holds no resource under is answered with the modelled
+//! `ResourceNotFoundException` — HTTP 404, that shape in `x-amzn-errortype`, and the
+//! `Message` member AWS Chatbot words a tagging operation's missing resource with, whose one
+//! variable part is the `ResourceARN` the request carried, verbatim. Those rows span the
+//! resource type the ARN names, its region segment, the name's length and charset, the
+//! service segment the member's pattern admits beside `chatbot`, the ARN's length up to the
+//! published bound and one past it, how many keys the request names, and the resource's whole
+//! life (absent, held, deleted) under one unchanging ARN.
 
 use std::collections::BTreeMap;
 
@@ -535,6 +545,354 @@ async fn an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls_for() {
         tag_list(&base_tags()),
         "a refused untag must detach nothing from any resource"
     );
+}
+
+/// The published maximum length of `ResourceARN` (`smithy_query` operation=UntagResource:
+/// `AmazonResourceName`, `@length` min 1 max 1011).
+const MAX_RESOURCE_ARN: usize = 1011;
+
+/// The published maximum number of keys one request can name (`smithy_query`
+/// operation=UntagResource: `TagKeys` -> `TagKeyList`, `@length` min 0 max 200).
+const MAX_TAG_KEYS: usize = 200;
+
+/// The modelled 400 a value outside a member's modelled constraints is refused with, before
+/// any resource is looked up.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The sentence AWS Chatbot words a tagging operation's missing resource with: fixed text
+/// around its one variable part, the `ResourceARN` the request carried.
+fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} does not exist!")
+}
+
+/// An ARN of exactly [`MAX_RESOURCE_ARN`] characters, the longest `ResourceARN` the member
+/// admits: the name it ends in is padded out to the bound, so the whole of a long ARN can be
+/// compared against what the refusal echoes back.
+fn longest_arn() -> String {
+    let prefix = format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/");
+    let padding = MAX_RESOURCE_ARN
+        .checked_sub(prefix.len())
+        .expect("the ARN prefix is shorter than the member's maximum length");
+    format!("{prefix}{}", "n".repeat(padding))
+}
+
+/// Chatbot ARNs that satisfy every modelled constraint on `ResourceARN` — `@length` 1..1011
+/// and `@pattern ^arn:aws:(wheatley|chatbot):…` (`smithy_query` operation=UntagResource) — and
+/// that this account's store holds no resource under, each labelled by what it varies.
+///
+/// The rows differ along what the rule generalises over: the resource type the ARN names (each
+/// chat client, a custom action of the account-scoped form a create mints, and a type this
+/// service holds nothing of), the region segment, the length and charset of the resource name,
+/// the service alias the pattern admits beside `chatbot`, and the ARN's overall length up to
+/// the published bound.
+fn unheld_arns() -> Vec<(String, String)> {
+    let rows = vec![
+        (
+            "a Slack channel configuration this region does not hold".to_string(),
+            chat_configuration_arn(REGION, "slack-channel", "absent-slack"),
+        ),
+        (
+            "a Chime webhook configuration this region does not hold".to_string(),
+            chat_configuration_arn(REGION, "chime-webhook", "absent-chime"),
+        ),
+        (
+            "a Microsoft Teams channel configuration this region does not hold".to_string(),
+            chat_configuration_arn(REGION, "microsoft-teams-channel", "absent-teams"),
+        ),
+        (
+            "another region's chat configuration".to_string(),
+            chat_configuration_arn(OTHER_REGION, "slack-channel", "absent-elsewhere"),
+        ),
+        (
+            "a custom action of the minted form the account does not hold".to_string(),
+            custom_action_arn("absent-action"),
+        ),
+        (
+            "a one-character custom action name".to_string(),
+            custom_action_arn("a"),
+        ),
+        (
+            // `CustomActionArn` names an action of up to 64 characters.
+            "a 64-character custom action name".to_string(),
+            custom_action_arn(&"z".repeat(64)),
+        ),
+        (
+            "a mixed-case, underscored custom action name".to_string(),
+            custom_action_arn("Mixed_Case-9"),
+        ),
+        (
+            "a resource type this service holds nothing of".to_string(),
+            format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:something-else/absent"),
+        ),
+        (
+            // The pattern admits `wheatley` beside `chatbot` as the service segment.
+            "the `wheatley` service segment the member's pattern admits".to_string(),
+            format!("arn:aws:wheatley:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/absent"),
+        ),
+        (
+            // The resource part admits `+=,@.-` and `:`, none of which the refusal may
+            // normalise away.
+            "a name carrying the punctuation the pattern admits".to_string(),
+            chat_configuration_arn(REGION, "slack-channel", "a+b=c,d@e.f-g:h"),
+        ),
+        (
+            "an ARN at the member's maximum length".to_string(),
+            longest_arn(),
+        ),
+    ];
+    for (label, arn) in &rows {
+        assert!(
+            arn.len() <= MAX_RESOURCE_ARN,
+            "case {label:?}: the row's ARN is {} characters, past the member's maximum of \
+             {MAX_RESOURCE_ARN}",
+            arn.len()
+        );
+    }
+    rows
+}
+
+/// Assert `answer` is the modelled not-found refusal for `arn`: the status, the
+/// `x-amzn-errortype` the restJson1 wire resolves the error shape from, the shape named in the
+/// body, and the `Message` member `ResourceNotFoundException` declares.
+fn assert_not_found(label: &str, path: &str, arn: &str, answer: &crate::wire::Answer) {
+    assert_eq!(
+        answer.status, 404,
+        "case {label:?} on {path}: expected HTTP 404, got {} with {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_type.as_deref(),
+        Some(RESOURCE_NOT_FOUND_EXCEPTION),
+        "case {label:?} on {path}: expected x-amzn-errortype {RESOURCE_NOT_FOUND_EXCEPTION}, \
+         got {:?} with {}",
+        answer.error_type,
+        answer.body
+    );
+    assert_eq!(
+        answer.code(),
+        RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {label:?} on {path}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, got {}",
+        answer.body
+    );
+    let expected = resource_not_found_message(arn);
+    let actual = answer.message_capitalized();
+    assert_eq!(
+        actual, expected,
+        "case {label:?} on {path}: expected Message {expected:?}, got {actual:?} in {}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn an_unheld_arn_is_the_modelled_not_found_whatever_keys_the_request_names() {
+    let emulator = emulator();
+    // One resource IS held, so every row's refusal follows from the ARN it addresses rather
+    // than from an empty store.
+    let held = create(
+        &emulator,
+        Kind::SlackChannel,
+        "present",
+        &tag_list(&base_tags()),
+    )
+    .await;
+
+    // The other half of the input: which keys the request names. The resource's absence is
+    // decided before any key is matched, so the refusal is the same for every list shape the
+    // member admits — from the empty list to the published maximum.
+    let key_lists: Vec<(&str, Vec<String>)> = vec![
+        ("no keys", Vec::new()),
+        ("one attached key", keys(&["env"])),
+        ("one key the resource never carried", keys(&["not-attached"])),
+        (
+            "the published maximum number of keys",
+            (0..MAX_TAG_KEYS).map(|n| format!("key-{n:03}")).collect(),
+        ),
+    ];
+
+    for (arn_label, arn) in unheld_arns() {
+        for (keys_label, tag_keys) in &key_lists {
+            let label = format!("{arn_label} / {keys_label}");
+            let answer = emulator
+                .call(
+                    UNTAG_PATH,
+                    &json!({"ResourceARN": arn, "TagKeys": tag_keys}),
+                )
+                .await;
+            assert_not_found(&label, UNTAG_PATH, &arn, &answer);
+        }
+
+        // The sibling ARN-addressed tagging operations word the same class the same way, so
+        // the detach cannot drift from the read and the attach it shares the rule with.
+        for (path, request) in [
+            (LIST_TAGS_PATH, json!({"ResourceARN": arn})),
+            (
+                TAG_PATH,
+                json!({"ResourceARN": arn, "Tags": [{"TagKey": "env", "TagValue": "prod"}]}),
+            ),
+        ] {
+            let answer = emulator.call(path, &request).await;
+            assert_not_found(&arn_label, path, &arn, &answer);
+        }
+    }
+
+    // None of those refusals touched the resource the store does hold.
+    assert_eq!(
+        listed_tags(&emulator, "the held configuration", &held).await,
+        tag_list(&base_tags()),
+        "a refused untag must detach nothing from any resource"
+    );
+}
+
+#[tokio::test]
+async fn whether_an_arn_is_a_resource_is_read_from_the_store_and_not_from_the_arn() {
+    let emulator = emulator();
+
+    // The SAME ARN, through the same request, across the resource's whole life: before it is
+    // created the detach is the modelled not-found, while the resource is held it succeeds,
+    // and once it is deleted it is the not-found again — so the refusal is a reading of the
+    // store rather than of the ARN's shape. Every kind of resource that carries tags is
+    // walked, each with the delete its own kind models.
+    let cases = [
+        (
+            Kind::SlackChannel,
+            "/delete-slack-channel-configuration",
+            "ChatConfigurationArn",
+        ),
+        (
+            Kind::ChimeWebhook,
+            "/delete-chime-webhook-configuration",
+            "ChatConfigurationArn",
+        ),
+        (Kind::CustomAction, "/delete-custom-action", "CustomActionArn"),
+    ];
+
+    for (kind, delete_path, delete_member) in cases {
+        let name = "lifecycle";
+        let label = format!("{kind:?}");
+        let arn = match kind {
+            Kind::SlackChannel => chat_configuration_arn(REGION, "slack-channel", name),
+            Kind::ChimeWebhook => chat_configuration_arn(REGION, "chime-webhook", name),
+            Kind::CustomAction => custom_action_arn(name),
+        };
+
+        let before = emulator
+            .call(UNTAG_PATH, &json!({"ResourceARN": arn, "TagKeys": ["env"]}))
+            .await;
+        assert_not_found(&format!("{label} before the create"), UNTAG_PATH, &arn, &before);
+
+        let minted = create(&emulator, kind, name, &tag_list(&base_tags())).await;
+        assert_eq!(
+            minted, arn,
+            "case {label:?}: the create must mint {arn}, got {minted}"
+        );
+
+        untag_ok(&emulator, &format!("{label} while held"), &arn, &keys(&["env"])).await;
+        assert_eq!(
+            listed_tags(&emulator, &label, &arn).await,
+            expected_tags(&all_but(&["env"])),
+            "case {label:?}: the detach of a held resource must leave the other keys attached"
+        );
+
+        let deleted = emulator
+            .call(delete_path, &json!({delete_member: arn.clone()}))
+            .await;
+        assert!(
+            (200..300).contains(&deleted.status),
+            "case {label:?}: {delete_path} must succeed, got {} with {}",
+            deleted.status,
+            deleted.body
+        );
+
+        let after = emulator
+            .call(UNTAG_PATH, &json!({"ResourceARN": arn, "TagKeys": ["env"]}))
+            .await;
+        assert_not_found(&format!("{label} after the delete"), UNTAG_PATH, &arn, &after);
+    }
+}
+
+#[tokio::test]
+async fn a_request_outside_a_members_modelled_bounds_is_client_input_and_not_a_not_found() {
+    let emulator = emulator();
+
+    // `ResourceARN` is `@length` 1..1011 with the ARN pattern above and `TagKeys` is
+    // `@length` 0..200 (`smithy_query` operation=UntagResource): a value AT a published bound
+    // is a request the store judges (and so answers the not-found for an ARN it holds
+    // nothing under), while a value past one never reaches a lookup and is refused as client
+    // input.
+    let longest = longest_arn();
+    assert_eq!(
+        longest.len(),
+        MAX_RESOURCE_ARN,
+        "the longest row must be {MAX_RESOURCE_ARN} characters, got {}",
+        longest.len()
+    );
+    let too_long = format!("{longest}x");
+    let most_keys: Vec<String> = (0..MAX_TAG_KEYS).map(|n| format!("key-{n:03}")).collect();
+    let mut too_many_keys = most_keys.clone();
+    too_many_keys.push("one-too-many".to_string());
+
+    // Rows inside the bounds: the store is reached, so the modelled not-found is the answer.
+    let inside: Vec<(String, Value)> = vec![
+        (
+            "an ARN at the maximum length".to_string(),
+            json!({"ResourceARN": longest, "TagKeys": ["env"]}),
+        ),
+        (
+            "the maximum number of keys".to_string(),
+            json!({"ResourceARN": longest, "TagKeys": most_keys}),
+        ),
+        (
+            "no keys at all, the minimum the list admits".to_string(),
+            json!({"ResourceARN": longest, "TagKeys": []}),
+        ),
+    ];
+    for (label, request) in &inside {
+        let answer = emulator.call(UNTAG_PATH, request).await;
+        assert_not_found(label, UNTAG_PATH, &longest, &answer);
+    }
+
+    // Rows past a bound: refused before any lookup, with this service's only client-input
+    // class.
+    let outside: Vec<(String, Value)> = vec![
+        (
+            "an ARN one character past the maximum length".to_string(),
+            json!({"ResourceARN": too_long, "TagKeys": ["env"]}),
+        ),
+        (
+            "an empty ARN, one character short of the minimum length".to_string(),
+            json!({"ResourceARN": "", "TagKeys": ["env"]}),
+        ),
+        (
+            "a one-character ARN, which satisfies the length and not the pattern".to_string(),
+            json!({"ResourceARN": "a", "TagKeys": ["env"]}),
+        ),
+        (
+            "one key past the maximum the list admits".to_string(),
+            json!({"ResourceARN": custom_action_arn("absent-action"), "TagKeys": too_many_keys}),
+        ),
+    ];
+    for (label, request) in &outside {
+        let answer = emulator.call(UNTAG_PATH, request).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {label:?}: expected HTTP 400, got {} with {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_type.as_deref(),
+            Some(INVALID_REQUEST_EXCEPTION),
+            "case {label:?}: expected x-amzn-errortype {INVALID_REQUEST_EXCEPTION}, got {:?} \
+             with {}",
+            answer.error_type,
+            answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            INVALID_REQUEST_EXCEPTION,
+            "case {label:?}: expected the modelled {INVALID_REQUEST_EXCEPTION}, got {}",
+            answer.body
+        );
+    }
 }
 
 #[tokio::test]
