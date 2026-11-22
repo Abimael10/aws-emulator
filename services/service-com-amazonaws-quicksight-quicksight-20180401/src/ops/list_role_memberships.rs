@@ -181,17 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the account holds role memberships at all is a fact about the ACCOUNT,
         // settled before any address inside it is resolved: a role is held by a group the
         // account manages itself, so an account whose authentication method gives it no
-        // QuickSight identity store of its own holds no role memberships to report. What
-        // the refusal states is that store, because that is what forbids the call.
+        // QuickSight identity store of its own holds no role memberships to report. The
+        // refusal states that fact alone, carrying nothing from the request.
         if !store.manages_quicksight_users(&input.aws_account_id) {
             return Err(ListRoleMembershipsErrorModeled::AccessDeniedException(
                 crate::state::access_denied(
-                    crate::state::role_membership_not_authorized_message(
-                        &store.identity_store(&input.aws_account_id),
-                        &input.aws_account_id,
-                        &input.namespace,
-                        &input.role,
-                    ),
+                    crate::state::ROLE_MEMBERSHIP_NOT_AUTHORIZED_MESSAGE.to_string(),
                     &request_id,
                 ),
             )

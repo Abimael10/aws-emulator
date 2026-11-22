@@ -17,7 +17,7 @@
 //! ([`ComAmazonawsQuicksightQuicksight20180401State::manages_quicksight_users`]) holds no
 //! role memberships at all, and a call addressing them is refused with the modelled
 //! `AccessDeniedException` ([`super::authorization::access_denied`]) carrying the reason
-//! [`super::refusals::role_membership_not_authorized_message`] words.
+//! [`super::refusals::ROLE_MEMBERSHIP_NOT_AUTHORIZED_MESSAGE`] words.
 
 use super::*;
 

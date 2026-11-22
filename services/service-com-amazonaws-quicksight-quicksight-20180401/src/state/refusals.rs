@@ -237,27 +237,19 @@ pub fn role_membership_not_found_message(
     )
 }
 
-/// The refusal a role-membership call on an account that holds no QuickSight identity
-/// store of its own reports.
+/// The refusal every role-membership call on an account whose QuickSight identities are
+/// not managed by QuickSight itself reports: one fixed sentence, ending in a period and a
+/// single space.
 ///
-/// A role is held by a group the account manages itself, so what forbids the call is not
-/// the caller's permissions but the identity store the ACCOUNT has — the one its
-/// authentication method gave it — and that is what the sentence states: the operation is
-/// not supported for an account whose identity store is that one. The store is read from
-/// the account's own subscription rather than fixed here, so the sentence names the store
-/// the refused account actually has, and the identity path's labelled fields then report
-/// the account, the namespace the call addressed and the role inside it.
-pub fn role_membership_not_authorized_message(
-    identity_store: &str,
-    aws_account_id: &str,
-    namespace: &str,
-    role: &str,
-) -> String {
-    format!(
-        "Operation is not supported for {identity_store} identity store.{}",
-        identity_scope_fields(aws_account_id, &[("Namespace", namespace), ("Role", role)])
-    )
-}
+/// What forbids the call is a fact about the ACCOUNT rather than the address the call
+/// named or the caller's permissions, and the service states only that fact: the whole
+/// message is this sentence, with nothing taken from the request and nothing read off
+/// stored state — no account id, no namespace, no role, and not the account's identity
+/// store either. Every role-membership handler carries it, so a client telling this
+/// refusal from a plain permissions denial reads the same text whichever of them it
+/// called.
+pub const ROLE_MEMBERSHIP_NOT_AUTHORIZED_MESSAGE: &str =
+    "Operation is disabled for identities managed by QuickSight. ";
 
 /// The clause a namespace write closes its refusal with: the call that failed, named by
 /// the verb of the operation, the namespace it addressed and the account it addressed it

@@ -1789,16 +1789,10 @@ fn reported_members(case: &str, body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// What a role-membership call on an account that holds no QuickSight identity store of
-/// its own reports: the store that account HAS — which is what forbids the call — and
-/// then the identity path's locator for the address the call named, which follows the
-/// sentence directly.
-fn role_denial_message(identity_store: &str, account: &str, namespace: &str, role: &str) -> String {
-    format!(
-        "Operation is not supported for {identity_store} identity store.AWS account id: \
-         {account}, Namespace: {namespace}, Role: {role}. "
-    )
-}
+/// What a role-membership call on an account whose identities QuickSight does not manage
+/// reports: one fixed sentence, which is the whole message — it carries nothing from the
+/// request and nothing from the account's stored configuration.
+const ROLE_DENIAL_MESSAGE: &str = "Operation is disabled for identities managed by QuickSight. ";
 
 /// What a role-membership delete reports for a group the role does not hold: the locator
 /// alone, because nothing is known to have existed at that address.
@@ -2035,15 +2029,14 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
     // Rows: the ways an account ends up with no QuickSight identity store of its own —
     // it never signed up, so it authenticates Amazon Web Services identities alone (the
     // service default); it signed up choosing exactly that; or it signed up against a
-    // directory, which is where its identities then come from. The store the refusal
-    // names is the one the row's account has rather than a constant.
+    // directory, which is where its identities then come from. However the account got
+    // there, the refusal reads the same sentence.
     // Source: smithy_query(query="shape", shape="AuthenticationMethodOption").
     let rows = [
-        ("never-signed-up", ACCOUNT, "IAM_ONLY", Value::Null),
+        ("never-signed-up", ACCOUNT, Value::Null),
         (
             "signed-up-without-one",
             OTHER_ACCOUNT,
-            "IAM_ONLY",
             json!({
                 "AccountName": format!("roles-{OTHER_ACCOUNT}"),
                 "AuthenticationMethod": "IAM_ONLY",
@@ -2054,7 +2047,6 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
         (
             "signed-up-against-a-directory",
             DIRECTORY_ACCOUNT,
-            "ACTIVE_DIRECTORY",
             json!({
                 "AccountName": format!("roles-{DIRECTORY_ACCOUNT}"),
                 "AuthenticationMethod": "ACTIVE_DIRECTORY",
@@ -2066,7 +2058,7 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
             }),
         ),
     ];
-    for (case, account, identity_store, subscription) in rows {
+    for (case, account, subscription) in rows {
         if !subscription.is_null() {
             sign_up(&harness, case, account, subscription).await;
         }
@@ -2102,14 +2094,9 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
                 );
                 assert_eq!(
                     body["Message"],
-                    json!(role_denial_message(
-                        identity_store,
-                        account,
-                        DEFAULT_NAMESPACE,
-                        role
-                    )),
-                    "case {case:?} {call} {role}: the refusal must name the identity \
-                     store the account has: {body}"
+                    json!(ROLE_DENIAL_MESSAGE),
+                    "case {case:?} {call} {role}: expected the fixed denial \
+                     {ROLE_DENIAL_MESSAGE:?}, got {body}"
                 );
                 assert!(
                     body["RequestId"].is_string(),
@@ -2117,6 +2104,125 @@ async fn a_role_is_reached_only_in_an_account_that_holds_a_quicksight_identity_s
                      {body}"
                 );
             }
+        }
+    }
+    assert_eq!(
+        held_role_memberships(&harness),
+        0,
+        "a denied call must persist nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_role_membership_denial_reads_the_same_whatever_the_call_named() {
+    let harness = Harness::new();
+    // One account signed up against a directory, so a row reads the refusal on an account
+    // whose stored identity store is not the service default: the sentence does not vary
+    // with what the account has either.
+    sign_up(
+        &harness,
+        "directory",
+        DIRECTORY_ACCOUNT,
+        json!({
+            "AccountName": format!("roles-{DIRECTORY_ACCOUNT}"),
+            "AuthenticationMethod": "ACTIVE_DIRECTORY",
+            "NotificationEmail": "ops@example.com",
+            "Edition": "ENTERPRISE",
+            "ActiveDirectoryName": "corp.example.com",
+            "Realm": "CORP.EXAMPLE.COM",
+            "AdminGroup": ["Domain Admins"],
+        }),
+    )
+    .await;
+
+    // Rows: the address a refused call named — the account (one that never signed up, so
+    // it holds the service default, one signed up against a directory, and a third
+    // unrelated one), the namespace label (the one every account has, a name no namespace
+    // is held under, the punctuation the pattern admits, the shortest name and the
+    // longest), the role, and the form and length of the member name. The denial settles
+    // on the ACCOUNT before any address inside it is resolved, so neither the namespace
+    // nor the group a row names has to exist for the call to be refused.
+    // Source: smithy_query(query="operation",
+    // operation="ListRoleMemberships,CreateRoleMembership,DeleteRoleMembership") —
+    // `Namespace` is len 0..64 over `^[a-zA-Z0-9._-]*$`, `Role` is the `Role` enum and
+    // `MemberName` targets `GroupName`, len 1.. over `^[\u0020-\u00FF]+$`.
+    let rows: Vec<(&str, &str, String, &str, String)> = vec![
+        (
+            "the default namespace",
+            ACCOUNT,
+            DEFAULT_NAMESPACE.to_string(),
+            "ADMIN",
+            "Admins".to_string(),
+        ),
+        (
+            "a namespace the account holds no record of",
+            ACCOUNT,
+            "absent-ns".to_string(),
+            "READER",
+            "Readers".to_string(),
+        ),
+        (
+            "a namespace name holding the punctuation the pattern admits",
+            OTHER_ACCOUNT,
+            "sales.archive_2026-Q1".to_string(),
+            "AUTHOR_PRO",
+            "Report Authors".to_string(),
+        ),
+        (
+            "the shortest namespace name the model admits",
+            OTHER_ACCOUNT,
+            "n".to_string(),
+            "READER_PRO",
+            "Zürich Authoren".to_string(),
+        ),
+        (
+            "the longest namespace name the model admits",
+            DIRECTORY_ACCOUNT,
+            "n".repeat(64),
+            "ADMIN_PRO",
+            "g".repeat(128),
+        ),
+        (
+            "an account whose identities come from a directory",
+            DIRECTORY_ACCOUNT,
+            DEFAULT_NAMESPACE.to_string(),
+            "AUTHOR",
+            "Domain Admins".to_string(),
+        ),
+    ];
+
+    for (case, account, namespace, role, member) in rows {
+        let calls = [
+            (
+                "list",
+                list_role_members(&harness, account, &namespace, role, "").await,
+            ),
+            (
+                "create",
+                add_role_member(&harness, account, &namespace, role, &member).await,
+            ),
+            (
+                "delete",
+                remove_role_member(&harness, account, &namespace, role, &member).await,
+            ),
+        ];
+        for (call, (status, body)) in calls {
+            assert_eq!(
+                status, 401,
+                "case {case:?} {call}: an account whose identities QuickSight does not \
+                 manage must be denied its roles, got {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("AccessDeniedException"),
+                "case {case:?} {call}: expected AccessDeniedException, got {body}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(ROLE_DENIAL_MESSAGE),
+                "case {case:?} {call}: expected the fixed denial {ROLE_DENIAL_MESSAGE:?} \
+                 whatever the call named, got {body}"
+            );
         }
     }
     assert_eq!(
