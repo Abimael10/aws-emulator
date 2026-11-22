@@ -138,8 +138,10 @@ const ROWS: &[Row] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of concurrent control plane operations in this \
-                      account in the current Region.",
+        description: "The maximum number of allowed concurrent control plane operations. For \
+                      more information, see \
+                      https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits\
+                      .html#limits-api",
         period: None,
         metric: Metric::None,
         context: None,
@@ -151,8 +153,11 @@ const ROWS: &[Row] = &[
         value: 80_000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of write capacity units that can be provisioned \
-                      across all tables in this account in the current Region.",
+        description: "The maximum number of write throughput allocated across all your tables \
+                      and global secondary indexes using provisioned read/write capacity mode. \
+                      For more information, see \
+                      https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits\
+                      .html#default-limits-throughput-capacity-modes",
         period: None,
         metric: Metric::Resources {
             usage_service: "DynamoDB",
@@ -163,13 +168,12 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "ebs",
         quota_code: "L-18E976AB",
-        quota_name: "ListSnapshotBlocks requests allowed per account",
+        quota_name: "ListSnapshotBlocks requests per account",
         value: 50.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of ListSnapshotBlocks requests per second in this \
-                      account in the current Region.",
-        period: None,
+        description: "The maximum number of ListSnapshotBlocks requests allowed per account.",
+        period: Some((1, "SECOND")),
         metric: Metric::None,
         context: None,
     },
@@ -180,9 +184,8 @@ const ROWS: &[Row] = &[
         value: 1000.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of PutSnapshotBlock requests per second for one \
-                      snapshot.",
-        period: None,
+        description: "The maximum number of PutSnapshotBlock requests allowed per snapshot.",
+        period: Some((1, "SECOND")),
         metric: Metric::None,
         context: None,
     },
@@ -193,8 +196,8 @@ const ROWS: &[Row] = &[
         value: 5.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of concurrent volume copy operations in this account \
-                      in the current Region.",
+        description: "Maximum number of concurrent copy volume operations allowed per account \
+                      in this region.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -206,8 +209,9 @@ const ROWS: &[Row] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum aggregated storage, in TiB, that all General Purpose SSD \
-                      (gp2) volumes in this account in the current Region can be modified to.",
+        description: "The maximum aggregated amount of storage, in TiB, that can be requested \
+                      in volume modifications across General Purpose SSD (gp2) volumes in this \
+                      Region.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -219,8 +223,8 @@ const ROWS: &[Row] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of GetAuthorizationToken requests you can make per \
-                      second in this account in the current Region.",
+        description: "The maximum number of GetAuthorizationToken requests that you can make \
+                      per second in the current Region.",
         period: Some((1, "SECOND")),
         metric: Metric::Calls {
             usage_service: "ECR",
@@ -235,7 +239,7 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of pull through cache rules in one registry.",
+        description: "The maximum number of pull-through cache rules.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -247,8 +251,8 @@ const ROWS: &[Row] = &[
         value: 1000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of BatchCheckLayerAvailability requests you can make \
-                      per second in this account in the current Region.",
+        description: "The maximum number of BatchCheckLayerAvailability requests that you can \
+                      make per second in the current Region.",
         period: Some((1, "SECOND")),
         metric: Metric::Calls {
             usage_service: "ECR",
@@ -312,8 +316,8 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of Kubernetes clusters that can be connected to EKS \
-                      in this account in the current Region.",
+        description: "The maximum number of registered clusters in this account in the current \
+                      Region.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -325,8 +329,7 @@ const ROWS: &[Row] = &[
         value: 300.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of subnet groups in this account in the current \
-                      Region.",
+        description: "The maximum number of subnet groups you can create in a Region.",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "ElastiCache",
@@ -341,7 +344,8 @@ const ROWS: &[Row] = &[
         value: 24.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of snapshots that can be taken per day for one cache.",
+        description: "The maximum number of snapshots that can be taken per day per serverless \
+                      cache.",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "ElastiCache",
@@ -356,7 +360,7 @@ const ROWS: &[Row] = &[
         value: 100.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of users in one user group.",
+        description: "The maximum number of users you can define for a user group.",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "ElastiCache",
@@ -411,9 +415,10 @@ const ROWS: &[Row] = &[
         quota_name: "Rate of file system operations",
         value: 250_000.0,
         unit: "None",
-        adjustable: true,
-        description: "The maximum number of file system operations per second for one file \
-                      system.",
+        adjustable: false,
+        description: "The maximum number of file system operations per second for a file system \
+                      using General Purpose performance mode. Each read operation consumes one \
+                      file operation, and each write operation consumes five file operations.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -425,7 +430,7 @@ const ROWS: &[Row] = &[
         value: 10_000.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of access points per file system.",
+        description: "The maximum number of access points allowed per file system",
         period: None,
         metric: Metric::None,
         context: None,
@@ -437,7 +442,7 @@ const ROWS: &[Row] = &[
         value: 1200.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of Network Load Balancer ENIs per VPC.",
+        description: "The total number of Network Load Balancer eni's per VPC",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "Elastic Load Balancing",
@@ -452,8 +457,7 @@ const ROWS: &[Row] = &[
         value: 100.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of rules per Application Load Balancer, not counting \
-                      default rules.",
+        description: "The maximum number of rules per Application Load Balancer",
         period: None,
         metric: Metric::Resources {
             usage_service: "Elastic Load Balancing",
@@ -468,7 +472,7 @@ const ROWS: &[Row] = &[
         value: 100.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of target groups per Application Load Balancer.",
+        description: "The maximum number of target groups per Application Load Balancer",
         period: None,
         metric: Metric::Resources {
             usage_service: "Elastic Load Balancing",
@@ -496,7 +500,8 @@ const ROWS: &[Row] = &[
         value: 200.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of instances in a single cluster.",
+        description: "The maximum number of instances in a single Amazon OpenSearch Service \
+                      domain. You can request an increase up to 1002 instances per domain.",
         period: None,
         metric: Metric::None,
         context: Some(Context {
@@ -512,7 +517,8 @@ const ROWS: &[Row] = &[
         value: 5.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of dedicated master instances in a single cluster.",
+        description: "The maximum number of dedicated master instances in a single Amazon \
+                      OpenSearch Service domain.",
         period: None,
         metric: Metric::None,
         context: None,

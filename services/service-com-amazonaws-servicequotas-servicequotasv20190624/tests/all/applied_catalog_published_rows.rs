@@ -149,8 +149,9 @@ const PUBLISHED: &[Published] = &[
         quota_code: "L-F98FE922",
         quota_name: "Maximum number of tables",
         description: Some(
-            "The maximum number of tables that can be created in this account in the current \
-             Region.",
+            "The maximum number of tables that can be created per account. For more \
+             information, see https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/\
+             Limits.html#limits-tables",
         ),
         unit: "None",
         value: 2500.0,

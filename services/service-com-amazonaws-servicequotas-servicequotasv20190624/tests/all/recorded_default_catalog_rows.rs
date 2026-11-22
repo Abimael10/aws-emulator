@@ -827,7 +827,8 @@ const UNCITED_ROWS: &[Row] = &[
         value: 200.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of instances in a single cluster.",
+        description: "The maximum number of instances in a single Amazon OpenSearch Service \
+                      domain. You can request an increase up to 1002 instances per domain.",
         period: None,
         metric: Metric::None,
         context: Some(Context {

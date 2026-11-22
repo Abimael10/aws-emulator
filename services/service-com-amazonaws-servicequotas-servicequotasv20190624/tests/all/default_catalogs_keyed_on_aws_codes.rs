@@ -45,7 +45,11 @@ struct Catalog {
     /// The display name AWS's own Service Quotas data reports for the code, which every
     /// row of the service repeats as its `ServiceName`.
     service_name: &'static str,
-    /// How many quotas the service's published catalog holds.
+    /// How many quotas the service's published catalog holds — the rows this emulator
+    /// publishes for the code, which is the recorded response's row count LESS any code of
+    /// it whose quota nothing available here can name: such a code is left to the
+    /// default-quota-set gap rather than published under a borrowed row (see
+    /// `src/state/quota_rows/ebs.rs`, which leaves `L-C125AE42` and `L-DB2FBAA1` to it).
     quota_count: usize,
     /// Codes no quota of this service is published under: the descriptive stand-ins a
     /// quota name yields (`src/state.rs::descriptive_quota_code`), which AWS publishes
@@ -79,7 +83,7 @@ const CATALOGS: &[Catalog] = &[
     Catalog {
         service_code: "ebs",
         service_name: "Amazon Elastic Block Store (Amazon EBS)",
-        quota_count: 43,
+        quota_count: 41,
         withdrawn: &["SnapshotsPerRegion", "StorageForGeneralPurposeSSDGp3VolumesInTiB"],
     },
     Catalog {
@@ -207,10 +211,10 @@ const ROWS: &[Row] = &[
         value: 40_000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of write capacity units that can be provisioned for a \
-                      single table or global secondary index. For more information, see \
+        description: "The maximum number of write throughput allocated for a table or global \
+                      secondary index. For more information, see \
                       https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits\
-                      .html#default-limits-throughput-capacity-modes.",
+                      .html#default-limits-throughput-capacity-modes",
         period: None,
         metric: Metric::None,
     },
@@ -221,8 +225,10 @@ const ROWS: &[Row] = &[
         value: 2500.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of tables that can be created in this account in the \
-                      current Region.",
+        description: "The maximum number of tables that can be created per account. For more \
+                      information, see \
+                      https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits\
+                      .html#limits-tables",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "DynamoDB",
@@ -234,10 +240,10 @@ const ROWS: &[Row] = &[
         quota_code: "L-D18FCD1D",
         quota_name: "Storage for General Purpose SSD (gp2) volumes, in TiB",
         value: 50.0,
-        unit: "TiB",
+        unit: "None",
         adjustable: true,
-        description: "The maximum aggregated storage, in TiB, of all General Purpose SSD (gp2) \
-                      volumes in this account in the current Region.",
+        description: "The maximum aggregated amount of storage, in TiB, that can be requested \
+                      across General Purpose SSD (gp2) volumes in this Region.",
         period: None,
         metric: Metric::None,
     },
@@ -247,7 +253,7 @@ const ROWS: &[Row] = &[
         quota_name: "Rate of GetSnapshotBlock requests",
         value: 1000.0,
         unit: "None",
-        adjustable: true,
+        adjustable: false,
         description: "The maximum number of GetSnapshotBlock requests you can make per second \
                       in this account in the current Region.",
         period: Some((1, "SECOND")),
@@ -281,22 +287,22 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "eks",
         quota_code: "L-6D54EA21",
-        quota_name: "Control plane security groups per cluster",
-        value: 4.0,
+        quota_name: "Managed node groups per cluster",
+        value: 30.0,
         unit: "None",
-        adjustable: false,
-        description: "The maximum number of control plane security groups per cluster.",
+        adjustable: true,
+        description: "The maximum number of managed node groups per cluster.",
         period: None,
         metric: Metric::None,
     },
     Row {
         service_code: "eks",
         quota_code: "L-C56B9FC3",
-        quota_name: "Pod identity associations per cluster",
-        value: 1000.0,
+        quota_name: "Access entries per cluster",
+        value: 100.0,
         unit: "None",
-        adjustable: true,
-        description: "The maximum number of EKS Pod Identity associations per cluster.",
+        adjustable: false,
+        description: "The maximum number of access entries per cluster.",
         period: None,
         metric: Metric::None,
     },
@@ -307,7 +313,7 @@ const ROWS: &[Row] = &[
         value: 300.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of subnet groups in this account in the current Region.",
+        description: "The maximum number of subnet groups you can create in a Region.",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "ElastiCache",
@@ -321,9 +327,12 @@ const ROWS: &[Row] = &[
         value: 20.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of subnets in one subnet group.",
-        period: None,
-        metric: Metric::None,
+        description: "The maximum number of subnets you can add to a subnet group.",
+        period: Some((5, "MINUTE")),
+        metric: Metric::Resources {
+            usage_service: "ElastiCache",
+            resource: "SubnetsPerSubnetGroup",
+        },
     },
     Row {
         service_code: "elasticbeanstalk",
@@ -346,7 +355,8 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of custom platform versions that you can create in \
-                      this account in the current Region.",
+                      this account in the current Region. The limit applies across custom \
+                      platforms, not per custom platform.",
         period: None,
         metric: Metric::None,
     },
@@ -357,7 +367,7 @@ const ROWS: &[Row] = &[
         value: 10_000.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of access points per file system.",
+        description: "The maximum number of access points allowed per file system",
         period: None,
         metric: Metric::None,
     },
@@ -367,7 +377,7 @@ const ROWS: &[Row] = &[
         quota_name: "Rate of DescribeFileSystems requests",
         value: 100.0,
         unit: "None",
-        adjustable: true,
+        adjustable: false,
         description: "The maximum number of DescribeFileSystems requests you can make per \
                       second in this account in the current Region.",
         period: Some((1, "SECOND")),
@@ -384,7 +394,7 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of Application Load Balancers in this account in the \
-                      current Region.",
+                      current Region",
         period: Some((5, "MINUTE")),
         metric: Metric::Resources {
             usage_service: "Elastic Load Balancing",
@@ -398,9 +408,12 @@ const ROWS: &[Row] = &[
         value: 1.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of load balancers one target group can be used by.",
+        description: "The maximum number of load balancers one target group can be used by",
         period: None,
-        metric: Metric::None,
+        metric: Metric::Resources {
+            usage_service: "Elastic Load Balancing",
+            resource: "LoadBalancersPerTargetGroup",
+        },
     },
     Row {
         service_code: "es",
@@ -409,18 +422,20 @@ const ROWS: &[Row] = &[
         value: 150.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of warm nodes in a single cluster.",
+        description: "The maximum number of warm nodes in a single Amazon OpenSearch Service \
+                      cluster.",
         period: None,
         metric: Metric::None,
     },
     Row {
         service_code: "es",
         quota_code: "L-E9BC8C95",
-        quota_name: "T2 instances per domain",
+        quota_name: "Instances per domain (T2 instance type)",
         value: 10.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of T2 instances in a single cluster.",
+        description: "The maximum number of T2 instances in a single Amazon OpenSearch Service \
+                      domain.",
         period: None,
         metric: Metric::None,
     },

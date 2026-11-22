@@ -610,3 +610,19 @@ Diverging-key counts per cause: dynamodb 13 codes / 29 keys, ebs ~60 codes / 140
 5. Replay ...-elasticache step task#1 and read Quotas[QuotaCode="L-80E085C7"] and Quotas[QuotaCode="L-AF354865"] — wrong QuotaName/Value/MetricDimensions.Resource, and Period/UsageMetric absent (cause 5).
 6. Replay ...-elasticbeanstalk step task#1 and read Quotas[QuotaCode="L-E593A077"].Description — the second sentence AWS publishes is missing (cause 6).
 7. Repeat for ServiceCode ebs, elasticfilesystem, elasticloadbalancing and es (fixtures service-quotas-catalog-list-aws-default-service-quotas-<code>, step task#1) for causes 2, 7, 8 and 9, comparing each returned row against the recorded row for the SAME QuotaCode.
+
+## Resolution, and the keys still open
+
+Causes 6 (elasticbeanstalk) and 9 (es) replay clean. Cause 4 (eks) replays clean on 18 of its 21 keys: the whole code-to-quota binding of that catalog is corrected, and the two sentence forms the service publishes are built once and applied to every row.
+
+Causes 1, 2, 3, 5, 7 and 8 are corrected for every code whose published quota is named by this report or derivable from a rule it states — each service's published sentence form, the per-code adjustability and windows it enumerates, the `Unit` of a plane that names its unit in its own name, the usage metrics of the load-balancing planes, and the rebindings it gives (ecr L-44194860, elasticache L-80E085C7 and L-AF354865, elasticfilesystem L-B34D07B4 and L-FA0AAA42, elasticloadbalancing L-B6DF7632 and L-8A66D0E6, ebs L-87C9DEA6, L-1774F84A and L-18E976AB, dynamodb L-F3CA5463).
+
+Still open, for a later round, are the codes whose published quota neither this report nor anything else available to a fixer names (the report states the facts of the rows it cites and says only "e.g." for the rest, and a replay withholds recorded values). Those rows were left as they stood rather than given a value chosen to make one recording match:
+
+* dynamodb: L-2A593B99, L-6F30DCE1, L-923BEB7A, L-C2098644, L-CF0CBE56, L-D98E8184 (QuotaName/Value/Unit/Description), L-34F6A552 and L-34F8CCC8 (Description wording).
+* eks: L-11427A54.Description, L-93A74D60.Description, L-C56B9FC3.Value.
+* ebs: the per-API rate rows whose codes name another quota (L-028ACFB9, L-07399329, L-09BD8365, L-1D4D9345, L-309BACF6, L-35B31D98, L-3A0E616D, L-59C8FC87, L-5F80CA91, L-631ECBD3, L-651D1834, L-750405C3, L-82ACEF56, L-835364B2, L-915A3DBB, L-94D7AB7D, L-98A0B26D, L-9F6E7C4E, L-A37D9CF3, L-AFAE1BE8, L-AFEBDF7A, L-B9F7C487, L-D8F37C68, L-E137849C), the capacity planes whose names diverge (L-17AF77E8, L-8D977E7E, L-9A0E0F82, L-9CF3C2EB), and L-D0291BE3, L-DB70D580, L-E20676C1. L-C125AE42 and L-DB2FBAA1 are no longer published at all: the recorded listing reports both over a one-second window, so neither names the counted plane this catalog had served there, and a code whose quota cannot be named is left to the default-quota-set gap.
+* ecr: L-03A36CE1, L-0A556EFC, L-1165B4AE, L-16E70933, L-241DEEBA, L-24725E9A, L-343F3D94, L-8BE1781E, L-95B28F8D, L-9B60BFFB, L-9C9D5A08, L-A1670B10, L-A60A366D, L-A71EAF5A, L-AD52DFB2, L-C0B33BA1, L-CB63E564, L-CFEB8E8D, L-EF8F6F4E.
+* elasticache: L-3F15A733, L-7D6587E6, L-8C334AD1, L-A87EE522, L-AD484FC5, L-BBCDAECC, L-DFE45DF3.
+* elasticfilesystem: L-03A6A61D, L-06519EB8, L-1E30FF38, L-207AE8E0, L-29770CF9, L-336A920F, L-3D348029, L-48B15094, L-509A1582, L-6D380DD0, L-7391004C, L-7FEABCD7, L-848C634D, L-A139E5A7, L-B8B14E21, L-BFB6FB19, L-C8C0D2A0, L-CDCE244F, L-D6548EE7, L-F3C5D9EF.
+* elasticloadbalancing: the per-Region planes and the per-balancer planes whose names diverge (L-057ECE54, L-0BB7B635, L-1A491844, L-332EE142, L-37E1617B, L-43FE5A42, L-52964454, L-53DA6B97, L-57A373D6, L-69A177A2, L-723DCCB6, L-7A15E3C5, L-7C45F98A, L-9365A611, L-9E6F9012, L-A012D4E8, L-A0D0B863, L-A8F7060B, L-B211E961, L-B22855CB, L-CE3125E5, L-E9E9831D, L-EBC0C08B, L-EEF1AD04, L-F31E307C).
