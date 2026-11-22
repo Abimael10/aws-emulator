@@ -362,21 +362,31 @@ async fn every_refusal_of_a_bad_value_carries_this_service_s_own_code() {
     }
 }
 
-/// A `Name` another namespace already answers to is a NAME conflict, not a bad value and
-/// not a conflict between operations: it is refused with `NamespaceAlreadyExists` naming
-/// the namespace that owns the name. Deleting that namespace frees the name and the
-/// identical call then succeeds.
+/// A `Name` another namespace already answers to is refused and persists nothing: as the
+/// duplicate REQUEST naming the create operation already on file for the name when the
+/// HTTP create — which claims no DNS name — repeats itself, and as `NamespaceAlreadyExists`
+/// naming the namespace that owns the name for the DNS creates. Deleting that namespace
+/// frees the name and the identical call then succeeds.
 #[tokio::test]
-async fn a_name_another_namespace_owns_is_a_namespace_already_exists() {
+async fn a_name_another_namespace_owns_is_refused_and_frees_on_delete() {
     let router = emulator();
 
-    // (operation, the name it creates, the extra members that operation requires)
-    let cases: Vec<(&str, &str, Value)> = vec![
-        ("CreateHttpNamespace", "dup-http-ns", json!({})),
+    // (operation, the name it creates, the extra members that operation requires, the
+    // status and code a repeat of it earns)
+    let cases: Vec<(&str, &str, Value, u16, &str)> = vec![
+        (
+            "CreateHttpNamespace",
+            "dup-http-ns",
+            json!({}),
+            400,
+            "DuplicateRequest",
+        ),
         (
             "CreatePrivateDnsNamespace",
             "dup-private-ns.example",
             json!({ "Vpc": VPC }),
+            400,
+            "NamespaceAlreadyExists",
         ),
         // The third namespace create follows the same rule; its `Name` is a dotted DNS
         // name because `NamespaceNamePublic`'s pattern is a label pattern.
@@ -384,10 +394,12 @@ async fn a_name_another_namespace_owns_is_a_namespace_already_exists() {
             "CreatePublicDnsNamespace",
             "dup-public-ns.example.com",
             json!({}),
+            400,
+            "NamespaceAlreadyExists",
         ),
     ];
 
-    for (operation, name, extra) in cases {
+    for (operation, name, extra, expected_status, expected_code) in cases {
         let mut body = json!({ "Name": name });
         if let Value::Object(members) = extra {
             for (key, value) in members {
@@ -395,22 +407,33 @@ async fn a_name_another_namespace_owns_is_a_namespace_already_exists() {
             }
         }
 
-        let (_first_operation, namespace_id) =
+        let (first_operation, namespace_id) =
             created_namespace(&router, operation, body.clone()).await;
 
         let (status, answer) = call(&router, operation, body.clone()).await;
         let (code, _) = error_of(&answer);
         assert_eq!(
             (status, code.as_str()),
-            (400, "NamespaceAlreadyExists"),
-            "case {operation} on the taken name {name:?}: expected 400 NamespaceAlreadyExists, \
-             got {answer}"
+            (expected_status, expected_code),
+            "case {operation} on the taken name {name:?}: expected {expected_status} \
+             {expected_code}, got {answer}"
         );
-        assert_eq!(
-            answer["NamespaceId"],
-            json!(namespace_id),
-            "case {operation}: the refusal names the namespace that owns the name, got {answer}"
-        );
+        // Each class identifies the call's own subject: the duplicate request the operation
+        // it repeats, the name conflict the namespace that owns the name.
+        if expected_code == "DuplicateRequest" {
+            assert_eq!(
+                answer["DuplicateOperationId"],
+                json!(first_operation),
+                "case {operation}: the refusal names the create operation on file, got {answer}"
+            );
+        } else {
+            assert_eq!(
+                answer["NamespaceId"],
+                json!(namespace_id),
+                "case {operation}: the refusal names the namespace that owns the name, got \
+                 {answer}"
+            );
+        }
 
         // A second namespace was NOT created: the name still resolves to the first.
         let read = ok(&router, "GetNamespace", json!({ "Id": namespace_id })).await;

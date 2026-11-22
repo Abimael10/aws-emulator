@@ -39,9 +39,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance,
-    InstanceSummary, Namespace, NamespaceAlreadyExists, NamespaceProperties, NamespaceSummary,
-    Operation, Service, ServiceAttributes, ServiceSummary, Tag, SOA,
+    DnsConfig, DuplicateRequest, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties,
+    Instance, InstanceSummary, Namespace, NamespaceAlreadyExists, NamespaceProperties,
+    NamespaceSummary, Operation, Service, ServiceAttributes, ServiceSummary, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -469,6 +469,37 @@ pub fn namespace_already_exists(existing: &NamespaceRecord) -> NamespaceAlreadyE
         message: Some(NAMESPACE_ALREADY_EXISTS_MESSAGE.to_string()),
         namespace_id: Some(existing.id.clone()),
         creator_request_id: existing.creator_request_id.clone(),
+    }
+}
+
+/// The refusal the HTTP namespace create earns when the `Name` it asks for is already held
+/// by a namespace of its OWN kind.
+///
+/// An HTTP namespace is the API-only kind: it holds no Route 53 hosted zone, so its create
+/// claims no DNS name and recognises a repeat of ITSELF by the create operation already on
+/// file for that name — the duplicate-request class ("the operation is already in progress",
+/// `@httpError 409`), which is the one error of these creates declaring a member for the
+/// operation a request duplicates (`DuplicateRequest$DuplicateOperationId`). The sentence
+/// names the operation it duplicates: the call that filed it, the id a caller can poll, and
+/// what became of it — still running, or already settled. A name held by a namespace of
+/// ANOTHER kind was filed by no operation of this call's and stays the NAME conflict
+/// ([`namespace_already_exists`]).
+pub fn duplicate_namespace_create(
+    operation_name: &str,
+    duplicated_operation_id: &str,
+    still_in_progress: bool,
+) -> DuplicateRequest {
+    let outcome = if still_in_progress {
+        "is in progress"
+    } else {
+        "has completed"
+    };
+    DuplicateRequest {
+        message: Some(format!(
+            "Another operation of type {operation_name} and id {duplicated_operation_id} \
+             {outcome}"
+        )),
+        duplicate_operation_id: Some(duplicated_operation_id.to_string()),
     }
 }
 
@@ -1023,6 +1054,26 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
     pub fn operation(&mut self, id: &str, now: SystemTime) -> Option<&OperationRecord> {
         self.advance(now);
         self.operations.get(id)
+    }
+
+    /// Whether the operation `id` is on file and has not reached a terminal status.
+    ///
+    /// Read AFTER [`Self::advance`], so the answer is the status a reader of the record
+    /// would see rather than one the clock has already moved past. An operation no longer
+    /// on file settled long ago and was forgotten with the oldest records
+    /// ([`Self::evict_oldest_operations`] drops a settled record first), so it is not in
+    /// progress either.
+    ///
+    /// The status alone is the whole predicate here, which is why this asks nothing about
+    /// the due instant: `advance` has already moved every record the clock owes a terminal
+    /// status, so a record still `SUBMITTED` is one whose span has not run out. The delete
+    /// path's own search for an in-progress delete states the due instant as well because
+    /// it SEARCHES the records rather than looking one up by the id a resource already
+    /// names.
+    pub fn operation_in_progress(&self, id: &str) -> bool {
+        self.operations
+            .get(id)
+            .is_some_and(|record| record.status == OPERATION_STATUS_SUBMITTED)
     }
 
     /// Every stored operation in one stable total order — oldest first, `OperationId`

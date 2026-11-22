@@ -4,7 +4,8 @@
 //! Implemented: mints a namespace record and files the `CREATE_NAMESPACE` operation
 //! whose id is this call's only output. The namespace id reaches the caller through
 //! that operation's `Targets` map, which is how Cloud Map's asynchronous create works.
-//! A `Name` another namespace already answers to is refused with
+//! A `Name` another HTTP namespace already answers to is refused with `DuplicateRequest`
+//! naming the create operation it repeats; a name a DNS namespace holds is refused with
 //! `NamespaceAlreadyExists` naming that namespace.
 //!
 //! ## Shape of an operation
@@ -121,6 +122,11 @@ impl From<CreateHttpNamespaceErrorModeled> for CreateHttpNamespaceError {
     }
 }
 
+/// The `NamespaceType` this create stores: the API-only kind, whose instances are found
+/// through `DiscoverInstances` and which holds no Route 53 hosted zone. Also what decides
+/// whether a `Name` already in the index was taken by a create of THIS operation.
+const NAMESPACE_TYPE: &str = "HTTP";
+
 /// The `CreateHttpNamespace` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,20 +207,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // A name already owned by a stored namespace is a NAME conflict, which is the class
-        // `NamespaceAlreadyExists` is declared for: the refusal names the namespace that
-        // owns it, so the caller can tell "someone else owns this name" from a retry of its
-        // own create ([`crate::state::namespace_already_exists`], the one home for this
-        // refusal). Deleting the namespace frees the name and the identical call then
-        // succeeds.
+        // A name this create's OWN kind of namespace already holds is a repeat of a create
+        // this service already served: an HTTP namespace claims no DNS name, so the create
+        // recognises the duplicate by the `CREATE_NAMESPACE` operation on file for that
+        // name and refuses the call with the duplicate-request class naming it
+        // ([`crate::state::duplicate_namespace_create`], the one home for this refusal).
+        // A name held by a DNS namespace was filed by no operation of this call's, so that
+        // stays the NAME conflict `NamespaceAlreadyExists` names
+        // ([`crate::state::namespace_already_exists`]). Deleting the namespace frees the
+        // name and the identical call then succeeds either way.
         if let Some(existing) = state
             .namespace_ids_by_name
             .get(&input.name)
             .and_then(|id| state.namespaces.get(id))
         {
-            return Err(CreateHttpNamespaceErrorModeled::NamespaceAlreadyExists(
-                crate::state::namespace_already_exists(existing),
-            )
+            let duplicated = (existing.namespace_type == NAMESPACE_TYPE)
+                .then(|| existing.create_operation_id.clone())
+                .flatten();
+            return Err(match duplicated {
+                Some(operation_id) => CreateHttpNamespaceErrorModeled::DuplicateRequest(
+                    crate::state::duplicate_namespace_create(
+                        Self::NAME,
+                        &operation_id,
+                        state.operation_in_progress(&operation_id),
+                    ),
+                ),
+                None => CreateHttpNamespaceErrorModeled::NamespaceAlreadyExists(
+                    crate::state::namespace_already_exists(existing),
+                ),
+            }
             .into());
         }
 
@@ -246,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An HTTP namespace holds no hosted zone, so it names no
             // `Properties.DnsProperties.HostedZoneId` and holds no SOA TTL of its own;
             // it is discoverable under `Properties.HttpProperties.HttpName`.
-            namespace_type: "HTTP".to_string(),
+            namespace_type: NAMESPACE_TYPE.to_string(),
             description: crate::state::described(input.description.clone()),
             create_date: now,
             creator_request_id: input.creator_request_id.clone(),

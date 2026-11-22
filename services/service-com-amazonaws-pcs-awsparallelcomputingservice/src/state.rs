@@ -200,15 +200,6 @@ pub const MAX_STORED_LIST_ENTRIES: usize = 200;
 /// an empty list is refused by ([`length_at_least_constraint`]).
 pub const MIN_SUBNET_IDS: usize = 1;
 
-/// The fewest compute node groups a stored queue assigns jobs to: "You must associate 1 or
-/// more compute node groups with the queue" (`CreateQueue`'s own documentation), which
-/// states the association as a requirement on the request that writes the list. A stored
-/// queue's `computeNodeGroupConfigurations` is `@required` (`Queue$computeNodeGroupConfigurations`)
-/// while `ComputeNodeGroupConfigurationList` itself carries no `@length`, so this is the
-/// bound a request that would associate none is refused by
-/// ([`queue_association_violation`]).
-pub const MIN_QUEUE_ASSOCIATIONS: usize = 1;
-
 /// The most tags one PCS resource holds, matching AWS's resource-tagging limit of 50
 /// tags per resource. Checked on every path that writes tags — the `tags` a create
 /// carries, and the set a `TagResource` would LEAVE BEHIND, so repeated tag writes cannot
@@ -1284,23 +1275,6 @@ pub fn stored_list_violation(entries: usize) -> Option<String> {
 /// the boundary refuses an empty list before a handler runs.
 pub fn subnet_list_violation(entries: usize) -> Option<String> {
     (entries < MIN_SUBNET_IDS).then(|| length_at_least_constraint(MIN_SUBNET_IDS))
-}
-
-/// The constraint clause a queue's `computeNodeGroupConfigurations` failed, or `None` when
-/// the service accepts the associations the request writes.
-///
-/// `associations` is how many of the request's configurations NAME a compute node group:
-/// `ComputeNodeGroupConfiguration` carries one, optional, member, so an entry that leaves it
-/// out associates no group — it assigns the queue's jobs to nothing
-/// ([`ClusterRecord::queues_assigning_to`] resolves each entry's id) and counts for nothing
-/// here. This is the lower bound ([`MIN_QUEUE_ASSOCIATIONS`]) every path that WRITES that
-/// list holds it to, stated once so a create and an update cannot disagree about it — the
-/// queue's counterpart of [`subnet_list_violation`], in the same clause form
-/// ([`length_at_least_constraint`]); the caller hands it to [`field_validation`] with the
-/// member it bounds.
-pub fn queue_association_violation(associations: usize) -> Option<String> {
-    (associations < MIN_QUEUE_ASSOCIATIONS)
-        .then(|| length_at_least_constraint(MIN_QUEUE_ASSOCIATIONS))
 }
 
 /// The modelled `ValidationException` a scaling configuration the cluster could never

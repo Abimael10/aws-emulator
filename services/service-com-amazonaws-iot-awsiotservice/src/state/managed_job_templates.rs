@@ -608,18 +608,68 @@ pub fn managed_job_template_catalog() -> Vec<ManagedJobTemplate> {
     CATALOG.iter().map(CatalogRow::template).collect()
 }
 
+/// The prefix every name in AWS's MANAGED job template namespace carries, which every row
+/// of [`CATALOG`] is published under (`a_published_name_is_in_the_managed_namespace` pins
+/// that). A managed template is AWS's to name, so a `templateName` outside this namespace
+/// is not one of them and never could be — which is what decides HOW an unpublished name
+/// is refused ([`unpublished_managed_job_template`]).
+pub const MANAGED_NAME_PREFIX: &str = "AWS-";
+
+/// Whether `template_name` is a name in AWS's managed job template namespace, i.e. one a
+/// managed template could be published under. Exact text: the published names carry the
+/// prefix as written, so a differently-cased spelling of it is another namespace.
+pub fn is_managed_job_template_name_form(template_name: &str) -> bool {
+    template_name.starts_with(MANAGED_NAME_PREFIX)
+}
+
 /// How this service refuses a request that names a managed job template the catalog does
-/// not publish.
+/// not publish — the ONE decision, so a listing's filter and a describe cannot classify or
+/// word the same miss two ways.
 ///
-/// A NOT-FOUND (`ResourceNotFoundException`, HTTP 404, "The specified resource does not
-/// exist"): a `templateName` of the modelled shape that addresses no published entry
-/// names a resource this service does not have, not a request it cannot read. The fixed
-/// text names the kind of resource that was looked up, and the variable part is the name
-/// the request sent. Every operation that looks a `templateName` up refuses it with this
-/// one sentence, so a listing's filter and a describe cannot word the same refusal two
-/// ways.
+/// The catalog is AWS-PUBLISHED reference data rather than account state, the same for
+/// every caller on every boot, and AWS publishes it under its own namespace
+/// ([`MANAGED_NAME_PREFIX`]). Which of the two modelled refusals a miss earns follows from
+/// that: a name IN the managed namespace could name a managed template, so one the catalog
+/// does not hold is a resource that is not there ([`Self::NotFound`]), while a name outside
+/// the namespace is not a managed template name at all and no catalog could ever hold it,
+/// which makes it a value the request got wrong ([`Self::Invalid`]) — the same class an
+/// unpublished `templateVersion` earns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnpublishedManagedJobTemplate {
+    /// `ResourceNotFoundException` (HTTP 404, "The specified resource does not exist"),
+    /// carrying [`managed_job_template_not_found_message`].
+    NotFound(String),
+    /// `InvalidRequestException` (HTTP 400, "The request is not valid"), carrying
+    /// [`invalid_managed_job_template_name_message`].
+    Invalid(String),
+}
+
+/// The refusal `template_name` earns from a catalog that does not publish it, with the
+/// sentence that refusal carries.
+pub fn unpublished_managed_job_template(template_name: &str) -> UnpublishedManagedJobTemplate {
+    if is_managed_job_template_name_form(template_name) {
+        return UnpublishedManagedJobTemplate::NotFound(managed_job_template_not_found_message(
+            template_name,
+        ));
+    }
+    UnpublishedManagedJobTemplate::Invalid(invalid_managed_job_template_name_message(
+        template_name,
+    ))
+}
+
+/// The sentence a `templateName` in AWS's managed namespace that the catalog does not hold
+/// is refused with: fixed text naming the kind of resource that was looked up, around the
+/// name the request sent.
 pub fn managed_job_template_not_found_message(template_name: &str) -> String {
     format!("ManagedJobTemplate with name: {template_name} not found")
+}
+
+/// The sentence a `templateName` outside AWS's managed namespace is refused with: fixed
+/// text naming the member that was rejected, then the name the request sent — worded the
+/// way the unpublished-version refusal of the same catalog is
+/// ([`invalid_managed_job_template_version_message`]).
+pub fn invalid_managed_job_template_name_message(template_name: &str) -> String {
+    format!("Invalid ManagedJobTemplate name: {template_name}")
 }
 
 /// How this service refuses a `templateVersion` a published template does not publish.
@@ -654,4 +704,44 @@ pub fn is_modeled_managed_template_version(template_version: &str) -> bool {
 /// no pattern of its own. Smithy `length` counts CHARACTERS, so this does too.
 pub fn is_modeled_managed_job_template_name(template_name: &str) -> bool {
     (1..=64).contains(&template_name.chars().count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariant [`MANAGED_NAME_PREFIX`] claims: AWS publishes its managed templates
+    /// under its own namespace, so every row of the catalog carries that prefix — which is
+    /// what makes a name outside it one no catalog could hold.
+    #[test]
+    fn a_published_name_is_in_the_managed_namespace() {
+        for row in CATALOG {
+            assert!(
+                is_managed_job_template_name_form(row.template_name),
+                "case {:?}: a published template is named in the managed namespace",
+                row.template_name
+            );
+        }
+    }
+
+    /// The classification of a name the catalog does not hold, on each side of the
+    /// namespace: in it, the resource is simply not there; outside it, the name is not a
+    /// managed template name at all.
+    #[test]
+    fn an_unpublished_name_is_classified_by_the_namespace_it_is_in() {
+        assert_eq!(
+            unpublished_managed_job_template("AWS-Not-Published"),
+            UnpublishedManagedJobTemplate::NotFound(
+                "ManagedJobTemplate with name: AWS-Not-Published not found".to_string()
+            ),
+            "a name in the managed namespace that is not published is a not-found"
+        );
+        assert_eq!(
+            unpublished_managed_job_template("not-managed"),
+            UnpublishedManagedJobTemplate::Invalid(
+                "Invalid ManagedJobTemplate name: not-managed".to_string()
+            ),
+            "a name outside the managed namespace is not a managed template name"
+        );
+    }
 }

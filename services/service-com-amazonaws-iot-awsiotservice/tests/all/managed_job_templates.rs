@@ -23,9 +23,13 @@
 //!   account segment of AWS-managed data) scoped to the region the request was signed
 //!   for;
 //! * `templateName` narrows the listing to that template's versions, and a `templateName`
-//!   of the modelled shape that names no published template is a NOT-FOUND
-//!   (`ResourceNotFoundException`, 404) with the one sentence every operation that looks
-//!   a `templateName` up words a miss with;
+//!   of the modelled shape that names no published template is refused by WHICH namespace
+//!   the name is in: AWS publishes its managed templates under its own name prefix, so a
+//!   name in that namespace which the catalog does not hold is a NOT-FOUND
+//!   (`ResourceNotFoundException`, 404, "ManagedJobTemplate with name: <name> not found")
+//!   while a name outside it is not a managed template name at all and is an INVALID
+//!   REQUEST (`InvalidRequestException`, 400, "Invalid ManagedJobTemplate name: <name>");
+//!   both operations that look a name up classify and word a miss the same way;
 //! * `maxResults` bounds the page and `nextToken` resumes the SAME listing exactly once
 //!   per entry, for EVERY page size from one to past the number of entries;
 //! * every listed entry is DESCRIBABLE: the describe reports the listing's five members
@@ -56,8 +60,17 @@ const REGION: &str = "eu-west-2";
 const QUALIFIED_INVALID_REQUEST: &str =
     "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// The wire error shape of a managed job template the catalog does not publish.
-const NOT_FOUND: &str = "ResourceNotFoundException";
+/// The wire error shape of a name in AWS's managed namespace that the catalog does not
+/// hold: a resource that is not there.
+const UNPUBLISHED_IN_NAMESPACE: &str = "ResourceNotFoundException";
+
+/// The wire error shape of a name outside that namespace: the qualified
+/// `InvalidRequestException`, as the version refusal of the same catalog carries.
+const UNPUBLISHED_OUTSIDE_NAMESPACE: &str = QUALIFIED_INVALID_REQUEST;
+
+/// The prefix AWS publishes its managed job templates under, which every published name
+/// carries and which decides how an unpublished name is refused.
+const MANAGED_NAME_PREFIX: &str = "AWS-";
 
 /// One `documentParameter` the catalog publishes: the pattern a caller replaces and the
 /// guidance published with it. `example` is `None` for a parameter the service publishes
@@ -411,9 +424,51 @@ fn expected_pairs() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The sentence every operation that looks a `templateName` up words a miss with.
+/// The sentence a name IN the managed namespace that the catalog does not hold is refused
+/// with.
 fn not_found_message(template_name: &str) -> String {
     format!("ManagedJobTemplate with name: {template_name} not found")
+}
+
+/// The sentence a name OUTSIDE the managed namespace is refused with.
+fn unpublished_name_message(template_name: &str) -> String {
+    format!("Invalid ManagedJobTemplate name: {template_name}")
+}
+
+/// What a name the catalog does not hold must be refused with: the status, the
+/// `x-amzn-errortype` and the sentence, decided by the namespace the name is in — stated
+/// once, so the describe's rows and the listing filter's rows cannot disagree.
+fn unpublished(template_name: &str) -> (u16, &'static str, String) {
+    if template_name.starts_with(MANAGED_NAME_PREFIX) {
+        return (
+            404,
+            UNPUBLISHED_IN_NAMESPACE,
+            not_found_message(template_name),
+        );
+    }
+    (
+        400,
+        UNPUBLISHED_OUTSIDE_NAMESPACE,
+        unpublished_name_message(template_name),
+    )
+}
+
+/// The names the catalog does not hold that every lookup is exercised over: four in AWS's
+/// managed namespace (a name of the right shape, a prefix of a published name, a published
+/// name with a trailing hyphen, and the longest such name `@length 1..64` admits) and four
+/// outside it (a differently-cased spelling of the prefix, a name of another vendor's
+/// shape, the bare prefix word without its hyphen, and the longest name the model admits).
+fn unpublished_names() -> Vec<String> {
+    vec![
+        "AWS-Does-Not-Exist".to_string(),
+        "AWS-Rebo".to_string(),
+        "AWS-Reboot-".to_string(),
+        format!("AWS-{}", "n".repeat(60)),
+        "aws-reboot".to_string(),
+        "Managed-Nothing".to_string(),
+        "AWS".to_string(),
+        "n".repeat(64),
+    ]
 }
 
 /// The `${aws:iot:parameter:<key>}` form a managed template's document leaves a
@@ -593,33 +648,24 @@ async fn listing_narrows_to_one_templates_versions() {
 }
 
 #[tokio::test]
-async fn a_filter_naming_no_published_template_is_a_not_found() {
-    // The rows differ along WHY the name names nothing: a name of the right shape, one
-    // that differs from a published name only in case, one that is a prefix of a
-    // published name, and the longest name the model admits (`length 1..64`).
-    let cases = [
-        "Managed-Nothing",
-        "aws-reboot",
-        "AWS-Reboot-",
-        "AWS-Rebo",
-        &"n".repeat(64),
-    ];
+async fn a_filter_naming_no_published_template_is_refused_by_its_namespace() {
     let emulator = Emulator::new();
-    for name in cases {
+    for name in unpublished_names() {
+        let (status, errortype, message) = unpublished(&name);
         let reply = emulator.list(&format!("templateName={name}")).await;
         assert_eq!(
-            reply.status, 404,
-            "case {name:?}: expected 404, got {reply:?}"
+            reply.status, status,
+            "case {name:?}: expected {status}, got {reply:?}"
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some(NOT_FOUND),
-            "case {name:?}: expected {NOT_FOUND}, got {reply:?}"
+            Some(errortype),
+            "case {name:?}: expected {errortype}, got {reply:?}"
         );
         assert_eq!(
             reply.message(),
-            not_found_message(name),
-            "case {name:?}: expected the catalog's not-found sentence, got {:?}",
+            message,
+            "case {name:?}: expected {message:?}, got {:?}",
             reply.message()
         );
     }
@@ -916,25 +962,26 @@ async fn describe_selects_the_version_and_defaults_to_the_published_one() {
 }
 
 #[tokio::test]
-async fn describing_a_template_the_catalog_does_not_publish_is_a_not_found() {
-    // The rows differ along why the name names nothing, as the listing's filter rows do.
-    let cases = ["Managed-Nothing", "aws-reboot", "AWS-Rebo", &"n".repeat(64)];
+async fn describing_a_template_the_catalog_does_not_publish_is_refused_by_its_namespace() {
     let emulator = Emulator::new();
-    for name in cases {
-        let reply = emulator.describe(name, "").await;
+    // The same names the listing's filter rows span, so a describe and a listing cannot
+    // classify or word one miss two ways.
+    for name in unpublished_names() {
+        let (status, errortype, message) = unpublished(&name);
+        let reply = emulator.describe(&name, "").await;
         assert_eq!(
-            reply.status, 404,
-            "case {name:?}: expected 404, got {reply:?}"
+            reply.status, status,
+            "case {name:?}: expected {status}, got {reply:?}"
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some(NOT_FOUND),
-            "case {name:?}: expected {NOT_FOUND}, got {reply:?}"
+            Some(errortype),
+            "case {name:?}: expected {errortype}, got {reply:?}"
         );
         assert_eq!(
             reply.message(),
-            not_found_message(name),
-            "case {name:?}: expected the catalog's not-found sentence, got {:?}",
+            message,
+            "case {name:?}: expected {message:?}, got {:?}",
             reply.message()
         );
     }

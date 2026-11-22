@@ -1413,8 +1413,12 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "a namespace name that is already taken",
             "CreateHttpNamespace",
             json!({ "Name": "errors-ns" }),
+            // An HTTP namespace claims no DNS name, so a repeat of its create is the
+            // duplicate REQUEST naming the operation already on file for that name; the
+            // DNS creates answer the name conflict, which `namespace_name_conflict` states
+            // over every pair of creates.
             400,
-            "NamespaceAlreadyExists",
+            "DuplicateRequest",
         ),
         (
             "a service name that is already taken in the namespace",
@@ -1484,8 +1488,8 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
         );
     }
 
-    // The conflict names the namespace that already owns the name, so a caller can read it
-    // rather than guess which call took the name.
+    // The refusal names the create operation already on file for the name, so a caller can
+    // poll that operation rather than guess which call took the name.
     let create_operation = ok(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await
         ["OperationId"]
         .as_str()
@@ -1502,9 +1506,20 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
         .to_string();
     let (_, conflict) = call(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await;
     assert_eq!(
-        conflict["NamespaceId"],
-        json!(owning_namespace),
-        "NamespaceAlreadyExists names the namespace that already owns the name, got {conflict}"
+        conflict["DuplicateOperationId"],
+        json!(create_operation),
+        "DuplicateRequest names the create operation on file for the name, got {conflict}"
+    );
+    // That operation is the one that created the namespace holding the name.
+    assert_eq!(
+        ok(
+            &router,
+            "GetNamespace",
+            json!({ "Id": owning_namespace.clone() })
+        )
+        .await["Namespace"]["Name"],
+        json!("poll-ns"),
+        "the operation the refusal names created the namespace that holds the name"
     );
     let (_, conflict) = call(
         &router,

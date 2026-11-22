@@ -4,23 +4,21 @@
 //! awsJson1_0 wire through the same router the emulator serves from, on the harness
 //! [`crate::cluster_lifecycle`] builds.
 //!
-//! RULE under test: a queue is stored only with an association list that NAMES at least one
-//! compute node group — "You must associate 1 or more compute node groups with the queue"
-//! (`CreateQueue`'s own documentation), the lower bound every path that writes that list
-//! holds it to. `ComputeNodeGroupConfiguration` carries one, optional, member
-//! (`smithy_query(query="shape", shape="ComputeNodeGroupConfiguration")`), so an entry that
-//! leaves `computeNodeGroupId` out names no group and counts for nothing toward that bound:
-//! a request whose configurations are absent, empty, or made only of such entries is refused
-//! with the modelled `ValidationException` naming `computeNodeGroupConfigurations`, in the
-//! standard constraint-violation framing, and persists nothing. A request naming one group
-//! or several is served and stores the configurations exactly as it wrote them.
+//! RULE under test: a queue stores the associations its request wrote and HOW MANY groups
+//! they name is never itself a ground for refusal — `computeNodeGroupConfigurations` is an
+//! optional member of an unbounded list whose `ComputeNodeGroupConfiguration` carries one
+//! optional member (`smithy_query(query="shape",
+//! shape="CreateQueueRequest,ComputeNodeGroupConfigurationList,ComputeNodeGroupConfiguration")`),
+//! so a create that names no group at all is served and stores exactly that, and `UpdateQueue`
+//! is what associates a group later. The only refusal that member can earn is naming a
+//! compute node group the cluster does not hold, and the cluster the create is scoped to is
+//! reported as not found however few groups the request names.
 //!
 //! Each test builds its own engine, so the state one test writes is invisible to the others,
 //! and nothing here waits on the wall clock.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
-use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MIN_QUEUE_ASSOCIATIONS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::{call, create_cluster, create_compute_node_group, emulator};
@@ -29,11 +27,9 @@ use super::{call, create_cluster, create_compute_node_group, emulator};
 /// (`smithy_query(query="shape", shape="CreateQueueRequest,UpdateQueueRequest")`).
 const ASSOCIATIONS_MEMBER: &str = "computeNodeGroupConfigurations";
 
-/// The constraint clause PCS states for an association list shorter than the fewest
-/// compute node groups a stored queue assigns jobs to.
-fn too_few_associations() -> String {
-    format!("Member must have length greater than or equal to {MIN_QUEUE_ASSOCIATIONS}")
-}
+/// The sentence PCS states a cluster it cannot find with: fixed text throughout, echoing no
+/// value the caller sent.
+const CLUSTER_NOT_FOUND: &str = "AWS PCS couldn't find the cluster you specified.";
 
 /// A cluster holding two compute node groups, as `(cluster id, [(group name, group id)])`.
 /// Every resource is settled by the request that follows its own create, so there is
@@ -93,81 +89,126 @@ async fn queue_names(router: &MultiServiceRouter, cluster: &str) -> Vec<String> 
         .unwrap_or_default()
 }
 
+/// RULE: a create that names no compute node group is SERVED and stores the association list
+/// it wrote, whatever form "no group" took.
 #[tokio::test]
-async fn a_create_that_names_no_compute_node_group_is_refused_and_persists_nothing() {
+async fn a_create_that_names_no_compute_node_group_is_served_and_stores_what_it_wrote() {
     let router = emulator();
     let (cluster_id, _groups) = cluster_with_two_groups(&router).await;
 
     // Rows: every way a request can carry no association at all — the member absent
     // altogether, an empty list, and entries that name no group because the shape's one
     // member is optional, from a single such entry up to several.
+    let rows: Vec<(&str, &str, Option<Value>)> = vec![
+        ("the member absent altogether", "absent", None),
+        ("an empty list", "empty", Some(json!([]))),
+        ("one entry naming no group", "unnamed-one", Some(json!([{}]))),
+        (
+            "three entries, none naming a group",
+            "unnamed-three",
+            Some(json!([{}, {}, {}])),
+        ),
+    ];
+
+    for (case, queue, configurations) in &rows {
+        let mut request = json!({"clusterIdentifier": &cluster_id, "queueName": queue});
+        if let Some(configurations) = configurations {
+            request[ASSOCIATIONS_MEMBER] = configurations.clone();
+        }
+        let (status, created) = call(&router, "CreateQueue", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the create served, got {status} with {created}"
+        );
+        // An absent member stores the empty list; everything else stores exactly what the
+        // request wrote, entries naming no group included.
+        let stored = configurations.clone().unwrap_or_else(|| json!([]));
+        assert_eq!(
+            created["queue"][ASSOCIATIONS_MEMBER], stored,
+            "case {case}: expected the configurations the request wrote, got {created}"
+        );
+        let (status, read) = call(
+            &router,
+            "GetQueue",
+            &json!({"clusterIdentifier": &cluster_id, "queueIdentifier": queue}),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: GetQueue got {status} with {read}");
+        assert_eq!(
+            read["queue"][ASSOCIATIONS_MEMBER], stored,
+            "case {case}: expected the stored configurations read back, got {read}"
+        );
+    }
+
+    let expected: Vec<String> = rows
+        .iter()
+        .map(|(_, queue, _)| (*queue).to_string())
+        .collect();
+    let names = queue_names(&router, &cluster_id).await;
+    assert_eq!(
+        names, expected,
+        "expected every served create to have persisted its queue, got {names:?}"
+    );
+}
+
+/// RULE: what a create naming no group IS refused about is the cluster it is scoped to —
+/// a `clusterIdentifier` in the generated-id form that resolves to nothing earns the
+/// modelled cluster not-found, however few groups the request names, and persists nothing.
+#[tokio::test]
+async fn a_create_on_an_absent_cluster_reports_the_cluster_whatever_it_associates() {
+    let router = emulator();
+    let absent = format!("pcs_{}", "2".repeat(20));
+
+    // Rows: no associations at all, in each form, and one naming a group — the refusal
+    // follows the cluster identifier and not the association list.
     let rows: Vec<(&str, Option<Value>)> = vec![
         ("the member absent altogether", None),
         ("an empty list", Some(json!([]))),
         ("one entry naming no group", Some(json!([{}]))),
-        ("three entries, none naming a group", Some(json!([{}, {}, {}]))),
+        (
+            "one entry naming a group",
+            Some(json!([{"computeNodeGroupId": "nodes"}])),
+        ),
     ];
 
     for (case, configurations) in rows {
-        let mut request = json!({"clusterIdentifier": &cluster_id, "queueName": "work"});
+        let mut request = json!({"clusterIdentifier": &absent, "queueName": "work"});
         if let Some(configurations) = configurations {
             request[ASSOCIATIONS_MEMBER] = configurations;
         }
         let (status, refused) = call(&router, "CreateQueue", &request).await;
         assert_eq!(
             (status, refused["__type"].as_str()),
-            (CLIENT_ERROR_STATUS, Some("ValidationException")),
-            "case {case}: expected the modelled ValidationException, got {status} with \
-             {refused}"
-        );
-        // The service's standard constraint-violation framing: how many violations were
-        // detected, then the member path and the constraint its value failed.
-        let expected = format!(
-            "1 validation error(s) detected: Value at '{ASSOCIATIONS_MEMBER}' failed to \
-             satisfy constraint: {}",
-            too_few_associations()
+            (CLIENT_ERROR_STATUS, Some("ResourceNotFoundException")),
+            "case {case}: expected the cluster not-found, got {status} with {refused}"
         );
         assert_eq!(
-            refused["message"].as_str(),
-            Some(expected.as_str()),
-            "case {case}: expected {expected:?}, got {refused}"
-        );
-        // The same detail, structurally, for a client that does not parse the sentence.
-        assert_eq!(
-            refused["reason"].as_str(),
-            Some("fieldValidationFailed"),
-            "case {case}: expected the field-validation reason, got {refused}"
-        );
-        assert_eq!(
-            refused["fieldList"],
-            json!([{"name": ASSOCIATIONS_MEMBER, "message": too_few_associations()}]),
-            "case {case}: expected one fieldList entry naming {ASSOCIATIONS_MEMBER}, got \
-             {refused}"
+            (
+                refused["message"].as_str(),
+                refused["resourceId"].as_str(),
+                refused["resourceType"].as_str()
+            ),
+            (
+                Some(CLUSTER_NOT_FOUND),
+                Some(absent.as_str()),
+                Some("Cluster ID")
+            ),
+            "case {case}: expected the fixed cluster sentence with the identifier as \
+             supplied, got {refused}"
         );
     }
 
-    // Not one of the refused creates left a queue behind.
-    let names = queue_names(&router, &cluster_id).await;
-    assert!(
-        names.is_empty(),
-        "expected the refused creates to have persisted no queue, got {names:?}"
-    );
-
-    // And the name they all asked for is still free: the same call naming a group the
-    // cluster holds is served.
-    let (status, created) = call(
+    // Nothing was stored: the identifier still resolves to no cluster.
+    let (status, refused) = call(
         &router,
-        "CreateQueue",
-        &json!({
-            "clusterIdentifier": &cluster_id,
-            "queueName": "work",
-            "computeNodeGroupConfigurations": [{"computeNodeGroupId": "nodes-a"}],
-        }),
+        "GetCluster",
+        &json!({"clusterIdentifier": &absent}),
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case the same create naming a group the cluster holds: got {status} with {created}"
+        (status, refused["__type"].as_str()),
+        (CLIENT_ERROR_STATUS, Some("ResourceNotFoundException")),
+        "case GetCluster after the refused creates: got {status} with {refused}"
     );
 }
 
