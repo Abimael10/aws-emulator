@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCertificateProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCertificateProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCertificateProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCertificateProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCertificateProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCertificateProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCertificateProviderErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+
+        // An operation the provider claims the default for has to be an operation a
+        // provider CAN serve ([`crate::state::CERTIFICATE_PROVIDER_OPERATIONS`], the
+        // modelled `CertificateProviderOperation` values), exactly as the create
+        // requires: anything else is the modelled `InvalidRequestException` (HTTP 400).
+        if let Some(operations) = input.account_default_for_operations.as_ref() {
+            for operation in operations {
+                if !crate::state::CERTIFICATE_PROVIDER_OPERATIONS.contains(&operation.as_str()) {
+                    return Err(
+                        UpdateCertificateProviderErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(
+                                    crate::state::certificate_providers::unsupported_provider_operation_message(
+                                        operation,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The name is the provider's identity, so a name the account holds no provider
+        // under is the modelled `ResourceNotFoundException` (HTTP 404), worded with this
+        // family's own not-found sentence — the same refusal the readers give.
+        if !store
+            .certificate_providers
+            .contains_key(&input.certificate_provider_name)
+        {
+            return Err(
+                UpdateCertificateProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_certificate_provider_message(
+                            &input.certificate_provider_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An operation has ONE account default, so claiming one ANOTHER provider holds is
+        // refused and nothing is written; a provider re-stating the claim it already holds
+        // is no conflict with itself.
+        if let Some(operations) = input.account_default_for_operations.as_ref() {
+            for operation in operations {
+                let holder = store
+                    .default_certificate_provider(operation)
+                    .map(str::to_string);
+                if holder.is_some_and(|holder| holder != input.certificate_provider_name) {
+                    return Err(
+                        UpdateCertificateProviderErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(crate::state::default_provider_conflict_message(
+                                    &input.certificate_provider_name,
+                                    operation,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // Only the members the request carries change: an update states the new value of
+        // what it names and leaves every other member of the stored record as it was, and
+        // the write moves the record's last-modified instant.
+        let provider = store
+            .certificate_providers
+            .get_mut(&input.certificate_provider_name)
+            .expect("the provider was found under this name above");
+        if let Some(lambda_function_arn) = input.lambda_function_arn {
+            provider.lambda_function_arn = lambda_function_arn;
+        }
+        if let Some(account_default_for_operations) = input.account_default_for_operations {
+            provider.account_default_for_operations = account_default_for_operations;
+        }
+        provider.last_modified_date = now;
+
+        // Reported off the record that was just written, so what this call answers and what
+        // the next `DescribeCertificateProvider` reads are one value.
+        Ok(UpdateCertificateProviderOutput {
+            certificate_provider_name: Some(provider.certificate_provider_name.clone()),
+            certificate_provider_arn: Some(provider.certificate_provider_arn.clone()),
+        })
     }
 }

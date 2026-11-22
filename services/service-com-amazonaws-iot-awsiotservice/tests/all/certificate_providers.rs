@@ -2,8 +2,8 @@
 
 //! End-to-end HTTP coverage of CERTIFICATE PROVIDERS: `CreateCertificateProvider`, the
 //! `DescribeCertificateProvider` reader that proves what it persisted,
-//! `ListCertificateProviders`, `DeleteCertificateProvider`, and the rule that an
-//! operation has ONE account default.
+//! `ListCertificateProviders`, `UpdateCertificateProvider`,
+//! `DeleteCertificateProvider`, and the rule that an operation has ONE account default.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a
 //! restJson1 request signed for the `iot` signing name — so what is asserted is what
@@ -18,6 +18,9 @@
 //!   holds is refused `InvalidRequestException` (400) with nothing created, and the
 //!   claim is free again as soon as the provider holding it is deleted;
 //! * a name the account holds no provider under is `ResourceNotFoundException` (404);
+//! * an update rewrites exactly the members the request names, leaves every other member
+//!   of the stored record as it was, and is refused `ResourceNotFoundException` (404) for
+//!   a name the account holds no provider under;
 //! * a name the account already holds a provider under is
 //!   `ResourceAlreadyExistsException` (409), worded with this family's own already-exists
 //!   sentence, and the stored provider is left as it was;
@@ -95,6 +98,14 @@ impl Emulator {
 
     async fn delete_provider(&self, name: &str) -> Reply {
         self.dispatch("DELETE", &format!("/certificate-providers/{name}"), None)
+            .await
+    }
+
+    /// `UpdateCertificateProvider`: the model binds it to `PUT
+    /// /certificate-providers/{certificateProviderName}`
+    /// (`smithy_query(query="operation",operation="UpdateCertificateProvider")`).
+    async fn update_provider(&self, name: &str, body: &Value) -> Reply {
+        self.dispatch("PUT", &format!("/certificate-providers/{name}"), Some(body))
             .await
     }
 
@@ -636,4 +647,211 @@ async fn a_next_token_the_listing_did_not_issue_is_refused() {
         "case after the refused tokens: the account must still hold its provider, got {}",
         listed.text()
     );
+}
+
+/// RULE: an update rewrites exactly the members the request names and leaves every other
+/// member of the stored record as it was — the identity it was created under included —
+/// and reports the provider it wrote.
+#[tokio::test]
+async fn an_update_rewrites_only_the_members_the_request_names() {
+    let operation = CERTIFICATE_PROVIDER_OPERATIONS
+        .first()
+        .expect("the model declares at least one certificate provider operation");
+    // One row per combination of the OPTIONAL members an update may carry
+    // (`lambdaFunctionArn` and `accountDefaultForOperations`, both optional,
+    // `smithy_query(query="operation",operation="UpdateCertificateProvider")`), with the
+    // function the row expects to find stored afterwards. Re-stating the claim the
+    // provider already holds is no conflict with itself.
+    let rows: [(&str, Value, &str); 4] = [
+        (
+            "the function alone",
+            json!({ "lambdaFunctionArn": REPLACEMENT_FUNCTION }),
+            REPLACEMENT_FUNCTION,
+        ),
+        (
+            "the claim alone",
+            json!({ "accountDefaultForOperations": [operation] }),
+            PROVIDER_FUNCTION,
+        ),
+        (
+            "both members",
+            json!({
+                "lambdaFunctionArn": REPLACEMENT_FUNCTION,
+                "accountDefaultForOperations": [operation],
+            }),
+            REPLACEMENT_FUNCTION,
+        ),
+        ("neither member", json!({}), PROVIDER_FUNCTION),
+    ];
+    // The names span the form `CertificateProviderName` admits (len 1..128, pattern
+    // `^[\w=,@-]+$`): a plain name, one using every character class the pattern allows,
+    // and the shortest legal one.
+    for name in ["issuer", "issuer_2-A=,@", "a"] {
+        for (case, body, expected_function) in &rows {
+            // Each row gets its own account: a provider claims an operation's account
+            // default, and an account holds one provider per operation.
+            let emulator = Emulator::new();
+            let created = emulator
+                .create_provider(name, &Emulator::claim(&[operation]))
+                .await;
+            assert_eq!(
+                created.status,
+                200,
+                "case {case} for {name}: expected the create to answer 200, got {} body {}",
+                created.status,
+                created.text()
+            );
+
+            let updated = emulator.update_provider(name, body).await;
+            assert_eq!(
+                updated.status,
+                200,
+                "case {case} for {name}: expected 200, got {} body {}",
+                updated.status,
+                updated.text()
+            );
+            assert_eq!(
+                updated.json()["certificateProviderName"],
+                json!(name),
+                "case {case} for {name}: the update must name the provider it wrote, got {}",
+                updated.text()
+            );
+            assert_eq!(
+                updated.json()["certificateProviderArn"],
+                created.json()["certificateProviderArn"],
+                "case {case} for {name}: an update keeps the identity the create minted, got {}",
+                updated.text()
+            );
+
+            // What the update wrote is what the reader hands back.
+            let read = emulator.describe_provider(name).await;
+            let described = read.json();
+            assert_eq!(
+                read.status,
+                200,
+                "case {case} for {name}: expected the read to answer 200, got {} body {}",
+                read.status,
+                read.text()
+            );
+            assert_eq!(
+                described["lambdaFunctionArn"],
+                json!(expected_function),
+                "case {case} for {name}: expected {expected_function} stored, got {described}"
+            );
+            assert_eq!(
+                described["accountDefaultForOperations"],
+                json!([operation]),
+                "case {case} for {name}: the claim must be the one the record holds, got \
+                 {described}"
+            );
+            assert_eq!(
+                described["certificateProviderArn"],
+                created.json()["certificateProviderArn"],
+                "case {case} for {name}: the read must report the ARN the create minted, got \
+                 {described}"
+            );
+            let creation_date = described["creationDate"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case} for {name}: no creationDate in {described}"));
+            let last_modified = described["lastModifiedDate"].as_f64().unwrap_or_else(|| {
+                panic!("case {case} for {name}: no lastModifiedDate in {described}")
+            });
+            assert!(
+                last_modified >= creation_date,
+                "case {case} for {name}: a written record is not modified before it was \
+                 created, got creationDate {creation_date} lastModifiedDate {last_modified}"
+            );
+
+            // The listing reports the same identity after the update as before it.
+            let listed = emulator.list_providers("").await;
+            assert_eq!(
+                listed.json()["certificateProviders"],
+                json!([{
+                    "certificateProviderName": name,
+                    "certificateProviderArn": created.json()["certificateProviderArn"],
+                }]),
+                "case {case} for {name}: the account must still hold exactly its provider, got {}",
+                listed.text()
+            );
+        }
+    }
+}
+
+/// RULE: an update of a name the account holds no certificate provider under is refused
+/// `ResourceNotFoundException` (404), with this family's own not-found sentence, and
+/// creates nothing.
+#[tokio::test]
+async fn updating_a_certificate_provider_the_account_does_not_hold_is_not_found() {
+    let operation = CERTIFICATE_PROVIDER_OPERATIONS
+        .first()
+        .expect("the model declares at least one certificate provider operation");
+    // The bodies span the optional members an update may carry, so the refusal does not
+    // depend on what the request asked to change.
+    let bodies = [
+        ("the function alone", json!({ "lambdaFunctionArn": REPLACEMENT_FUNCTION })),
+        (
+            "the claim alone",
+            json!({ "accountDefaultForOperations": [operation] }),
+        ),
+        ("neither member", json!({})),
+    ];
+    for (body_case, body) in &bodies {
+        // Two ways an account can hold no provider under a name: one it never created,
+        // and one whose provider it deleted.
+        for (case, name, delete_first) in [
+            ("a name the account never created", "absent", false),
+            ("a name whose provider was deleted", "issuer", true),
+        ] {
+            let emulator = Emulator::new();
+            if delete_first {
+                assert_eq!(
+                    emulator
+                        .create_provider(name, &Emulator::claim(&[operation]))
+                        .await
+                        .status,
+                    200,
+                    "case {case} with {body_case}: the provider to be deleted must be created"
+                );
+                assert_eq!(
+                    emulator.delete_provider(name).await.status,
+                    200,
+                    "case {case} with {body_case}: expected the delete to answer 200"
+                );
+            }
+
+            let refused = emulator.update_provider(name, body).await;
+            assert_eq!(
+                refused.status,
+                404,
+                "case {case} with {body_case}: expected 404, got {} body {}",
+                refused.status,
+                refused.text()
+            );
+            assert_eq!(
+                refused.error_code(),
+                "ResourceNotFoundException",
+                "case {case} with {body_case}: expected ResourceNotFoundException, got {}",
+                refused.text()
+            );
+            assert_eq!(
+                refused.error_message(),
+                format!("Certificate provider with name [{name}] not found"),
+                "case {case} with {body_case}: expected this family's not-found sentence, got {}",
+                refused.text()
+            );
+
+            // A refused update creates nothing: the account still holds no provider under
+            // that name.
+            assert_eq!(
+                emulator.describe_provider(name).await.status,
+                404,
+                "case {case} with {body_case}: a refused update must create nothing"
+            );
+            assert_eq!(
+                emulator.list_providers("").await.json()["certificateProviders"],
+                json!([]),
+                "case {case} with {body_case}: a refused update must leave the account empty"
+            );
+        }
+    }
 }
