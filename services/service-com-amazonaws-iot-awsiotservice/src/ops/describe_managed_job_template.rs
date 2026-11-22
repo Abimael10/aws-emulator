@@ -10,12 +10,11 @@
 //! `templateVersion` selects the version; a request that names none is answered with
 //! the template's default version, which is the latest version published for it
 //! (`crate::state::ManagedJobTemplate::default_version`). The catalog is AWS-published
-//! reference data rather than account state, published under AWS's own namespace, so a
-//! `templateName` it does not hold is refused by which namespace that name is in: a
-//! managed-namespace name the catalog does not publish is a `ResourceNotFoundException`
-//! (HTTP 404), a name outside that namespace is an `InvalidRequestException` (HTTP 400) —
-//! the latter being the class a version the catalog does not publish for a template it DOES
-//! publish also earns. A read only: nothing here writes.
+//! reference data rather than account state, and no operation of this service creates an
+//! entry in it, so a `templateName` it does not publish names no managed template that
+//! could exist: it is refused as a value the request got wrong, an
+//! `InvalidRequestException` (HTTP 400) — the same class a version the catalog does not
+//! publish for a template it DOES publish earns. A read only: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -184,28 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read of the published catalog: nothing here writes, so a later caller
         // sees exactly what this one did.
         let store = state.lock();
-        // The catalog is AWS-published data rather than this account's state, and AWS
-        // publishes it under its own namespace, so a `templateName` it does not hold is
-        // refused by WHICH namespace the name is in — the one decision every lookup of a
-        // name shares ([`crate::state::unpublished_managed_job_template`]).
+        // The catalog is AWS-published data rather than this account's state, and nothing
+        // in this service creates an entry in it, so a `templateName` it does not hold
+        // names no managed template that could exist: the value the request sent is the
+        // one it got wrong ([`crate::state::invalid_managed_job_template_name_message`]),
+        // which is the same class an unpublished version earns below.
         let Some(template) = store.managed_job_templates.template(&input.template_name) else {
             return Err(
-                match crate::state::unpublished_managed_job_template(&input.template_name) {
-                    crate::state::UnpublishedManagedJobTemplate::NotFound(message) => {
-                        DescribeManagedJobTemplateErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException {
-                                message: Some(message),
-                            },
-                        )
-                    }
-                    crate::state::UnpublishedManagedJobTemplate::Invalid(message) => {
-                        DescribeManagedJobTemplateErrorModeled::InvalidRequestException(
-                            InvalidRequestException {
-                                message: Some(message),
-                            },
-                        )
-                    }
-                }
+                DescribeManagedJobTemplateErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::invalid_managed_job_template_name_message(
+                            &input.template_name,
+                        )),
+                    },
+                )
                 .into(),
             );
         };

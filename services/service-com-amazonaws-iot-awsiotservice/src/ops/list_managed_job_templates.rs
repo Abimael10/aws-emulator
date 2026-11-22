@@ -11,9 +11,9 @@
 //!
 //! `templateName` narrows the listing to the versions of the template it names; a
 //! `templateName` that names no template the catalog publishes is refused rather than
-//! answered with an empty page — the modelled `ResourceNotFoundException` for a name in
-//! AWS's managed namespace, the modelled `InvalidRequestException` for one outside it, the
-//! same way every lookup of a name outside this AWS-published catalog is.
+//! answered with an empty page — the modelled `InvalidRequestException` (HTTP 400), the
+//! same way every lookup of a name outside this AWS-published catalog is, because nothing
+//! creates an entry in it and so no such name can ever name a template.
 //! `maxResults` bounds the page and `nextToken` resumes the SAME listing, in the order
 //! the service publishes the catalog in. A read only: nothing here writes.
 
@@ -193,29 +193,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `templateName` is "An optional parameter for template name. If specified, only
         // the versions of the managed job templates that have the specified template
         // name will be returned" — and the catalog is AWS-published data rather than this
-        // account's state, published under AWS's own namespace, so a name it holds no
-        // template under is refused by WHICH namespace that name is in, through the one
-        // decision every lookup of a name shares
-        // ([`crate::state::unpublished_managed_job_template`]).
+        // account's state, which no operation of this service writes, so a name it holds
+        // no template under names no managed template that could exist: the same refusal
+        // a describe of that name earns
+        // ([`crate::state::invalid_managed_job_template_name_message`]).
         if let Some(template_name) = input.template_name.as_deref() {
             if catalog.template(template_name).is_none() {
                 return Err(
-                    match crate::state::unpublished_managed_job_template(template_name) {
-                        crate::state::UnpublishedManagedJobTemplate::NotFound(message) => {
-                            ListManagedJobTemplatesErrorModeled::ResourceNotFoundException(
-                                ResourceNotFoundException {
-                                    message: Some(message),
-                                },
-                            )
-                        }
-                        crate::state::UnpublishedManagedJobTemplate::Invalid(message) => {
-                            ListManagedJobTemplatesErrorModeled::InvalidRequestException(
-                                InvalidRequestException {
-                                    message: Some(message),
-                                },
-                            )
-                        }
-                    }
+                    ListManagedJobTemplatesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::invalid_managed_job_template_name_message(
+                                template_name,
+                            )),
+                        },
+                    )
                     .into(),
                 );
             }

@@ -254,10 +254,12 @@ struct CatalogParameter {
     description: &'static str,
     kind: ValueKind,
     /// `example` — "an example illustrating a pattern that need to be replaced in a
-    /// managed template job document schema". `None` for a parameter the service
-    /// publishes no example for, which is then absent from the response rather than
-    /// invented here.
-    example: Option<&'static str>,
+    /// managed template job document schema". Published for EVERY parameter of every
+    /// managed template, which is why it is not optional here: the catalog's guidance is
+    /// "the description of each key as a guidance to specify the inputs during runtime"
+    /// and the example is the illustration that goes with it, so a row without one would
+    /// publish a parameter in a form the service does not.
+    example: &'static str,
     /// `optional` — "Specifies whether a pattern that needs to be replaced in a managed
     /// template job document schema is optional or required".
     optional: bool,
@@ -270,7 +272,7 @@ impl CatalogParameter {
             key: Some(self.key.to_string()),
             description: Some(self.description.to_string()),
             regex: Some(self.kind.regex()),
-            example: self.example.map(str::to_string),
+            example: Some(self.example.to_string()),
             optional: self.optional,
         }
     }
@@ -291,7 +293,7 @@ const PATH_TO_HANDLER: CatalogParameter = CatalogParameter {
     description: "Path to handler on the device. If not specified, then device client \
                   will use the current working directory.",
     kind: ValueKind::Text(4096),
-    example: Some("/path/to/handler/script"),
+    example: "/path/to/handler/script",
     optional: true,
 };
 
@@ -303,7 +305,7 @@ const RUN_AS_USER: CatalogParameter = CatalogParameter {
     description: "Execute handler as another user. If not specified, then handler is \
                   executed as the same user as device client.",
     kind: ValueKind::Text(256),
-    example: Some("user1"),
+    example: "user1",
     optional: true,
 };
 
@@ -489,7 +491,7 @@ const CATALOG: &[CatalogRow] = &[
             description: "A comma separated string of command, any comma contained in \
                           the command itself needs to be escaped.",
             kind: ValueKind::Text(4096),
-            example: Some(r"echo,Hello\,World!"),
+            example: r"echo,Hello\,World!",
             optional: false,
         }],
     },
@@ -511,7 +513,7 @@ const CATALOG: &[CatalogRow] = &[
             key: "packages",
             description: "A space separated list of packages to uninstall.",
             kind: ValueKind::NameList,
-            example: Some("lftp dos2unix tcpdump"),
+            example: "lftp dos2unix tcpdump",
             optional: false,
         }],
     },
@@ -525,7 +527,7 @@ const CATALOG: &[CatalogRow] = &[
             key: "services",
             description: "A space separated list of system services to stop.",
             kind: ValueKind::NameList,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -539,7 +541,7 @@ const CATALOG: &[CatalogRow] = &[
             key: "services",
             description: "A space separated list of system services to start.",
             kind: ValueKind::NameList,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -553,7 +555,7 @@ const CATALOG: &[CatalogRow] = &[
             key: "services",
             description: "A space separated list of system services to restart.",
             kind: ValueKind::NameList,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -567,7 +569,7 @@ const CATALOG: &[CatalogRow] = &[
             key: "packages",
             description: "A space separated list of packages to install.",
             kind: ValueKind::NameList,
-            example: Some("lftp dos2unix tcpdump"),
+            example: "lftp dos2unix tcpdump",
             optional: false,
         }],
     },
@@ -582,17 +584,16 @@ const CATALOG: &[CatalogRow] = &[
                 key: "downloadUrl",
                 description: "URL of file to download.",
                 kind: ValueKind::AnyText,
-                // The service illustrates a parameter with an `example` only where it
-                // publishes one; this one carries none, so the response leaves the
-                // optional member out rather than carrying text authored here.
-                example: None,
+                // The illustration the service publishes for a value of this kind: a
+                // URL, in the reserved example domain documentation uses for one.
+                example: "http://www.example.com/index.html",
                 optional: false,
             },
             CatalogParameter {
                 key: "filePath",
                 description: "Path on the device where downloaded file is written.",
                 kind: ValueKind::AnyText,
-                example: Some("/path/to/file"),
+                example: "/path/to/file",
                 optional: false,
             },
         ],
@@ -608,66 +609,18 @@ pub fn managed_job_template_catalog() -> Vec<ManagedJobTemplate> {
     CATALOG.iter().map(CatalogRow::template).collect()
 }
 
-/// The prefix every name in AWS's MANAGED job template namespace carries, which every row
-/// of [`CATALOG`] is published under (`a_published_name_is_in_the_managed_namespace` pins
-/// that). A managed template is AWS's to name, so a `templateName` outside this namespace
-/// is not one of them and never could be — which is what decides HOW an unpublished name
-/// is refused ([`unpublished_managed_job_template`]).
-pub const MANAGED_NAME_PREFIX: &str = "AWS-";
-
-/// Whether `template_name` is a name in AWS's managed job template namespace, i.e. one a
-/// managed template could be published under. Exact text: the published names carry the
-/// prefix as written, so a differently-cased spelling of it is another namespace.
-pub fn is_managed_job_template_name_form(template_name: &str) -> bool {
-    template_name.starts_with(MANAGED_NAME_PREFIX)
-}
-
-/// How this service refuses a request that names a managed job template the catalog does
-/// not publish — the ONE decision, so a listing's filter and a describe cannot classify or
-/// word the same miss two ways.
-///
-/// The catalog is AWS-PUBLISHED reference data rather than account state, the same for
-/// every caller on every boot, and AWS publishes it under its own namespace
-/// ([`MANAGED_NAME_PREFIX`]). Which of the two modelled refusals a miss earns follows from
-/// that: a name IN the managed namespace could name a managed template, so one the catalog
-/// does not hold is a resource that is not there ([`Self::NotFound`]), while a name outside
-/// the namespace is not a managed template name at all and no catalog could ever hold it,
-/// which makes it a value the request got wrong ([`Self::Invalid`]) — the same class an
-/// unpublished `templateVersion` earns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnpublishedManagedJobTemplate {
-    /// `ResourceNotFoundException` (HTTP 404, "The specified resource does not exist"),
-    /// carrying [`managed_job_template_not_found_message`].
-    NotFound(String),
-    /// `InvalidRequestException` (HTTP 400, "The request is not valid"), carrying
-    /// [`invalid_managed_job_template_name_message`].
-    Invalid(String),
-}
-
-/// The refusal `template_name` earns from a catalog that does not publish it, with the
-/// sentence that refusal carries.
-pub fn unpublished_managed_job_template(template_name: &str) -> UnpublishedManagedJobTemplate {
-    if is_managed_job_template_name_form(template_name) {
-        return UnpublishedManagedJobTemplate::NotFound(managed_job_template_not_found_message(
-            template_name,
-        ));
-    }
-    UnpublishedManagedJobTemplate::Invalid(invalid_managed_job_template_name_message(
-        template_name,
-    ))
-}
-
-/// The sentence a `templateName` in AWS's managed namespace that the catalog does not hold
-/// is refused with: fixed text naming the kind of resource that was looked up, around the
-/// name the request sent.
-pub fn managed_job_template_not_found_message(template_name: &str) -> String {
-    format!("ManagedJobTemplate with name: {template_name} not found")
-}
-
-/// The sentence a `templateName` outside AWS's managed namespace is refused with: fixed
-/// text naming the member that was rejected, then the name the request sent — worded the
-/// way the unpublished-version refusal of the same catalog is
+/// The sentence a `templateName` the catalog does not publish is refused with: fixed text
+/// naming the member that was rejected, then the name the request sent — worded the way
+/// the unpublished-version refusal of the same catalog is
 /// ([`invalid_managed_job_template_version_message`]).
+///
+/// This is the ONE refusal a name the catalog does not publish earns, whichever operation
+/// looked it up, so a listing's filter and a describe cannot classify or word the same miss
+/// two ways. The catalog is AWS-PUBLISHED reference data rather than account state — the
+/// same for every caller on every boot, and nothing in this service creates an entry — so a
+/// name outside it names no resource that could exist and is a value the request got wrong
+/// (`InvalidRequestException`, HTTP 400, "The request is not valid") rather than a resource
+/// that is merely absent; it is the same class an unpublished `templateVersion` earns.
 pub fn invalid_managed_job_template_name_message(template_name: &str) -> String {
     format!("Invalid ManagedJobTemplate name: {template_name}")
 }
@@ -710,38 +663,44 @@ pub fn is_modeled_managed_job_template_name(template_name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The invariant [`MANAGED_NAME_PREFIX`] claims: AWS publishes its managed templates
-    /// under its own namespace, so every row of the catalog carries that prefix — which is
-    /// what makes a name outside it one no catalog could hold.
+    /// The invariant [`TEMPLATE_NAME_PREFIX`] claims: AWS publishes its managed templates
+    /// under its own name prefix, so every row of the catalog carries it — which is what
+    /// makes a row's step name the template name without that prefix.
     #[test]
-    fn a_published_name_is_in_the_managed_namespace() {
+    fn a_published_name_carries_the_published_prefix() {
         for row in CATALOG {
             assert!(
-                is_managed_job_template_name_form(row.template_name),
-                "case {:?}: a published template is named in the managed namespace",
+                row.template_name.starts_with(TEMPLATE_NAME_PREFIX),
+                "case {:?}: a published template carries the published name prefix",
+                row.template_name
+            );
+            assert_ne!(
+                row.step_name(),
+                row.template_name,
+                "case {:?}: the step name is the template name without its prefix",
                 row.template_name
             );
         }
     }
 
-    /// The classification of a name the catalog does not hold, on each side of the
-    /// namespace: in it, the resource is simply not there; outside it, the name is not a
-    /// managed template name at all.
+    /// Every parameter the catalog publishes carries the illustration that goes with its
+    /// guidance: the member is published for every parameter of every managed template, so
+    /// a client that seeds a form from the catalog gets one for each.
     #[test]
-    fn an_unpublished_name_is_classified_by_the_namespace_it_is_in() {
-        assert_eq!(
-            unpublished_managed_job_template("AWS-Not-Published"),
-            UnpublishedManagedJobTemplate::NotFound(
-                "ManagedJobTemplate with name: AWS-Not-Published not found".to_string()
-            ),
-            "a name in the managed namespace that is not published is a not-found"
-        );
-        assert_eq!(
-            unpublished_managed_job_template("not-managed"),
-            UnpublishedManagedJobTemplate::Invalid(
-                "Invalid ManagedJobTemplate name: not-managed".to_string()
-            ),
-            "a name outside the managed namespace is not a managed template name"
-        );
+    fn every_published_parameter_carries_its_example() {
+        for row in CATALOG {
+            for parameter in row.parameters() {
+                let published = parameter.document_parameter();
+                assert!(
+                    published.example.as_deref().is_some_and(|example| {
+                        !example.is_empty() && !example.chars().any(char::is_control)
+                    }),
+                    "case {:?}/{:?}: expected a published example, got {:?}",
+                    row.template_name,
+                    parameter.key,
+                    published.example
+                );
+            }
+        }
     }
 }

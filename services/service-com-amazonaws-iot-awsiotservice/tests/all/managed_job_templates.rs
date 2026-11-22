@@ -15,6 +15,9 @@
 //!   the SERVICE's text, the same for every caller, so a client that renders the catalog
 //!   or validates a parameter value against a published `regex` reads the service's rule
 //!   and not one this emulator invented;
+//! * every entry's `documentParameters` carries, for EVERY parameter, the `example`
+//!   illustrating the pattern that goes there — the member a client seeds or renders a
+//!   parameter from, published for each one rather than for some of them;
 //! * both operations report the same entries on a store nothing has written, no request
 //!   creates or changes one, and reading one changes nothing a later caller sees;
 //! * a listing carries ONE ENTRY PER (template, version) PAIR in the order the service
@@ -23,13 +26,12 @@
 //!   account segment of AWS-managed data) scoped to the region the request was signed
 //!   for;
 //! * `templateName` narrows the listing to that template's versions, and a `templateName`
-//!   of the modelled shape that names no published template is refused by WHICH namespace
-//!   the name is in: AWS publishes its managed templates under its own name prefix, so a
-//!   name in that namespace which the catalog does not hold is a NOT-FOUND
-//!   (`ResourceNotFoundException`, 404, "ManagedJobTemplate with name: <name> not found")
-//!   while a name outside it is not a managed template name at all and is an INVALID
-//!   REQUEST (`InvalidRequestException`, 400, "Invalid ManagedJobTemplate name: <name>");
-//!   both operations that look a name up classify and word a miss the same way;
+//!   of the modelled shape that names no published template is refused rather than
+//!   answered: the catalog is AWS's own published data that nothing creates into, so such a
+//!   name can never name a template and is an INVALID REQUEST
+//!   (`InvalidRequestException`, 400, "Invalid ManagedJobTemplate name: <name>") whichever
+//!   namespace its text is in; both operations that look a name up classify and word a miss
+//!   the same way;
 //! * `maxResults` bounds the page and `nextToken` resumes the SAME listing exactly once
 //!   per entry, for EVERY page size from one to past the number of entries;
 //! * every listed entry is DESCRIBABLE: the describe reports the listing's five members
@@ -60,26 +62,21 @@ const REGION: &str = "eu-west-2";
 const QUALIFIED_INVALID_REQUEST: &str =
     "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// The wire error shape of a name in AWS's managed namespace that the catalog does not
-/// hold: a resource that is not there.
-const UNPUBLISHED_IN_NAMESPACE: &str = "ResourceNotFoundException";
-
-/// The wire error shape of a name outside that namespace: the qualified
+/// The wire error shape of a `templateName` the catalog does not publish: the qualified
 /// `InvalidRequestException`, as the version refusal of the same catalog carries.
-const UNPUBLISHED_OUTSIDE_NAMESPACE: &str = QUALIFIED_INVALID_REQUEST;
+const UNPUBLISHED_NAME_ERROR_TYPE: &str = QUALIFIED_INVALID_REQUEST;
 
-/// The prefix AWS publishes its managed job templates under, which every published name
-/// carries and which decides how an unpublished name is refused.
-const MANAGED_NAME_PREFIX: &str = "AWS-";
+/// The status a `templateName` the catalog does not publish is refused with.
+const UNPUBLISHED_NAME_STATUS: u16 = 400;
 
 /// One `documentParameter` the catalog publishes: the pattern a caller replaces and the
-/// guidance published with it. `example` is `None` for a parameter the service publishes
-/// no example for, which is then absent from the response.
+/// guidance published with it, including the `example` AWS publishes for EVERY parameter
+/// of every managed template.
 struct PublishedParameter {
     key: &'static str,
     description: &'static str,
     regex: &'static str,
-    example: Option<&'static str>,
+    example: &'static str,
     optional: bool,
 }
 
@@ -90,7 +87,7 @@ const RUN_AS_USER: PublishedParameter = PublishedParameter {
     description: "Execute handler as another user. If not specified, then handler is \
                   executed as the same user as device client.",
     regex: "(.){0,256}",
-    example: Some("user1"),
+    example: "user1",
     optional: true,
 };
 
@@ -101,7 +98,7 @@ const PATH_TO_HANDLER: PublishedParameter = PublishedParameter {
     description: "Path to handler on the device. If not specified, then device client \
                   will use the current working directory.",
     regex: "(.){0,4096}",
-    example: Some("/path/to/handler/script"),
+    example: "/path/to/handler/script",
     optional: true,
 };
 
@@ -166,7 +163,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             description: "A comma separated string of command, any comma contained in \
                           the command itself needs to be escaped.",
             regex: "(.){0,4096}",
-            example: Some(r"echo,Hello\,World!"),
+            example: r"echo,Hello\,World!",
             optional: false,
         }],
     },
@@ -186,7 +183,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             key: "packages",
             description: "A space separated list of packages to uninstall.",
             regex: NAME_LIST_REGEX,
-            example: Some("lftp dos2unix tcpdump"),
+            example: "lftp dos2unix tcpdump",
             optional: false,
         }],
     },
@@ -199,7 +196,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             key: "services",
             description: "A space separated list of system services to stop.",
             regex: NAME_LIST_REGEX,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -212,7 +209,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             key: "services",
             description: "A space separated list of system services to start.",
             regex: NAME_LIST_REGEX,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -225,7 +222,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             key: "services",
             description: "A space separated list of system services to restart.",
             regex: NAME_LIST_REGEX,
-            example: Some("cron httpd bluetooth"),
+            example: "cron httpd bluetooth",
             optional: false,
         }],
     },
@@ -238,7 +235,7 @@ const PUBLISHED: &[PublishedTemplate] = &[
             key: "packages",
             description: "A space separated list of packages to install.",
             regex: NAME_LIST_REGEX,
-            example: Some("lftp dos2unix tcpdump"),
+            example: "lftp dos2unix tcpdump",
             optional: false,
         }],
     },
@@ -252,14 +249,14 @@ const PUBLISHED: &[PublishedTemplate] = &[
                 key: "downloadUrl",
                 description: "URL of file to download.",
                 regex: "(.*?)",
-                example: None,
+                example: "http://www.example.com/index.html",
                 optional: false,
             },
             PublishedParameter {
                 key: "filePath",
                 description: "Path on the device where downloaded file is written.",
                 regex: "(.*?)",
-                example: Some("/path/to/file"),
+                example: "/path/to/file",
                 optional: false,
             },
         ],
@@ -424,40 +421,28 @@ fn expected_pairs() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The sentence a name IN the managed namespace that the catalog does not hold is refused
-/// with.
-fn not_found_message(template_name: &str) -> String {
-    format!("ManagedJobTemplate with name: {template_name} not found")
-}
-
-/// The sentence a name OUTSIDE the managed namespace is refused with.
+/// The sentence a `templateName` the catalog does not publish is refused with.
 fn unpublished_name_message(template_name: &str) -> String {
     format!("Invalid ManagedJobTemplate name: {template_name}")
 }
 
 /// What a name the catalog does not hold must be refused with: the status, the
-/// `x-amzn-errortype` and the sentence, decided by the namespace the name is in — stated
-/// once, so the describe's rows and the listing filter's rows cannot disagree.
+/// `x-amzn-errortype` and the sentence — stated once, so the describe's rows and the
+/// listing filter's rows cannot disagree.
 fn unpublished(template_name: &str) -> (u16, &'static str, String) {
-    if template_name.starts_with(MANAGED_NAME_PREFIX) {
-        return (
-            404,
-            UNPUBLISHED_IN_NAMESPACE,
-            not_found_message(template_name),
-        );
-    }
     (
-        400,
-        UNPUBLISHED_OUTSIDE_NAMESPACE,
+        UNPUBLISHED_NAME_STATUS,
+        UNPUBLISHED_NAME_ERROR_TYPE,
         unpublished_name_message(template_name),
     )
 }
 
-/// The names the catalog does not hold that every lookup is exercised over: four in AWS's
-/// managed namespace (a name of the right shape, a prefix of a published name, a published
-/// name with a trailing hyphen, and the longest such name `@length 1..64` admits) and four
-/// outside it (a differently-cased spelling of the prefix, a name of another vendor's
-/// shape, the bare prefix word without its hyphen, and the longest name the model admits).
+/// The names the catalog does not hold that every lookup is exercised over: four whose
+/// text is in AWS's published name prefix (a name of the right shape, a prefix of a
+/// published name, a published name with a trailing hyphen, and the longest such name
+/// `@length 1..64` admits) and four outside it (a differently-cased spelling of the prefix,
+/// a name of another vendor's shape, the bare prefix word without its hyphen, and the
+/// longest name the model admits) — the rule is the same for all of them.
 fn unpublished_names() -> Vec<String> {
     vec![
         "AWS-Does-Not-Exist".to_string(),
@@ -543,9 +528,7 @@ fn expected_parameters(published: &PublishedTemplate) -> Vec<Value> {
             object.insert("key".to_string(), json!(parameter.key));
             object.insert("description".to_string(), json!(parameter.description));
             object.insert("regex".to_string(), json!(parameter.regex));
-            if let Some(example) = parameter.example {
-                object.insert("example".to_string(), json!(example));
-            }
+            object.insert("example".to_string(), json!(parameter.example));
             object.insert("optional".to_string(), json!(parameter.optional));
             Value::Object(object)
         })
@@ -648,7 +631,7 @@ async fn listing_narrows_to_one_templates_versions() {
 }
 
 #[tokio::test]
-async fn a_filter_naming_no_published_template_is_refused_by_its_namespace() {
+async fn a_filter_naming_no_published_template_is_refused_as_an_invalid_request() {
     let emulator = Emulator::new();
     for name in unpublished_names() {
         let (status, errortype, message) = unpublished(&name);
@@ -814,6 +797,55 @@ async fn describe_reports_the_published_document_and_parameters() {
 }
 
 #[tokio::test]
+async fn every_published_parameter_is_served_with_its_example() {
+    let emulator = Emulator::new();
+    // The rows span every published template and both forms a request can select a
+    // version in: the example is published data of the parameter, so it is served
+    // whichever way the entry is reached.
+    let selections = [
+        ("default version", String::new()),
+        (
+            "named version",
+            format!("templateVersion={PUBLISHED_VERSION}"),
+        ),
+    ];
+    for published in PUBLISHED {
+        let name = published.template_name;
+        for (case, query) in &selections {
+            let reply = emulator.describe(name, query).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {name:?}/{case}: expected 200, got {reply:?}"
+            );
+            let parameters = reply
+                .body
+                .get("documentParameters")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                parameters.len(),
+                published.published_parameters().len(),
+                "case {name:?}/{case}: expected every declared parameter, got {parameters:?}"
+            );
+            for parameter in &parameters {
+                let key = member(parameter, "key");
+                let example = parameter.get("example").and_then(Value::as_str);
+                // `DocumentParameter$example` is `@pattern ^[^\p{C}]+$`
+                // (`smithy_query(query="shape",shape="DocumentParameter")`): present, at
+                // least one character, and no control character.
+                assert!(
+                    example.is_some_and(|example| !example.is_empty()
+                        && !example.chars().any(char::is_control)),
+                    "case {name:?}/{case}/{key:?}: expected a published example of the \
+                     modelled form, got {example:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn every_listed_entry_is_describable_with_its_document() {
     let emulator = Emulator::new();
     let listing = emulator.list("").await;
@@ -962,7 +994,7 @@ async fn describe_selects_the_version_and_defaults_to_the_published_one() {
 }
 
 #[tokio::test]
-async fn describing_a_template_the_catalog_does_not_publish_is_refused_by_its_namespace() {
+async fn describing_a_template_the_catalog_does_not_publish_is_refused_as_an_invalid_request() {
     let emulator = Emulator::new();
     // The same names the listing's filter rows span, so a describe and a listing cannot
     // classify or word one miss two ways.
