@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVerifiedAccessEndpointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVerifiedAccessEndpointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVerifiedAccessEndpointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the Verified Access policy the store holds for the endpoint the
+//! request names — the document `CreateVerifiedAccessEndpoint` accepted and whether that
+//! policy is in effect — and refuses an id the account holds no endpoint for. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVerifiedAccessEndpointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVerifiedAccessEndpointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVerifiedAccessEndpointPolicy"))
+        use crate::state;
+
+        // Both members reported here are read off the STORED endpoint, so nothing is taken
+        // from the request's metadata; the store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+
+        // A reporting operation may write only what the CLOCK already made due — an
+        // endpoint's `pending` -> `active` move, and the removal a begun delete left owed —
+        // so this read answers from the state a caller would have seen anyway.
+        store.materialize_due_transitions();
+
+        // "Get the Verified Access policy associated with THE ENDPOINT": an id this account
+        // holds no endpoint for has no policy to report, so it is refused rather than
+        // answered with the empty report an endpoint carrying no policy answers.
+        let endpoint = store
+            .verified_access_endpoints
+            .get(&input.verified_access_endpoint_id)
+            .ok_or_else(|| {
+                state::invalid_verified_access_endpoint_id_not_found(
+                    &input.verified_access_endpoint_id,
+                )
+            })?;
+
+        // "The Verified Access policy document"
+        // (`GetVerifiedAccessEndpointPolicyResult$PolicyDocument`): the document the endpoint
+        // was created with, kept beside the stored endpoint
+        // ([`crate::state::VerifiedAccessEndpointRecord::policy_document`]) because the
+        // modelled endpoint shape carries no member for it. A document of no text is no
+        // policy at all, so it is reported as the absent member rather than as an empty one.
+        let policy_document = endpoint
+            .policy_document
+            .as_deref()
+            .filter(|document| !document.trim().is_empty())
+            .map(str::to_string);
+
+        // DryRun sits AFTER the named endpoint has been resolved and BEFORE anything is
+        // reported: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        Ok(GetVerifiedAccessEndpointPolicyOutput {
+            // "The status of the Verified Access policy"
+            // (`GetVerifiedAccessEndpointPolicyResult$PolicyEnabled`): the endpoint enforces a
+            // policy exactly when it holds one to enforce, so the status is reported off the
+            // stored document rather than kept as a second fact that could disagree with it.
+            policy_enabled: Some(policy_document.is_some()),
+            policy_document,
+        })
     }
 }

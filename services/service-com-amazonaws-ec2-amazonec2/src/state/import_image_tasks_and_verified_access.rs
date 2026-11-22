@@ -1837,9 +1837,13 @@ pub struct VerifiedAccessEndpointRecord {
     pub pending: Option<ClockTransition<&'static str>>,
     /// "The Verified Access policy document"
     /// (`CreateVerifiedAccessEndpointRequest$PolicyDocument`), which the modelled endpoint
-    /// shape carries no member for: `GetVerifiedAccessEndpointPolicy` is what reports it
-    /// (still a scaffold stub with its own open issue). Kept here so the document the create
-    /// accepted is the one that reader will answer with, rather than dropped on the floor.
+    /// shape carries no member for: `GetVerifiedAccessEndpointPolicy` is what reports it, and
+    /// whether the endpoint enforces a policy is read off this document rather than kept
+    /// beside it — nothing in this emulator can yet set that status on its own, because
+    /// `ModifyVerifiedAccessEndpointPolicy`, which takes `PolicyEnabled` as its own member,
+    /// is still a scaffold stub with its own open issue; implementing it means keeping the
+    /// status here as a stored fact beside the document. Kept here so the document the create
+    /// accepted is the one that reader answers with, rather than dropped on the floor.
     pub policy_document: Option<String>,
 }
 
