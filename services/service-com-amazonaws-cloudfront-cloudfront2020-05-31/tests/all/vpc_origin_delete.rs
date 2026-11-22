@@ -69,7 +69,7 @@ const NOT_FOUND_MESSAGE: &str = "The specified vpc origin does not exist";
 /// The sentence a delete of a VPC origin whose endpoint has not been deployed yet answers
 /// with.
 const ILLEGAL_DELETE_MESSAGE: &str =
-    "The request failed because delete is not allowed while the VPC origin is being deployed.";
+    "The request failed because delete is not allowed for this vpc origin";
 
 /// The sentence a delete of a VPC origin a distribution still fronts answers with.
 const IN_USE_MESSAGE: &str = "The entity cannot be deleted while it is in use.";

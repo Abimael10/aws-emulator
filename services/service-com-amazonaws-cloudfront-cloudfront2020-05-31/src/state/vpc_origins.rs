@@ -102,11 +102,18 @@ pub fn vpc_origin_already_exists() -> EntityAlreadyExists {
 /// `DeleteVpcOrigin` models `IllegalDelete` ("Deletion is not allowed for this entity"), and the
 /// condition it states for this resource kind is the one the CLOCK owes away: a VPC origin whose
 /// create is still propagating to the edge locations ([`VPC_ORIGIN_STATUS_DEPLOYING`]) is not a
-/// VPC origin a delete may remove, so the refusal stands until the deployment settles. Worded in
-/// the form [`ILLEGAL_DELETE_MANAGED_POLICY_MESSAGE`] gives this code — the CONDITION and
-/// nothing from the request — so every refusal of it reads the same.
+/// VPC origin a delete may remove, so the refusal stands until the deployment settles.
+///
+/// The value below is the WIRE text — what the recorded service answers this condition with for
+/// THIS resource kind — and it is FIXED whole: it states the condition and interpolates nothing,
+/// so neither the identifier addressed, the name the configuration holds nor the status the record
+/// reports reaches it, and every refusal of the condition reads the same. Down to the lower-case
+/// resource name and the absent full stop, as [`VPC_ORIGIN_NOT_FOUND_MESSAGE`] is written: it is
+/// not how the neighbouring kinds sharing this code word their own
+/// ([`ILLEGAL_DELETE_MANAGED_POLICY_MESSAGE`]), and it is the one part of the refusal a caller
+/// retrying a still-deploying delete branches on, so do not "correct" it into theirs.
 pub const VPC_ORIGIN_ILLEGAL_DELETE_MESSAGE: &str =
-    "The request failed because delete is not allowed while the VPC origin is being deployed.";
+    "The request failed because delete is not allowed for this vpc origin";
 
 /// The modelled `IllegalDelete` (HTTP 400) for a delete of a VPC origin that is still deploying
 /// ([`VPC_ORIGIN_ILLEGAL_DELETE_MESSAGE`]).
