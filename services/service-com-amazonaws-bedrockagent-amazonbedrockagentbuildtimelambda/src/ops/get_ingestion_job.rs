@@ -166,6 +166,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for the job.
         state.materialise_due_transitions(now);
 
+        // The job is nested under the data source that ran it, so the data
+        // source is what this read resolves first: a request whose
+        // `dataSourceId` resolves to nothing addresses no job at all, and the
+        // refusal names THAT data source rather than the job id it also
+        // carried. The pair selects the data source, exactly as `GetDataSource`
+        // selects it, so an unresolvable `knowledgeBaseId` is reported the same
+        // way — as the data source the pair does not resolve.
+        if state
+            .data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .is_none()
+        {
+            return Err(GetIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::data_source_not_found_message(
+                        &input.data_source_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // An ingestion job is identified by the knowledge base and data source
         // it ran for as well as its own id, so an id of another data source's
         // job is as absent here as one nothing holds.
