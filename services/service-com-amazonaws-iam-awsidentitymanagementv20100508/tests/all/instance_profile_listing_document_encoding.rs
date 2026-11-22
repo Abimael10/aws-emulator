@@ -52,14 +52,18 @@ use crate::role_lifecycle::{borrowed, param};
 use crate::user_lifecycle::{call, element, elements, router};
 
 /// One trust policy the fixture stores on a role of its own.
-struct TrustPolicyCase {
-    case: &'static str,
+///
+/// The corpus is shared with the suites that drive the same member from another angle
+/// (`tests/all/instance_profile_listing_document_round_trip.rs`), so the documents the rule
+/// generalises over are written down once and cannot drift apart.
+pub(crate) struct TrustPolicyCase {
+    pub(crate) case: &'static str,
     /// The text `CreateRole` carries.
-    submitted: &'static str,
+    pub(crate) submitted: &'static str,
     /// The text the account HOLDS for it — the policy rendered, which is what every read
     /// reports (encoded): the whitespace between its JSON tokens gone, a one-element
     /// string-or-array element written as its string.
-    stored: &'static str,
+    pub(crate) stored: &'static str,
 }
 
 /// The compact trust policy of an instance profile's role: the EC2 service principal, which
@@ -88,7 +92,7 @@ const OTHER_PATH: &str = "/elsewhere/";
 /// (`smithy_query(query="shape",shape="policyDocumentType")`), so the tab, the line feed and
 /// every byte up to U+00FF are part of what a caller may submit and therefore part of what a
 /// report has to carry back.
-fn trust_policies() -> Vec<TrustPolicyCase> {
+pub(crate) fn trust_policies() -> Vec<TrustPolicyCase> {
     vec![
         TrustPolicyCase {
             case: "the compact trust policy of an instance profile's role",
