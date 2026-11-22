@@ -2282,6 +2282,13 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// store has at most one and a pump that is no longer running them holds it no longer
     /// ([`PumpLease`], taken through [`PumpClaim`]).
     pub recording_pump: PumpLease,
+    /// The lease on the request that is OBSERVING this account's resources inline
+    /// ([`materialise_recorded_types`]), so one store observes at most once at a time: a
+    /// resource of this account is read through the service that owns it, and that
+    /// service's answer can reach Config again (an evaluator delivering its verdicts),
+    /// which must not start an observation nested inside the one it was reached from.
+    /// Taken through [`PumpClaim`], so it is given up however that request ended.
+    pub recording_inline_pass: PumpLease,
     /// Whether an in-process pump is already performing the configuration-snapshot
     /// deliveries this store owes, so one store has at most one
     /// ([`Self::claim_snapshot_delivery_pump`]); see `state::snapshot_delivery` for what

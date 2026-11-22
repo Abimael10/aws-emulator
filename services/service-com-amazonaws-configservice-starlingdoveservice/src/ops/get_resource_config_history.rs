@@ -219,6 +219,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.limit
         } as usize;
 
+        // What a recorder that is recording owes for a resource of this TYPE is the
+        // configuration item of the state it is in, so the type this read is about is
+        // observed before the window below is opened: the item reported is the one the
+        // resource's configuration owed at the instant it was asked for, which is what a
+        // client polling this read after a change is waiting for. It happens before that
+        // window because "If not specified, current time is taken" for its later end — a
+        // window opened first would end before the item the observation records, and this
+        // read would report no item at all. It happens after the refusals above, so a
+        // request this operation does not serve costs the account's services nothing.
+        // Nothing is observed for a type the account does not record.
+        crate::state::materialise_recorded_types(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            &[input.resource_type.as_str()],
+        )
+        .await;
+        // A configuration item that observation recorded owes the rules whose scope covers
+        // the resource an invocation, so the pump that performs them is started — the same
+        // way the operations that make a pass due start it.
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
+
         // "The chronologically latest time in the time range for which the history
         // requested. If not specified, current time is taken", and the earliest time
         // bounds the other end — so a range whose earlier time is not before its later

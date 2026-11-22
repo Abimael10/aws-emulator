@@ -166,81 +166,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let name = input.configuration_recorder_name;
-        let mut store = state.lock();
+        // Whether THIS call is the one that turned recording on, which is what owes the
+        // inventory below: a start of a recorder that is already recording changes
+        // nothing, so it takes none.
+        let turned_on;
+        // The whole decision and the write it makes are one critical section, which ends
+        // before the observation below: that observation reads this account's resources
+        // through the services that own them, so no guard of this store may be held
+        // across it.
+        {
+            let mut store = state.lock();
 
-        let Some(recorder) = store.recorders.get(&name) else {
-            return Err(
-                StartConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
-                    NoSuchConfigurationRecorderException {
-                        message: Some(
-                            crate::state::no_such_configuration_recorder_message(
-                                crate::state::RecorderSelector::Name,
+            let Some(recorder) = store.recorders.get(&name) else {
+                return Err(
+                    StartConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
+                        NoSuchConfigurationRecorderException {
+                            message: Some(
+                                crate::state::no_such_configuration_recorder_message(
+                                    crate::state::RecorderSelector::Name,
+                                ),
                             ),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
-        // This operation does not affect a service-linked configuration recorder: that
-        // recorder is ALWAYS RECORDING, so there is nothing for this call to start
-        // (`UnmodifiableEntityException`). The refusal names the operation that was
-        // refused and the recorder it was refused on, the same way the stop of such a
-        // recorder is refused.
-        if recorder.is_service_linked() {
-            return Err(
-                StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
-                    UnmodifiableEntityException {
-                        message: Some(
-                            crate::state::service_linked_recorder_always_recording_message(
-                                Self::NAME,
-                                &name,
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // This operation does not affect a service-linked configuration recorder: that
+            // recorder is ALWAYS RECORDING, so there is nothing for this call to start
+            // (`UnmodifiableEntityException`). The refusal names the operation that was
+            // refused and the recorder it was refused on, the same way the stop of such a
+            // recorder is refused.
+            if recorder.is_service_linked() {
+                return Err(
+                    StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
+                        UnmodifiableEntityException {
+                            message: Some(
+                                crate::state::service_linked_recorder_always_recording_message(
+                                    Self::NAME,
+                                    &name,
+                                ),
                             ),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-        let arn = recorder.arn.clone();
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let arn = recorder.arn.clone();
 
-        // Config needs somewhere to deliver what it records before it can record.
-        if store.delivery_channels.is_empty() {
-            return Err(
-                StartConfigurationRecorderErrorModeled::NoAvailableDeliveryChannelException(
-                    NoAvailableDeliveryChannelException {
-                        message: Some(
-                            crate::state::NO_DELIVERY_CHANNEL_TO_START_RECORDER.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
+            // Config needs somewhere to deliver what it records before it can record.
+            if store.delivery_channels.is_empty() {
+                return Err(
+                    StartConfigurationRecorderErrorModeled::NoAvailableDeliveryChannelException(
+                        NoAvailableDeliveryChannelException {
+                            message: Some(
+                                crate::state::NO_DELIVERY_CHANNEL_TO_START_RECORDER.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
 
-        let now = ::std::time::SystemTime::now();
-        let status = store
-            .recorder_status
-            .entry(name.clone())
-            .or_insert_with(|| crate::state::RecorderStatusEntry::new(&name, &arn));
+            let now = ::std::time::SystemTime::now();
+            let status = store
+                .recorder_status
+                .entry(name.clone())
+                .or_insert_with(|| crate::state::RecorderStatusEntry::new(&name, &arn));
 
-        // Starting a recorder that is already recording changes nothing: the start
-        // this recorder is serving is the one already stamped.
-        if !status.recording {
-            status.recording = true;
-            status.last_start_time = Some(now);
-            status.last_status = Some(crate::state::RECORDER_STATUS_PENDING.to_string());
-            status.last_status_change_time = Some(now);
-            // The recording event is `Pending` until it has been processed; the clock
-            // owes the move to `Success` at this instant, which the status describe
-            // materialises.
-            status.status_settles_at = Some(now + crate::state::RECORDER_STATUS_SETTLE_AFTER);
+            // Starting a recorder that is already recording changes nothing: the start
+            // this recorder is serving is the one already stamped.
+            turned_on = !status.recording;
+            if turned_on {
+                status.recording = true;
+                status.last_start_time = Some(now);
+                status.last_status = Some(crate::state::RECORDER_STATUS_PENDING.to_string());
+                status.last_status_change_time = Some(now);
+                // The recording event is `Pending` until it has been processed; the clock
+                // owes the move to `Success` at this instant, which the status describe
+                // materialises.
+                status.status_settles_at = Some(now + crate::state::RECORDER_STATUS_SETTLE_AFTER);
+            }
         }
         // A recorder that is recording keeps observing this account's resources with no
-        // further call, so the guard is released and the pump that runs those passes is
-        // started.
-        drop(store);
-        crate::state::drive_recorder_clock(ctx, &self.engine, &crate::state::request_region(ctx));
+        // further call, so the guard is released, the inventory below is taken and the
+        // pump that runs the later passes is started.
+        let region = crate::state::request_region(ctx);
+        // Turning recording ON takes an INVENTORY: Config "discovers all the supported
+        // resources in your account and records their configurations" when the
+        // configuration recorder starts recording, so the resources this recorder records
+        // are observed here and each one's current configuration is recorded. That is what
+        // a recorder resumed after a stop catches up with — every resource that came into
+        // existence, changed or went away while it was stopped has its state recorded as it
+        // is NOW (nothing is backfilled for the stopped window, because Config observed
+        // nothing then) — and it is what makes a later change to one of them the SECOND
+        // item of that resource rather than its first. Only the call that TURNED recording
+        // on takes it: a start of a recorder that was already recording changes nothing, so
+        // it records nothing either.
+        if turned_on {
+            crate::state::materialise_recorded_types(
+                ctx.callback(),
+                &*self.engine,
+                &region,
+                &crate::state::OBSERVABLE_RESOURCE_TYPES,
+            )
+            .await;
+        }
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
 
         Ok(StartConfigurationRecorderOutput)
     }

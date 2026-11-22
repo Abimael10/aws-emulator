@@ -201,6 +201,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports belongs to the Region the request is signed for.
         let region = crate::state::request_region(ctx);
 
+        // What a recorder that is recording owes for a resource of a type it records is
+        // the configuration item of the state it is in, so the types this batch is about
+        // are observed before it answers: the items it reports are the ones those
+        // resources' configurations owed at the instant they were asked for. Nothing is
+        // observed for a type the account does not record.
+        let asked_types: Vec<&str> = requested
+            .iter()
+            .map(|key| key.resource_type.as_str())
+            .collect();
+        crate::state::materialise_recorded_types(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            &asked_types,
+        )
+        .await;
+        // A configuration item that observation recorded owes the rules whose scope covers
+        // the resource an invocation, so the pump that performs them is started — the same
+        // way the operations that make a pass due start it.
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
+
         // Read-only: the guard is taken, the configuration items are projected out of
         // the inventory, and nothing is written.
         let store = state.lock();

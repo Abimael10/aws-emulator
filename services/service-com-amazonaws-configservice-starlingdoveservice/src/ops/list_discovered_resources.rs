@@ -282,6 +282,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.limit
         } as usize;
 
+        // What a recorder that is recording owes for a resource of this TYPE is the
+        // configuration item of the state it is in, so the type this listing is about is
+        // observed before it answers: what it reports is what the account held at the
+        // instant it was asked. Nothing is observed for a type the account does not
+        // record.
+        let region = crate::state::request_region(ctx);
+        crate::state::materialise_recorded_types(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            &[input.resource_type.as_str()],
+        )
+        .await;
+        // A configuration item that observation recorded owes the rules whose scope covers
+        // the resource an invocation, so the pump that performs them is started — the same
+        // way the operations that make a pass due start it.
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
+
         let store = state.lock();
 
         // This is a REPORT of the discovered-resource inventory, so what the inventory

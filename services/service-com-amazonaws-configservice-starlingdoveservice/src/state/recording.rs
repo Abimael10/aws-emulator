@@ -10,11 +10,15 @@
 //! Neither half needs a call from the caller: a recorder that is recording keeps
 //! recording, and "when you create a rule, Config evaluates your resources against
 //! the rule automatically" (`PutConfigRule`). So a pass is OWED at an instant
-//! ([`RECORDING_PASS_DUE_AFTER`] after the call that made it due) and is run by the
-//! in-process pump [`drive_recorder_clock`] starts — which is what lets a client that
-//! consumes only the resulting compliance-change events make no further Config call
-//! at all. A caller reading before that instant still sees the state from before the
-//! pass, and the pass writes nothing a read could have written.
+//! ([`RECORDING_PASS_DUE_AFTER`] after the call that made it due) and is performed by
+//! the in-process pump [`drive_recorder_clock`] starts — which is what lets a client
+//! that consumes only the resulting compliance-change events make no further Config
+//! call at all. A caller reading before that instant still sees the state from before
+//! the pass, and the pass writes nothing a read could have written. A pass the pump
+//! did not perform leaves the account owing it, so nothing it was owed for is lost:
+//! starting a recorder observes what it records straight away, and an operation that
+//! REPORTS the resources of a type observes that type before it answers
+//! ([`materialise_recorded_types`]).
 //!
 //! What Config OBSERVES, it observes through the owning service's own API, reached
 //! over the in-process callback
@@ -137,6 +141,19 @@ const MAX_RECORDING_PASSES: usize = 10_000;
 /// for good — which is how an account that is recording would stop recording. Many
 /// passes' worth of time, so a pass that is merely slow is never given up on.
 const PASS_ANSWERS_WITHIN: Duration = Duration::from_secs(60);
+
+/// How long the observation a REQUEST performs itself
+/// ([`materialise_recorded_types`]) may run before that request is served without it.
+///
+/// A HOST bound of the same kind as [`PASS_ANSWERS_WITHIN`], and a shorter one because a
+/// caller is waiting: a resource read that does not answer delays the request by this
+/// much at most, nothing is recorded for what was not observed, and the next request
+/// observes again. Shorter than the lease that guards one observation
+/// ([`super::PUMP_LEASE_HOLDS_FOR`]), so that lease cannot lapse under an observation
+/// still running and let a second one start beside it. Many observations' worth of time,
+/// so one that is merely slow — a host running every test of this workspace at once —
+/// still finishes.
+const INLINE_PASS_ANSWERS_WITHIN: Duration = Duration::from_secs(12);
 
 /// The most verdict CHANGES one pass records and publishes.
 ///
@@ -533,31 +550,54 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         self.recording_pump.renew(id, now).then_some(due)
     }
 
-    /// Take the pass the clock has made due as of `now`, as the resource types the
-    /// recording recorder records and this emulator can observe; `None` when no pass is
-    /// due yet.
+    /// The pass the clock has made due as of `now`, as the resource types the recording
+    /// recorder records and this emulator can observe; `None` when no pass is due yet.
     ///
-    /// Taking it clears the due instant, so one due pass runs once however many pumps
-    /// ask for it. The list is EMPTY while no recorder is recording: nothing is observed
-    /// then, and the pass is still the one that evaluates the rules the account owes a
-    /// verdict for.
+    /// The due instant is NOT cleared here: what clears it is a pass that was PERFORMED
+    /// ([`Self::note_recording_pass_performed`]), which owes the next one from the instant
+    /// the recorded state was brought up to date. That is what makes continuous recording
+    /// survive a pass nothing finished — a task the host stopped driving, one that was
+    /// given up on, one dropped with the request it was started from — because the pass is
+    /// still owed afterwards and whatever reaches it next performs it, rather than the
+    /// account going on reporting `recording: true` while nothing is ever recorded again.
+    /// Two callers reaching one owed pass together each perform it, which records the same
+    /// state twice and writes a configuration item once: an observation of a resource that
+    /// is still in the state its held item records writes nothing
+    /// ([`Self::record_discovered_resource`]).
+    pub fn take_due_recording_pass(&mut self, now: SystemTime) -> Option<Vec<&'static str>> {
+        if self.recording_pass_due.is_none_or(|due| now < due) {
+            return None;
+        }
+        Some(self.recorded_resource_types())
+    }
+
+    /// The resource types one pass OBSERVES: the ones this emulator can read and the
+    /// recording recorder records.
+    ///
+    /// The list is EMPTY while no recorder is recording: nothing is observed then, and the
+    /// pass is still the one that evaluates the rules the account owes a verdict for.
     ///
     /// A GLOBAL resource type is observed only where the recording group asks for the
     /// global resource types (`RecordingGroup$includeGlobalResourceTypes`) or names that
     /// type itself, which is what a group of `allSupported` alone does not cover
     /// (`PutConfigurationRecorder`: "Default is to record all supported resource types,
     /// excluding the global IAM resource types").
-    pub fn take_due_recording_pass(&mut self, now: SystemTime) -> Option<Vec<&'static str>> {
-        if self.recording_pass_due.is_none_or(|due| now < due) {
-            return None;
-        }
+    pub fn recorded_resource_types(&self) -> Vec<&'static str> {
+        OBSERVABLE_RESOURCE_TYPES
+            .into_iter()
+            .filter(|resource_type| self.records_resource_type(resource_type))
+            .collect()
+    }
+
+    /// Note that a pass has brought the recorded state up to date as of `now`: the next
+    /// pass this account owes falls due [`RECORDING_PASS_DUE_AFTER`] from here.
+    ///
+    /// Called under the same guard that recorded what the pass observed, so the instant
+    /// the next pass is owed from is the instant the inventory reflects — and an account
+    /// that owes no further pass (every recorder stopped, every rule evaluated) owes none.
+    pub fn note_recording_pass_performed(&mut self, now: SystemTime) {
         self.recording_pass_due = None;
-        Some(
-            OBSERVABLE_RESOURCE_TYPES
-                .into_iter()
-                .filter(|resource_type| self.records_resource_type(resource_type))
-                .collect(),
-        )
+        self.owe_recording_pass(now);
     }
 
     /// Whether this account is RECORDING `resource_type` at this instant: a recorder of
@@ -767,43 +807,26 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
     let Some(resource_types) = state.lock().take_due_recording_pass(now) else {
         return;
     };
-    let mut observed: Vec<(&'static str, Vec<DiscoveredResourceEntry>)> = Vec::new();
-    for resource_type in resource_types {
-        // Only a type whose resources were actually READ is recorded: a read that
-        // failed says nothing about what the account holds, and recording it as empty
-        // would record every resource of that type as deleted.
-        if resource_type == S3_BUCKET_RESOURCE_TYPE {
-            if let Some(buckets) = observed_s3_buckets(callback, region, now).await {
-                observed.push((resource_type, buckets));
-            }
-        }
-        if resource_type == SQS_QUEUE_RESOURCE_TYPE {
-            if let Some(queues) = observed_sqs_queues(callback, region, now).await {
-                observed.push((resource_type, queues));
-            }
-        }
-        if resource_type == super::observed_ec2::EC2_INSTANCE_RESOURCE_TYPE {
-            if let Some(instances) =
-                super::observed_ec2::observed_ec2_instances(callback, region, now).await
-            {
-                observed.push((resource_type, instances));
-            }
-        }
-        if resource_type == super::observed_iam::IAM_ROLE_RESOURCE_TYPE {
-            if let Some(roles) = super::observed_iam::observed_iam_roles(callback, region, now).await
-            {
-                observed.push((resource_type, roles));
-            }
-        }
-        if resource_type == super::observed_iam::IAM_POLICY_RESOURCE_TYPE {
-            if let Some(policies) =
-                super::observed_iam::observed_iam_policies(callback, region, now).await
-            {
-                observed.push((resource_type, policies));
-            }
-        }
-    }
+    run_recording_pass(callback, engine, region, now, resource_types).await;
+}
 
+/// Perform ONE recording-and-evaluation pass over `resource_types` as of `now`: observe
+/// the resources of each type through the service that owns it, record what changed,
+/// re-evaluate the rules, and publish what that produced.
+///
+/// The caller has already decided that this pass is owed: the clock made it due
+/// ([`run_due_recording_pass`]).
+async fn run_recording_pass<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    now: SystemTime,
+    resource_types: Vec<&'static str>,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let observed = observed_resources(callback, region, now, resource_types).await;
     // The ACCOUNT's own configuration, read only while this account holds a rule whose
     // subject is the account: a rule nothing asks about costs no read, and an account
     // whose configuration could not be read leaves those rules unevaluated rather than
@@ -824,7 +847,13 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
         // the resource it is about, which is what owes their evaluators an invocation
         // (`super::custom_lambda_rule`).
         store.owe_change_triggered_invocations(&recorded, now);
-        (recorded, store.evaluate_rules(account.as_ref(), now))
+        let changes = store.evaluate_rules(account.as_ref(), now);
+        // The recorded state is now what the account held: the pass this one was owed has
+        // been performed, and the next one falls due from here. Noted under the guard that
+        // wrote it, so an account whose recording nothing else resumes cannot be left owing
+        // a pass that was taken and never performed.
+        store.note_recording_pass_performed(SystemTime::now());
+        (recorded, changes)
     };
 
     // The evaluators Config has to INVOKE for the rules it does not evaluate itself: a
@@ -865,6 +894,124 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
     super::follow_remediation_automations(callback, engine, region).await;
 }
 
+/// What the resources of `resource_types` LOOK LIKE now, read through the service that
+/// owns each type.
+///
+/// Only a type whose resources were actually READ is answered for: a read that failed
+/// says nothing about what the account holds, and recording it as empty would record every
+/// resource of that type as deleted. A type this emulator cannot observe is answered for
+/// by nobody and so is not recorded at all.
+async fn observed_resources(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    now: SystemTime,
+    resource_types: Vec<&'static str>,
+) -> Vec<(&'static str, Vec<DiscoveredResourceEntry>)> {
+    let mut observed: Vec<(&'static str, Vec<DiscoveredResourceEntry>)> = Vec::new();
+    for resource_type in resource_types {
+        if resource_type == S3_BUCKET_RESOURCE_TYPE {
+            if let Some(buckets) = observed_s3_buckets(callback, region, now).await {
+                observed.push((resource_type, buckets));
+            }
+        }
+        if resource_type == SQS_QUEUE_RESOURCE_TYPE {
+            if let Some(queues) = observed_sqs_queues(callback, region, now).await {
+                observed.push((resource_type, queues));
+            }
+        }
+        if resource_type == super::observed_ec2::EC2_INSTANCE_RESOURCE_TYPE {
+            if let Some(instances) =
+                super::observed_ec2::observed_ec2_instances(callback, region, now).await
+            {
+                observed.push((resource_type, instances));
+            }
+        }
+        if resource_type == super::observed_iam::IAM_ROLE_RESOURCE_TYPE {
+            if let Some(roles) = super::observed_iam::observed_iam_roles(callback, region, now).await
+            {
+                observed.push((resource_type, roles));
+            }
+        }
+        if resource_type == super::observed_iam::IAM_POLICY_RESOURCE_TYPE {
+            if let Some(policies) =
+                super::observed_iam::observed_iam_policies(callback, region, now).await
+            {
+                observed.push((resource_type, policies));
+            }
+        }
+    }
+    observed
+}
+
+/// Observe the resources of the types `resource_types` NAMES and record what changed — for
+/// a request whose answer is read from those resources' configuration items.
+///
+/// What a recorder that is recording owes for a resource of a type it records is the
+/// configuration item of the state that resource is in; a read ABOUT that type therefore
+/// observes it before it answers, so the item it reports is the one the resource's
+/// configuration owed at the instant it was asked for — including the FIRST item of a
+/// resource that changed after a stopped recorder was started again, which is the item a
+/// client polling that read is waiting for.
+///
+/// Only the types the account RECORDS are observed, so a stopped recorder records nothing
+/// here either, and only this emulator's observable types
+/// ([`OBSERVABLE_RESOURCE_TYPES`]) — the rest cost no read. The rules this records an item
+/// for are left to the pass ([`run_recording_pass`]): what is owed here is the item, and
+/// the change notification it owes with it.
+///
+/// Bounded like the pass a request performs ([`INLINE_PASS_ANSWERS_WITHIN`]), and taken
+/// under the same claim, so a resource read that does not answer delays this request by
+/// that much at most and nothing nests inside a pass already running.
+pub async fn materialise_recorded_types<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    resource_types: &[&str],
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let observing: Vec<&'static str> = {
+        let store = state.lock();
+        OBSERVABLE_RESOURCE_TYPES
+            .into_iter()
+            .filter(|observable| {
+                resource_types.contains(observable) && store.records_resource_type(observable)
+            })
+            .collect()
+    };
+    if observing.is_empty() {
+        return;
+    }
+    let Some(_inline) = super::PumpClaim::take(
+        &state,
+        |store| &mut store.recording_inline_pass,
+        now,
+    ) else {
+        return;
+    };
+    let _ = ::tokio::time::timeout(INLINE_PASS_ANSWERS_WITHIN, async {
+        let observed = observed_resources(callback, region, now, observing).await;
+        let recorded = {
+            let mut store = state.lock();
+            let mut recorded = Vec::new();
+            for (resource_type, entries) in observed {
+                recorded.extend(store.record_observed(resource_type, entries, now));
+            }
+            // A configuration item this RECORDED triggers the rules whose scope covers the
+            // resource it is about, which is what owes their evaluators an invocation
+            // (`super::custom_lambda_rule`).
+            store.owe_change_triggered_invocations(&recorded, now);
+            recorded
+        };
+        // Each configuration item recorded is streamed to the delivery channel's Amazon SNS
+        // topic, as one a pass recorded is.
+        stream_recorded_item_changes(callback, engine, region, &recorded, now).await;
+    })
+    .await;
+}
+
 /// Start the in-process pump that runs the passes this store owes, after noting that
 /// one is owed.
 ///
@@ -875,7 +1022,9 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
 /// most one pump runs per store, it is bounded by [`MAX_RECORDING_PASSES`] passes, and
 /// it ends as soon as the store owes nothing — which is what stopping every recorder
 /// does. With no async runtime to spawn onto there is no pump, and the pass is simply
-/// not run: nothing a caller is told depends on it.
+/// not run: nothing a caller is told depends on it, because a pass the pump did not run
+/// is performed by the next request that reports the resources of a type it records
+/// ([`materialise_recorded_types`]).
 ///
 /// A recorder that is recording keeps recording, so a pump that is no longer running
 /// the passes cannot be what stops them: it holds the store's pump lease only while it
@@ -956,9 +1105,16 @@ pub fn drive_recorder_clock<Eng: Send + Sync + 'static>(
                      and the next pass is owed as usual"
                 );
             }
-            // Continuous recording owes the next pass as soon as this one is done; an
-            // account whose recorders are all stopped owes none, which ends the pump.
-            claim.store().lock().owe_recording_pass(SystemTime::now());
+            // The pass this pump ran is over, however it ended, so the next one it owes
+            // falls due a span from HERE: a pass that failed fast cannot spin this loop,
+            // and an account whose recorders are all stopped owes none, which ends the
+            // pump. What such a pass did not record is not lost — it is still owed, and
+            // the observation a report about those resources performs brings the recorded
+            // state up to date ([`materialise_recorded_types`]).
+            claim
+                .store()
+                .lock()
+                .note_recording_pass_performed(SystemTime::now());
         }
     });
 }
