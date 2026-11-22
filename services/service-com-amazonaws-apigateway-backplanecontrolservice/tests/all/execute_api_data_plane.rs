@@ -438,6 +438,70 @@ pub(crate) fn json_template(body: &str) -> Value {
     json!({ "application/json": body })
 }
 
+/// The response header the two branches below map their own value for: declared by each
+/// method response (a header is declarable only there) and given its value by the integration
+/// response that was selected, so an answer says WHICH branch it was mapped by.
+pub(crate) const ROUTE_HEADER: &str = "X-Sim-Route";
+
+/// The branch a result no `selectionPattern` covers maps to, keyed by `200`.
+pub(crate) const CATCH_ALL_ROUTE: &str = "internal";
+
+/// The branch covering the 5xx class, keyed by `500`.
+pub(crate) const PATTERNED_ROUTE: &str = "external";
+
+/// The pattern that branch declares: the whole 5xx class, so it covers every result of that
+/// class and not only the status it is keyed by.
+pub(crate) const SERVER_CLASS_PATTERN: &str = r"5\d{2}";
+
+/// The body the branch for `route` renders — the value that tells which mapping was applied.
+///
+/// `pub(crate)` with [`branch_records`]: one fixture for every suite that asserts WHICH
+/// branch a `MOCK`'s result was mapped by.
+pub(crate) fn branch_body(route: &str) -> String {
+    format!("{{\"route\":\"{route}\"}}")
+}
+
+/// The TWO BRANCHES a `MOCK`'s result is selected between, as
+/// `(statusCode, PutMethodResponse request, PutIntegrationResponse request)` triples: the
+/// catch-all keyed `200`, which is what a result no pattern covers maps to, and the one keyed
+/// `500` whose [`SERVER_CLASS_PATTERN`] covers the 5xx class. Each renders [`branch_body`] of
+/// its own name and maps its own value for the one header both method responses declare.
+///
+/// `empty_default_pattern` spells the catch-all's own `selectionPattern` as the EMPTY STRING
+/// instead of leaving it out: `selectionPattern` is "the regular expression (regex) pattern
+/// used to choose an integration response based on the response from the back end", so a
+/// response declaring neither is chosen by no result in particular and both spellings are the
+/// catch-all.
+///
+/// `pub(crate)` for every suite that needs that pair — the deployed stage's wire
+/// (`mock_rendered_status_selection`), a `TestInvokeMethod` simulation of the same records
+/// (`test_invoke_method_data_plane_parity`) and a template branching on the request's verb
+/// (`stage_verb_precedence`) — so one fixture is configured once.
+pub(crate) fn branch_records(empty_default_pattern: bool) -> Vec<(&'static str, Value, Value)> {
+    let parameter = format!("method.response.header.{ROUTE_HEADER}");
+    let mut declared = ::serde_json::Map::new();
+    declared.insert(parameter.clone(), json!(true));
+    let declared = json!({ "responseParameters": Value::Object(declared) });
+
+    let mut branches = Vec::with_capacity(2);
+    for (status, route, pattern) in [
+        ("200", CATCH_ALL_ROUTE, empty_default_pattern.then_some("")),
+        ("500", PATTERNED_ROUTE, Some(SERVER_CLASS_PATTERN)),
+    ] {
+        let mut mapped = ::serde_json::Map::new();
+        mapped.insert(parameter.clone(), json!(format!("'{route}'")));
+        let mut response = json!({
+            "responseTemplates": json_template(&branch_body(route)),
+            "responseParameters": Value::Object(mapped),
+        });
+        if let Some(pattern) = pattern {
+            response["selectionPattern"] = json!(pattern);
+        }
+        branches.push((status, declared.clone(), response));
+    }
+    branches
+}
+
 #[tokio::test]
 async fn an_integration_responses_selection_pattern_is_evaluated_server_side() {
     // `IntegrationResponse$selectionPattern` is "the regular expression (regex) pattern used

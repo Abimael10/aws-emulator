@@ -16,7 +16,9 @@
 //! > from `ANY`. WHAT the serving method reports about the request's HTTP method is the verb
 //! > the CLIENT sent (`$context.httpMethod` is "the HTTP method used"): `ANY` is the name a
 //! > method is configured under, the stand-in for every verb, so no request is ever reported
-//! > as having been sent with it.
+//! > as having been sent with it — and a template that BRANCHES on that reference derives a
+//! > different integration result per verb, which the integration responses are then selected
+//! > against.
 //!
 //! The rows span what that rule generalises over: the verb (two explicit ones, and every
 //! other verb `PutMethod` admits, served by `ANY`), and the resource before and after the
@@ -27,6 +29,10 @@
 
 use serde_json::json;
 
+use crate::execute_api_data_plane::{
+    branch_body, branch_records, invoke as data_plane_invoke, CATCH_ALL_ROUTE, PATTERNED_ROUTE,
+    ROUTE_HEADER,
+};
 use crate::rest_api_lifecycle::{create_api, resource_under, Gateway};
 
 /// The region the invoke host is addressed in; any region is served, so one is enough.
@@ -151,6 +157,94 @@ fn context_verb_template(route: &str) -> String {
 /// been rendered against that request.
 fn rendered_context_verb(route: &str, verb: &str) -> String {
     format!("{{\"route\": \"{route}\", \"verb\": \"{verb}\"}}")
+}
+
+/// The request template of a `MOCK` whose RESULT is chosen by the verb the request carries:
+/// `$context.httpMethod` is read where a template would otherwise carry a written status, so
+/// the integration response the call maps to follows the verb.
+const VERB_BRANCHING_TEMPLATE: &str = "#if($context.httpMethod == \"POST\") \
+                                       {\"statusCode\": 200} #else {\"statusCode\": 500} #end";
+
+/// Put one `MOCK` method of `verb` on `resource` whose request template is
+/// [`VERB_BRANCHING_TEMPLATE`], with the two branches that template's results are mapped
+/// through — the crate's one copy of that fixture
+/// ([`crate::execute_api_data_plane::branch_records`]): the branch keyed `200` carrying no
+/// `selectionPattern`, which is what a result no pattern covers maps to, and the one keyed
+/// `500` covering the 5xx class, each rendering a body that names itself.
+async fn verb_branching_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) {
+    let base = format!("/restapis/{api}/resources/{resource}/methods/{verb}");
+    let mut calls: Vec<(String, serde_json::Value)> = vec![
+        (base.clone(), json!({ "authorizationType": "NONE" })),
+        (
+            format!("{base}/integration"),
+            json!({
+                "type": "MOCK",
+                "requestTemplates": { "application/json": VERB_BRANCHING_TEMPLATE },
+            }),
+        ),
+    ];
+    for (status, declared, mapped) in branch_records(false) {
+        calls.push((format!("{base}/responses/{status}"), declared));
+        calls.push((format!("{base}/integration/responses/{status}"), mapped));
+    }
+    for (uri, request) in calls {
+        let answer = gateway.call("PUT", &uri, Some(request)).await;
+        assert_eq!(
+            answer.status, 201,
+            "setup {uri}: expected 201, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_verb_a_request_carries_is_what_an_any_methods_template_branches_on() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "verb-precedence-branch").await;
+    let collection = resource_under(&gateway, &api, &root, COLLECTION_SEGMENT).await;
+    let item = resource_under(&gateway, &api, &collection, ITEM_SEGMENT).await;
+
+    // One method, under the catch-all, so every verb below is served by it and the only
+    // thing that differs between the calls is the verb the request carries.
+    verb_branching_method(&gateway, &api, &item, "ANY").await;
+    deploy(&gateway, &api).await;
+
+    let path = format!("/{STAGE}/{COLLECTION_SEGMENT}/dua-2");
+    // Rows: every verb the resource can be reached by. The condition admits one of them, so
+    // that verb's call renders the result the unpatterned branch answers and every other
+    // verb's renders the result the 5xx branch covers — which a constant `ANY` could not
+    // tell apart.
+    for verb in VERBS {
+        let (status, branch) = if *verb == "POST" {
+            (200, CATCH_ALL_ROUTE)
+        } else {
+            (500, PATTERNED_ROUTE)
+        };
+        let expected = branch_body(branch);
+        let answered = data_plane_invoke(
+            &gateway,
+            &api,
+            verb,
+            &path,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(
+            (answered.status, answered.body.as_str()),
+            (status, expected.as_str()),
+            "case {verb:?}: expected the branch the request's own verb selects, got ({}, {:?})",
+            answered.status,
+            answered.body
+        );
+        // And the branch's own mapped header, which is per integration response: a mapping
+        // that followed the method's CONFIGURED verb would report one value for every verb.
+        assert_eq!(
+            answered.header(&ROUTE_HEADER.to_ascii_lowercase()),
+            Some(branch),
+            "case {verb:?}: expected the selected branch's {ROUTE_HEADER} {branch:?}, got {:?}",
+            answered.header(&ROUTE_HEADER.to_ascii_lowercase())
+        );
+    }
 }
 
 #[tokio::test]

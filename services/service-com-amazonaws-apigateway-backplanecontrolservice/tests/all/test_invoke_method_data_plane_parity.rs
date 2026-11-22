@@ -19,11 +19,19 @@
 //!   simulating a call (no authorization granted, no key metered, no response consumed).
 //!
 //! The rows differ along what those rules generalise over: the integration configuration
-//! (a `MOCK` that answers, one whose template cannot be evaluated, one that refuses an
-//! unmapped media type, and a type naming a backend that cannot be called), the media type
-//! the request declares and the one it accepts, the verb, whether the method declares a
-//! mapped response header, and the method's authorization — each documented
+//! (a `MOCK` that answers, one whose request template DERIVES the status from the request,
+//! one whose template cannot be evaluated, one that refuses an unmapped media type, and a
+//! type naming a backend that cannot be called), the media type the request declares and the
+//! one it accepts, the verb, the query string the request carries, whether the method
+//! declares a mapped response header, and the method's authorization — each documented
 //! `authorizationType` the data plane can decide on its own, plus the API-key gate.
+//!
+//! A simulated request names its path and query string in `pathWithQueryString` ("the URI
+//! path, including query string, of the simulated invocation request") where a real one
+//! carries them on the request line, so a row whose template reads a query parameter is the
+//! one that shows the two halves read the SAME request: the integration response its
+//! `selectionPattern` selects for the derived result is the same branch on both sides, with
+//! that branch's own body and its own mapped header.
 //!
 //! Every case drives the real wire path — the control plane through this crate's
 //! `restJson1` wire harness ([`Gateway`]) and the data plane through the same emulator on
@@ -31,7 +39,10 @@
 
 use serde_json::{json, Value};
 
-use crate::execute_api_data_plane::{deploy, invoke, put_method, Invoked};
+use crate::execute_api_data_plane::{
+    branch_body, branch_records, deploy, invoke, put_method, Invoked, CATCH_ALL_ROUTE,
+    PATTERNED_ROUTE, ROUTE_HEADER,
+};
 use crate::integration_response::put_integration_response;
 use crate::method_integration::{aws_integration_uri, put_integration};
 use crate::method_response::{put_method_response, response_header};
@@ -50,21 +61,24 @@ struct Parity {
     /// The path part of the resource this row stands its method up on, which is also the
     /// path the data plane addresses it at.
     path_part: &'static str,
+    /// The query string BOTH halves carry, with its leading `?`, or empty for none: on the
+    /// data-plane request line, and inside the simulation's `pathWithQueryString`.
+    query: &'static str,
     /// The verb the method is put under, and the verb the data-plane request carries.
     verb: &'static str,
     /// The `PutIntegration` request this row's method carries.
     integration: Value,
     /// The `PutMethodResponse` requests, by status code.
-    method_responses: Vec<(&'static str, Value)>,
+    method_responses: Responses,
     /// The `PutIntegrationResponse` requests, by status code.
-    integration_responses: Vec<(&'static str, Value)>,
+    integration_responses: Responses,
     /// The request headers BOTH halves carry: as `TestInvokeMethod`'s `headers` members and
     /// as the data-plane request's own headers.
     headers: Vec<(&'static str, &'static str)>,
     /// The status both halves must answer.
     status: u16,
     /// The body both halves must answer.
-    body: &'static str,
+    body: String,
     /// The headers the SIMULATION must report, by name and value — the media type the body
     /// was rendered with, plus the mapped response header a row that declares one must
     /// carry. Asserted on their own as well as cross-checked against the wire, so a
@@ -116,14 +130,47 @@ async fn method_response(
     );
 }
 
-/// The `headers` member of a `TestInvokeMethod` request carrying `headers`, which is where a
-/// simulated request declares what a real one carries on the wire.
-fn simulated_request(headers: &[(&str, &str)]) -> Value {
+/// The `TestInvokeMethod` request simulating the one the data plane is sent: its `headers`,
+/// which is where a simulated request declares what a real one carries on the wire, and the
+/// `pathWithQueryString` where it names the path and query string a real request carries on
+/// its request line.
+fn simulated_request(path_part: &str, query: &str, headers: &[(&str, &str)]) -> Value {
     let map: serde_json::Map<String, Value> = headers
         .iter()
         .map(|(name, value)| ((*name).to_string(), json!(value)))
         .collect();
-    json!({ "headers": Value::Object(map) })
+    json!({
+        "headers": Value::Object(map),
+        "pathWithQueryString": format!("/{path_part}{query}"),
+    })
+}
+
+/// The `(statusCode, request)` pairs a row's method or integration responses are put under.
+type Responses = Vec<(&'static str, Value)>;
+
+/// The two branches a row whose request template DERIVES the result maps that result through,
+/// split into the `PutMethodResponse` and `PutIntegrationResponse` halves this suite's rows
+/// carry: the crate's one copy of that fixture ([`crate::execute_api_data_plane::branch_records`])
+/// — the catch-all keyed `200`, carrying no `selectionPattern` of its own, and the one keyed
+/// `500` covering the 5xx class, each rendering its own body and mapping its own value for the
+/// one response header both method responses declare.
+fn derived_branches() -> (Responses, Responses) {
+    let mut method_responses = Responses::with_capacity(2);
+    let mut integration_responses = Responses::with_capacity(2);
+    for (status, declared, mapped) in branch_records(false) {
+        method_responses.push((status, declared));
+        integration_responses.push((status, mapped));
+    }
+    (method_responses, integration_responses)
+}
+
+/// A `MOCK` integration whose request template derives the result from the call: the form an
+/// `Integration$requestTemplates` entry takes when the status is computed rather than written.
+fn derived_integration(template: &str) -> Value {
+    json!({
+        "type": "MOCK",
+        "requestTemplates": { "application/json": template },
+    })
 }
 
 /// Assert the simulated invocation and the real one are the SAME answer: the status, the
@@ -173,12 +220,15 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
     let (api, root) = create_api(&gateway, "test-invoke-parity").await;
 
     // Rows differ along the integration configuration, the media type declared and the one
-    // accepted, the verb, and whether a mapped response header is declared — a served
-    // answer and each way an integration cannot be performed among them.
+    // accepted, the verb, the query string the request carries, and whether a mapped response
+    // header is declared — a served answer, a status the request template DERIVES, and each
+    // way an integration cannot be performed among them.
+    let (derived_method_responses, derived_integration_responses) = derived_branches();
     let cases: Vec<Parity> = vec![
         Parity {
             case: "a MOCK whose json request template names 200",
             path_part: "pets",
+            query: "",
             verb: "GET",
             integration: json!({
                 "type": "MOCK",
@@ -214,7 +264,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             ],
             headers: vec![("Content-Type", "application/json")],
             status: 200,
-            body: "{\"pets\":[]}",
+            body: "{\"pets\":[]}".to_string(),
             reported_headers: vec![
                 ("Content-Type", "application/json"),
                 ("X-Pets", "none"),
@@ -223,6 +273,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
         Parity {
             case: "a MOCK whose xml request template names 404",
             path_part: "pets-xml",
+            query: "",
             verb: "GET",
             integration: json!({
                 "type": "MOCK",
@@ -246,12 +297,13 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             ],
             headers: vec![("Content-Type", "application/xml")],
             status: 404,
-            body: "{\"message\":\"no such pet\"}",
+            body: "{\"message\":\"no such pet\"}".to_string(),
             reported_headers: vec![("Content-Type", "application/json")],
         },
         Parity {
             case: "an accepted text/plain selects that response template",
             path_part: "pets-text",
+            query: "",
             verb: "GET",
             integration: json!({
                 "type": "MOCK",
@@ -269,7 +321,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             )],
             headers: vec![("Content-Type", "application/json"), ("Accept", "text/plain")],
             status: 200,
-            body: "no pets",
+            body: "no pets".to_string(),
             // The accepted template decides the BODY; with no `Content-Type` mapping
             // declared, the media type stays `application/json` on both sides.
             reported_headers: vec![("Content-Type", "application/json")],
@@ -277,6 +329,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
         Parity {
             case: "a POST method answering its own status",
             path_part: "created",
+            query: "",
             verb: "POST",
             integration: json!({
                 "type": "MOCK",
@@ -289,12 +342,13 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             )],
             headers: vec![("Content-Type", "application/json")],
             status: 201,
-            body: "{\"created\":true}",
+            body: "{\"created\":true}".to_string(),
             reported_headers: vec![("Content-Type", "application/json")],
         },
         Parity {
             case: "an integration naming a Lambda backend that cannot be called",
             path_part: "proxy",
+            query: "",
             verb: "GET",
             integration: json!({
                 "type": "AWS_PROXY",
@@ -308,12 +362,13 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             integration_responses: vec![],
             headers: vec![("Content-Type", "application/json")],
             status: 500,
-            body: "{\"message\":\"Internal server error\"}",
+            body: "{\"message\":\"Internal server error\"}".to_string(),
             reported_headers: vec![("Content-Type", "application/json")],
         },
         Parity {
             case: "a MOCK whose response template is a Velocity template",
             path_part: "velocity",
+            query: "",
             verb: "GET",
             integration: json!({ "type": "MOCK" }),
             method_responses: vec![("200", json!({}))],
@@ -327,12 +382,13 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             )],
             headers: vec![("Content-Type", "application/json")],
             status: 500,
-            body: "{\"message\":\"Internal server error\"}",
+            body: "{\"message\":\"Internal server error\"}".to_string(),
             reported_headers: vec![("Content-Type", "application/json")],
         },
         Parity {
             case: "a MOCK that passes no unmapped media type through",
             path_part: "strict",
+            query: "",
             verb: "GET",
             integration: json!({
                 "type": "MOCK",
@@ -346,8 +402,100 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             )],
             headers: vec![("Content-Type", "text/csv")],
             status: 415,
-            body: "{\"message\":\"Unsupported Media Type\"}",
+            body: "{\"message\":\"Unsupported Media Type\"}".to_string(),
             reported_headers: vec![("Content-Type", "application/json")],
+        },
+        // The DERIVED rows: the result is not written in the template but computed from the
+        // request both halves are given, so each shows the two sides read the same request
+        // and select the same branch for what it rendered.
+        Parity {
+            case: "a status derived from a query parameter, which the catch-all answers",
+            path_part: "derived-ok",
+            query: "?code=200",
+            verb: "GET",
+            integration: derived_integration(r#"{"statusCode": $input.params('code')}"#),
+            method_responses: derived_method_responses.clone(),
+            integration_responses: derived_integration_responses.clone(),
+            headers: vec![("Content-Type", "application/json")],
+            status: 200,
+            body: branch_body(CATCH_ALL_ROUTE),
+            reported_headers: vec![
+                ("Content-Type", "application/json"),
+                (ROUTE_HEADER, CATCH_ALL_ROUTE),
+            ],
+        },
+        Parity {
+            case: "a status derived from a query parameter, which the 5xx pattern covers",
+            path_part: "derived-error",
+            query: "?code=500",
+            verb: "GET",
+            integration: derived_integration(r#"{"statusCode": $input.params('code')}"#),
+            method_responses: derived_method_responses.clone(),
+            integration_responses: derived_integration_responses.clone(),
+            headers: vec![("Content-Type", "application/json")],
+            status: 500,
+            body: branch_body(PATTERNED_ROUTE),
+            reported_headers: vec![
+                ("Content-Type", "application/json"),
+                (ROUTE_HEADER, PATTERNED_ROUTE),
+            ],
+        },
+        Parity {
+            case: "a #set binding of that parameter, naming another result of the 5xx class",
+            path_part: "derived-bound",
+            query: "?code=503",
+            verb: "GET",
+            integration: derived_integration(
+                "#set($code = $input.params('code'))\n{\"statusCode\": $code}",
+            ),
+            method_responses: derived_method_responses.clone(),
+            integration_responses: derived_integration_responses.clone(),
+            headers: vec![("Content-Type", "application/json")],
+            // The branch is selected by its PATTERN and mapped onto its own `statusCode`, so
+            // a `503` result is served as the `500` the covering branch is keyed by.
+            status: 500,
+            body: branch_body(PATTERNED_ROUTE),
+            reported_headers: vec![
+                ("Content-Type", "application/json"),
+                (ROUTE_HEADER, PATTERNED_ROUTE),
+            ],
+        },
+        Parity {
+            case: "a #if/#else choice over a query parameter the condition does not admit",
+            path_part: "derived-choice",
+            query: "?scope=external",
+            verb: "GET",
+            integration: derived_integration(
+                "#if($input.params('scope') == \"internal\") {\"statusCode\": 200} \
+                 #else {\"statusCode\": 500} #end",
+            ),
+            method_responses: derived_method_responses.clone(),
+            integration_responses: derived_integration_responses.clone(),
+            headers: vec![("Content-Type", "application/json")],
+            status: 500,
+            body: branch_body(PATTERNED_ROUTE),
+            reported_headers: vec![
+                ("Content-Type", "application/json"),
+                (ROUTE_HEADER, PATTERNED_ROUTE),
+            ],
+        },
+        Parity {
+            case: "a request carrying nothing for the template to derive the status from",
+            path_part: "derived-absent",
+            query: "",
+            verb: "GET",
+            integration: derived_integration(r#"{"statusCode": $input.params('code')}"#),
+            method_responses: derived_method_responses,
+            integration_responses: derived_integration_responses,
+            headers: vec![("Content-Type", "application/json")],
+            // The rendering is then not a status-carrying object at all, so it names no
+            // result and the call maps to the catch-all branch.
+            status: 200,
+            body: branch_body(CATCH_ALL_ROUTE),
+            reported_headers: vec![
+                ("Content-Type", "application/json"),
+                (ROUTE_HEADER, CATCH_ALL_ROUTE),
+            ],
         },
     ];
 
@@ -378,7 +526,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
 
     for (row, resource) in cases.iter().zip(&resources) {
         let case = row.case;
-        let path = format!("/{STAGE}/{}", row.path_part);
+        let path = format!("/{STAGE}/{}{}", row.path_part, row.query);
         // Before: what the endpoint serves with no simulation having happened.
         let before = invoke(&gateway, &api, row.verb, &path, &row.headers).await;
         assert_eq!(
@@ -397,7 +545,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             &api,
             resource,
             row.verb,
-            simulated_request(&row.headers),
+            simulated_request(row.path_part, row.query, &row.headers),
         )
         .await;
         assert_same_answer(case, &simulated, &before);
@@ -434,7 +582,7 @@ async fn a_simulated_invocation_reports_what_the_deployed_stage_serves() {
             &api,
             resource,
             row.verb,
-            simulated_request(&row.headers),
+            simulated_request(row.path_part, row.query, &row.headers),
         )
         .await;
         assert_same_answer(case, &repeated, &after);
