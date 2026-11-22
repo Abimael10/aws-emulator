@@ -5,13 +5,14 @@
 //! `ListAccountAssociations` -> `CreateAccountAssociation` again.
 //!
 //! RULE: `DeleteAccountAssociation` (DELETE `/account-associations/{AccountAssociationId}`,
-//! success 200) removes the account association the signing region holds under that
-//! identifier: the reads stop reporting it, the connector destination it was created against
-//! is free to start a new authorization flow, and a `ClientToken` that minted the removed
-//! record no longer replays into it. An identifier this region holds no association under —
-//! never created, deleted since, or created in another region — is the modelled
-//! `ResourceNotFoundException` (HTTP 404) carrying this resource's own absence sentence, and
-//! removes nothing.
+//! success 200, `@idempotent`) removes the account association the signing region holds under
+//! that identifier: the reads stop reporting it, the connector destination it was created
+//! against is free to start a new authorization flow, and a `ClientToken` that minted the
+//! removed record no longer replays into it. It promises that end state rather than that this
+//! call reached it, so an identifier this region holds no association under — never created,
+//! deleted since, or created in another region — removes nothing and answers that SAME
+//! success, with no error code and no body; the modelled `ResourceNotFoundException` (HTTP
+//! 404) is what this resource's RESOLVING paths (the read, the refresh) answer for it.
 //!
 //! The rows below differ along what the rule generalises over: the region the calls are
 //! signed for, the members the removed record carried, the form of an identifier that
@@ -261,8 +262,30 @@ fn accepted_id(case: &str, reply: &Reply) -> String {
         .to_string()
 }
 
+/// Assert `reply` is this delete's modelled success: the bound status, no error code, and no
+/// body at all (the output shape is `Unit`).
+fn assert_delete_succeeded(case: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected HTTP 200 from the delete, got {} with body {:?}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type, None,
+        "case {case:?}: a successful delete carries no error code, got {:?}",
+        reply.error_type
+    );
+    assert_eq!(
+        reply.body,
+        Value::Null,
+        "case {case:?}: the modelled output has no members, so the body is empty, got {:?}",
+        reply.body
+    );
+}
+
 /// Assert `reply` is the modelled 404 of this resource: the code, the absence sentence, and
-/// the `ResourceId` / `ResourceType` members the recorded body carries.
+/// the `ResourceId` / `ResourceType` members the recorded body carries. Used for the READS
+/// this suite performs: the delete itself answers an absent identifier as a success.
 fn assert_not_found(case: &str, reply: &Reply, identifier: &str) {
     assert_eq!(
         reply.status, 404,
@@ -325,12 +348,7 @@ async fn a_delete_removes_the_record_and_frees_its_destination() {
             &create_in(&router, region, &destination, members).await,
         );
 
-        let removed = delete_in(&router, region, &held).await;
-        assert_eq!(
-            removed.status, 200,
-            "case {case:?}: expected HTTP 200 from the delete, got {} with body {:?}",
-            removed.status, removed.body
-        );
+        assert_delete_succeeded(&case, &delete_in(&router, region, &held).await);
 
         // The reads no longer hold it.
         assert_not_found(&case, &get_in(&router, region, &held).await, &held);
@@ -341,11 +359,15 @@ async fn a_delete_removes_the_record_and_frees_its_destination() {
             list_in(&router, region).await.body
         );
 
-        // A second delete of the same identifier holds nothing to remove, so it is the
-        // modelled 404 rather than another success.
-        assert_not_found(
+        // A second delete of the same identifier holds nothing to remove, which is the end
+        // state it asks for, so it answers the same success as the first.
+        assert_delete_succeeded(
             &format!("{case}, deleted twice"),
             &delete_in(&router, region, &held).await,
+        );
+        assert_not_found(
+            &format!("{case}, read after the second delete"),
+            &get_in(&router, region, &held).await,
             &held,
         );
 
@@ -376,11 +398,11 @@ async fn a_delete_removes_the_record_and_frees_its_destination() {
 }
 
 /// RULE: a delete resolves ONE region's association under the identifier it carries, so an
-/// identifier this region holds no association under is the modelled 404 and removes
-/// nothing — whatever the form of that identifier, and including one another region's
-/// endpoint really minted.
+/// identifier this region holds no association under removes nothing and answers the
+/// modelled success — whatever the form of that identifier, and including one another
+/// region's endpoint really minted.
 #[tokio::test]
-async fn a_delete_of_an_association_this_region_does_not_hold_is_the_modelled_404() {
+async fn a_delete_of_an_association_this_region_does_not_hold_removes_nothing() {
     let router = emulator();
     let destination = connector_destination_in(&router, REGION, "the destination").await;
     let held = accepted_id(
@@ -410,7 +432,7 @@ async fn a_delete_of_an_association_this_region_does_not_hold_is_the_modelled_40
         ("another region's association", elsewhere.clone()),
     ];
     for (case, identifier) in absent {
-        assert_not_found(case, &delete_in(&router, REGION, &identifier).await, &identifier);
+        assert_delete_succeeded(case, &delete_in(&router, REGION, &identifier).await);
     }
 
     // Nothing was removed: both regions still report their own association.
@@ -447,12 +469,7 @@ async fn a_client_token_does_not_replay_into_a_deleted_association() {
             )
             .await,
         );
-        let removed = delete_in(&router, REGION, &first).await;
-        assert_eq!(
-            removed.status, 200,
-            "case {case:?}: expected HTTP 200 from the delete, got {} with body {:?}",
-            removed.status, removed.body
-        );
+        assert_delete_succeeded(&case, &delete_in(&router, REGION, &first).await);
 
         let retried = accepted_id(
             &format!("{case}, retried after the delete"),
@@ -472,12 +489,9 @@ async fn a_client_token_does_not_replay_into_a_deleted_association() {
         assert_not_found(&case, &get_in(&router, REGION, &first).await, &first);
 
         // Leave the destination free for the next row.
-        let removed = delete_in(&router, REGION, &retried).await;
-        assert_eq!(
-            removed.status, 200,
-            "case {case:?}: expected HTTP 200 removing the retry's association, got {} with \
-             body {:?}",
-            removed.status, removed.body
+        assert_delete_succeeded(
+            &format!("{case}, removing the retry's association"),
+            &delete_in(&router, REGION, &retried).await,
         );
     }
 }

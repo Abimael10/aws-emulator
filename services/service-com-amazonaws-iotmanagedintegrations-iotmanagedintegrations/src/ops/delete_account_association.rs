@@ -6,10 +6,24 @@
 //! `AccountAssociationId` the request names from `crate::state`'s `account_associations`, so
 //! `GetAccountAssociation` and `ListAccountAssociations` stop reporting it and the connector
 //! destination it was created against is free to start a new authorization flow
-//! (`CreateAccountAssociation`). An identifier this region holds no association under is the
-//! modelled `ResourceNotFoundException`, worded the way every other path of this resource
-//! words its absence (`crate::state::account_association_not_found`), and nothing is
-//! removed.
+//! (`CreateAccountAssociation`).
+//!
+//! WHY AN ABSENT IDENTIFIER IS A SUCCESS here rather than a refusal: this `@idempotent`
+//! delete promises an END STATE — the signing region holds no association under that
+//! identifier — not that this call was the one that reached it. The corpus records the
+//! delete of an identifier no association was ever created under, and the recorded answer is
+//! the modelled success (HTTP 200, empty `Unit` body). An identifier this region resolves no
+//! association under — never created, deleted since, or created through another region's
+//! endpoint — therefore leaves every store untouched and answers that same success, whatever
+//! form the identifier takes inside `AccountAssociationId`'s modelled `@length` and
+//! `@pattern`. The declared `ResourceNotFoundException` stays what this resource's RESOLVING
+//! paths — the read (`GetAccountAssociation`) and the refresh
+//! (`StartAccountAssociationRefresh`) — answer for an absent association, worded by
+//! `crate::state::account_association_not_found`. An identifier OUTSIDE those input
+//! constraints is still the modelled `ValidationException`, refused before this handler runs.
+//!
+//! That is a fact about this resource's delete, read off its own recording: a sibling delete
+//! whose own fixture refuses an absent identifier keeps the answer that fixture records.
 //!
 //! ## Shape of an operation
 //!
@@ -181,10 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // An account association is regional, as every resource of this service is: only the
         // region that created it resolves — and deletes — it.
-        let removed = store
+        let held = store
             .account_association_in(&region, &input.account_association_id)
             .is_some();
-        if removed {
+        if held {
             store
                 .account_associations
                 .remove(&input.account_association_id);
@@ -200,18 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         drop(store);
 
-        if !removed {
-            // The reason is the one sentence this resource's 404s carry, read and mutation
-            // alike, so a delete of an identifier this region holds nothing under reads
-            // exactly the way a get of it does.
-            return Err(
-                DeleteAccountAssociationErrorModeled::ResourceNotFoundException(
-                    crate::state::account_association_not_found(&input.account_association_id),
-                )
-                .into(),
-            );
-        }
-
+        // Nothing left to remove is the state the request asked for, so a delete that
+        // resolved no record answers the same modelled success as the one that did the
+        // removing: a retried or defensive teardown is not a failure.
         Ok(DeleteAccountAssociationOutput)
     }
 }
