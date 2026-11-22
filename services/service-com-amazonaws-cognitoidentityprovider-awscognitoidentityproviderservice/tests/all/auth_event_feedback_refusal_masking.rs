@@ -79,23 +79,23 @@ const EMULATOR_HOST: &str = "127.0.0.1:9297";
 const ERRORTYPE: &str = "x-amzn-errortype";
 
 /// The status this endpoint answers every refusal of the caller with.
-const REFUSED: u16 = 400;
+pub const REFUSED: u16 = 400;
 
 /// A password satisfying a default pool's password policy, so a created user can hold a
 /// permanent one and sign in.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The users these tests create: two of the pool under test, and one of a second pool.
-const USERNAME: &str = "feedback-user";
-const OTHER_USERNAME: &str = "other-feedback-user";
-const FOREIGN_POOL_USERNAME: &str = "user-of-another-pool";
+pub const USERNAME: &str = "feedback-user";
+pub const OTHER_USERNAME: &str = "other-feedback-user";
+pub const FOREIGN_POOL_USERNAME: &str = "user-of-another-pool";
 
 /// An `EventIdType` value (pattern `^[\w+-]+$`) that names no logged event.
-const ABSENT_EVENT_ID: &str = "n0-such-event";
+pub const ABSENT_EVENT_ID: &str = "n0-such-event";
 
 /// A `TokenModelType` value (pattern `^[A-Za-z0-9-_=.]+$`) this emulator minted for no
 /// event, so it authorizes feedback on none.
-const FOREIGN_FEEDBACK_TOKEN: &str = "n0t-a-feedback-token";
+pub const FOREIGN_FEEDBACK_TOKEN: &str = "n0t-a-feedback-token";
 
 /// A `UserPoolIdType` value (pattern `^[\w-]+_[0-9a-zA-Z]+$`) that names no pool.
 const ABSENT_USER_POOL_ID: &str = "us-east-1_n0suchpool";
@@ -108,9 +108,9 @@ const OFF: &str = "OFF";
 /// The sentences the refusals under test carry.
 const INCORRECT_CREDENTIALS_MESSAGE: &str = "Incorrect username or password.";
 const EVENT_ID_INVALID_MESSAGE: &str = "EventId is invalid";
-const FEEDBACK_TOKEN_INVALID_MESSAGE: &str = "Invalid session provided";
+pub const FEEDBACK_TOKEN_INVALID_MESSAGE: &str = "Invalid session provided";
 const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
-const USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE: &str = "This is an add on feature. Please update \
+pub const USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE: &str = "This is an add on feature. Please update \
      AdvancedSecurityMode for your user pool to access this API.";
 
 /// The published bounds of `UsernameType`'s modelled length (1..128), which the rows
@@ -127,7 +127,7 @@ const EVENT_ID_MAX_LENGTH: usize = 50;
 /// One emulator with just this service mounted, beside the engine it is mounted on —
 /// which is where a test reads an event's `FeedbackToken` from, because no response
 /// carries it.
-fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(cognito_idp::EmulatedService::new(Arc::clone(&engine)));
@@ -138,17 +138,17 @@ fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// What one call answered: its HTTP status, its `x-amzn-errortype` header and its JSON
 /// body — the three values the rules are stated over.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Answered {
-    status: u16,
-    errortype: Option<String>,
-    payload: Value,
+pub struct Answered {
+    pub status: u16,
+    pub errortype: Option<String>,
+    pub payload: Value,
 }
 
 /// Dispatch `operation` with `body`. A `signed` call carries a credential scope, as the
 /// SDK sends every administrative operation; an unsigned one is addressed to the
 /// emulator's own address, which is how the holder of a notification link calls the
 /// user's own submission.
-async fn dispatch(
+pub async fn dispatch(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -213,7 +213,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 }
 
 /// Call the unsigned `operation`, requiring success, and return its response body.
-async fn ok_anonymous(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub async fn ok_anonymous(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let answered = dispatch(router, operation, body, false).await;
     assert_eq!(
         answered.status, 200,
@@ -224,7 +224,7 @@ async fn ok_anonymous(router: &MultiServiceRouter, operation: &str, body: &Value
 }
 
 /// The `__type` of an error body, which is the wire error code.
-fn error_code(payload: &Value) -> &str {
+pub fn error_code(payload: &Value) -> &str {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -232,7 +232,7 @@ fn error_code(payload: &Value) -> &str {
 }
 
 /// The `message` of an error body.
-fn error_message(payload: &Value) -> &str {
+pub fn error_message(payload: &Value) -> &str {
     payload
         .get("message")
         .and_then(Value::as_str)
@@ -240,9 +240,9 @@ fn error_message(payload: &Value) -> &str {
 }
 
 /// A created pool and its app client.
-struct Fixture {
-    user_pool_id: String,
-    client_id: String,
+pub struct Fixture {
+    pub user_pool_id: String,
+    pub client_id: String,
 }
 
 /// Create a pool whose `UserPoolAddOns` run threat protection in `mode` (and none at
@@ -250,7 +250,11 @@ struct Fixture {
 ///
 /// `UserPoolAddOns` is a Plus-tier feature of a pool, so a pool configuring it is
 /// created on that tier.
-async fn given_pool(router: &MultiServiceRouter, pool_name: &str, mode: Option<&str>) -> Fixture {
+pub async fn given_pool(
+    router: &MultiServiceRouter,
+    pool_name: &str,
+    mode: Option<&str>,
+) -> Fixture {
     let mut pool = json!({ "PoolName": pool_name, "AutoVerifiedAttributes": ["email"] });
     if let Some(mode) = mode {
         pool["UserPoolTier"] = json!("PLUS");
@@ -284,7 +288,7 @@ async fn given_pool(router: &MultiServiceRouter, pool_name: &str, mode: Option<&
 
 /// Create `username` in `user_pool_id` holding [`GOOD_PASSWORD`] permanently, so it can
 /// sign in and so its sign-ins are logged.
-async fn given_user(router: &MultiServiceRouter, user_pool_id: &str, username: &str) {
+pub async fn given_user(router: &MultiServiceRouter, user_pool_id: &str, username: &str) {
     ok(
         router,
         "AdminCreateUser",
@@ -314,7 +318,7 @@ async fn given_user(router: &MultiServiceRouter, user_pool_id: &str, username: &
 
 /// Sign `username` in through `client_id` with the password it holds, which is what logs
 /// one authentication event in a pool whose threat protection is active.
-async fn sign_in(router: &MultiServiceRouter, client_id: &str, username: &str) {
+pub async fn sign_in(router: &MultiServiceRouter, client_id: &str, username: &str) {
     let answered = ok_anonymous(
         router,
         "InitiateAuth",
@@ -332,7 +336,11 @@ async fn sign_in(router: &MultiServiceRouter, client_id: &str, username: &str) {
 }
 
 /// The events `AdminListUserAuthEvents` reports for `username`, newest first.
-async fn history(router: &MultiServiceRouter, user_pool_id: &str, username: &str) -> Vec<Value> {
+pub async fn history(
+    router: &MultiServiceRouter,
+    user_pool_id: &str,
+    username: &str,
+) -> Vec<Value> {
     let answered = ok(
         router,
         "AdminListUserAuthEvents",
@@ -347,7 +355,11 @@ async fn history(router: &MultiServiceRouter, user_pool_id: &str, username: &str
 }
 
 /// The ids of the events logged for `username`, newest first.
-async fn event_ids(router: &MultiServiceRouter, user_pool_id: &str, username: &str) -> Vec<String> {
+pub async fn event_ids(
+    router: &MultiServiceRouter,
+    user_pool_id: &str,
+    username: &str,
+) -> Vec<String> {
     history(router, user_pool_id, username)
         .await
         .iter()
@@ -363,7 +375,7 @@ async fn event_ids(router: &MultiServiceRouter, user_pool_id: &str, username: &s
 /// The `FeedbackToken` the pool minted for the logged event `event_id`, read out of the
 /// emulator's own state the way a user reads it out of the notification email: it is a
 /// secret of that event, so no response carries it.
-fn feedback_token(
+pub fn feedback_token(
     engine: &Arc<engine::InMemoryEngine>,
     user_pool_id: &str,
     username: &str,
@@ -386,7 +398,7 @@ fn feedback_token(
 /// The usernames that resolve to no user of the pool under test, spanning the forms
 /// `UsernameType` admits and the ways a name resolves to nothing. The length bounds are
 /// the modelled ones ([`USERNAME_MIN_LENGTH`], [`USERNAME_MAX_LENGTH`]).
-fn unresolved_usernames() -> Vec<(String, String)> {
+pub fn unresolved_usernames() -> Vec<(String, String)> {
     vec![
         ("a name nothing created".to_string(), "nobody-at-all".to_string()),
         (
