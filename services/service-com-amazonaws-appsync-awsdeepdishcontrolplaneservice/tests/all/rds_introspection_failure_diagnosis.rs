@@ -30,7 +30,7 @@ use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::{state, Emulat
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call below is signed for, and the Region every resource lives in.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A second Region, so a case can address a cluster where this emulator holds none.
 const OTHER_REGION: &str = "eu-west-1";
@@ -40,7 +40,7 @@ const MASTER_USER: &str = "pgadmin";
 
 /// The database every cluster here is created with (`DBName`), which is the one an
 /// introspection names.
-const DATABASE: &str = "appdb";
+pub(crate) const DATABASE: &str = "appdb";
 
 /// The access key id every call presents: a key neither STS nor IAM holds a record for,
 /// which is the position AWS account root credentials are in.
@@ -62,23 +62,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One answer from the emulator: the parts a client branches on.
 #[derive(Debug, Clone)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves the error shape from.
     error_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 /// One emulator: AppSync with the owners of what an introspection reads mounted beside it
 /// — the RDS control plane that holds the cluster, the Data API that serves its databases,
 /// and the Secrets Manager (with the KMS its value is sealed under) the login comes from —
 /// over ONE shared engine, exactly as the assembled router mounts them.
-struct Cloud {
+pub(crate) struct Cloud {
     router: MultiServiceRouter,
 }
 
 impl Cloud {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -125,7 +125,11 @@ impl Cloud {
     /// Create a cluster the way a Data API caller does — its HTTP endpoint on or off as
     /// `http_endpoint` says, RDS managing the master user password — and answer its ARN
     /// and the ARN of the secret RDS minted for it.
-    async fn create_cluster(&self, identifier: &str, http_endpoint: bool) -> (String, String) {
+    pub(crate) async fn create_cluster(
+        &self,
+        identifier: &str,
+        http_endpoint: bool,
+    ) -> (String, String) {
         let created = self
             .rds()
             .create_db_cluster()
@@ -162,7 +166,7 @@ impl Cloud {
     }
 
     /// Run one statement against `cluster` through the Data API, which must serve it.
-    async fn execute(&self, cluster: &str, secret: &str, sql: &str) {
+    pub(crate) async fn execute(&self, cluster: &str, secret: &str, sql: &str) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://rds-data.{REGION}.amazonaws.com/Execute"))
@@ -221,7 +225,7 @@ impl Cloud {
 
     /// Start an introspection of the cluster `resource_arn` names, which must be accepted,
     /// and read the record back once the clock has settled it.
-    async fn settled_introspection(
+    pub(crate) async fn settled_introspection(
         &self,
         case: &str,
         resource_arn: &str,
@@ -287,7 +291,7 @@ fn authorization(signing_name: &str) -> String {
 
 /// A well-formed RDS DB cluster ARN, as `RdsDataApiConfig$resourceArn`'s modelled pattern
 /// (`^arn:[a-z-]*:rds:[a-z0-9-]*:\d{12}:cluster:[0-9A-Za-z_/-]*$`) admits one.
-fn cluster_arn(region: &str, account: &str, identifier: &str) -> String {
+pub(crate) fn cluster_arn(region: &str, account: &str, identifier: &str) -> String {
     format!("arn:aws:rds:{region}:{account}:cluster:{identifier}")
 }
 
