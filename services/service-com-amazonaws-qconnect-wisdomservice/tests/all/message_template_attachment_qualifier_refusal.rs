@@ -22,8 +22,9 @@
 
 use super::message_template::content_for;
 use super::message_template_attachment_deletion::{
-    attachment_ids, delete_attachment, get_template, upload, MESSAGE_QUALIFIER_NOT_ACCEPTED,
+    attachment_ids, delete_attachment, get_template, upload,
 };
+use super::message_template_qualifier::MESSAGE_QUALIFIER_NOT_ACCEPTED;
 use super::message_template_versions::{knowledge_base, message_template, publish};
 use super::resource_tags::{wisdom_arn, Emulator, ABSENT_UUID, REGION};
 use serde_json::Value;

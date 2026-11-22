@@ -29,6 +29,7 @@
 use serde_json::{json, Value};
 
 use super::message_template::{content_for, CHANNEL_SUBTYPES};
+use super::message_template_qualifier::MESSAGE_QUALIFIER_NOT_ACCEPTED;
 use super::message_template_versions::{
     activate, deactivate, integer, knowledge_base, list_versions, listed_active_versions,
     listed_versions, message_template, publish, publish_versions, read, sms_content, update,
@@ -46,20 +47,6 @@ pub(crate) fn message_version_not_active(version_number: i64) -> String {
 /// The sentence a request addressed to a version this template never published is refused
 /// with.
 const MESSAGE_VERSION_NOT_FOUND: &str = "Message template version does not exist.";
-
-/// The message a label carrying a version qualifier is refused with, on an operation whose
-/// own documentation says its label may not carry one: AWS's report of the member's
-/// `@pattern` violation, stating the expression the service enforces for it — `UuidOrArn`,
-/// quoted without the `^`/`$` pair a whole-value pattern is wrapped in, which is how this
-/// endpoint quotes every other pattern requirement.
-const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = concat!(
-    "1 validation error detected: Value at 'messageTemplateId' failed to satisfy constraint: ",
-    "Member must satisfy regular expression pattern: ",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
-    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}",
-);
 
 /// The two managed version qualifiers a label may name
 /// (`smithy_query(query="doc",shape="GetMessageTemplate")`: the qualifier is "either an

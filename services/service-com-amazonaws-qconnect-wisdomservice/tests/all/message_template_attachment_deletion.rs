@@ -30,6 +30,7 @@
 use serde_json::{json, Value};
 
 use super::message_template::content_for;
+use super::message_template_qualifier::MESSAGE_QUALIFIER_NOT_ACCEPTED;
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, ABSENT_UUID, OTHER_ACCOUNT, REGION};
 
 /// The only value the modelled `ContentDisposition` enumeration declares
@@ -43,21 +44,6 @@ const CONTENT_DISPOSITION: &str = "ATTACHMENT";
 const MESSAGE_ATTACHMENT_NOT_FOUND: &str = "Message template attachment does not exist.";
 const MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
-
-/// The message a label carrying a version qualifier is refused with, on an operation whose
-/// own documentation says its label may not carry one: AWS's report of the member's
-/// `@pattern` violation, stating the expression the service enforces for it — `UuidOrArn`,
-/// quoted without the `^`/`$` pair a whole-value pattern is wrapped in, which is how this
-/// endpoint quotes every other pattern requirement. Written out here rather than imported
-/// from the implementation, so the assertion pins the message a client reads.
-pub(crate) const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = concat!(
-    "1 validation error detected: Value at 'messageTemplateId' failed to satisfy constraint: ",
-    "Member must satisfy regular expression pattern: ",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
-    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}",
-);
 
 /// The two managed version qualifiers the read's own documentation names
 /// (`smithy_query(query="doc",shape="GetMessageTemplate")`: "either an actual version

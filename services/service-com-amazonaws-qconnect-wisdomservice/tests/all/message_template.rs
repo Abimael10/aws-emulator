@@ -63,6 +63,7 @@ use service_com_amazonaws_qconnect_wisdomservice::state::{
     MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE, MAX_MESSAGE_TEMPLATE_ATTACHMENT_BYTES,
 };
 
+use super::message_template_qualifier::MESSAGE_QUALIFIER_NOT_ACCEPTED;
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, ABSENT_UUID, OTHER_ACCOUNT, REGION};
 
 /// Every value the modelled `ChannelSubtype` enumeration declares
@@ -1655,19 +1656,6 @@ const MESSAGE_ATTACHMENT_QUOTA: &str =
     "This message template holds as many attachments as its store keeps. Delete an \
      attachment before uploading another.";
 
-/// The message a label that carries a version qualifier is refused with, on an operation
-/// whose own documentation says it may not carry one: AWS's constraint-violation report for
-/// the member, stating the expression the service enforces for it — the model's `UuidOrArn`
-/// (`smithy_query(query="shape",shape="UuidOrArn")`), which admits no qualifier group, quoted
-/// without the anchors a whole-value pattern is wrapped in.
-const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = concat!(
-    "1 validation error detected: Value at 'messageTemplateId' failed to satisfy constraint: ",
-    "Member must satisfy regular expression pattern: ",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
-    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
-    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}",
-);
 
 /// `bytes` as the base64 text the request's `body` carries, through the workspace's own
 /// codec rather than a hand-written one.
