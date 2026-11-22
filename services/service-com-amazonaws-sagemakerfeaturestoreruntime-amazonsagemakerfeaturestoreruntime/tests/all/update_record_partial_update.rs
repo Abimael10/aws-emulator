@@ -15,6 +15,10 @@
 //!   (404) — `PutRecord`, not `UpdateRecord`, is what creates a record;
 //! * a `TtlDuration` recomputes `ExpiresAt = EventTime + TtlDuration` and requires an
 //!   `EventTime` in the same request;
+//! * that expiry is ONE value the record holds in two spellings — the ISO-8601 string a
+//!   read reports and the instant the store compares against — so a sum stating no
+//!   instant an ISO-8601 string can carry leaves the record under no expiry at all,
+//!   reported by neither read and enforced by nothing;
 //! * a feature of a record has ONE value, so a request that names the same feature more
 //!   than once — which the modelled `Features` list admits, carrying no `uniqueItems` —
 //!   settles that feature on the value it names LAST and leaves no earlier value of it
@@ -1578,5 +1582,217 @@ async fn a_feature_written_twice_by_one_write_is_updated_as_one_value() {
             "case {case:?}: expected BatchGetRecord to serve {expected_merged:?}, got \
              {batched:?}"
         );
+    }
+}
+
+/// The last instant an `ExpiresAt` can state, in epoch seconds: the end of year 9999,
+/// the greatest year the ISO-8601 string that member carries admits ("The `ExpiresAt`
+/// ISO string of the requested record",
+/// `smithy_query(query="shape", shape="GetRecordResponse")`).
+const LAST_STATABLE_SECS: i64 = 253_402_300_799;
+
+/// The largest value a `TtlDuration` can carry: `TtlDuration$Value` targets
+/// `TtlDurationValue`, an `integer` modelled `range 1..` with no maximum, so the type's
+/// own upper bound is what a request may state
+/// (`smithy_query(query="shape", shape="TtlDuration")`).
+const LARGEST_TTL_VALUE: i64 = i32::MAX as i64;
+
+/// What a read of the record a row wrote is expected to answer about its expiry.
+#[derive(Debug, Clone, Copy)]
+enum Expiry {
+    /// Reported as an ISO-8601 string this many seconds after the row's event time, and
+    /// enforced from that same instant.
+    Reported(f64),
+    /// None at all: the sum states no instant an ISO-8601 string can carry, so the
+    /// record holds the expiry in NEITHER spelling — no `ExpiresAt` is reported and
+    /// nothing hard-deletes the record.
+    Unstatable,
+    /// Reported and already reached, so the record is hard-deleted and the read serves
+    /// nothing at all.
+    Due,
+}
+
+/// Store the record one row reads back, under its event time and `TtlDuration`, through
+/// `write` — the two writes that derive a record's `ExpiresAt`.
+async fn write_under_ttl(
+    emulator: &Emulator,
+    write: &str,
+    event_time: &str,
+    unit: &str,
+    value: i64,
+) -> (u16, Value) {
+    let ttl = json!({ "Unit": unit, "Value": value });
+    if write == "PutRecord" {
+        return emulator
+            .put_record(
+                "ttlgroup",
+                json!({
+                    "Record": [
+                        feature("customer_id", "C1"),
+                        feature("event_time", event_time),
+                        feature("city", "Seattle")
+                    ],
+                    "TtlDuration": ttl
+                }),
+            )
+            .await;
+    }
+    // `UpdateRecord` is a PARTIAL update, so the record has to exist first. It is seeded
+    // under the row's OWN event time and no TTL duration, so the update's event time is
+    // not older than the stored one (no `ConflictException`) and the expiry it reads back
+    // is the one this request's duration derives.
+    seed(emulator, "ttlgroup", event_time).await;
+    emulator
+        .update_record(
+            "ttlgroup",
+            json!({
+                "RecordIdentifierValueAsString": "C1",
+                "Features": [
+                    feature("event_time", event_time),
+                    feature("city", "Tacoma")
+                ],
+                "TtlDuration": ttl
+            }),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn an_expiry_no_iso_8601_string_can_state_leaves_the_record_under_no_expiry() {
+    // `ExpiresAt = EventTime + TtlDuration` is one value held in two spellings, so the
+    // class the rule spans is WHERE that sum falls: inside the range an ISO-8601 string
+    // states (reported, and enforced once reached) or outside it on either side (no
+    // expiry at all). The rows differ in the event time's form (ISO-8601, epoch seconds)
+    // and magnitude and in the size of the duration — the largest `TtlDuration` the model
+    // admits under an ordinary event time reaches the far side of the bound on its own —
+    // and the published bound is tested from both sides. Each row is written through BOTH
+    // writes that derive an expiry.
+    let iso = tomorrow_iso();
+    let epoch = format!("{}", tomorrow() as i64);
+    let inside_bound = format!("{}", LAST_STATABLE_SECS - 1);
+    let at_bound = format!("{LAST_STATABLE_SECS}");
+    let milliseconds = format!("{}", tomorrow() as i64 * 1_000);
+    let cases: Vec<(&str, &str, &str, i64, Expiry)> = vec![
+        ("an ISO-8601 event time", &iso, "Hours", 1, Expiry::Reported(3_600.0)),
+        ("an epoch-seconds event time", &epoch, "Days", 1, Expiry::Reported(86_400.0)),
+        (
+            "a sum one second inside the last statable instant",
+            &inside_bound,
+            "Seconds",
+            1,
+            Expiry::Reported(1.0),
+        ),
+        (
+            "a sum one second past the last statable instant",
+            &at_bound,
+            "Seconds",
+            1,
+            Expiry::Unstatable,
+        ),
+        (
+            "the largest duration the model admits",
+            &iso,
+            "Weeks",
+            LARGEST_TTL_VALUE,
+            Expiry::Unstatable,
+        ),
+        (
+            "an event time passed in milliseconds",
+            &milliseconds,
+            "Hours",
+            1,
+            Expiry::Unstatable,
+        ),
+        (
+            "an event time above every statable instant",
+            "1e300",
+            "Hours",
+            1,
+            Expiry::Unstatable,
+        ),
+        (
+            "an event time below every statable instant",
+            "-1e300",
+            "Days",
+            1,
+            Expiry::Unstatable,
+        ),
+        (
+            "an expiry already reached",
+            "2024-01-01T00:00:00Z",
+            "Seconds",
+            1,
+            Expiry::Due,
+        ),
+    ];
+
+    for (case, event_time, unit, value, expected) in cases {
+        for write in ["PutRecord", "UpdateRecord"] {
+            let emulator = Emulator::new();
+            let (status, body) = write_under_ttl(&emulator, write, event_time, unit, value).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} through {write}: expected 200, got {status} {body:?}"
+            );
+
+            let (status, body) = emulator
+                .get_record(
+                    "ttlgroup",
+                    "RecordIdentifierValueAsString=C1&ExpirationTimeResponse=Enabled",
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} through {write}: expected GetRecord 200, got {status} {body:?}"
+            );
+            let served = record_pairs(&body);
+            let reported = body
+                .get("ExpiresAt")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+
+            match expected {
+                Expiry::Reported(delta) => {
+                    assert!(
+                        !served.is_empty(),
+                        "case {case:?} through {write}: expected GetRecord to serve the \
+                         record, got {body:?}"
+                    );
+                    let at = reported.clone().unwrap_or_default();
+                    assert!(
+                        DateTime::from_str(&at, Format::DateTime).is_ok(),
+                        "case {case:?} through {write}: expected an ISO-8601 ExpiresAt, got \
+                         {reported:?}"
+                    );
+                    let actual = secs(&at) - secs(event_time);
+                    assert!(
+                        (actual - delta).abs() < 0.001,
+                        "case {case:?} through {write}: expected ExpiresAt {delta} s after the \
+                         event time, got {actual} s (ExpiresAt {reported:?})"
+                    );
+                }
+                Expiry::Unstatable => {
+                    assert!(
+                        !served.is_empty(),
+                        "case {case:?} through {write}: expected GetRecord to serve the record, \
+                         since an expiry no ISO-8601 string states is no expiry the store \
+                         enforces, got {body:?}"
+                    );
+                    assert!(
+                        reported.is_none(),
+                        "case {case:?} through {write}: expected no ExpiresAt, since the sum \
+                         states no instant an ISO-8601 string can carry, got {reported:?}"
+                    );
+                }
+                Expiry::Due => {
+                    assert!(
+                        served.is_empty() && reported.is_none(),
+                        "case {case:?} through {write}: expected an expiry already reached to \
+                         have hard-deleted the record, got {served:?} with ExpiresAt \
+                         {reported:?}"
+                    );
+                }
+            }
+        }
     }
 }

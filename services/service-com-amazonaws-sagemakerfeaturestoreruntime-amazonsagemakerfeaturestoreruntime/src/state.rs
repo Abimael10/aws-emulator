@@ -300,10 +300,14 @@ pub struct StoredRecord {
     /// The record's event time, exactly as the event-time feature carried it.
     pub event_time: Option<String>,
     /// `EventTime + TtlDuration`, as an ISO-8601 string; absent when the record is under
-    /// no TTL at all ([`effective_ttl_seconds`]) or carries no parsable event time.
+    /// no TTL at all ([`effective_ttl_seconds`]), carries no parsable event time, or the
+    /// sum of the two states no instant an `ExpiresAt` can carry ([`derived_expiry`]).
     pub expires_at: Option<String>,
     /// The same instant as [`Self::expires_at`] in epoch seconds, for the expiry
-    /// comparison, so no handler re-parses the string.
+    /// comparison, so no handler re-parses the string. Set exactly when
+    /// [`Self::expires_at`] is: the two are one derived expiry in two spellings
+    /// ([`derived_expiry`]), so the clock is never compared against an expiry no read
+    /// reports.
     pub expires_at_secs: Option<f64>,
     /// The record's `TtlDuration` in SECONDS — the duration the write that stored it was
     /// under, which is its own when it named one and otherwise its feature group's
@@ -329,15 +333,13 @@ impl StoredRecord {
     /// [`Self::event_time`] and [`Self::ttl_secs`], so the stored instant and the two
     /// values it is computed from can never disagree.
     ///
-    /// Both members go to `None` when the record carries no TTL duration or no parsable
-    /// event time: there is then no expiry the clock owes.
+    /// Both members go to `None` together — the record then has no expiry at all, and
+    /// there is none the clock owes — in each case [`derived_expiry`] yields nothing for:
+    /// no TTL duration, no parsable event time, or a sum stating no instant an
+    /// `ExpiresAt` can carry.
     pub fn recompute_expiry(&mut self) {
-        let at = self
-            .ttl_secs
-            .zip(self.event_time_secs())
-            .map(|(ttl, event_time)| event_time + ttl);
-        self.expires_at = at.and_then(|at| iso8601(at).ok());
-        self.expires_at_secs = at;
+        (self.expires_at, self.expires_at_secs) =
+            derived_expiry(self.event_time_secs(), self.ttl_secs).unzip();
     }
 
     /// This record's features, restricted to `feature_names` when the caller named
@@ -400,7 +402,7 @@ impl PreparedRecord {
     }
 
     /// `ExpiresAt = EventTime + TtlDuration`, as the ISO-8601 string a read reports,
-    /// when the write carries a TTL duration and a parsable event time.
+    /// for a write the expiry is derived for at all ([`derived_expiry`]).
     pub fn expires_at(&self) -> Option<&str> {
         self.record.expires_at.as_deref()
     }
@@ -669,10 +671,33 @@ fn event_time_order(event_time_secs: Option<f64>) -> f64 {
 
 /// `secs` as the ISO-8601 string an `ExpiresAt` carries.
 ///
-/// `Err` only for an instant [`DateTime`] cannot format (one outside the range a
-/// timestamp can state), which no event time plus a modelled `TtlDuration` reaches.
-pub fn iso8601(secs: f64) -> Result<String, aws_smithy_types::date_time::DateTimeFormatError> {
+/// `Err` for an instant [`DateTime`] cannot format: one outside the range a timestamp can
+/// state. An event time plus a `TtlDuration` reaches that range — see [`derived_expiry`],
+/// the one caller, for what a record whose expiry lands there is stored with.
+fn iso8601(secs: f64) -> Result<String, aws_smithy_types::date_time::DateTimeFormatError> {
     DateTime::from_secs_f64(secs).fmt(Format::DateTime)
+}
+
+/// `EventTime + TtlDuration` as the TWO spellings a record holds one expiry in: the
+/// ISO-8601 string a read reports as its `ExpiresAt` (modelled a string, "The `ExpiresAt`
+/// ISO string of the requested record") and the same instant in epoch seconds the expiry
+/// comparison uses ([`FeatureGroupStore::purge_expired`]).
+///
+/// `None` — no expiry, in NEITHER spelling — when the record is under no TTL duration,
+/// when it carries no event time an instant can be read from
+/// ([`parse_event_time_secs`]), and when the sum of the two states no instant a timestamp
+/// can state. That last case is reachable from both sides: an event-time feature carries
+/// any finite number of seconds since the epoch, and `TtlDuration` is modelled
+/// `Value: range 1..` of its `Unit`, so even an ordinary event time under the largest
+/// duration the model admits lands beyond the range. An expiry is one value, so where it
+/// has no spelling the record keeps neither half of it: the store never hard-deletes a
+/// record at an instant no read can report, and never reports an `ExpiresAt` it does not
+/// enforce.
+fn derived_expiry(event_time_secs: Option<f64>, ttl_secs: Option<f64>) -> Option<(String, f64)> {
+    let at = ttl_secs
+        .zip(event_time_secs)
+        .map(|(ttl, event_time)| event_time + ttl)?;
+    Some((iso8601(at).ok()?, at))
 }
 
 /// The TTL a record of feature group `definition` is under, in seconds: the duration the
