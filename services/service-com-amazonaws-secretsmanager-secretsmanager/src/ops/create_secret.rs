@@ -640,6 +640,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Never retrieved yet: `LastAccessedDate` "is omitted if
                     // the secret has never been retrieved".
                     last_accessed_date: None,
+                    // The key this value was just sealed under: the one the
+                    // secret names, in the form this request named it.
+                    kms_key_id: secret.kms_key_id.clone(),
                 },
                 now,
             );

@@ -638,6 +638,9 @@ pub fn seed_secret_value(engine: &engine::InMemoryEngine, arn: &str, value: &str
             version_stages: vec![secrets::STAGE_CURRENT.to_string()],
             created_date: now,
             last_accessed_date: None,
+            // The seeded secret names no KMS key, so its version is held under the
+            // account's default Secrets Manager key.
+            kms_key_id: None,
         },
         now,
     );

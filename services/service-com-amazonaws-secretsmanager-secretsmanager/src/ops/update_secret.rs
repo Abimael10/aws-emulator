@@ -434,6 +434,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.description.is_some() {
             secret.description = input.description.clone().filter(|text| !text.is_empty());
         }
+        // Which of the stored versions this call leaves on the key it points the
+        // secret at, decided before that key is applied. "The ARN, key ID, or alias
+        // of the KMS key that Secrets Manager uses to encrypt new secret versions
+        // as well as any existing versions with the staging labels AWSCURRENT,
+        // AWSPENDING, or AWSPREVIOUS" (`UpdateSecretRequest$KmsKeyId`, this
+        // service's Smithy model): when the bytes have to move, exactly the versions
+        // that were re-encrypted under the new key, since one the new key would not
+        // encrypt stays under the key holding it; when the key the secret names
+        // changed only in FORM, so nothing had to be re-encrypted, every version
+        // those labels reach.
+        let rekeyed: Vec<String> = if input.kms_key_id.is_none() {
+            Vec::new()
+        } else if moves_to_another_key(secret.kms_key_id.as_deref(), target.kms_key_id.as_deref())
+        {
+            resealed.iter().map(|(id, _)| id.clone()).collect()
+        } else {
+            secret.staged_version_ids()
+        };
         if input.kms_key_id.is_some() {
             secret.kms_key_id = target.kms_key_id.clone();
         }
@@ -448,6 +466,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (staged_id, staged_value) in resealed {
             secret.reseal_version(&staged_id, staged_value);
         }
+        // And each of those versions now REPORTS the key holding it, so a caller
+        // reading the versions back sees which key wraps which one
+        // (`SecretVersionsListEntry$KmsKeyIds`).
+        secret.rekey_versions(&rekeyed, target.kms_key_id.as_deref());
 
         // "If you include SecretString or SecretBinary to create a new secret
         // version, Secrets Manager automatically moves the staging label
@@ -464,6 +486,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Never retrieved yet: `LastAccessedDate` "is omitted if
                     // the secret has never been retrieved".
                     last_accessed_date: None,
+                    // The key this value was sealed under: the one this call
+                    // leaves the secret on, in the form it names it.
+                    kms_key_id: target.kms_key_id.clone(),
                 },
                 now,
             );

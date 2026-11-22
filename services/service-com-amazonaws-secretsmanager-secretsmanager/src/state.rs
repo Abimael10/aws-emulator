@@ -881,6 +881,26 @@ pub const DEFAULT_KMS_KEY_ALIAS: &str = "alias/aws/secretsmanager";
 /// on the account default key from one on a key of the secret's own.
 pub const DEFAULT_ENCRYPTION_KEY_ID: &str = "DefaultEncryptionKey";
 
+/// The keys a version held under `kms_key_id` is encrypted under, as the service
+/// reports them: the key reference STORED on the version, exactly as the request
+/// that put it there named the key — the same form `DescribeSecret` reports as a
+/// secret's `KmsKeyId`, "the ARN, key ID, or alias of the KMS key"
+/// (`CreateSecretRequest$KmsKeyId`, this service's Smithy model) — and
+/// [`DEFAULT_ENCRYPTION_KEY_ID`] only where no key was named at all, which is the
+/// one case the service has no identifier of the caller's to report.
+///
+/// So a version wrapped under the Amazon Web Services managed key BY NAME reports
+/// that name, and only one stored while the secret named no key at all reports the
+/// token — which is what lets a caller tell the two apart after an update that
+/// re-keys a secret onto the managed key. Never empty: every version is encrypted
+/// under some key.
+pub fn encryption_key_ids(kms_key_id: Option<&str>) -> Vec<String> {
+    match kms_key_id.filter(|key| !key.is_empty()) {
+        Some(key) => vec![key.to_string()],
+        None => vec![DEFAULT_ENCRYPTION_KEY_ID.to_string()],
+    }
+}
+
 /// Whether `kms_key_id` names the account's default Secrets Manager key —
 /// [`DEFAULT_KMS_KEY_ALIAS`] — rather than a key of the secret's own.
 ///
@@ -1785,6 +1805,16 @@ pub struct SecretVersion {
     /// service reports it (see [`Secret::record_access`]); `None` while it has
     /// never been retrieved.
     pub last_accessed_date: Option<SystemTime>,
+    /// The KMS key THIS version's value is held under, as the request that put it
+    /// there named the key ("the ARN, key ID, or alias of the KMS key",
+    /// `CreateSecretRequest$KmsKeyId`, this service's Smithy model); `None` for a
+    /// version stored while the secret named no key at all.
+    ///
+    /// It is the version's OWN, not the secret's: pointing a secret at another key
+    /// moves only the versions carrying the staging labels the service itself moves
+    /// ([`Secret::staged_version_ids`]), so a version outside them stays under — and
+    /// goes on reporting — the key that holds it.
+    pub kms_key_id: Option<String>,
 }
 
 impl SecretVersion {
@@ -1829,6 +1859,23 @@ impl SecretVersion {
                 .cloned(),
         );
         ordered
+    }
+
+    /// Whether this version carries a staging label the service itself moves,
+    /// which is what makes it one of the versions a change of the secret's
+    /// `KmsKeyId` covers.
+    pub fn is_staged(&self) -> bool {
+        self.version_stages
+            .iter()
+            .any(|held| is_reserved_stage(held))
+    }
+
+    /// The KMS keys this version's value is encrypted under, which is what
+    /// `SecretVersionsListEntry$KmsKeyIds` reports — "the KMS keys used to encrypt
+    /// the secret version" (this service's Smithy model). See
+    /// [`encryption_key_ids`].
+    pub fn encryption_key_ids(&self) -> Vec<String> {
+        encryption_key_ids(self.kms_key_id.as_deref())
     }
 
     /// How many of the staging labels on this version a CALLER named: the ones
@@ -2120,25 +2167,28 @@ impl Secret {
         self.versions.iter().find(|v| v.version_id == version_id)
     }
 
-    /// The keys every version of this secret is encrypted under: the key the
-    /// secret's configuration NAMES, exactly as the secret holds it — the value
-    /// `DescribeSecret` reports as its `KmsKeyId`, in whichever of the forms
-    /// `KmsKeyId` accepts it was given ("the ARN, key ID, or alias of the KMS
-    /// key", `CreateSecretRequest$KmsKeyId`, this service's Smithy model) — and
-    /// [`DEFAULT_ENCRYPTION_KEY_ID`] only for a secret whose configuration names
-    /// NO key, which is the one case the service has no identifier of the
-    /// caller's to report. This is `SecretVersionsListEntry$KmsKeyIds`, "the KMS
-    /// keys used to encrypt the secret version", and it is never empty: every
-    /// version is encrypted under some key.
-    ///
-    /// So a secret pointed at the Amazon Web Services managed key BY NAME reports
-    /// that name, and only one that was never given a key at all reports the
-    /// token — which is what lets a caller tell the two apart after an update
-    /// that re-keys a secret onto the managed key.
-    pub fn encryption_key_ids(&self) -> Vec<String> {
-        match self.kms_key_id.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => vec![key.to_string()],
-            None => vec![DEFAULT_ENCRYPTION_KEY_ID.to_string()],
+    /// The ids of the versions carrying a staging label the service itself moves —
+    /// the versions a change of this secret's key covers: "the KMS key that Secrets
+    /// Manager uses to encrypt new secret versions as well as any existing versions
+    /// with the staging labels AWSCURRENT, AWSPENDING, or AWSPREVIOUS"
+    /// (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model).
+    pub fn staged_version_ids(&self) -> Vec<String> {
+        self.versions
+            .iter()
+            .filter(|version| version.is_staged())
+            .map(|version| version.version_id.clone())
+            .collect()
+    }
+
+    /// Record that the versions `version_ids` name are now held under the key
+    /// `kms_key_id` names, in the form the request that pointed the secret at it
+    /// gave — which is what each of them reports as its `KmsKeyIds`. A version that
+    /// has since gone is left alone.
+    pub fn rekey_versions(&mut self, version_ids: &[String], kms_key_id: Option<&str>) {
+        for version in &mut self.versions {
+            if version_ids.contains(&version.version_id) {
+                version.kms_key_id = kms_key_id.map(str::to_string);
+            }
         }
     }
 
@@ -2204,12 +2254,7 @@ impl Secret {
     pub fn staged_version_values(&self) -> Vec<(String, envelope::StoredValue)> {
         self.versions
             .iter()
-            .filter(|version| {
-                version
-                    .version_stages
-                    .iter()
-                    .any(|held| is_reserved_stage(held))
-            })
+            .filter(|version| version.is_staged())
             .map(|version| (version.version_id.clone(), version.value.clone()))
             .collect()
     }
@@ -3264,6 +3309,7 @@ mod tests {
             version_stages: stages.iter().map(|stage| (*stage).to_string()).collect(),
             created_date: at,
             last_accessed_date: None,
+            kms_key_id: None,
         }
     }
 

@@ -371,6 +371,7 @@ fn stake_current_version(
     value: &sm::envelope::SecretValue,
     at: SystemTime,
 ) {
+    let kms_key_id = secret.kms_key_id.clone();
     secret.put_version(
         sm::SecretVersion {
             version_id: sm::new_version_id(),
@@ -380,6 +381,9 @@ fn stake_current_version(
             // Never retrieved yet: `LastAccessedDate` "is omitted if the secret has never been
             // retrieved".
             last_accessed_date: None,
+            // The key the version is held under, which this path reports back as the secret's
+            // own: the key the record names, and so the managed key for a secret made here.
+            kms_key_id,
         },
         at,
     );

@@ -261,21 +261,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListSecretVersionIdsOutput {
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
-            versions: Some(
-                page.into_iter()
-                    .map(|version| entry_for(content, version))
-                    .collect(),
-            ),
+            versions: Some(page.into_iter().map(entry_for).collect()),
             next_token,
         })
     }
 }
 
 /// One `SecretVersionsListEntry`, built from the stored version.
-fn entry_for(
-    secret: &crate::state::Secret,
-    version: &crate::state::SecretVersion,
-) -> SecretVersionsListEntry {
+fn entry_for(version: &crate::state::SecretVersion) -> SecretVersionsListEntry {
     SecretVersionsListEntry {
         version_id: Some(version.version_id.clone()),
         // `SecretVersionStagesType` is modelled with a minimum length of 1, so a
@@ -286,11 +279,11 @@ fn entry_for(
         // the retrieval of its value records and which is omitted until one
         // has (see `state::Secret::record_access`).
         last_accessed_date: version.last_accessed_date.map(crate::state::timestamp),
-        // "The KMS keys used to encrypt the secret version." Every version is
-        // encrypted under some key, so this is never absent: the key the secret
-        // names, or the account's default Secrets Manager key for a secret that
-        // names none (see `state::Secret::encryption_key_ids`).
-        kms_key_ids: Some(secret.encryption_key_ids()),
+        // "The KMS keys used to encrypt the secret version" — THIS version's: the
+        // key it was stored under, and the key a later update moved it to, rather
+        // than whatever key the secret happens to name now (see
+        // `state::SecretVersion::encryption_key_ids`).
+        kms_key_ids: Some(version.encryption_key_ids()),
     }
 }
 

@@ -334,6 +334,9 @@ pub(crate) fn register_secret_storing(
             version_stages: vec![secretsmanager::state::STAGE_CURRENT.to_string()],
             created_date: now,
             last_accessed_date: None,
+            // The fixture secret names no KMS key, so its version is held under the
+            // account's default Secrets Manager key.
+            kms_key_id: None,
         },
         now,
     );
