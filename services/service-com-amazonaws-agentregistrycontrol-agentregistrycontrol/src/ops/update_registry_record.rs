@@ -464,19 +464,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked above, before the store was taken again.
 
         // Where the record lands once the asynchronous update has been processed: an edit
-        // to a record under review takes it back out of the approval workflow, so it
-        // settles at DRAFT and can be submitted again; any other record settles back at
-        // the status it was in, since an edit decides nothing about its curation.
-        let settles_at = if [
-            crate::state::RECORD_PENDING_APPROVAL,
-            crate::state::RECORD_REJECTED,
-        ]
-        .contains(&record.status.as_str())
-        {
-            crate::state::RECORD_DRAFT.to_string()
-        } else {
-            record.status.clone()
-        };
+        // of a record that is in the registry's approval workflow — one waiting for review,
+        // one a curator approved, one a curator turned down — takes it back out of that
+        // workflow, so it settles at DRAFT and can be submitted again; a record that is not
+        // in the workflow settles back at the status it was in. The rule itself is the
+        // state module's ([`crate::state::status_after_edit`]), so it is written once.
+        let settles_at = crate::state::status_after_edit(&record.status).to_string();
         let withdrawn = settles_at != record.status;
         let updated_at = crate::state::now();
         // The update is asynchronous: the record carries UPDATING while it is processed,
@@ -537,6 +530,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored.
         let _ = input.trigger_synchronization;
 
+        // The record carries UPDATING while this service processes the edit. The revision
+        // the approval workflow published stays as it is — this edit publishes nothing, so
+        // consumers of the registry keep resolving the last approved revision through the
+        // edit and past the status it settles at.
         record.status = crate::state::RECORD_UPDATING.to_string();
         if withdrawn {
             // The reason described the status the edit took the record out of.

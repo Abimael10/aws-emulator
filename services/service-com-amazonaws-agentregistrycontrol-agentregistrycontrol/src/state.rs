@@ -252,6 +252,32 @@ pub fn is_terminal_record_status(status: &str) -> bool {
     status == RECORD_DEPRECATED
 }
 
+/// The statuses a record has been through the registry's approval workflow in, so an EDIT
+/// of its content takes it back out of that workflow: one waiting for a curator, one a
+/// curator approved, and one a curator turned down. A `DRAFT` has not entered the workflow,
+/// so there is nothing for an edit to withdraw it from.
+pub const RECORD_WITHDRAWN_BY_EDIT: &[&str] =
+    &[RECORD_PENDING_APPROVAL, RECORD_APPROVED, RECORD_REJECTED];
+
+/// The status an edit settles a record at once this service has processed it.
+///
+/// An edit decides nothing about a record's curation, but it does invalidate the review the
+/// record has already been through — the content a curator saw is not the content the record
+/// now holds — so a record that is in the approval workflow ([`RECORD_WITHDRAWN_BY_EDIT`])
+/// is withdrawn from it and settles at `DRAFT`, where it can be submitted for approval
+/// again; a record that is not settles back at the status it was in.
+///
+/// The ONE place this rule is written, so an edit of any record of this service withdraws
+/// it on the same terms. The approved revision a withdrawn record had published stays
+/// published until the edit is approved in turn ([`RegistryRecord::settle_at_status`]).
+pub fn status_after_edit(status: &str) -> &str {
+    if RECORD_WITHDRAWN_BY_EDIT.contains(&status) {
+        RECORD_DRAFT
+    } else {
+        status
+    }
+}
+
 /// The statuses the record lifecycle allows a record in `status` to move to, by ANY means:
 /// a curator's step, a submission, or this service's own asynchronous work. Its order is
 /// the order the service states them in — the workflow's next steps, then retirement, then
@@ -480,6 +506,33 @@ impl Registry {
     }
 }
 
+/// The content of a registry record as of the moment it was last APPROVED: the record's
+/// published revision.
+///
+/// A record enters the discovery surface when the approval workflow approves it, and what
+/// that surface serves is the content that was approved. So a record carries the revision
+/// its approval published, which the discovery reads report until the workflow publishes
+/// another one: an edit of an approved record withdraws the record from the workflow
+/// ([`status_after_edit`]) without publishing the edited content, so consumers keep
+/// resolving the last approved revision while the edit waits to be approved in turn.
+///
+/// It holds the content members alone. A record's identity (its ids and ARNs, the account
+/// that created it and when) does not change with a revision, so it is read from the record
+/// itself; the control plane's own reads always report the record as it stands now.
+#[derive(Debug, Clone)]
+pub struct ApprovedRevision {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub record_type: String,
+    pub descriptors: Option<Descriptors>,
+    pub record_version: String,
+    pub custom_metadata: Option<::aws_smithy_types::Document>,
+    /// When this revision was published — the instant the approval that published it
+    /// stamped on the record.
+    pub updated_at: DateTime,
+}
+
 /// A registry record, exactly as `CreateRegistryRecord` stored it.
 #[derive(Debug)]
 pub struct RegistryRecord {
@@ -502,6 +555,46 @@ pub struct RegistryRecord {
     pub updated_at: DateTime,
     pub tags: BTreeMap<String, String>,
     pub pending: Option<DueTransition<RecordTransition>>,
+    /// The revision the approval workflow last published, or `None` for a record no
+    /// approval has published: see [`ApprovedRevision`].
+    pub approved_revision: Option<ApprovedRevision>,
+}
+
+impl RegistryRecord {
+    /// Move this record into `status`, keeping its published revision in step.
+    ///
+    /// Every settled status this service writes goes through here — a submission's verdict,
+    /// a curator's step, and the status an asynchronous change settles at — so what the
+    /// discovery surface serves follows from the workflow alone: entering `APPROVED`
+    /// publishes the content the record holds at that moment, and leaving the approved
+    /// state for a status that is not discoverable withdraws what was published. Any other
+    /// status leaves the published revision alone, which is what lets a withdrawn edit keep
+    /// the last approved revision available to consumers.
+    pub fn settle_at_status(&mut self, status: &str) {
+        self.status = status.to_string();
+        match status {
+            RECORD_APPROVED => {
+                let published = self.revision();
+                self.approved_revision = Some(published);
+            }
+            RECORD_REJECTED | RECORD_DEPRECATED => self.approved_revision = None,
+            _ => {}
+        }
+    }
+
+    /// The content this record holds now, as a revision.
+    fn revision(&self) -> ApprovedRevision {
+        ApprovedRevision {
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            record_type: self.record_type.clone(),
+            descriptors: self.descriptors.clone(),
+            record_version: self.record_version.clone(),
+            custom_metadata: self.custom_metadata.clone(),
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 /// What one `@idempotencyToken` replay remembers: the ANSWER the first call returned, a
@@ -638,11 +731,12 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
             for record in registry.records.values_mut() {
                 if let Some(pending) = record.pending.clone() {
                     if pending.due_at <= now {
-                        record.status = match &pending.to {
+                        let status = match &pending.to {
                             RecordTransition::Draft => RECORD_DRAFT.to_string(),
                             RecordTransition::Settled(status) => status.clone(),
                         };
                         record.updated_at = pending.at;
+                        record.settle_at_status(&status);
                         record.pending = None;
                     } else {
                         arm(pending.due_at);

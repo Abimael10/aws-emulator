@@ -81,21 +81,51 @@ fn discoverable(held: &control::Registry) -> Registry {
 }
 
 /// One stored record as the discovery surface publishes it.
+///
+/// What this surface serves is the record's APPROVED REVISION — the content the approval
+/// workflow last published ([`control::ApprovedRevision`]) — so a record that has one is
+/// projected from it, whatever content the control plane holds for the record now and
+/// whatever status the record is in there: an edit withdraws the record from the approval
+/// workflow without publishing the edited content, so consumers keep resolving the last
+/// approved revision until that edit is approved in turn, and a curation step that takes the
+/// record off this surface is what withdraws it. A record with no published revision is
+/// projected as it stands, and its own status is what keeps it off the surface
+/// ([`super::RegistryRecord::is_discoverable`]).
 fn record(held: &control::RegistryRecord) -> RegistryRecord {
+    let published = held.approved_revision.as_ref();
     RegistryRecord {
         record_id: held.record_id.clone(),
         record_arn: held.record_arn.clone(),
         registry_arn: held.registry_arn.clone(),
-        name: held.name.clone(),
-        display_name: held.display_name.clone(),
-        description: held.description.clone(),
-        record_type: held.record_type.clone(),
-        record_version: held.record_version.clone(),
-        status: held.status.clone(),
-        descriptors: held.descriptors.as_ref().map(descriptors).unwrap_or_default(),
-        custom_metadata: held.custom_metadata.clone(),
+        name: published.map_or(&held.name, |revision| &revision.name).clone(),
+        display_name: published
+            .map_or(&held.display_name, |revision| &revision.display_name)
+            .clone(),
+        description: published
+            .map_or(&held.description, |revision| &revision.description)
+            .clone(),
+        record_type: published
+            .map_or(&held.record_type, |revision| &revision.record_type)
+            .clone(),
+        record_version: published
+            .map_or(&held.record_version, |revision| &revision.record_version)
+            .clone(),
+        // A published revision IS approved content, so that is the status a discovery read
+        // reports for it; the record's live status is the control plane's to report.
+        status: match published {
+            Some(_) => super::STATUS_APPROVED.to_string(),
+            None => held.status.clone(),
+        },
+        descriptors: published
+            .map_or(&held.descriptors, |revision| &revision.descriptors)
+            .as_ref()
+            .map(descriptors)
+            .unwrap_or_default(),
+        custom_metadata: published
+            .map_or(&held.custom_metadata, |revision| &revision.custom_metadata)
+            .clone(),
         created_at: held.created_at,
-        updated_at: held.updated_at,
+        updated_at: published.map_or(held.updated_at, |revision| revision.updated_at),
     }
 }
 

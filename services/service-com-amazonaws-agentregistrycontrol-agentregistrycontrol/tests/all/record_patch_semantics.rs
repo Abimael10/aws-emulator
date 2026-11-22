@@ -601,8 +601,12 @@ struct EditRow {
 async fn an_edit_settles_the_record_at_the_status_its_curation_state_decides() {
     let (router, _engine) = router();
 
-    // An edit to a record under review takes it back out of the approval workflow; any
-    // other record settles back where it was.
+    // An edit of a record that is in the registry's approval workflow takes it back out of
+    // that workflow: the content a curator saw is not the content the record now holds, so
+    // the record settles at DRAFT and can be submitted again. A record that is not in the
+    // workflow — a DRAFT — settles back where it was. The rows are every status an edit can
+    // arrive in: the asynchronous ones are refused while the change is in flight and the
+    // terminal one is refused outright, both in the suites below.
     let rows: Vec<EditRow> = vec![
         EditRow {
             case: "a draft record",
@@ -633,8 +637,11 @@ async fn an_edit_settles_the_record_at_the_status_its_curation_state_decides() {
             auto_approve: true,
             start_status: "APPROVED",
             start_reason: Some("reviewed by the catalogue team"),
-            settles_at: "APPROVED",
-            reason_after: Some("reviewed by the catalogue team"),
+            // An edit invalidates the approval it was made against, so the record is
+            // withdrawn from the workflow and the reason that described the status it has
+            // left goes with it.
+            settles_at: "DRAFT",
+            reason_after: None,
         },
     ];
 

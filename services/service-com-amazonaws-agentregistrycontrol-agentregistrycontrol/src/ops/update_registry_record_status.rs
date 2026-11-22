@@ -310,12 +310,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        record.status = input.status;
+        record.updated_at = updated_at;
+        // A curator's step decides what the discovery surface serves: APPROVED publishes
+        // the content the record holds at this instant as its revision, and a step that
+        // takes the record off that surface withdraws what was published. The record's own
+        // step holds those together, so no caller of it has to remember them.
+        record.settle_at_status(&input.status);
         // `statusReason` is `@required` on this request and on its answer — "the reason for
         // the status change" — so the reason the caller gave is what the record carries
         // from now on and what every later read reports.
         record.status_reason = Some(input.status_reason);
-        record.updated_at = updated_at;
 
         Ok(UpdateRegistryRecordStatusOutput {
             registry_arn: record.registry_arn.clone(),

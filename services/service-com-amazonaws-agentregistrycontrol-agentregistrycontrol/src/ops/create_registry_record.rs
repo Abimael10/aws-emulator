@@ -448,6 +448,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: created_at,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             pending: Some(pending),
+            // Nothing is published until the registry's approval workflow approves the
+            // record, so a record this call creates has no approved revision yet.
+            approved_revision: None,
         };
         let status = record.status.clone();
 

@@ -255,11 +255,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        record.status = submitted_status.to_string();
+        record.updated_at = updated_at;
+        // A submission the registry auto-approves PUBLISHES the record: entering APPROVED
+        // is what makes the content it holds at that instant the revision the discovery
+        // surface serves, so the status is written through the record's own step rather
+        // than onto the field.
+        record.settle_at_status(submitted_status);
         // The reason belonged to the status the record has just left, and nothing is
         // claimed about the new one that the workflow did not decide.
         record.status_reason = None;
-        record.updated_at = updated_at;
 
         Ok(SubmitRegistryRecordForApprovalOutput {
             registry_arn: record.registry_arn.clone(),
