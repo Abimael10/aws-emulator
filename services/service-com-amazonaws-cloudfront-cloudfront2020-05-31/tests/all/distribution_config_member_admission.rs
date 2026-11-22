@@ -45,7 +45,7 @@ const ORIGIN_CUSTOM_HEADERS_QUOTA: usize = 10;
 /// The published quota on the alternate domain names one distribution may state.
 const ALIAS_QUOTA: usize = 100;
 /// The published quota on the origins one distribution may state.
-const ORIGIN_QUOTA: usize = 25;
+const ORIGIN_QUOTA: usize = 100;
 /// The published quota on the origin groups one distribution may state.
 const ORIGIN_GROUP_QUOTA: usize = 10;
 /// The published quota on the cookie names, headers and query string keys ONE cache behaviour
@@ -418,7 +418,7 @@ fn cases() -> Vec<Case> {
             expect: refused(
                 400,
                 "TooManyOrigins",
-                "You cannot create more origins for the distribution.",
+                "Your request contains more Origins than are allowed per distribution.",
             ),
         },
         Case {

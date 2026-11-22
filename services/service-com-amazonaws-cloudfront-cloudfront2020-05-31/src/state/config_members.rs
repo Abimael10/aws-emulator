@@ -131,10 +131,13 @@ pub fn parameter_out_of_range(parameter: &str) -> ConfigMemberRefusal {
 
 /// The most origins ONE distribution's configuration may state.
 ///
-/// CloudFront's published quota is 25 origins per distribution (the Amazon CloudFront
-/// Developer Guide's "Quotas", the general quotas on distributions), the same scope
-/// [`MAX_CACHE_BEHAVIORS`] carries. Over it, the refusal is the modelled `TooManyOrigins`.
-pub const MAX_ORIGINS_PER_DISTRIBUTION: usize = 25;
+/// RECORDED behaviour, which is where this number comes from: the service creates a
+/// distribution whose configuration states exactly this many origins and reports every one of
+/// them back, and refuses one stating one more. The figure the Developer Guide's "Quotas" page
+/// carries for this list is an adjustable default, so it is the recording rather than that
+/// page that fixes the bound here — do not "correct" this constant to a smaller published one.
+/// Over it, the refusal is the modelled `TooManyOrigins`.
+pub const MAX_ORIGINS_PER_DISTRIBUTION: usize = 100;
 
 /// The most origin groups ONE distribution's configuration may state.
 ///
@@ -643,8 +646,18 @@ fn is_country_code(value: &str) -> bool {
 pub const TOO_MANY_DISTRIBUTION_CNAMES_MESSAGE: &str =
     "Your request contains more CNAMEs than are allowed per distribution.";
 
-/// `TooManyOrigins`'s message, as the model documents the shape.
-pub const TOO_MANY_ORIGINS_MESSAGE: &str = "You cannot create more origins for the distribution.";
+/// `TooManyOrigins`'s message, on the wire.
+///
+/// It names the MEMBER the origins travel in and the scope the quota is published for — the
+/// same shape as the sentence the sibling per-distribution list quotas state
+/// ([`TOO_MANY_DISTRIBUTION_CNAMES_MESSAGE`], [`TOO_MANY_ORIGIN_CUSTOM_HEADERS_MESSAGE`]) —
+/// and nothing of the request: neither the count submitted, the quota itself nor any origin
+/// id is part of what the caller has to fix. Recorded behaviour, which differs from the
+/// sentence the model's documentation of the shape uses for the same condition ("You cannot
+/// create more origins for the distribution") — do not "correct" this constant to the
+/// documentation sentence.
+pub const TOO_MANY_ORIGINS_MESSAGE: &str =
+    "Your request contains more Origins than are allowed per distribution.";
 
 /// `TooManyOriginGroupsPerDistribution`'s message, as the model documents the shape.
 pub const TOO_MANY_ORIGIN_GROUPS_MESSAGE: &str =
