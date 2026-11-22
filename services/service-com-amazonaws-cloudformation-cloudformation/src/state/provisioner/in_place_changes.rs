@@ -386,6 +386,19 @@ impl Provisioner {
             Self::AutoScalingScalingPolicy => {
                 update_scaling_policy(ctx, region, resource, declared).await
             }
+            // Each of the three children of a group is stated by one upsert of its own —
+            // `PutLifecycleHook`, `PutScheduledUpdateGroupAction` and `PutWarmPool` each
+            // "creates or updates" the resource — so a changed declaration reaches the child
+            // through the same call that created it, on the group it is already on.
+            Self::AutoScalingLifecycleHook => {
+                update_lifecycle_hook(ctx, region, resource, declared).await
+            }
+            Self::AutoScalingScheduledAction => {
+                update_scheduled_action(ctx, region, resource, declared).await
+            }
+            Self::AutoScalingWarmPool => {
+                update_warm_pool(ctx, region, resource, declared).await
+            }
             // A LAUNCH TEMPLATE is a versioned document: `CreateLaunchTemplateVersion`
             // "creates a new version of a launch template", so a changed declaration of its
             // launch data reaches Amazon EC2 as a new version of the template the stack

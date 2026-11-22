@@ -79,6 +79,30 @@ impl Provisioner {
                 )
                 .await
             }
+            // The three children of a group are read back the same way: by the group the
+            // resource's own record names and, for the two that carry a name, the name they
+            // were created under.
+            Self::AutoScalingLifecycleHook => {
+                describe_lifecycle_hook(
+                    ctx,
+                    region,
+                    &resource.properties,
+                    &declared_name(resource),
+                )
+                .await
+            }
+            Self::AutoScalingScheduledAction => {
+                describe_scheduled_action(
+                    ctx,
+                    region,
+                    &resource.properties,
+                    &declared_name(resource),
+                )
+                .await
+            }
+            Self::AutoScalingWarmPool => {
+                describe_warm_pool(ctx, region, &resource.properties).await
+            }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             // A policy resource's configuration is the document the named bucket carries
             // now, read back from Amazon S3.

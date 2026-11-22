@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWarmPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWarmPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWarmPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The warm pool of one group is a SINGLE CHILD of it ([`crate::state::warm_pools`]), so this
+//! delete is addressed by the group alone: the pool's record is removed and the instances it
+//! holds are shut down where they live. A pool that still holds instances is protected unless
+//! the request asks for the force delete the model publishes for exactly that.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWarmPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWarmPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWarmPool"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteWarmPoolErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        // "Specifies that the warm pool is to be deleted along with all of its associated
+        // instances, without waiting for all instances to be terminated"
+        // (`DeleteWarmPoolType$ForceDelete`): a request that omits it asks for the SAFE
+        // delete, which is the one the pool's instances protect.
+        let forced = input.force_delete.unwrap_or(false);
+        // Whether IAM lets this caller delete the warm pool of THIS group, decided against
+        // the group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A warm pool belongs to a group, so a name no group answers to is refused with the
+        // detail the warm pool's own writer and reader both serve
+        // ([`crate::state::absent_group_message_as_no_such_group`]) — resolved FIRST, before
+        // anything else of the request is read.
+        let Some(group) = state.groups.get(&group_name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message_as_no_such_group(&group_name),
+            ));
+        };
+        // "The operation can't be performed because the resource is in use"
+        // (`ResourceInUseFault`): a pool that still holds instances is deleted only with the
+        // force delete, so the instances a client warmed are not taken out from under it by a
+        // request that did not ask for that. An instance already on its way out does not hold
+        // the pool: it is leaving on its own.
+        if !forced && group.warm_pool().is_some_and(|pool| pool.live_size() > 0) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: the warm pool still holds instances",
+            );
+            return Err(DeleteWarmPoolErrorModeled::ResourceInUseFault(
+                ResourceInUseFault {
+                    message: Some(crate::state::WARM_POOL_IN_USE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A group with no warm pool is already in the state this delete asks for, so the
+        // answer is the same either way: what the call states is that the group has no pool.
+        state.delete_warm_pool(&*self.engine, &group_name, now);
+
+        crate::state::audit(ctx.parts(), Self::NAME, &group_name, "warm pool deleted");
+        // The instances the pool held reach `terminated` on Amazon EC2's own clock, with no
+        // further call from anybody. The store's lock is released first: the pump takes it
+        // itself.
+        drop(state);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(DeleteWarmPoolOutput {})
     }
 }

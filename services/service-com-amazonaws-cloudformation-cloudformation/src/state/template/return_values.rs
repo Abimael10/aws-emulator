@@ -1674,7 +1674,13 @@ pub(in crate::state) fn adopt_composite_identity(resource: &mut StoredResource) 
 ///   name" for that type too — so two apis of one stack each carrying the `$default` stage
 ///   every auto-deployed HTTP api is served on are two stages, and AWS creates both;
 /// * a model belongs to ONE REST API (`GetModel` and `DeleteModel` take `restApiId` beside
-///   `modelName`, and a method's `requestModels` names one by that name).
+///   `modelName`, and a method's `requestModels` names one by that name);
+/// * a lifecycle hook and a scheduled action each belong to ONE Auto Scaling group
+///   (`PutLifecycleHook` and `DeleteLifecycleHook` take `AutoScalingGroupName` beside
+///   `LifecycleHookName`, `PutScheduledUpdateGroupAction` and `DeleteScheduledAction` take it
+///   beside `ScheduledActionName`, and each type's `Ref` returns the child's own name) — so
+///   two groups of one stack each carrying a hook of one name are two hooks, and AWS creates
+///   both.
 ///
 /// A type whose physical id its owning service ASSIGNS needs no row: that identifier is
 /// unique by construction, so two resources of the type never resolve to one name.
@@ -1688,6 +1694,10 @@ pub fn name_scope_properties(resource_type: &str) -> &'static [&'static str] {
         "AWS::ApiGateway::Stage" => &["RestApiId"],
         APIGATEWAY_MODEL => &["RestApiId"],
         APIGATEWAYV2_STAGE => &["ApiId"],
+        crate::state::provisioner::auto_scaling_group_children::AUTOSCALING_LIFECYCLE_HOOK
+        | crate::state::provisioner::auto_scaling_group_children::AUTOSCALING_SCHEDULED_ACTION => {
+            &["AutoScalingGroupName"]
+        }
         _ => &[],
     }
 }

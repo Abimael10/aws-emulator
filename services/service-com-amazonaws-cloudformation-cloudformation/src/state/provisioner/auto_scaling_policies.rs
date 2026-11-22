@@ -202,7 +202,7 @@ pub(super) async fn delete_scaling_policy(
 /// This is both the read the create confirms itself with and the ACTUAL configuration drift
 /// detection compares the declared one against. An awsQuery answer carries each policy as a
 /// `<member>` of its `ScalingPolicies` list, and the request names ONE policy, so the first
-/// such element is that policy. The group is named beside it where the declaration states one,
+/// such element is that policy ([`reported_child`]). The group is named beside it where the declaration states one,
 /// because a policy name is unique within a group rather than within the account.
 pub(super) async fn describe_scaling_policy(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -223,18 +223,17 @@ pub(super) async fn describe_scaling_policy(
         &parameters,
     )
     .await?;
-    let reported = xml_scalar_children(&answered, "member");
-    Ok(reported
-        .get("PolicyName")
-        .and_then(Value::as_str)
-        .is_some_and(|reported_name| reported_name == name)
-        .then_some(Value::Object(reported)))
+    Ok(reported_child(&answered, "PolicyName", name))
 }
 
 /// The Auto Scaling group a declaration states the policy on: "the name of the Auto Scaling
 /// group" (`PutScalingPolicyType$AutoScalingGroupName`), which every call that addresses the
 /// policy takes beside its name.
-fn declared_group(properties: &Value) -> Option<String> {
+///
+/// THE ONE reader of that property for this service's types: every type a stack declares ON a
+/// group names the group in that same property, so the group of a lifecycle hook, a scheduled
+/// action or a warm pool is read here too ([`super::auto_scaling_group_children`]).
+pub(super) fn declared_group(properties: &Value) -> Option<String> {
     properties
         .get("AutoScalingGroupName")
         .map(attribute_text)

@@ -163,7 +163,7 @@ pub use warm_pools::{
     too_large_warm_pool_message, warm_pool_change_cause, warmed_lifecycle_state, StoredWarmPool,
     WarmPoolPut, DEFAULT_WARM_POOL_MIN_SIZE, DEFAULT_WARM_POOL_STATE,
     MAX_GROUP_PREPARED_CAPACITY_UNSET, MAX_WARM_POOL_RECORDS, WARMED_PENDING,
-    WARMED_STATE_PREFIX, WARMED_TERMINATING,
+    WARMED_STATE_PREFIX, WARMED_TERMINATING, WARM_POOL_IN_USE_MESSAGE,
 };
 
 /// The scaling processes a group has suspended: the collection `SuspendProcesses` writes

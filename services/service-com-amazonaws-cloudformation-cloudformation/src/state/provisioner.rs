@@ -720,6 +720,19 @@ pub(super) enum Provisioner {
     /// ARN is the one Amazon EC2 Auto Scaling minted, published through `Fn::GetAtt`
     /// ([`auto_scaling_policies`]).
     AutoScalingScalingPolicy,
+    /// `AWS::AutoScaling::LifecycleHook`: a lifecycle hook of such a group, which
+    /// `PutLifecycleHook` creates "or updates" under the name the stack decided — the name
+    /// this type's physical id is — and `DeleteLifecycleHook` removes by that name beside the
+    /// group's ([`auto_scaling_group_children`]).
+    AutoScalingLifecycleHook,
+    /// `AWS::AutoScaling::ScheduledAction`: a scheduled capacity change of such a group, which
+    /// `PutScheduledUpdateGroupAction` creates "or updates" under the name the stack decided
+    /// and `DeleteScheduledAction` removes by that name beside the group's.
+    AutoScalingScheduledAction,
+    /// `AWS::AutoScaling::WarmPool`: the warm pool that sits beside such a group, which
+    /// `PutWarmPool` creates "or updates" and `DeleteWarmPool` removes. A group holds at most
+    /// one and it carries no name, so every call addresses it by the GROUP alone.
+    AutoScalingWarmPool,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchServerless::VpcEndpoint`: a managed interface endpoint of OpenSearch
@@ -1593,6 +1606,15 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         auto_scaling_policies::AUTOSCALING_SCALING_POLICY => {
             Some(Provisioner::AutoScalingScalingPolicy)
         }
+        auto_scaling_group_children::AUTOSCALING_LIFECYCLE_HOOK => {
+            Some(Provisioner::AutoScalingLifecycleHook)
+        }
+        auto_scaling_group_children::AUTOSCALING_SCHEDULED_ACTION => {
+            Some(Provisioner::AutoScalingScheduledAction)
+        }
+        auto_scaling_group_children::AUTOSCALING_WARM_POOL => {
+            Some(Provisioner::AutoScalingWarmPool)
+        }
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         AOSS_VPC_ENDPOINT => Some(Provisioner::OpenSearchServerlessVpcEndpoint),
@@ -1944,6 +1966,14 @@ impl Provisioner {
             // `AWS::AutoScaling::ScalingPolicy` publishes no `Tags` property and
             // `PutScalingPolicy` takes none, so no tag is propagated to a scaling policy.
             Self::AutoScalingScalingPolicy => put_scaling_policy(ctx, region, resource).await,
+            // Neither `AWS::AutoScaling::LifecycleHook`, `AWS::AutoScaling::ScheduledAction`
+            // nor `AWS::AutoScaling::WarmPool` publishes a `Tags` property, and none of the
+            // three `Put…` calls takes one, so no tag is propagated to any of them.
+            Self::AutoScalingLifecycleHook => put_lifecycle_hook(ctx, region, resource).await,
+            Self::AutoScalingScheduledAction => {
+                put_scheduled_action(ctx, region, resource).await
+            }
+            Self::AutoScalingWarmPool => put_warm_pool(ctx, region, resource).await,
             // Boxed, as the deeper arms of this match are: a bucket's create sends the
             // declared access controls and notification configuration after the create,
             // so this arm's own future is one of the largest here and a stack it shares
@@ -3298,6 +3328,16 @@ impl Provisioner {
             // The policy is addressed by the group it belongs to and the name it was created
             // under, and only the resource's own declaration says which group that is.
             Self::AutoScalingScalingPolicy => delete_scaling_policy(ctx, region, resource).await,
+            // Each of the three children of a group is addressed by the group it belongs to —
+            // and, for the two that carry a name, by the name it was created under — and only
+            // the resource's own declaration says which group that is.
+            Self::AutoScalingLifecycleHook => {
+                delete_lifecycle_hook(ctx, region, resource).await
+            }
+            Self::AutoScalingScheduledAction => {
+                delete_scheduled_action(ctx, region, resource).await
+            }
+            Self::AutoScalingWarmPool => delete_warm_pool(ctx, region, resource).await,
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -4289,6 +4329,10 @@ mod route53_policies;
 pub(super) mod compute_fleet;
 /// The scaling policies a stack attaches to an Auto Scaling group of [`compute_fleet`]'s.
 pub(in crate::state) mod auto_scaling_policies;
+/// The three other types a stack declares ON such a group — the lifecycle hook, the scheduled
+/// action and the warm pool. Visible to the rest of this service's state because those types'
+/// own NAMES live here, beside the arms that provision them.
+pub(in crate::state) mod auto_scaling_group_children;
 mod network_and_delivery;
 /// Applying a CHANGED declaration to an Amazon EC2 resource that already exists: the calls
 /// each of that service's types takes a new property value through, and the tag reconciliation
@@ -4413,6 +4457,7 @@ use ssm_documents::*;
 use resource_groups::*;
 use application_insights::*;
 use auto_scaling_policies::*;
+use auto_scaling_group_children::*;
 use batch_job_definitions::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;

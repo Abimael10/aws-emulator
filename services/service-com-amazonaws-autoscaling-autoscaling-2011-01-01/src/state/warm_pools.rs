@@ -97,8 +97,30 @@ pub const MAX_WARM_POOL_RECORDS: i32 = 50;
 /// "the instance state to transition to after the lifecycle actions are complete"
 /// (`WarmPoolConfiguration$PoolState`), under the prefix the enum spells warm-pool
 /// states with.
+///
+/// `pool_state` is one of the states the model PUBLISHES, because that is all a stored pool
+/// ever carries ([`published_pool_state`]): the `Warmed:` namespace also carries this
+/// module's own bookkeeping ([`WARMED_TERMINATING`]), and a state that spelled one of those
+/// would make a settled instance indistinguishable from one on its way out.
 pub fn warmed_lifecycle_state(pool_state: &str) -> String {
     format!("{WARMED_STATE_PREFIX}{pool_state}")
+}
+
+/// `requested` as the model's own `WarmPoolState` enum spells it, or `None` for a value that
+/// enum does not publish.
+///
+/// The set is the one the model declares, read off the generated catalogue of that enum's
+/// values rather than written out here, so it is the same set the boundary validator holds a
+/// request to — which refuses a `PoolState` outside it before any handler runs. This is the
+/// FLOOR under that check rather than a second validation of the request: what it guarantees
+/// is that the state a pool is STORED with is always one of the published three, so neither
+/// the state an instance settles in ([`warmed_lifecycle_state`]) nor the one this module uses
+/// for its own bookkeeping can ever be spelled by the other.
+fn published_pool_state(requested: &str) -> Option<String> {
+    crate::ops::types::WARM_POOL_STATE_VALUES
+        .iter()
+        .find(|published| **published == requested)
+        .map(|published| (*published).to_string())
 }
 
 /// The message a request whose warm pool would hold more instances than this process
@@ -110,6 +132,21 @@ pub fn too_large_warm_pool_message(size: i32) -> String {
         super::MAX_GROUP_CAPACITY
     )
 }
+
+/// The sentence a delete of a warm pool that still holds instances, asked for without the
+/// force option, is refused with — the `ResourceInUseFault` the operation models ("the
+/// operation can't be performed because the resource is in use").
+///
+/// This is Amazon EC2 Auto Scaling's own sentence for that refusal, and it is entirely fixed
+/// text: the refusal is about the state the pool is in rather than about anything the request
+/// carried, so no part of the request appears in it — not the group, not the number of
+/// instances the pool holds. The way out it names is the member the model publishes for
+/// exactly this case: "specifies that the warm pool is to be deleted along with all of its
+/// associated instances, without waiting for all instances to be terminated"
+/// (`DeleteWarmPoolType$ForceDelete`).
+pub const WARM_POOL_IN_USE_MESSAGE: &str =
+    "You cannot delete a warm pool while there are instances still in it unless you use the \
+     force delete option.";
 
 /// The `Activity$Cause` the launches and terminations that bring a warm pool to its
 /// target size record: when the pool was brought to size, what asked for it, and the sizes
@@ -308,7 +345,9 @@ impl StoredGroup {
                 if let Some(policy) = put.instance_reuse_policy.clone() {
                     pool.instance_reuse_policy = Some(policy);
                 }
-                if let Some(pool_state) = put.pool_state.clone() {
+                if let Some(pool_state) =
+                    put.pool_state.as_deref().and_then(published_pool_state)
+                {
                     if pool_state != pool.pool_state {
                         pool.pool_state = pool_state;
                         for instance in &mut pool.instances {
@@ -330,7 +369,8 @@ impl StoredGroup {
                         .filter(|value| *value != MAX_GROUP_PREPARED_CAPACITY_UNSET),
                     pool_state: put
                         .pool_state
-                        .clone()
+                        .as_deref()
+                        .and_then(published_pool_state)
                         .unwrap_or_else(|| DEFAULT_WARM_POOL_STATE.to_string()),
                     instance_reuse_policy: put.instance_reuse_policy.clone(),
                     instances: Vec::new(),
@@ -342,6 +382,39 @@ impl StoredGroup {
 }
 
 impl AutoScalingState {
+    /// Remove the warm pool of `group_name`, taking the instances it holds with it, and
+    /// answer whether a pool was there to remove.
+    ///
+    /// "The warm pool is to be deleted along with all of its associated instances"
+    /// (`DeleteWarmPoolType$ForceDelete`): the instances the pool holds are the account's own
+    /// Amazon EC2 instances, so they are shut down where they live — on Amazon EC2's own
+    /// clock, exactly as a pool that SHRINKS takes its surplus out
+    /// ([`AutoScalingState::resize_warm_pool`]) — and the pool's record goes with them, so no
+    /// later reconcile launches into a pool the group no longer has.
+    ///
+    /// `false` for a group this store holds nothing for and for one with no warm pool: the
+    /// group is then already in the state a delete of its pool asks for.
+    pub fn delete_warm_pool<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return false;
+        };
+        let Some(pool) = group.warm_pool.take() else {
+            return false;
+        };
+        let instance_ids: Vec<String> = pool
+            .instances
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        super::ec2_instances::terminate(engine, &instance_ids, now);
+        true
+    }
+
     /// Bring every group's warm pool to the size it maintains, and settle the warm-pool
     /// transitions the clock has made due at `now`.
     ///
@@ -379,6 +452,13 @@ impl AutoScalingState {
     /// each pass rather than only at the instant it settles, because that move is the
     /// pool's to own however long Amazon EC2's own clock takes over it — and the call is
     /// idempotent, so an instance already there is left alone.
+    ///
+    /// The one instance this LEAVES the pool is one already on its way out — [`WARMED_PENDING`]
+    /// cannot settle into [`WARMED_TERMINATING`], a stored pool's state being one of the
+    /// published three ([`published_pool_state`]) — so the Amazon EC2 instance behind it was
+    /// shut down by whatever marked it, the pool's own resize ([`Self::resize_warm_pool`]) or
+    /// the pool's delete ([`Self::delete_warm_pool`]); nothing is dropped here that no
+    /// termination accompanied.
     fn settle_warm_pool<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
