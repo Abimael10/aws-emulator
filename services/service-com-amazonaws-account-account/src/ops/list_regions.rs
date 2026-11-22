@@ -237,16 +237,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal
-        // (`state::target_account_id`), decided before the request's paging is
-        // read, exactly as it was before.
-        let account_id = crate::state::target_account_id(input.account_id.as_deref())
+        // The account this call acts on, through the ONE composition of the
+        // account-target rule
+        // (`state::ComAmazonawsAccountAccountState::target_account`): an absent
+        // `AccountId` is the standalone call on the caller's own account; a
+        // PRESENT one names a member account of the caller's organization,
+        // which neither the caller's own account nor an account this emulator
+        // holds no record of is — so both are the same single modelled
+        // authorization refusal, decided before the request's paging is read. A
+        // REPORTING operation: the store is read, never written, so no record
+        // is created here and a later caller sees exactly what this one saw.
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let account = store
+            .target_account(input.account_id.as_deref())
             .map_err(ListRegionsErrorModeled::AccessDeniedException)?;
 
-        let now = ::std::time::SystemTime::now();
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
             .unwrap_or(MAX_PAGE_SIZE as usize);
         let resume_after = match input.next_token.as_deref() {
@@ -255,17 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListRegionsErrorModeled::ValidationException(invalid_next_token())
             })?),
         };
-
-        // The other half of the account-target rule, stated once in
-        // `state::ComAmazonawsAccountAccountState::accessible_account`: an id
-        // this emulator holds no record of is the same modelled authorization
-        // refusal, decided before the Region list is projected. A REPORTING
-        // operation: the store is read, never written, so no record is created
-        // here and a later caller sees exactly what this one saw.
-        let store = state.lock();
-        let account = store
-            .accessible_account(&account_id)
-            .map_err(ListRegionsErrorModeled::AccessDeniedException)?;
 
         // The filter is applied BEFORE the page is cut, so a page carries up to
         // `MaxResults` MATCHING Regions rather than up to `MaxResults` candidates. An

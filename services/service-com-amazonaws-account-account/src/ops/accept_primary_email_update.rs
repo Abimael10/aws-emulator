@@ -11,7 +11,8 @@
 //! email — is owed by the clock
 //! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
 //!
-//! The order the refusals are decided in: the authorization rule, then the
+//! The order the refusals are decided in: the authorization rule — BOTH of its
+//! causes, in the one composition the state module states it as — then the
 //! address's syntax, then whether there is an update at all (the modelled 400
 //! `ValidationException`, as on the status read), then the update's status, then the input
 //! members the request presents (the address, then the passcode), and last the
@@ -186,23 +187,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The authorization rule comes FIRST, as it does on
-        // `StartPrimaryEmailUpdate`: this operation acts on a member account
-        // from the management or delegated administrator account, and the
-        // model's own `AccountId` documentation states that the management
-        // account can't specify its own `AccountId`. The member is required
-        // here, so it always names an account — and a named account is
-        // resolved by the one resolution every operation taking an account id
-        // goes through (`state::target_account_id`), which is what refuses the
+        // `StartPrimaryEmailUpdate`, and it comes WHOLE: the account this call
+        // acts on is resolved by the ONE composition of the account-target rule
+        // (`state::ComAmazonawsAccountAccountState::target_account_mut`), so
+        // the member naming the caller's own account and an account this
+        // emulator holds no record of are the same single decision rather than
+        // two refusals on either side of something else. This operation acts on
+        // an update that already exists, so the composition is the form that
+        // creates NO account record, exactly as on `DeleteAlternateContact`,
+        // `SendPhoneNumberVerification` and `VerifyPhoneNumber`. The member is
+        // required here, so it always names an account — and the model's own
+        // `AccountId` documentation states that the management account can't
+        // specify its own `AccountId`, which is the half that refuses the
         // caller's own.
-        let account_id = crate::state::target_account_id(Some(&input.account_id))
-            .map_err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException)?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let account_id = store
+            .target_account_mut(Some(&input.account_id))
+            .map_err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException)?
+            .account_id
+            .clone();
 
         // The address presented here is the one that becomes the account's root
         // user email address, so it is held to the same syntax
         // `StartPrimaryEmailUpdate` holds the proposed address to — this model's
         // own email-address expression — before any stored update is looked at.
         // `PrimaryEmailAddress`'s `@length(min: 5, max: 64)` and `Otp`'s
-        // `^[a-zA-Z0-9]{6}$` were already enforced at the boundary.
+        // `^[a-zA-Z0-9]{6}$` were already enforced at the boundary. Nothing has
+        // been written by the time this refusal is answered.
         if let Err(refusal) = crate::state::validated_email_address(
             crate::state::PRIMARY_EMAIL_MEMBER,
             &input.primary_email,
@@ -210,8 +222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(refusal).into());
         }
 
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
         // Materialise every completion the clock already owes before deciding,
         // so the update this call acts on and the addresses that count as in
         // use are the settled ones.
@@ -226,11 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let address_in_use =
             store.primary_email_in_use_by_other(&input.primary_email, &account_id);
 
-        // The other half of the account-target rule, stated once in
-        // `state::ComAmazonawsAccountAccountState::accessible_account_mut`:
-        // this operation acts on an update that already exists, so it creates
-        // no account record, and an account this emulator has never been told
-        // about is the modelled authorization refusal.
+        // The record the composition above already resolved, borrowed mutably
+        // now that the store-wide question is answered. The account-target rule
+        // was decided there, in one call, and the lock has not been released
+        // since, so this borrow adds no refusal of its own.
         let account = store
             .accessible_account_mut(&account_id)
             .map_err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException)?;

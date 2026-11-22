@@ -14,6 +14,12 @@
 //! store holds lands on THAT record, and one naming no account lands on the
 //! caller's own.
 //!
+//! The rule is also ONE decision taken WHOLE: it is decided before any refusal
+//! a handler makes of its own, so a request that is both an account-target
+//! refusal and carries a member such a handler would refuse answers that same
+//! 403 — for either cause — while the identical request on an account the store
+//! holds is refused for its member.
+//!
 //! Every case goes through the router, so it exercises routing,
 //! deserialization, the handler and the persisted store: the path a client
 //! takes.
@@ -334,6 +340,197 @@ async fn an_account_the_store_holds_is_resolved_by_every_operation() {
             DENIED,
             "case {case:?}: an account the store holds must not be an authorization \
              refusal, got {:?}",
+            answer.body
+        );
+    }
+}
+
+/// One row whose request carries, BESIDES the account id under test, a member
+/// the HANDLER refuses once the account target resolves: a label, the
+/// operation's URI, the body for that account, and the member the refusal names.
+type RefusableRow = (&'static str, &'static str, fn(&str) -> Value, &'static str);
+
+/// A `NextToken` no `ListRegions` response ever issued: the hex of a string that
+/// is not a Region code, inside `NextToken`'s modelled `@length(max: 1000)`
+/// (`smithy_query(query="operation", operation="ListRegions")`), so the request
+/// boundary admits it and the handler is what refuses it.
+const UNISSUED_NEXT_TOKEN: &str = "6e6f742061207265616c20746f6b656e";
+
+/// The modelled error code and HTTP status of a refused input member:
+/// `ValidationException` at HTTP 400.
+const REFUSED_MEMBER: (u16, &str) = (400, "ValidationException");
+
+/// Every operation of [`rows`] that decides a refusal of its OWN inside the
+/// handler, paired with a value that earns it. The rows differ in which
+/// operation runs, in whether it reports or writes, in which member is at fault,
+/// in the form of the faulty value and in what else the request carries — which
+/// is what the precedence rule generalises over.
+///
+/// Each faulty value is one the request boundary admits, so the refusal under
+/// test is the handler's: a `PrimaryEmail` inside `PrimaryEmailAddress`'s
+/// modelled `@length(min: 5, max: 64)` that is not an email address by this
+/// model's own email expression (the forms come from the published expression,
+/// each row breaking a different part of its shape), and a `NextToken` inside
+/// its modelled length that names no page.
+fn refusable_rows() -> Vec<RefusableRow> {
+    vec![
+        (
+            "AcceptPrimaryEmailUpdate with a word carrying no @ at all",
+            "/acceptPrimaryEmailUpdate",
+            |id| {
+                json!({
+                    "AccountId": id,
+                    "PrimaryEmail": "not-an-email-address",
+                    "Otp": WELL_FORMED_OTP,
+                })
+            },
+            "PrimaryEmail",
+        ),
+        (
+            "AcceptPrimaryEmailUpdate with an address with no local part",
+            "/acceptPrimaryEmailUpdate",
+            |id| {
+                json!({
+                    "AccountId": id,
+                    "PrimaryEmail": "@example.com",
+                    "Otp": WELL_FORMED_OTP,
+                })
+            },
+            "PrimaryEmail",
+        ),
+        (
+            "AcceptPrimaryEmailUpdate with a domain with no top-level label",
+            "/acceptPrimaryEmailUpdate",
+            |id| {
+                json!({
+                    "AccountId": id,
+                    "PrimaryEmail": "ada@example",
+                    "Otp": WELL_FORMED_OTP,
+                })
+            },
+            "PrimaryEmail",
+        ),
+        (
+            "ListRegions resuming from a token nothing issued",
+            "/listRegions",
+            |id| json!({"AccountId": id, "NextToken": UNISSUED_NEXT_TOKEN}),
+            "NextToken",
+        ),
+        (
+            "ListRegions filtered and paged from a token nothing issued",
+            "/listRegions",
+            |id| {
+                json!({
+                    "AccountId": id,
+                    "MaxResults": 2,
+                    "RegionOptStatusContains": ["ENABLED_BY_DEFAULT"],
+                    "NextToken": UNISSUED_NEXT_TOKEN,
+                })
+            },
+            "NextToken",
+        ),
+    ]
+}
+
+/// The members this refusal's `fieldList` names, in the order it lists them.
+fn refused_members(answer: &Answer) -> Vec<&str> {
+    answer.body["fieldList"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| field["name"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The account-target rule is ONE decision, taken whole before any refusal the
+/// handler itself decides: a request that is both an account-target refusal and
+/// carries a member the handler would refuse answers the IDENTICAL 403 — the
+/// same payload the bare request for that account earns — for BOTH causes, so
+/// neither cause can be outranked by a member refusal the other one outranks.
+#[tokio::test]
+async fn an_account_target_refusal_outranks_every_member_the_handler_refuses() {
+    let router = emulator();
+    let own = default_account_id().to_string();
+    let mut causes: Vec<String> = vec![own];
+    causes.extend(UNKNOWN_ACCOUNTS.iter().map(|id| id.to_string()));
+
+    for account_id in causes {
+        // The refusal this account id earns on its own, with nothing else in the
+        // request to refuse: the one every row below must answer too.
+        let bare = call(
+            &router,
+            "/getAccountInformation",
+            json!({"AccountId": account_id}),
+        )
+        .await;
+        let expected = bare.refusal(&account_id);
+        assert_eq!(
+            (bare.status, bare.error_code()),
+            DENIED,
+            "case {account_id:?}: the bare request must be the account-target refusal, \
+             got {} with {:?}",
+            bare.status,
+            bare.body
+        );
+
+        for (label, uri, body, member) in refusable_rows() {
+            let case = format!("{label} on {account_id}");
+            let answer = call(&router, uri, body(&account_id)).await;
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                DENIED,
+                "case {case:?}: expected {DENIED:?} rather than a refusal of {member}, \
+                 got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+            let observed = answer.refusal(&account_id);
+            assert_eq!(
+                observed, expected,
+                "case {case:?}: expected the same refusal as the bare request \
+                 ({expected:?}), got {observed:?}"
+            );
+        }
+    }
+}
+
+/// The other side of that precedence: once the account target RESOLVES, the very
+/// same requests are refused for the member they carry — HTTP 400
+/// `ValidationException` naming it — so the 403 above is the rule's order and not
+/// a refusal that swallowed the member check.
+#[tokio::test]
+async fn the_member_refusal_is_answered_once_the_account_target_resolves() {
+    let router = emulator();
+    let member_account = UNKNOWN_ACCOUNTS[2];
+    let created = call(
+        &router,
+        "/putAccountName",
+        json!({"AccountName": "Precedence Member", "AccountId": member_account}),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the member account's record must be created, got {} with {:?}",
+        created.status, created.body
+    );
+
+    for (label, uri, body, member) in refusable_rows() {
+        let case = format!("{label} on the known account {member_account}");
+        let answer = call(&router, uri, body(member_account)).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            REFUSED_MEMBER,
+            "case {case:?}: expected {REFUSED_MEMBER:?}, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            refused_members(&answer),
+            vec![member],
+            "case {case:?}: the refusal must name {member}, got {:?}",
             answer.body
         );
     }
