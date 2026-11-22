@@ -260,6 +260,23 @@ fn decode_page_token(
     Ok(cursor)
 }
 
+/// Whether `filter` is the `PREFERENCE_KEY` filter — the one filter this
+/// service supports, which matches a preference key against the filter's
+/// values.
+///
+/// `BillingFeatureFilter$name` is NOT `@required` and
+/// `BillingFeatureFilterName` declares exactly one value, so a filter that
+/// omits the member still names that value: there is no other filter it could
+/// be. A member a request may leave out does not change WHICH filter the
+/// request sent, so the values travelling with it narrow the result exactly as
+/// they do for a filter that spells the name out.
+fn is_preference_key_filter(filter: &BillingFeatureFilter) -> bool {
+    filter
+        .name
+        .as_deref()
+        .is_none_or(|name| name == FILTER_PREFERENCE_KEY)
+}
+
 /// Refuse a filter name this service does not support, BEFORE any entry is
 /// considered, so the refusal does not depend on the feature having a stored
 /// entry to test the filter against.
@@ -269,11 +286,7 @@ fn decode_page_token(
 /// value this handler has not learned.
 fn validate_filters(input: &GetBillingPreferencesInput) -> Result<(), GetBillingPreferencesError> {
     for filter in input.filters.iter().flatten() {
-        if filter
-            .name
-            .as_deref()
-            .is_some_and(|name| name != FILTER_PREFERENCE_KEY)
-        {
+        if !is_preference_key_filter(filter) {
             return Err(invalid_field(
                 "filters",
                 "name is not a filter this service supports",
@@ -286,18 +299,20 @@ fn validate_filters(input: &GetBillingPreferencesInput) -> Result<(), GetBilling
 /// The preference keys the request's `filters` select, or `None` when they
 /// narrow nothing.
 ///
-/// Absent `filters`, a filter naming no member and a filter carrying no value
-/// each select everything — as `ListBillingViews` treats an omitted filter in
-/// this same service. Several filters all have to hold, so what they select is
-/// the INTERSECTION of their value sets; the model admits only one filter per
-/// request today, which is that intersection of one.
+/// Absent `filters`, and a filter carrying no value, each select everything —
+/// a filter that names nothing to match narrows nothing, as `ListBillingViews`
+/// treats an omitted filter in this same service. A filter that DOES carry
+/// values narrows by them whether or not it spells its name out
+/// ([`is_preference_key_filter`]). Several filters all have to hold, so what
+/// they select is the INTERSECTION of their value sets; the model admits only
+/// one filter per request today, which is that intersection of one.
 ///
 /// The one place the request's filters are interpreted, so what a page REPORTS
 /// and what its token is scoped to cannot read them two ways.
 fn filtered_keys(input: &GetBillingPreferencesInput) -> Option<BTreeSet<&str>> {
     let mut selected: Option<BTreeSet<&str>> = None;
     for filter in input.filters.iter().flatten() {
-        if filter.name.as_deref() != Some(FILTER_PREFERENCE_KEY) {
+        if !is_preference_key_filter(filter) {
             continue;
         }
         let Some(values) = filter.value.as_deref().filter(|values| !values.is_empty()) else {
