@@ -39,8 +39,10 @@
 //!   `KMSEncryptionConfig`, "the encryption key" the destination's objects are encrypted at
 //!   rest with ([`kms_key_arn`], [`object_encryption`]).
 //! * UNDER WHOSE PERMISSIONS — the `RoleARN` the destination configuration names, which is
-//!   the role Firehose makes the write under, so the write happens only where the
-//!   permissions in force on that role allow it ([`withheld_writes`]). A delivery the
+//!   the role Firehose makes the write under, so the write happens only where the permissions
+//!   in force on it allow it — that role's own documents and the destination BUCKET's own
+//!   policy, weighed the way IAM weighs the two within one account
+//!   ([`write_authorization`]). A delivery the
 //!   destination did not take is reported through the destination's own
 //!   `CloudWatchLoggingOptions` ([`destination_logging`]) and the records stay buffered for
 //!   a later attempt, which is all a producer can observe of it.
@@ -100,8 +102,7 @@ use crate::ops::types::{
 };
 use crate::state::cloudwatch_logs_pipeline::{CloudWatchLogsPipeline, Processed};
 use crate::state::delivery::destination_logging::{
-    DeliveryErrorReport, DestinationError, DestinationLogging, S3_ACCESS_DENIED,
-    S3_NO_SUCH_BUCKET,
+    DeliveryErrorReport, DestinationError, DestinationLogging, S3_NO_SUCH_BUCKET,
 };
 use crate::state::delivery::time_zone::DeliveryTimeZone;
 use crate::state::{
@@ -133,6 +134,9 @@ pub mod search_error_output;
 pub mod splunk;
 /// The zone a destination's time fields are rendered in.
 pub mod time_zone;
+/// What the permissions in force on a delivered object's write say about it: the destination
+/// role's own documents and the destination BUCKET's own policy, weighed together.
+pub mod write_authorization;
 
 /// The action an object write is authorized under, which is the one the destination's role
 /// has to allow for a delivery to be made: Amazon S3's own write of an object.
@@ -1843,7 +1847,8 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
         // written, is reported through the destination's own logging and is owed again, which
         // is what a producer observes of it (nothing but the error event).
         let region = delivery_region(&delivery.source_arn).unwrap_or_default();
-        let (withheld, mut reported) = withheld_writes(hop, region, &objects).await;
+        let (withheld, mut reported) =
+            write_authorization::withheld_writes(engine, hop, region, &objects).await;
         if withheld {
             destination_logging::report_delivery_errors(
                 engine,
@@ -2710,63 +2715,6 @@ fn report(
     if !reports.contains(&report) {
         reports.push(report);
     }
-}
-
-/// The objects of this delivery the destination's ROLE may not write, as the failures its
-/// logging reports — paired with whether any object was withheld at all.
-///
-/// Firehose writes a delivered object under the role the destination configuration names
-/// ("the Amazon Resource Name (ARN) of the Amazon Web Services credentials" —
-/// `S3DestinationConfiguration$RoleARN`), so the write is that role's to make: it happens
-/// only where the permissions in force on the role allow Amazon S3's own write of the object
-/// it would create. That decision is IAM's, asked of IAM
-/// ([`service_common::iam_role::role_withholds_action_through`]), so the documents in force
-/// are collected and decided by the service that holds them.
-///
-/// Nothing is withheld where there is no one to ask (a hop built over a transport alone), nor
-/// for a destination naming no role at all, nor for anything that is not IAM ANSWERING that
-/// the role does not allow the write — a role this account's IAM holds nothing under
-/// included, exactly as that question is read everywhere else in this emulator.
-async fn withheld_writes(
-    hop: &DeliveryHop,
-    region: &str,
-    objects: &[DeliveredObject],
-) -> (bool, Vec<DeliveryErrorReport>) {
-    let Some(emulator) = hop.emulator() else {
-        return (false, Vec::new());
-    };
-    let mut withheld = false;
-    let mut reported = Vec::new();
-    for object in objects {
-        let destination = &object.destination;
-        if destination.role_arn.is_empty() {
-            continue;
-        }
-        // The resource is the object this write would create, which is what an
-        // object-granting statement (`arn:<partition>:s3:::<bucket>/<key pattern>`) is
-        // written about.
-        let resource = format!("{}/{}", destination.bucket_arn, object.key);
-        if !::service_common::iam_role::role_withholds_action_through(
-            emulator,
-            region,
-            &destination.role_arn,
-            S3_PUT_OBJECT_ACTION,
-            &resource,
-        )
-        .await
-        {
-            continue;
-        }
-        ::tracing::warn!(
-            bucket = %object.bucket,
-            key = %object.key,
-            "the destination role is not allowed to write this object, so this delivery was \
-             not written"
-        );
-        withheld = true;
-        report(&mut reported, destination, S3_ACCESS_DENIED);
-    }
-    (withheld, reported)
 }
 
 /// The Region a delivery of `stream_arn` asks its authorization question in: the Region that
