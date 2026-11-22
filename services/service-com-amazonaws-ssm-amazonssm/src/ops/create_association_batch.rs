@@ -295,6 +295,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let first = crate::state::associations::AssociationVersionRecord {
                 version: crate::state::associations::FIRST_ASSOCIATION_VERSION,
                 created_at: now,
+                // The document this version applies, in the spelling the entry named it by;
+                // the create resolves it to the name the document is held under.
+                document_name: entry.name.clone(),
                 document_version: entry.document_version.clone(),
                 parameters: entry
                     .parameters
@@ -324,7 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // an association this batch creates starts with none.
             match store.create_one_association(
                 crate::state::association_create::AssociationCreate {
-                    name: &entry.name,
                     instance_id: entry.instance_id.as_deref(),
                     tags: ::std::collections::BTreeMap::new(),
                     version: first,

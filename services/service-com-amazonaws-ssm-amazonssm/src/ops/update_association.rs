@@ -492,6 +492,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let applied = crate::state::associations::AssociationVersionRecord {
             version: next_version,
             created_at: now,
+            // `AssociationDescription$Name` is "the name of the SSM document", so the name
+            // the document is held under is the one this version applies, whichever
+            // spelling named it — and a call that named none applies the document the
+            // association already applied.
+            document_name: document.name.clone(),
             document_version: input.document_version.clone(),
             parameters,
             targets,
@@ -516,10 +521,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let record = store
                 .association_mut(&region, &input.association_id)
                 .ok_or_else(does_not_exist)?;
-            // `AssociationDescription$Name` is "the name of the SSM document", so the name
-            // the document is held under is what the association applies from now on,
-            // whichever spelling named it.
-            record.name = document.name.clone();
+            // The appended version is the one in force from now on, so the document the
+            // association applies is taken from it
+            // ([`crate::state::associations::AssociationRecord::push_version`]).
             record.push_version(applied);
         }
         // "When you update an association, the association immediately runs against the

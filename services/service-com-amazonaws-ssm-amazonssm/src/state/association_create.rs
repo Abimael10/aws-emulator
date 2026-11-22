@@ -182,14 +182,10 @@ impl AssociationCreateRejection {
     }
 }
 
-/// What ONE create of an association supplies — the same four things whether it arrived on
+/// What ONE create of an association supplies — the same three things whether it arrived on
 /// its own or as an entry of a batch.
 #[derive(Debug, Clone)]
 pub struct AssociationCreate<'a> {
-    /// "The name of the SSM document" the association applies, in whichever spelling the
-    /// call named it by; the association is stored under the name the document is held
-    /// under.
-    pub name: &'a str,
     /// "The managed node ID" a call that named one through the deprecated `InstanceId`
     /// member gives.
     pub instance_id: Option<&'a str>,
@@ -197,7 +193,10 @@ pub struct AssociationCreate<'a> {
     /// `Tags` is a member of the single create only.
     pub tags: BTreeMap<String, String>,
     /// The FIRST version of the association, holding everything the call set
-    /// ([`AssociationVersionRecord`]).
+    /// ([`AssociationVersionRecord`]) — including the document it names, in whichever
+    /// spelling the call named it by
+    /// ([`AssociationVersionRecord::document_name`]); the create resolves that spelling to
+    /// the name the document is held under before anything is persisted.
     pub version: AssociationVersionRecord,
 }
 
@@ -230,20 +229,22 @@ impl ComAmazonawsSsmAmazonssmState {
         now: SystemTime,
     ) -> Result<AssociationDescription, AssociationCreateRejection> {
         let AssociationCreate {
-            name,
             instance_id,
             tags,
-            version,
+            mut version,
         } = create;
         // "You can specify Amazon Web Services-predefined documents, documents you created,
         // or a document that is shared with you from another Amazon Web Services account…
         // you must specify the complete SSM document ARN" (`Name`), so either spelling names
         // the same document.
-        let Some(document) = self.resolve_document_for_request(name, region, now) else {
-            return Err(AssociationCreateRejection::InvalidDocument {
-                name: name.to_string(),
-            });
+        let name = version.document_name.clone();
+        let Some(document) = self.resolve_document_for_request(&name, region, now) else {
+            return Err(AssociationCreateRejection::InvalidDocument { name });
         };
+        // Whichever spelling named the document, the version applies the document by the
+        // name it is held under: `AssociationDescription$Name` is "the name of the SSM
+        // document", and the version in force is where the association reads it from.
+        version.document_name = document.name.clone();
         // "The document version you want to associate with the targets. Can be a specific
         // version or the default version" (`DocumentVersion`): each names one of the
         // versions the document holds, and a number it does not hold names none. A request
@@ -313,9 +314,6 @@ impl ComAmazonawsSsmAmazonssmState {
         let mut record = AssociationRecord::new(
             super::new_uuid(),
             region.to_string(),
-            // `AssociationDescription$Name` is "the name of the SSM document", so the name
-            // the document is held under is reported whichever spelling named it.
-            document.name.clone(),
             instance_id.map(str::to_string),
             now,
             version,

@@ -352,6 +352,15 @@ pub struct AssociationVersionRecord {
     /// When this version came into being — the create's instant for the first version, an
     /// update's for every later one.
     pub created_at: SystemTime,
+    /// The document THIS version applies, by the name the document is held under rather
+    /// than any ARN spelling the call may have named it by: a create names one and an
+    /// update either names another or keeps the one the association already applied, so the
+    /// document belongs to the version rather than to the whole association.
+    ///
+    /// The version in force is what the association applies now, which is why
+    /// [`AssociationRecord::name`] is written from this field alone
+    /// ([`AssociationRecord::push_version`]): the two cannot disagree.
+    pub document_name: String,
     /// "The document version you want to associate with the targets", as supplied; `None`
     /// for a call that named none.
     pub document_version: Option<String>,
@@ -389,8 +398,11 @@ pub struct AssociationRecord {
     pub association_id: String,
     /// The Region the association was created in, the other half of its key.
     pub region: String,
-    /// "The name of the SSM document" the association applies, by the name the document is
-    /// held under rather than any ARN spelling the create may have named it by.
+    /// "The name of the SSM document" the association applies NOW: the document the
+    /// version in force names ([`AssociationVersionRecord::document_name`]), which is what
+    /// every read of the association itself reports and what pairs the association with the
+    /// node a create named. Written from the version in force and from nothing else
+    /// ([`AssociationRecord::push_version`]).
     pub name: String,
     /// "The managed node ID" the association was created for, for a create that named one
     /// through the deprecated `InstanceId` member.
@@ -496,7 +508,6 @@ impl AssociationRecord {
     pub fn new(
         association_id: String,
         region: String,
-        name: String,
         instance_id: Option<String>,
         created_at: SystemTime,
         version: AssociationVersionRecord,
@@ -505,7 +516,9 @@ impl AssociationRecord {
         Self {
             association_id,
             region,
-            name,
+            // The document the association applies is the one its version in force names,
+            // so it is read from that version rather than passed beside it.
+            name: version.document_name.clone(),
             instance_id,
             created_at,
             versions: vec![version],
@@ -634,7 +647,13 @@ impl AssociationRecord {
     }
 
     /// Append `version` to this association, which is what an update persists.
+    ///
+    /// The appended version is the one in FORCE from now on, so the document the
+    /// association applies is taken from it: an update that names another document moves the
+    /// association onto it, and one that names none keeps the document the version it was
+    /// built from already carried.
     pub fn push_version(&mut self, version: AssociationVersionRecord) {
+        self.name = version.document_name.clone();
         self.versions.push(version);
     }
 
@@ -717,7 +736,10 @@ impl AssociationRecord {
         now: SystemTime,
     ) -> AssociationDescription {
         AssociationDescription {
-            name: Some(self.name.clone()),
+            // "The name of the SSM document" the association applies: the document the
+            // version being described names, since an update can move the association onto
+            // another ([`AssociationVersionRecord::document_name`]).
+            name: Some(version.document_name.clone()),
             instance_id: self.instance_id.clone(),
             association_version: Some(version.version.to_string()),
             date: Some(::aws_smithy_types::DateTime::from(self.created_at)),
@@ -1207,6 +1229,7 @@ mod tests {
         AssociationVersionRecord {
             version: number,
             created_at: SystemTime::UNIX_EPOCH,
+            document_name: "AWS-UpdateSSMAgent".to_string(),
             document_version: None,
             parameters: BTreeMap::new(),
             targets: Vec::new(),
@@ -1234,7 +1257,6 @@ mod tests {
         let mut record = AssociationRecord::new(
             "00000000-0000-4000-8000-000000000000".to_string(),
             "us-west-2".to_string(),
-            "AWS-UpdateSSMAgent".to_string(),
             None,
             SystemTime::UNIX_EPOCH,
             version(FIRST_ASSOCIATION_VERSION),

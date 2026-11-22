@@ -300,6 +300,10 @@ pub mod association_create;
 /// report, and what the nodes one of those runs reached report.
 pub mod association_executions;
 
+/// Listing the versions of ONE association: the identity each version is reported by, and
+/// the page a version listing is served.
+pub mod association_version_listing;
+
 /// The resource policies attached to this account's Systems Manager resources, and the
 /// hash that keeps two writers from overwriting each other's.
 pub mod resource_policies;

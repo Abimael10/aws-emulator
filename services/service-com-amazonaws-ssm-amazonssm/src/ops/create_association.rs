@@ -344,6 +344,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let first = crate::state::associations::AssociationVersionRecord {
             version: crate::state::associations::FIRST_ASSOCIATION_VERSION,
             created_at: now,
+            // The document this version applies, in the spelling the call named it by; the
+            // create resolves it to the name the document is held under.
+            document_name: input.name.clone(),
             document_version: input.document_version.clone(),
             parameters: input
                 .parameters
@@ -379,7 +382,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let description = store
             .create_one_association(
                 crate::state::association_create::AssociationCreate {
-                    name: &input.name,
                     instance_id: input.instance_id.as_deref(),
                     tags: crate::state::to_btree_map(input.tags.clone()),
                     version: first,

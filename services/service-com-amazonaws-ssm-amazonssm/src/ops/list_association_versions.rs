@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssociationVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssociationVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssociationVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions of ONE State Manager association: "retrieves all versions of an
+//! association for a specific association ID", so the association the request's id names is
+//! resolved through the endpoint the call was signed for and every version a create and its
+//! updates wrote ([`crate::state::associations::AssociationVersionRecord`]) is reported, in
+//! the order they were minted in and a page at a time
+//! ([`crate::state::association_version_listing`]).
+//!
+//! An id that names no association of that endpoint is `AssociationDoesNotExist`, worded the
+//! way every read of an association by its id words it, and a `NextToken` this listing could
+//! not have issued is `InvalidNextToken`. Reading a history changes none of it: this
+//! operation writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +151,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssociationVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssociationVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssociationVersions"))
+        // `AssociationId`'s presence and pattern and `MaxResults`'s range are MODELLED
+        // constraints, so the centralized walk has already refused anything outside them.
+        // What is read here is which association the id resolves to, and where its page of
+        // versions starts.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssociationVersionsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = crate::state::associations::association_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // An association id names ONE association of the endpoint the call was signed for;
+        // the refusal NAMES the association the request asked about
+        // ([`crate::state::associations::association_does_not_exist`]), the way every read
+        // that resolves an association by an id its request carries words it.
+        let Some(held) = store.association(&region, &input.association_id) else {
+            return Err(ListAssociationVersionsErrorModeled::AssociationDoesNotExist(
+                AssociationDoesNotExist {
+                    message: Some(crate::state::associations::association_does_not_exist(
+                        &input.association_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The token is the version the next page starts at, so a value that is not a version
+        // number at all — or one past the newest version this association has, which could
+        // have started no page of its history — was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match token.parse::<u64>() {
+                Ok(version)
+                    if version >= crate::state::associations::FIRST_ASSOCIATION_VERSION
+                        && version <= held.latest_version() =>
+                {
+                    Some(version)
+                }
+                _ => {
+                    return Err(ListAssociationVersionsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page = held.list_versions(resume_from, page_size);
+
+        Ok(ListAssociationVersionsOutput {
+            association_versions: Some(page.versions),
+            next_token: page.next_token,
+        })
     }
 }
