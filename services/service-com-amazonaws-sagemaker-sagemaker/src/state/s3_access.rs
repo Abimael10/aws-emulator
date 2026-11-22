@@ -107,6 +107,45 @@ pub fn arn_partition(arn: &str) -> String {
         .to_string()
 }
 
+/// The NAME one object carries under the directory the location that named it is placed at:
+/// its key below that prefix, and its last segment for a key the prefix does not cover.
+///
+/// The ONE reading of that name, used wherever this service places a location's objects in a
+/// container's storage: a prefix holding a tree of objects is carried across as that same tree,
+/// and an object named directly — by a key that IS the prefix, or by a manifest — is carried
+/// across under its own file name.
+///
+/// The name is a RELATIVE name of ordinary segments and nothing else: an Amazon S3 key is a
+/// caller's own string and may carry `.`, `..` or empty segments, which name no file of a
+/// container's tree — a name carrying them, joined under a directory, would name a path outside
+/// it — so those segments are dropped, and a key that names no ordinary segment at all is
+/// `None`: it names no file to place.
+#[must_use]
+pub fn object_name_under(prefix: &str, key: &str) -> Option<String> {
+    let under = key
+        .strip_prefix(prefix)
+        .map(|under| under.trim_start_matches('/'))
+        .filter(|under| !under.is_empty())
+        .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(key));
+    ordinary_name(under)
+}
+
+/// `name` as a RELATIVE name of ordinary segments, and `None` for a value that names none.
+///
+/// The ONE reading of a name this service carries between an Amazon S3 key and a file of a
+/// container's storage, in either direction: both ends are caller-chosen strings — an object's
+/// key, and the name a container's own program gave a file — and a segment that is empty, `.`
+/// or `..` names no file of a tree, so it is dropped rather than carried into a path or a key
+/// where it would name something else.
+#[must_use]
+pub fn ordinary_name(name: &str) -> Option<String> {
+    let segments: Vec<&str> = name
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect();
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
 /// Why one Amazon S3 location a request names cannot be read as the execution role, with the
 /// location AS THE CALLER WROTE IT.
 ///
@@ -267,6 +306,37 @@ pub async fn object_read_is_unauthorized(
     .await
 }
 
+/// Whether the WRITE of the object `location` names, made AS `role_arn`, is one neither the
+/// bucket's own policy nor the role's identity-based policies allow.
+///
+/// The one question the work a job performs asks per OBJECT it writes — a job's model
+/// artifact, its checkpoints, the files it uploads from an output directory — and the same
+/// decision [`object_read_is_unauthorized`] makes for a read, over the action a write is
+/// authorized under: the destination bucket's policy refuses what it EXPLICITLY DENIES, and
+/// otherwise the grant the execution role itself carries decides. Only what was ANSWERED
+/// withholds anything, so a bucket with no policy and an emulator with no IAM to ask refuse
+/// nothing.
+pub async fn object_write_is_unauthorized(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    client: &::aws_sdk_s3::Client,
+    region: &str,
+    role_arn: &str,
+    partition: &str,
+    location: &S3Location,
+) -> bool {
+    if bucket_policy_denies_write(client, location, role_arn, partition).await {
+        return true;
+    }
+    ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        role_arn,
+        PUT_OBJECT_ACTION,
+        &location.object_arn(partition),
+    )
+    .await
+}
+
 /// Whether the policy on `location`'s bucket EXPLICITLY DENIES the read of the object
 /// `location` names to the SageMaker read made under the role `role_arn`.
 ///
@@ -286,27 +356,53 @@ pub async fn bucket_policy_denies_read(
     role_arn: &str,
     partition: &str,
 ) -> bool {
-    bucket_policy_refuses_read(
+    bucket_policy_refuses_action(
         client,
         location,
         role_arn,
         partition,
+        GET_OBJECT_ACTION,
         ReadAuthorization::PolicyMayNotDeny,
     )
     .await
 }
 
-/// The ONE evaluation of a bucket's policy both readings above take: the decision it reaches
-/// over the read of `location` as `role_arn`, judged by the rule `under` names.
+/// Whether the policy on `location`'s bucket EXPLICITLY DENIES the WRITE of the object
+/// `location` names to the write made under the role `role_arn`.
 ///
-/// Stated once so the two readings cannot drift apart in WHICH principals they offer the
-/// document, WHICH action and resource they ask about, or what a document this emulator could
-/// not read means — they differ only in which decision refuses.
-async fn bucket_policy_refuses_read(
+/// The same rule [`bucket_policy_denies_read`] states, over the action a write is authorized
+/// under ([`PUT_OBJECT_ACTION`]): within one account an explicit `Deny` in the bucket's own
+/// policy wins over every `Allow`, the role's identity-based grant included, while a bucket
+/// whose policy says nothing about the role leaves that grant standing.
+pub async fn bucket_policy_denies_write(
     client: &::aws_sdk_s3::Client,
     location: &S3Location,
     role_arn: &str,
     partition: &str,
+) -> bool {
+    bucket_policy_refuses_action(
+        client,
+        location,
+        role_arn,
+        partition,
+        PUT_OBJECT_ACTION,
+        ReadAuthorization::PolicyMayNotDeny,
+    )
+    .await
+}
+
+/// The ONE evaluation of a bucket's policy every reading above takes: the decision it reaches
+/// over `action` on `location` as `role_arn`, judged by the rule `under` names.
+///
+/// Stated once so the readings cannot drift apart in WHICH principals they offer the
+/// document, WHICH resource they ask about, or what a document this emulator could not read
+/// means — they differ only in the action asked about and in which decision refuses.
+async fn bucket_policy_refuses_action(
+    client: &::aws_sdk_s3::Client,
+    location: &S3Location,
+    role_arn: &str,
+    partition: &str,
+    action: &str,
     under: ReadAuthorization,
 ) -> bool {
     let Some(document) = bucket_policy_document(client, location).await else {
@@ -318,11 +414,7 @@ async fn bucket_policy_refuses_read(
         role_arn,
     ));
     let object_arn = location.object_arn(partition);
-    let request = ::service_common::iam_authorization::Request::new(
-        GET_OBJECT_ACTION,
-        &object_arn,
-        &principals,
-    );
+    let request = ::service_common::iam_authorization::Request::new(action, &object_arn, &principals);
     let decision = ::service_common::iam_authorization::resource_decision(&document, &request);
     match under {
         ReadAuthorization::PolicyMustAllow => {
@@ -423,11 +515,12 @@ pub async fn bucket_policy_withholds_read(
     role_arn: &str,
     partition: &str,
 ) -> bool {
-    bucket_policy_refuses_read(
+    bucket_policy_refuses_action(
         client,
         location,
         role_arn,
         partition,
+        GET_OBJECT_ACTION,
         ReadAuthorization::PolicyMustAllow,
     )
     .await
@@ -561,6 +654,58 @@ mod tests {
             assert_eq!(
                 read, partition,
                 "case {case:?}: expected {partition:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: the name an object carries under the directory its location is placed at is its
+    /// key below the prefix that named it, of ORDINARY segments only, and its own file name for
+    /// a key that prefix does not cover — and no name at all for a key that names no ordinary
+    /// segment.
+    ///
+    /// The rows differ along the shape of the key: one directly under the prefix, one nested
+    /// below it, a prefix with no trailing delimiter, a prefix naming the object itself, a key
+    /// the prefix does not cover at all, a key carrying segments that name no file of a tree,
+    /// and a key of nothing but those.
+    #[test]
+    fn an_objects_name_is_its_key_below_the_prefix_that_named_it() {
+        // (case, the prefix, the key, the name it is placed under)
+        let rows: [(&str, &str, &str, Option<&str>); 8] = [
+            ("one object under the prefix", "input/", "input/data.csv", Some("data.csv")),
+            ("a nested object", "input/", "input/one/data.csv", Some("one/data.csv")),
+            (
+                "a prefix with no trailing delimiter",
+                "input",
+                "input/data.csv",
+                Some("data.csv"),
+            ),
+            (
+                "a prefix naming the object itself",
+                "input/data.csv",
+                "input/data.csv",
+                Some("data.csv"),
+            ),
+            (
+                "a key the prefix does not cover",
+                "other/",
+                "input/data.csv",
+                Some("data.csv"),
+            ),
+            (
+                "a key carrying segments that name no file of a tree",
+                "input/",
+                "input/../../etc/data.csv",
+                Some("etc/data.csv"),
+            ),
+            ("a key of nothing but those segments", "input/", "input/../..", None),
+            ("a key of empty segments", "input/", "input///", None),
+        ];
+        for (case, prefix, key, expected) in rows {
+            let read = super::object_name_under(prefix, key);
+            assert_eq!(
+                read.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
     }

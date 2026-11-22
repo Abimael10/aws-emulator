@@ -221,7 +221,7 @@ pub(crate) async fn keys_until(
 }
 
 /// The entries a `model.tar.gz` holds, as `(name, contents)`.
-fn archive_entries(bytes: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn archive_entries(bytes: &[u8]) -> Vec<(String, String)> {
     use std::io::Read;
 
     let decoder = flate2::read::GzDecoder::new(bytes);

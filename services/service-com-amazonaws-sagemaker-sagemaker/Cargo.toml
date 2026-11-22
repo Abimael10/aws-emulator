@@ -88,14 +88,16 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # registry, whose store lives on the same shared engine, so the digest a reader reports is
 # the one `PutImage` minted rather than a value computed here.
 service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
-# The CONTAINED Python interpreter the INFERENCE CODE a model artifact carries is executed by
-# — the handler script a framework inference container takes out of the artifact's `code`
-# directory (`state::inference_script`) — reached through the Lambda service crate, which is
-# where this workspace's ONE embedded Python execution substrate lives
-# (`state::execution::python`). Reused rather than stood up a second time here, so a model's
-# own script runs under exactly the containment and the bounds that engine already enforces,
-# and this crate adds no execution surface of its own: it supplies the script's modules, the
-# payload, the read-only model directory and the run's ceilings and nothing else.
+# The CONTAINED Python interpreter the caller-supplied PYTHON this service runs is executed by:
+# the INFERENCE CODE a model artifact carries — the handler script a framework inference container
+# takes out of the artifact's `code` directory (`state::inference_script`) — and the PROGRAM a
+# training or processing job's container declares when its `ContainerEntrypoint` names the
+# interpreter the SageMaker images provide (`state::container_python`). Both reach it through the
+# Lambda service crate, which is where this workspace's ONE embedded Python execution substrate
+# lives (`state::execution::python`). Reused rather than stood up a second time here, so a
+# caller's own code runs under exactly the containment and the bounds that engine already
+# enforces, and this crate adds no execution surface of its own: it supplies the modules, the
+# event, the in-memory files the code reads and writes, and the run's ceilings and nothing else.
 #
 # Capability class: an execution substrate. What it re-opens is answered by that engine and by
 # this crate's own module docs — the interpreter is built with the engine crate's host-reaching

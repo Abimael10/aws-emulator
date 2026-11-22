@@ -19,16 +19,39 @@
 //!
 //! # How the program is performed
 //!
-//! In process, by the ONE bounded POSIX/bash session this workspace performs caller-supplied
-//! shell text with ([`::service_common::posix_shell_session`]): the grammar is that crate's,
+//! In process, by one of the TWO engines this workspace performs caller-supplied code with,
+//! chosen by the program's own name:
+//!
+//! * a vector naming the PYTHON INTERPRETER the SageMaker images provide (`python3 -c …`,
+//!   `python3 <script>`) is a Python program, run in the contained interpreter this workspace
+//!   embeds ([`super::container_python`], which states its own bounds and what it serves the
+//!   program);
+//! * every other program is resolved against the SESSION's own catalog, below.
+//!
+//! # ONE engine, and ONE CONTAINER PER RUN
+//!
+//! "One engine" is one IMPLEMENTATION — the single bounded POSIX/bash session crate this
+//! workspace performs caller-supplied shell text with, and the single contained interpreter it
+//! performs caller-supplied Python with — and never one shared instance. Each call of
+//! [`run_container_program`] builds the CONTAINER it performs that program in, performs the
+//! program in it, reads the files out of it and DROPS it: the session is constructed here
+//! ([`::service_common::posix_shell_session::ShellSession::new`]) and owned by that call, the
+//! interpreter is stood up for that run and torn down with it, and the storage tree is memory
+//! that call owns. So nothing of one job survives into another: a job's program sees the data
+//! the service placed in ITS container and the files its OWN program wrote, never a file of a
+//! job that ran before it, and no path a request names can reach one. The bounds below are
+//! per-run for the same reason, so one job's program cannot spend another's.
+//!
+//! The session: the grammar is that crate's,
 //! the commands are the session's own catalog, and the session has NO host process to start,
 //! no host filesystem to open and no host environment to read — the utilities it provides are
 //! the ones whose whole effect is inside the session itself, and the tree the file utilities
-//! work over is memory this run owns. Nothing here resolves a command against the host's
+//! work over is memory this run owns, holding the data the service placed in the container and
+//! what the program itself writes. Nothing here resolves a command against the host's
 //! `PATH`, starts a child process or reaches a socket; a command the session's catalog does not
 //! provide is never performed at all and answers the status a shell answers for a command it
 //! could not run — which is also the status a container exits with when its program cannot be
-//! started. So a declared program chooses between the session's own utilities and nothing: it
+//! started. So a declared program chooses between the two engines above and nothing: it
 //! does not choose a program on the machine running the emulator.
 //!
 //! Every bound is the emulator's and lives in that session's own configuration
@@ -54,8 +77,10 @@
 //! # A program nothing performed CLAIMS NOTHING
 //!
 //! Whether the declared program is one this emulator can perform at all is decided BEFORE it is
-//! performed: the catalog is a fixed set of names ([`performable_program`]), so a vector naming
-//! a program outside it — a script inside the caller's own image, an interpreter — and a
+//! performed: the engines above answer for a fixed set of names (the interpreter names of
+//! [`super::container_python::python_interpreter`] and the session's catalog,
+//! [`performable_program`]), so a vector naming a program outside them — a script inside the
+//! caller's own image, an interpreter this emulator has none of — and a
 //! specification declaring no vector at all are both answered [`ContainerOutcome::NotPerformed`],
 //! which carries NO exit status and NO output. Nothing ran, so nothing about a run is reported:
 //! a job in that position ends in its modelled failure status with a reason NAMING what was not
@@ -64,8 +89,9 @@
 //! `service-com-amazonaws-ecs-amazonec2containerservicev20141113` states for its own declined
 //! commands.
 //!
-//! A program the catalog DOES name is performed, and the status it exits with is the container's
-//! own — including the status a shell inside it reports for a command that shell could not find,
+//! A program one of the engines DOES name is performed, and the status it exits with is the
+//! container's own — including the status a shell inside it reports for a command that shell
+//! could not find, and the status the interpreter gives a Python program that raised, each of
 //! which is a status the program itself produced.
 
 use super::*;
@@ -262,21 +288,42 @@ pub fn performable_program(program: &[String]) -> Option<&str> {
 /// was performed for it.
 ///
 /// `image` is the container image the job declared, which the reason for a vector naming no
-/// program at all names.
+/// program at all names. `inputs` is the data the SERVICE places in the container's storage
+/// before its entrypoint is invoked, as `(absolute path, contents)` — a training channel's
+/// objects under `/opt/ml/input/data/<ChannelName>/`, a processing input's objects under its
+/// `LocalPath` — so the program works over the job's own data and over nothing else.
 ///
-/// Pure computation over the caller's own words: the session starts no process, opens no host
-/// file and reaches no network, and the work it performs is bounded by that session's own
-/// bounds.
+/// Two kinds of program are performed, and the choice is made on the program's own name: the
+/// PYTHON interpreter the SageMaker images provide, whose program is run in the contained
+/// interpreter this workspace embeds ([`super::container_python`]), and the session's own
+/// catalog of shell utilities. Either way this is pure computation over the caller's own words:
+/// no process is started, no host file is opened and no network is reached.
+///
+/// The CONTAINER is this call's own, whichever engine performs the program: the session below is
+/// constructed here and dropped when this call returns, the interpreter is stood up for the run
+/// and torn down with it, and the storage tree holds `inputs` and what this program wrote and
+/// nothing else. No state is carried between two calls, so one job's program can neither read
+/// nor name a file of another job's container.
 #[must_use]
 pub fn run_container_program(
     program: &[String],
     image: &str,
     environment: Option<&HashMap<String, String>>,
+    inputs: &[(String, String)],
 ) -> ContainerOutcome {
     if program.is_empty() {
         return ContainerOutcome::NotPerformed {
             reason: no_declared_program(image),
         };
+    }
+    // A vector naming the PYTHON interpreter names a Python program, which is run by the one
+    // contained interpreter this workspace embeds rather than by the shell session.
+    if super::container_python::python_interpreter(program).is_some() {
+        return super::container_python::run_python_container_program(
+            program,
+            environment,
+            inputs,
+        );
     }
     let Some(name) = performable_program(program) else {
         let declared = program.first().map_or("", String::as_str);
@@ -306,9 +353,19 @@ pub fn run_container_program(
     // The container has storage of its own — the ML storage volume the job's inputs are
     // downloaded to and its outputs are written from — so the session performs the file
     // utilities over its own tree, which is also what makes `sh -c` a program it can run.
+    //
+    // The session is CONSTRUCTED HERE, for this one run: it is a local of this call, its tree
+    // starts empty, and both are dropped when the call returns. Nothing of another job's run is
+    // in it and nothing of this one outlives it.
     let mut session =
         ::service_common::posix_shell_session::ShellSession::new(variables, config)
             .with_file_utilities();
+    // The data the service placed in the container before its entrypoint is invoked is in that
+    // tree from the program's first line, which is what makes a program reading its channel or
+    // its input directory read the job's own data.
+    for (path, contents) in inputs {
+        session.put_file(path, contents);
+    }
     let status = session.run(&line);
     // An `exit` the program performed is the status it ended with, the way a shell takes it.
     let status = session.exit_status().unwrap_or(status);
@@ -336,12 +393,14 @@ pub async fn run_container_program_off_worker(
     program: &[String],
     image: &str,
     environment: Option<&HashMap<String, String>>,
+    inputs: &[(String, String)],
 ) -> Option<ContainerOutcome> {
     let program = program.to_vec();
     let image = image.to_string();
     let environment = environment.cloned();
+    let inputs = inputs.to_vec();
     ::tokio::task::spawn_blocking(move || {
-        run_container_program(&program, &image, environment.as_ref())
+        run_container_program(&program, &image, environment.as_ref(), &inputs)
     })
     .await
     .ok()
@@ -389,7 +448,7 @@ mod tests {
 
         for (case, program, expected) in rows {
             let words: Vec<String> = program.iter().map(|word| (*word).to_string()).collect();
-            let outcome = run_container_program(&words, IMAGE, None);
+            let outcome = run_container_program(&words, IMAGE, None, &[]);
             let ContainerOutcome::Performed {
                 status, error_tail, ..
             } = &outcome
@@ -438,7 +497,7 @@ mod tests {
             ),
         ];
         for (case, program, fragment) in rows {
-            let outcome = run_container_program(&program, IMAGE, None);
+            let outcome = run_container_program(&program, IMAGE, None, &[]);
             let ContainerOutcome::NotPerformed { reason } = &outcome else {
                 panic!("case {case:?}: expected nothing to be performed, got {outcome:?}");
             };
@@ -520,7 +579,7 @@ mod tests {
             .iter()
             .map(|word| (*word).to_string())
             .collect();
-        let outcome = run_container_program(&program, IMAGE, Some(&environment));
+        let outcome = run_container_program(&program, IMAGE, Some(&environment), &[]);
         assert_eq!(
             outcome.failure_reason(),
             Some(algorithm_error("", 4)),
@@ -545,7 +604,7 @@ mod tests {
         .iter()
         .map(|word| (*word).to_string())
         .collect();
-        let outcome = run_container_program(&program, IMAGE, None);
+        let outcome = run_container_program(&program, IMAGE, None, &[]);
         assert_eq!(
             outcome.failure_reason(),
             None,
@@ -584,5 +643,87 @@ mod tests {
             "the file's contents are the ones the program wrote, got {:?}",
             outcome.file("/opt/ml/model/artifact.txt")
         );
+    }
+
+    /// RULE: the container one program is performed in is that RUN's own — the data the service
+    /// placed for it and the files it wrote itself — so a later program sees nothing of an
+    /// earlier one, whatever path it names.
+    ///
+    /// The rows differ along the ENGINE the program is performed by, because the container is
+    /// per-run in both: the shell session's catalog, and the contained Python interpreter.
+    #[test]
+    fn each_run_gets_its_own_container() {
+        /// One row: the case, the vector of the first program, and the vector of the second.
+        struct Row {
+            case: &'static str,
+            first: Vec<&'static str>,
+            second: Vec<&'static str>,
+        }
+        let rows = [
+            Row {
+                case: "two programs of the session's own catalog",
+                first: vec![
+                    "/bin/sh",
+                    "-c",
+                    "mkdir -p /opt/ml/model && echo private > /opt/ml/model/first.txt",
+                ],
+                second: vec![
+                    "/bin/sh",
+                    "-c",
+                    "mkdir -p /opt/ml/model && echo mine > /opt/ml/model/second.txt",
+                ],
+            },
+            Row {
+                case: "two programs of the contained interpreter",
+                first: vec![
+                    "python3",
+                    "-c",
+                    "import os\n\
+                     os.makedirs('/opt/ml/model', exist_ok=True)\n\
+                     open('/opt/ml/model/first.txt', 'w').write('private')\n",
+                ],
+                second: vec![
+                    "python3",
+                    "-c",
+                    "import os\n\
+                     os.makedirs('/opt/ml/model', exist_ok=True)\n\
+                     open('/opt/ml/model/second.txt', 'w').write('mine')\n",
+                ],
+            },
+        ];
+        // The data the service places for the FIRST run only, which the second must not see.
+        let placed = vec![(
+            "/opt/ml/input/data/train/data.csv".to_string(),
+            "1,2\n".to_string(),
+        )];
+        for row in rows {
+            let case = row.case;
+            let words = |program: &[&'static str]| -> Vec<String> {
+                program.iter().map(|word| (*word).to_string()).collect()
+            };
+            let first = run_container_program(&words(&row.first), IMAGE, None, &placed);
+            assert_eq!(
+                first.file("/opt/ml/model/first.txt").map(str::trim),
+                Some("private"),
+                "case {case:?}: the first run leaves what it wrote, got {first:?}"
+            );
+            let second = run_container_program(&words(&row.second), IMAGE, None, &[]);
+            assert_eq!(
+                second.file("/opt/ml/model/second.txt").map(str::trim),
+                Some("mine"),
+                "case {case:?}: the second run leaves what it wrote, got {second:?}"
+            );
+            for path in [
+                "/opt/ml/model/first.txt",
+                "/opt/ml/input/data/train/data.csv",
+            ] {
+                let held = second.file(path);
+                assert_eq!(
+                    held, None,
+                    "case {case:?}: the second run's container holds nothing of the first's, \
+                     but {path} read {held:?}"
+                );
+            }
+        }
     }
 }

@@ -175,8 +175,9 @@ pub use admission::{
 pub mod s3_access;
 pub use s3_access::{
     arn_partition, first_unreadable_location, first_unreadable_location_as_role,
-    object_read_is_unauthorized, s3_client, s3_client_through, S3Location, UnreadableLocation,
-    DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
+    object_name_under, object_read_is_unauthorized, object_write_is_unauthorized, ordinary_name,
+    s3_client, s3_client_through, S3Location, UnreadableLocation, DEFAULT_PARTITION,
+    GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
 };
 
 /// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and
@@ -1229,6 +1230,20 @@ pub use tuning_run::*;
 /// `state/container_run.rs`.
 pub mod container_run;
 pub use container_run::*;
+
+/// The PYTHON program a job's container declares, performed in the contained interpreter this
+/// workspace embeds, over the container's own storage: see `state/container_python.rs`.
+pub mod container_python;
+pub use container_python::*;
+
+/// How many runs of caller-supplied code this process performs at once, shared by every caller
+/// that performs one: see `state/run_slots.rs`.
+pub mod run_slots;
+
+/// What an accepted PROCESSING job's work does with Amazon S3 — the inputs it downloads into
+/// the container and the outputs it uploads from it: see `state/processing_run.rs`.
+pub mod processing_run;
+pub use processing_run::*;
 
 /// The lineage-action slice: see `state/lineage_action.rs`.
 pub mod lineage_action;

@@ -980,6 +980,15 @@ pub struct ProcessingJob {
     /// recorded by the create that started it and revealed by the clock
     /// ([`Self::settle_status`]). `None` while the create has not reported at all.
     pub run: Option<crate::state::ContainerOutcome>,
+    /// Why the job's own OUTPUT stage failed — the upload of what the container left under a
+    /// `ProcessingOutput`'s `LocalPath` to its `S3Uri`
+    /// ([`crate::state::upload_processing_outputs`]) — and `None` for a job whose outputs were
+    /// uploaded, or that declared none.
+    ///
+    /// It is a leg of the job's WORK, like the program itself, so it is recorded by the create
+    /// that performed it and revealed by the clock: a job whose program exited zero but whose
+    /// declared output could not be written has failed, and says which leg failed.
+    pub upload_failure: Option<String>,
 }
 
 impl ProcessingJob {
@@ -1009,7 +1018,12 @@ impl ProcessingJob {
                 // A job whose create never reported an outcome at all is the server's own
                 // failure, not a status the program produced.
                 let failure = match self.run.as_ref() {
-                    Some(outcome) => outcome.failure_reason(),
+                    Some(outcome) => outcome
+                        .failure_reason()
+                        // A program that exited zero still fails the job when a LEG of the
+                        // job's own work around it did: the output stage that uploads what it
+                        // wrote is one of those legs.
+                        .or_else(|| self.upload_failure.clone()),
                     None => Some(INTERNAL_FAILURE_REASON.to_string()),
                 };
                 match failure {
@@ -1070,6 +1084,14 @@ impl ProcessingJob {
             self.ends_at = stage_due_after(at, PROCESSING_JOB_ENDS_AFTER, 0);
         }
         self.run = run;
+    }
+
+    /// Record why the job's own OUTPUT stage failed: the upload of what the container left
+    /// under a declared `LocalPath` to its `S3Uri` could not be made
+    /// ([`Self::upload_failure`]). Recorded by the create that performed that stage, and
+    /// revealed by the clock with the rest of the job's outcome.
+    pub fn record_upload_failure(&mut self, reason: String) {
+        self.upload_failure = Some(reason);
     }
 
     /// Record that the caller asked this job to stop: it moves to the transient

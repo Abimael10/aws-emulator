@@ -53,12 +53,13 @@
 
 use super::*;
 
-use ::std::sync::{Condvar, Mutex};
 use ::std::time::Duration;
 
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::INIT_PHASE_LIMIT;
+
+use super::run_slots::RunSlots;
 
 /// The directory of a model artifact that holds the model's own inference code: "you can include
 /// your inference script in the `code` directory of your model artifact", which is where a
@@ -339,7 +340,7 @@ pub fn run_inference_script(
             detail: "the payload could not be handed to the model's inference script".to_string(),
         })?;
     // Nothing is run at all while this process is already running as many scripts as it may.
-    let Some(slot) = INFERENCE_SCRIPT_SLOTS.take(INFERENCE_SCRIPT_SLOT_WAIT) else {
+    let Some(slot) = INFERENCE_SCRIPT_SLOTS.take(MAX_CONCURRENT_INFERENCE_SCRIPTS, INFERENCE_SCRIPT_SLOT_WAIT) else {
         return Err(ServingRefusal::ScriptNotRun {
             detail: format!(
                 "this emulator runs at most {MAX_CONCURRENT_INFERENCE_SCRIPTS} inference scripts \
@@ -590,68 +591,10 @@ fn run_event(
 }
 
 /// The runs this process has given a slot to, out of [`MAX_CONCURRENT_INFERENCE_SCRIPTS`].
-static INFERENCE_SCRIPT_SLOTS: RunSlots = RunSlots {
-    taken: Mutex::new(0),
-    freed: Condvar::new(),
-};
-
-/// The slots the concurrent-run count hands out.
 ///
-/// A counting semaphore this caller can wait on without an async runtime, because the run it
-/// guards is performed synchronously on a thread of its own: the slot is MOVED INTO that thread,
-/// so it is given back when the thread really ends — including a run the caller has already given
-/// up waiting for, which would otherwise take the count past its bound while its thread was still
-/// going.
-#[derive(Debug)]
-struct RunSlots {
-    /// How many runs hold a slot.
-    taken: Mutex<usize>,
-    /// Signalled as each slot is given back.
-    freed: Condvar,
-}
-
-impl RunSlots {
-    /// Take a slot, waiting at most `wait` for one — and `None` when none came free, which is a
-    /// run that did not happen at all.
-    fn take(&'static self, wait: Duration) -> Option<RunSlot> {
-        let deadline = ::std::time::Instant::now() + wait;
-        let mut taken = self.taken.lock().unwrap_or_else(|held| held.into_inner());
-        loop {
-            if *taken < MAX_CONCURRENT_INFERENCE_SCRIPTS {
-                *taken += 1;
-                return Some(RunSlot { slots: self });
-            }
-            let left = deadline.saturating_duration_since(::std::time::Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            let (held, _) = self
-                .freed
-                .wait_timeout(taken, left)
-                .unwrap_or_else(|held| held.into_inner());
-            taken = held;
-        }
-    }
-}
-
-/// One taken slot, given back when the run that holds it ends.
-#[derive(Debug)]
-struct RunSlot {
-    slots: &'static RunSlots,
-}
-
-impl Drop for RunSlot {
-    fn drop(&mut self) {
-        let mut taken = self
-            .slots
-            .taken
-            .lock()
-            .unwrap_or_else(|held| held.into_inner());
-        *taken = taken.saturating_sub(1);
-        drop(taken);
-        self.slots.freed.notify_one();
-    }
-}
+/// The accounting is the one shared by every run of caller-supplied code this service
+/// performs ([`super::run_slots`]); the BOUND above is this caller's own.
+static INFERENCE_SCRIPT_SLOTS: RunSlots = RunSlots::new();
 
 /// The KERNEL one run resolves: the program that imports the artifact's own entry point and calls
 /// its handler functions in the order an inference container calls them.

@@ -10,13 +10,29 @@
 //! `DescribeProcessingJob`. This is the ONLY file to touch for this operation.
 //!
 //! The job's container PROGRAM is RUN, in process: the argument vector the
-//! `AppSpecification` declares is performed by the shared bounded shell session
-//! (`crate::state::run_container_program_off_worker`), its outcome is recorded on the stored
-//! job, and the clock reveals it — so the job ends `Completed` when that program exited zero
-//! and `Failed` with the `AlgorithmError` reason when it exited non-zero. A specification that
-//! declares no program names one this emulator cannot start, which is the could-not-run
+//! `AppSpecification` declares is performed by the engine its own program name chooses
+//! (`crate::state::run_container_program_off_worker` — the bounded shell session, or the
+//! contained Python interpreter for a vector naming `python3`), its outcome is recorded on the
+//! stored job, and the clock reveals it — so the job ends `Completed` when that program exited
+//! zero and `Failed` with the `AlgorithmError` reason when it exited non-zero. A specification
+//! that declares no program names one this emulator cannot start, which is the could-not-run
 //! status. Everything around the run — accepting, validating, minting the ARN,
 //! replaying the job — is real.
+//!
+//! The CONTAINER is this job's own: the session (or the interpreter) and the storage tree the
+//! program reads and writes are built for THIS run and dropped with it, holding the data this
+//! request's own inputs were downloaded into and the files this program wrote. Nothing of
+//! another job's run is in it and nothing of this one outlives it, so no `LocalPath` a request
+//! names can reach another job's data (see `crate::state::container_run`).
+//!
+//! The job's DATA MOVEMENT around that program is SageMaker's own work and is performed here
+//! too (`crate::state::processing_run`), as the job's role: every object of a
+//! SageMaker-managed `ProcessingInput`'s `S3Input` is downloaded into the container's storage
+//! under its `LocalPath` before the program starts, and every file the program left under a
+//! `ProcessingOutput`'s `S3Output.LocalPath` is uploaded to that output's `S3Uri` once it has
+//! exited. Either leg can FAIL the job — a location holding no object, a read or a write the
+//! destination bucket's policy or the role's own grant refuses — and the job then reports the
+//! `ClientError:` reason naming that leg instead of a status for work that produced nothing.
 //!
 //! WHAT THAT PROGRAM CAN REACH, which is nothing of the machine: the session
 //! (`crate::state::container_run`, over `service_common::posix_shell_session`) has no host
@@ -238,6 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The environment the declared program is given: the job's own, and nothing of this
         // process's. Taken before the request's members are moved into the stored job.
         let environment = input.environment.clone();
+        // The members the job's own WORK below needs, taken before the request's are moved
+        // into the stored job: the role every Amazon S3 call of that work is made as, the
+        // inputs the service downloads into the container, and the outputs it uploads out of
+        // it.
+        let role_arn = input.role_arn.clone();
+        let declared_inputs = input.processing_inputs.clone();
+        let declared_outputs = input.processing_output_config.clone();
         let tracked_component;
         {
         let mut store = state.lock();
@@ -299,6 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ends_at: now + crate::state::PROCESSING_JOB_ENDS_AFTER,
                 // Filled in by the run below, once it has reported.
                 run: None,
+                upload_failure: None,
             },
         );
         // "Associates a SageMaker job as a trial component with an experiment and trial"
@@ -331,22 +355,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for are all answered the same way: NOTHING is performed, so no exit status is claimed
         // and the job fails with the reason naming what was not performed.
         //
-        // A program that IS performed reaches nothing of the machine: it runs in the ONE
-        // bounded session this workspace performs caller-supplied shell text with, which has no
-        // host process, no host filesystem, no host environment and no socket, performs only
+        // A program that IS performed reaches nothing of the machine: it runs in a bounded
+        // session this call's own run owns — built for that run and dropped with it — which has
+        // no host process, no host filesystem, no host environment and no socket, performs only
         // its own catalog of session-local utilities, is bounded by that session's own command
-        // budget, and sees only the variables this request declared (see
-        // `crate::state::container_run`).
-        let outcome = crate::state::run_container_program_off_worker(
-            &program,
-            &image_uri,
-            environment.as_ref(),
+        // budget, and sees only the files this job's own inputs were downloaded into and the
+        // variables this request declared (see `crate::state::container_run`).
+        let outcome = match crate::state::processing_inputs_in_container(
+            ctx,
+            &region,
+            &role_arn,
+            declared_inputs.as_deref(),
         )
-        .await;
+        .await
+        {
+            Ok(placed) => {
+                crate::state::run_container_program_off_worker(
+                    &program,
+                    &image_uri,
+                    environment.as_ref(),
+                    &placed,
+                )
+                .await
+            }
+            // The DOWNLOAD leg of the job's work failed, so the container's program was never
+            // started: the job fails with the reason naming that leg and claims no exit status
+            // for a program nothing performed.
+            Err(reason) => Some(crate::state::ContainerOutcome::NotPerformed { reason }),
+        };
+        // The job's own OUTPUT stage, which SageMaker performs rather than the container:
+        // every file the program left under a declared `LocalPath` becomes an object under
+        // that output's `S3Uri`, written as the job's role — so a write the destination
+        // bucket's policy or the role's grant refuses FAILS the job rather than being skipped
+        // (see `crate::state::processing_run`).
+        let upload_failure = match outcome.as_ref() {
+            Some(performed) => {
+                crate::state::upload_processing_outputs(
+                    ctx,
+                    &region,
+                    &role_arn,
+                    declared_outputs.as_ref(),
+                    performed,
+                )
+                .await
+            }
+            None => None,
+        };
         {
             let mut store = state.lock();
             if let Some(job) = store.processing_jobs.get_mut(&input.processing_job_name) {
                 job.record_run(outcome, ::std::time::SystemTime::now());
+                if let Some(reason) = upload_failure {
+                    job.record_upload_failure(reason);
+                }
             }
         }
 
@@ -363,7 +424,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The directory a SageMaker-managed input must be mounted under, from
 /// `ProcessingS3Input$LocalPath`'s doc: "`LocalPath` is an absolute path to the input
 /// data and must begin with `/opt/ml/processing/`."
-const MANAGED_INPUT_LOCAL_PATH_PREFIX: &str = "/opt/ml/processing/";
+///
+/// It is the directory EVERY SageMaker-managed path of a processing job is under — an output's
+/// `LocalPath` is a directory of the same tree, which "will be created by the platform and
+/// exist when your container's entrypoint is invoked" — so the prefix and the reading of it are
+/// the ONE the job's work also checks where it places and collects files
+/// (`crate::state::PROCESSING_LOCAL_PATH_PREFIX`,
+/// `crate::state::is_container_directory`).
+const MANAGED_INPUT_LOCAL_PATH_PREFIX: &str = crate::state::PROCESSING_LOCAL_PATH_PREFIX;
 
 /// `ProcessingS3CompressionType` value that only `Pipe` input mode accepts, from
 /// `ProcessingS3Input$S3CompressionType`'s doc: "`Gzip` can only be used when `Pipe`
@@ -420,7 +488,9 @@ fn validate_processing_inputs(
                          AppManaged is false."
                     )));
                 }
-                Some(local_path) if !local_path.starts_with(MANAGED_INPUT_LOCAL_PATH_PREFIX) => {
+                Some(local_path)
+                    if !crate::state::is_container_directory(local_path) =>
+                {
                     return Err(refuse(format!(
                         "ProcessingInputs[{name}].S3Input.LocalPath must begin with \
                          {MANAGED_INPUT_LOCAL_PATH_PREFIX}, but was \"{local_path}\"."
@@ -449,6 +519,14 @@ fn validate_processing_inputs(
 ///   `S3Output` or `FeatureStoreOutput` types."
 /// * `ProcessingOutput$FeatureStoreOutput`: "This processing output type is only
 ///   supported when `AppManaged` is specified."
+/// * `ProcessingS3Output$LocalPath`: "the local path of a directory where you want Amazon
+///   SageMaker to upload its contents to Amazon S3 … This directory will be created by the
+///   platform and exist when your container's entrypoint is invoked" — the platform creates it
+///   inside the ONE directory a processing job's SageMaker-managed data lives under
+///   ([`MANAGED_INPUT_LOCAL_PATH_PREFIX`], which `ProcessingS3Input$LocalPath` states for the
+///   same tree), so a value naming a directory outside it names a directory this job has none
+///   of, and the upload stage would have nothing to read. An `AppManaged` output is uploaded by
+///   the application itself, whose own paths are its business.
 fn validate_output_config(
     config: Option<&ProcessingOutputConfig>,
 ) -> Result<(), CreateProcessingJobError> {
@@ -477,6 +555,23 @@ fn validate_output_config(
                 "ProcessingOutputConfig.Outputs[{name}].FeatureStoreOutput is supported \
                  only when AppManaged is true."
             )));
+        }
+        // SageMaker manages the upload unless the application does, and the directory it
+        // uploads from is only meaningful inside the tree the platform creates for the job.
+        if output.app_managed.unwrap_or(false) {
+            continue;
+        }
+        if let Some(local_path) = output
+            .s3_output
+            .as_ref()
+            .and_then(|destination| destination.local_path.as_deref())
+        {
+            if !crate::state::is_container_directory(local_path) {
+                return Err(refuse(format!(
+                    "ProcessingOutputConfig.Outputs[{name}].S3Output.LocalPath must begin \
+                     with {MANAGED_INPUT_LOCAL_PATH_PREFIX}, but was \"{local_path}\"."
+                )));
+            }
         }
     }
     Ok(())

@@ -292,6 +292,13 @@ pub struct ChannelData {
     pub records: Vec<Record>,
     /// The rows that held no record of the channel's form, which the artifact reports.
     pub skipped: usize,
+    /// The objects THEMSELVES, as `(name under the channel's directory, contents)`: what the
+    /// service places in the container before its entrypoint is invoked, under
+    /// `/opt/ml/input/data/<ChannelName>/` ([`container_inputs`]).
+    ///
+    /// The records above are the same bytes READ as the form the built-in algorithms document;
+    /// these are the bytes, which is what a container's own program opens.
+    pub files: Vec<(String, String)>,
 }
 
 impl ChannelData {
@@ -303,8 +310,44 @@ impl ChannelData {
             objects: 0,
             records: Vec::new(),
             skipped: 0,
+            files: Vec::new(),
         }
     }
+}
+
+/// The directory a training channel's data is placed in for the container: "SageMaker makes
+/// the data available in the `/opt/ml/input/data/<channel_name>` directory" — the path a
+/// container's own program opens its channel data at.
+pub const INPUT_DATA_DIRECTORY: &str = "/opt/ml/input/data";
+
+/// The data the service places in the container's storage before its entrypoint is invoked:
+/// every object of every channel it downloaded, as `(absolute path, contents)` under that
+/// channel's own directory below [`INPUT_DATA_DIRECTORY`].
+///
+/// This is what makes a declared container program — a shell program reading its channel, a
+/// Python program counting its records — work over the job's OWN data rather than over an empty
+/// container ([`crate::state::run_container_program`]).
+///
+/// Every path answered here is INSIDE that directory: the channel's own name is the one the
+/// request named (`ChannelName` is `@pattern ^[A-Za-z0-9\.\-_]+$`, so it names one directory
+/// below it) and the file's name is a relative name of ordinary segments
+/// ([`object_name_under`]) — and the join is checked against the directory itself, so nothing a
+/// request carries can place a file outside the container's own storage.
+#[must_use]
+pub fn container_inputs(channels: &[ChannelData]) -> Vec<(String, String)> {
+    let root = format!("{INPUT_DATA_DIRECTORY}/");
+    channels
+        .iter()
+        .flat_map(|channel| {
+            channel.files.iter().map(|(name, contents)| {
+                (
+                    format!("{INPUT_DATA_DIRECTORY}/{}/{name}", channel.name),
+                    contents.clone(),
+                )
+            })
+        })
+        .filter(|(path, _)| path.starts_with(&root) && !path.split('/').any(|part| part == ".."))
+        .collect()
 }
 
 /// A fitted linear model: `prediction = intercept + weights · features`, in the caller's own
@@ -567,17 +610,24 @@ pub async fn run_training_job(
         // SageMaker's own and which this run performs below; only a DECLARED program takes
         // precedence over them.
         if !program.is_empty() {
-            // Performed off the request worker, in the ONE bounded session this workspace
-            // performs caller-supplied shell text with: no host process, no host filesystem,
-            // no host environment and no network (see `crate::state::container_run`). A
-            // program that session performs none of is not performed at all, and no exit
-            // status is claimed for it; a run this process could not carry out is the
-            // server's own failure.
+            // Performed off the request worker, by the engine the program's own name chooses:
+            // the bounded shell session, or the contained Python interpreter for a vector
+            // naming the interpreter the SageMaker images provide (see
+            // `crate::state::container_run`). Neither has a host process to start, a host
+            // filesystem to open, a host environment to read or a socket. A program neither
+            // engine performs is not performed at all, and no exit status is claimed for it;
+            // a run this process could not carry out is the server's own failure.
+            //
+            // The container's storage holds the job's own data from its first line: every
+            // object of every channel the run downloaded, under
+            // `/opt/ml/input/data/<ChannelName>/` ([`container_inputs`]), which is where
+            // SageMaker makes a channel's data available.
             let image = specification.training_image.clone().unwrap_or_default();
             let outcome = crate::state::run_container_program_off_worker(
                 &program,
                 &image,
                 request.environment.as_ref(),
+                &container_inputs(&channels),
             )
             .await;
             match outcome {
@@ -641,12 +691,16 @@ pub async fn run_training_job(
         Err(reason) => return TrainingRunOutcome::failed_in(phases, reason),
     };
     for checkpoint in &checkpoints {
-        if ::service_common::iam_role::role_withholds_action(
+        // The write is authorized the way every write a job's work makes is: the destination
+        // bucket's own policy refuses what it EXPLICITLY DENIES, and otherwise the grant in
+        // force on the execution role decides (see [`super::s3_access`]).
+        if object_write_is_unauthorized(
             ctx,
+            &client,
             region,
             &request.role_arn,
-            PUT_OBJECT_ACTION,
-            &checkpoint.location.object_arn(&partition),
+            &partition,
+            &checkpoint.location,
         )
         .await
         {
@@ -690,12 +744,13 @@ pub async fn run_training_job(
             model_upload_failed(&artifact.uri(), ARCHIVE_NOT_BUILT),
         );
     };
-    if ::service_common::iam_role::role_withholds_action(
+    if object_write_is_unauthorized(
         ctx,
+        &client,
         region,
         &request.role_arn,
-        PUT_OBJECT_ACTION,
-        &artifact.object_arn(&partition),
+        &partition,
+        &artifact,
     )
     .await
     {
@@ -877,6 +932,14 @@ pub async fn read_channel(
             .map_err(|detail| data_download_failed(name, &object.uri(), &detail))?;
         *remaining_bytes = remaining_bytes.saturating_sub(bytes.len());
         read.objects += 1;
+        // The object itself, as the container's own storage holds it: the file the service
+        // places under this channel's directory ([`container_inputs`]). Its name is the key
+        // below the prefix that named it, of ordinary segments only, so a prefix holding a tree
+        // is placed as that tree and a key that names no file of a tree places none.
+        if let Some(file) = object_name_under(&location.key, &object.key) {
+            read.files
+                .push((file, String::from_utf8_lossy(&bytes).to_string()));
+        }
         read_records(&bytes, &mut read);
         if read.records.len() >= MAX_RECORDS {
             break;
