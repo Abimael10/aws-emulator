@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcontrolplaneservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appsync#TagResourceRequest")]
+// `skip_validation = ["resourceArn"]`: see the note on `ListTagsForResourceInput` — the
+// route's own member is read against the ARN forms this service issues, in the handler.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.appsync#TagResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

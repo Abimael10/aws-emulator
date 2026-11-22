@@ -99,6 +99,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ApplicationInsights",
         SdkDiagnostic::Attempts,
     ),
+    // AWS AppSync's SDK names it by that model's own `sdkId` (`AppSync`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::AppSync::ChannelNamespace` whose declared `CodeHandlers` that service will not
+    // compile carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `appsync__cloudformation.deploy-channel-namespace-cfn-invalid-code-handler-rolls-back`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: AppSync, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`). Every type this emulator
+    // provisions over this signing name is that service's (a GraphQL API's own estate,
+    // the two custom-domain types, and the Event API types beside them).
+    ("appsync", "AppSync", SdkDiagnostic::Attempts),
     // Amazon EC2 Auto Scaling's SDK names it `AutoScaling` — that model's own
     // `awsService.cloudFormationName`, which is its `sdkId` (`Auto Scaling`,
     // `smithy_query(query="service_info")` on that service's model) with the space closed up,

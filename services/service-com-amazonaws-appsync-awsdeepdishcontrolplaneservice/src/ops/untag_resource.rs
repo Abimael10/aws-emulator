@@ -13,10 +13,12 @@
 //! the empty string, so a key removed here stops being reported at all, while a key
 //! whose value is empty keeps being reported with that value.
 //!
-//! `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), under which an
-//! API of either resource family is published, so the resource is resolved from the
-//! whole ARN through the store's `tags_of_mut` — the same lookup the tag write and the
-//! tag listing go through. An ARN this account holds no resource for is a 404
+//! `ResourceArn`'s modelled form describes an API's ARN alone, while the surface serves
+//! every ARN this service ISSUES for a resource that carries tags — an API of either
+//! family and a channel namespace of one — so the ARN is read against those forms
+//! ([`crate::state::tagged_resource_arn_refusal`]) and then resolved from the whole ARN
+//! through the store's `tags_of_mut`, the same lookup the tag write and the tag listing go
+//! through. An ARN this account holds no resource for is a 404
 //! `NotFoundException` and a key outside `TagKey`'s rule a 400 `BadRequestException`.
 //! Every refusal is decided before anything is removed, so a refused call leaves the
 //! stored map exactly as it was.
@@ -171,6 +173,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `ResourceArn`'s modelled form describes ONE of the ARNs this surface serves, so
+        // the value is read against the union of the forms this service issues for a
+        // resource that carries tags (the member carries `skip_validation` for that
+        // reason), before anything is removed.
+        if let Some(message) = crate::state::tagged_resource_arn_refusal(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         // A key's LENGTH is refused by the request boundary against `TagKey`'s modelled
         // bounds before this handler runs, but its alphabet and its reserved prefix are

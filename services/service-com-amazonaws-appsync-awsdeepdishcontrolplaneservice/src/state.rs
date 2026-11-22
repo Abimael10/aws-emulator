@@ -121,6 +121,17 @@ pub use dependencies::*;
 mod code_definition;
 pub use code_definition::*;
 
+/// The APPSYNC_JS `codeHandlers` a channel namespace is defined by: the compile a call that
+/// stores them runs, and the refusal handlers the runtime cannot read take.
+mod channel_namespace_handlers;
+pub use channel_namespace_handlers::*;
+
+/// The `resourceArn` the tagging surface addresses a resource by: the ARN forms this
+/// service issues for a resource that carries tags, and the refusal a value of no such form
+/// takes.
+mod tagged_resource;
+pub use tagged_resource::*;
+
 /// The data source introspections this service has run, and how the schema one read is
 /// reported.
 mod data_source_introspection;
@@ -2481,23 +2492,26 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// The tags the resource `resource_arn` names holds, or `None` when this account
     /// holds no such resource.
     ///
-    /// `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), and an API of
-    /// EITHER resource family is published under exactly that shape, so the ARN is
-    /// resolved against both stores here — the single lookup every tag operation uses,
-    /// so a tag read and a tag write can never disagree about which resources are
-    /// taggable. The whole ARN is compared, so a resource is addressed only in the
-    /// account and Region it was created in.
+    /// A resource CARRIES tags exactly where its own create takes them — a `GraphqlApi`,
+    /// an `Api` and a `ChannelNamespace` of one — so the ARN is resolved against each of
+    /// those stores here, which is the single lookup every tag operation uses: a tag read
+    /// and a tag write can never disagree about which resources are taggable, and a
+    /// namespace's tags are reached under the ARN this service minted for it
+    /// ([`channel_namespace_resource`]). The whole ARN is compared, so a resource is
+    /// addressed only in the account and Region it was created in.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
-        self.graphql_apis
-            .values()
-            .find(|api| api.arn == resource_arn)
-            .map(|api| &api.tags)
-            .or_else(|| {
-                self.event_apis
-                    .values()
-                    .find(|api| api.api_arn == resource_arn)
-                    .map(|api| &api.tags)
-            })
+        if let Some(api) = self.graphql_apis.values().find(|api| api.arn == resource_arn) {
+            return Some(&api.tags);
+        }
+        self.event_apis.values().find_map(|api| {
+            if api.api_arn == resource_arn {
+                return Some(&api.tags);
+            }
+            api.channel_namespaces
+                .values()
+                .find(|namespace| namespace.channel_namespace_arn == resource_arn)
+                .map(|namespace| &namespace.tags)
+        })
     }
 
     /// The tags the resource `resource_arn` names holds, for a call that writes them.
@@ -2511,10 +2525,15 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         {
             return Some(&mut api.tags);
         }
-        self.event_apis
-            .values_mut()
-            .find(|api| api.api_arn == resource_arn)
-            .map(|api| &mut api.tags)
+        self.event_apis.values_mut().find_map(|api| {
+            if api.api_arn == resource_arn {
+                return Some(&mut api.tags);
+            }
+            api.channel_namespaces
+                .values_mut()
+                .find(|namespace| namespace.channel_namespace_arn == resource_arn)
+                .map(|namespace| &mut namespace.tags)
+        })
     }
     /// Mint a fresh opaque id: 26 lowercase base-32 characters, the shape an AppSync
     /// `apiId` takes.

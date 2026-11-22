@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcontrolplaneservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appsync#ListTagsForResourceRequest")]
+// `skip_validation = ["resourceArn"]`: the modelled `ResourceArn` `@pattern` and `@length`
+// describe an API's ARN alone, where this surface also serves the ARN this service mints
+// for a channel namespace, which is longer. The handler enforces the union of the forms
+// this service ISSUES instead (`crate::state::tagged_resource_arn_refusal`), under the one
+// client error these operations model.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.appsync#ListTagsForResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTagsForResourceInput {
     pub resource_arn: String,

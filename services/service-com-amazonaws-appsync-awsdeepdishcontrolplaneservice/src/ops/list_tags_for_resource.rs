@@ -7,11 +7,12 @@
 //! call, so it is exactly what the create (and any later tag write) persisted. A
 //! pure read — nothing about the resource changes because its tags were listed.
 //!
-//! `ResourceArn` admits exactly one ARN shape (`^arn:aws:appsync:…:apis/…$`), under
-//! which an API of either resource family is published, so the resource is resolved
-//! from its whole stored ARN through the store's `tags_of` — the same lookup
-//! `TagResource` writes through; an ARN this account holds no API for is a 404
-//! `NotFoundException`.
+//! `ResourceArn`'s modelled form describes an API's ARN alone, while the surface serves
+//! every ARN this service ISSUES for a resource that carries tags — an API of either
+//! family and a channel namespace of one — so the ARN is read against those forms here
+//! ([`crate::state::tagged_resource_arn_refusal`]) and then resolved from its whole stored
+//! ARN through the store's `tags_of`, the same lookup `TagResource` writes through; an ARN
+//! this account holds no such resource for is a 404 `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,16 +167,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `ResourceArn`'s modelled form describes ONE of the ARNs this surface serves, so
+        // the value is read against the union of the forms this service issues for a
+        // resource that carries tags (the member carries `skip_validation` for that
+        // reason): a value of no such form names nothing this service could address and is
+        // the malformed request it is, under the one client error these operations model.
+        if let Some(message) = crate::state::tagged_resource_arn_refusal(&input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let guard = state.lock();
 
-        // `ResourceArn` is constrained to ONE ARN shape — an AppSync API's — and a value
-        // that is not one is refused before this handler runs (see the service's
-        // `override_refusal`), so the value here is a well-formed resource ARN and the
-        // only question left is whether this account holds the resource it names.
         // Resolved through the store's `tags_of`, the single lookup a tag read and a tag
-        // write share, so an API of either resource family lists the tags its create
-        // persisted — and an ARN naming no resource is refused as the absent RESOURCE it
-        // is, the way the whole tagging surface refuses one.
+        // write share, so every taggable resource lists the tags its create persisted —
+        // and an ARN naming no resource is refused as the absent RESOURCE it is, the way
+        // the whole tagging surface refuses one.
         let Some(tags) = guard.tags_of(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),

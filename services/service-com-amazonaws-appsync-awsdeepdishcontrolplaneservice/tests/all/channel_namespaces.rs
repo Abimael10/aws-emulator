@@ -627,7 +627,7 @@ async fn the_listing_pages_the_stored_namespaces_without_their_code_handlers() {
         let created = create_namespace(
             &router,
             &api_id,
-            json!({"name": name, "codeHandlers": format!("export const {name} = 1")}),
+            json!({"name": name, "codeHandlers": seed_handlers(name)}),
         )
         .await;
         assert_eq!(
@@ -682,7 +682,7 @@ async fn the_listing_pages_the_stored_namespaces_without_their_code_handlers() {
         let read = get_namespace(&router, &api_id, name).await;
         assert_eq!(
             read.body["channelNamespace"]["codeHandlers"].as_str(),
-            Some(format!("export const {name} = 1").as_str()),
+            Some(seed_handlers(name).as_str()),
             "case the reader for {name:?}: expected the stored code handlers, got {read:?}"
         );
     }
@@ -746,6 +746,15 @@ async fn the_listing_pages_the_stored_namespaces_without_their_code_handlers() {
              token was submitted to, got {answer:?}"
         );
     }
+}
+
+/// The code handlers one seeded namespace carries: a module the APPSYNC_JS runtime can
+/// READ whose text differs per namespace, so the reader below proves each namespace's own
+/// handlers are stored. A namespace whose handlers that runtime cannot compile is refused
+/// outright (`crate::channel_namespace_code_handlers`), so a seed cannot carry the name
+/// where an identifier belongs: a `Namespace` may hold hyphens and an identifier may not.
+fn seed_handlers(name: &str) -> String {
+    format!("export const seeded = '{name}';")
 }
 
 /// The `name` of every namespace a listing answered, in the order it reported them.

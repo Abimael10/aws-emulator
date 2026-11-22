@@ -166,6 +166,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `codeHandlers` the update would store have to compile, exactly as the
+        // create's do ([`crate::state::channel_namespace_handlers`]): the rule is over the
+        // member, so handlers the APPSYNC_JS runtime cannot read are refused here too and
+        // the stored namespace keeps the configuration it had.
+        match crate::state::channel_namespace_handlers(input.code_handlers.as_deref()).await {
+            crate::state::CodeDefinition::Compiled => {}
+            crate::state::CodeDefinition::Refused(refusal) => {
+                return Err(
+                    UpdateChannelNamespaceErrorModeled::BadRequestException(refusal).into(),
+                )
+            }
+            crate::state::CodeDefinition::Unknown(reason) => {
+                return Err(
+                    UpdateChannelNamespaceErrorModeled::InternalFailureException(
+                        InternalFailureException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
+
         // A channel namespace is addressed under the `Api` that holds it, so an
         // `apiId` naming no `Api` of this account — a GraphQL API's id, an id nothing
         // created, or a value no `Api` id could even be — holds no namespace to

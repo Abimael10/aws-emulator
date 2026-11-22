@@ -169,6 +169,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `codeHandlers` a namespace is defined by have to compile: AppSync compiles
+        // the module as the namespace is written and refuses handlers the APPSYNC_JS
+        // runtime cannot read, so a namespace whose handlers could never process an event
+        // is never stored ([`crate::state::channel_namespace_handlers`]). A compile that
+        // could not be run at all is the server's fault, not the request's, and stores
+        // nothing either.
+        match crate::state::channel_namespace_handlers(input.code_handlers.as_deref()).await {
+            crate::state::CodeDefinition::Compiled => {}
+            crate::state::CodeDefinition::Refused(refusal) => {
+                return Err(
+                    CreateChannelNamespaceErrorModeled::BadRequestException(refusal).into(),
+                )
+            }
+            crate::state::CodeDefinition::Unknown(reason) => {
+                return Err(
+                    CreateChannelNamespaceErrorModeled::InternalFailureException(
+                        InternalFailureException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
+
         // A channel namespace is addressed under the `Api` that holds it, so an
         // `apiId` naming no `Api` of this account — a GraphQL API's id, an id nothing
         // created, or a value no `Api` id could even be — leaves nothing for this call

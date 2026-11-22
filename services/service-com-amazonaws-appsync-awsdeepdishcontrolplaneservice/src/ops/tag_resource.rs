@@ -8,10 +8,12 @@
 //! so this call MERGES rather than replaces and `ListTagsForResource` (and the
 //! resource's own `tags` member) answers the merged map afterwards.
 //!
-//! `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), under which an
-//! API of either resource family is published, so the resource is resolved from the
-//! whole ARN through the store's `tags_of_mut` — the same lookup the tag listing reads
-//! through. An ARN this account holds no resource for is a 404 `NotFoundException`, a
+//! `ResourceArn`'s modelled form describes an API's ARN alone, while the surface serves
+//! every ARN this service ISSUES for a resource that carries tags — an API of either
+//! family and a channel namespace of one — so the ARN is read against those forms
+//! ([`crate::state::tagged_resource_arn_refusal`]) and then resolved from the whole ARN
+//! through the store's `tags_of_mut`, the same lookup the tag listing reads through. An ARN
+//! this account holds no resource for is a 404 `NotFoundException`, a
 //! key outside `TagKey`'s rule a 400 `BadRequestException`, and a write that would push
 //! the resource past the per-resource tag quota a 429 `LimitExceededException`. Every
 //! refusal is decided before anything is written, so a refused call leaves the stored
@@ -166,6 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `ResourceArn`'s modelled form describes ONE of the ARNs this surface serves, so
+        // the value is read against the union of the forms this service issues for a
+        // resource that carries tags (the member carries `skip_validation` for that
+        // reason), before anything is written.
+        if let Some(message) = crate::state::tagged_resource_arn_refusal(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
 
         // The entry COUNT and every VALUE are refused by the request boundary against
         // the modelled bounds before this handler runs; a map KEY is not covered there,
