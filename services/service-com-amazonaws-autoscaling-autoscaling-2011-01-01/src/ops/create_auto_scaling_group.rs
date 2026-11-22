@@ -896,6 +896,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A group is created owing no launch: the capacity its own create launches is
             // launched below, and a launch that could not place it is what leaves it owing.
             owes_launch: false,
+            // …and nothing holds its first launch back either: the instant a further attempt
+            // is owed at is set by an attempt Amazon EC2 took back, never by the create.
+            launch_retry_due: None,
             // The hooks the request's own lifecycle hook specifications created, taken
             // against the same rules as a later `PutLifecycleHook`.
             lifecycle_hooks,

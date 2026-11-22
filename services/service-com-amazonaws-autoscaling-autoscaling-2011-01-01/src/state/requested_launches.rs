@@ -33,10 +33,9 @@ use std::time::SystemTime;
 use crate::ops::types::{InstanceCollection, LaunchInstancesError2};
 
 use super::{
-    ec2_instances, failed_launch_description, zone_id_of, AutoScalingState, BlockedLaunch,
-    GroupLaunch, GroupLaunchOutcome, InstanceLifecycle, InstanceLifecycleChange,
-    LaunchDestination, PendingCapacity, LAUNCH_FAILED_SENTENCE, LIFECYCLE_TRANSITION,
-    PROCESS_LAUNCH, UNPLACED_INSTANCE_MESSAGE,
+    ec2_instances, zone_id_of, AutoScalingState, BlockedLaunch, GroupLaunch, GroupLaunchOutcome,
+    InstanceLifecycle, InstanceLifecycleChange, LaunchDestination, PendingCapacity,
+    LAUNCH_FAILED_SENTENCE, LIFECYCLE_TRANSITION, PROCESS_LAUNCH, UNPLACED_INSTANCE_MESSAGE,
 };
 
 /// The most instances ONE launch places.
@@ -245,6 +244,7 @@ impl AutoScalingState {
         let unplaced = launch.unplaced;
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
+        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
         let error_code = if launch.blocked.is_some() {
             LAUNCH_BLOCKED_CODE
         } else {
@@ -316,11 +316,11 @@ impl AutoScalingState {
                 },
             );
         }
-        for _ in 0..unplaced {
+        for description in unplaced_descriptions {
             self.record_failed_activity(
                 request.group_name,
                 &arn,
-                failed_launch_description(&unplaced_message),
+                description,
                 unplaced_message.clone(),
                 unplaced_status_code,
                 cause.clone(),

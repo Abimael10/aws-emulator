@@ -32,6 +32,8 @@ use ::service_com_amazonaws_ec2_amazonec2::ops::types::{
 };
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
+pub use ::service_com_amazonaws_ec2_amazonec2::state::VolumeKeyRefusal;
+
 use crate::ops::types::{LaunchTemplateSpecification, MixedInstancesPolicy, Tag};
 use crate::state::{ec2_subnets, StoredInstance, StoredLaunchConfiguration};
 
@@ -78,6 +80,10 @@ pub struct LaunchRequest<'a> {
     pub selects_by_requirements: bool,
     /// The group's tags; the ones marked `PropagateAtLaunch` go on the instances.
     pub tags: &'a [Tag],
+    /// The service-linked role the group makes the launch under, which is the principal the
+    /// authorities over the launch's own references are weighed for — the KMS key the volumes
+    /// it creates would be encrypted under ([`super::volume_encryption_keys`]).
+    pub service_linked_role_arn: &'a str,
 }
 
 /// One instance Amazon EC2 launched: its id, where EC2 placed it and what it runs.
@@ -1480,17 +1486,66 @@ pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
     }
     // The KMS key the volumes those instances boot would be encrypted under, resolved
     // against the account's own KMS records: a key that produces no data key produces no
-    // volume, so the instance Amazon EC2 launched is taken back before it ever reaches
-    // service and the capacity change ends CANCELLED
-    // ([`super::volume_encryption_keys`]). Amazon EC2's store is read and then KMS's, one
-    // after the other, neither while this service's own is held.
+    // volume — whether the key's own state refuses it or the authorities in force do not
+    // let the group's service-linked role use the key — so the instance Amazon EC2 launched
+    // is taken back before it ever reaches service and the capacity change ends CANCELLED
+    // ([`super::volume_encryption_keys`]). Amazon EC2's store is read, then IAM's, then
+    // KMS's, one after the other, none while this service's own is held.
+    //
+    // Amazon EC2 ACCEPTS such a launch — nothing about the request is wrong — so the attempt
+    // is one the launch MAKES and EC2 withdraws, which is why the reason carries that
+    // service's own refusal for the caller to perform it with
+    // ([`super::BlockedLaunch::cancelled_attempt`]).
     super::volume_encryption_keys::unusable_volume_key_launch_failure(
         engine,
         request.region,
+        request.service_linked_role_arn,
         request.launch_template,
         request.mixed_instances_policy,
     )
-    .map(super::BlockedLaunch::cancelled)
+    .map(|unusable| {
+        super::BlockedLaunch::cancelled_attempt(unusable.status_message, unusable.refusal)
+    })
+}
+
+/// Make the launch Amazon EC2 ACCEPTS and take the instances it minted back, because a volume
+/// each of them would boot cannot be created under the key it was to be encrypted under
+/// (`refusal`) — and answer the ids of the attempts, in launch order.
+///
+/// What Amazon EC2 does for such a launch: the instances exist, in the account's own store,
+/// where every instance of the account lives — an attempt a client can describe — and the
+/// clock owes each of them the shutdown instead of `running`, carrying the state reason that
+/// says why ([`ec2::ComAmazonawsEc2Amazonec2State::withdraw_launch_under_unusable_volume_key`],
+/// the ONE writer of that outcome, so an attempt this service made and one a client's own
+/// `RunInstances` made end the same way). The volumes that launch created go with them.
+///
+/// The attempts are NOT instances of the group: none of them ever reaches service, so the
+/// group reports none of them and the capacity it was asked for stays owed. Answers nothing
+/// for a launch of nothing, and nothing when the account's Amazon EC2 store could place
+/// nothing.
+pub fn withdraw_unusable_key_attempt<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+    refusal: &VolumeKeyRefusal,
+) -> Vec<String> {
+    let attempted: Vec<String> = launch(engine, request)
+        .into_iter()
+        .map(|instance| instance.instance_id)
+        .collect();
+    if attempted.is_empty() {
+        return attempted;
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        // Unreachable: a launch with no Amazon EC2 store behind it mints nothing, so there is
+        // nothing here to withdraw. Answered as the attempts that WERE made, so the ids this
+        // function reports and the instances it minted can never disagree.
+        return attempted;
+    };
+    let mut store = state.lock();
+    for instance_id in &attempted {
+        store.withdraw_launch_under_unusable_volume_key(instance_id, refusal);
+    }
+    attempted
 }
 
 /// What a launch whose source's `InstanceRequirements` admit no offered instance type

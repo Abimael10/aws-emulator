@@ -547,6 +547,31 @@ pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
 }
 
+/// The inner text of the first `<tag …>…</tag>` ELEMENT, whose open tag may carry attributes
+/// — so a member of a structure is read inside the element it belongs to rather than as "the
+/// first element of that name in the document".
+///
+/// THE ONE COPY for every suite here that has to scope a read to one element: the envelope
+/// stamps an `xmlns` on the elements a modelled structure renders, and an element whose name
+/// merely BEGINS with the tag (`<Activities>` against `<Activity`) is not that element, so the
+/// character after the name is what tells the two apart.
+pub fn element_body<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut rest = xml;
+    loop {
+        let start = rest.find(&open)?;
+        let after = &rest[start + open.len()..];
+        let boundary = after.chars().next()?;
+        if boundary == '>' || boundary.is_whitespace() {
+            let inner_start = after.find('>')? + 1;
+            let end = after.find(&close)?;
+            return Some(&after[inner_start..end]);
+        }
+        rest = after;
+    }
+}
+
 /// Each `<member>` of the list element `list` in one answer, as its own block.
 ///
 /// THE ONE COPY for every suite here that reads a LIST of structures back: scoped to that

@@ -356,6 +356,21 @@ pub use activity_records::{
 /// short, fixed span (chosen, not documented) and never sleeps for it.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
+/// How long a group waits before ATTEMPTING an owed launch again, once the attempt it made
+/// was one Amazon EC2 took back ([`StoredGroup::launch_retry_due`]).
+///
+/// A group maintains the capacity it is configured for, so a launch that placed nothing is
+/// attempted again — but an attempt of this kind is an instance Amazon EC2 creates and
+/// terminates, so it is owed at an INSTANT rather than made on every pass over the store.
+/// The span is CHOSEN, not an AWS-published figure: it is far above the transition spans this
+/// service owes, so a client reading the group sees one attempt rather than a stream of them,
+/// and far below the patience of a client that repairs the key and waits for the group to
+/// converge on its own. What the attempts of a group left pointing at a key that never becomes
+/// usable can accumulate to is bounded where those instances live: the account's Amazon EC2
+/// store caps how many instances it holds and charges each against its own byte budget, so a
+/// launch that cannot be made can no more fill this process's memory than one that can.
+pub const WITHDRAWN_LAUNCH_RETRY: Duration = Duration::from_secs(10);
+
 /// `DefaultCooldown` when the request omits it.
 ///
 /// From the model's own documentation for `CreateAutoScalingGroup$DefaultCooldown`:
@@ -571,6 +586,12 @@ pub struct BlockedLaunch {
     pub status_message: String,
     /// The terminal status code the activity ends in.
     pub status_code: &'static str,
+    /// Set for a launch Amazon EC2 ACCEPTS and then takes back: what the service that owns
+    /// the volume's key said about it, which is the record Amazon EC2 keeps on the attempt it
+    /// withdraws ([`ec2_instances::withdraw_unusable_key_attempt`]). Such a launch is MADE —
+    /// the attempt is an instance of the account, terminated under Amazon EC2's own reason —
+    /// while a reason carrying none is a launch no attempt was ever made for.
+    pub withdrawn_attempt: Option<ec2_instances::VolumeKeyRefusal>,
 }
 
 impl BlockedLaunch {
@@ -582,17 +603,34 @@ impl BlockedLaunch {
         Self {
             status_message,
             status_code: ACTIVITY_FAILED,
+            withdrawn_attempt: None,
         }
     }
 
     /// A launch Amazon EC2 did not carry out: the launch source it would have run resolves to
-    /// nothing there, or the instance it launched would never reach service and is taken back
-    /// — either way the capacity change ends CANCELLED.
+    /// nothing there, so no attempt was made at all — and the capacity change ends CANCELLED.
     #[must_use]
     pub fn cancelled(status_message: String) -> Self {
         Self {
             status_message,
             status_code: ACTIVITY_CANCELLED,
+            withdrawn_attempt: None,
+        }
+    }
+
+    /// A launch Amazon EC2 ACCEPTED and then took back: the instance it launched cannot come
+    /// into service — a volume it boots cannot be created under the key it was to be
+    /// encrypted under — so the attempt is withdrawn under that service's own state reason
+    /// (`refusal`) and the capacity change ends CANCELLED, carrying why.
+    #[must_use]
+    pub fn cancelled_attempt(
+        status_message: String,
+        refusal: ec2_instances::VolumeKeyRefusal,
+    ) -> Self {
+        Self {
+            status_message,
+            status_code: ACTIVITY_CANCELLED,
+            withdrawn_attempt: Some(refusal),
         }
     }
 }
@@ -1079,6 +1117,16 @@ pub struct StoredGroup {
     /// one a launch lifecycle hook abandoned, say — leaves no mark and is not relaunched
     /// here: that is the business of whatever took it out.
     pub owes_launch: bool,
+    /// When the group may ATTEMPT an owed launch again, or `None` when nothing holds it back.
+    ///
+    /// Set by the one launch path a group's own instances come from, for the launches Amazon
+    /// EC2 accepts and then takes the instance back from
+    /// ([`ec2_instances::withdraw_unusable_key_attempt`]): each of those attempts creates and
+    /// terminates an instance of the account, so the next one is owed at an INSTANT
+    /// ([`WITHDRAWN_LAUNCH_RETRY`]) rather than made on every pass over the store. Cleared
+    /// with [`Self::owes_launch`], and never consulted by a capacity change a CALLER asked
+    /// for: a client that repairs the key and asks for the capacity again is served at once.
+    pub launch_retry_due: Option<SystemTime>,
     /// The group's lifecycle hooks, keyed by `LifecycleHookName`: the ONE collection
     /// every reader and writer of a hook of this group reaches
     /// ([`lifecycle_hooks`]), so deleting the group takes its hooks with it.
@@ -2320,7 +2368,7 @@ impl AutoScalingState {
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced = launch.unplaced;
+        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
 
         let group = self
             .groups
@@ -2389,11 +2437,11 @@ impl AutoScalingState {
                 },
             );
         }
-        for _ in 0..unplaced {
+        for description in unplaced_descriptions {
             self.record_failed_activity(
                 group_name,
                 &arn,
-                failed_launch_description(&unplaced_message),
+                description,
                 unplaced_message.clone(),
                 unplaced_status_code,
                 cause.to_string(),
@@ -2436,6 +2484,9 @@ impl AutoScalingState {
         for group in self.groups.values_mut() {
             if group.owes_launch && group.launches_needed(group.desired_capacity) <= 0 {
                 group.owes_launch = false;
+                // Nothing is owed, so nothing is waiting for the instant the next attempt
+                // was owed at either.
+                group.launch_retry_due = None;
             }
         }
         // What each group is owed, read before anything is launched so no group is borrowed
@@ -2448,6 +2499,9 @@ impl AutoScalingState {
                     && group.pending_capacity.is_none()
                     && !group.availability_zones.is_empty()
                     && !group.is_process_suspended(PROCESS_LAUNCH)
+                    // A group whose last attempt Amazon EC2 took back tries again when that
+                    // attempt is DUE, not on every pass ([`StoredGroup::launch_retry_due`]).
+                    && group.launch_retry_due.is_none_or(|due| due <= now)
             })
             .filter_map(|group| {
                 // The same shortfall a capacity change launches, bounded the same way
@@ -2680,6 +2734,11 @@ impl AutoScalingState {
         if request.destination == LaunchDestination::Group && request.count > 0 {
             if let Some(group) = self.groups.get_mut(request.group_name) {
                 group.owes_launch = outcome.unplaced > 0;
+                if !group.owes_launch {
+                    // A launch that placed everything owes no further attempt, so nothing is
+                    // waiting for the instant the next one was owed at.
+                    group.launch_retry_due = None;
+                }
             }
         }
         outcome
@@ -2714,6 +2773,9 @@ impl AutoScalingState {
             }
         }
         let region = group.region.clone();
+        // The role the group makes this launch under, which is the principal the authorities
+        // over what the launch references are weighed for ([`volume_encryption_keys`]).
+        let service_linked_role_arn = group.service_linked_role_arn.clone();
         // Where the instances go: the placement the CALLER named, when a launch request
         // named one of the group's own ([`requested_launches`]), and otherwise the whole of
         // the group's configuration — which is what every launch the group makes for itself
@@ -2786,6 +2848,7 @@ impl AutoScalingState {
             selected_instance_type: selected_instance_type.as_deref(),
             selects_by_requirements,
             tags: &tags,
+            service_linked_role_arn: &service_linked_role_arn,
         };
         // A launch is made only from a configuration that CAN produce an instance, asked
         // at the instant of the launch rather than when the group was configured: a group
@@ -2796,7 +2859,36 @@ impl AutoScalingState {
         // ([`ec2_instances::launch_failure_reason`]).
         if wanted > 0 {
             if let Some(blocked) = ec2_instances::launch_failure_reason(engine, &launch_request) {
-                return GroupLaunchOutcome::unplaced(request.count, Some(blocked));
+                // A reason Amazon EC2 ACCEPTS the launch for and then withdraws the instance
+                // for is a launch that WAS made: the attempt is minted where every instance
+                // of the account lives and taken back there, under that service's own state
+                // reason ([`ec2_instances::withdraw_unusable_key_attempt`]), so a client
+                // watching Amazon EC2 sees the instance it would have got terminated with the
+                // reason it was terminated for. None of them is an instance of the group:
+                // they never reach service, so the group reports none and the capacity stays
+                // owed.
+                let Some(refusal) = blocked.withdrawn_attempt.clone() else {
+                    return GroupLaunchOutcome::unplaced(request.count, Some(blocked));
+                };
+                // Each of those attempts is an instance Amazon EC2 creates and terminates, so
+                // the group makes one when the next one is DUE rather than on every pass over
+                // the store ([`StoredGroup::launch_retry_due`]): a launch the clock asks for
+                // while the previous attempt is still the current one places nothing and
+                // records the same reason, without creating a second instance for it.
+                if self
+                    .groups
+                    .get(request.group_name)
+                    .and_then(|group| group.launch_retry_due)
+                    .is_some_and(|due| due > request.launched_at)
+                {
+                    return GroupLaunchOutcome::unplaced(request.count, Some(blocked));
+                }
+                let withdrawn =
+                    ec2_instances::withdraw_unusable_key_attempt(engine, &launch_request, &refusal);
+                if let Some(group) = self.groups.get_mut(request.group_name) {
+                    group.launch_retry_due = Some(request.launched_at + WITHDRAWN_LAUNCH_RETRY);
+                }
+                return GroupLaunchOutcome::withdrawn(request.count, blocked, withdrawn);
             }
         }
         let launched = ec2_instances::launch(engine, &launch_request);
@@ -2890,6 +2982,10 @@ impl AutoScalingState {
         GroupLaunchOutcome {
             launched_ids,
             unplaced,
+            // Nothing was withdrawn: this launch placed what Amazon EC2 gave it, and a unit
+            // it did not place is one the account had no room for rather than an attempt
+            // that was taken back.
+            withdrawn_ids: Vec::new(),
             blocked: None,
         }
     }
@@ -3252,7 +3348,7 @@ impl AutoScalingState {
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
         let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced = launch.unplaced;
+        let unplaced_descriptions = launch.unplaced_descriptions(&unplaced_message);
         let replaced = if launched_ids.is_empty() {
             Vec::new()
         } else {
@@ -3288,11 +3384,11 @@ impl AutoScalingState {
                 },
             );
         }
-        for _ in 0..unplaced {
+        for description in unplaced_descriptions {
             self.record_failed_activity(
                 group_name,
                 &arn,
-                failed_launch_description(&unplaced_message),
+                description,
                 unplaced_message.clone(),
                 unplaced_status_code,
                 cause.to_string(),
@@ -3364,6 +3460,11 @@ struct GroupLaunchOutcome {
     launched_ids: Vec<String>,
     /// How many of the instances asked for were not placed.
     unplaced: usize,
+    /// The ids of the attempts Amazon EC2 ACCEPTED and took back, in launch order: a launch
+    /// blocked for a reason Amazon EC2 withdraws the instance for leaves one attempt per unit
+    /// of capacity it could not place ([`BlockedLaunch::cancelled_attempt`]). Empty for every
+    /// launch no attempt was made for.
+    withdrawn_ids: Vec<String>,
     /// The reason each unplaced unit's terminal activity records, and the code it ends in,
     /// when something about the group stopped the launch outright.
     blocked: Option<BlockedLaunch>,
@@ -3375,11 +3476,23 @@ impl GroupLaunchOutcome {
         Self {
             launched_ids: Vec::new(),
             unplaced: count,
+            withdrawn_ids: Vec::new(),
             blocked,
         }
     }
 
-    /// What the activity of each unplaced unit of this launch records: the reason
+    /// A launch that placed nothing because Amazon EC2 took back every attempt it made:
+    /// `withdrawn_ids` are those attempts, which the activity of each unplaced unit names.
+    fn withdrawn(count: usize, blocked: BlockedLaunch, withdrawn_ids: Vec<String>) -> Self {
+        Self {
+            launched_ids: Vec::new(),
+            unplaced: count,
+            withdrawn_ids,
+            blocked: Some(blocked),
+        }
+    }
+
+    /// What the activity of each unplaced unit records: the reason
     /// the launch itself carries, or `account` — what an account that could not place the
     /// instance records — when it carries none.
     fn unplaced_message(&self, account: &str) -> String {
@@ -3395,6 +3508,20 @@ impl GroupLaunchOutcome {
         self.blocked
             .as_ref()
             .map_or(ACTIVITY_FAILED, |blocked| blocked.status_code)
+    }
+
+    /// What the activity of each unplaced unit DESCRIBES, one per unit: the instance of the
+    /// attempt where Amazon EC2 made one and took it back — the launch was made, so the
+    /// activity names the instance it launched, exactly as a launch that carried through does
+    /// ([`InstanceLifecycle::description`]) — and the reason the launch was not made where no
+    /// attempt was made at all ([`failed_launch_description`]).
+    fn unplaced_descriptions(&self, message: &str) -> Vec<String> {
+        (0..self.unplaced)
+            .map(|index| match self.withdrawn_ids.get(index) {
+                Some(instance_id) => InstanceLifecycle::Launched.description(instance_id),
+                None => failed_launch_description(message),
+            })
+            .collect()
     }
 }
 
