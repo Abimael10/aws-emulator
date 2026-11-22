@@ -249,21 +249,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You provide an event object that represents an HTTP request or response that your
         // CloudFront distribution could receive in production", and the function is handed
         // THAT object: it is the argument of the call, so a payload that is not a JSON object
-        // describes no event CloudFront could pass to a function, and is refused with the
-        // modelled `InvalidArgument` rather than run. The sentence the caller is served is
-        // the FIXED one for the condition — the parser's own account of where the document
-        // stopped is a detail of this emulator, so it is logged rather than put on the wire.
+        // describes no event CloudFront could pass to a function. The test therefore cannot be
+        // CARRIED OUT — there is no run to report — and that is the modelled server-side test
+        // failure rather than argument validation: the caller's request is well formed, and it
+        // is the test that produced no result. The sentence served is the FIXED one that error
+        // carries; this emulator's own account of why the payload is unusable (the parser's,
+        // or the kind of JSON it holds) is logged rather than put on the wire.
         let event = match ::serde_json::from_slice::<::serde_json::Value>(&input.event_object) {
             Ok(event @ ::serde_json::Value::Object(_)) => event.to_string(),
-            Ok(_) => return Err(invalid_argument(NOT_AN_EVENT_OBJECT).into()),
-            Err(error) => {
-                ::tracing::debug!(
-                    operation = Self::NAME,
-                    detail = %error,
-                    "the event object a function test carried is not JSON",
-                );
-                return Err(invalid_argument(NOT_JSON).into());
-            }
+            Ok(_) => return Err(unrunnable_event_object(NOT_AN_EVENT_OBJECT)),
+            Err(error) => return Err(unrunnable_event_object(error)),
         };
 
         // The run itself: the code the store holds, over that event object, under every bound
@@ -289,8 +284,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let reported = match run.outcome.reported() {
             Ok(reported) => reported,
             // The run did not happen at all, so there is no result to report and nothing is
-            // known about the code: "The CloudFront function failed" is what the service
-            // answers for a test it could not carry out.
+            // known about the code: the test produced no result, which is the modelled
+            // server-side test failure, served with that error's own fixed sentence.
             Err(reason) => {
                 ::tracing::warn!(
                     detail = %reason,
@@ -323,12 +318,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `InvalidArgument` ("An argument is invalid") for an event object this
-/// operation refuses, carrying `reason`.
-fn invalid_argument(reason: impl ::std::fmt::Display) -> TestFunctionErrorModeled {
-    TestFunctionErrorModeled::InvalidArgument(InvalidArgument {
-        message: Some(format!("An argument is invalid: {reason}")),
+/// The modelled `TestFunctionFailed` for an event object the function cannot be run against,
+/// logging `reason` — what this emulator found wrong with the payload, which is a detail of
+/// this engine and is not part of the fixed sentence the error carries.
+fn unrunnable_event_object(reason: impl ::std::fmt::Display) -> TestFunctionError {
+    ::tracing::debug!(
+        operation = "TestFunction",
+        detail = %reason,
+        "the event object a function test carried describes no event a function can be passed",
+    );
+    TestFunctionErrorModeled::TestFunctionFailed(TestFunctionFailed {
+        message: Some(TEST_FUNCTION_FAILED_MESSAGE.to_string()),
     })
+    .into()
 }
 
 /// What a run came to, in one word, for the record of the call: the outcome's kind and
@@ -342,16 +344,15 @@ fn outcome_kind(outcome: &crate::state::FunctionOutcome) -> &'static str {
     }
 }
 
-/// The reason an event object that is valid JSON but not a JSON OBJECT is refused: an event
-/// is an object with the request or response the function is handed.
+/// The reason, logged and never served, that an event object which is valid JSON but not a
+/// JSON OBJECT cannot be run against: an event is an object with the request or response the
+/// function is handed.
 const NOT_AN_EVENT_OBJECT: &str =
     "the event object is not a JSON object, so it describes no event a function can be \
      passed";
 
-/// The reason an event object that is not JSON at all is refused.
-const NOT_JSON: &str = "the event object is not valid JSON";
-
-/// `TestFunctionFailed`'s message: the sentence the model states for the condition ("The
-/// CloudFront function failed."), served for a test this emulator could not carry out at
-/// all. It names no run of its own, because nothing about the code was learned.
-const TEST_FUNCTION_FAILED_MESSAGE: &str = "The CloudFront function failed.";
+/// `TestFunctionFailed`'s message: the one FIXED sentence that error carries, served for
+/// every test this service could not carry out — a run that did not happen at all, and an
+/// event object no function can be run against. It names no run and no value of its own,
+/// because the test produced no result to report.
+const TEST_FUNCTION_FAILED_MESSAGE: &str = "The test returned an unexpected result.";

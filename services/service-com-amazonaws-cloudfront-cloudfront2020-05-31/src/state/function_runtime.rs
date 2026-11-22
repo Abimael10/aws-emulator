@@ -243,13 +243,28 @@ impl ReportedRun {
     }
 
     /// A run that failed with `message`, and so produced no event object of its own.
+    ///
+    /// The reported message is the service's FIXED sentence for a function that could not be
+    /// run as it stands ([`FUNCTION_FAILED_SENTENCE`]) followed by `message`, the account the
+    /// runtime gave of the failure: the sentence says WHAT failed, which is the same for every
+    /// failure of every function, and the variable part says how.
     fn failed(message: String) -> Self {
         Self {
             output: EMPTY_EVENT_OBJECT.to_string(),
-            error_message: message,
+            error_message: format!("{FUNCTION_FAILED_SENTENCE}{message}"),
         }
     }
 }
+
+/// The fixed part of the error message a function test reports for a run that FAILED: the
+/// sentence identifying the function as one that is invalid or could not run, which every
+/// such message opens with, and which the message the runtime gave is appended to.
+///
+/// It names no function, no run and no value, because it is the whole fixed text: everything
+/// about the particular failure is in the variable part that follows it.
+pub const FUNCTION_FAILED_SENTENCE: &str =
+    "The CloudFront function associated with the CloudFront distribution is invalid or could \
+     not run. Error: ";
 
 /// The event object a run that produced none is reported with: the empty JSON object
 /// document.
@@ -891,13 +906,16 @@ fn returned_output(text: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
-/// The message a raise carries: the error as the ENGINE renders it.
+/// The message a raise carries: the account the ENGINE gives of what was raised.
 ///
 /// A JavaScript error stringifies as its NAME and its message joined by `": "`
 /// (`Error.prototype.toString`), and the name is what tells a caller which KIND of failure
 /// the run had — a `SyntaxError` from code that does not parse is a different answer from an
-/// `Error` the code threw itself — so both halves are reported, each worded by the engine.
-/// An error carrying only one of them is reported as that one, and a thrown value that is no
+/// error the code threw itself — so the name is reported beside the message WHERE IT NAMES
+/// that kind. The name [`GENERIC_ERROR_NAME`] names none: it is the label the sentence every
+/// reported failure opens with already ends in ([`FUNCTION_FAILED_SENTENCE`]), so an error
+/// carrying it contributes only its message and the label is not said twice. An error
+/// carrying only one of the two halves is reported as that one, and a raised value that is no
 /// error object at all as the engine renders that value.
 fn raised_message(caught: &::rquickjs::CaughtError<'_>) -> String {
     match caught {
@@ -912,12 +930,19 @@ fn raised_message(caught: &::rquickjs::CaughtError<'_>) -> String {
                 ("", "") => exception.to_string(),
                 ("", message) => message.to_string(),
                 (name, "") => name.to_string(),
+                (GENERIC_ERROR_NAME, message) => message.to_string(),
                 (name, message) => format!("{name}: {message}"),
             }
         }
         other => other.to_string(),
     }
 }
+
+/// The name a JavaScript error carries when it names no KIND of failure — the base `Error`
+/// constructor's own name, which is also the label [`FUNCTION_FAILED_SENTENCE`] ends in. A
+/// failure reported under this name is reported by its message alone, so the label the
+/// sentence already states is not repeated inside the variable part.
+const GENERIC_ERROR_NAME: &str = "Error";
 
 /// The error message reported for code that is not text at all, so no engine can read it.
 const NOT_TEXT: &str = "The function code is not valid UTF-8 text, so it cannot be compiled.";
@@ -1029,25 +1054,38 @@ const CONSOLE_SOURCE: &str = r#"
 /// code that rebinds either cannot change how its own answer is rendered. A handler that
 /// returned a promise reports through the same channel when that promise settles.
 ///
-/// A raise is described the way the ENGINE renders the value that was raised (`String(error)`,
-/// which for an error object is its name and its message joined by `": "`), so the kind of
-/// failure reaches the caller beside its wording; a value whose conversion itself fails falls
-/// back to its `message` and then to one fixed sentence.
+/// A raise is described by the account the error itself carries: its `message`, preceded by
+/// its `name` only where that name names the KIND of failure, so the kind reaches the caller
+/// beside its wording while the generic error label is not repeated inside the variable part
+/// of a reported message ([`FUNCTION_FAILED_SENTENCE`], [`GENERIC_ERROR_NAME`]). A raised
+/// value that is no error object is described as the engine renders it (`String(value)`), and
+/// a value whose conversion itself fails by one fixed sentence.
 const INVOKER_SOURCE: &str = r#"
 (function () {
     const stringify = JSON.stringify;
     const toText = String;
+    const genericName = toText(Error.prototype.name);
     const described = function (error) {
+        try {
+            const held = error === null || error === undefined;
+            const name = held ? null : error.name;
+            const message = held ? null : error.message;
+            const named = name === undefined || name === null ? "" : toText(name);
+            const said = message === undefined || message === null ? "" : toText(message);
+            if (said.length > 0) {
+                if (named.length > 0 && named !== genericName) {
+                    return named + ": " + said;
+                }
+                return said;
+            }
+            if (named.length > 0) {
+                return named;
+            }
+        } catch (ignored) { }
         try {
             const text = toText(error);
             if (text !== undefined && text !== null && text.length > 0) {
                 return text;
-            }
-        } catch (ignored) { }
-        try {
-            const message = error === null || error === undefined ? null : error.message;
-            if (message !== undefined && message !== null && toText(message).length > 0) {
-                return toText(message);
             }
         } catch (ignored) { }
         return "The function raised a value that cannot be read.";

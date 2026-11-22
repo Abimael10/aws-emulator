@@ -16,7 +16,8 @@
 //! * a result that is served at all reports BOTH halves of the run: `FunctionOutput` is
 //!   present on every 200 and carries the empty JSON object for a run that returned none, and
 //!   `FunctionErrorMessage` is present on every 200 and carries the EMPTY STRING for a run
-//!   that reported no error;
+//!   that reported no error, and for a run that FAILED the service's fixed sentence for a
+//!   function that is invalid or could not run followed by what the runtime reported;
 //! * the code that runs is the one the STAGE the request names holds: a request naming no
 //!   stage tests `DEVELOPMENT`, `LIVE` runs what a publish copied there, and a stage no
 //!   stored function has is "The function does not exist" (`NoSuchFunctionExists`, HTTP 404);
@@ -25,7 +26,8 @@
 //!   at all is `InvalidIfMatchVersion` (HTTP 400), and a well-formed token that is not that
 //!   stage's current one is the failed precondition (`PreconditionFailed`, HTTP 412);
 //! * an event object that is no JSON object describes no event a function can be passed, so
-//!   it is refused with `InvalidArgument` (HTTP 400) and nothing runs;
+//!   the test cannot be carried out and is answered with the modelled server-side test
+//!   failure (`TestFunctionFailed`, HTTP 500) and nothing runs;
 //! * a test REPORTS, so it persists nothing: the function, its version tokens and its code
 //!   stand exactly as they did before it.
 //!
@@ -716,10 +718,10 @@ async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
 }
 
 /// "You provide an event object that represents an HTTP request or response": a payload that
-/// is no JSON object describes no such event, so it is refused as an invalid argument and
-/// nothing runs.
+/// is no JSON object describes no such event, so the test cannot be carried out — the
+/// modelled server-side test failure (`TestFunctionFailed`, HTTP 500) — and nothing runs.
 #[tokio::test]
-async fn an_event_object_that_is_no_json_object_is_refused() {
+async fn an_event_object_that_is_no_json_object_fails_the_test() {
     let router = emulator();
     let name = "event_object_shape";
     let etag = create_one(
@@ -741,14 +743,14 @@ async fn an_event_object_that_is_no_json_object_is_refused() {
     ] {
         let answer = test_function(&router, name, None, event, &etag).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, 500,
+            "case {case}: expected HTTP 500, got {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case {case}: expected InvalidArgument, got {}",
+            "TestFunctionFailed",
+            "case {case}: expected TestFunctionFailed, got {}",
             answer.raw
         );
     }

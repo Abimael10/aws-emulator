@@ -231,22 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The connection object" is the connection the code is run over: the service puts
         // it in scope for that code, so a payload that is not a JSON object describes no
-        // connection a connection function can decide about, and is refused with the modelled
-        // `InvalidArgument` rather than run. The sentence the caller is served is the FIXED
-        // one for the condition — the parser's own account of where the document stopped is a
-        // detail of this emulator, so it is logged rather than put on the wire.
+        // connection a connection function can decide about. The test therefore cannot be
+        // CARRIED OUT — there is no run to report — and that is the modelled server-side test
+        // failure rather than argument validation. The sentence served is the FIXED one that
+        // error carries; this emulator's own account of why the payload is unusable is logged
+        // rather than put on the wire.
         let connection_object =
             match ::serde_json::from_slice::<::serde_json::Value>(&input.connection_object) {
                 Ok(object @ ::serde_json::Value::Object(_)) => object.to_string(),
-                Ok(_) => return Err(invalid_argument(NOT_A_CONNECTION_OBJECT).into()),
-                Err(error) => {
-                    ::tracing::debug!(
-                        operation = Self::NAME,
-                        detail = %error,
-                        "the connection object a connection function test carried is not JSON",
-                    );
-                    return Err(invalid_argument(NOT_JSON).into());
-                }
+                Ok(_) => return Err(unrunnable_connection_object(NOT_A_CONNECTION_OBJECT)),
+                Err(error) => return Err(unrunnable_connection_object(error)),
             };
 
         // The run itself: the code the store holds, over that connection object, under every
@@ -274,8 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let reported = match run.outcome.reported() {
             Ok(reported) => reported,
             // The run did not happen at all, so there is no result to report and nothing is
-            // known about the code: "The CloudFront function failed" is what the service
-            // answers for a test it could not carry out.
+            // known about the code: the test produced no result, which is the modelled
+            // server-side test failure, served with that error's own fixed sentence.
             Err(reason) => {
                 ::tracing::warn!(
                     detail = %reason,
@@ -313,12 +307,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `InvalidArgument` ("An argument is invalid") for a connection object this
-/// operation refuses, carrying `reason`.
-fn invalid_argument(reason: impl ::std::fmt::Display) -> TestConnectionFunctionErrorModeled {
-    TestConnectionFunctionErrorModeled::InvalidArgument(InvalidArgument {
-        message: Some(format!("An argument is invalid: {reason}")),
+/// The modelled `TestFunctionFailed` for a connection object the function cannot be run
+/// over, logging `reason` — what this emulator found wrong with the payload, which is a
+/// detail of this engine and is not part of the fixed sentence the error carries.
+fn unrunnable_connection_object(
+    reason: impl ::std::fmt::Display,
+) -> TestConnectionFunctionError {
+    ::tracing::debug!(
+        operation = "TestConnectionFunction",
+        detail = %reason,
+        "the connection object a connection function test carried describes no connection a \
+         connection function can be passed",
+    );
+    TestConnectionFunctionErrorModeled::TestFunctionFailed(TestFunctionFailed {
+        message: Some(TEST_FUNCTION_FAILED_MESSAGE.to_string()),
     })
+    .into()
 }
 
 /// What a run came to, in one word, for the record of the call: the outcome's kind and
@@ -332,16 +336,14 @@ fn outcome_kind(outcome: &crate::state::FunctionOutcome) -> &'static str {
     }
 }
 
-/// The reason a connection object that is valid JSON but not a JSON OBJECT is refused: the
-/// object is what the function is called with.
+/// The reason, logged and never served, that a connection object which is valid JSON but not
+/// a JSON OBJECT cannot be run over: the object is what the function is called with.
 const NOT_A_CONNECTION_OBJECT: &str =
     "the connection object is not a JSON object, so it describes no connection a connection \
      function can be passed";
 
-/// The reason a connection object that is not JSON at all is refused.
-const NOT_JSON: &str = "the connection object is not valid JSON";
-
-/// `TestFunctionFailed`'s message: the sentence the model states for the condition ("The
-/// CloudFront function failed."), served for a test this emulator could not carry out at
-/// all. It names no run of its own, because nothing about the code was learned.
-const TEST_FUNCTION_FAILED_MESSAGE: &str = "The CloudFront function failed.";
+/// `TestFunctionFailed`'s message: the one FIXED sentence that error carries, served for
+/// every test this service could not carry out — a run that did not happen at all, and a
+/// connection object no function can be run over. It names no run and no value of its own,
+/// because the test produced no result to report.
+const TEST_FUNCTION_FAILED_MESSAGE: &str = "The test returned an unexpected result.";

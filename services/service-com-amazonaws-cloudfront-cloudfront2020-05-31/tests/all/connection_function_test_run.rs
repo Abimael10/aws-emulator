@@ -33,7 +33,8 @@
 //!   is not that stage's current one is a failed precondition (`PreconditionFailed`,
 //!   HTTP 412);
 //! * a connection object that is no JSON object describes no connection a function can be
-//!   handed, so it is refused (`InvalidArgument`, HTTP 400) and nothing runs;
+//!   handed, so the test cannot be carried out (`TestFunctionFailed`, HTTP 500) and nothing
+//!   runs;
 //! * a test REPORTS, so it persists nothing: the connection function, its version tokens and
 //!   its code stand exactly as they did before it.
 //!
@@ -807,10 +808,11 @@ async fn a_test_needs_the_current_version_of_the_stage_it_runs() {
 }
 
 /// "The connection object" is what the function is handed, so a payload that is no JSON
-/// object describes no connection a function can be passed: it is refused as an invalid
-/// argument and nothing runs.
+/// object describes no connection a function can be passed: the test cannot be carried out,
+/// which is the modelled server-side test failure (`TestFunctionFailed`, HTTP 500), and
+/// nothing runs.
 #[tokio::test]
-async fn a_connection_object_that_is_no_json_object_is_refused() {
+async fn a_connection_object_that_is_no_json_object_fails_the_test() {
     let router = emulator();
     let created = create_one(
         &router,
@@ -832,14 +834,14 @@ async fn a_connection_object_that_is_no_json_object_is_refused() {
         let answer =
             test_connection_function(&router, &created.id, None, object, &created.etag).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, 500,
+            "case {case}: expected HTTP 500, got {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case {case}: expected InvalidArgument, got {}",
+            "TestFunctionFailed",
+            "case {case}: expected TestFunctionFailed, got {}",
             answer.raw
         );
     }
