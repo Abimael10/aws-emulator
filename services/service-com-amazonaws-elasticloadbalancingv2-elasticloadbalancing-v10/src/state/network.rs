@@ -246,6 +246,17 @@ impl NetworkRefusal {
             ::service_common::query_error_envelope::new_request_id()
         )
     }
+
+    /// Whether this is the fault EC2 answers for a value that is not a security group id at
+    /// all, rather than for an id the account holds no group under.
+    ///
+    /// The two say different things about the request — one value could name no group in ANY
+    /// account, the other names one this account does not hold — and Elastic Load Balancing
+    /// answers them under different error codes, so the caller that states the refusal asks
+    /// which it ran into ([`super::check_security_groups`]).
+    pub fn names_no_security_group_id(&self) -> bool {
+        self.code == GROUP_ID_MALFORMED
+    }
 }
 
 /// How Amazon EC2 names ITSELF in the fault clause an SDK renders around a call made to it,

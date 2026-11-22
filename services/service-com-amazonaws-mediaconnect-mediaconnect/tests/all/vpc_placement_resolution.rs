@@ -66,6 +66,27 @@ const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 /// The EC2 error code for an identifier the account holds no security group for.
 const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
+/// The EC2 error code for a value that is not a security group id AT ALL, which EC2 refuses
+/// a read for before it looks the value up: no group of any account carries it.
+const INVALID_GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
+
+/// Which of the two EC2 answers a value naming no security group of the account earns.
+///
+/// EC2 mints a group id as `sg-` followed by 8 or 17 hexadecimal digits: a value of that form
+/// the account holds no group under is reported ABSENT, while a value outside it names no
+/// group in any account and the read is refused as MALFORMED. The refusal MediaConnect states
+/// relays whichever of the two EC2 answered, so each row expects the one its value earns.
+fn group_refusal_code(value: &str) -> &'static str {
+    let is_group_id = value.strip_prefix("sg-").is_some_and(|suffix| {
+        matches!(suffix.len(), 8 | 17) && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    if is_group_id {
+        INVALID_GROUP_NOT_FOUND
+    } else {
+        INVALID_GROUP_ID_MALFORMED
+    }
+}
+
 /// The member path a refusal about a router network interface's subnet names.
 const SUBNET_MEMBER: &str = "Configuration.Vpc.SubnetId";
 
@@ -344,12 +365,13 @@ async fn a_router_network_interface_placement_is_resolved_against_ec2_before_it_
         ));
     }
     for (form, unknown) in unresolvable_forms("sg") {
+        let answered = group_refusal_code(&unknown);
         rows.push((
             format!("the only security group EC2 does not hold, in {form}"),
             vpc_configuration(&home.subnet_ids[0], ::std::slice::from_ref(&unknown)),
             None,
             GROUP_MEMBER,
-            INVALID_GROUP_NOT_FOUND,
+            answered,
         ));
         rows.push((
             format!("the LAST of three security groups EC2 does not hold, in {form}"),
@@ -363,7 +385,7 @@ async fn a_router_network_interface_placement_is_resolved_against_ec2_before_it_
             ),
             None,
             GROUP_MEMBER,
-            INVALID_GROUP_NOT_FOUND,
+            answered,
         ));
         rows.push((
             format!("the FIRST of two security groups EC2 does not hold, in {form}"),
@@ -373,7 +395,7 @@ async fn a_router_network_interface_placement_is_resolved_against_ec2_before_it_
             ),
             None,
             GROUP_MEMBER,
-            INVALID_GROUP_NOT_FOUND,
+            answered,
         ));
     }
     // Ids of the WRONG KIND that EC2 really minted: neither member carries a modelled
@@ -391,7 +413,7 @@ async fn a_router_network_interface_placement_is_resolved_against_ec2_before_it_
         vpc_configuration(&home.subnet_ids[0], &[home.subnet_ids[0].clone()]),
         None,
         GROUP_MEMBER,
-        INVALID_GROUP_NOT_FOUND,
+        group_refusal_code(&home.subnet_ids[0]),
     ));
     // The Region the placement is resolved in is the Region the interface is placed in: this
     // account's own subnet, named for a Region whose network does not hold it.

@@ -61,8 +61,12 @@ const INVALID_VPC_ID: &str = "InvalidVpcID.";
 /// The same for a subnet identifier.
 const INVALID_SUBNET_ID: &str = "InvalidSubnetID.";
 
-/// The same for a security group identifier.
-const INVALID_GROUP: &str = "InvalidGroup.";
+/// The same for a security group identifier, which Amazon EC2 spells under TWO names —
+/// `InvalidGroup.NotFound` for an identifier no group of the account carries, and
+/// `InvalidGroupId.Malformed` for a value that is no group id at all — so the prefix stops
+/// before the one letter that differs. Both say the same thing about a member: the value
+/// resolves to no security group.
+const INVALID_GROUP: &str = "InvalidGroup";
 
 /// The service principal an EMR Studio's `ServiceRole` has to trust: the Studio "assumes"
 /// that role (`CreateStudio$ServiceRole` doc), and what assumes it is Amazon EMR, so the

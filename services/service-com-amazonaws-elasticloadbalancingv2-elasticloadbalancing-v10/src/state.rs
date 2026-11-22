@@ -1952,7 +1952,8 @@ pub fn check_subnet_vpcs(
 pub enum SecurityGroupRefusal {
     /// The request named a value that is not a security group id at all, so no security
     /// group exists under it in any account: the modelled "the specified security group
-    /// does not exist", stated in the words [`SECURITY_GROUP_NOT_FOUND`] carries.
+    /// does not exist", stated in the words
+    /// [`security_group_not_found_message`] gives the answer that was read.
     NotFound,
     /// The groups the request named cannot govern THIS load balancer's traffic: one of them
     /// is a group id this account holds no group for, or one that governs traffic in
@@ -1970,10 +1971,15 @@ pub enum SecurityGroupRefusal {
 /// rather than anything about one value: no one of them is more at fault than another.
 pub const INVALID_SECURITY_GROUPS: &str = "One or more security groups are invalid";
 
-/// What the modelled refusal for a value that names no security group at all states, which
-/// is the sentence the model itself gives `InvalidSecurityGroupException`
+/// What the modelled refusal for a value that names no security group at all states when
+/// there was no EC2 to ask, which is the sentence the model itself gives
+/// `InvalidSecurityGroupException`
 /// (`smithy_query(query="shape",shape="InvalidSecurityGroupException")`). It names no
 /// value, because a request may carry several and none of them is more at fault.
+///
+/// A read EC2 REFUSED states the fault it answered instead
+/// ([`security_group_not_found_message`]): it names the value at fault, which this sentence
+/// cannot.
 pub const SECURITY_GROUP_NOT_FOUND: &str = "The specified security group does not exist";
 
 /// The prefix of a security group id, from EC2's own ids.
@@ -2026,6 +2032,14 @@ pub fn check_security_groups(
         return Err(SecurityGroupRefusal::NotFound);
     }
     match lookup {
+        // WHICH fault EC2 answered decides the class: a value that is no group id at all
+        // names no group in any account, while an id the account simply holds no group
+        // under is a group this load balancer cannot be given.
+        network::SecurityGroupLookup::Absent(refusal)
+            if refusal.names_no_security_group_id() =>
+        {
+            Err(SecurityGroupRefusal::NotFound)
+        }
         network::SecurityGroupLookup::Absent(_) => Err(SecurityGroupRefusal::Invalid),
         network::SecurityGroupLookup::Unknown => Ok(()),
         network::SecurityGroupLookup::Resolved(groups) => {
@@ -2041,6 +2055,32 @@ pub fn check_security_groups(
                 return Err(SecurityGroupRefusal::Invalid);
             }
             Ok(())
+        }
+    }
+}
+
+/// The sentence the modelled refusal for a value that names NO security group states, for
+/// the answer `lookup` carries.
+///
+/// Whether a value names a security group is EC2's to say, and the read this service made to
+/// ask is the caller's own: when that read was REFUSED, the fault it ran into is what reaches
+/// the caller — EC2's sentence, which names the value at fault, under the clause an SDK
+/// renders around a failed call ([`network::NetworkRefusal::relayed_message`]), exactly as
+/// the refusal for an Elastic IP allocation states it. Neither half alone is the message: the
+/// sentence without the clause is EC2's refusal passed off as this service's own, and the
+/// clause without the sentence names nothing the caller sent.
+///
+/// With no EC2 to ask there is no fault to state, and the value was judged on its own form
+/// here ([`security_group_id_is_well_formed`]), so what is left is this API's own sentence
+/// for the class ([`SECURITY_GROUP_NOT_FOUND`]).
+///
+/// The ONE reading of that wording, stated by `CreateLoadBalancer` for the groups a new load
+/// balancer starts with and by `SetSecurityGroups` for the groups that replace them.
+pub fn security_group_not_found_message(lookup: &network::SecurityGroupLookup) -> String {
+    match lookup {
+        network::SecurityGroupLookup::Absent(refusal) => refusal.relayed_message(),
+        network::SecurityGroupLookup::Resolved(_) | network::SecurityGroupLookup::Unknown => {
+            SECURITY_GROUP_NOT_FOUND.to_string()
         }
     }
 }

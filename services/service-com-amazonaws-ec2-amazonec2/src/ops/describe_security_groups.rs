@@ -255,6 +255,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // "The IDs of the security groups" (`DescribeSecurityGroupsRequest$GroupIds`): a
+        // value outside the id form EC2 mints names no group of ANY account, so it is
+        // refused as malformed rather than reported absent from this one — the ordering
+        // every other operation that takes a group id keeps
+        // ([`crate::state::invalid_group_id_malformed`]), so one malformed id earns one
+        // refusal wherever it is named.
+        if let Some(malformed) = requested_ids
+            .iter()
+            .find(|id| !crate::state::security_group_id_is_well_formed(id))
+        {
+            return Err(crate::state::invalid_group_id_malformed(malformed));
+        }
+
         // A page size and an explicit id selection cannot be given together: a request that
         // NAMES the groups it wants is not walking the account's groups, so EC2 refuses the
         // pair rather than paging a fixed set — the same refusal `DescribeInstances`,

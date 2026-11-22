@@ -243,9 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A security group governs traffic to the load balancer's network interfaces,
         // which live in its own VPC: a group EC2 reports in another VPC can never be
-        // applied to them, and neither can a value that is no group id at all, while an id
-        // the account holds no group for is the modelled refusal for an absent group. The
-        // ONE reading of all three, shared with `CreateLoadBalancer`.
+        // applied to them, and neither can an id the account holds no group under, while a
+        // value that is no group id at all is the modelled refusal for an absent group —
+        // stated with the fault the EC2 read ran into
+        // ([`crate::state::security_group_not_found_message`]). The ONE reading of all
+        // three, shared with `CreateLoadBalancer`.
         let lookup = crate::state::network::resolve_security_groups(
             ctx,
             &region,
@@ -267,7 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     SetSecurityGroupsErrorModeled::InvalidSecurityGroupException(
                         InvalidSecurityGroupException {
-                            message: Some(crate::state::SECURITY_GROUP_NOT_FOUND.to_string()),
+                            message: Some(crate::state::security_group_not_found_message(
+                                &lookup,
+                            )),
                         },
                     )
                     .into(),

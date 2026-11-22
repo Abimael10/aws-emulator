@@ -667,11 +667,12 @@ fn tag_map(
 /// silence.
 ///
 /// A load balancer's security groups govern traffic to its network interfaces, which live
-/// in the subnets it is placed in: a group of ANOTHER VPC, and a value that is no group id
-/// at all, can never be applied to them, so the request is a configuration that cannot
+/// in the subnets it is placed in: a group of ANOTHER VPC, and an id the account holds no
+/// group under, can never be applied to them, so the request is a configuration that cannot
 /// hold together — the modelled `InvalidConfigurationRequest` — rather than a load balancer
-/// carrying a group that enforces nothing. An id the account simply holds no group for is
-/// the modelled refusal for an absent group, carrying the code EC2 answered. Both readings
+/// carrying a group that enforces nothing. A value that is no group id at all names no group
+/// in ANY account, which is the modelled refusal for an absent group, stated with the fault
+/// the EC2 read ran into ([`crate::state::security_group_not_found_message`]). Both readings
 /// are `crate::state::check_security_groups`, shared with `SetSecurityGroups`.
 async fn unusable_security_groups(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -689,7 +690,7 @@ async fn unusable_security_groups(
         Err(crate::state::SecurityGroupRefusal::NotFound) => Some(
             CreateLoadBalancerErrorModeled::InvalidSecurityGroupException(
                 InvalidSecurityGroupException {
-                    message: Some(crate::state::SECURITY_GROUP_NOT_FOUND.to_string()),
+                    message: Some(crate::state::security_group_not_found_message(&lookup)),
                 },
             )
             .into(),
