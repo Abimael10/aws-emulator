@@ -1266,3 +1266,123 @@ async fn type_data_type_key_id_and_tag_rules() {
     );
 }
 
+// --- The tag plane, as every suite that tags a resource reaches it ---------------------
+//
+// One copy of the three tag operations and of the `TagList` shape they carry, beside the
+// front-door helpers above: `all/resource_tags.rs` and `all/tag_plane_resource_lifetimes.rs`
+// tag resources through these, so a write and a read of one tag set cannot be spelled two
+// different ways.
+
+/// A minimal `Command` document, so a document exists to tag.
+pub(crate) const DOCUMENT_CONTENT: &str = r#"{
+  "schemaVersion": "2.2",
+  "description": "A document to tag",
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "runShell",
+      "inputs": { "runCommand": ["echo hi"] }
+    }
+  ]
+}"#;
+
+/// A modelled `TagList` from `(key, value)` pairs.
+pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| json!({ "Key": key, "Value": value }))
+            .collect(),
+    )
+}
+
+/// `AddTagsToResource`, returning `(status, body)`.
+pub(crate) async fn add(
+    router: &MultiServiceRouter,
+    resource_type: &str,
+    resource_id: &str,
+    tags: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "AddTagsToResource",
+        &json!({ "ResourceType": resource_type, "ResourceId": resource_id, "Tags": tags }),
+    )
+    .await
+}
+
+/// `AddTagsToResource`, asserting it succeeded.
+pub(crate) async fn add_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    resource_type: &str,
+    resource_id: &str,
+    tags: &Value,
+) {
+    let (status, response) = add(router, resource_type, resource_id, tags).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: AddTagsToResource {resource_type} {resource_id} must succeed, \
+         got {status} {response}"
+    );
+}
+
+/// `ListTagsForResource`, returning `(status, body)`.
+pub(crate) async fn list(
+    router: &MultiServiceRouter,
+    resource_type: &str,
+    resource_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "ListTagsForResource",
+        &json!({ "ResourceType": resource_type, "ResourceId": resource_id }),
+    )
+    .await
+}
+
+/// The `TagList` a resource reports, asserting the read succeeded.
+pub(crate) async fn listed(
+    router: &MultiServiceRouter,
+    case: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Value {
+    let (status, response) = list(router, resource_type, resource_id).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: ListTagsForResource {resource_type} {resource_id} must succeed, \
+         got {status} {response}"
+    );
+    response["TagList"].clone()
+}
+
+/// `RemoveTagsFromResource`, returning `(status, body)`.
+pub(crate) async fn remove(
+    router: &MultiServiceRouter,
+    resource_type: &str,
+    resource_id: &str,
+    keys: &[&str],
+) -> (u16, Value) {
+    call(
+        router,
+        "RemoveTagsFromResource",
+        &json!({ "ResourceType": resource_type, "ResourceId": resource_id, "TagKeys": keys }),
+    )
+    .await
+}
+
+/// `CreateDocument` of a document carrying `tags`, asserting it succeeded.
+pub(crate) async fn create_document(router: &MultiServiceRouter, name: &str, tags: &Value) {
+    let (status, response) = call(
+        router,
+        "CreateDocument",
+        &json!({ "Name": name, "Content": DOCUMENT_CONTENT, "Tags": tags }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateDocument {name} must succeed, got {status} {response}"
+    );
+}
+

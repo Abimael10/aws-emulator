@@ -7,8 +7,8 @@
 //! `(ResourceType, ResourceId)` — "Use the ID of the resource", which for `Document` and
 //! `Parameter` is "the name of the resource", for `ManagedInstance` is the `mi-ID_number`
 //! node id (`AddTagsToResourceRequest$ResourceId`) and for an `OpsItem`, a
-//! `CloudConnector`, an `Association` or a `MaintenanceWindow` is the id its create minted,
-//! and for an `OpsMetadata` object is the ARN its create minted
+//! `CloudConnector`, an `Association`, a `MaintenanceWindow` or a `PatchBaseline` is the id
+//! its create minted, and for an `OpsMetadata` object is the ARN its create minted
 //! — and that pair
 //! resolves to the ONE record the Region holds for it. Each such record owns its tag
 //! set, so a tag written through `AddTagsToResource` is the tag `ListTagsForResource`
@@ -332,6 +332,14 @@ impl ComAmazonawsSsmAmazonssmState {
     /// Systems Manager publishes are owned by Amazon rather than by the account reading
     /// them (`super::PUBLISHED_DOCUMENT_OWNER`), so the account carries no tag set on
     /// one and a published name addresses no resource of its own to tag.
+    ///
+    /// Patch baselines resolve the same way, and for the same reason: a baseline the
+    /// account CREATED carries its own tag set — the one its create wrote and the one the
+    /// tag operations rewrite — while a baseline Systems Manager predefines
+    /// (`super::patch_baselines::PREDEFINED_BASELINES`) is owned by Systems Manager rather
+    /// than by the account (`super::patch_baselines::OWNER_AWS`), so the
+    /// account holds no tag set on one and its id addresses no resource of its own to tag,
+    /// even though every READ of a baseline reports it.
     pub fn resource_tags(
         &self,
         region: &str,
@@ -361,6 +369,9 @@ impl ComAmazonawsSsmAmazonssmState {
             }
             TAGGING_TYPE_MAINTENANCE_WINDOW => self
                 .maintenance_window(region, resource_id)
+                .map(|held| &held.tags),
+            TAGGING_TYPE_PATCH_BASELINE => self
+                .patch_baseline(region, resource_id)
                 .map(|held| &held.tags),
             _ => None,
         }
@@ -401,6 +412,9 @@ impl ComAmazonawsSsmAmazonssmState {
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_MAINTENANCE_WINDOW => self
                 .maintenance_window_mut(region, resource_id)
+                .map(|held| &mut held.tags),
+            TAGGING_TYPE_PATCH_BASELINE => self
+                .patch_baseline_mut(region, resource_id)
                 .map(|held| &mut held.tags),
             _ => None,
         }

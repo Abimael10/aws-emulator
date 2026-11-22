@@ -15,13 +15,14 @@
 //! already held or not, the value form, which keys a remove names, the Region — rather
 //! than the single resource a recorded unit happened to tag.
 
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_ssm_amazonssm::ops::types::InstanceProperty;
 use service_com_amazonaws_ssm_amazonssm::state::{ComAmazonawsSsmAmazonssmState, ManagedNodeRecord};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::parameter_store::{
-    call, call_in_region, error_code, router, router_with_engine, ACCOUNT, REGION,
+    add, add_ok, call, call_in_region, create_document, error_code, list, listed, remove, router,
+    router_with_engine, tag_list, ACCOUNT, REGION,
 };
 
 /// How many tags one resource may carry
@@ -31,19 +32,6 @@ const MAX_TAGS: usize = service_com_amazonaws_ssm_amazonssm::state::tagging::MAX
 
 /// A second Region, so a tag set is shown to live with the resource of ONE Region.
 const OTHER_REGION: &str = "eu-central-1";
-
-/// A minimal `Command` document, so a document exists to tag.
-const DOCUMENT_CONTENT: &str = r#"{
-  "schemaVersion": "2.2",
-  "description": "A document to tag",
-  "mainSteps": [
-    {
-      "action": "aws:runShellScript",
-      "name": "runShell",
-      "inputs": { "runCommand": ["echo hi"] }
-    }
-  ]
-}"#;
 
 /// The `ResourceTypeForTagging` values the model's enum declares
 /// (`smithy_query(query="shape", shape="ResourceTypeForTagging")`), each beside an id of
@@ -71,92 +59,6 @@ const TAGGABLE_TYPES: &[(&str, &str)] = &[
     ("PatchBaseline", "pb-0123456789abcdef0"),
 ];
 
-/// `AddTagsToResource`, returning `(status, body)`.
-async fn add(
-    router: &MultiServiceRouter,
-    resource_type: &str,
-    resource_id: &str,
-    tags: &Value,
-) -> (u16, Value) {
-    call(
-        router,
-        "AddTagsToResource",
-        &json!({ "ResourceType": resource_type, "ResourceId": resource_id, "Tags": tags }),
-    )
-    .await
-}
-
-/// `AddTagsToResource`, asserting it succeeded.
-async fn add_ok(
-    router: &MultiServiceRouter,
-    case: &str,
-    resource_type: &str,
-    resource_id: &str,
-    tags: &Value,
-) {
-    let (status, response) = add(router, resource_type, resource_id, tags).await;
-    assert_eq!(
-        status, 200,
-        "case {case}: AddTagsToResource {resource_type} {resource_id} must succeed, \
-         got {status} {response}"
-    );
-}
-
-/// `ListTagsForResource`, returning `(status, body)`.
-async fn list(
-    router: &MultiServiceRouter,
-    resource_type: &str,
-    resource_id: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "ListTagsForResource",
-        &json!({ "ResourceType": resource_type, "ResourceId": resource_id }),
-    )
-    .await
-}
-
-/// The `TagList` a resource reports, asserting the read succeeded.
-async fn listed(
-    router: &MultiServiceRouter,
-    case: &str,
-    resource_type: &str,
-    resource_id: &str,
-) -> Value {
-    let (status, response) = list(router, resource_type, resource_id).await;
-    assert_eq!(
-        status, 200,
-        "case {case}: ListTagsForResource {resource_type} {resource_id} must succeed, \
-         got {status} {response}"
-    );
-    response["TagList"].clone()
-}
-
-/// `RemoveTagsFromResource`, returning `(status, body)`.
-async fn remove(
-    router: &MultiServiceRouter,
-    resource_type: &str,
-    resource_id: &str,
-    keys: &[&str],
-) -> (u16, Value) {
-    call(
-        router,
-        "RemoveTagsFromResource",
-        &json!({ "ResourceType": resource_type, "ResourceId": resource_id, "TagKeys": keys }),
-    )
-    .await
-}
-
-/// A modelled `TagList` from `(key, value)` pairs.
-fn tag_list(pairs: &[(&str, &str)]) -> Value {
-    Value::Array(
-        pairs
-            .iter()
-            .map(|(key, value)| json!({ "Key": key, "Value": value }))
-            .collect(),
-    )
-}
-
 /// `PutParameter` of an untagged `String` parameter in `region`.
 async fn put_parameter(router: &MultiServiceRouter, region: &str, name: &str) {
     let (status, response) = call_in_region(
@@ -169,20 +71,6 @@ async fn put_parameter(router: &MultiServiceRouter, region: &str, name: &str) {
     assert_eq!(
         status, 200,
         "PutParameter {name} in {region} must succeed, got {status} {response}"
-    );
-}
-
-/// `CreateDocument` of a document carrying `tags`.
-async fn create_document(router: &MultiServiceRouter, name: &str, tags: &Value) {
-    let (status, response) = call(
-        router,
-        "CreateDocument",
-        &json!({ "Name": name, "Content": DOCUMENT_CONTENT, "Tags": tags }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateDocument {name} must succeed, got {status} {response}"
     );
 }
 

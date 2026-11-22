@@ -819,6 +819,17 @@ impl ComAmazonawsSsmAmazonssmState {
             .get(&(region.to_string(), baseline_id.to_string()))
     }
 
+    /// The same baseline, to write it — the record a write of one of its own properties,
+    /// its tag set included, is applied to.
+    pub fn patch_baseline_mut(
+        &mut self,
+        region: &str,
+        baseline_id: &str,
+    ) -> Option<&mut PatchBaselineRecord> {
+        self.patch_baselines
+            .get_mut(&(region.to_string(), baseline_id.to_string()))
+    }
+
     /// Store `record` as a patch baseline of its own Region, keyed by its id.
     pub fn insert_patch_baseline(&mut self, record: PatchBaselineRecord) {
         let key = (record.region.clone(), record.baseline_id.clone());
