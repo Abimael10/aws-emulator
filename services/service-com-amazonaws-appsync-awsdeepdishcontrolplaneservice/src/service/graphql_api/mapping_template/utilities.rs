@@ -80,6 +80,36 @@ impl Raised {
         Json::Object(entry)
     }
 
+    /// One such entry read back as the error it describes — the inverse of [`Self::detail`].
+    ///
+    /// What appends an error inside the SANDBOX reports its entries in exactly that
+    /// projection, as JSON text (`crate::ops::evaluate_code::appsync_js`), so this is how an
+    /// error a definition written in that runtime appended reaches the execution that reports
+    /// it beside the field's value. A member the entry carries as `null` was named by no
+    /// raise, so it is left unset; an appended error never REFUSES the field — only
+    /// `$util.unauthorized` does, and that one raises.
+    #[must_use]
+    pub fn of_detail(entry: &Json) -> Self {
+        let named = |member: &str| {
+            entry
+                .get(member)
+                .filter(|value| !value.is_null())
+                .cloned()
+        };
+        Self {
+            message: entry
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            error_type: named("errorType")
+                .and_then(|value| value.as_str().map(str::to_string)),
+            data: named("data"),
+            error_info: named("errorInfo"),
+            refuses_the_field: false,
+        }
+    }
+
     /// The error as one entry of a GraphQL result's `errors`.
     #[must_use]
     pub fn document(&self, path: &[Json]) -> Json {

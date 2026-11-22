@@ -122,7 +122,7 @@ pub async fn answered(
         .map(str::trim)
         .filter(|region| !region.is_empty())
         .unwrap_or(&context.region);
-    let body = call.wire_request(table, requested).map_err(Refused::request)?;
+    let body = call.wire_request(table, requested)?;
     // The permissions are weighed BEFORE the hop: a call they do not admit reads and writes
     // nothing, which is what lets a denied read leave the item it addressed untouched. A
     // BATCH call addresses the tables its own request names, so each of them is weighed.
@@ -301,7 +301,7 @@ impl Call {
     /// key, an item's values and the values an expression is parameterised by are already
     /// DynamoDB's own representation — and every other member is the one DynamoDB's input
     /// names for it.
-    fn wire_request(self, table: &str, requested: &Json) -> Result<Json, String> {
+    fn wire_request(self, table: &str, requested: &Json) -> Result<Json, Refused> {
         let mut input = JsonMap::new();
         // A batch call addresses the tables its own request names, so it carries no single
         // table at all; every other call is made against the configured one.
@@ -325,7 +325,7 @@ impl Call {
                 input.insert(KEY_INPUT.to_string(), object(requested, KEY_MEMBER)?);
                 let update = expression(requested, UPDATE_MEMBER)?;
                 if update.expression.is_none() {
-                    return Err(format!("{AN_UPDATE_STATES} {UPDATE_MEMBER}.{EXPRESSION_MEMBER}."));
+                    return Err(format!("{AN_UPDATE_STATES} {UPDATE_MEMBER}.{EXPRESSION_MEMBER}.").into());
                 }
                 update.carry(&mut input, UPDATE_EXPRESSION_INPUT);
                 expression(requested, CONDITION_MEMBER)?.carry(&mut input, CONDITION_EXPRESSION_INPUT);
@@ -349,7 +349,7 @@ impl Call {
             Self::Query => {
                 let query = expression(requested, QUERY_MEMBER)?;
                 if query.expression.is_none() {
-                    return Err(format!("{A_QUERY_STATES} {QUERY_MEMBER}.{EXPRESSION_MEMBER}."));
+                    return Err(format!("{A_QUERY_STATES} {QUERY_MEMBER}.{EXPRESSION_MEMBER}.").into());
                 }
                 query.carry(&mut input, KEY_CONDITION_EXPRESSION_INPUT);
                 expression(requested, FILTER_MEMBER)?.carry(&mut input, FILTER_EXPRESSION_INPUT);
@@ -371,17 +371,22 @@ impl Call {
                 let mut carried: usize = 0;
                 for (name, stated) in batch_tables(requested)? {
                     let Json::Array(entries) = stated else {
-                        return Err(format!("{A_BATCH_TABLE_IS_A_LIST} {TABLES_MEMBER}.{name}."));
+                        return Err(
+                            format!("{A_BATCH_TABLE_IS_A_LIST} {TABLES_MEMBER}.{name}.").into(),
+                        );
                     };
                     if entries.is_empty() {
-                        return Err(format!("{A_BATCH_TABLE_IS_NOT_EMPTY} {TABLES_MEMBER}.{name}."));
+                        return Err(
+                            format!("{A_BATCH_TABLE_IS_NOT_EMPTY} {TABLES_MEMBER}.{name}.").into(),
+                        );
                     }
                     carried = carried.saturating_add(entries.len());
                     if carried > MAX_BATCH_WRITE_REQUESTS {
                         return Err(format!(
                             "{A_WRITE_BATCH_CARRIES} {MAX_BATCH_WRITE_REQUESTS} \
                              {ITEMS_OR_KEYS_IN_ALL}"
-                        ));
+                        )
+                        .into());
                     }
                     let writes: Vec<Json> = entries
                         .iter()
@@ -409,14 +414,16 @@ impl Call {
                         _ => {
                             return Err(format!(
                                 "{A_BATCH_GET_STATES} {TABLES_MEMBER}.{name}.{KEYS_MEMBER}."
-                            ))
+                            )
+                            .into())
                         }
                     };
                     carried = carried.saturating_add(keys.len());
                     if carried > MAX_BATCH_GET_KEYS {
                         return Err(format!(
                             "{A_READ_BATCH_CARRIES} {MAX_BATCH_GET_KEYS} {ITEMS_OR_KEYS_IN_ALL}"
-                        ));
+                        )
+                        .into());
                     }
                     let mut per_table = JsonMap::new();
                     per_table.insert(KEYS_INPUT.to_string(), Json::Array(keys));
@@ -489,29 +496,83 @@ impl Call {
                 },
                 UNPROCESSED_KEYS_MEMBER,
             ),
-            // What a read batch came to is what each table ANSWERED, beside the keys it did
-            // not get to.
-            Self::BatchGetItem => {
-                let data = per_table(answered.get(RESPONSES_OUTPUT), |items| {
-                    items
-                        .as_array()
-                        .map(|items| items.iter().map(plain_value).collect())
-                        .unwrap_or_default()
-                });
-                let unprocessed = per_table(answered.get(UNPROCESSED_KEYS_OUTPUT), |stated| {
-                    stated
-                        .get(KEYS_INPUT)
-                        .and_then(Json::as_array)
-                        .map(|keys| keys.iter().map(plain_value).collect())
-                        .unwrap_or_default()
-                });
-                json!({
-                    DATA_MEMBER: data,
-                    UNPROCESSED_KEYS_MEMBER: unprocessed,
-                })
-            }
+            // What a read batch came to is ONE SLOT PER KEY IT ASKED FOR, per table, beside
+            // the keys it did not get to ([`read_batch_answer`]).
+            Self::BatchGetItem => read_batch_answer(requested, answered),
         }
     }
+}
+
+/// The result of one READ batch: for every table the request named, the item answered for each
+/// of the keys it asked for — in the request's own order, `null` at a key the table answered
+/// none for — beside the keys the call did not get to.
+///
+/// The slots are built by mapping over the REQUESTED keys rather than over the items answered,
+/// because `BatchGetItem` "returns the attributes of one or more items" and answers nothing at
+/// all for a key it found no item for: a list built from the answer alone is shorter than the
+/// key list it stands for, so every position after the first absent key would be attributed to
+/// the wrong key. A table's own entry is a list of exactly as many slots as that table's
+/// `keys`, which is what lets a resolver correlate `data[<table>][i]` with `keys[i]` and append
+/// a per-key error for each hole.
+///
+/// `unprocessedKeys` is stated for every table the request named too — the empty list where the
+/// call got to all of that table's keys — so a resolver reads one entry per table it asked
+/// about either way.
+fn read_batch_answer(requested: &Json, answered: &Json) -> Json {
+    let requested_tables = requested
+        .get(REQUEST_ITEMS_INPUT)
+        .and_then(Json::as_object);
+    let answered_items = answered.get(RESPONSES_OUTPUT).and_then(Json::as_object);
+    let keys_left = answered
+        .get(UNPROCESSED_KEYS_OUTPUT)
+        .and_then(Json::as_object);
+    let mut data = JsonMap::new();
+    let mut unprocessed = JsonMap::new();
+    for (name, stated) in requested_tables.into_iter().flatten() {
+        let no_keys: Vec<Json> = Vec::new();
+        let asked = stated
+            .get(KEYS_INPUT)
+            .and_then(Json::as_array)
+            .unwrap_or(&no_keys);
+        let read = answered_items
+            .and_then(|tables| tables.get(name))
+            .and_then(Json::as_array)
+            .unwrap_or(&no_keys);
+        data.insert(
+            name.clone(),
+            Json::Array(asked.iter().map(|key| answered_for(read, key)).collect()),
+        );
+        let left: Vec<Json> = keys_left
+            .and_then(|tables| tables.get(name))
+            .and_then(|stated| stated.get(KEYS_INPUT))
+            .and_then(Json::as_array)
+            .map(|keys| keys.iter().map(plain_value).collect())
+            .unwrap_or_default();
+        unprocessed.insert(name.clone(), Json::Array(left));
+    }
+    json!({
+        DATA_MEMBER: Json::Object(data),
+        UNPROCESSED_KEYS_MEMBER: Json::Object(unprocessed),
+    })
+}
+
+/// The item `read` holds for `key`, unmarshalled, or `null` where the table answered none for
+/// it.
+///
+/// A key is matched by the attributes it NAMES, because an item a table answers carries its
+/// own non-key attributes beside them; the values are compared as DynamoDB holds them, which
+/// is the form both the request's keys and the answer's items are in at this point.
+fn answered_for(read: &[Json], key: &Json) -> Json {
+    let Some(named) = key.as_object() else {
+        return Json::Null;
+    };
+    read.iter()
+        .find(|item| {
+            named
+                .iter()
+                .all(|(attribute, value)| item.get(attribute) == Some(value))
+        })
+        .map_or(Json::Null, plain_value)
 }
 
 /// The result of one WRITE batch: what it carried per table, read back out of the call it
@@ -638,7 +699,7 @@ fn wire_values(value: &Json) -> Json {
 /// The members every selection of a page carries, where the request states them: which index
 /// it reads, how many values it reads, whether the read is consistent, which attributes it
 /// projects, what it selects and where the previous page left off.
-fn carry_selection(input: &mut JsonMap<String, Json>, requested: &Json) -> Result<(), String> {
+fn carry_selection(input: &mut JsonMap<String, Json>, requested: &Json) -> Result<(), Refused> {
     if let Some(index) = requested.get(INDEX_MEMBER).and_then(Json::as_str) {
         input.insert(INDEX_NAME_INPUT.to_string(), Json::String(index.to_string()));
     }
@@ -651,11 +712,10 @@ fn carry_selection(input: &mut JsonMap<String, Json>, requested: &Json) -> Resul
     match requested.get(NEXT_TOKEN_MEMBER) {
         None | Some(Json::Null) => {}
         Some(Json::String(token)) => {
-            let key = decoded_token(token)
-                .ok_or_else(|| format!("{NOT_A_NEXT_TOKEN} {NEXT_TOKEN_MEMBER}."))?;
+            let key = decoded_token(token).ok_or_else(Refused::not_a_pagination_token)?;
             input.insert(EXCLUSIVE_START_KEY_INPUT.to_string(), key);
         }
-        Some(_) => return Err(format!("{NOT_A_NEXT_TOKEN} {NEXT_TOKEN_MEMBER}.")),
+        Some(_) => return Err(Refused::not_a_pagination_token()),
     }
     Ok(())
 }
@@ -986,6 +1046,19 @@ impl Refused {
         }
     }
 
+    /// A request carrying a pagination token this endpoint did not mint: the value is an
+    /// ARGUMENT of the request the endpoint cannot read rather than a definition it cannot
+    /// act on, so it is reported under the class AppSync words an illegal argument with
+    /// ([`ILLEGAL_ARGUMENT_ERROR_TYPE`]), with the one fixed sentence it states for a token it
+    /// cannot read and nothing of the value that was carried.
+    fn not_a_pagination_token() -> Self {
+        Self {
+            message: crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+            error_type: ILLEGAL_ARGUMENT_ERROR_TYPE.to_string(),
+            data: None,
+        }
+    }
+
     /// A call that was never MADE: there is no answer from the owning service to report, so
     /// the step is reported as one whose call could not be placed, under the class a client
     /// raises for a call it could not complete.
@@ -995,6 +1068,16 @@ impl Refused {
             error_type: answered_error_type(BASE_EXCEPTION),
             data: None,
         }
+    }
+}
+
+/// A sentence with no class of its own is a request this data source cannot act on
+/// ([`Refused::request`]), which is what every member reading of a request object answers
+/// with: the readings state the member to correct and leave the classification to this one
+/// place.
+impl From<String> for Refused {
+    fn from(message: String) -> Self {
+        Self::request(message)
     }
 }
 
@@ -1158,6 +1241,12 @@ const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 const REQUEST_ERROR_TYPE: &str = super::data_source_role::REQUEST_FAULT_ERROR_TYPE;
 const ANSWERED_ERROR_TYPE_PREFIX: &str = "DynamoDB:";
 
+/// The `errorType` an ARGUMENT of the request this endpoint cannot read is reported under:
+/// the value the request carried is not well formed, which is neither a definition the data
+/// source cannot act on nor anything the called service answered, so a client reads it as the
+/// argument to correct — and drops it — rather than as a failure to retry.
+const ILLEGAL_ARGUMENT_ERROR_TYPE: &str = "IllegalArgument";
+
 /// The sentences a step that did not resolve states.
 ///
 /// AppSync publishes no wording for a request its own data source cannot act on, so these are
@@ -1207,9 +1296,6 @@ const NO_CALLER_CREDENTIALS: &str =
      this request presented none, so no call was made.";
 const AN_EXPRESSION_IS_TEXT: &str =
     "An expression of an AMAZON_DYNAMODB request is text, which is not what is carried at";
-const NOT_A_NEXT_TOKEN: &str =
-    "The pagination token of an AMAZON_DYNAMODB request is one this endpoint issued, which is \
-     not what is carried at";
 const NOT_SIGNED: &str = "This field's DynamoDB call could not be signed, so none was made:";
 const NOT_CALLED: &str = "This field's DynamoDB call could not be made:";
 const NO_SUCH_SERVICE: &str =
@@ -1375,7 +1461,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("case {case:?}: {operation} must be served"));
             let built = call
                 .wire_request("items", requested)
-                .unwrap_or_else(|refusal| panic!("case {case:?}: expected a call, got {refusal}"));
+                .unwrap_or_else(|refusal| panic!("case {case:?}: expected a call, got {refusal:?}"));
             assert_eq!(
                 &built, expected,
                 "case {case:?}: expected {expected}, got {built}"
@@ -1423,11 +1509,6 @@ mod tests {
                 json!({"operation": "GetItem", "key": {"id": {"S": "A-1"}}, "consistentRead": 1}),
                 "consistentRead",
             ),
-            (
-                "a Scan carrying a token this endpoint did not issue",
-                json!({"operation": "Scan", "nextToken": "not-a-token-of-this-endpoint"}),
-                "nextToken",
-            ),
         ];
         for (case, requested, member) in rows {
             let operation = requested
@@ -1442,8 +1523,13 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("case {case:?}: expected a refusal, got {refused:?}"));
             assert!(
-                refusal.ends_with(&format!("{member}.")),
+                refusal.message.ends_with(&format!("{member}.")),
                 "case {case:?}: expected a refusal naming {member}, got {refusal:?}"
+            );
+            assert_eq!(
+                refusal.error_type, REQUEST_ERROR_TYPE,
+                "case {case:?}: expected the class of a definition this data source cannot act \
+                 on, got {refusal:?}"
             );
         }
         // And an operation no DynamoDB data source serves is refused too, naming the ones it
@@ -1452,6 +1538,76 @@ mod tests {
             Call::named("TransactWriteItems").is_none(),
             "case an operation this data source does not serve: expected no call"
         );
+    }
+
+    /// RULE: a selection carrying a pagination token this endpoint did not mint is refused as
+    /// an ILLEGAL ARGUMENT of the request, under the one fixed sentence AWS states for a token
+    /// it cannot read and with nothing of the value carried — so a client can tell the argument
+    /// to drop from a failure to retry; a token this endpoint DID mint continues the page it
+    /// stands for. The rows span both operations that take a token and the forms a value that
+    /// is no token of this endpoint takes.
+    #[test]
+    fn a_pagination_token_this_endpoint_did_not_mint_is_refused_as_an_illegal_argument() {
+        use ::base64::Engine as _;
+
+        let carried: &[(&str, Json)] = &[
+            ("text of no payload at all", json!("not-a-token")),
+            ("the empty token", json!("")),
+            (
+                "a payload that decodes to no document",
+                json!(::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{not json")),
+            ),
+            (
+                "a payload that decodes to a document that is no key",
+                json!(::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("[1, 2]")),
+            ),
+            ("a value that is no text", json!(7)),
+            ("a value that is a document", json!({"id": {"S": "A-1"}})),
+        ];
+        for operation in ["Query", "Scan"] {
+            let call = Call::named(operation).expect("the operation must be served");
+            for (form, token) in carried {
+                let case = format!("{operation} carrying {form}");
+                let requested = json!({
+                    "operation": operation,
+                    "query": {"expression": "#k = :k"},
+                    NEXT_TOKEN_MEMBER: token,
+                });
+                let refused = call.wire_request("items", &requested);
+                let refusal = refused
+                    .as_ref()
+                    .err()
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a refusal, got {refused:?}"));
+                assert_eq!(
+                    (refusal.error_type.as_str(), refusal.message.as_str()),
+                    (
+                        ILLEGAL_ARGUMENT_ERROR_TYPE,
+                        crate::state::INVALID_PAGINATION_TOKEN_MESSAGE
+                    ),
+                    "case {case:?}: expected the illegal-argument refusal, got {refusal:?}"
+                );
+            }
+            // And the token this endpoint MINTS for a page continues from the key it stands
+            // for, so the refusal is about the value and not about the member.
+            let key = json!({"id": {"S": "A-1"}});
+            let built = call
+                .wire_request(
+                    "items",
+                    &json!({
+                        "operation": operation,
+                        "query": {"expression": "#k = :k"},
+                        NEXT_TOKEN_MEMBER: encoded_token(&key),
+                    }),
+                )
+                .unwrap_or_else(|refusal| {
+                    panic!("case {operation} carrying a minted token: got {refusal:?}")
+                });
+            assert_eq!(
+                built[EXCLUSIVE_START_KEY_INPUT], key,
+                "case {operation} carrying a minted token: expected the page to continue from \
+                 the key it stands for, got {built}"
+            );
+        }
     }
 
     /// RULE: a BATCH operation addresses the tables its own request names — the items each
@@ -1467,7 +1623,7 @@ mod tests {
                 "items",
                 &json!({"tables": {"items": [item("A-1"), item("A-2")]}}),
             )
-            .unwrap_or_else(|refusal| panic!("the put batch must build: {refusal}"));
+            .unwrap_or_else(|refusal| panic!("the put batch must build: {refusal:?}"));
         assert_eq!(
             built,
             json!({"RequestItems": {"items": [
@@ -1493,7 +1649,7 @@ mod tests {
         let delete = Call::named("BatchDeleteItem").expect("BatchDeleteItem must be served");
         let built = delete
             .wire_request("items", &json!({"tables": {"items": [{"id": {"S": "A-1"}}]}}))
-            .unwrap_or_else(|refusal| panic!("the delete batch must build: {refusal}"));
+            .unwrap_or_else(|refusal| panic!("the delete batch must build: {refusal:?}"));
         assert_eq!(
             built,
             json!({"RequestItems": {"items": [
@@ -1507,33 +1663,44 @@ mod tests {
             .wire_request(
                 "items",
                 &json!({"tables": {
-                    "items": {"keys": [{"id": {"S": "A-1"}}], "consistentRead": true},
+                    "items": {
+                        "keys": [{"id": {"S": "A-1"}}, {"id": {"S": "A-2"}}],
+                        "consistentRead": true,
+                    },
                     "others": {"keys": [{"id": {"S": "B-1"}}]},
                 }}),
             )
-            .unwrap_or_else(|refusal| panic!("the get batch must build: {refusal}"));
+            .unwrap_or_else(|refusal| panic!("the get batch must build: {refusal:?}"));
         assert_eq!(
             built,
             json!({"RequestItems": {
-                "items": {"Keys": [{"id": {"S": "A-1"}}], "ConsistentRead": true},
+                "items": {
+                    "Keys": [{"id": {"S": "A-1"}}, {"id": {"S": "A-2"}}],
+                    "ConsistentRead": true,
+                },
                 "others": {"Keys": [{"id": {"S": "B-1"}}]},
             }}),
             "a get batch must carry the keys of every table it names, got {built}"
         );
+        // One slot per key ASKED FOR, in the request's own order: the table answered an item
+        // for the second of the two keys only, and the other table's one key was not got to.
         let read = get.read_answer(
             &built,
             &json!({
-                "Responses": {"items": [{"id": {"S": "A-1"}}], "others": []},
+                "Responses": {"items": [{"id": {"S": "A-2"}, "value": {"N": "7"}}], "others": []},
                 "UnprocessedKeys": {"others": {"Keys": [{"id": {"S": "B-1"}}]}},
             }),
         );
         assert_eq!(
             read,
             json!({
-                "data": {"items": [{"id": "A-1"}], "others": []},
-                "unprocessedKeys": {"others": [{"id": "B-1"}]},
+                "data": {
+                    "items": [Json::Null, {"id": "A-2", "value": 7}],
+                    "others": [Json::Null],
+                },
+                "unprocessedKeys": {"items": [], "others": [{"id": "B-1"}]},
             }),
-            "a get batch must report what each table answered, got {read}"
+            "a get batch must report one slot per requested key per table, got {read}"
         );
 
         // Every batch names the tables it addresses, and those are the tables the call's
@@ -1553,7 +1720,7 @@ mod tests {
         );
         let refused = put.wire_request("items", &json!({"operation": "BatchPutItem"}));
         assert!(
-            refused.is_err_and(|refusal| refusal.ends_with("tables.")),
+            refused.is_err_and(|refusal| refusal.message.ends_with("tables.")),
             "a batch naming no table must be refused by that member"
         );
     }

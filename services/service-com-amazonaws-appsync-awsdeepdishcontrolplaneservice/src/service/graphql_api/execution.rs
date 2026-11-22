@@ -1405,7 +1405,18 @@ impl Execution<'_> {
         }
         self.engine_runs = self.engine_runs.saturating_add(1);
         let ran = ::std::time::Instant::now();
-        let returned = returned(code, function, context, stash, &mut self.extensions).await;
+        // The errors the run APPENDED travel onto this execution, as a template's do: an
+        // appended error "does not interrupt the evaluation", so it is reported beside the
+        // value the field resolved to whichever language the definition is written in.
+        let returned = returned(
+            code,
+            function,
+            context,
+            stash,
+            &mut self.appended,
+            &mut self.extensions,
+        )
+        .await;
         self.engine_spent = self.engine_spent.saturating_add(ran.elapsed());
         returned
     }
@@ -2946,17 +2957,22 @@ impl Evaluated {
 }
 
 /// Run `function` of `code` over `context` and answer what it returned, carrying the stash
-/// it left behind onto `stash` and the `extensions` calls it stated onto `extensions`.
+/// it left behind onto `stash`, the errors it APPENDED onto `appended` and the `extensions`
+/// calls it stated onto `extensions`.
 ///
 /// `Err` is a step that did not return: the code raised (`util.error` is how a resolver
 /// refuses), it defines no such function, or one of the engine's bounds stopped it. The text
 /// is the engine's own, and a raise that NAMED an `errorType` carries it — `util.error`'s
 /// second argument is "a custom error type" the error of the field reports as its own.
+///
+/// An appended error is carried whatever the run came to, because `util.appendError` "does
+/// not interrupt the evaluation": a half that appends one and then raises reported both.
 async fn returned(
     code: &str,
     function: &str,
     context: &Json,
     stash: &mut Json,
+    appended: &mut Vec<Raised>,
     extensions: &mut Vec<appsync_js::ExtensionCall>,
 ) -> Result<Evaluated, Failure> {
     let evaluation =
@@ -2969,6 +2985,16 @@ async fn returned(
     {
         *stash = left;
     }
+    appended.extend(
+        evaluation
+            .out_errors
+            .as_deref()
+            .and_then(|text| ::serde_json::from_str::<Json>(text).ok())
+            .as_ref()
+            .and_then(Json::as_array)
+            .map(|entries| entries.iter().map(Raised::of_detail).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
     let read = |text: &str| ::serde_json::from_str(text).unwrap_or(Json::Null);
     match evaluation.outcome {
         Outcome::Returned(text) => Ok(Evaluated {
