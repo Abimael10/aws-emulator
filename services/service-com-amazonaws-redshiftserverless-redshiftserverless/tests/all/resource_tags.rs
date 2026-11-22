@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListTagsForResource` and `TagResource`, end to end over the wire.
+//! `ListTagsForResource`, `TagResource` and `UntagResource`, end to end over the wire.
 //!
 //! The rule under test: the tags a Redshift Serverless resource carries are STATE, so
 //! `ListTagsForResource` reports exactly the tag set stored for the resource its
@@ -14,6 +14,11 @@
 //! `ListTagsForResource` reports is the merge and not the request. It is refused without
 //! storing anything when the ARN resolves to nothing and when the merge would leave the
 //! resource holding more tags than one may hold.
+//!
+//! `UntagResource` is the other write of it: it REMOVES the keys the request names and
+//! keeps every key it does not name, so what a later `ListTagsForResource` reports is
+//! what is left — a key the resource does not carry is nothing to remove, and an ARN
+//! that resolves to nothing is the same modelled refusal, having removed nothing.
 //!
 //! Every rule is asserted over a TABLE rather than one request: the rows differ along the
 //! resource kind (namespace, workgroup, snapshot), the number and shape of the tags
@@ -1028,5 +1033,470 @@ async fn a_merge_past_the_tag_bound_is_refused_and_stores_nothing() {
         after.contains(&held[0]),
         "case a held key at the bound: expected {:?} among the tags, got {after:?}",
         held[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — UntagResource is the other write of that same state: it REMOVES
+// the keys the request names from the stored set and leaves every key it does
+// not name alone, so the set a later ListTagsForResource reports is what is
+// left. A key the resource does not carry is nothing to remove.
+// ---------------------------------------------------------------------------
+
+/// One row of the removal table: the tags a create carries, the keys one `UntagResource`
+/// call names, and the set every later read must report.
+#[derive(Debug, Clone)]
+struct UntagCase {
+    /// What distinguishes this row.
+    label: &'static str,
+    /// The Region the row's resources are created in, so its ARNs differ from every other
+    /// row's.
+    region: &'static str,
+    /// The `tags` the create carries.
+    created: Vec<(String, String)>,
+    /// The `tagKeys` the `UntagResource` call names.
+    removed: Vec<String>,
+    /// What is left, in any order.
+    expected: Vec<(String, String)>,
+}
+
+/// A list of keys as a `tagKeys` member.
+fn tag_keys(keys: &[String]) -> Value {
+    Value::Array(keys.iter().map(|key| json!(key)).collect())
+}
+
+/// `UntagResource` for `arn` with `keys`, answering its HTTP status and parsed body.
+async fn untag_resource_call(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+    keys: &[String],
+) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "UntagResource",
+        json!({ "resourceArn": arn, "tagKeys": tag_keys(keys) }),
+    )
+    .await
+}
+
+/// [`untag_resource_call`], asserting it was served.
+async fn untag_resource(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+    keys: &[String],
+    case: &str,
+) {
+    let (status, body) = untag_resource_call(router, region, arn, keys).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: UntagResource on {arn} expected 200, got {status} with {body}"
+    );
+}
+
+/// The keys of `tags`, in order.
+fn keys_of(tags: &[(String, String)]) -> Vec<String> {
+    tags.iter().map(|(key, _)| key.clone()).collect()
+}
+
+/// The rows of the removal table.
+///
+/// They differ along what the rule generalises over: how many of the held keys one call
+/// names, whether a named key is held at all, whether the call names every key or none,
+/// whether it repeats a key, and the shape of the keys and values — including the
+/// published bounds of `Tag$key` (1..128) and `Tag$value` (0..256), from
+/// `smithy_query(query="shape", shape="Tag")`.
+fn untag_cases() -> Vec<UntagCase> {
+    let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+    let key = |key: &str| key.to_string();
+    let many = numbered_tags("created", 12);
+    vec![
+        UntagCase {
+            label: "one of several held keys",
+            region: "us-east-1",
+            created: vec![
+                pair("env", "staging"),
+                pair("team", "data"),
+                pair("owner", "analytics"),
+            ],
+            removed: vec![key("team")],
+            expected: vec![pair("env", "staging"), pair("owner", "analytics")],
+        },
+        UntagCase {
+            label: "every key the resource carries",
+            region: "eu-west-2",
+            created: vec![pair("env", "prod"), pair("team", "data")],
+            removed: vec![key("env"), key("team")],
+            expected: Vec::new(),
+        },
+        UntagCase {
+            label: "a key the resource does not carry leaves the set alone",
+            region: "ap-southeast-2",
+            created: vec![pair("env", "prod")],
+            removed: vec![key("never-attached")],
+            expected: vec![pair("env", "prod")],
+        },
+        UntagCase {
+            label: "a held key named beside one that is not held",
+            region: "us-west-2",
+            created: vec![pair("env", "prod"), pair("keep", "yes")],
+            removed: vec![key("env"), key("never-attached")],
+            expected: vec![pair("keep", "yes")],
+        },
+        UntagCase {
+            label: "the empty key list leaves the stored set alone",
+            region: "us-east-2",
+            created: vec![pair("env", "prod"), pair("team", "data")],
+            removed: Vec::new(),
+            expected: vec![pair("env", "prod"), pair("team", "data")],
+        },
+        UntagCase {
+            label: "a key the request repeats",
+            region: "eu-central-1",
+            created: vec![pair("env", "prod"), pair("team", "data")],
+            removed: vec![key("env"), key("env")],
+            expected: vec![pair("team", "data")],
+        },
+        UntagCase {
+            label: "a key whose value is the empty string",
+            region: "ap-northeast-1",
+            created: vec![pair("retired", ""), pair("owner", "analytics")],
+            removed: vec![key("retired")],
+            expected: vec![pair("owner", "analytics")],
+        },
+        UntagCase {
+            label: "the published key and value length bounds",
+            region: "ca-central-1",
+            created: vec![
+                ("k".repeat(128), "v".repeat(256)),
+                ("a".to_string(), String::new()),
+            ],
+            removed: vec!["k".repeat(128)],
+            expected: vec![("a".to_string(), String::new())],
+        },
+        UntagCase {
+            label: "many keys in one call",
+            region: "us-west-1",
+            created: many.clone(),
+            removed: keys_of(&many[..7]),
+            expected: many[7..].to_vec(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn untag_resource_removes_only_the_keys_the_request_names() {
+    let router = emulator();
+    for (index, case) in untag_cases().into_iter().enumerate() {
+        let expected = sorted(&case.expected);
+        let namespace = format!("untag-ns-{index}");
+        let workgroup = format!("untag-wg-{index}");
+        let snapshot = format!("untag-snap-{index}");
+        let created = Some(tag_list(&case.created));
+
+        let created_namespace = create_namespace_with(
+            &router,
+            case.region,
+            &namespace,
+            created.clone(),
+            case.label,
+        )
+        .await;
+        let created_workgroup = create_workgroup_with(
+            &router,
+            case.region,
+            &workgroup,
+            &namespace,
+            created.clone(),
+            case.label,
+        )
+        .await;
+        let created_snapshot = create_snapshot_with(
+            &router,
+            case.region,
+            &snapshot,
+            &namespace,
+            created.clone(),
+            case.label,
+        )
+        .await;
+
+        // Every taggable resource kind takes the removal the same way.
+        let arns = [
+            ("namespace", text(&created_namespace, "namespaceArn")),
+            ("workgroup", text(&created_workgroup, "workgroupArn")),
+            ("snapshot", text(&created_snapshot, "snapshotArn")),
+        ];
+        for (kind, arn) in &arns {
+            let case_name = format!("{} / {kind}", case.label);
+            untag_resource(&router, case.region, arn, &case.removed, &case_name).await;
+            let listed = list_tags(&router, case.region, arn, &case_name).await;
+            assert_eq!(
+                listed, expected,
+                "case {case_name}: expected the remaining set {expected:?}, got {listed:?}"
+            );
+
+            // Removing the same keys again is the same state: there is nothing left of
+            // them to remove.
+            untag_resource(&router, case.region, arn, &case.removed, &case_name).await;
+            let again = list_tags(&router, case.region, arn, &case_name).await;
+            assert_eq!(
+                again, expected,
+                "case {case_name}: removing the same keys again must leave {expected:?}, \
+                 got {again:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_removed_key_can_be_attached_again() {
+    let router = emulator();
+    let created = vec![
+        ("env".to_string(), "staging".to_string()),
+        ("team".to_string(), "data".to_string()),
+    ];
+    let namespace = create_namespace_with(
+        &router,
+        "us-east-1",
+        "round-trip-ns",
+        Some(tag_list(&created)),
+        "re-attached",
+    )
+    .await;
+    let arn = text(&namespace, "namespaceArn");
+
+    untag_resource(
+        &router,
+        "us-east-1",
+        &arn,
+        &["env".to_string()],
+        "re-attached",
+    )
+    .await;
+    let after_removal = list_tags(&router, "us-east-1", &arn, "re-attached").await;
+    assert_eq!(
+        after_removal,
+        sorted(&created[1..]),
+        "case re-attached: expected {:?} after the removal, got {after_removal:?}",
+        sorted(&created[1..])
+    );
+
+    // The key comes back with the value the new write gives it, not the one it had.
+    let re_attached = vec![("env".to_string(), "prod".to_string())];
+    tag_resource(&router, "us-east-1", &arn, &re_attached, "re-attached").await;
+    let expected = sorted(&[re_attached[0].clone(), created[1].clone()]);
+    let listed = list_tags(&router, "us-east-1", &arn, "re-attached").await;
+    assert_eq!(
+        listed, expected,
+        "case re-attached: expected {expected:?}, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn untagging_one_resource_leaves_every_other_resource_alone() {
+    let router = emulator();
+    // Three resources in ONE store, each created with the SAME two keys, so a removal
+    // that reached the wrong record — or more than one — cannot pass.
+    let created = vec![
+        ("env".to_string(), "staging".to_string()),
+        ("team".to_string(), "data".to_string()),
+    ];
+    let request_tags = Some(tag_list(&created));
+
+    let namespace = create_namespace_with(
+        &router,
+        "us-east-1",
+        "untag-only-ns",
+        request_tags.clone(),
+        "isolation",
+    )
+    .await;
+    let workgroup = create_workgroup_with(
+        &router,
+        "us-east-1",
+        "untag-only-wg",
+        "untag-only-ns",
+        request_tags.clone(),
+        "isolation",
+    )
+    .await;
+    let snapshot = create_snapshot_with(
+        &router,
+        "us-east-1",
+        "untag-only-snap",
+        "untag-only-ns",
+        request_tags.clone(),
+        "isolation",
+    )
+    .await;
+
+    let rows = [
+        ("namespace", text(&namespace, "namespaceArn")),
+        ("workgroup", text(&workgroup, "workgroupArn")),
+        ("snapshot", text(&snapshot, "snapshotArn")),
+    ];
+    let mut untagged_so_far: Vec<&str> = Vec::new();
+    for (untagged_kind, untagged_arn) in &rows {
+        let case = format!("after untagging the {untagged_kind}");
+        untag_resource(
+            &router,
+            "us-east-1",
+            untagged_arn,
+            &["env".to_string()],
+            &case,
+        )
+        .await;
+        untagged_so_far.push(untagged_kind);
+
+        for (kind, arn) in &rows {
+            let case = format!("{case} / reading the {kind}");
+            let expected = if untagged_so_far.contains(kind) {
+                sorted(&created[1..])
+            } else {
+                sorted(&created)
+            };
+            let listed = list_tags(&router, "us-east-1", arn, &case).await;
+            assert_eq!(
+                listed, expected,
+                "case {case}: expected {expected:?}, got {listed:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4, continued — an UntagResource whose ARN resolves to nothing is the
+// modelled ResourceNotFoundException, and removes nothing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn untag_resource_refuses_an_arn_that_resolves_to_no_resource() {
+    let router = emulator();
+    let held = vec![
+        ("env".to_string(), "staging".to_string()),
+        ("team".to_string(), "data".to_string()),
+    ];
+    let namespace = create_namespace_with(
+        &router,
+        "us-east-1",
+        "untag-write-ns",
+        Some(tag_list(&held)),
+        "setup",
+    )
+    .await;
+    let real_namespace_id = text(&namespace, "namespaceId");
+    let namespace_arn = text(&namespace, "namespaceArn");
+
+    // A namespace that existed and was deleted: its ARN resolved a moment ago.
+    let doomed = create_namespace_with(
+        &router,
+        "us-east-1",
+        "doomed-untag-ns",
+        Some(tag_list(&held)),
+        "setup",
+    )
+    .await;
+    let doomed_arn = text(&doomed, "namespaceArn");
+    let (status, body) = call(
+        &router,
+        "DeleteNamespace",
+        json!({ "namespaceName": "doomed-untag-ns" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DeleteNamespace doomed-untag-ns expected 200, got {status} with {body}"
+    );
+
+    // A UUID the emulator minted for nothing.
+    let absent_id = "1b7d4e52-0a93-4f61-9c28-6e5a3d1f7b40";
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a namespace id that names nothing",
+            format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:namespace/{absent_id}"),
+        ),
+        (
+            "a snapshot id that names nothing",
+            format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:snapshot/{absent_id}"),
+        ),
+        (
+            "a real namespace id under the wrong resource kind",
+            format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:workgroup/{real_namespace_id}"),
+        ),
+        (
+            "a real namespace id in another account",
+            format!(
+                "arn:aws:redshift-serverless:us-east-1:999999999999:namespace/{real_namespace_id}"
+            ),
+        ),
+        (
+            "a real namespace id in another Region",
+            format!(
+                "arn:aws:redshift-serverless:eu-central-1:{ACCOUNT}:namespace/{real_namespace_id}"
+            ),
+        ),
+        (
+            "a real namespace id in another partition",
+            format!(
+                "arn:aws-us-gov:redshift-serverless:us-gov-west-1:{ACCOUNT}:namespace/\
+                 {real_namespace_id}"
+            ),
+        ),
+        ("a value that is no ARN at all", "not-an-arn".to_string()),
+        ("the ARN of a deleted namespace", doomed_arn),
+    ];
+
+    for (label, resource_arn) in &cases {
+        let case = format!("{label} ({resource_arn})");
+        let (status, body) =
+            untag_resource_call(&router, "us-east-1", resource_arn, &["env".to_string()]).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case}: got {status} with {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(format!("Resource {resource_arn} not found.")),
+            "case {case}: got {:?}",
+            body["message"]
+        );
+        assert_eq!(
+            body["resourceName"],
+            json!(resource_arn),
+            "case {case}: resourceName names the resource that was not found, got {:?}",
+            body["resourceName"]
+        );
+    }
+
+    // None of those refusals removed anything: the one resource that does exist still
+    // carries the whole set its create carried.
+    let listed = list_tags(&router, "us-east-1", &namespace_arn, "after the refusals").await;
+    assert_eq!(
+        listed,
+        sorted(&held),
+        "case after the refusals: expected {:?}, got {listed:?}",
+        sorted(&held)
+    );
+
+    // And the ARN that DOES resolve is served, so the refusals are about the ARN
+    // resolving to nothing and not about the request's shape.
+    untag_resource(
+        &router,
+        "us-east-1",
+        &namespace_arn,
+        &["env".to_string()],
+        "the ARN that resolves",
+    )
+    .await;
+    let listed = list_tags(&router, "us-east-1", &namespace_arn, "the ARN that resolves").await;
+    assert_eq!(
+        listed,
+        sorted(&held[1..]),
+        "case the ARN that resolves: expected {:?}, got {listed:?}",
+        sorted(&held[1..])
     );
 }

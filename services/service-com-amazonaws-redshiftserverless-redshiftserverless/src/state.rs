@@ -436,6 +436,16 @@ pub fn upsert_tags(stored: &mut Vec<Tag>, submitted: Vec<Tag>) {
     }
 }
 
+/// Remove every key `keys` names from `stored`, keeping every other key exactly as it
+/// was: an untagging call is stated over "the tag or set of tags to remove from the
+/// resource" (`UntagResourceRequest$tagKeys`) and says nothing about the keys it does not
+/// name. A key the resource does not carry is nothing to remove rather than a failure, so
+/// removing the same key twice leaves the same set — the same map reading as
+/// [`upsert_tags`].
+pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
+    stored.retain(|held| !keys.contains(&held.key));
+}
+
 /// `arn:aws:redshift-serverless:<region>:<account>:namespace/<namespaceId>`.
 pub fn namespace_arn(region: &str, namespace_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("namespace/{namespace_id}"))

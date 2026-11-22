@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the submitted tag keys from the tags STORED for the resource
+//! `resourceArn` resolves to — a key the resource carries is dropped, a key it does not
+//! carry leaves the set alone, and every key the request does not name is kept — so a
+//! later `ListTagsForResource` reports what is left. An ARN that names no resource of
+//! this account in this Region is refused with the modelled `ResourceNotFoundException`
+//! ([`crate::state::tagged_resource_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +138,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let resource_arn = input.resource_arn;
+        // The write reaches the record the ARN resolves to, which is the record every
+        // later read projects from; an ARN of another account, Region or partition
+        // resolves to nothing here exactly as it does for a read.
+        let Some(stored) = state.tags_for_resource_arn_mut(&resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::tagged_resource_not_found(&resource_arn),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Removing "a tag or set of tags" is stated over the keys the request names and
+        // says nothing about the rest, so a key the resource does not carry is nothing to
+        // remove rather than a failure, and a repeated key removes the same one key.
+        crate::state::remove_tags(stored, &input.tag_keys);
+
+        Ok(UntagResourceOutput {})
     }
 }
