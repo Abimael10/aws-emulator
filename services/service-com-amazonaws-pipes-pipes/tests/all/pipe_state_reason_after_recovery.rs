@@ -27,7 +27,9 @@ use service_com_amazonaws_pipes_pipes::state::TRANSIENT_PIPE_STATES;
 use service_com_amazonaws_pipes_pipes::state::USER_INITIATED_STATE_REASON;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pipe_bring_up::{create_pipe, delete_queue, every_call, settled};
+use crate::pipe_bring_up::{
+    create_pipe, delete_queue, every_call, settled, FAILED_RECEIVE_MESSAGE_ON_SQS,
+};
 use crate::pipe_data_plane::given_queue;
 use crate::pipe_lifecycle::{call, describe, list, Reply, REGION};
 use crate::pipe_listing_state_reason::{
@@ -207,7 +209,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             case: "reason-restarted-after-create",
             failed: Failed::CreateWithSourceGone,
             failed_state: CREATE_FAILED,
-            failure_mentions: &["does not exist"],
+            failure_mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
             recovery: Recovery::Start,
             transient: Some(STARTING),
             rests_in: RUNNING,
@@ -315,10 +317,9 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             failed.member("StateReason")
         );
         let failure_reason = Reason::Failure {
-            // Only the failure the SOURCE RESOURCE caused names the source: the sentence a
-            // role without the source read leaves names the CALL it may not make.
-            source_arn: matches!(row.failed, Failed::CreateWithSourceGone)
-                .then(|| source_arn.clone()),
+            // No failure of a move names a resource: a source the pipe could not reach is
+            // reported as what became of the CALL that takes its records — one the role may
+            // not make, or one that could not be carried out.
             mentions: row.failure_mentions,
         };
         assert_reason(

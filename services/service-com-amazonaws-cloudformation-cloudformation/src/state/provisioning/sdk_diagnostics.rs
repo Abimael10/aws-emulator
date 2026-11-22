@@ -1064,6 +1064,18 @@ pub(super) const SERVER_ERROR_STATUS: u16 = 500;
 /// under, whatever the code itself reads like.
 pub(crate) const HANDLER_ERROR_SERVICE_FAILED: &str = "GeneralServiceException";
 
+/// The class a provider reports a resource THAT DID NOT STABILIZE under: the owning service
+/// accepted the call and then settled the resource somewhere the provider does not serve it
+/// from, which is the condition the resource-provider plugin has this `HandlerErrorCode` of
+/// its own for.
+///
+/// It is not a code any AWS service answers, so it is never mistaken for one of theirs, and it
+/// is a provider's class rather than this algorithm's: which of the two classes a provider
+/// reports a resource it could not bring up under is stated per type beside the rest of the
+/// per-type half of provisioning
+/// ([`crate::state::provisioner::Provisioner::reported_failure_class`]).
+pub(crate) const HANDLER_ERROR_NOT_STABILIZED: &str = "NotStabilized";
+
 /// The `HandlerErrorCode` an owning service's refusal is reported under — see
 /// [`HANDLER_ERROR_CLASSES`].
 ///
@@ -1151,9 +1163,14 @@ pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &R
 /// envelope is built from the same parts, and a client classifying the failure reads one shape
 /// however the provider arrived at it.
 ///
-/// The class is [`HANDLER_ERROR_SERVICE_FAILED`]: nothing about the request was wrong — the
-/// owning service ACCEPTED the call and then could not bring the resource up — which is what
-/// that class says of a provider whose own service failed it.
+/// The class is the PROVIDER's own classification of what it reported: a provider whose
+/// report is that the resource did not stabilize puts it in the plugin's class for exactly
+/// that ([`HANDLER_ERROR_NOT_STABILIZED`]), while one that passes on the owning service's own
+/// failure to bring an accepted resource up puts it in the class for a service that failed
+/// ([`HANDLER_ERROR_SERVICE_FAILED`]) — nothing about the request was wrong either way. Which
+/// of the two a type's provider reports is that provider's and cannot be derived from the
+/// resource, so it is stated per type
+/// ([`crate::state::provisioner::Provisioner::reported_failure_class`]).
 ///
 /// A type CloudFormation provisions ITSELF, and one backed by a provider of the client's own
 /// (a custom resource, whose answer carries no provider CloudFormation stands behind), has no
@@ -1171,10 +1188,16 @@ pub(in crate::state) fn handler_reported_failure_reason(
     if !owner.is_some_and(Owner::reported_by_a_resource_provider) {
         return reported.to_string();
     }
+    // The guard above answered for every type with no provider to quote, so what is left is a
+    // provider's own report and its own classification of it.
+    let Some(owner) = owner else {
+        return reported.to_string();
+    };
+    let class = owner.reported_failure_class();
     // Minted here for the reason [`handler_failure_reason`] records: this is where the resource
     // request ends, and the token reported is that request's own.
     let token = crate::state::new_request_id();
-    quoted_provider_message(reported, &token, HANDLER_ERROR_SERVICE_FAILED)
+    quoted_provider_message(reported, &token, class)
 }
 
 /// One provider's answer in the envelope CloudFormation reports a resource provider's answer

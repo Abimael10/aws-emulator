@@ -1808,9 +1808,10 @@ pub(crate) const ENVIRONMENT_TERMINATION_CHECKS: usize = 240;
 /// The code a refusal carries where a resource the owning service ACCEPTED the delete of
 /// had not reached the deleted state by the time the bounded wait ran out:
 /// CloudFormation's own resource-provider handler code for a resource that did not
-/// stabilize. It is not a code any AWS service answers, so it is never mistaken for one
-/// of theirs.
-pub(crate) const NOT_STABILIZED: &str = "NotStabilized";
+/// stabilize, which is stated once for the whole crate
+/// ([`crate::state::provisioning::HANDLER_ERROR_NOT_STABILIZED`]). It is not a code any AWS
+/// service answers, so it is never mistaken for one of theirs.
+pub(crate) const NOT_STABILIZED: &str = crate::state::provisioning::HANDLER_ERROR_NOT_STABILIZED;
 
 /// Terminate the environment a stack created, addressed by its name — this resource's
 /// physical id — and wait until Elastic Beanstalk no longer holds it among the live

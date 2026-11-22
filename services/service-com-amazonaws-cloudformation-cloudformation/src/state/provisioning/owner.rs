@@ -1751,6 +1751,18 @@ impl Owner {
         !matches!(self, Self::NestedStack | Self::ElbListenerCertificate)
     }
 
+    /// Which `HandlerErrorCode` class this type's provider reports a resource it could NOT
+    /// BRING UP under — see
+    /// [`Provisioner::reported_failure_class`](super::provisioner::Provisioner::reported_failure_class).
+    pub(super) fn reported_failure_class(self) -> &'static str {
+        match self {
+            Self::Builtin(provisioner) => provisioner.reported_failure_class(),
+            // Every other provider here passes on the owning service's own failure to bring
+            // the accepted resource up, which is the class that says a service failed.
+            _ => super::HANDLER_ERROR_SERVICE_FAILED,
+        }
+    }
+
     /// Which `HandlerErrorCode` class this type's provider puts a refusal carrying `code`
     /// in — see
     /// [`Provisioner::handler_error_class`](super::provisioner::Provisioner::handler_error_class).

@@ -31,7 +31,9 @@ use service_com_amazonaws_pipes_pipes::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pipe_bring_up::{create_pipe, delete_queue, every_call, reason_says, settled};
+use crate::pipe_bring_up::{
+    create_pipe, delete_queue, every_call, reason_says, settled, FAILED_RECEIVE_MESSAGE_ON_SQS,
+};
 use crate::pipe_data_plane::given_queue;
 use crate::pipe_lifecycle::{
     call, create, list, minimal_body, required_source_parameters, router, REGION,
@@ -57,10 +59,8 @@ pub(crate) enum Reason {
     /// pipe there.
     PollerIdle,
     /// A move that could not be completed: the sentence carries `mentions`, saying what
-    /// stopped it, and names `source_arn` where it is about the source resource rather than
-    /// about the call the pipe's role may not make.
+    /// stopped it.
     Failure {
-        source_arn: Option<String>,
         mentions: &'static [&'static str],
     },
 }
@@ -91,19 +91,11 @@ pub(crate) fn assert_reason(case: &str, read: &str, reported: Option<&str>, expe
              {NO_RECORDS_PROCESSED_STATE_REASON} for a pipe running over a stream whose \
              records it has processed none of, got {reason:?}"
         ),
-        Reason::Failure {
-            source_arn,
-            mentions,
-        } => {
-            // The failure sentence's own reading — it names the source, says what stopped
-            // the move and stays within the member's bound — is `tests/all/pipe_bring_up.rs`
-            // ONE reading of it, so this suite asserts no second version of it.
-            reason_says(
-                &format!("{case} as {read} reports it"),
-                reason,
-                source_arn.as_deref(),
-                mentions,
-            );
+        Reason::Failure { mentions } => {
+            // The failure sentence's own reading — it says what stopped the move and stays
+            // within the member's bound — is `tests/all/pipe_bring_up.rs`' ONE reading of it,
+            // so this suite asserts no second version of it.
+            reason_says(&format!("{case} as {read} reports it"), reason, mentions);
             assert_ne!(
                 reason, USER_INITIATED_STATE_REASON,
                 "case {case:?}: a move that could not be completed must not be reported as \
@@ -298,8 +290,9 @@ async fn every_listing_reports_the_reason_each_listed_pipe_reached_its_state_by(
             case: create_failed,
             state: CREATE_FAILED,
             reason: Reason::Failure {
-                source_arn: Some(gone_source),
-                mentions: &["does not exist"],
+                // The sentence a source its owner no longer holds leaves names the CALL that
+                // could not be carried out and no resource at all.
+                mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
             },
         },
         Listed {
@@ -308,7 +301,6 @@ async fn every_listing_reports_the_reason_each_listed_pipe_reached_its_state_by(
             reason: Reason::Failure {
                 // The sentence a role without the source read leaves names the CALL it may
                 // not make and no resource at all.
-                source_arn: None,
                 mentions: &["ReceiveMessage on SQS"],
             },
         },

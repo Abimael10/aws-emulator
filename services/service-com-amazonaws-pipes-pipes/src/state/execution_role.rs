@@ -127,6 +127,25 @@ pub fn source_read_failure_reason(api_action: &str, service: &str) -> String {
     ))
 }
 
+/// The sentence a pipe reports as its `StateReason` when the call that TAKES THE RECORDS from
+/// its source could not be CARRIED OUT at all — the source stage made it and it did not
+/// succeed, which is what a source the service that owns it does not hold comes to: WHICH call
+/// failed, which is the only variable part.
+///
+/// `api_action` is the name of that API action and `service` the service it is called on
+/// ([`super::data_plane::SourceRead`]), exactly as for a call the role may not make
+/// ([`source_read_failure_reason`]). The sentence says nothing about WHY the call could not be
+/// carried out — a resource that is not there, one that was taken away — because what the pipe
+/// reports is the call that failed.
+///
+/// Bounded by [`STATE_REASON_LENGTH_MAX`] like every other sentence that member carries.
+pub fn source_read_error_reason(api_action: &str, service: &str) -> String {
+    within_the_reason_bound(format!(
+        "Input parameter is invalid from the request due to : Error occurs while {api_action} \
+         on {service}"
+    ))
+}
+
 /// `reason` cut to [`STATE_REASON_LENGTH_MAX`], so a sentence built from the values a
 /// request named is always a legal value of the member that carries it however long those
 /// values are.

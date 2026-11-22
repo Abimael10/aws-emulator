@@ -25,10 +25,11 @@
 //! `tests/all/pipe_unassumable_role.rs` is the trust document's own table — the first thing
 //! this rule reads — and carries the rows that generalise over what a trust document says.
 //!
-//! The last table is the TEXT of what a pipe reports when the call that takes its source's
-//! records is the one its role is missing: the two tables above assert where such a move
-//! lands, and that one asserts the sentence, over the source kinds that decide which call is
-//! named.
+//! The last two tables are the TEXT of what a pipe reports when it could not reach its source
+//! at all: one for the call that takes its source's records being the one its role is missing,
+//! and one for that same call being one that could not be CARRIED OUT, because the source is a
+//! resource its owner does not hold. The two tables above assert where such a move lands;
+//! those two assert the sentence, over the source kinds that decide which call is named.
 
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,19 @@ const BODY_TEMPLATE: &str = "<$.body>";
 /// by the sentence table at the end of this file; the two tables above assert only that the
 /// sentence a failed move left names that call.
 const RECEIVE_MESSAGE_ON_SQS: &str = "ReceiveMessage on SQS";
+
+/// The whole sentence a pipe reports when the call that takes its Amazon SQS source's records
+/// could not be CARRIED OUT at all — the source is no resource that service holds. Fixed text
+/// of that failure class, naming only the call and the service it is made on, so a row asserts
+/// the sentence in full rather than a fragment of it.
+///
+/// `pub(crate)` because `tests/all/pipe_listing_state_reason.rs` and
+/// `tests/all/pipe_state_reason_after_recovery.rs` read the same sentence off the pipes they
+/// break the source of; [`the_reason_a_source_nobody_holds_leaves_names_that_call`], the last
+/// table of this file, is its own table, over the source kinds that decide which call is named.
+pub(crate) const FAILED_RECEIVE_MESSAGE_ON_SQS: &str = "Input parameter is invalid from the \
+                                                       request due to : Error occurs while \
+                                                       ReceiveMessage on SQS";
 
 /// The ARN form Amazon SQS gives a queue of this account and Region, for the row whose
 /// source queue is never created at all: there is no `CreateQueue` answer to read one off.
@@ -182,20 +196,12 @@ async fn publishes_nothing(router: &MultiServiceRouter, case: &str, name: &str) 
     }
 }
 
-/// Assert the `StateReason` of a failed move carries `mentions` — and names the source, for a
-/// failure whose sentence is about the source RESOURCE (`source_arn`) rather than about the
-/// call the pipe's role may not make — within the bound the member that reports it has.
+/// Assert the `StateReason` of a failed move carries `mentions`, within the bound the member
+/// that reports it has.
 ///
 /// `pub(crate)` because `tests/all/pipe_listing_state_reason.rs` reads the failure sentence a
 /// LISTING reports the same way: one reading of what that sentence has to say.
-pub(crate) fn reason_says(case: &str, reason: &str, source_arn: Option<&str>, mentions: &[&str]) {
-    if let Some(source_arn) = source_arn {
-        assert!(
-            reason.contains(source_arn),
-            "case {case:?}: expected the StateReason to name the source {source_arn}, got \
-             {reason:?}"
-        );
-    }
+pub(crate) fn reason_says(case: &str, reason: &str, mentions: &[&str]) {
     for mention in mentions {
         assert!(
             reason.contains(mention),
@@ -229,9 +235,6 @@ struct Row {
     settles_in: &'static str,
     /// Text the settled `StateReason` has to carry.
     reason_mentions: &'static [&'static str],
-    /// Whether that sentence NAMES the source: it is about the source resource rather than
-    /// about the call the pipe's role may not make.
-    names_source: bool,
     /// Whether the pipe, having been brought up, must move its record to its target.
     delivers: bool,
 }
@@ -271,8 +274,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             policy: every_call,
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
-            reason_mentions: &["does not exist"],
-            names_source: true,
+            reason_mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
             delivers: false,
         },
         Row {
@@ -285,8 +287,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             policy: every_call,
             desired_state: Some(STOPPED),
             settles_in: CREATE_FAILED,
-            reason_mentions: &["does not exist"],
-            names_source: true,
+            reason_mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
             delivers: false,
         },
         Row {
@@ -299,7 +300,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
             reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
-            names_source: false,
             delivers: false,
         },
         Row {
@@ -325,7 +325,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
             reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
-            names_source: false,
             delivers: false,
         },
         Row {
@@ -351,7 +350,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: None,
             settles_in: CREATE_FAILED,
             reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
-            names_source: false,
             delivers: false,
         },
         Row {
@@ -370,7 +368,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: None,
             settles_in: RUNNING,
             reason_mentions: &[],
-            names_source: false,
             delivers: false,
         },
         Row {
@@ -388,7 +385,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: None,
             settles_in: RUNNING,
             reason_mentions: &[],
-            names_source: false,
             delivers: true,
         },
         Row {
@@ -408,7 +404,6 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(RUNNING),
             settles_in: RUNNING,
             reason_mentions: &[],
-            names_source: false,
             delivers: false,
         },
     ];
@@ -483,12 +478,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
         );
         let reason = reported.string("StateReason");
         if entry.row.settles_in == CREATE_FAILED {
-            reason_says(
-                case,
-                &reason,
-                entry.row.names_source.then_some(entry.source_arn.as_str()),
-                entry.row.reason_mentions,
-            );
+            reason_says(case, &reason, entry.row.reason_mentions);
         } else {
             // A move that COULD be completed leaves the user-initiated reason its caller
             // drove it with.
@@ -570,8 +560,6 @@ struct Move {
     settles_in: &'static str,
     /// Text the settled `StateReason` has to carry.
     reason_mentions: &'static [&'static str],
-    /// Whether that sentence NAMES the source ([`Row::names_source`]).
-    names_source: bool,
 }
 
 /// RULE: the same reading holds for every LATER lifecycle call that puts a pipe on its way to
@@ -589,8 +577,7 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             broken: Break::SourceDeleted,
             starts: true,
             settles_in: START_FAILED,
-            reason_mentions: &["does not exist"],
-            names_source: true,
+            reason_mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
         },
         Move {
             case: "start-after-the-source-read-was-withdrawn",
@@ -598,7 +585,6 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             starts: true,
             settles_in: START_FAILED,
             reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
-            names_source: false,
         },
         Move {
             case: "update-onto-a-role-that-may-not-read-the-source",
@@ -606,15 +592,13 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             starts: false,
             settles_in: UPDATE_FAILED,
             reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
-            names_source: false,
         },
         Move {
             case: "update-after-the-source-was-deleted",
             broken: Break::SourceDeleted,
             starts: false,
             settles_in: UPDATE_FAILED,
-            reason_mentions: &["does not exist"],
-            names_source: true,
+            reason_mentions: &[FAILED_RECEIVE_MESSAGE_ON_SQS],
         },
     ];
 
@@ -705,12 +689,7 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             row.settles_in,
             reported.member("StateReason")
         );
-        reason_says(
-            case,
-            &reported.string("StateReason"),
-            row.names_source.then_some(source_arn.as_str()),
-            row.reason_mentions,
-        );
+        reason_says(case, &reported.string("StateReason"), row.reason_mentions);
 
         // And the pipe ran nothing: its target receives nothing over the whole window — the
         // invariant is watched through it rather than decided after it — and the record it
@@ -1127,6 +1106,188 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             expected,
             "case {case:?}: expected the StateReason {expected:?}, got {:?}",
             reported.string("StateReason")
+        );
+    }
+}
+
+/// The sentence a pipe reports as its `StateReason` when the call that takes its source's
+/// records could not be CARRIED OUT at all: the fixed text of this failure class, with the API
+/// action and the service that call is made to as its only variable parts.
+///
+/// Written out here rather than read from the crate, so a row asserts the TEXT a client reads
+/// and not merely that it equals whatever the crate happens to build.
+fn failed_source_read_reason(api_action: &str, service: &str) -> String {
+    format!(
+        "Input parameter is invalid from the request due to : Error occurs while {api_action} \
+         on {service}"
+    )
+}
+
+/// The ARN form Amazon Kinesis gives a data stream of this account and Region
+/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`, the form that service's own
+/// `StreamARN` carries), for a row whose source stream is never created: there is no
+/// `CreateStream` answer to read one off.
+fn unheld_stream_arn(name: &str) -> String {
+    format!(
+        "arn:aws:kinesis:{REGION}:{}:stream/{name}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The ARN form Amazon DynamoDB gives the stream of a table of this account and Region
+/// (`arn:<partition>:dynamodb:<region>:<account>:table/<name>/stream/<label>`, the form a
+/// table's own `LatestStreamArn` carries), for a row whose source stream is never created.
+fn unheld_table_stream_arn(name: &str) -> String {
+    format!(
+        "arn:aws:dynamodb:{REGION}:{}:table/{name}/stream/2026-01-01T00:00:00.000",
+        engine::emulator_account_id()
+    )
+}
+
+/// How a row's `Source` comes to name a resource the service that owns it does not hold.
+#[derive(Clone, Copy)]
+enum Unreachable {
+    /// A queue created the way a client creates one and then DELETED, so the `Source` keeps the
+    /// ARN that service answered with while the resource it names is gone.
+    TakenAway,
+    /// A resource that was never created at all: the ARN is written in the form the service
+    /// that owns such a resource mints one in.
+    NeverThere(fn(&str) -> String),
+}
+
+/// One row of the unreachable-source table: how its source comes to be absent, the
+/// `SourceParameters` a pipe reading a source of that kind carries, and the call the pipe has
+/// to report as the one that failed.
+struct Unreached {
+    case: &'static str,
+    unreachable: Unreachable,
+    parameters: fn() -> Value,
+    /// The name of the API action, and the service it is called on, that the pipe has to report
+    /// as the call that could not be carried out.
+    api_action: &'static str,
+    service: &'static str,
+}
+
+/// RULE: a pipe whose `Source` names a resource the service that owns it does not hold cannot
+/// be brought up, and what it reports is the call that TAKES THE RECORDS from a source of that
+/// kind and nothing else — the name of the API action and the service it is made to, in the
+/// fixed wording of that failure class ([`failed_source_read_reason`]) — interpolating nothing
+/// of the request: no source ARN, no role, no resource name.
+///
+/// The rows differ along what the rule generalises over: the KIND of source (an Amazon SQS
+/// queue, a DynamoDB table stream, a Kinesis data stream), which decides the call that is
+/// named, and HOW the source comes to be absent (a resource taken away after the pipe was
+/// given its ARN, one that was never there at all), which changes nothing about the sentence.
+///
+/// The create table above asserts where such a creation LANDS and that the pipe then runs
+/// nothing; this one asserts the exact text, which is what a client branching on a failure
+/// class reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reason_a_source_nobody_holds_leaves_names_that_call() {
+    let rows = [
+        Unreached {
+            case: "unreachable-queue-taken-away",
+            unreachable: Unreachable::TakenAway,
+            parameters: || json!({ "SqsQueueParameters": { "BatchSize": 1 } }),
+            api_action: "ReceiveMessage",
+            service: "SQS",
+        },
+        Unreached {
+            case: "unreachable-queue-never-there",
+            unreachable: Unreachable::NeverThere(unheld_queue_arn),
+            parameters: || json!({ "SqsQueueParameters": { "BatchSize": 1 } }),
+            api_action: "ReceiveMessage",
+            service: "SQS",
+        },
+        Unreached {
+            case: "unreachable-table-stream",
+            unreachable: Unreachable::NeverThere(unheld_table_stream_arn),
+            parameters: || json!({ "DynamoDBStreamParameters": { "StartingPosition": "LATEST" } }),
+            api_action: "GetRecords",
+            service: "DynamoDB",
+        },
+        Unreached {
+            case: "unreachable-data-stream",
+            unreachable: Unreachable::NeverThere(unheld_stream_arn),
+            parameters: || json!({ "KinesisStreamParameters": { "StartingPosition": "LATEST" } }),
+            api_action: "GetRecords",
+            service: "Kinesis",
+        },
+    ];
+
+    // A CONSTANTS-IN-SYNC guard, not a check on the emulator: the tables above look for this
+    // whole sentence for a queue source, and this is what keeps the two statements of it the
+    // same text, so editing one and not the other fails here rather than quietly leaving those
+    // tables looking for text no pipe reports.
+    assert_eq!(
+        failed_source_read_reason("ReceiveMessage", "SQS"),
+        FAILED_RECEIVE_MESSAGE_ON_SQS,
+        "expected the queue rows' sentence to be the one the tables above look for"
+    );
+
+    let router = emulator_over_every_source();
+    // Every row's pipe is created first, so the rows' settle spans overlap instead of being
+    // paid one after another.
+    let mut created: Vec<(&Unreached, String)> = Vec::new();
+    for row in &rows {
+        let case = row.case;
+        let (_target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+        let source_arn = match row.unreachable {
+            Unreachable::TakenAway => {
+                let (url, arn) = given_queue(&router, &format!("{case}-src")).await;
+                delete_queue(&router, case, &url).await;
+                arn
+            }
+            Unreachable::NeverThere(mint) => mint(&format!("{case}-src")),
+        };
+        // A role that may make every call on everything: what a row is about is the SOURCE
+        // being absent, so nothing the role withholds can be what the pipe reports.
+        let role = given_role_stating(
+            &router,
+            &format!("{case}-role"),
+            SERVICE_PRINCIPAL,
+            every_resource(),
+        )
+        .await;
+        let answered = create_pipe_reading(
+            &router,
+            case,
+            &source_arn,
+            &(row.parameters)(),
+            &target_arn,
+            &role,
+            RUNNING,
+        )
+        .await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            answered.status, answered.body
+        );
+        created.push((row, source_arn));
+    }
+
+    for (row, source_arn) in &created {
+        let case = row.case;
+        let reported = settled(&router, case, case).await;
+        let state = reported.string("CurrentState");
+        assert_eq!(
+            state, CREATE_FAILED,
+            "case {case:?}: expected the creation to settle in {CREATE_FAILED}, it reports \
+             {state} reason={:?}",
+            reported.member("StateReason")
+        );
+        let reason = reported.string("StateReason");
+        let expected = failed_source_read_reason(row.api_action, row.service);
+        assert_eq!(
+            reason, expected,
+            "case {case:?}: expected the StateReason {expected:?}, got {reason:?}"
+        );
+        // ...and nothing of the request is in it: the sentence is the class's own fixed text.
+        assert!(
+            !reason.contains(source_arn.as_str()),
+            "case {case:?}: expected the StateReason to interpolate nothing of the request, it \
+             names the source {source_arn}: {reason:?}"
         );
     }
 }

@@ -140,15 +140,21 @@ fn source_read_refusal<Eng: Send + Sync + 'static>(
 
 /// Why the source `source` names cannot be polled because it is not there, or `None` when
 /// the service that owns it does not say so.
+///
+/// What the pipe REPORTS for it is the call that TAKES THE RECORDS and nothing else
+/// ([`super::execution_role::source_read_error_reason`]): a source the service that owns it
+/// does not hold is that call being made and not succeeding, and the sentence names the call
+/// rather than the resource it was made on — so the two ways a pipe cannot poll its source at
+/// all, a call its role may not make and a call that failed, are each stated as what became of
+/// that one call.
 async fn absent_source_refusal(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     source: &str,
 ) -> Option<String> {
+    // The same one table the permission check reads the call off, so a source kind cannot be
+    // reported for by one of them and not the other.
+    let read = super::data_plane::source_read_call(source)?;
     super::data_plane::source_is_absent(ctx.callback(), source)
         .await
-        .then(|| {
-            super::execution_role::within_the_reason_bound(format!(
-                "Pipes cannot poll the source {source}: it does not exist."
-            ))
-        })
+        .then(|| super::execution_role::source_read_error_reason(read.api, read.service))
 }

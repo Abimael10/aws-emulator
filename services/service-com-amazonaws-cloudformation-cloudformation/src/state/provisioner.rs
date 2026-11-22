@@ -3090,6 +3090,32 @@ impl Provisioner {
         message.to_string()
     }
 
+    /// Which `HandlerErrorCode` class this type's provider reports a resource it could NOT
+    /// BRING UP under — a resource whose owning service accepted the call and then settled it
+    /// somewhere the provider does not serve the resource from
+    /// ([`super::provisioning::handler_reported_failure_reason`]).
+    ///
+    /// Nothing about the request was wrong in either class, so what separates them is what the
+    /// PROVIDER reported: a provider that gives up on a resource with its own account of a
+    /// resource that DID NOT STABILIZE classifies it as exactly that
+    /// ([`super::provisioning::HANDLER_ERROR_NOT_STABILIZED`]), while one that passes on the
+    /// owning service's own failure reports it under the class for a service that failed
+    /// ([`super::provisioning::HANDLER_ERROR_SERVICE_FAILED`]). Which of the two a type's
+    /// provider does is that provider's own and cannot be derived from the sentence it worded,
+    /// so it is stated per type here beside the rest of the per-type half of provisioning.
+    ///
+    /// `AWS::Pipes::Pipe` is the first kind: its provider holds the pipe open until EventBridge
+    /// Pipes reports it resting and reports a pipe that service settled in one of its FAILED
+    /// states as one that did not stabilize ([`event_pipes::readiness`]), which is the class the
+    /// recorded reason of such a resource carries. A type not named below reports the class for
+    /// a service that failed.
+    pub(super) fn reported_failure_class(self) -> &'static str {
+        if matches!(self, Self::PipesPipe) {
+            return super::provisioning::HANDLER_ERROR_NOT_STABILIZED;
+        }
+        super::provisioning::HANDLER_ERROR_SERVICE_FAILED
+    }
+
     /// Which `HandlerErrorCode` class this type's provider puts a refusal carrying `code` in,
     /// where that is NOT the class the code itself falls in
     /// ([`super::provisioning::handler_error_code`] computes `classified`).
