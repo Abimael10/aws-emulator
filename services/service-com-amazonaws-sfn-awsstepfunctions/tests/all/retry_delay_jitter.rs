@@ -46,7 +46,11 @@ const ERROR: &str = "States.TaskFailed";
 /// How close two second-figures must be to count as the same wait: the waits are
 /// recorded in whole milliseconds, so the comparison allows for that rounding and
 /// nothing more.
-const TOLERANCE: f64 = 0.01;
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, so a
+/// sibling suite that reads the same recorded waits compares them to the same
+/// precision rather than choosing a second one.
+pub(crate) const TOLERANCE: f64 = 0.01;
 
 /// What a retrier owes before its next attempt.
 #[derive(Debug)]
@@ -313,20 +317,23 @@ fn full_jitter_spreads_the_waits_across_the_band_under_the_cap() {
 
 /// The handler every execution below invokes: it always raises, so every attempt the
 /// retrier owes really fails.
-const RAISING_HANDLER: &str = r#"
+///
+/// `pub(crate)` for the reason [`TOLERANCE`] is: a sibling suite whose rule is about a
+/// retried task drives the very same always-failing function.
+pub(crate) const RAISING_HANDLER: &str = r#"
 def handler(event, context):
     raise Exception("this handler always raises")
 "#;
 
 /// The class a bare `Exception` reports, which is the name the failed task carries and
 /// so the error the execution ends under.
-const RAISED_ERROR_TYPE: &str = "Exception";
+pub(crate) const RAISED_ERROR_TYPE: &str = "Exception";
 
 /// The optimized integration the state under test names.
-const RESOURCE: &str = "arn:aws:states:::lambda:invoke";
+pub(crate) const RESOURCE: &str = "arn:aws:states:::lambda:invoke";
 
 /// The wildcard the Amazon States Language documents for every retriable error.
-const ALL_ERRORS: &str = "States.ALL";
+pub(crate) const ALL_ERRORS: &str = "States.ALL";
 
 /// What the retried state declares: a one-second interval grown by this rate, which
 /// without the cap would ask for 1, 3, 9, 27, 81, 243 and 729 seconds between the
@@ -368,7 +375,9 @@ fn definition(function_arn: &str, jitter: Option<&str>) -> Value {
 }
 
 /// The epoch seconds one history event is stamped at.
-fn stamped_at(event: &Value) -> f64 {
+///
+/// `pub(crate)` for the reason [`TOLERANCE`] is.
+pub(crate) fn stamped_at(event: &Value) -> f64 {
     event
         .get("timestamp")
         .and_then(Value::as_f64)
@@ -402,7 +411,9 @@ fn gaps(events: &[Value], case: &str) -> Vec<f64> {
 }
 
 /// How many events of `kind` a run wrote.
-fn count(events: &[Value], kind: &str) -> usize {
+///
+/// `pub(crate)` for the reason [`TOLERANCE`] is.
+pub(crate) fn count(events: &[Value], kind: &str) -> usize {
     event_types(events)
         .iter()
         .filter(|written| *written == kind)
