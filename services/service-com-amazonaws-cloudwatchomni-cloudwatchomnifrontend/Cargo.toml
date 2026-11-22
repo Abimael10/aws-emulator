@@ -29,8 +29,11 @@ hex = { workspace = true }
 sqlparser = "0.59"
 # `url`: a `redirectUrl` a deep-link request carries is PARSED with it rather than split as
 # text, so its scheme, origin, path, query and fragment are read the way a browser reads
-# them — see `state::deep_link`.
-url = "2"
+# them — see `state::deep_link`. At least 2.5.9, the first release whose `Url::origin()`
+# reads a wrapped URL's origin per the URL Standard — taking the inner URL's origin only for
+# an http, https or file inner URL and an opaque origin otherwise — instead of resolving one
+# wrapper at a time on the stack, so a deeply wrapped caller-supplied URL cannot exhaust it.
+url = "2.5.9"
 # `sha2`: a one-time deep-link code is recorded as its SHA-256 digest, never as the code —
 # see `state::deep_link`.
 sha2 = { workspace = true }
