@@ -160,6 +160,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let group_name = input.auto_scaling_group_name;
+
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        // A group-scoped READ of this service names the group it could not find, which is
+        // what tells a caller the warm pool is missing because the group is — in the
+        // detail form THIS operation serves. The group this read reports from is resolved
+        // BEFORE any other member of the request, the pagination members included: a
+        // cursor and a page size name a page of the list the group holds, and a group the
+        // account does not hold has no list to page over.
+        let Some(group) = state.groups.get(&group_name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message_as_no_such_group(&group_name),
+            ));
+        };
+
         // The page this read resumes at, from the token a previous one issued: a token
         // this service never issued names no page, which is the operation's own modelled
         // `InvalidNextToken`.
@@ -192,18 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-
-        let mut state = state.lock();
-        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
-
-        // A group-scoped READ of this service names the group it could not find, which is
-        // what tells a caller the warm pool is missing because the group is — in the
-        // detail form THIS operation serves.
-        let Some(group) = state.groups.get(&group_name) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message_as_no_such_group(&group_name),
-            ));
-        };
 
         // A group with no warm pool holds no configuration and no instance to report,
         // which is an answer with neither member rather than a refusal: the group exists.

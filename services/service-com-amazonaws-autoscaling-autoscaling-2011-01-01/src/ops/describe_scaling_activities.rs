@@ -191,6 +191,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let group_name = input.auto_scaling_group_name;
+
+        let now = SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A name that names neither a group the account holds nor a group it has
+        // recorded an activity for names nothing at all: the read is refused by that
+        // name rather than reporting an empty log for a group that never existed. A
+        // group that has since been deleted still has its own activities, so its name
+        // keeps naming something. The name this read reports from is resolved BEFORE any
+        // other member of the request, the pagination members included: a cursor and a
+        // page size name a page of the list that name selects, and a name nothing
+        // answers to selects no list to page over.
+        if let Some(name) = group_name.as_deref() {
+            if !state.groups.contains_key(name)
+                && !state
+                    .activities
+                    .iter()
+                    .any(|activity| activity.auto_scaling_group_name == name)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(name),
+                ));
+            }
+        }
+
         // The requested cursor: the offset it decodes to, and the token itself, kept so
         // a later refusal can name the token the caller actually submitted. The cursor is
         // read before any criterion, because a token this service never issued names no
@@ -227,11 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let group_name = input.auto_scaling_group_name;
-        // Every criterion is checked BEFORE a single activity is matched — and before the
-        // store is locked at all — so an unusable one is refused rather than quietly
-        // selecting nothing, and the criteria the walk below applies are a fixed-size
-        // value however many filters the request spent stating them.
+        // Every criterion is checked BEFORE a single activity is matched, so an unusable
+        // one is refused rather than quietly selecting nothing, and the criteria the walk
+        // below applies are a fixed-size value however many filters the request spent
+        // stating them.
         let criteria =
             ActivityCriteria::read(&input.filters.unwrap_or_default(), group_name.is_some())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
@@ -240,28 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // longer holds are reported only when the request asks for them.
         let include_deleted_groups = input.include_deleted_groups.unwrap_or(false);
 
-        let now = SystemTime::now();
-        let mut state = state.lock();
-        state.materialize_due(&*self.engine, now);
         let state = &*state;
-
-        // A name that names neither a group the account holds nor a group it has
-        // recorded an activity for names nothing at all: the read is refused by that
-        // name rather than reporting an empty log for a group that never existed. A
-        // group that has since been deleted still has its own activities, so its name
-        // keeps naming something.
-        if let Some(name) = group_name.as_deref() {
-            if !state.groups.contains_key(name)
-                && !state
-                    .activities
-                    .iter()
-                    .any(|activity| activity.auto_scaling_group_name == name)
-            {
-                return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::absent_group_message(name),
-                ));
-            }
-        }
 
         // "Only activities started within the last six weeks can be returned": the
         // window is the clock's, so it is applied to every read.
