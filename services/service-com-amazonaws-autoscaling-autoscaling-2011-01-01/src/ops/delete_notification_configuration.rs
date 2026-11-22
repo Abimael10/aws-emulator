@@ -184,9 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
 
-            // The operation deletes the notification the request specifies, so a pair the
-            // group holds no configuration for specifies none: this operation models no
-            // error for a request naming a resource the service does not hold, which this
+            // The operation deletes the notification the request specifies, so a `TopicARN`
+            // that names no Amazon SNS topic specifies none, and neither does a pair the
+            // group holds no configuration for: this operation models no error for a bad
+            // request or for one naming a resource the service does not hold, which this
             // service answers `ValidationError` for.
             group
                 .delete_notification_configuration(&topic_arn)

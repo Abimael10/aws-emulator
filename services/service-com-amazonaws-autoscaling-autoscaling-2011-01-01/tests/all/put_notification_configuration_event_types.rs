@@ -72,7 +72,11 @@ async fn published_catalog(router: &MultiServiceRouter) -> Vec<String> {
 
 /// Post one `PutNotificationConfiguration` and answer its status, wire error code and
 /// message — the form a row that expects a refusal reads.
-async fn put_configuration_result(
+///
+/// Shared with the suite that reads the `TopicARN` form (`notification_topic_arn_form.rs`),
+/// which asserts a refusal of the same call: THE ONE COPY of "post this write and tell me
+/// how it was answered" for every suite here whose rows expect either answer.
+pub(crate) async fn put_configuration_result(
     router: &MultiServiceRouter,
     group: &str,
     topic_arn: &str,

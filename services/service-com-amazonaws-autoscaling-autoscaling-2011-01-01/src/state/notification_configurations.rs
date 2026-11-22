@@ -23,6 +23,21 @@
 //! the documented ceiling ("your maximum limit of SNS topics, which is 10 per Auto Scaling
 //! group") a count of topics.
 //!
+//! # What a `TopicARN` has to name
+//!
+//! Both writers of the collection take the topic as a `TopicARN` the model documents as
+//! "The Amazon Resource Name (ARN) of the Amazon SNS topic"
+//! (`smithy_query(query="operation",operation="PutNotificationConfiguration")`). The member
+//! is modelled as free text bounded by length alone, so nothing at the request boundary can
+//! hold it to that form and this module does
+//! ([`names_an_sns_topic`]): the value has to be a well-formed resource ARN of the Amazon
+//! SNS namespace naming a topic in a Region, because a topic is a REGIONAL resource and the
+//! Region of its ARN is the one the notification is published in
+//! ([`super::sns_notifications`]). Anything else names no topic this service could ever
+//! notify, so it is refused on the input
+//! ([`NotificationConfigurationRefusal::MalformedTopicArn`]) rather than stored as a
+//! destination that can receive nothing.
+//!
 //! # The delete
 //!
 //! `DeleteNotificationConfiguration` "deletes the specified notification"
@@ -43,6 +58,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::sns_notifications::SNS_ARN_VENDOR;
 use super::StoredGroup;
 
 /// The most Amazon SNS topics one Auto Scaling group may be configured to notify.
@@ -65,6 +81,9 @@ pub type NotificationConfigurations = BTreeMap<String, BTreeSet<String>>;
 /// error class each situation belongs to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotificationConfigurationRefusal {
+    /// The request's `TopicARN` names no Amazon SNS topic ([`names_an_sns_topic`]); carries
+    /// the value it carried.
+    MalformedTopicArn(String),
     /// The request names an event type this service does not notify about; carries what it
     /// named.
     UnknownNotificationType(String),
@@ -81,6 +100,7 @@ impl NotificationConfigurationRefusal {
     /// configuration refuse the same request differently.
     pub fn message(&self) -> String {
         match self {
+            Self::MalformedTopicArn(topic_arn) => invalid_topic_arn_message(topic_arn),
             Self::UnknownNotificationType(notification_type) => {
                 unknown_notification_type_message(notification_type)
             }
@@ -103,6 +123,11 @@ impl StoredGroup {
         topic_arn: &str,
         notification_types: &[String],
     ) -> Result<(), NotificationConfigurationRefusal> {
+        if !names_an_sns_topic(topic_arn) {
+            return Err(NotificationConfigurationRefusal::MalformedTopicArn(
+                topic_arn.to_string(),
+            ));
+        }
         if let Some(unknown) = notification_types
             .iter()
             .find(|candidate| !super::AUTO_SCALING_NOTIFICATION_TYPES.contains(&candidate.as_str()))
@@ -134,6 +159,11 @@ impl StoredGroup {
         &mut self,
         topic_arn: &str,
     ) -> Result<(), NotificationConfigurationRefusal> {
+        if !names_an_sns_topic(topic_arn) {
+            return Err(NotificationConfigurationRefusal::MalformedTopicArn(
+                topic_arn.to_string(),
+            ));
+        }
         if self.notification_configurations.remove(topic_arn).is_none() {
             return Err(NotificationConfigurationRefusal::AbsentConfiguration(
                 topic_arn.to_string(),
@@ -155,6 +185,34 @@ impl StoredGroup {
             .map(|(topic_arn, _)| topic_arn.clone())
             .collect()
     }
+}
+
+/// Whether `value` names an Amazon SNS topic this service could publish to, per the rule in
+/// this module's own documentation.
+///
+/// ONE reading of the value, through the workspace's own caller-supplied-ARN parse
+/// (`service_common::arn::region_of`): a well-formed resource ARN of the Amazon SNS
+/// namespace whose Region field is a Region LABEL. Both halves come out of that one reader
+/// because they are one question — a topic is a REGIONAL resource, so an ARN naming no
+/// Region names no topic, and the label is read under the grammar the publisher addresses
+/// the topic in ([`super::sns_notifications`]). Nothing more is required of the resource
+/// field: an SNS topic ARN's resource field is the topic name itself
+/// (`arn:aws:sns:<region>:<account>:<topic>`), so there is no resource type to match.
+///
+/// THE ONE predicate for the whole crate: the writers hold a caller's `TopicARN` to it and
+/// the publisher of a confirmation and of an instance lifecycle event asks it before
+/// addressing a stored topic ([`super::sns_notifications`]), so what a group may be
+/// configured with and what the publisher can reach cannot drift apart.
+#[must_use]
+pub fn names_an_sns_topic(value: &str) -> bool {
+    ::service_common::arn::region_of(value, SNS_ARN_VENDOR).is_some()
+}
+
+/// The message a request whose `TopicARN` names no Amazon SNS topic is refused with: the
+/// member as the model names it, and the value the request carried, which is the only
+/// variable part.
+pub fn invalid_topic_arn_message(topic_arn: &str) -> String {
+    format!("Invalid TopicARN: {topic_arn}")
 }
 
 /// The message a request naming an event type outside this service's own catalog is

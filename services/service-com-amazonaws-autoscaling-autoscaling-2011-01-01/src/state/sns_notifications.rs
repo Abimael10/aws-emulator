@@ -72,7 +72,12 @@ use super::{PendingLifecycleEvent, StoredGroup};
 
 /// The vendor field of an Amazon SNS ARN: the service namespace Amazon SNS publishes,
 /// which is what says a `TopicARN` names a topic at all.
-const SNS_ARN_VENDOR: &str = "sns";
+///
+/// Shared with the writers of a notification configuration
+/// ([`super::notification_configurations`]), which hold a caller's `TopicARN` to this
+/// namespace before storing it, so the namespace this service reads a topic ARN against is
+/// stated once.
+pub(crate) const SNS_ARN_VENDOR: &str = "sns";
 
 /// The `Service` every notification this service publishes names itself by, as Amazon EC2
 /// Auto Scaling words it in the message a subscriber receives.
@@ -133,7 +138,7 @@ pub fn test_notification(
     {
         return None;
     }
-    if ::service_common::arn::region_of(topic_arn, SNS_ARN_VENDOR).is_none() {
+    if !super::notification_configurations::names_an_sns_topic(topic_arn) {
         ::tracing::debug!(
             group = %group.name,
             "this notification configuration names no Amazon SNS topic in a Region of this \
@@ -192,8 +197,7 @@ pub fn owed_for_lifecycle_event(event: &PendingLifecycleEvent) -> Vec<PendingNot
         .notification_topics
         .iter()
         .filter(|topic_arn| {
-            let addressable =
-                ::service_common::arn::region_of(topic_arn, SNS_ARN_VENDOR).is_some();
+            let addressable = super::notification_configurations::names_an_sns_topic(topic_arn);
             if !addressable {
                 ::tracing::debug!(
                     group = %event.group_name,

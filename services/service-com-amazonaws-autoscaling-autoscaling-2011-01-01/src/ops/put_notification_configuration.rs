@@ -212,9 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let message = refusal.message();
                     match refusal {
                         // The documented ceiling on the topics one group may notify is the
-                        // operation's modelled `LimitExceededFault`; a value outside this
-                        // service's own event catalog is about what the request carries,
-                        // which this service answers `ValidationError` for.
+                        // operation's modelled `LimitExceededFault`; a request whose own
+                        // members are wrong — a `TopicARN` that names no Amazon SNS topic,
+                        // or a value outside this service's own event catalog — is about
+                        // what the request carries, which this service answers
+                        // `ValidationError` for.
                         crate::state::NotificationConfigurationRefusal::LimitExceeded => {
                             PutNotificationConfigurationErrorModeled::LimitExceededFault(
                                 LimitExceededFault {

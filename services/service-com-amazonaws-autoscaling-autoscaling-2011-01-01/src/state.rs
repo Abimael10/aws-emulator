@@ -242,9 +242,9 @@ pub use policy_execution::{
 pub mod notification_configurations;
 
 pub use notification_configurations::{
-    absent_notification_configuration_message, too_many_topics_message,
-    unknown_notification_type_message, NotificationConfigurationRefusal, NotificationConfigurations,
-    MAX_NOTIFICATION_TOPICS_PER_GROUP,
+    absent_notification_configuration_message, invalid_topic_arn_message, names_an_sns_topic,
+    too_many_topics_message, unknown_notification_type_message, NotificationConfigurationRefusal,
+    NotificationConfigurations, MAX_NOTIFICATION_TOPICS_PER_GROUP,
 };
 
 /// The Amazon SNS notifications this service publishes to the topics those configurations
