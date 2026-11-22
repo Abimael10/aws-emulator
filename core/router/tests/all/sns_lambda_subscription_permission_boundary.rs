@@ -305,8 +305,13 @@ pub(crate) async fn execution_role(router: &MultiServiceRouter) {
 /// handed to the queue the stack also declares, which is where the delivery is observed.
 ///
 /// The queue is addressed by NAME, resolved through the service's own `GetQueueUrl`, so the
-/// source carries nothing the deployment had to compute.
-const FORWARDING_SOURCE: &str = r#"
+/// source carries nothing the deployment had to compute: a caller substitutes the sink's name
+/// for `SINK_NAME`.
+///
+/// `pub(crate)` with the helpers above and for the same reason: every suite that observes an
+/// SNS -> Lambda delivery downstream of the function deploys this same handler, and one copy of
+/// it keeps those suites observing the same thing.
+pub(crate) const FORWARDING_SOURCE: &str = r#"
 import boto3
 
 
