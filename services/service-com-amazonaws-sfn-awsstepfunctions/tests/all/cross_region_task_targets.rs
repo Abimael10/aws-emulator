@@ -27,13 +27,17 @@
 //! authorization half — which Region the grant on the queue names. A row's far queue has
 //! a DECOY of the same name in the execution's own Region, so a message that went to the
 //! near queue instead of the far one fails the row rather than passing it.
+//!
+//! The url a SERVED emulator reports for a queue names no Region at all — its authority is
+//! the one address the emulator answers on — so where such a url is addressed is the
+//! subject of `tests/all/served_queue_url_addressing.rs`, which borrows this harness.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
@@ -44,21 +48,21 @@ use crate::task_refusal_session_principal::{definition, session_principal};
 
 /// How long a row waits for an execution to leave `RUNNING`. Generous, so a loaded host
 /// cannot fail a row the emulator is still working through.
-const PATIENCE: Duration = Duration::from_secs(20);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
 
 /// How long one look at a queue waits before looking again.
 const POLL: Duration = Duration::from_millis(25);
 
 /// The body every row's message carries, so a row reads back what it sent.
-const BODY: &str = "cross-region";
+pub(crate) const BODY: &str = "cross-region";
 
 /// Step Functions, Amazon SQS and IAM over ONE engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -70,6 +74,17 @@ impl Emulator {
             service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
         );
         Self { router }
+    }
+
+    /// The same emulator, SERVED at `endpoint` — the state starting a data port there
+    /// leaves it in (`MultiServiceRouter::set_url_base`), which is what makes the address
+    /// every service announces its own rather than AWS's published host.
+    pub(crate) fn served_at(endpoint: &str) -> Self {
+        let base = EndpointUrl::parse(endpoint)
+            .unwrap_or_else(|| panic!("a data port publishes a bare https url, not {endpoint:?}"));
+        let mut emulator = Self::new();
+        emulator.router.set_url_base(base);
+        emulator
     }
 
     /// One `awsJson` RPC call to the service whose signing name is `signing_name`, in
@@ -171,7 +186,7 @@ impl Emulator {
     }
 
     /// An IAM role carrying `policy` as its inline policy, by its own ARN.
-    async fn role(&self, name: &str, policy: &Value) -> String {
+    pub(crate) async fn role(&self, name: &str, policy: &Value) -> String {
         let created = self
             .iam(
                 "CreateRole",
@@ -197,7 +212,7 @@ impl Emulator {
 
     /// The queue named `name` in `region`, as that Region's own `CreateQueue` answers its
     /// url.
-    async fn queue_in(&self, region: &str, name: &str) -> String {
+    pub(crate) async fn queue_in(&self, region: &str, name: &str) -> String {
         let created = self
             .sqs_in(region, "CreateQueue", &json!({ "QueueName": name }))
             .await;
@@ -205,7 +220,7 @@ impl Emulator {
     }
 
     /// Create a state machine under `role_arn` and return its ARN.
-    async fn machine(&self, name: &str, definition: &str, role_arn: &str) -> String {
+    pub(crate) async fn machine(&self, name: &str, definition: &str, role_arn: &str) -> String {
         let created = self
             .sfn(
                 "CreateStateMachine",
@@ -216,7 +231,7 @@ impl Emulator {
     }
 
     /// Start one execution and report it once it has left `RUNNING`.
-    async fn ran(&self, machine_arn: &str, name: &str, case: &str) -> Value {
+    pub(crate) async fn ran(&self, machine_arn: &str, name: &str, case: &str) -> Value {
         let started = self
             .sfn(
                 "StartExecution",
@@ -246,7 +261,7 @@ impl Emulator {
     /// The bodies the queue at `url` holds, read in `region`: looked at again until one
     /// arrives or `PATIENCE` runs out, so a row waits for the CONDITION rather than for a
     /// span. What the caller does with an empty answer is its own assertion.
-    async fn bodies_in(&self, region: &str, url: &str) -> Vec<String> {
+    pub(crate) async fn bodies_in(&self, region: &str, url: &str) -> Vec<String> {
         let began = Instant::now();
         loop {
             let received = self
@@ -275,7 +290,7 @@ impl Emulator {
 
     /// How many messages the queue at `url` holds in `region`, as its own attribute
     /// reports: the reading for a queue that must stay EMPTY, which no receive can prove.
-    async fn depth_in(&self, region: &str, url: &str) -> String {
+    pub(crate) async fn depth_in(&self, region: &str, url: &str) -> String {
         let reported = self
             .sqs_in(
                 region,
@@ -294,12 +309,12 @@ impl Emulator {
 
 /// The ARN of the queue named `name` in `region`, which is the resource
 /// `sqs:SendMessage` on it is taken on.
-fn queue_arn(region: &str, name: &str) -> String {
+pub(crate) fn queue_arn(region: &str, name: &str) -> String {
     format!("arn:aws:sqs:{region}:{ACCOUNT}:{name}")
 }
 
 /// A policy granting `sqs:SendMessage` on `resource` alone.
-fn send_grant(resource: &str) -> Value {
+pub(crate) fn send_grant(resource: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -315,14 +330,14 @@ fn send_grant(resource: &str) -> Value {
 /// them in its own PascalCase, and the AWS SDK family takes the invoked operation's own
 /// members, which either spelling reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     Optimized,
     AwsSdk,
 }
 
 impl Family {
     /// The `Resource` a `Task` of this family names.
-    fn resource(self) -> &'static str {
+    pub(crate) fn resource(self) -> &'static str {
         match self {
             Self::Optimized => "arn:aws:states:::sqs:sendMessage",
             Self::AwsSdk => "arn:aws:states:::aws-sdk:sqs:sendMessage",
@@ -330,10 +345,21 @@ impl Family {
     }
 
     /// The parameters it carries for a send of `BODY` to `url`.
-    fn parameters(self, url: &str) -> Value {
+    pub(crate) fn parameters(self, url: &str) -> Value {
         match self {
             Self::Optimized => json!({ "QueueUrl": url, "MessageBody": BODY }),
             Self::AwsSdk => json!({ "queueUrl": url, "messageBody": BODY }),
+        }
+    }
+
+    /// The error a `Task` of this family reports for a refusal Amazon SQS answered: that
+    /// service's base SDK exception, named as the client this family is served by names
+    /// the service — the earlier client's own name through an optimized `Resource`, and
+    /// the current AWS SDK's name through the AWS SDK family.
+    pub(crate) fn refusal_error(self) -> &'static str {
+        match self {
+            Self::Optimized => "SQS.AmazonSQSException",
+            Self::AwsSdk => "Sqs.AmazonSQSException",
         }
     }
 }

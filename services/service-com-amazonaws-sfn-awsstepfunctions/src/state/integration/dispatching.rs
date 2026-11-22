@@ -130,7 +130,10 @@ pub async fn call_answered(
 ) -> Result<Answered, String> {
     let built = wired(call, request)?;
     // Addressed exactly as [`call_api`] addresses it: the endpoint the request's own
-    // target names, where that target carries one.
+    // target names, where that target carries one. A caller that can also resolve WHERE a
+    // target addressed by an endpoint naming no Region is held reads that itself
+    // (`crate::state::target_addressing`) and passes the Region it answers, which is what a
+    // walk of an execution does.
     let addressed = addressed_region(call, request);
     let region = addressed.as_deref().unwrap_or(region);
     dispatch(callback, call.api, region, built, None).await
