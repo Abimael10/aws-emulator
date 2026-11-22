@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether the CALLER's own identity-based IAM policies let a request to this service
-//! perform the action it asks for — the decision an operation takes BEFORE it looks at the
-//! channel the request named.
+//! perform the action it asks for — the decision taken in FRONT of every operation of this
+//! service, before anything the request carried is read.
 //!
 //! A signed call is decided by IAM ahead of the service, so a principal whose policies
 //! grant none of this service's actions is told it is not authorized whatever reference it
@@ -10,6 +10,17 @@
 //! what makes a MISSING GRANT distinguishable from an absent channel: the first is an
 //! authorization refusal (HTTP 403, `AccessDeniedException`, carrying neither `successful`
 //! nor `failed`), the second this service's own modelled `ChannelNotFound`.
+//!
+//! WHERE the decision is taken is part of the rule, which is why it is taken by
+//! [`Authorized`] — the layer that serves this service's operations — and not inside a
+//! handler: a handler runs only after the request's own values have been deserialized and
+//! held to the model's constraints, so a decision taken there would be SKIPPED for every
+//! request refused at that boundary. The decision therefore precedes every refusal this
+//! service states, and the error class a caller meets does not depend on which of a fault's
+//! spellings its request used: a value that is not a channel reference is answered the same
+//! way whether the model's `@pattern` rejects it at the boundary or this service finds it
+//! names no channel, and an unentitled caller is never handed a refusal restating the
+//! values it submitted.
 //!
 //! The three pieces, each held in exactly one place:
 //!
@@ -46,10 +57,10 @@
 //! under — a namespace DISJOINT from the CloudTrail control plane's `cloudtrail:`, so a
 //! grant of `cloudtrail:*` covers no action of this service.
 //!
-//! The resource is the channel reference the request itself carried, never one resolved out
-//! of the store, so the decision is the same whether or not a channel of that name is
-//! registered here and a refusal tells an unauthorized caller nothing about what the
-//! emulator holds.
+//! The resource is the channel reference the request itself carried, read off the request
+//! ([`judged_resource`]) rather than resolved out of the store, so the decision is the same
+//! whether or not a channel of that name is registered here and a refusal tells an
+//! unauthorized caller nothing about what the emulator holds.
 //!
 //! ## The two callers the decision cannot refuse
 //!
@@ -67,11 +78,32 @@
 //! it asks for is refused, and the refusal names that state rather than the key it
 //! presented, which this module never quotes back.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use ::aws_smithy_types::body::SdkBody;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+use ::smithy_server_runtime::{
+    BoxFuture, ErasedOperation, OperationContext, ServerHttpProtocol, Service,
+};
+
+use crate::scaffolded::{AccessDeniedException, ACCESS_DENIED_CODE, ACCESS_DENIED_STATUS};
+
+/// The query parameter this service's operations bind the channel reference to
+/// (`PutAuditEventsRequest$channelArn` is `@httpQuery("channelArn")`,
+/// `smithy_query(query="operation", operation="PutAuditEvents")`), which is where the
+/// channel a request names is read from before anything of the request is deserialized.
+const CHANNEL_ARN_PARAMETER: &str = "channelArn";
+
+/// The resource a request that names no channel at all is judged against: IAM's own resource
+/// wildcard, which is how it writes the resource of a request that addresses none.
+const ANY_CHANNEL: &str = "*";
+
+/// The detail the access record of a refused call carries.
+const DENIED_DETAIL: &str = "the caller's identity-based policies do not allow this action";
 
 /// What a refusal names as the principal of a request whose session credential has already
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
@@ -87,6 +119,143 @@ pub const ACTION_PREFIX: &str = "cloudtrail-data";
 #[must_use]
 pub fn action_for(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
+}
+
+/// The resource this request is judged against: the channel reference the REQUEST carried,
+/// read off the request itself so the decision can be taken before anything of it is
+/// deserialized or held to the model's constraints.
+///
+/// The reference is the value of the query parameter the model binds it to
+/// ([`CHANNEL_ARN_PARAMETER`]), percent-decoded the way the protocol's own deserializer
+/// decodes a query-bound member, so the gate judges the very value a handler would see —
+/// whatever spelling it takes, including one the member's modelled `@pattern` rejects.
+///
+/// [`ANY_CHANNEL`] for a request that carries no reference at all (the parameter absent, or
+/// bound with no value): such a request addresses no channel of this service, and the
+/// absent `@required` member is reported by the boundary once the call is authorized.
+#[must_use]
+pub fn judged_resource(req: &RtRequest) -> String {
+    channel_reference_named(req.uri()).unwrap_or_else(|| ANY_CHANNEL.to_string())
+}
+
+/// The channel reference `uri` names, or `None` when it names none.
+///
+/// The raw query string is read through the tree's one reader of a raw one
+/// (`service_common::query_parameter`), which takes the FIRST spelling of a repeated
+/// parameter — the one the protocol's deserializer keeps.
+fn channel_reference_named(uri: &str) -> Option<String> {
+    let (_, query) = uri.split_once('?')?;
+    let reference = ::service_common::query_parameter(query, CHANNEL_ARN_PARAMETER)
+        .map(::smithy_server_runtime::percent_decode)?;
+    (!reference.is_empty()).then_some(reference)
+}
+
+/// One modelled operation of this service, served behind the decision IAM takes in front of
+/// it.
+///
+/// It holds the shared engine, which is what the caller's identity and the documents in
+/// force on it are read through, and the operation's own name, which is what the action asked
+/// about is built from ([`action_for`]). Every request it does not refuse is handed to the
+/// layer it wraps, which serves the one operation the generated routing table built from
+/// that same engine — so there is no second instance of the operation and no second store,
+/// and nothing about how a served request is deserialized, validated, handled or serialized
+/// changes.
+pub(super) struct Authorized<Inner, Eng> {
+    /// What serves a request this gate admits.
+    inner: Inner,
+    /// The shared engine the decision reads the caller and its policies through.
+    engine: Arc<Eng>,
+    /// The operation's own name, as the model declares it.
+    operation: &'static str,
+}
+
+impl<Inner, Eng> Authorized<Inner, Eng> {
+    /// Put `inner` — the layer that serves the modelled operation named `operation` — behind
+    /// the identity-based decision, read from `engine`.
+    pub(super) fn new(engine: Arc<Eng>, operation: &'static str, inner: Inner) -> Self {
+        Self {
+            inner,
+            engine,
+            operation,
+        }
+    }
+}
+
+impl<Inner: ErasedOperation, Eng: Send + Sync + 'static> ErasedOperation for Authorized<Inner, Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // IAM's decision, taken before anything of the request is read: the action is
+            // this operation's own, and the resource is the channel reference the request
+            // carried. A refused request reaches neither the constraint boundary nor the
+            // handler, so it reports nothing of what it submitted and persists nothing.
+            let resource = judged_resource(req);
+            if let Some(denial) = refusal(&*self.engine, ctx, self.operation, &resource) {
+                crate::ops::put_audit_events::record_access(
+                    ctx,
+                    &resource,
+                    ACCESS_DENIED_CODE,
+                    DENIED_DETAIL,
+                );
+                // The protocol is read, used and dropped inside this one statement:
+                // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
+                // await below would make this future non-`Send`.
+                return denied_response(svc.definition().protocol(), &denial);
+            }
+            self.inner.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped layer's modelled auth schemes: standing in front of an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.inner.auth_schemes()
+    }
+}
+
+/// The wire answer to a request this gate refused: `AccessDeniedException` at
+/// [`ACCESS_DENIED_STATUS`], serialized through the SAME protocol call a handler-returned
+/// error of that shape goes through, so a refusal taken here and one taken in a handler are
+/// indistinguishable on the wire.
+///
+/// An authorization decision never degrades into success, so a response is answered in every
+/// case: the hand-written fallback carries the same three things a client branches on — the
+/// status, the shape name and the prose member — for the one case the serializer can fail.
+fn denied_response(protocol: &dyn ServerHttpProtocol, denial: &str) -> RtResponse {
+    let refused = AccessDeniedException::new(denial);
+    protocol
+        .serialize_error(
+            &refused,
+            &crate::scaffolded::ACCESS_DENIED_SCHEMA,
+            ACCESS_DENIED_CODE,
+            ACCESS_DENIED_STATUS,
+        )
+        .unwrap_or_else(|failed| {
+            ::tracing::warn!(
+                error = %failed,
+                "the authorization refusal could not be rendered in this service's envelope"
+            );
+            let body = ::serde_json::json!({
+                "__type": ACCESS_DENIED_CODE,
+                "Message": refused.message,
+            });
+            let mut response = RtResponse::new(
+                StatusCode::try_from(ACCESS_DENIED_STATUS)
+                    .expect("the refusal's status is a constant of this crate"),
+                SdkBody::from(body.to_string()),
+            );
+            response
+                .headers_mut()
+                .insert("content-type", "application/json");
+            response
+                .headers_mut()
+                .insert("x-amzn-errortype", ACCESS_DENIED_CODE);
+            response
+        })
 }
 
 /// `Some(message)` when IAM does not allow `cloudtrail-data:<operation>` on `resource` for
@@ -384,6 +553,84 @@ mod tests {
     /// one: `arn:aws:cloudtrail:<region>:<account>:channel/<channel id>`.
     fn channel_arn(region: &str, channel_id: &str) -> String {
         ::engine::emulator_arn("cloudtrail", region, &format!("channel/{channel_id}"))
+    }
+
+    /// RULE: the resource a request is judged against is the channel reference its query
+    /// string binds, whatever else the URI carries and whatever spelling the value takes;
+    /// a request that binds none addresses no channel.
+    #[test]
+    fn the_resource_judged_is_the_bound_channel_reference() {
+        let arn = channel_arn("us-west-2", "7d9c2f1e-3b45-4a6d-8e90-1f2a3b4c5d6e");
+        let encoded: String = arn.replace(':', "%3A").replace('/', "%2F");
+        // (case, the request URI, the resource the decision is taken against)
+        let rows: Vec<(&str, String, String)> = vec![
+            (
+                "the one parameter",
+                format!("/PutAuditEvents?channelArn={arn}"),
+                arn.clone(),
+            ),
+            (
+                "percent-encoded, as an SDK writes a query value",
+                format!("/PutAuditEvents?channelArn={encoded}"),
+                arn.clone(),
+            ),
+            (
+                "among other parameters",
+                format!("/PutAuditEvents?externalId=x&channelArn={arn}"),
+                arn.clone(),
+            ),
+            (
+                "an absolute URI",
+                format!("https://cloudtrail-data.us-west-2.amazonaws.com/PutAuditEvents?channelArn={arn}"),
+                arn.clone(),
+            ),
+            (
+                "the first of two spellings, as the deserializer reads it",
+                format!("/PutAuditEvents?channelArn={arn}&channelArn=other"),
+                arn.clone(),
+            ),
+            (
+                // Outside the member's modelled `@pattern`: the boundary refuses such a
+                // value, and this gate still judges the call on the value it carried.
+                "a value that is no ARN at all",
+                "/PutAuditEvents?channelArn=not-an-arn".to_string(),
+                "not-an-arn".to_string(),
+            ),
+            (
+                "a bare channel id (the ARN suffix the doc also names)",
+                "/PutAuditEvents?channelArn=7d9c2f1e-3b45-4a6d-8e90-1f2a3b4c5d6e".to_string(),
+                "7d9c2f1e-3b45-4a6d-8e90-1f2a3b4c5d6e".to_string(),
+            ),
+            (
+                "no query string at all",
+                "/PutAuditEvents".to_string(),
+                ANY_CHANNEL.to_string(),
+            ),
+            (
+                "another parameter only",
+                "/PutAuditEvents?externalId=x".to_string(),
+                ANY_CHANNEL.to_string(),
+            ),
+            (
+                "bound with no value",
+                "/PutAuditEvents?channelArn=".to_string(),
+                ANY_CHANNEL.to_string(),
+            ),
+            (
+                "bound as a bare key",
+                "/PutAuditEvents?channelArn".to_string(),
+                ANY_CHANNEL.to_string(),
+            ),
+        ];
+        for (case, uri, expected) in rows {
+            let mut req = ::aws_smithy_runtime_api::http::Request::new(SdkBody::empty());
+            req.set_uri(uri.clone()).expect("a request URI");
+            let judged = judged_resource(&req);
+            assert_eq!(
+                judged, expected,
+                "case {case:?}: expected the resource {expected:?} for {uri:?}, got {judged:?}"
+            );
+        }
     }
 
     /// RULE: the action this gate asks about carries this service's OWN namespace, so a

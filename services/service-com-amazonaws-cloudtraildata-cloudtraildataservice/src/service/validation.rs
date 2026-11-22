@@ -18,6 +18,11 @@
 //! body from the framework's refusal channel. A request this wrapper does not refuse is
 //! handed to the generated operation, which owns deserialize -> validate -> handle ->
 //! serialize and every modelled error.
+//!
+//! This wrapper is itself served behind the identity-based decision IAM takes in front of
+//! the service ([`super::authorization::Authorized`]), so every refusal stated here is
+//! stated to a caller that decision allowed: a clause restating what the request submitted
+//! can never reach a principal no statement allows.
 
 use super::refuses_channel_arn;
 use crate::ops::put_audit_events::{INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE};

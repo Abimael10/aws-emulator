@@ -667,3 +667,264 @@ async fn each_kind_of_principal_is_judged_on_its_own_policies() {
         }
     }
 }
+
+/// The resource a refusal names for a request that carried no channel reference at all:
+/// IAM's own resource wildcard, which is how it writes the resource of a request that
+/// addresses none.
+const ANY_CHANNEL: &str = "*";
+
+/// One request whose fault is found BEFORE any handler of this service runs, with what each
+/// of the two callers must be answered with.
+struct PreHandlerFault {
+    case: &'static str,
+    /// The `channelArn` the request carries.
+    channel: String,
+    /// The batch it carries.
+    events: Vec<crate::put_audit_events::Ev>,
+    /// The resource a refusal of this request names.
+    resource: String,
+    /// `(status, error code)` the call is answered with once the action is GRANTED — the
+    /// service's own verdict, `""` for a served call.
+    granted: (u16, &'static str),
+}
+
+/// Every class of fault this service finds before a handler runs, each at a size and a
+/// spelling the issue did not cite as well as the ones it did: the two spellings of "not a
+/// channel ARN" (one outside the member's modelled `@pattern ^arn:.*$`, one inside it that
+/// names no channel), a reference the request binds with no value at all, the batch member's
+/// `@length` broken in both directions (`AuditEvents`, 1..100), an element id outside
+/// `AuditEvent$id`'s `@pattern ^[-_A-Za-z0-9]+$` and one past its `@length` maximum (128) —
+/// `smithy_query(query="shape", shape="AuditEvents,AuditEvent,Uuid")` — plus a request with
+/// no fault at all as the control.
+fn pre_handler_faults(registered: &str) -> Vec<PreHandlerFault> {
+    let good = || vec![ev("evt-1", GOOD_EVENT)];
+    vec![
+        PreHandlerFault {
+            case: "no fault at all",
+            channel: registered.to_string(),
+            events: good(),
+            resource: registered.to_string(),
+            granted: (200, ""),
+        },
+        PreHandlerFault {
+            case: "a channel reference outside the member's modelled pattern",
+            channel: "not-an-arn".to_string(),
+            events: good(),
+            resource: "not-an-arn".to_string(),
+            granted: (400, "InvalidChannelARN"),
+        },
+        PreHandlerFault {
+            case: "an arn: value that names no channel",
+            channel: "arn:aws:s3:::a-bucket-name".to_string(),
+            events: good(),
+            resource: "arn:aws:s3:::a-bucket-name".to_string(),
+            granted: (400, "InvalidChannelARN"),
+        },
+        PreHandlerFault {
+            case: "a bare channel id, which is no ARN",
+            channel: "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809".to_string(),
+            events: good(),
+            resource: "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809".to_string(),
+            granted: (400, "InvalidChannelARN"),
+        },
+        PreHandlerFault {
+            case: "the channel reference bound with no value",
+            channel: String::new(),
+            events: good(),
+            resource: ANY_CHANNEL.to_string(),
+            granted: (400, "InvalidChannelARN"),
+        },
+        PreHandlerFault {
+            case: "one event past the batch maximum",
+            channel: registered.to_string(),
+            events: (0..101).map(|n| ev(format!("evt-{n}"), GOOD_EVENT)).collect(),
+            resource: registered.to_string(),
+            granted: (400, "ValidationException"),
+        },
+        PreHandlerFault {
+            case: "far past the batch maximum",
+            channel: registered.to_string(),
+            events: (0..250).map(|n| ev(format!("evt-{n}"), GOOD_EVENT)).collect(),
+            resource: registered.to_string(),
+            granted: (400, "ValidationException"),
+        },
+        PreHandlerFault {
+            case: "an empty batch, below the batch minimum",
+            channel: registered.to_string(),
+            events: Vec::new(),
+            resource: registered.to_string(),
+            granted: (400, "ValidationException"),
+        },
+        PreHandlerFault {
+            case: "an event id outside its modelled pattern",
+            channel: registered.to_string(),
+            events: vec![ev("evt 1!", GOOD_EVENT)],
+            resource: registered.to_string(),
+            granted: (400, "ValidationException"),
+        },
+        PreHandlerFault {
+            case: "an event id past its modelled length maximum",
+            channel: registered.to_string(),
+            events: vec![ev("e".repeat(129), GOOD_EVENT)],
+            resource: registered.to_string(),
+            granted: (400, "ValidationException"),
+        },
+        PreHandlerFault {
+            case: "a malformed channel reference and a malformed batch together",
+            channel: "not-an-arn".to_string(),
+            events: vec![ev("evt 1!", GOOD_EVENT)],
+            resource: "not-an-arn".to_string(),
+            granted: (400, "InvalidChannelARN"),
+        },
+    ]
+}
+
+/// THE RULE: the identity-based decision is taken in FRONT of this service, so it precedes
+/// every refusal the service states — a caller no statement allows meets the authorization
+/// refusal whatever fault its request also carried, and never a refusal that restates the
+/// values it submitted. The same caller, once the action is granted, meets the service's own
+/// verdict for that same request.
+///
+/// This is what makes the answer independent of which SPELLING a fault took: both spellings
+/// of "not a channel ARN" — the one the member's modelled `@pattern` rejects at the boundary
+/// and the `arn:` one the service resolves — are one error for each caller.
+#[tokio::test]
+async fn an_unentitled_caller_is_refused_before_any_submitted_value_is_read() {
+    let registered = channel_arn("8e7f6a5b-4c3d-42e1-90f8-a7b6c5d4e3f2");
+
+    for fault in pre_handler_faults(&registered) {
+        for granted in [false, true] {
+            let case = format!(
+                "{} / {}",
+                fault.case,
+                if granted {
+                    "the action granted"
+                } else {
+                    "nothing granted"
+                }
+            );
+            // A fresh engine per row: no row can pass on another's write.
+            let harness = Harness::new();
+            given_session(harness.engine());
+            // Ungranted is the position the recorded client was in: the CloudTrail control
+            // plane's whole namespace, which publishes no action of this service.
+            let document = if granted {
+                allow(json!(ACTION))
+            } else {
+                allow(json!("cloudtrail:*"))
+            };
+            given_role_policy(harness.engine(), Some(&document));
+            harness.register(Channel::from_arn(&registered, "Custom").expect("a channel ARN"));
+
+            let reply = harness
+                .put_as(SESSION_KEY_ID, &fault.channel, None, &fault.events)
+                .await;
+            if granted {
+                assert_eq!(
+                    (reply.status, reply.error_code().as_str()),
+                    (fault.granted.0, fault.granted.1),
+                    "case {case:?}: an entitled caller meets the service's own verdict, got \
+                     {} with body {}",
+                    reply.status,
+                    reply.body
+                );
+            } else {
+                assert_refused(
+                    &case,
+                    &reply,
+                    &session_arn(),
+                    &fault.resource,
+                    Refusal::DefaultDeny,
+                );
+                // Nothing of the request may be restated to a caller no statement allows:
+                // not an event id, and not the payload the batch carried.
+                let stated = message_of(&reply);
+                for event in &fault.events {
+                    assert!(
+                        !stated.contains(event.id()),
+                        "case {case:?}: the refusal must not restate the event id {:?}, got \
+                         {stated:?}",
+                        event.id()
+                    );
+                }
+                assert!(
+                    !stated.contains(GOOD_EVENT),
+                    "case {case:?}: the refusal must not restate the submitted batch, got \
+                     {stated:?}"
+                );
+            }
+            assert!(
+                harness.ingest_log(&registered).is_empty() || fault.granted == (200, ""),
+                "case {case:?}: a refused call must persist nothing, got {:?}",
+                harness.ingest_log(&registered)
+            );
+        }
+    }
+}
+
+/// RULE: one fault is one error, so the two spellings of "not a channel ARN" are answered
+/// alike for each caller — the authorization refusal for a caller no statement allows (which
+/// differs only in the reference it names), and this service's own `InvalidChannelARN` for an
+/// entitled one.
+#[tokio::test]
+async fn both_spellings_of_a_reference_that_is_no_channel_arn_are_one_error() {
+    // The two spellings: outside the member's modelled `@pattern ^arn:.*$`, and inside it
+    // but naming no channel of this service.
+    let spellings = ["not-an-arn", "arn:aws:s3:::a-bucket-name"];
+
+    for granted in [false, true] {
+        let mut answers: Vec<(&str, u16, String, String)> = Vec::new();
+        for spelling in spellings {
+            let harness = Harness::new();
+            given_session(harness.engine());
+            let document = if granted {
+                allow(json!(ACTION))
+            } else {
+                allow(json!("cloudtrail:*"))
+            };
+            given_role_policy(harness.engine(), Some(&document));
+            let reply = harness
+                .put_as(SESSION_KEY_ID, spelling, None, &[ev("evt-1", GOOD_EVENT)])
+                .await;
+            answers.push((
+                spelling,
+                reply.status,
+                reply.error_code(),
+                // The reference the refusal names is the one the request carried, so it is
+                // the one thing the two answers may differ in.
+                message_of(&reply).replace(spelling, "<reference>"),
+            ));
+        }
+        let (first_spelling, first_status, first_code, first_message) = &answers[0];
+        for (spelling, status, code, message) in &answers[1..] {
+            assert_eq!(
+                (status, code, message),
+                (first_status, first_code, first_message),
+                "case \"{spelling} / {}\": the two spellings of one fault must be answered \
+                 alike; {first_spelling:?} was answered ({first_status}, {first_code:?}, \
+                 {first_message:?}) and this one ({status}, {code:?}, {message:?})",
+                if granted {
+                    "the action granted"
+                } else {
+                    "nothing granted"
+                }
+            );
+        }
+        let expected = if granted {
+            (400, "InvalidChannelARN")
+        } else {
+            (403, "AccessDeniedException")
+        };
+        assert_eq!(
+            (*first_status, first_code.as_str()),
+            expected,
+            "case \"{first_spelling} / {}\": expected {expected:?}, got ({first_status}, \
+             {first_code:?})",
+            if granted {
+                "the action granted"
+            } else {
+                "nothing granted"
+            }
+        );
+    }
+}

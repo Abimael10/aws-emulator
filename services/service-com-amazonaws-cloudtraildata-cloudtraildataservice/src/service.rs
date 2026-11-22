@@ -21,9 +21,13 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE. The routing DECISION is still the model's: this
-//!   service serves the operation the generated table names, through the wrapper in
-//!   [`validation`] that states a pre-handler refusal the way this service states one,
-//!   which the `override_refusal` seam cannot do because it never sees the request.
+//!   service serves the operation the generated table names, through two layers — the
+//!   identity-based decision IAM takes in FRONT of the service
+//!   ([`authorization::Authorized`]), and then the wrapper in [`validation`] that states a
+//!   pre-handler refusal the way this service states one, which the `override_refusal` seam
+//!   cannot do because it never sees the request. The order is part of the rule: a caller no
+//!   statement allows is refused before any value it submitted is read, so the error class
+//!   it meets does not depend on which spelling of a fault its request carried.
 //! - `override_refusal` — EDITED HERE. A refusal ABOUT a channel reference is answered
 //!   under the error this service's model declares for that fault; every other
 //!   pre-handler refusal is stated by the wrapper in [`validation`], which serves this
@@ -38,9 +42,9 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
-//! Beside those seams, [`authorization`] holds the decision every operation of this
-//! service takes before it reads anything: whether the calling principal's identity-based
-//! IAM policies allow the action it asks for.
+//! Beside those seams, [`authorization`] holds the decision taken in front of every
+//! operation of this service, before anything of the request is read: whether the calling
+//! principal's identity-based IAM policies allow the action it asks for.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -86,12 +90,14 @@ fn refused_channel_arn(violations: &[Violation]) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The same modelled operations the generated table holds, each wrapped so a refusal
-    /// found before the handler runs is stated the way this service states one (see
-    /// [`validation`]). Keyed by the routing key the protocol resolves — the key the
-    /// generated table uses — and built from the SAME shared engine, so a wrapped
-    /// operation reads and writes the one store. Held on the service because
-    /// [`Service::override_operation`] hands back a borrow of `self`.
+    /// The same modelled operations the generated table holds, each served behind the
+    /// decision IAM takes in front of this service ([`authorization::Authorized`]) and then
+    /// through the wrapper that states a refusal found before the handler runs the way this
+    /// service states one (see [`validation`]). Keyed by the routing key the protocol
+    /// resolves — the key the generated table uses — and built from the SAME shared engine,
+    /// so a wrapped operation reads and writes the one store and the decision reads the one
+    /// set of policies. Held on the service because [`Service::override_operation`] hands
+    /// back a borrow of `self`.
     stating_submitted_values: OperationRoutingTable,
 }
 
@@ -102,9 +108,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         let mut stating_submitted_values = OperationRoutingTable::new();
         stating_submitted_values.add_operation(
-            "PutAuditEvents",
-            Box::new(validation::StatingSubmittedValues::new(
-                crate::ops::put_audit_events::PutAuditEvents::new(Arc::clone(&engine)),
+            crate::ops::put_audit_events::OPERATION_NAME,
+            Box::new(authorization::Authorized::new(
+                Arc::clone(&engine),
+                crate::ops::put_audit_events::OPERATION_NAME,
+                validation::StatingSubmittedValues::new(
+                    crate::ops::put_audit_events::PutAuditEvents::new(Arc::clone(&engine)),
+                ),
             )) as Box<dyn ErasedOperation>,
         );
         Self {
@@ -136,11 +146,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Serve the operation the generated routing table names, through the wrapper that
-        // states a pre-handler refusal the way this service states one (see
-        // [`validation`]). The routing DECISION is not overridden: the key is resolved by
-        // the model's own protocol, and a request the table cannot serve is declined here
-        // so the framework's routing-error path stays exactly as it was.
+        // Serve the operation the generated routing table names, behind the identity-based
+        // decision IAM takes in front of this service ([`authorization::Authorized`]) and
+        // through the wrapper that states a pre-handler refusal the way this service states
+        // one (see [`validation`]). The routing DECISION is not overridden: the key is
+        // resolved by the model's own protocol, and a request the table cannot serve is
+        // declined here so the framework's routing-error path stays exactly as it was.
         let operation = self.definition().protocol().routing_key(req).ok()?;
         self.definition().routing_table().get(operation)?;
         self.stating_submitted_values.get(operation)

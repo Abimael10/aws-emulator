@@ -3,9 +3,10 @@
 //! @op PutAuditEvents
 //!
 //! Ingests a batch of audit events into a CloudTrail Lake channel held in this
-//! service's engine state (see [`crate::state`]): the call is first authorized against the
-//! calling principal's identity-based IAM policies (see
-//! [`crate::service::authorization`]), the channel is then resolved from `channelArn`
+//! service's engine state (see [`crate::state`]): the call is authorized against the
+//! calling principal's identity-based IAM policies by the gate in FRONT of this operation
+//! (see [`crate::service::authorization`]) before anything of the request is read, the
+//! channel is then resolved from `channelArn`
 //! (full ARN or ARN suffix), a channel ARN naming another account is
 //! denied before the channel is looked up, the caller's account and the channel's
 //! external-id requirement (stated by the channel's resource policy, which the
@@ -189,9 +190,10 @@ pub const INVALID_CHANNEL_ARN_CODE: &str = "InvalidChannelARN";
 /// violation against this expression.
 pub const CHANNEL_ARN_PATTERN: &str = "^arn:.*$";
 
-/// This operation's own name, as the model declares it: what the access record reports and
-/// what the IAM action it is authorized under is built from.
-const OPERATION_NAME: &str = "PutAuditEvents";
+/// This operation's own name, as the model declares it: the key the service serves it under,
+/// what the access record reports, and what the IAM action it is authorized under is built
+/// from.
+pub(crate) const OPERATION_NAME: &str = "PutAuditEvents";
 
 /// The IAM action this operation is authorized under, as a policy and a denial spell one:
 /// this service's action namespace and the operation's own name, composed by
@@ -281,7 +283,12 @@ fn rejection(event: &AuditEvent) -> Option<(&'static str, String)> {
 /// which operation, the presented access key id, the caller account, the channel the
 /// caller named, and how the request ended. Carries NO event payload and no secret —
 /// an access key id is an identifier, not a credential.
-fn record_access(
+///
+/// Reached by the authorization gate in front of this operation
+/// ([`crate::service::authorization`]) as well as by the handler below, so every request
+/// this service answers — served or refused, and whichever layer refused it — is recorded
+/// in one shape.
+pub(crate) fn record_access(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     channel_arn: &str,
     outcome: &str,
@@ -324,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     type Output = PutAuditEventsOutput;
     type Error = PutAuditEventsError;
 
-    const NAME: &'static str = "PutAuditEvents";
+    const NAME: &'static str = OPERATION_NAME;
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_AUDIT_EVENTS_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_AUDIT_EVENTS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
@@ -334,26 +341,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // AUTHORIZATION FIRST, as IAM decides a signed call ahead of the service: the
-        // calling principal's identity-based policies are evaluated for this operation's
-        // own action on the channel reference the request carried (see
-        // [`crate::service::authorization`]). A principal no statement allows is refused
-        // before anything of this service is read, so the answer reports neither whether
-        // that channel exists nor any per-event outcome.
-        if let Some(denial) = crate::service::authorization::refusal(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &input.channel_arn,
-        ) {
-            record_access(
-                ctx,
-                &input.channel_arn,
-                crate::scaffolded::ACCESS_DENIED_CODE,
-                "the caller's identity-based policies do not allow this action",
-            );
-            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
-        }
+        // AUTHORIZATION has already been decided, as IAM decides a signed call ahead of the
+        // service: the gate in FRONT of this operation (see
+        // [`crate::service::authorization`]) evaluated the calling principal's
+        // identity-based policies for this operation's own action on the channel reference
+        // the request carried, and it is reached before the request is deserialized and
+        // before the model's constraints are checked. A principal no statement allows is
+        // therefore refused before anything of this service is read and before any value it
+        // submitted is restated, so nothing below runs for such a caller.
 
         // The engine is reachable from `&self` (constructor-injected); never build one
         // here, or the ingest log this request appends to is dropped on return.
@@ -380,7 +375,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names neither is not a channel ARN. A value that does not even start with
         // `arn:` fails the member's modelled `@pattern` at the boundary and is answered
         // as this same refusal there (see `crate::service`'s refusal override), so the
-        // two spellings of "not a channel ARN" reach the caller as one error.
+        // two spellings of "not a channel ARN" reach the caller as one error — and both
+        // of them only after the authorization gate in front of this operation has
+        // allowed the call, so neither spelling can reach an unentitled caller as a
+        // different error class.
         let Some(channel_ref) = crate::state::parse_channel_ref(&input.channel_arn) else {
             record_access(
                 ctx,
