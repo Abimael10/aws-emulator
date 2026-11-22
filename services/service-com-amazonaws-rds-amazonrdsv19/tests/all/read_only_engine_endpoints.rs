@@ -26,91 +26,16 @@ use std::sync::Arc;
 
 use crate::db_clusters::{describe_one, the_cluster};
 use crate::db_instance_engine_endpoint::{
-    available_instance, endpoint_of, mysql_login, postgres_login, Refusal, Rows, Transport,
-    DATABASE, MASTER_PASSWORD, MASTER_USER,
+    available_instance, endpoint_of, wire_login as login, Refusal, Session, Wire, DATABASE,
+    MASTER_PASSWORD, MASTER_USER,
 };
 use crate::db_instances::{
     call, emulator, emulator_with_engine, expect_ok, text, wait_for_settle, REGION,
 };
 
-/// Which wire a row's resource is dialled on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wire {
-    Postgres,
-    MySql,
-}
-
-/// A session a client has opened on one of the two wires, so one table can drive both.
-enum Session {
-    Postgres(Box<crate::db_instance_engine_endpoint::PostgresSession>),
-    MySql(Box<crate::db_instance_engine_endpoint::MySqlSession>),
-}
-
-impl Session {
-    /// Run one statement and answer with what the server did.
-    async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
-        match self {
-            Self::Postgres(session) => session.query(sql).await,
-            Self::MySql(session) => session.query(sql).await,
-        }
-    }
-
-    /// The one value a single-row, single-column statement answers with.
-    async fn value(&mut self, case: &str, sql: &str) -> String {
-        let answer = self
-            .query(sql)
-            .await
-            .unwrap_or_else(|refusal| panic!("case {case:?}: {sql:?} must run, got {refusal:?}"));
-        answer
-            .only()
-            .unwrap_or_else(|| panic!("case {case:?}: {sql:?} must answer with a value"))
-            .to_string()
-    }
-}
-
-/// Open a session as the master user on `address:port` of `wire`, in the database every
-/// resource of this suite was created with.
-async fn login(case: &str, wire: Wire, address: &str, port: u16, database: &str) -> Session {
-    match wire {
-        Wire::Postgres => Session::Postgres(Box::new(
-            postgres_login(
-                address,
-                port,
-                // The in-band TLS upgrade this wire negotiates on the same port: an RDS for
-                // PostgreSQL instance of a current version refuses a session in the clear
-                // (`rds.force_ssl`), which its own suite covers.
-                Transport::Tls,
-                MASTER_USER,
-                MASTER_PASSWORD,
-                Some(database),
-            )
-            .await
-            .unwrap_or_else(|refusal| {
-                panic!(
-                    "case {case:?}: the master user must be admitted on {address}:{port}, got \
-                     {refusal:?}"
-                )
-            }),
-        )),
-        Wire::MySql => Session::MySql(Box::new(
-            mysql_login(
-                address,
-                port,
-                Transport::Plaintext,
-                MASTER_USER,
-                MASTER_PASSWORD,
-                Some(database),
-            )
-            .await
-            .unwrap_or_else(|refusal| {
-                panic!(
-                    "case {case:?}: the master user must be admitted on {address}:{port}, got \
-                     {refusal:?}"
-                )
-            }),
-        )),
-    }
-}
+// The session type and the login this suite drives both wires through live beside the wire
+// clients themselves (`crate::db_instance_engine_endpoint`), so every suite whose rows span
+// both wires opens its sessions the same way.
 
 /// The statement that asks a session whether the server it is on serves writes, and the
 /// answers a read-only and a read-write session give.
@@ -336,15 +261,15 @@ async fn available_cluster(
             text(&settled, "Port")
         )
     });
-    // Both endpoint members are HOSTS the cluster mints from its own identifier: the model
-    // gives a DB cluster ONE `Port` for the pair, so neither carries a port of its own, and
-    // the `cluster-`/`cluster-ro-` label is what tells the read path from the write path.
+    // Both endpoint members are HOSTS: the model gives a DB cluster ONE `Port` for the pair,
+    // so neither carries a port of its own. The writer member is the address this emulator
+    // answers the cluster's engine wire at, and the reader member the `cluster-ro-` name the
+    // cluster mints, which is what tells the read path from the write path.
     let reader_host = text(&settled, "ReaderEndpoint");
-    crate::db_clusters::assert_endpoint_name_pair(
+    crate::db_clusters::assert_served_endpoint_pair(
         row.case,
         row.identifier,
         REGION,
-        crate::db_clusters::SERVED_SUFFIX,
         &text(&settled, "Endpoint"),
         &reader_host,
     );

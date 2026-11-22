@@ -209,23 +209,28 @@ fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCa
         row.expected_allocated_storage
     );
     let identifier = text(cluster, "DBClusterIdentifier");
-    // Both endpoint names are minted by the CLUSTER from its identifier, over one shared
-    // suffix: the engine's service label in the zone this emulator announces a served
-    // cluster's names in, and the endpoint domain of the control plane that owns the engine
-    // for a cluster this emulator serves no data plane for.
-    let suffix = if row.serves_the_engines_wire {
-        crate::db_clusters::SERVED_SUFFIX
+    // A cluster whose engine wire this emulator SERVES publishes the address that wire is
+    // answered at as its writer endpoint, beside the `cluster-ro-` name it mints in the zone
+    // its own listener is reached in; a cluster this emulator serves no data plane for mints
+    // both names over the endpoint domain of the control plane that owns its engine.
+    if row.serves_the_engines_wire {
+        crate::db_clusters::assert_served_endpoint_pair(
+            &case,
+            &identifier,
+            REGION,
+            &text(cluster, "Endpoint"),
+            &text(cluster, "ReaderEndpoint"),
+        );
     } else {
-        row.expected_domain
-    };
-    crate::db_clusters::assert_endpoint_name_pair(
-        &case,
-        &identifier,
-        REGION,
-        suffix,
-        &text(cluster, "Endpoint"),
-        &text(cluster, "ReaderEndpoint"),
-    );
+        crate::db_clusters::assert_endpoint_name_pair(
+            &case,
+            &identifier,
+            REGION,
+            row.expected_domain,
+            &text(cluster, "Endpoint"),
+            &text(cluster, "ReaderEndpoint"),
+        );
+    }
 }
 
 #[tokio::test]

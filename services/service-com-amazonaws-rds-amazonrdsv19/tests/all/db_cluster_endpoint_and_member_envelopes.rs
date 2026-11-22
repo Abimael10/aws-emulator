@@ -10,11 +10,12 @@
 //!    `DBCluster$Port` ("the port that the database engine is listening on") beside its two
 //!    endpoint members, so neither `Endpoint` nor `ReaderEndpoint` carries a port of its own
 //!    and neither is ever written as a `host:port` authority; a client composes the address
-//!    it dials from an endpoint and that one port. Both are the documented DNS names the
-//!    CLUSTER mints from its identifier — `<identifier>.cluster-<label>` for the writer and
-//!    `<identifier>.cluster-ro-<label>` for the reader — over one shared suffix: the zone a
-//!    cluster whose data plane this emulator SERVES is reached in, and the endpoint domain of
-//!    the control plane that owns the engine for every other cluster.
+//!    it dials from an endpoint and that one port. A cluster whose data plane this emulator
+//!    SERVES publishes, as `Endpoint`, the address that plane is answered at — the host of
+//!    its own listener — and the `cluster-ro-` name it mints as `ReaderEndpoint`; every other
+//!    cluster publishes the documented DNS names the CLUSTER mints from its identifier for
+//!    both, `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>`, over one
+//!    shared suffix: the endpoint domain of the control plane that owns its engine.
 //!
 //! 2. `DBClusterMember$PromotionTier` is "the order in which an Aurora Replica is promoted
 //!    to the primary instance": a property of the MEMBER instance — the value its request
@@ -170,13 +171,13 @@ fn the_published_address(case: &str, row: &EndpointCase, which: &str, cluster: &
         );
     }
     if row.served {
-        // A cluster whose engine wire this emulator serves announces both names in the zone
-        // its own listener is reached in.
-        crate::db_clusters::assert_endpoint_name_pair(
+        // A cluster whose engine wire this emulator serves publishes the address that wire is
+        // answered at as its writer endpoint, and the `cluster-ro-` name it mints in the zone
+        // its own listener is reached in as its reader endpoint.
+        crate::db_clusters::assert_served_endpoint_pair(
             &format!("{case} ({which})"),
             row.identifier,
             REGION,
-            crate::db_clusters::SERVED_SUFFIX,
             &endpoint,
             &reader,
         );

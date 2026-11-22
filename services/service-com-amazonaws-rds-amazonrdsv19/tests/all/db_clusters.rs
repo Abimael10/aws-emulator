@@ -325,6 +325,10 @@ pub(crate) const SERVED_SUFFIX: &str = "rds.localhost";
 /// server-assigned label and ONE shared suffix behind them, and neither carries a port. They
 /// are therefore non-empty and distinct whatever the cluster's membership is.
 ///
+/// The pair a cluster this emulator serves no data plane for publishes. A SERVED cluster
+/// publishes the address its own listener answers on as its writer endpoint instead — see
+/// [`assert_served_endpoint_pair`].
+///
 /// `pub(crate)` so every suite that reads a cluster's endpoints asserts the one rule rather
 /// than a copy of it.
 pub(crate) fn assert_endpoint_name_pair(
@@ -365,6 +369,51 @@ pub(crate) fn assert_endpoint_name_pair(
         writer_rest, reader_rest,
         "case {case:?}: both endpoints must carry one label and one suffix, got {writer:?} and \
          {reader:?}"
+    );
+}
+
+/// RULE: a cluster whose engine wire this emulator SERVES publishes, as the `Endpoint` a
+/// client opens a session on, the HOST of the listener that serves it — an address of this
+/// machine, carrying no DNS zone and no port, because the `Port` beside it is that listener's
+/// and the pair is the whole address a client dials. Its `ReaderEndpoint` stays the name the
+/// cluster mints under `cluster-ro-`, which is what tells a read path from a write path, so
+/// the two members are still distinct.
+///
+/// `pub(crate)` so every suite that reads a served cluster's endpoints asserts the one rule
+/// rather than a copy of it.
+pub(crate) fn assert_served_endpoint_pair(
+    case: &str,
+    identifier: &str,
+    region: &str,
+    writer: &str,
+    reader: &str,
+) {
+    let address = writer.parse::<std::net::IpAddr>();
+    assert!(
+        address.is_ok_and(|address| address.is_loopback()),
+        "case {case:?}: expected the writer endpoint to be the address this emulator serves \
+         the cluster's engine wire at — the loopback interface the core binds on — got \
+         {writer:?}"
+    );
+    assert!(
+        !writer.contains(':') || writer.parse::<std::net::Ipv6Addr>().is_ok(),
+        "case {case:?}: an endpoint member carries no port of its own, got {writer:?}"
+    );
+    let reader_label = format!("{identifier}.cluster-ro-");
+    let tail = format!(".{region}.{SERVED_SUFFIX}");
+    assert!(
+        reader.starts_with(reader_label.as_str()) && reader.ends_with(&tail),
+        "case {case:?}: expected a reader endpoint of the form {reader_label}<label>{tail}, \
+         got {reader:?}"
+    );
+    assert!(
+        !reader.contains(':'),
+        "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
+    );
+    assert_ne!(
+        writer, reader,
+        "case {case:?}: a cluster's reader endpoint must be distinct from its writer \
+         endpoint, got {writer:?} for both"
     );
 }
 
@@ -429,21 +478,14 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
             "case {case:?}: expected <{element}> {expected:?}, got {actual:?} in {xml}"
         );
     }
-    // The cluster's WRITER endpoint is a DNS name the cluster mints from its own identifier,
-    // and its READER endpoint the same name under the `cluster-ro-` label: a client dials
-    // what it resolves either of them to with the one `Port` beside them, so neither endpoint
-    // member carries a port of its own. A cluster whose engine wire this emulator serves
-    // announces both in the zone its own listener is reached in.
+    // The cluster's WRITER endpoint is the address this emulator answers its engine wire at:
+    // a client dials that host with the one `Port` beside it, so the endpoint member carries
+    // no port of its own. Its READER endpoint is the name the cluster mints under the
+    // `cluster-ro-` label, in the zone its own listener is reached in, which is what tells
+    // the read path from the write path.
     let endpoint = text(xml, "Endpoint");
     let reader = text(xml, "ReaderEndpoint");
-    assert_endpoint_name_pair(
-        &case,
-        row.stored_identifier,
-        REGION,
-        SERVED_SUFFIX,
-        &endpoint,
-        &reader,
-    );
+    assert_served_endpoint_pair(&case, row.stored_identifier, REGION, &endpoint, &reader);
     let port = text(xml, "Port");
     assert!(
         port.parse::<u16>().is_ok_and(|port| port != 0),

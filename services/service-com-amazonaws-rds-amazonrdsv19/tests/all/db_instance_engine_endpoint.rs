@@ -1909,3 +1909,98 @@ async fn an_engine_this_emulator_serves_no_wire_for_publishes_no_listener() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ONE session over EITHER wire, for the sibling suites whose rows span both.
+// ---------------------------------------------------------------------------
+
+/// Which wire a resource is dialled on.
+///
+/// `pub(crate)` beside the two clients above, so a suite whose table spans both wires drives
+/// them through one session type rather than writing a wrapper of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wire {
+    Postgres,
+    MySql,
+}
+
+/// A session a client has opened on one of the two wires, so one table can drive both.
+pub(crate) enum Session {
+    Postgres(Box<PostgresSession>),
+    MySql(Box<MySqlSession>),
+}
+
+impl Session {
+    /// Run one statement and answer with what the server did.
+    pub(crate) async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
+        match self {
+            Self::Postgres(session) => session.query(sql).await,
+            Self::MySql(session) => session.query(sql).await,
+        }
+    }
+
+    /// Run one statement, failing the case when the server refuses it.
+    pub(crate) async fn run(&mut self, case: &str, sql: &str) -> Rows {
+        self.query(sql)
+            .await
+            .unwrap_or_else(|refusal| panic!("case {case:?}: {sql:?} must run, got {refusal:?}"))
+    }
+
+    /// The one value a single-row, single-column statement answers with.
+    pub(crate) async fn value(&mut self, case: &str, sql: &str) -> String {
+        let answer = self.run(case, sql).await;
+        answer
+            .only()
+            .unwrap_or_else(|| panic!("case {case:?}: {sql:?} must answer with a value"))
+            .to_string()
+    }
+}
+
+/// Open a session as the master user on `address:port` of `wire`, in `database`.
+pub(crate) async fn wire_login(
+    case: &str,
+    wire: Wire,
+    address: &str,
+    port: u16,
+    database: &str,
+) -> Session {
+    match wire {
+        Wire::Postgres => Session::Postgres(Box::new(
+            postgres_login(
+                address,
+                port,
+                // The in-band TLS upgrade this wire negotiates on the same port: an RDS for
+                // PostgreSQL endpoint of a current version refuses a session in the clear
+                // (`rds.force_ssl`), which its own suite above covers.
+                Transport::Tls,
+                MASTER_USER,
+                MASTER_PASSWORD,
+                Some(database),
+            )
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "case {case:?}: the master user must be admitted on {address}:{port}, got \
+                     {refusal:?}"
+                )
+            }),
+        )),
+        Wire::MySql => Session::MySql(Box::new(
+            mysql_login(
+                address,
+                port,
+                Transport::Plaintext,
+                MASTER_USER,
+                MASTER_PASSWORD,
+                Some(database),
+            )
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "case {case:?}: the master user must be admitted on {address}:{port}, got \
+                     {refusal:?}"
+                )
+            }),
+        )),
+    }
+}

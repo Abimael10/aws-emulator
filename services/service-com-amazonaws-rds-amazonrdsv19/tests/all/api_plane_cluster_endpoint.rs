@@ -162,13 +162,13 @@ fn assert_published_address(case: &str, label: &str, cluster: &str, row: &Addres
             );
         }
         Expected::OwnListener => {
-            // A cluster whose own engine listener serves its data plane publishes the two
-            // names it mints from its identifier, in the zone that listener is reached in.
-            crate::db_clusters::assert_endpoint_name_pair(
+            // A cluster whose own engine listener serves its data plane publishes the address
+            // that listener answers on as its writer endpoint, and the name it mints under the
+            // `cluster-ro-` label in the zone that listener is reached in as its reader one.
+            crate::db_clusters::assert_served_endpoint_pair(
                 &case,
                 &text(cluster, "DBClusterIdentifier"),
                 REGION,
-                crate::db_clusters::SERVED_SUFFIX,
                 &endpoint,
                 &reader,
             );

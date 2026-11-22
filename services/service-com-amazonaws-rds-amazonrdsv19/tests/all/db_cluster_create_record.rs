@@ -291,6 +291,10 @@ async fn the_record_a_create_acknowledges_is_the_record_describe_reports() {
 struct IdentityCase {
     identifier: &'static str,
     engine: &'static str,
+    /// Whether this emulator serves the engine's own wire, which decides what the cluster
+    /// publishes as its writer endpoint: the address that wire is answered at, or the name the
+    /// cluster mints under the `cluster-` label.
+    served: bool,
     /// The parameters this row adds beyond `DBClusterIdentifier` and `Engine`.
     extra: &'static [(&'static str, &'static str)],
 }
@@ -305,21 +309,25 @@ const IDENTITY_CASES: &[IdentityCase] = &[
     IdentityCase {
         identifier: "emu-identity-one",
         engine: "aurora-mysql",
+        served: true,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-two",
         engine: "aurora-mysql",
+        served: true,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-three",
         engine: "aurora-postgresql",
+        served: true,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-four",
         engine: "postgres",
+        served: true,
         extra: &[
             ("AllocatedStorage", "100"),
             ("DBClusterInstanceClass", "db.m6gd.xlarge"),
@@ -332,6 +340,7 @@ const IDENTITY_CASES: &[IdentityCase] = &[
         // An engine whose wire this emulator serves no data plane for, so its cluster's
         // endpoints sit in its own control plane's DNS domain.
         engine: "docdb",
+        served: false,
         extra: &[],
     },
 ];
@@ -380,7 +389,7 @@ fn reader_endpoint(case: &str, identifier: &str, endpoint: &str) -> String {
 
 /// The identity one cluster envelope reports, asserting the published form of each member
 /// on the way.
-fn identity_of(case: &str, identifier: &str, cluster: &str) -> Identity {
+fn identity_of(case: &str, identifier: &str, served: bool, cluster: &str) -> Identity {
     let resource_id = text(cluster, "DbClusterResourceId");
     // "The Amazon Web Services Region-unique, immutable identifier for the DB cluster",
     // written `cluster-` plus server-minted characters.
@@ -396,13 +405,22 @@ fn identity_of(case: &str, identifier: &str, cluster: &str) -> Identity {
     );
 
     let endpoint = text(cluster, "Endpoint");
-    // The writer endpoint is the same name under the `cluster-` label, so it too is derived
-    // from the cluster's identifier.
-    assert!(
-        endpoint.starts_with(&format!("{identifier}.cluster-")),
-        "case {case:?}: expected the published DNS form of the cluster endpoint, got \
-         {endpoint:?}"
-    );
+    // The writer endpoint is where a client OPENS a session: the address this emulator answers
+    // the cluster's engine wire at for an engine whose wire it serves, and the same name under
+    // the `cluster-` label — derived from the cluster's identifier too — for one it does not.
+    if served {
+        assert!(
+            endpoint.parse::<std::net::IpAddr>().is_ok(),
+            "case {case:?}: expected the address this emulator serves the cluster's engine \
+             wire at as the cluster endpoint, got {endpoint:?}"
+        );
+    } else {
+        assert!(
+            endpoint.starts_with(&format!("{identifier}.cluster-")),
+            "case {case:?}: expected the published DNS form of the cluster endpoint, got \
+             {endpoint:?}"
+        );
+    }
     let reader = text(cluster, "ReaderEndpoint");
 
     Identity {
@@ -416,7 +434,7 @@ fn identity_of(case: &str, identifier: &str, cluster: &str) -> Identity {
 async fn every_cluster_is_minted_an_identity_of_its_own() {
     let router = emulator();
 
-    let mut created: Vec<(&str, Identity)> = Vec::new();
+    let mut created: Vec<(&IdentityCase, Identity)> = Vec::new();
     for row in IDENTITY_CASES {
         let mut params: Vec<(&str, String)> = vec![
             ("DBClusterIdentifier", row.identifier.to_string()),
@@ -433,14 +451,16 @@ async fn every_cluster_is_minted_an_identity_of_its_own() {
         );
         let cluster = the_cluster(row.identifier, &body);
         created.push((
-            row.identifier,
-            identity_of(row.identifier, row.identifier, &cluster),
+            row,
+            identity_of(row.identifier, row.identifier, row.served, &cluster),
         ));
     }
 
     // No two clusters share a minted identity.
-    for (left_index, (left, left_identity)) in created.iter().enumerate() {
-        for (right, right_identity) in created.iter().skip(left_index + 1) {
+    for (left_index, (left_row, left_identity)) in created.iter().enumerate() {
+        let left = left_row.identifier;
+        for (right_row, right_identity) in created.iter().skip(left_index + 1) {
+            let right = right_row.identifier;
             assert_ne!(
                 left_identity.resource_id, right_identity.resource_id,
                 "clusters {left} and {right} were minted the same DbClusterResourceId {:?}",
@@ -464,9 +484,10 @@ async fn every_cluster_is_minted_an_identity_of_its_own() {
     // An identity is minted ONCE: a later read reports what the create did, rather than a
     // value recomputed per response.
     wait_for_settle();
-    for (identifier, identity) in &created {
+    for (row, identity) in &created {
+        let identifier = row.identifier;
         let read_back = describe_one(&router, identifier, identifier).await;
-        let read_identity = identity_of(identifier, identifier, &read_back);
+        let read_identity = identity_of(identifier, identifier, row.served, &read_back);
         assert_eq!(
             read_identity, *identity,
             "cluster {identifier}: expected the identity the create minted {identity:?}, got \

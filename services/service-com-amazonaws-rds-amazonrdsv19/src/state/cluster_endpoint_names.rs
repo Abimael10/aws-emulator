@@ -1,46 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The DNS HOST NAMES a DB cluster publishes as its two endpoints.
+//! The DNS HOST NAMES a DB cluster MINTS for its endpoints, for the members that publish one.
 //!
 //! `DBCluster$Endpoint` is "the connection endpoint for the primary instance of the DB
 //! cluster" and `DBCluster$ReaderEndpoint` "the reader endpoint for the DB cluster … [which]
 //! load-balances connections across the Aurora Replicas that are available in a DB cluster"
-//! (`smithy_query(query="shape",shape="DBCluster")`). Both are host NAMES and neither carries
-//! a port: the cluster has ONE `Port` member, "the port that the database engine is listening
+//! (`smithy_query(query="shape",shape="DBCluster")`). Both are HOSTS and neither carries a
+//! port: the cluster has ONE `Port` member, "the port that the database engine is listening
 //! on", so `Endpoint` + `Port` and `ReaderEndpoint` + `Port` are the two pairs a client dials.
 //!
-//! The CLUSTER mints both names, from its own identifier and the one server-assigned label it
-//! was created with:
+//! A name composed here is minted by the CLUSTER, from its own identifier and the one
+//! server-assigned label it was created with:
 //!
 //! * `<identifier>.cluster-<label>.<region>.<suffix>` for the writer, and
 //! * `<identifier>.cluster-ro-<label>.<region>.<suffix>` for the reader,
 //!
-//! over the SAME suffix. Neither is read off a member instance, so both exist, are
-//! non-empty and keep that form for a cluster with no members at all — a serverless cluster
-//! nobody has created an instance in is reached at both of them — and the discriminating
-//! `cluster-`/`cluster-ro-` label is what tells a read path from a write path.
+//! over the SAME suffix. Neither is read off a member instance, so a cluster with no members
+//! at all publishes its own — a serverless cluster nobody has created an instance in is
+//! reached at it — and the discriminating `cluster-`/`cluster-ro-` label is what tells a read
+//! path from a write path.
 //!
-//! WHICH suffix depends on where the cluster's data plane is served, because a name a service
-//! hands a client is a name the client RESOLVES and then dials:
+//! WHICH of a cluster's endpoint members is published as a minted name at all, and under
+//! which suffix, depends on where that cluster's data plane is served, because a name a
+//! service hands a client is a name the client RESOLVES and then dials:
 //!
 //! * a cluster whose engine wire this emulator serves is reached on a listener of its own
-//!   ([`super::data_plane::cluster_endpoint`]), so its names sit under the engine's own
-//!   service label in the zone a resolver answers with the interface that listener is bound
-//!   on ([`served_endpoint_suffix`]) — `localhost` and every name under it being reserved for
-//!   the loopback interface the core binds on (RFC 6761), which is where the port is;
-//! * a cluster this emulator serves no data plane for keeps the published AWS form, under the
-//!   DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]): there
-//!   is no local plane for such a cluster to lead a client to.
+//!   ([`super::data_plane::cluster_endpoint`]), so its `Endpoint` — the member a session is
+//!   opened on, beside the one `Port` that listener answers at — is that listener's own HOST
+//!   and no name at all ([`super::DbClusterRecord::endpoint`]). Its `ReaderEndpoint` keeps the
+//!   minted `cluster-ro-` name, which is the only thing that tells the read path from the
+//!   write path, under the engine's own service label in the zone a resolver answers with the
+//!   interface that listener is bound on ([`served_endpoint_suffix`]) — `localhost` and every
+//!   name under it being reserved for the loopback interface the core binds on (RFC 6761);
+//! * a cluster this emulator serves no data plane for publishes the AWS form for BOTH, under
+//!   the DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]):
+//!   there is no local plane for such a cluster to lead a client to.
 //!
 //! A cluster whose data plane is an AWS API served at this emulator's own endpoint
-//! ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune graph cluster) publishes
-//! neither form, and is the ONE class of cluster exempt from the pair above: that plane is
-//! HTTP on this emulator's own front door, which admits a request only when its `Host` names
-//! the interface the core bound (`emulator_server::is_loopback_host`, the DNS-rebinding
-//! guard), so a name of this emulator's own — in any zone — is refused there and would be no
-//! connection endpoint at all. Such a cluster therefore publishes the HOST this process is
-//! reached at for both of its endpoint members, which is the only address its plane answers
-//! on ([`super::api_plane_address`]).
+//! ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune graph cluster) publishes no
+//! minted name at all, for either member: that plane is HTTP on this emulator's own front
+//! door, which admits a request only when its `Host` names the interface the core bound
+//! (`emulator_server::is_loopback_host`, the DNS-rebinding guard), so a name of this
+//! emulator's own — in any zone — is refused there and would be no connection endpoint at
+//! all. Such a cluster therefore publishes the HOST this process is reached at for both of its
+//! endpoint members, which is the only address its plane answers on
+//! ([`super::api_plane_address`]).
 
 /// The label a cluster's WRITER endpoint carries in front of its server-assigned one:
 /// `<identifier>.cluster-<label>.…`, the published form of "the connection endpoint for the
@@ -101,8 +105,9 @@ pub fn served_endpoint_suffix(endpoint_domain: &str, served_host: &str) -> Strin
 mod tests {
     use super::*;
 
-    /// RULE: a cluster's two endpoint names differ only in the `cluster-`/`cluster-ro-` label,
-    /// are derived from the cluster's own identifier, and share one suffix.
+    /// RULE: the two names composed here for one cluster differ only in the
+    /// `cluster-`/`cluster-ro-` label, are derived from the cluster's own identifier, and
+    /// share one suffix.
     #[test]
     fn the_two_endpoint_names_share_a_suffix_and_differ_in_their_role_label() {
         // The rows span what the composition generalises over: the identifier (short, long,

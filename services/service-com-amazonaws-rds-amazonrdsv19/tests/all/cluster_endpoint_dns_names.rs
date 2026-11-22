@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the two DNS HOST NAMES a DB cluster publishes as its endpoints.
+//! End-to-end tests for the two HOSTS a DB cluster publishes as its endpoints.
 //!
-//! The rule under test: `DBCluster$Endpoint` and `DBCluster$ReaderEndpoint` are host names
-//! the CLUSTER mints from its own identifier — `<identifier>.cluster-<label>` for the writer
-//! and `<identifier>.cluster-ro-<label>` for the reader, over ONE shared suffix — so the two
-//! are non-empty, DISTINCT and of that form whatever the cluster's membership is, with the
-//! port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`. Neither
-//! name is read off a member instance: a cluster with no DB instance in it at all publishes
-//! both, which is what lets a read/write-splitting client, a DSN builder or a
-//! production-readiness audit tell a read path from a write path.
+//! The rule under test: `DBCluster$Endpoint` and `DBCluster$ReaderEndpoint` are hosts, with
+//! the port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`, and
+//! the two are non-empty and DISTINCT whatever the cluster's membership is. For a cluster
+//! whose engine wire this emulator SERVES, `Endpoint` is the address that wire is answered at
+//! — the host of the cluster's own listener — because that host with the published `Port` is
+//! the whole address a session is opened on; `ReaderEndpoint` is the name the CLUSTER mints
+//! from its own identifier, `<identifier>.cluster-ro-<label>`, which is what lets a
+//! read/write-splitting client, a DSN builder or a production-readiness audit tell a read path
+//! from a write path. Neither member is read off a member instance: a cluster with no DB
+//! instance in it at all publishes both.
 //!
-//! A name a service hands a client is a name the client RESOLVES and then dials, so the
-//! names of a cluster whose engine wire this emulator serves resolve to the interface the
-//! cluster's own listeners are bound on, and the pair `<endpoint>` + `<Port>` is an address a
-//! session really opens on — asserted here by resolving each published name and completing a
-//! PostgreSQL login on it, and by looking the published pair up in the register an in-process
-//! client of this emulator dials through.
+//! An address a service hands a client is one the client DIALS, so both published members lead
+//! to the interface the cluster's own listeners are bound on, and the pair `<endpoint>` +
+//! `<Port>` is an address a session really opens on — asserted here by resolving each
+//! published member and completing a PostgreSQL login on it, and by looking the published pair
+//! up in the register an in-process client of this emulator dials through.
 //!
 //! The rows span what the rule generalises over: the MEMBERSHIP a cluster has (none at all —
 //! the Aurora Serverless v2 cluster nobody created an instance in — one member, and a writer
@@ -30,7 +31,7 @@
 use std::net::SocketAddr;
 
 use crate::db_cluster_snapshot_restore::cluster_endpoint;
-use crate::db_clusters::{assert_endpoint_name_pair, the_cluster, SERVED_SUFFIX};
+use crate::db_clusters::{assert_served_endpoint_pair, the_cluster, SERVED_SUFFIX};
 use crate::db_instance_engine_endpoint::{
     postgres_login, Transport, DATABASE, MASTER_PASSWORD, MASTER_USER,
 };
@@ -213,7 +214,7 @@ async fn resolved_to_loopback(case: &str, which: &str, host: &str, port: u16) ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_cluster_publishes_two_identifier_derived_endpoint_names_whatever_its_membership() {
+async fn every_cluster_publishes_two_distinct_endpoint_members_whatever_its_membership() {
     let router = emulator();
     for row in CLUSTERS {
         let created = create_cluster(&router, row).await;
@@ -221,14 +222,7 @@ async fn every_cluster_publishes_two_identifier_derived_endpoint_names_whatever_
 
         let writer = text(&settled, "Endpoint");
         let reader = text(&settled, "ReaderEndpoint");
-        assert_endpoint_name_pair(
-            row.case,
-            row.stored_identifier,
-            REGION,
-            SERVED_SUFFIX,
-            &writer,
-            &reader,
-        );
+        assert_served_endpoint_pair(row.case, row.stored_identifier, REGION, &writer, &reader);
         // The membership the row stood up, which the rule holds ACROSS: the two names are
         // the cluster's own either way.
         let members = subtrees(&settled, "DBClusterMember").len();
@@ -357,8 +351,8 @@ async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_ga
             .await,
         ),
     );
-    // The restored cluster is a cluster of its own, so it mints its own pair of names: both
-    // carry ITS identifier, and neither carries the source's.
+    // The restored cluster is a cluster of its own: the name it mints carries ITS identifier
+    // and neither published member names the source's.
     let settled = available_cluster(&router, case, restored).await;
     for (which, envelope) in [
         ("RestoreDBClusterFromSnapshot", &answered),
@@ -366,11 +360,10 @@ async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_ga
     ] {
         let writer = text(envelope, "Endpoint");
         let reader = text(envelope, "ReaderEndpoint");
-        assert_endpoint_name_pair(
+        assert_served_endpoint_pair(
             &format!("{case} ({which})"),
             restored,
             REGION,
-            SERVED_SUFFIX,
             &writer,
             &reader,
         );
@@ -409,7 +402,7 @@ async fn both_published_endpoint_names_lead_to_the_plane_they_name() {
     let settled = available_cluster(&router, case, identifier).await;
     let (writer, port) = cluster_endpoint(case, &settled);
     let reader = text(&settled, "ReaderEndpoint");
-    assert_endpoint_name_pair(case, identifier, REGION, SERVED_SUFFIX, &writer, &reader);
+    assert_served_endpoint_pair(case, identifier, REGION, &writer, &reader);
 
     // Both names resolve to the interface the cluster's own listeners are bound on.
     for (which, name) in [("writer", &writer), ("reader", &reader)] {
