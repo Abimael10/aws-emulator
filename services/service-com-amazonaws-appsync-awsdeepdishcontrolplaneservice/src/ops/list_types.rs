@@ -165,16 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
-        if !crate::state::is_api_id(&input.api_id) {
-            return Err(ListTypesErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
-                ..Default::default()
-            })
-            .into());
-        }
-
+        // The `apiId` is a reference to RESOLVE, not a value to screen: this listing is
+        // addressed at the type collection of the API the reference names, so a reference
+        // that names no API of this account is the missing API it is, whatever the value's
+        // length or alphabet, and the lookup below is the only test of it
+        // (`crate::state::api_reference` states which operations screen a reference and
+        // which only resolve one).
         let now = std::time::SystemTime::now();
         let mut guard = state.lock();
 

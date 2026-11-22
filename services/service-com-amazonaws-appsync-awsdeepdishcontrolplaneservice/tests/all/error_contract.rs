@@ -6,10 +6,13 @@
 //! Four rules are asserted here, each over a TABLE that spans the class it
 //! generalises over rather than the single request that exposed it:
 //!
-//! 1. an `apiId` longer than the 26 characters an AppSync API id has names no API, so
-//!    the call is a bad request (400 `BadRequestException`) naming the rejected id;
-//!    a shorter id that simply names nothing is a not-found (404) — asserted on every
-//!    operation that resolves an `apiId`, over ids from 1 to 64 characters;
+//! 1. on an operation that SCREENS the reference it is handed, an `apiId` longer than the
+//!    26 characters an AppSync API id has names no API, so the call is a bad request (400
+//!    `BadRequestException`) naming the rejected id, while a shorter id that simply names
+//!    nothing is a not-found (404) — asserted over ids from 1 to 64 characters on the
+//!    API and API-key operations, which screen one (an operation that only RESOLVES a
+//!    reference answers the not-found for every value it cannot resolve — see
+//!    `crate::type_plane_api_resolution`);
 //! 2. a member the model rules out outright — absent though required, or outside the
 //!    member's modelled `@range` — is AppSync's own `BadRequestException` (400)
 //!    naming that member, and the whole modelled range when it has one; asserted on
@@ -170,12 +173,12 @@ fn create_event_api_body(name: &str, connection: &str, publish: &str, subscribe:
     })
 }
 
-/// Rule 1: the id's SHAPE decides bad-request from not-found, on every operation that
-/// resolves an `apiId`.
+/// Rule 1: the id's SHAPE decides bad-request from not-found on the operations that
+/// SCREEN the reference they are handed.
 ///
 /// The rows differ along the one thing the rule reads — the id's length — from a
 /// single character to well past the id length, and each is sent to all four
-/// `apiId`-resolving operations.
+/// `apiId`-screening operations.
 #[tokio::test]
 async fn an_overlong_api_id_is_a_bad_request_and_a_short_absent_one_is_not_found() {
     let router = router();

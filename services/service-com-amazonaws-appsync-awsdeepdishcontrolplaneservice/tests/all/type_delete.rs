@@ -307,29 +307,20 @@ async fn a_delete_that_addresses_nothing_is_refused_and_removes_nothing() {
     }
 
     // An `apiId` of the right shape that this account does not hold, and one longer than
-    // an API id, which cannot name an API at all.
-    for (case, api, expected_status, expected_error) in [
-        (
-            "an apiId no API has",
-            "z".repeat(state::API_ID_LEN),
-            404,
-            "NotFoundException",
-        ),
+    // an API id: the type collection RESOLVES the reference, so both name the same missing
+    // API (see `crate::type_plane_api_resolution`).
+    for (case, api) in [
+        ("an apiId no API has", "z".repeat(state::API_ID_LEN)),
         (
             "an apiId too long to be one",
             "z".repeat(state::API_ID_LEN + 1),
-            400,
-            "BadRequestException",
         ),
     ] {
         let answer = delete_type(&router, &api, kept[0].name).await;
         assert_eq!(
-            answer.status, expected_status,
-            "case delete under {case}: expected {expected_status}, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_type, expected_error,
-            "case delete under {case}: expected {expected_error}, got {answer:?}"
+            (answer.status, answer.error_type.as_str()),
+            (404, "NotFoundException"),
+            "case delete under {case}: expected 404 NotFoundException, got {answer:?}"
         );
     }
 

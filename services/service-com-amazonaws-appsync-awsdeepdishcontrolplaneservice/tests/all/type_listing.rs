@@ -11,9 +11,9 @@
 //!    page the request's `maxResults` and `nextToken` select — so walking the cursor from
 //!    the first page visits every type exactly once, whatever the page size, and an
 //!    update replaces a type's definition without moving its place;
-//! 2. a `nextToken` that resumes nothing is a 400 `BadRequestException`, an `apiId` this
-//!    account does not hold a 404 `NotFoundException`, and one that cannot name an API at
-//!    all a 400;
+//! 2. a `nextToken` that resumes nothing is a 400 `BadRequestException`, while every
+//!    `apiId` the type collection cannot resolve — of any length and any alphabet — is a
+//!    404 `NotFoundException` with AppSync's fixed absent-API sentence;
 //! 3. `ListTypesByAssociation` answers the types the SOURCE API of the named association
 //!    holds, each named under the MERGED API the request addresses, under the same paging
 //!    rule, and refuses a pair that names no association of the addressed Merged API with
@@ -315,25 +315,25 @@ async fn a_listing_of_nothing_is_empty_and_an_unresumable_one_is_refused() {
         );
     }
 
-    for (case, api, expected_status, expected_error) in [
-        (
-            "an apiId no API has",
-            "z".repeat(state::API_ID_LEN),
-            404,
-            "NotFoundException",
-        ),
+    // Every reference the type collection cannot resolve is the missing API it names,
+    // whatever its length or alphabet (see `crate::type_plane_api_resolution`).
+    for (case, api) in [
+        ("an apiId no API has", "z".repeat(state::API_ID_LEN)),
         (
             "an apiId too long to be one",
             "z".repeat(state::API_ID_LEN + 1),
-            400,
-            "BadRequestException",
         ),
     ] {
         let refused = list_types(&router, &api, state::SDL_FORMAT, None, None).await;
         assert_eq!(
-            (refused.status, refused.error_type.as_str()),
-            (expected_status, expected_error),
-            "case listing under {case}: expected {expected_status} {expected_error}, got {refused:?}"
+            (
+                refused.status,
+                refused.error_type.as_str(),
+                message(&refused)
+            ),
+            (404, "NotFoundException", API_NOT_FOUND),
+            "case listing under {case}: expected 404 NotFoundException {API_NOT_FOUND:?}, got \
+             {refused:?}"
         );
     }
 }

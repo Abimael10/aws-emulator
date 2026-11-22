@@ -27,9 +27,9 @@
 //! 5. the declared name identifies the type within its API: a second create under the
 //!    same name is refused and leaves the stored one untouched, while the same name
 //!    under a different API is a different type;
-//! 6. an `apiId` that cannot name an API is a 400 `BadRequestException`, one that names
-//!    no API this account holds a 404 `NotFoundException`, and a type name the API does
-//!    not hold a 404.
+//! 6. every `apiId` the type collection cannot resolve — of any length and any alphabet
+//!    — is a 404 `NotFoundException` stating the absent API, and a type name the API does
+//!    not hold a 404 stating the absent type.
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the handlers and the shared engine
@@ -851,43 +851,35 @@ async fn the_json_rendering_reports_arguments_defaults_and_deprecations() {
 }
 
 #[tokio::test]
-async fn an_unnameable_api_is_a_bad_request_and_an_absent_one_a_not_found() {
+async fn an_api_the_type_collection_cannot_resolve_is_a_not_found() {
     let router = router();
     let api_id = create_api(&router, "type-api-refusals").await;
     let row = &rows()[0];
 
-    // An `apiId` longer than an AppSync API id holds more characters than one has, so
-    // it names no API at all.
+    // An `apiId` longer than an AppSync API id holds more characters than one has, and one
+    // of the right shape this account simply does not hold: the type collection RESOLVES
+    // the reference it is handed, so neither names an API and both are the same missing
+    // resource (see `crate::type_plane_api_resolution`).
     let unnameable = "z".repeat(state::API_ID_LEN + 1);
-    // An id of the right shape this account simply does not hold.
     let absent = "z".repeat(state::API_ID_LEN);
 
-    for (api, expected_status, expected_error) in [
-        (unnameable.as_str(), 400, "BadRequestException"),
-        (absent.as_str(), 404, "NotFoundException"),
-    ] {
+    for api in [unnameable.as_str(), absent.as_str()] {
         let created = create_type(&router, api, row.definition, state::SDL_FORMAT).await;
         assert_eq!(
-            created.status, expected_status,
-            "case create under {api:?}: expected {expected_status}, got {} {:?}",
-            created.status, created.body
-        );
-        assert_eq!(
-            created.error_type, expected_error,
-            "case create under {api:?}: expected {expected_error}, got {:?} {:?}",
-            created.error_type, created.body
+            (created.status, created.error_type.as_str()),
+            (404, "NotFoundException"),
+            "case create under {api:?}: expected 404 NotFoundException, got {} {:?}",
+            created.status,
+            created.body
         );
 
         let read = get_type(&router, api, row.name, state::SDL_FORMAT).await;
         assert_eq!(
-            read.status, expected_status,
-            "case get under {api:?}: expected {expected_status}, got {} {:?}",
-            read.status, read.body
-        );
-        assert_eq!(
-            read.error_type, expected_error,
-            "case get under {api:?}: expected {expected_error}, got {:?} {:?}",
-            read.error_type, read.body
+            (read.status, read.error_type.as_str()),
+            (404, "NotFoundException"),
+            "case get under {api:?}: expected 404 NotFoundException, got {} {:?}",
+            read.status,
+            read.body
         );
     }
 

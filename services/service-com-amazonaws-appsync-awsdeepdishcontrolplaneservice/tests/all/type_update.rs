@@ -582,27 +582,21 @@ async fn an_update_that_addresses_no_type_is_refused_and_creates_nothing() {
     }
 
     // An `apiId` of the right shape this account does not hold, and one longer than an
-    // API id, which cannot name an API at all.
-    for (case, api, expected_status, expected_error) in [
-        (
-            "an apiId no API has",
-            "z".repeat(state::API_ID_LEN),
-            404,
-            "NotFoundException",
-        ),
+    // API id: the type collection RESOLVES the reference, so both name the same missing
+    // API (see `crate::type_plane_api_resolution`).
+    for (case, api) in [
+        ("an apiId no API has", "z".repeat(state::API_ID_LEN)),
         (
             "an apiId too long to be one",
             "z".repeat(state::API_ID_LEN + 1),
-            400,
-            "BadRequestException",
         ),
     ] {
         let refused =
             update_type(&router, &api, "Widget", Some(definition), state::SDL_FORMAT).await;
         assert_eq!(
             (refused.status, refused.error_type.as_str()),
-            (expected_status, expected_error),
-            "case update under {case}: expected {expected_status} {expected_error}, got {refused:?}"
+            (404, "NotFoundException"),
+            "case update under {case}: expected 404 NotFoundException, got {refused:?}"
         );
     }
 

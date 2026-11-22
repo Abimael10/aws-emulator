@@ -9,8 +9,23 @@
 //! also what a CloudFormation `AWS::AppSync::GraphQLApi` records as the resource's physical
 //! id. An `Api` (the Event API family) publishes its identity the same way, as `apiId` and
 //! `apiArn`. So a reference of either form names the API it was built for, and only a value
-//! that is NEITHER form names no API at all — the malformed request [`is_api_id`] refuses
-//! with [`invalid_api_id_message`], before anything is resolved.
+//! that is NEITHER form names no API at all.
+//!
+//! WHICH of the two client refusals the model binds to every API-scoped operation an `apiId`
+//! that names no API of this account draws is fixed per OPERATION, not read off the value:
+//!
+//! * an operation that SCREENS the reference answers a value of a form no API reference can
+//!   have as the malformed request it is ([`is_api_id`], or the stricter
+//!   [`is_issued_api_reference`]), with [`invalid_api_id_message`] naming the rejected value,
+//!   before anything is resolved;
+//! * an operation that only RESOLVES the reference hands it straight to [`ApiStore`] and
+//!   reports EVERY value it cannot resolve as the missing API it names, with the fixed
+//!   sentence [`crate::state::API_NOT_FOUND_MESSAGE`] — whatever that value's length or
+//!   alphabet.
+//!
+//! The operations of an API's type collection (`/v1/apis/{apiId}/types…`: `ListTypes`,
+//! `CreateType`, `GetType`, `UpdateType` and `DeleteType`) are the resolving kind, so none of
+//! them tests the form of the reference it is handed.
 //!
 //! The resolution is in ONE place, [`ApiStore`], which is how every operation of this crate
 //! reaches an API: a map of the APIs of one family keyed by the id AppSync minted, whose
@@ -35,7 +50,8 @@ use super::*;
 /// The ids this service mints are 26 base-32 characters
 /// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::mint_id`]), the shape AppSync's
 /// own `apiId` takes. The model types every `apiId` member as a plain `String`, so nothing
-/// refuses a longer one at the boundary; [`is_api_id`] is where this service refuses it.
+/// refuses a longer one at the boundary; [`is_api_id`] is where the operations that screen a
+/// reference refuse it.
 pub const API_ID_LEN: usize = 26;
 
 /// Whether `candidate` could name an AppSync API at all: an API id, or an ARN — the two forms
@@ -47,6 +63,10 @@ pub const API_ID_LEN: usize = 26;
 /// not-found. The alphabet is deliberately NOT part of the test: AppSync answers not-found
 /// for a short id drawn from outside the id alphabet, so a character outside it does not make
 /// the request malformed.
+///
+/// Read only by the operations that SCREEN an `apiId` before resolving it (this module's own
+/// documentation states which kind an operation is): an operation that only resolves the
+/// reference calls nothing here and reports an unresolvable value as the missing API it names.
 ///
 /// This is NOT the test for the form of an id the service ISSUES ([`is_opaque_id`]), which
 /// reads the length and the alphabet both: the two are deliberately different tests, because

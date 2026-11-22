@@ -164,16 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
-        if !crate::state::is_api_id(&input.api_id) {
-            return Err(UpdateTypeErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
-                ..Default::default()
-            })
-            .into());
-        }
-
+        // The `apiId` is a reference to RESOLVE, not a value to screen: this update is
+        // addressed at a type of the API the reference names, so a reference that names no
+        // API of this account is the missing API it is, whatever the value's length or
+        // alphabet (`crate::state::api_reference` states which operations screen a
+        // reference and which only resolve one).
+        //
         // The definition the request carries is the type's NEW definition, written in the
         // same GraphQL SDL a create carries, so it is read the same way and before
         // anything is written: a definition GraphQL cannot read, or one that declares no
