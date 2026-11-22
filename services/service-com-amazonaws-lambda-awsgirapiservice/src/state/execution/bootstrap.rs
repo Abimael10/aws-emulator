@@ -297,6 +297,11 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
     the instant the record was created. A record carrying an exception names its class, the
     FRAMES of its stack and where it was emitted beside them, which is what makes a failure
     readable as a record rather than as free text.
+
+    The keys the logging CALL carried beyond the message — a `extra=` mapping, which is how a
+    program states the fields of a structured record — are members of that SAME object,
+    merged in at its top level and each keeping its own JSON type, because that is what makes
+    a field expression over the log group find them.
     """
 
     def frames(self, record):
@@ -322,6 +327,23 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
 
         return "%s:%s:%s" % (record.pathname, record.funcName, record.lineno)
 
+    def carried(self, record):
+        """The keys the logging CALL put on the record beside the standard ones.
+
+        A record holds one attribute per key of the call's `extra=` mapping, which the library
+        puts there and nothing else does — it refuses an `extra=` key that would displace an
+        attribute of its own — so the fields a program stated are exactly the attributes the
+        library did not ([_RECORD_ATTRIBUTES]). They are returned as the VALUES the call
+        passed, so each is serialised by its own JSON type rather than as text.
+        """
+
+        held = getattr(record, "__dict__", None) or {}
+        return dict(
+            (key, value)
+            for key, value in held.items()
+            if key not in _RECORD_ATTRIBUTES and not key.startswith("_")
+        )
+
     def format(self, record):
         document = {
             "timestamp": self.formatTime(record),
@@ -336,10 +358,56 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
             document["errorMessage"] = failure[1]
             document["stackTrace"] = self.frames(record)
             document["location"] = self.location(record)
-        return json.dumps(document)
+        # The standard keys above are the record's own and are not displaced: the library
+        # refuses an `extra=` key that names one of its attributes, so a carried key is a
+        # field of the call's own and is written beside them.
+        for key, value in self.carried(record).items():
+            if key not in document:
+                document[key] = value
+        # A value no JSON type holds is written as its text rather than failing the record:
+        # a record a program emitted is reported, and the type-preserving members above are
+        # unaffected by the fallback.
+        return json.dumps(document, default=str)
 
 
-def _install_logging(request_id, log_format, log_level):
+# The attributes the logging library itself puts on every record: the record's own framing,
+# which a structured record states under its documented members instead. Anything else on a
+# record came from the logging call's own `extra=` mapping
+# ([`_LambdaJsonLogFormatter.carried`]).
+#
+# Source: the LogRecord attributes the library documents, plus the two that FORMATTING a
+# record adds (`message`, `asctime`).
+_RECORD_ATTRIBUTES = frozenset(
+    (
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "message",
+        "module",
+        "msecs",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "stacklevel",
+        "taskName",
+        "thread",
+        "threadName",
+    )
+)
+
+
+def _install_logging(request_id, log_format):
     """Give the root logger the handler the managed runtime gives it.
 
     A record emitted through `logging` reaches no output on its own: with no handler on
@@ -353,18 +421,11 @@ def _install_logging(request_id, log_format, log_level):
     The FORMAT is the function's own, which the invocation's environment states: the text
     framing of the managed runtime, or the structured record its JSON format delivers.
 
-    The LEVEL is the function's own too, where it has one: `ApplicationLogLevel` filters the
-    application logs "to the selected level of detail and lower", and a managed runtime
-    applies that by setting the ROOT logger to the level the invocation's environment states
-    — which is what makes a function configured at a level see that level's records and
-    nothing more detailed. A function that states no level leaves the root logger exactly as
-    the library's own default (a warning), because that is where the managed runtime leaves
-    it: what a record then has to clear is the level the handler's own code set.
-
     Installed before the handler's module is imported, so a record a module emits while it
     is being imported is carried too, and installed as the ONLY handler, so a handler
     module calling `logging.basicConfig()` adds none beside it and no record is written
-    twice.
+    twice. It is re-installed for each invocation an environment serves, so a record names
+    the invocation that wrote it; the LEVEL is not touched there ([_install_log_level]).
     """
 
     json_records = log_format == _JSON_LOG_FORMAT
@@ -377,9 +438,29 @@ def _install_logging(request_id, log_format, log_level):
     for installed in list(root.handlers):
         root.removeHandler(installed)
     root.addHandler(handler)
+
+
+def _install_log_level(log_level):
+    """Put the function's configured level on the root logger, at INITIALIZATION.
+
+    `ApplicationLogLevel` is the level Lambda filters the application logs it SENDS to
+    CloudWatch at, and a managed runtime starts the environment's root logger at it, so a
+    function that sets no level of its own emits that level's records and nothing more
+    detailed. A function that states no level leaves the root logger exactly as the library's
+    own default (a warning), because that is where the managed runtime leaves it.
+
+    It is done ONCE, while the environment is being initialized and BEFORE the handler's
+    module is imported, so it is the starting level and not a ceiling: a module that sets its
+    own logger level is the last word on what the application logger admits, and every record
+    it admits is emitted into the invocation's output — the log tail of that invocation
+    included. What `ApplicationLogLevel` then withholds, it withholds on the DELIVERY to
+    CloudWatch Logs, which is where the level is applied a second time
+    ([`super::log_delivery`]).
+    """
+
     level = _LOG_LEVELS.get(str(log_level or "").upper())
     if level is not None:
-        root.setLevel(level)
+        logging.getLogger().setLevel(level)
 
 
 # What each `ApplicationLogLevel` is as a level of the logging library, in the order the
@@ -1172,8 +1253,8 @@ def _prepare(request, library):
     _install_logging(
         request["requestId"],
         _configured_log_format(request.get("environment")),
-        _configured_log_level(request.get("environment")),
     )
+    _install_log_level(_configured_log_level(request.get("environment")))
 
     handler = request["handler"]
     module_name, separator, attribute = handler.rpartition(".")
@@ -1334,7 +1415,6 @@ def _bind(request):
     _install_logging(
         prepared["requestId"],
         _configured_log_format(prepared.get("environment")),
-        _configured_log_level(prepared.get("environment")),
     )
     _PREPARED.pop("event", None)
     _PREPARED.pop("context", None)

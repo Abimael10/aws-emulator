@@ -13,7 +13,11 @@
 //! otherwise null is returned". So a `Manual` mode naming no runtime version, and any
 //! other mode naming one, each describe no single configuration and are refused with
 //! this operation's own `InvalidParameterValueException` ("One of the parameters in the
-//! request is not valid") before any record is written.
+//! request is not valid") before any record is written. A `Manual` mode naming a runtime
+//! version of ANOTHER runtime than the function's own is refused the same way, and for the
+//! same reason: a runtime version is a build of one managed runtime, so a version the
+//! function's runtime is not a build of could not run it
+//! ([`crate::state::runtime_named_by_version_arn`]).
 //!
 //! The request's members are judged only once the function it names is in a state that
 //! admits a modification at all: this call modifies the function, so while an update of
@@ -293,6 +297,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // A runtime version is a BUILD of ONE managed runtime, so a version of another
+        // runtime cannot run this function: the `Manual` mode "specif[ies] a runtime version
+        // in your function configuration", and a configuration naming a version the
+        // function's own runtime is not a build of describes nothing that can be deployed.
+        // So the offered ARN is resolved to the runtime it is a version of
+        // (`crate::state::runtime_named_by_version_arn`) and compared with the runtime the
+        // version this call addresses is configured with; a version this emulator can resolve
+        // no runtime for shows nothing about which runtime it is a build of, so there is
+        // nothing to refuse it on.
+        let configured_runtime = record
+            .config_of(&version)
+            .and_then(|config| config.runtime.clone());
+        if let (Some(offered), Some(configured)) = (
+            input
+                .runtime_version_arn
+                .as_deref()
+                .and_then(crate::state::runtime_named_by_version_arn),
+            configured_runtime,
+        ) {
+            if offered != configured {
+                return Err(
+                    PutRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            r#type: None,
+                            message: Some(crate::state::incompatible_runtime_version_message(
+                                input.runtime_version_arn.as_deref().unwrap_or_default(),
+                                &configured,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         record.set_runtime_management_config(

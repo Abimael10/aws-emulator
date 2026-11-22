@@ -445,6 +445,17 @@ pub use archive::{is_over_the_unzipped_limit, unzipped_bytes, unzipped_limit_mes
 pub mod invocation_payload;
 pub use invocation_payload::unparseable_payload_message;
 
+/// The managed runtime VERSION a function runs on — the ARN it is addressed by, the digest
+/// that ARN carries, the BUILD an execution environment reports initialising on, and the
+/// runtime an offered ARN names back — lives in [`runtime_version`]. It is re-exported here
+/// for the same reason as [`capacity_provider`]: the configuration it is read off, and the
+/// store that holds it, stay in this module.
+pub mod runtime_version;
+pub use runtime_version::{
+    incompatible_runtime_version_message, runtime_build, runtime_named_by_version_arn,
+    runtime_version_arn, runtime_version_digest,
+};
+
 /// WHERE a function's invocations are logged and IN WHICH FORM — the one reading of
 /// `LoggingConfig$LogGroup` and of the default group, and of `LoggingConfig$LogFormat` and the
 /// default format — lives in [`invocation_logs`], between the read that REPORTS them and the
@@ -3507,36 +3518,6 @@ pub fn mint_code_signing_config_id() -> String {
 #[must_use]
 pub fn default_log_group(name: &str) -> String {
     format!("/aws/lambda/{name}")
-}
-
-/// The ARN of the managed runtime version a function is pinned to:
-/// `arn:aws:lambda:<region>::runtime:<digest>`, the first form the model's
-/// `RuntimeVersionArn` pattern admits.
-///
-/// The resource position of that form holds the SHA-256 DIGEST of the runtime build the
-/// version is, which AWS reports in full: 64 lowercase hexadecimal digits, the width a
-/// client that pins or compares a runtime version (runtime-management configuration, drift
-/// detection) reads it at. So it is the whole digest rather than a prefix of one, and it is
-/// DERIVED from the runtime identifier — two reads of a function on one runtime report the
-/// same runtime version, two runtimes report different ones, and nothing is taken from the
-/// clock or from the request.
-#[must_use]
-pub fn runtime_version_arn(region: &str, runtime: &str) -> String {
-    format!(
-        "arn:aws:lambda:{region}::runtime:{}",
-        runtime_version_digest(runtime)
-    )
-}
-
-/// The 64 lowercase hexadecimal digits of the runtime build `runtime` names: the SHA-256
-/// of the identifier, rendered whole.
-///
-/// The digest comes from the maintained `sha2` crate and its hexadecimal from `hex`, so
-/// neither is written out here; it is the one place the width of a runtime-version digest
-/// is decided.
-#[must_use]
-pub fn runtime_version_digest(runtime: &str) -> String {
-    ::hex::encode(sha2::Sha256::digest(runtime.as_bytes()))
 }
 
 /// The unqualified ARN of a layer: `arn:aws:lambda:<region>:<account>:layer:<name>`,

@@ -1780,6 +1780,15 @@ fn run_log(
     // to the cold start; an invocation a standing environment served pays no initialization
     // and writes neither.
     if finished.initialized {
+        // WHICH BUILD of the managed runtime the environment stands on, in the form AWS names
+        // a runtime version by (`crate::state::runtime_build`): the runtime identifier names
+        // the runtime, while a record of an environment names the build of it that
+        // initialised, which is what a client correlating a pinned runtime version with the
+        // build that ran reads. An identifier naming no version line at all is reported as
+        // itself, because there is no build of a line to name.
+        let runtime = invocation.runtime.as_deref().unwrap_or_default();
+        let runtime_build =
+            super::runtime_build(runtime).unwrap_or_else(|| runtime.to_string());
         records.push(framed(log_records::init_start(
             json,
             started,
@@ -1789,12 +1798,10 @@ fn run_log(
                 function_version: version,
                 // The runtime version the environment was built on, and the ARN that version
                 // is addressed by — the same reading a read of the function reports as its
-                // `RuntimeVersionConfig` (`crate::state::runtime_version_arn`).
-                runtime_version: invocation.runtime.as_deref().unwrap_or_default(),
-                runtime_version_arn: &super::runtime_version_arn(
-                    &invocation.region,
-                    invocation.runtime.as_deref().unwrap_or_default(),
-                ),
+                // `RuntimeVersionConfig` (`crate::state::runtime_version_arn`), derived from
+                // the same digest as the build above.
+                runtime_version: &runtime_build,
+                runtime_version_arn: &super::runtime_version_arn(&invocation.region, runtime),
                 instance_id: log_stream,
                 // The memory an environment of this function may hold, in the bytes the
                 // record states it in: the function's own `MemorySize`, in MB.
