@@ -172,6 +172,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own members, so a caller whose identity-based policies do not allow
+        // this action is refused with this operation's modelled `AccessDeniedException`
+        // (403) and creates nothing — not even a refusal about the values it submitted. A
+        // create addresses no resource of its own (the dashboard's ARN does not exist until
+        // the store mints it), so IAM judges it against the resource it writes for such a
+        // request (`crate::service::authorization::ANY_RESOURCE`).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(|refusal| {
+            // A refused state change is audited with the modelled error as its outcome, as
+            // every other refusal of this operation is; no dashboard was minted, so the
+            // record names the sentinel resource the other refusals of a create name.
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                crate::service::authorization::NO_RESOURCE_AUDITED,
+                crate::service::authorization::ACCESS_DENIED_CODE,
+            );
+            CreateDashboardErrorModeled::AccessDeniedException(refusal)
+        })?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDashboardErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),

@@ -156,7 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS decides authorization at the IAM layer, ahead of the service reading
+        // anything, so a caller whose identity-based policies do not allow this action on
+        // the dashboard the request addresses is refused with this operation's modelled
+        // `AccessDeniedException` (403) and learns nothing about the policy stored on it —
+        // which is who the dashboard is shared with (`crate::service::authorization`).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(GetResourcePolicyErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetResourcePolicyErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),

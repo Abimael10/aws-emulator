@@ -240,6 +240,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own members, so a caller whose identity-based policies do not allow
+        // this action on the report the request addresses is refused with this operation's
+        // modelled `AccessDeniedException` (403) and the report keeps every member it had
+        // (`crate::service::authorization`).
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.arn)
+            .map_err(|refusal| {
+                // A refused state change is audited with the modelled error as its outcome,
+                // naming the ARN the request addressed, as every other refusal of this
+                // operation does.
+                crate::state::record_state_change(
+                    ctx,
+                    Self::NAME,
+                    &input.arn,
+                    crate::service::authorization::ACCESS_DENIED_CODE,
+                );
+                UpdateScheduledReportErrorModeled::AccessDeniedException(refusal)
+            })?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateScheduledReportErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),

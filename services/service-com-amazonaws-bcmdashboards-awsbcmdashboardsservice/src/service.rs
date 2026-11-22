@@ -63,7 +63,13 @@
 //!   declared range is stated with the member and the bound alone. Routing, status, codes,
 //!   the envelope, the member paths and every other requirement stay with the framework.
 //!   Both choices live in [`validation`].
+//!
+//! One step that is NOT a seam lives here too: [`authorization`], the IAM decision every
+//! operation whose model declares `AccessDeniedException` takes before it reads or writes
+//! anything — the step AWS takes at the IAM layer, ahead of the service looking at the
+//! request's own input.
 
+pub mod authorization;
 pub mod response_media_type;
 pub mod validation;
 
