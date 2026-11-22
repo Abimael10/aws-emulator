@@ -11,9 +11,9 @@
 //!
 //! `templateName` narrows the listing to the versions of the template it names; a
 //! `templateName` that names no template the catalog publishes is refused with the
-//! modelled `InvalidRequestException` rather than answered with an empty page.
-//! `maxResults` bounds the page and `nextToken` resumes the SAME listing. A read only:
-//! nothing here writes.
+//! modelled `ResourceNotFoundException` rather than answered with an empty page.
+//! `maxResults` bounds the page and `nextToken` resumes the SAME listing, in the order
+//! the service publishes the catalog in. A read only: nothing here writes.
 
 //!
 //! ## Shape of an operation
@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this page carries: a managed template is published per region, so the ARN
         // names the catalog of the region it is read from.
         let region = crate::state::request_region(ctx.parts());
-
         // What the request selects is resolved BEFORE the catalog is reached: a
         // `nextToken` this listing never issued is refused whatever the catalog holds.
         let scope = listing_scope(input.template_name.as_deref());
@@ -192,18 +191,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `templateName` is "An optional parameter for template name. If specified, only
         // the versions of the managed job templates that have the specified template
         // name will be returned" — so a name the catalog publishes no template under
-        // selects no versions at all. It is refused as the modelled
-        // `InvalidRequestException` (HTTP 400, "The request is not valid") and not as a
-        // miss of this account's: the catalog is AWS-published reference data, so naming
-        // a template it does not publish is a bad request rather than a resource this
-        // account does not have.
+        // addresses a managed job template this service does not have. It is refused as
+        // the modelled `ResourceNotFoundException` (HTTP 404, "The specified resource does
+        // not exist"), worded with the one sentence every operation that looks a
+        // `templateName` up refuses a miss with.
         if let Some(template_name) = input.template_name.as_deref() {
             if catalog.template(template_name).is_none() {
                 return Err(
-                    ListManagedJobTemplatesErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
+                    ListManagedJobTemplatesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
                             message: Some(
-                                crate::state::invalid_managed_job_template_name_message(
+                                crate::state::managed_job_template_not_found_message(
                                     template_name,
                                 ),
                             ),
@@ -215,11 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One entry per published (template, version) pair the request selects, in
-        // catalog order — by `templateName`, then by `templateVersion` — which is what
-        // makes a page boundary meaningful. One pair beyond the page is taken: its
-        // presence is what says the listing is truncated, and nothing more than that is
-        // read.
-        let mut page: Vec<(CatalogKey, ManagedJobTemplateSummary)> = catalog
+        // CATALOG order — the order the service publishes the templates in, then the
+        // order their versions are in — which is what makes a page boundary meaningful.
+        let selected: Vec<(CatalogKey, ManagedJobTemplateSummary)> = catalog
             .pairs()
             .filter(|(template, _)| {
                 input
@@ -236,17 +232,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     template.summary(&region, version),
                 )
             })
-            .filter(|(key, _)| {
-                resume_after
-                    .as_ref()
-                    .is_none_or(|cursor| key > cursor)
-            })
-            .take(page_size.saturating_add(1))
             .collect();
         drop(store);
 
-        let truncated = page.len() > page_size;
-        page.truncate(page_size);
+        // A continuation token names the POSITION the previous page ended at, so the
+        // next page starts after that entry of this same order. A token naming a position
+        // this listing does not walk is not one it issued.
+        let start = match resume_after.as_ref() {
+            None => 0,
+            Some(cursor) => {
+                let Some(index) = selected.iter().position(|(key, _)| key == cursor) else {
+                    return Err(not_a_token_of_this_listing());
+                };
+                index + 1
+            }
+        };
+
+        // One pair beyond the page is looked at: its presence is what says the listing is
+        // truncated, and nothing more than that is read.
+        let remaining = &selected[start.min(selected.len())..];
+        let truncated = remaining.len() > page_size;
+        let page = &remaining[..remaining.len().min(page_size)];
 
         // `nextToken` is "The token to retrieve the next set of results", so it is
         // issued only while entries remain.
@@ -260,7 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ManagedJobTemplatesSummaryList` carries no length constraint, so a
             // selection nothing matches answers with an EMPTY list rather than an absent
             // member: "nothing matches" is an answer, not a missing one.
-            managed_job_templates: Some(page.into_iter().map(|(_, summary)| summary).collect()),
+            managed_job_templates: Some(
+                page.iter()
+                    .map(|(_, summary)| summary.clone())
+                    .collect(),
+            ),
             next_token,
         })
     }
@@ -274,6 +284,19 @@ const MAX_PAGE_SIZE: i32 = 250;
 /// the version of it this entry is about. The PAIR, because one entry is one version of
 /// one template, so the name alone would not be a position.
 type CatalogKey = (String, String);
+
+/// How a `nextToken` that is not one this listing issued is refused: the modelled
+/// `InvalidRequestException` (HTTP 400, "The request is not valid").
+///
+/// One sentence for every way a token can fail — unreadable, issued for another filter,
+/// or naming a position this listing does not walk — because they are one fact about the
+/// token the caller sent, and none of them tells the caller anything about the catalog.
+fn not_a_token_of_this_listing() -> ListManagedJobTemplatesError {
+    ListManagedJobTemplatesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some("nextToken is not a continuation token of this listing".to_string()),
+    })
+    .into()
+}
 
 /// The character that separates a token's scope from the position it resumes after, and
 /// the two fields of that position. A control character, so it occurs in no
@@ -320,12 +343,7 @@ fn decode_next_token(
     token: &str,
     scope: &str,
 ) -> Result<CatalogKey, ListManagedJobTemplatesError> {
-    let invalid = || -> ListManagedJobTemplatesError {
-        ListManagedJobTemplatesErrorModeled::InvalidRequestException(InvalidRequestException {
-            message: Some("nextToken is not a continuation token of this listing".to_string()),
-        })
-        .into()
-    };
+    let invalid = not_a_token_of_this_listing;
     let bytes = ::hex::decode(token).map_err(|_| invalid())?;
     let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
     let (token_scope, position) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;

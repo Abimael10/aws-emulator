@@ -10,17 +10,22 @@
 //!
 //! The rules under test:
 //!
-//! * the catalog is PUBLISHED data: both operations report the same entries on a store
-//!   nothing has written, no request creates or changes one, and reading one changes
-//!   nothing a later caller sees;
-//! * a listing carries ONE ENTRY PER (template, version) PAIR, in `templateName` then
-//!   `templateVersion` order, each with the ARN of that version
-//!   (`arn:aws:iot:<region>::jobtemplate/<name>:<version>`, with the EMPTY account
-//!   segment of AWS-managed data) scoped to the region the request was signed for;
-//! * `templateName` narrows the listing to that template's versions, and a name the
-//!   catalog publishes nothing under is refused with the modelled
-//!   `InvalidRequestException` (400) — published reference data is not a resource of
-//!   this account, so naming an entry it does not publish is a bad request;
+//! * the catalog is PUBLISHED data: every member of an entry — its description, the
+//!   document of its version and the `documentParameters` that document leaves open — is
+//!   the SERVICE's text, the same for every caller, so a client that renders the catalog
+//!   or validates a parameter value against a published `regex` reads the service's rule
+//!   and not one this emulator invented;
+//! * both operations report the same entries on a store nothing has written, no request
+//!   creates or changes one, and reading one changes nothing a later caller sees;
+//! * a listing carries ONE ENTRY PER (template, version) PAIR in the order the service
+//!   PUBLISHES the catalog in — which is not alphabetical — each with the ARN of that
+//!   version (`arn:aws:iot:<region>::jobtemplate/<name>:<version>`, with the EMPTY
+//!   account segment of AWS-managed data) scoped to the region the request was signed
+//!   for;
+//! * `templateName` narrows the listing to that template's versions, and a `templateName`
+//!   of the modelled shape that names no published template is a NOT-FOUND
+//!   (`ResourceNotFoundException`, 404) with the one sentence every operation that looks
+//!   a `templateName` up words a miss with;
 //! * `maxResults` bounds the page and `nextToken` resumes the SAME listing exactly once
 //!   per entry, for EVERY page size from one to past the number of entries;
 //! * every listed entry is DESCRIBABLE: the describe reports the listing's five members
@@ -28,8 +33,9 @@
 //!   that document leaves open — every placeholder in the document is a declared
 //!   parameter and every required parameter has a placeholder;
 //! * `templateVersion` selects the version, a request that names none gets the default
-//!   (latest) version, and a version the template does not publish is refused the same
-//!   way, with a sentence naming the pair.
+//!   (latest) version, and a version the published template does not publish is refused
+//!   `InvalidRequestException` (400) with a sentence naming the version that was asked
+//!   for.
 //!
 //! The tables span the class each rule generalises over — every entry of the catalog,
 //! every page size, both filter states, the versions a request can ask for and more than
@@ -38,7 +44,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -50,66 +56,209 @@ const REGION: &str = "eu-west-2";
 const QUALIFIED_INVALID_REQUEST: &str =
     "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// The parameters EVERY managed template declares, because they are about running the
-/// device client's handler rather than about the action: where the handlers live and
-/// which user to run one as. Both are optional.
-const COMMON_PARAMETERS: &[(&str, bool)] = &[("pathToHandler", true), ("runAsUser", true)];
+/// The wire error shape of a managed job template the catalog does not publish.
+const NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// One entry the catalog publishes: the template's name and its OWN document
-/// parameters, in the order the document passes them to the handler, each with whether
-/// it is optional.
+/// One `documentParameter` the catalog publishes: the pattern a caller replaces and the
+/// guidance published with it. `example` is `None` for a parameter the service publishes
+/// no example for, which is then absent from the response.
+struct PublishedParameter {
+    key: &'static str,
+    description: &'static str,
+    regex: &'static str,
+    example: Option<&'static str>,
+    optional: bool,
+}
+
+/// Which user a step runs as: published by EVERY managed template, because every one of
+/// them runs something.
+const RUN_AS_USER: PublishedParameter = PublishedParameter {
+    key: "runAsUser",
+    description: "Execute handler as another user. If not specified, then handler is \
+                  executed as the same user as device client.",
+    regex: "(.){0,256}",
+    example: Some("user1"),
+    optional: true,
+};
+
+/// Where the device client's job handlers live: published by every template whose step
+/// RUNS a handler, and by no other.
+const PATH_TO_HANDLER: PublishedParameter = PublishedParameter {
+    key: "pathToHandler",
+    description: "Path to handler on the device. If not specified, then device client \
+                  will use the current working directory.",
+    regex: "(.){0,4096}",
+    example: Some("/path/to/handler/script"),
+    optional: true,
+};
+
+/// One entry the catalog publishes: the template's name and description, the one step
+/// its document runs, and its OWN document parameters in the order the document passes
+/// them to that step.
 ///
 /// Written out by hand rather than read from the crate, so the test pins the published
-/// surface instead of restating the table that produces it. Source: the remote actions
-/// AWS publishes as managed job templates for the AWS IoT Device Client, of which
-/// `AWS-Reboot` is the one the model itself names
+/// surface instead of restating the table that produces it. Source: the managed job
+/// templates AWS publishes for the AWS IoT Device Client, of which `AWS-Reboot` is the
+/// one the model itself names
 /// (`smithy_query(query="doc",shape="DescribeManagedJobTemplateResponse",member="templateName")`:
 /// "The unique name of a managed template, such as AWS-Reboot").
 struct PublishedTemplate {
     template_name: &'static str,
-    parameters: &'static [(&'static str, bool)],
+    description: &'static str,
+    /// The `name` of the one step the template's document runs.
+    step_name: &'static str,
+    /// The device client's job handler that step runs, or `None` for a step that runs no
+    /// handler but the command the caller supplies.
+    handler: Option<&'static str>,
+    parameters: &'static [PublishedParameter],
 }
 
-/// The whole published catalog, in `templateName` order — the order a listing must
-/// report it in.
+impl PublishedTemplate {
+    /// The step's `type`: a template that names a handler runs it, and one that names
+    /// none runs the caller's command.
+    fn step_type(&self) -> &'static str {
+        if self.handler.is_some() {
+            "runHandler"
+        } else {
+            "runCommand"
+        }
+    }
+
+    /// Every parameter this template publishes, in order: its own, then the ones that
+    /// come with the kind of step it runs.
+    fn published_parameters(&self) -> Vec<&PublishedParameter> {
+        let mut parameters: Vec<&PublishedParameter> = self.parameters.iter().collect();
+        parameters.push(&RUN_AS_USER);
+        if self.handler.is_some() {
+            parameters.push(&PATH_TO_HANDLER);
+        }
+        parameters
+    }
+}
+
+/// The expression AWS publishes for a space-separated list of name tokens, which is how
+/// the device client's handlers take a list of packages or of system services.
+const NAME_LIST_REGEX: &str = r"([a-zA-Z0-9+_\-\.]+[\s]?)+";
+
+/// The whole published catalog, in the order the service publishes it — the order a
+/// listing must report it in, which is NOT the alphabetical order of the names.
 const PUBLISHED: &[PublishedTemplate] = &[
     PublishedTemplate {
-        template_name: "AWS-Download-File",
-        parameters: &[("downloadUrl", false), ("filePath", false)],
-    },
-    PublishedTemplate {
-        template_name: "AWS-Install-Application",
-        parameters: &[("packages", false)],
+        template_name: "AWS-Run-Command",
+        description: "A managed job template for running a shell command.",
+        step_name: "Run-Command",
+        handler: None,
+        parameters: &[PublishedParameter {
+            key: "command",
+            description: "A comma separated string of command, any comma contained in \
+                          the command itself needs to be escaped.",
+            regex: "(.){0,4096}",
+            example: Some(r"echo,Hello\,World!"),
+            optional: false,
+        }],
     },
     PublishedTemplate {
         template_name: "AWS-Reboot",
+        description: "A managed job template for rebooting the device.",
+        step_name: "Reboot",
+        handler: Some("reboot.sh"),
         parameters: &[],
     },
     PublishedTemplate {
         template_name: "AWS-Remove-Application",
-        parameters: &[("packages", false)],
-    },
-    PublishedTemplate {
-        template_name: "AWS-Restart-Application",
-        parameters: &[("serviceName", false)],
-    },
-    PublishedTemplate {
-        template_name: "AWS-Run-Command",
-        parameters: &[("command", false)],
-    },
-    PublishedTemplate {
-        template_name: "AWS-Start-Application",
-        parameters: &[("serviceName", false)],
+        description: "A managed job template for uninstalling one or more applications.",
+        step_name: "Remove-Application",
+        handler: Some("remove-packages.sh"),
+        parameters: &[PublishedParameter {
+            key: "packages",
+            description: "A space separated list of packages to uninstall.",
+            regex: NAME_LIST_REGEX,
+            example: Some("lftp dos2unix tcpdump"),
+            optional: false,
+        }],
     },
     PublishedTemplate {
         template_name: "AWS-Stop-Application",
-        parameters: &[("serviceName", false)],
+        description: "A managed job template for stopping one or more system services.",
+        step_name: "Stop-Application",
+        handler: Some("stop-services.sh"),
+        parameters: &[PublishedParameter {
+            key: "services",
+            description: "A space separated list of system services to stop.",
+            regex: NAME_LIST_REGEX,
+            example: Some("cron httpd bluetooth"),
+            optional: false,
+        }],
+    },
+    PublishedTemplate {
+        template_name: "AWS-Start-Application",
+        description: "A managed job template for starting one or more system services.",
+        step_name: "Start-Application",
+        handler: Some("start-services.sh"),
+        parameters: &[PublishedParameter {
+            key: "services",
+            description: "A space separated list of system services to start.",
+            regex: NAME_LIST_REGEX,
+            example: Some("cron httpd bluetooth"),
+            optional: false,
+        }],
+    },
+    PublishedTemplate {
+        template_name: "AWS-Restart-Application",
+        description: "A managed job template for restarting one or more system services.",
+        step_name: "Restart-Application",
+        handler: Some("restart-services.sh"),
+        parameters: &[PublishedParameter {
+            key: "services",
+            description: "A space separated list of system services to restart.",
+            regex: NAME_LIST_REGEX,
+            example: Some("cron httpd bluetooth"),
+            optional: false,
+        }],
+    },
+    PublishedTemplate {
+        template_name: "AWS-Install-Application",
+        description: "A managed job template for installing one or more applications.",
+        step_name: "Install-Application",
+        handler: Some("install-packages.sh"),
+        parameters: &[PublishedParameter {
+            key: "packages",
+            description: "A space separated list of packages to install.",
+            regex: NAME_LIST_REGEX,
+            example: Some("lftp dos2unix tcpdump"),
+            optional: false,
+        }],
+    },
+    PublishedTemplate {
+        template_name: "AWS-Download-File",
+        description: "A managed job template for downloading a file.",
+        step_name: "Download-File",
+        handler: Some("download-file.sh"),
+        parameters: &[
+            PublishedParameter {
+                key: "downloadUrl",
+                description: "URL of file to download.",
+                regex: "(.*?)",
+                example: None,
+                optional: false,
+            },
+            PublishedParameter {
+                key: "filePath",
+                description: "Path on the device where downloaded file is written.",
+                regex: "(.*?)",
+                example: Some("/path/to/file"),
+                optional: false,
+            },
+        ],
     },
 ];
 
 /// The version every published template carries, in the `<major>.<minor>` form
 /// `ManagedTemplateVersion` (`^[1-9]+.[0-9]+$`) fixes.
 const PUBLISHED_VERSION: &str = "1.0";
+
+/// The `version` every published job document declares.
+const DOCUMENT_VERSION: &str = "1.0";
 
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name
 /// and `region`: the scope is how the router picks the claiming service, and how the
@@ -262,6 +411,17 @@ fn expected_pairs() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The sentence every operation that looks a `templateName` up words a miss with.
+fn not_found_message(template_name: &str) -> String {
+    format!("ManagedJobTemplate with name: {template_name} not found")
+}
+
+/// The `${aws:iot:parameter:<key>}` form a managed template's document leaves a
+/// parameter's value open with.
+fn placeholder(key: &str) -> String {
+    format!("${{aws:iot:parameter:{key}}}")
+}
+
 /// The `${aws:iot:parameter:<key>}` placeholders a document carries, found over the
 /// whole document text so a placeholder nested anywhere in the step is seen.
 fn placeholders(document: &str) -> BTreeSet<String> {
@@ -276,8 +436,69 @@ fn placeholders(document: &str) -> BTreeSet<String> {
     found
 }
 
+/// The `document` the catalog publishes for `published`: one step of the kind the row
+/// runs, with a placeholder wherever one of the row's own parameters goes — passed to a
+/// handler as positional arguments beside the directory it is found in, or to a command
+/// as an input field of its own name — and the user as the step's `runAsUser`.
+fn expected_document(published: &PublishedTemplate) -> Value {
+    let mut input = Map::new();
+    match published.handler {
+        Some(handler) => {
+            input.insert("handler".to_string(), json!(handler));
+            if !published.parameters.is_empty() {
+                let args: Vec<Value> = published
+                    .parameters
+                    .iter()
+                    .map(|parameter| json!(placeholder(parameter.key)))
+                    .collect();
+                input.insert("args".to_string(), Value::Array(args));
+            }
+            input.insert(
+                "path".to_string(),
+                json!(placeholder(PATH_TO_HANDLER.key)),
+            );
+        }
+        None => {
+            for parameter in published.parameters {
+                input.insert(parameter.key.to_string(), json!(placeholder(parameter.key)));
+            }
+        }
+    }
+    json!({
+        "version": DOCUMENT_VERSION,
+        "steps": [{
+            "action": {
+                "name": published.step_name,
+                "type": published.step_type(),
+                "input": Value::Object(input),
+                "runAsUser": placeholder(RUN_AS_USER.key),
+            }
+        }]
+    })
+}
+
+/// The `documentParameters` the catalog publishes for `published`, as the JSON a client
+/// reads: every member of every parameter, in order.
+fn expected_parameters(published: &PublishedTemplate) -> Vec<Value> {
+    published
+        .published_parameters()
+        .into_iter()
+        .map(|parameter| {
+            let mut object = Map::new();
+            object.insert("key".to_string(), json!(parameter.key));
+            object.insert("description".to_string(), json!(parameter.description));
+            object.insert("regex".to_string(), json!(parameter.regex));
+            if let Some(example) = parameter.example {
+                object.insert("example".to_string(), json!(example));
+            }
+            object.insert("optional".to_string(), json!(parameter.optional));
+            Value::Object(object)
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn listing_reports_the_whole_published_catalog_in_order() {
+async fn listing_reports_the_whole_published_catalog_in_published_order() {
     let emulator = Emulator::new();
     let reply = emulator.list("").await;
     assert_eq!(
@@ -287,7 +508,7 @@ async fn listing_reports_the_whole_published_catalog_in_order() {
     assert_eq!(
         reply.pairs(),
         expected_pairs(),
-        "unfiltered listing: expected every published pair in templateName order, got {:?}",
+        "unfiltered listing: expected every published pair in published order, got {:?}",
         reply.pairs()
     );
     assert_eq!(
@@ -297,32 +518,25 @@ async fn listing_reports_the_whole_published_catalog_in_order() {
         reply.next_token()
     );
 
-    for entry in reply.templates() {
-        let name = member(&entry, "templateName");
+    for (published, entry) in PUBLISHED.iter().zip(reply.templates()) {
+        let name = published.template_name;
         assert_eq!(
             member(&entry, "templateArn"),
-            expected_arn(REGION, &name, PUBLISHED_VERSION),
+            expected_arn(REGION, name, PUBLISHED_VERSION),
             "case {name:?}: expected the version's ARN, got {:?}",
             member(&entry, "templateArn")
         );
-        assert!(
-            !member(&entry, "description").is_empty(),
-            "case {name:?}: expected a description, got {entry:?}"
+        assert_eq!(
+            member(&entry, "description"),
+            published.description,
+            "case {name:?}: expected the published description, got {:?}",
+            member(&entry, "description")
         );
-        let environments: Vec<String> = entry
-            .get("environments")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| value.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert!(
-            !environments.is_empty(),
-            "case {name:?}: expected the environments the template is supported with, \
-             got {environments:?}"
+        assert_eq!(
+            entry.get("environments"),
+            Some(&json!(["LINUX"])),
+            "case {name:?}: expected the environments the template is supported with, got {:?}",
+            entry.get("environments")
         );
     }
 }
@@ -379,7 +593,7 @@ async fn listing_narrows_to_one_templates_versions() {
 }
 
 #[tokio::test]
-async fn a_filter_naming_no_published_template_is_refused() {
+async fn a_filter_naming_no_published_template_is_a_not_found() {
     // The rows differ along WHY the name names nothing: a name of the right shape, one
     // that differs from a published name only in case, one that is a prefix of a
     // published name, and the longest name the model admits (`length 1..64`).
@@ -394,18 +608,18 @@ async fn a_filter_naming_no_published_template_is_refused() {
     for name in cases {
         let reply = emulator.list(&format!("templateName={name}")).await;
         assert_eq!(
-            reply.status, 400,
-            "case {name:?}: expected 400, got {reply:?}"
+            reply.status, 404,
+            "case {name:?}: expected 404, got {reply:?}"
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some(QUALIFIED_INVALID_REQUEST),
-            "case {name:?}: expected InvalidRequestException, got {reply:?}"
+            Some(NOT_FOUND),
+            "case {name:?}: expected {NOT_FOUND}, got {reply:?}"
         );
         assert_eq!(
             reply.message(),
-            format!("Invalid ManagedJobTemplate name: {name}"),
-            "case {name:?}: expected the catalog's refusal sentence, got {:?}",
+            not_found_message(name),
+            "case {name:?}: expected the catalog's not-found sentence, got {:?}",
             reply.message()
         );
     }
@@ -480,14 +694,19 @@ async fn a_token_of_another_listing_or_of_no_listing_is_refused() {
     );
 
     // The rows differ along HOW the token is not one this listing issued: not hex, hex
-    // of text with no scope in it, and hex of a well-formed position whose version is
-    // outside `ManagedTemplateVersion`.
+    // of text with no scope in it, hex of a well-formed position whose version is
+    // outside `ManagedTemplateVersion`, and hex of a well-formed position naming a
+    // template this listing does not walk.
     let cases = [
         ("not hex", "zzzz".to_string()),
         ("hex of a bare word", hex::encode("AWS-Reboot")),
         (
             "hex of an unmodelled version",
             hex::encode("n\u{1f}AWS-Reboot\u{1f}0.1"),
+        ),
+        (
+            "hex of a position outside the catalog",
+            hex::encode("n\u{1f}Managed-Nothing\u{1f}1.0"),
         ),
     ];
     for (case, token) in cases {
@@ -500,6 +719,50 @@ async fn a_token_of_another_listing_or_of_no_listing_is_refused() {
             reply.error_code.as_deref(),
             Some(QUALIFIED_INVALID_REQUEST),
             "case {case:?}: expected InvalidRequestException, got {reply:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_reports_the_published_document_and_parameters() {
+    let emulator = Emulator::new();
+    // Every published entry is a row: what the describe reports for it is the service's
+    // own text, not a rendering of the request.
+    for published in PUBLISHED {
+        let name = published.template_name;
+        let reply = emulator.describe(name, "").await;
+        assert_eq!(
+            reply.status, 200,
+            "case {name:?}: expected 200, got {reply:?}"
+        );
+        assert_eq!(
+            member(&reply.body, "description"),
+            published.description,
+            "case {name:?}: expected the published description, got {:?}",
+            member(&reply.body, "description")
+        );
+
+        let document = member(&reply.body, "document");
+        let parsed: Value = serde_json::from_str(&document)
+            .unwrap_or_else(|error| panic!("case {name:?}: document is not JSON: {error}"));
+        assert_eq!(
+            parsed,
+            expected_document(published),
+            "case {name:?}: expected the published document {}, got {document:?}",
+            expected_document(published)
+        );
+
+        let parameters = reply
+            .body
+            .get("documentParameters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            parameters,
+            expected_parameters(published),
+            "case {name:?}: expected the published documentParameters {:?}, got {parameters:?}",
+            expected_parameters(published)
         );
     }
 }
@@ -542,8 +805,9 @@ async fn every_listed_entry_is_describable_with_its_document() {
             reply.body.get("environments")
         );
 
-        // Every parameter this template declares, in order: its own, then the two every
-        // template declares.
+        // The document and the parameters are two halves of one entry: every pattern the
+        // document leaves open is a declared parameter, and every REQUIRED parameter has
+        // a pattern in the document.
         let declared: Vec<(String, bool)> = reply
             .body
             .get("documentParameters")
@@ -563,51 +827,10 @@ async fn every_listed_entry_is_describable_with_its_document() {
                     .collect()
             })
             .unwrap_or_default();
-        let expected: Vec<(String, bool)> = published
-            .parameters
-            .iter()
-            .chain(COMMON_PARAMETERS.iter())
-            .map(|(key, optional)| ((*key).to_string(), *optional))
-            .collect();
-        assert_eq!(
-            declared, expected,
-            "case {name:?}: expected the declared documentParameters {expected:?}, got \
-             {declared:?}"
-        );
-
-        // Each declared parameter carries the guidance a caller fills it in from.
-        let parameters: Vec<Value> = reply
-            .body
-            .get("documentParameters")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for parameter in &parameters {
-            let key = member(parameter, "key");
-            for guidance in ["description", "regex", "example"] {
-                assert!(
-                    !member(parameter, guidance).is_empty(),
-                    "case {name:?}/{key}: expected a {guidance}, got {parameter:?}"
-                );
-            }
-        }
-
-        // The document and the parameters are two halves of one entry: every pattern the
-        // document leaves open is a declared parameter, and every REQUIRED parameter has
-        // a pattern in the document.
         let document = member(&reply.body, "document");
         assert!(
             !document.is_empty(),
             "case {name:?}: expected the version's document, got {reply:?}"
-        );
-        let parsed: Value = serde_json::from_str(&document)
-            .unwrap_or_else(|error| panic!("case {name:?}: document is not JSON: {error}"));
-        assert!(
-            parsed
-                .get("steps")
-                .and_then(Value::as_array)
-                .is_some_and(|steps| !steps.is_empty()),
-            "case {name:?}: expected a document with steps, got {document:?}"
         );
         let found = placeholders(&document);
         let declared_keys: BTreeSet<String> =
@@ -693,25 +916,25 @@ async fn describe_selects_the_version_and_defaults_to_the_published_one() {
 }
 
 #[tokio::test]
-async fn describing_a_template_the_catalog_does_not_publish_is_refused() {
+async fn describing_a_template_the_catalog_does_not_publish_is_a_not_found() {
     // The rows differ along why the name names nothing, as the listing's filter rows do.
     let cases = ["Managed-Nothing", "aws-reboot", "AWS-Rebo", &"n".repeat(64)];
     let emulator = Emulator::new();
     for name in cases {
         let reply = emulator.describe(name, "").await;
         assert_eq!(
-            reply.status, 400,
-            "case {name:?}: expected 400, got {reply:?}"
+            reply.status, 404,
+            "case {name:?}: expected 404, got {reply:?}"
         );
         assert_eq!(
             reply.error_code.as_deref(),
-            Some(QUALIFIED_INVALID_REQUEST),
-            "case {name:?}: expected InvalidRequestException, got {reply:?}"
+            Some(NOT_FOUND),
+            "case {name:?}: expected {NOT_FOUND}, got {reply:?}"
         );
         assert_eq!(
             reply.message(),
-            format!("Invalid ManagedJobTemplate name: {name}"),
-            "case {name:?}: expected the catalog's refusal sentence, got {:?}",
+            not_found_message(name),
+            "case {name:?}: expected the catalog's not-found sentence, got {:?}",
             reply.message()
         );
     }

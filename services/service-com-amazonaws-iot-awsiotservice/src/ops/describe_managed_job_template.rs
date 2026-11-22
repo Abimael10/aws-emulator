@@ -9,12 +9,12 @@
 //!
 //! `templateVersion` selects the version; a request that names none is answered with
 //! the template's default version, which is the latest version published for it
-//! (`crate::state::ManagedJobTemplate::default_version`). A name the catalog publishes
-//! no template under, and a version it does not publish for a template it does, are
-//! each refused with the modelled `InvalidRequestException`: the catalog is
-//! AWS-published reference data, so naming an entry it does not publish is a bad
-//! request rather than a resource this account is missing. A read only: nothing here
-//! writes.
+//! (`crate::state::ManagedJobTemplate::default_version`). A `templateName` the catalog
+//! publishes no template under is a NOT-FOUND (`ResourceNotFoundException`, HTTP 404):
+//! the request addresses a managed job template this service does not have. A version
+//! the catalog does not publish for a template it DOES publish is refused with the
+//! modelled `InvalidRequestException`, which names the member that was rejected. A read
+//! only: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -185,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(template) = store.managed_job_templates.template(&input.template_name) else {
             return Err(
-                DescribeManagedJobTemplateErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::invalid_managed_job_template_name_message(
+                DescribeManagedJobTemplateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::managed_job_template_not_found_message(
                             &input.template_name,
                         )),
                     },
@@ -198,8 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `templateVersion` is "An optional parameter to specify version of a managed
         // template. If not specified, the pre-defined default version is returned" — so
-        // a version this template does not publish is the resource that does not exist,
-        // stated as the PAIR that was asked for.
+        // a version this published template does not publish is the member the request
+        // got wrong, stated as the version that was asked for.
         let Some(version) = template.version(input.template_version.as_deref()) else {
             let requested = input.template_version.clone().unwrap_or_default();
             return Err(

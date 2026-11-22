@@ -13,25 +13,29 @@
 //! ([`ManagedJobTemplateCatalog::default`]) and only ever read. A reader therefore
 //! changes nothing, and two readers of one entry cannot disagree.
 //!
-//! Each entry is a REMOTE ACTION AWS publishes for the AWS IoT Device Client: the
-//! template's job document runs one of the client's job handlers, and the patterns the
-//! document leaves open are exactly the entry's `documentParameters` — "a map of
-//! key-value pairs containing the patterns that need to be replaced in a managed
-//! template job document schema"
-//! (`smithy_query(query="shape",shape="DocumentParameter")`). The document is BUILT
-//! from that parameter table ([`CatalogRow::document`]), so a parameter and the
-//! `${aws:iot:parameter:<key>}` placeholder it fills cannot drift apart, and every
-//! template declares the two parameters that are about the handler rather than about
-//! the action ([`COMMON_PARAMETERS`]).
+//! Every member of an entry is the SERVICE's published text, identical for every caller
+//! in every account and region: the template's description, the one step its document
+//! runs, and the `documentParameters` that document leaves open — "a map of key-value
+//! pairs containing the patterns that need to be replaced in a managed template job
+//! document schema" (`smithy_query(query="shape",shape="DocumentParameter")`). The
+//! document is BUILT from that parameter table ([`CatalogRow::document`]), so a
+//! parameter and the `${aws:iot:parameter:<key>}` placeholder it fills cannot drift
+//! apart.
+//!
+//! Each entry is a REMOTE ACTION the AWS IoT Device Client performs. Two facts follow
+//! from the action's TYPE and are not written out per row: the step's action name is the
+//! template name without its `AWS-` prefix, and a `runHandler` step declares the two
+//! parameters that are about running a handler (where the handlers live and which user
+//! to run one as) while a `runCommand` step declares only the user, because it runs no
+//! handler.
 //!
 //! `AWS-Reboot` is the entry the model itself names
 //! (`smithy_query(query="doc",shape="DescribeManagedJobTemplateResponse",member="templateName")`:
 //! "The unique name of a managed template, such as AWS-Reboot"); the rest of the table
-//! is the published set of the device client's remote actions — downloading a file,
-//! running a command, and installing, removing, starting, stopping or restarting an
-//! application.
-
-use std::collections::BTreeMap;
+//! is the published set of the device client's remote actions — running a command,
+//! rebooting, downloading a file, and installing or removing applications and starting,
+//! stopping or restarting system services. [`CATALOG`] holds them in the order the
+//! service publishes them, which is the order a listing reports.
 
 use crate::ops::types::{DocumentParameter, ManagedJobTemplateSummary};
 
@@ -66,7 +70,7 @@ pub struct ManagedJobTemplateVersion {
 }
 
 /// One managed job template as this service publishes it: the facts that hold for the
-/// template, and every version of it, keyed by `templateVersion`.
+/// template, and every version of it, in published order.
 #[derive(Debug, Clone)]
 pub struct ManagedJobTemplate {
     /// `templateName` — "The unique Name for a managed template".
@@ -76,13 +80,14 @@ pub struct ManagedJobTemplate {
     /// `environments` — "A list of environments that are supported with the managed job
     /// template".
     pub environments: Vec<String>,
-    /// Every published version of this template, keyed by `templateVersion`.
+    /// Every published version of this template, in the order the service publishes
+    /// them.
     ///
-    /// A `BTreeMap` because `ListManagedJobTemplates` is `@paginated` and, with a
-    /// `templateName`, lists "the versions of the managed job templates that have the
-    /// specified template name" — a page boundary over versions is only meaningful over
-    /// a stable order.
-    pub versions: BTreeMap<String, ManagedJobTemplateVersion>,
+    /// Ordered rather than a map, because `ListManagedJobTemplates` is `@paginated`
+    /// and, with a `templateName`, lists "the versions of the managed job templates that
+    /// have the specified template name" — a page boundary over versions is only
+    /// meaningful over a stable order.
+    pub versions: Vec<ManagedJobTemplateVersion>,
 }
 
 impl ManagedJobTemplate {
@@ -96,7 +101,7 @@ impl ManagedJobTemplate {
     /// [`managed_job_template_catalog`] never builds.
     pub fn default_version(&self) -> Option<&ManagedJobTemplateVersion> {
         self.versions
-            .values()
+            .iter()
             .max_by_key(|version| version_order(&version.template_version))
     }
 
@@ -104,7 +109,10 @@ impl ManagedJobTemplate {
     /// `None` when this template publishes no such version.
     pub fn version(&self, requested: Option<&str>) -> Option<&ManagedJobTemplateVersion> {
         match requested {
-            Some(wanted) => self.versions.get(wanted),
+            Some(wanted) => self
+                .versions
+                .iter()
+                .find(|version| version.template_version == wanted),
             None => self.default_version(),
         }
     }
@@ -149,15 +157,16 @@ fn version_order(template_version: &str) -> (u32, u32) {
 
 /// The managed job template catalog as the store holds it.
 ///
-/// A struct of its own, rather than a bare map on the state struct, so that the state's
-/// derived `Default` — what the engine builds the store with on first touch — seeds the
-/// AWS-managed collection COMPLETE while every customer-owned collection beside it
-/// starts empty.
+/// A struct of its own, rather than a bare collection on the state struct, so that the
+/// state's derived `Default` — what the engine builds the store with on first touch —
+/// seeds the AWS-managed collection COMPLETE while every customer-owned collection
+/// beside it starts empty.
 #[derive(Debug, Clone)]
 pub struct ManagedJobTemplateCatalog {
-    /// Every published template, keyed by `templateName`: the name is the template's
-    /// identity and the `@httpLabel` of `/managed-job-templates/{templateName}`.
-    entries: BTreeMap<String, ManagedJobTemplate>,
+    /// Every published template, in PUBLISHED order: the order the service lists the
+    /// catalog in, which is a property of the catalog rather than of a reader, so a
+    /// listing and a paged walk of it report the same sequence.
+    entries: Vec<ManagedJobTemplate>,
 }
 
 impl Default for ManagedJobTemplateCatalog {
@@ -170,13 +179,16 @@ impl Default for ManagedJobTemplateCatalog {
 
 impl ManagedJobTemplateCatalog {
     /// The template `template_name` names, or `None` when the catalog publishes none
-    /// under that name.
+    /// under that name. The name is the template's identity and the `@httpLabel` of
+    /// `/managed-job-templates/{templateName}`.
     pub fn template(&self, template_name: &str) -> Option<&ManagedJobTemplate> {
-        self.entries.get(template_name)
+        self.entries
+            .iter()
+            .find(|template| template.template_name == template_name)
     }
 
-    /// Every published (template, version) PAIR, in catalog order: by `templateName`,
-    /// then by `templateVersion`.
+    /// Every published (template, version) PAIR, in catalog order: the order the
+    /// templates are published in, then the order their versions are.
     ///
     /// A pair and not a template, because one entry of a listing is one version of one
     /// template — with a `templateName` the listing is of "the versions of the managed
@@ -184,80 +196,68 @@ impl ManagedJobTemplateCatalog {
     pub fn pairs(
         &self,
     ) -> impl Iterator<Item = (&ManagedJobTemplate, &ManagedJobTemplateVersion)> + '_ {
-        self.entries.values().flat_map(|template| {
+        self.entries.iter().flat_map(|template| {
             template
                 .versions
-                .values()
+                .iter()
                 .map(move |version| (template, version))
         })
     }
 }
 
 /// What kind of value a template parameter takes, which fixes the `regex` the catalog
-/// publishes as "a regular expression of the patterns that need to be replaced" and the
-/// `example` that illustrates it (`DocumentParameter$regex`, `$example`).
+/// publishes as "a regular expression of the patterns that need to be replaced"
+/// (`DocumentParameter$regex`).
 ///
-/// Carried as a KIND rather than as two strings per parameter so that two parameters
-/// that take the same kind of value are published with the same rule, and a parameter's
-/// example always satisfies its own regex.
+/// Carried as a KIND rather than as a string per parameter so that two parameters that
+/// take the same kind of value are published with the same rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueKind {
-    /// An HTTP(S) location the device fetches from.
-    Url,
-    /// A path on the device's file system.
-    Path,
-    /// One or more operating-system package names, separated by commas.
-    PackageNames,
-    /// The name of a service the device's init system manages.
-    ServiceName,
-    /// A command line, whose arguments the device client splits on commas.
-    CommandLine,
-    /// The name of an operating-system user.
-    UserName,
+    /// Any text at most this many characters long: the service publishes the bound as
+    /// the repetition count of a single-character expression.
+    Text(usize),
+    /// One or more name tokens separated by whitespace, which is how the device
+    /// client's handlers take a list of packages or of system services.
+    NameList,
+    /// Any text at all, with no bound published for it.
+    AnyText,
 }
+
+/// The expression the service publishes for a list of name tokens separated by
+/// whitespace ([`ValueKind::NameList`]).
+const NAME_LIST_REGEX: &str = r"([a-zA-Z0-9+_\-\.]+[\s]?)+";
+
+/// The expression the service publishes for a value it bounds in no way
+/// ([`ValueKind::AnyText`]).
+const ANY_TEXT_REGEX: &str = "(.*?)";
 
 impl ValueKind {
     /// The `regex` the catalog publishes for a parameter of this kind.
-    ///
-    /// Each one is the character class the value can have: a URL is a scheme and the
-    /// rest of the location, a service or user name is a single name token, a package
-    /// list is one or more name tokens separated by commas, and a path or a command line
-    /// is any text with no control character in it — the same class `JobDescription` is
-    /// modelled with (`^[^\p{C}]+$`).
-    const fn regex(self) -> &'static str {
+    fn regex(self) -> String {
         match self {
-            Self::Url => "^(http|https)://[^\\p{C}]+$",
-            Self::Path | Self::CommandLine => "^[^\\p{C}]+$",
-            Self::PackageNames => "^[a-zA-Z0-9+._-]+(,[a-zA-Z0-9+._-]+)*$",
-            Self::ServiceName | Self::UserName => "^[a-zA-Z0-9+._-]+$",
-        }
-    }
-
-    /// The `example` the catalog publishes for a parameter of this kind: "an example
-    /// illustrating a pattern that need to be replaced in a managed template job
-    /// document schema".
-    const fn example(self) -> &'static str {
-        match self {
-            Self::Url => "https://example.com/device-firmware.1.0",
-            Self::Path => "/tmp/device-firmware.1.0",
-            Self::PackageNames => "openssl,curl",
-            Self::ServiceName => "aws-iot-device-client",
-            Self::CommandLine => "ls,-l",
-            Self::UserName => "root",
+            Self::Text(max) => format!("(.){{0,{max}}}"),
+            Self::NameList => NAME_LIST_REGEX.to_string(),
+            Self::AnyText => ANY_TEXT_REGEX.to_string(),
         }
     }
 }
 
 /// One parameter of a managed template's document: the pattern a caller replaces, what
-/// it is for, and the kind of value that goes there.
+/// it is for, the kind of value that goes there and the example the catalog illustrates
+/// it with.
 struct CatalogParameter {
     /// `key` — "Key of the map field containing the patterns that need to be replaced in
     /// a managed template job document schema", a `ParameterKey`
     /// (`^[a-zA-Z0-9_-]+$`).
     key: &'static str,
-    /// `description` — what the caller has to put there.
+    /// `description` — what the caller has to put there, as the service words it.
     description: &'static str,
     kind: ValueKind,
+    /// `example` — "an example illustrating a pattern that need to be replaced in a
+    /// managed template job document schema". `None` for a parameter the service
+    /// publishes no example for, which is then absent from the response rather than
+    /// invented here.
+    example: Option<&'static str>,
     /// `optional` — "Specifies whether a pattern that needs to be replaced in a managed
     /// template job document schema is optional or required".
     optional: bool,
@@ -269,8 +269,8 @@ impl CatalogParameter {
         DocumentParameter {
             key: Some(self.key.to_string()),
             description: Some(self.description.to_string()),
-            regex: Some(self.kind.regex().to_string()),
-            example: Some(self.kind.example().to_string()),
+            regex: Some(self.kind.regex()),
+            example: self.example.map(str::to_string),
             optional: self.optional,
         }
     }
@@ -283,36 +283,72 @@ impl CatalogParameter {
     }
 }
 
-/// Where the device client's job handlers live on the device, which every managed
+/// Where the device client's job handlers live on the device, which every `runHandler`
 /// template's document carries as its step's `path`. Optional: a device client
 /// configured with its own handler directory needs none.
 const PATH_TO_HANDLER: CatalogParameter = CatalogParameter {
     key: "pathToHandler",
-    description: "The directory on the device that contains the job handler to run. \
-                  Optional: the device client falls back to its configured handler \
-                  directory.",
-    kind: ValueKind::Path,
+    description: "Path to handler on the device. If not specified, then device client \
+                  will use the current working directory.",
+    kind: ValueKind::Text(4096),
+    example: Some("/path/to/handler/script"),
     optional: true,
 };
 
-/// Which user the handler runs as, which every managed template's document carries as
-/// its step's `runAsUser`. Optional: the device client otherwise runs it as the user it
-/// runs as itself.
+/// Which user the step runs as, which every managed template's document carries as its
+/// step's `runAsUser`. Optional: the device client otherwise runs it as the user it runs
+/// as itself.
 const RUN_AS_USER: CatalogParameter = CatalogParameter {
     key: "runAsUser",
-    description: "The user to run the job handler as. Optional: the device client \
-                  falls back to the user it runs as itself.",
-    kind: ValueKind::UserName,
+    description: "Execute handler as another user. If not specified, then handler is \
+                  executed as the same user as device client.",
+    kind: ValueKind::Text(256),
+    example: Some("user1"),
     optional: true,
 };
 
-/// The parameters EVERY managed template declares, because they are about running the
-/// device client's handler rather than about the action itself.
-const COMMON_PARAMETERS: &[CatalogParameter] = &[PATH_TO_HANDLER, RUN_AS_USER];
+/// What the one step of a managed template's document DOES, which is the step's `type`.
+///
+/// The two forms differ in how the template's own parameters reach the step: a handler
+/// takes them as positional arguments beside the directory it is found in, and a
+/// command takes each one as an input field of its own name.
+enum StepAction {
+    /// `runHandler` — the step runs one of the device client's job handlers, named here.
+    RunHandler(&'static str),
+    /// `runCommand` — the step runs the command the caller supplies.
+    RunCommand,
+}
+
+impl StepAction {
+    /// The step's `type`.
+    const fn step_type(&self) -> &'static str {
+        match self {
+            Self::RunHandler(_) => "runHandler",
+            Self::RunCommand => "runCommand",
+        }
+    }
+
+    /// The parameters a template of this action kind declares beside its own: a handler
+    /// is found in a directory and run as a user, and a command is only run as a user.
+    fn handler_parameters(&self) -> &'static [CatalogParameter] {
+        match self {
+            Self::RunHandler(_) => RUN_HANDLER_PARAMETERS,
+            Self::RunCommand => RUN_COMMAND_PARAMETERS,
+        }
+    }
+}
+
+/// The parameters a `runHandler` template declares beside its own: the directory the
+/// handler is found in and the user it runs as.
+const RUN_HANDLER_PARAMETERS: &[CatalogParameter] = &[RUN_AS_USER, PATH_TO_HANDLER];
+
+/// The parameters a `runCommand` template declares beside its own: the user the command
+/// runs as. No handler is run, so no handler directory is published.
+const RUN_COMMAND_PARAMETERS: &[CatalogParameter] = &[RUN_AS_USER];
 
 /// One row of the catalog table: everything that differs between managed templates. The
-/// rest of an entry — its ARN, its document, the common parameters it declares — is
-/// DERIVED from the row, so no two members of one entry can disagree.
+/// rest of an entry — its ARN, its document, its step's name, the handler parameters it
+/// declares — is DERIVED from the row, so no two members of one entry can disagree.
 struct CatalogRow {
     template_name: &'static str,
     description: &'static str,
@@ -321,49 +357,65 @@ struct CatalogRow {
     /// The environments the template is supported with. An `Environment`
     /// (`^[^\p{C}]+$`).
     environments: &'static [&'static str],
-    /// The name of the one step the template's document runs.
-    step_name: &'static str,
-    /// The device client's job handler that step runs.
-    handler: &'static str,
+    /// What the template's one step does.
+    action: StepAction,
     /// The template's OWN parameters, in the order the document passes them to the
-    /// handler as arguments. The common parameters are declared by every template and
-    /// are not repeated here.
+    /// step. The handler parameters follow from the action kind and are not repeated
+    /// here.
     parameters: &'static [CatalogParameter],
 }
 
 impl CatalogRow {
-    /// Every parameter this template declares: its own, then the ones every template
-    /// declares.
-    fn parameters(&self) -> impl Iterator<Item = &CatalogParameter> {
-        self.parameters.iter().chain(COMMON_PARAMETERS.iter())
+    /// The name of the one step the template's document runs: the template's name
+    /// without the `AWS-` prefix every published template carries.
+    fn step_name(&self) -> &'static str {
+        self.template_name
+            .strip_prefix(TEMPLATE_NAME_PREFIX)
+            .unwrap_or(self.template_name)
     }
 
-    /// The template's `document`: one `runHandler` step that runs this row's handler,
-    /// with a `${aws:iot:parameter:<key>}` placeholder wherever one of the row's own
-    /// parameters goes, the handler directory as the step's `path` and the user as its
-    /// `runAsUser`.
+    /// Every parameter this template declares: its own, then the ones that come with its
+    /// action kind.
+    fn parameters(&self) -> impl Iterator<Item = &CatalogParameter> {
+        self.parameters
+            .iter()
+            .chain(self.action.handler_parameters().iter())
+    }
+
+    /// The template's `document`: one step of the row's action kind, with a
+    /// `${aws:iot:parameter:<key>}` placeholder wherever one of the row's own parameters
+    /// goes and the user as the step's `runAsUser`.
     ///
     /// Built from the row rather than written out per template, so a document can carry
     /// no placeholder the entry does not declare a parameter for.
     fn document(&self) -> String {
         let mut input = ::serde_json::Map::new();
-        input.insert("handler".to_string(), self.handler.into());
-        if !self.parameters.is_empty() {
-            let args: Vec<::serde_json::Value> = self
-                .parameters
-                .iter()
-                .map(|parameter| parameter.placeholder().into())
-                .collect();
-            input.insert("args".to_string(), args.into());
+        match self.action {
+            StepAction::RunHandler(handler) => {
+                input.insert("handler".to_string(), handler.into());
+                if !self.parameters.is_empty() {
+                    let args: Vec<::serde_json::Value> = self
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.placeholder().into())
+                        .collect();
+                    input.insert("args".to_string(), args.into());
+                }
+                input.insert("path".to_string(), PATH_TO_HANDLER.placeholder().into());
+            }
+            StepAction::RunCommand => {
+                for parameter in self.parameters {
+                    input.insert(parameter.key.to_string(), parameter.placeholder().into());
+                }
+            }
         }
-        input.insert("path".to_string(), PATH_TO_HANDLER.placeholder().into());
         let run_as_user = RUN_AS_USER.placeholder();
         let document = ::serde_json::json!({
             "version": JOB_DOCUMENT_VERSION,
             "steps": [{
                 "action": {
-                    "name": self.step_name,
-                    "type": "runHandler",
+                    "name": self.step_name(),
+                    "type": self.action.step_type(),
                     "input": ::serde_json::Value::Object(input),
                     "runAsUser": run_as_user,
                 }
@@ -390,7 +442,7 @@ impl CatalogRow {
                 .iter()
                 .map(|environment| (*environment).to_string())
                 .collect(),
-            versions: BTreeMap::from([(version.template_version.clone(), version)]),
+            versions: vec![version],
         }
     }
 }
@@ -400,6 +452,10 @@ impl CatalogRow {
 /// `steps`.
 const JOB_DOCUMENT_VERSION: &str = "1.0";
 
+/// The prefix every published managed template's name carries, which its step's action
+/// name is the name without.
+const TEMPLATE_NAME_PREFIX: &str = "AWS-";
+
 /// The environment the device client's remote actions are supported in.
 const LINUX: &str = "LINUX";
 
@@ -408,165 +464,171 @@ const LINUX: &str = "LINUX";
 /// (`^[1-9]+.[0-9]+$`) fixes.
 const FIRST_TEMPLATE_VERSION: &str = "1.0";
 
-/// The published managed job templates: one row per remote action AWS publishes for the
-/// AWS IoT Device Client, which is the whole of what this catalog serves.
+/// The published managed job templates, in the order the service publishes them: one row
+/// per remote action AWS publishes for the AWS IoT Device Client, which is the whole of
+/// what this catalog serves.
 ///
 /// `AWS-Reboot` is named by the model itself
 /// (`smithy_query(query="doc",shape="DescribeManagedJobTemplateResponse",member="templateName")`),
-/// and the other rows are the client's remaining published actions: fetch a file, run a
-/// command, and install, remove, start, stop or restart an application. The table is
-/// COMPLETE rather than a sample — a listing of it is the answer to "which managed
-/// templates are there", so a missing row would be a wrong answer and not a short one.
+/// and the other rows are the client's remaining published actions: run a command, fetch
+/// a file, install or remove applications, and start, stop or restart system services.
+/// The table is COMPLETE rather than a sample — a listing of it is the answer to "which
+/// managed templates are there", so a missing row would be a wrong answer and not a
+/// short one — and its ORDER is published data too, because a caller that reads the
+/// first entry or pages with `maxResults` reads the service's order and not an
+/// alphabetical one.
 const CATALOG: &[CatalogRow] = &[
     CatalogRow {
-        template_name: "AWS-Download-File",
-        description: "A managed job template to download a file to a device.",
+        template_name: "AWS-Run-Command",
+        description: "A managed job template for running a shell command.",
         template_version: FIRST_TEMPLATE_VERSION,
         environments: &[LINUX],
-        step_name: "downloadFile",
-        handler: "download-file.sh",
-        parameters: &[
-            CatalogParameter {
-                key: "downloadUrl",
-                description: "The URL the device downloads the file from.",
-                kind: ValueKind::Url,
-                optional: false,
-            },
-            CatalogParameter {
-                key: "filePath",
-                description: "The path on the device the downloaded file is written to.",
-                kind: ValueKind::Path,
-                optional: false,
-            },
-        ],
-    },
-    CatalogRow {
-        template_name: "AWS-Install-Application",
-        description: "A managed job template to install one or more applications on a device.",
-        template_version: FIRST_TEMPLATE_VERSION,
-        environments: &[LINUX],
-        step_name: "installPackages",
-        handler: "install-packages.sh",
+        action: StepAction::RunCommand,
         parameters: &[CatalogParameter {
-            key: "packages",
-            description: "The packages to install, separated by commas.",
-            kind: ValueKind::PackageNames,
+            key: "command",
+            description: "A comma separated string of command, any comma contained in \
+                          the command itself needs to be escaped.",
+            kind: ValueKind::Text(4096),
+            example: Some(r"echo,Hello\,World!"),
             optional: false,
         }],
     },
     CatalogRow {
         template_name: "AWS-Reboot",
-        description: "A managed job template to reboot a device.",
+        description: "A managed job template for rebooting the device.",
         template_version: FIRST_TEMPLATE_VERSION,
         environments: &[LINUX],
-        step_name: "reboot",
-        handler: "reboot.sh",
+        action: StepAction::RunHandler("reboot.sh"),
         parameters: &[],
     },
     CatalogRow {
         template_name: "AWS-Remove-Application",
-        description: "A managed job template to remove one or more applications from a device.",
+        description: "A managed job template for uninstalling one or more applications.",
         template_version: FIRST_TEMPLATE_VERSION,
         environments: &[LINUX],
-        step_name: "removePackages",
-        handler: "remove-packages.sh",
+        action: StepAction::RunHandler("remove-packages.sh"),
         parameters: &[CatalogParameter {
             key: "packages",
-            description: "The packages to remove, separated by commas.",
-            kind: ValueKind::PackageNames,
-            optional: false,
-        }],
-    },
-    CatalogRow {
-        template_name: "AWS-Restart-Application",
-        description: "A managed job template to restart an application's service on a device.",
-        template_version: FIRST_TEMPLATE_VERSION,
-        environments: &[LINUX],
-        step_name: "restartService",
-        handler: "restart-service.sh",
-        parameters: &[CatalogParameter {
-            key: "serviceName",
-            description: "The name of the service to restart.",
-            kind: ValueKind::ServiceName,
-            optional: false,
-        }],
-    },
-    CatalogRow {
-        template_name: "AWS-Run-Command",
-        description: "A managed job template to run a shell command on a device.",
-        template_version: FIRST_TEMPLATE_VERSION,
-        environments: &[LINUX],
-        step_name: "runCommand",
-        handler: "run-command.sh",
-        parameters: &[CatalogParameter {
-            key: "command",
-            description: "The command to run, with its arguments separated by commas.",
-            kind: ValueKind::CommandLine,
-            optional: false,
-        }],
-    },
-    CatalogRow {
-        template_name: "AWS-Start-Application",
-        description: "A managed job template to start an application's service on a device.",
-        template_version: FIRST_TEMPLATE_VERSION,
-        environments: &[LINUX],
-        step_name: "startService",
-        handler: "start-service.sh",
-        parameters: &[CatalogParameter {
-            key: "serviceName",
-            description: "The name of the service to start.",
-            kind: ValueKind::ServiceName,
+            description: "A space separated list of packages to uninstall.",
+            kind: ValueKind::NameList,
+            example: Some("lftp dos2unix tcpdump"),
             optional: false,
         }],
     },
     CatalogRow {
         template_name: "AWS-Stop-Application",
-        description: "A managed job template to stop an application's service on a device.",
+        description: "A managed job template for stopping one or more system services.",
         template_version: FIRST_TEMPLATE_VERSION,
         environments: &[LINUX],
-        step_name: "stopService",
-        handler: "stop-service.sh",
+        action: StepAction::RunHandler("stop-services.sh"),
         parameters: &[CatalogParameter {
-            key: "serviceName",
-            description: "The name of the service to stop.",
-            kind: ValueKind::ServiceName,
+            key: "services",
+            description: "A space separated list of system services to stop.",
+            kind: ValueKind::NameList,
+            example: Some("cron httpd bluetooth"),
             optional: false,
         }],
     },
+    CatalogRow {
+        template_name: "AWS-Start-Application",
+        description: "A managed job template for starting one or more system services.",
+        template_version: FIRST_TEMPLATE_VERSION,
+        environments: &[LINUX],
+        action: StepAction::RunHandler("start-services.sh"),
+        parameters: &[CatalogParameter {
+            key: "services",
+            description: "A space separated list of system services to start.",
+            kind: ValueKind::NameList,
+            example: Some("cron httpd bluetooth"),
+            optional: false,
+        }],
+    },
+    CatalogRow {
+        template_name: "AWS-Restart-Application",
+        description: "A managed job template for restarting one or more system services.",
+        template_version: FIRST_TEMPLATE_VERSION,
+        environments: &[LINUX],
+        action: StepAction::RunHandler("restart-services.sh"),
+        parameters: &[CatalogParameter {
+            key: "services",
+            description: "A space separated list of system services to restart.",
+            kind: ValueKind::NameList,
+            example: Some("cron httpd bluetooth"),
+            optional: false,
+        }],
+    },
+    CatalogRow {
+        template_name: "AWS-Install-Application",
+        description: "A managed job template for installing one or more applications.",
+        template_version: FIRST_TEMPLATE_VERSION,
+        environments: &[LINUX],
+        action: StepAction::RunHandler("install-packages.sh"),
+        parameters: &[CatalogParameter {
+            key: "packages",
+            description: "A space separated list of packages to install.",
+            kind: ValueKind::NameList,
+            example: Some("lftp dos2unix tcpdump"),
+            optional: false,
+        }],
+    },
+    CatalogRow {
+        template_name: "AWS-Download-File",
+        description: "A managed job template for downloading a file.",
+        template_version: FIRST_TEMPLATE_VERSION,
+        environments: &[LINUX],
+        action: StepAction::RunHandler("download-file.sh"),
+        parameters: &[
+            CatalogParameter {
+                key: "downloadUrl",
+                description: "URL of file to download.",
+                kind: ValueKind::AnyText,
+                // The service illustrates a parameter with an `example` only where it
+                // publishes one; this one carries none, so the response leaves the
+                // optional member out rather than carrying text authored here.
+                example: None,
+                optional: false,
+            },
+            CatalogParameter {
+                key: "filePath",
+                description: "Path on the device where downloaded file is written.",
+                kind: ValueKind::AnyText,
+                example: Some("/path/to/file"),
+                optional: false,
+            },
+        ],
+    },
 ];
 
-/// The catalog as the store holds it: [`CATALOG`] expanded into published entries, keyed
-/// by `templateName`.
+/// The catalog as the store holds it: [`CATALOG`] expanded into published entries, in
+/// published order.
 ///
 /// Every derived member is a function of its row, so the catalog is identical on every
 /// boot: nothing here reads a clock, a request or a random source.
-pub fn managed_job_template_catalog() -> BTreeMap<String, ManagedJobTemplate> {
-    CATALOG
-        .iter()
-        .map(|row| (row.template_name.to_string(), row.template()))
-        .collect()
+pub fn managed_job_template_catalog() -> Vec<ManagedJobTemplate> {
+    CATALOG.iter().map(CatalogRow::template).collect()
 }
 
 /// How this service refuses a request that names a managed job template the catalog does
 /// not publish.
 ///
-/// Not a not-found: the catalog is AWS-published reference data rather than a resource of
-/// this account, so a `templateName` outside it is an INVALID REQUEST
-/// (`InvalidRequestException`, HTTP 400, "The request is not valid"). The fixed text
-/// names the shape the value was rejected as, and the variable part is the name the
-/// request sent. Every operation that takes a `templateName` refuses it with this one
-/// sentence, so a listing's filter and a describe cannot word the same refusal two ways.
-pub fn invalid_managed_job_template_name_message(template_name: &str) -> String {
-    format!("Invalid ManagedJobTemplate name: {template_name}")
+/// A NOT-FOUND (`ResourceNotFoundException`, HTTP 404, "The specified resource does not
+/// exist"): a `templateName` of the modelled shape that addresses no published entry
+/// names a resource this service does not have, not a request it cannot read. The fixed
+/// text names the kind of resource that was looked up, and the variable part is the name
+/// the request sent. Every operation that looks a `templateName` up refuses it with this
+/// one sentence, so a listing's filter and a describe cannot word the same refusal two
+/// ways.
+pub fn managed_job_template_not_found_message(template_name: &str) -> String {
+    format!("ManagedJobTemplate with name: {template_name} not found")
 }
 
 /// How this service refuses a `templateVersion` a published template does not publish.
 ///
-/// The same class and the same template form as
-/// [`invalid_managed_job_template_name_message`], with the MEMBER that was rejected and
-/// the version the request sent — which keeps a published template asked for at an
-/// unpublished version distinguishable from a template the catalog does not publish at
-/// all.
+/// The template itself IS published here, so what the request named outside the catalog
+/// is the version member: an `InvalidRequestException` (HTTP 400, "The request is not
+/// valid") naming the member that was rejected and the version the request sent, which
+/// keeps a published template asked for at an unpublished version distinguishable from a
+/// template the catalog does not publish at all.
 pub fn invalid_managed_job_template_version_message(template_version: &str) -> String {
     format!("Invalid ManagedJobTemplate version: {template_version}")
 }

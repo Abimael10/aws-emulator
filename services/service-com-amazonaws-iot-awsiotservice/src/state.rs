@@ -3490,9 +3490,9 @@ pub use already_exists::{
 // a handler reaches them as `crate::state::<name>`.
 pub mod managed_job_templates;
 pub use managed_job_templates::{
-    invalid_managed_job_template_name_message, invalid_managed_job_template_version_message,
-    is_modeled_managed_job_template_name, is_modeled_managed_template_version,
-    managed_job_template_arn, ManagedJobTemplate, ManagedJobTemplateCatalog,
+    invalid_managed_job_template_version_message, is_modeled_managed_job_template_name,
+    is_modeled_managed_template_version, managed_job_template_arn,
+    managed_job_template_not_found_message, ManagedJobTemplate, ManagedJobTemplateCatalog,
     ManagedJobTemplateVersion,
 };
 
