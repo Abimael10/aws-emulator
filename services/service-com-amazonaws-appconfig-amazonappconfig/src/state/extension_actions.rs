@@ -1349,6 +1349,12 @@ mod tests {
         &'static str,
     );
 
+    /// One row of [`a_dispatched_point_states_the_position_the_clock_has_already_made_due`]:
+    /// the case, the strategy's final bake minutes, how long the deployment has been
+    /// running when the invocation is made, and the position the event must then state —
+    /// `None` where the clock has finished with the deployment, which is not ticked.
+    type TickPositionRow = (&'static str, i32, Duration, Option<f64>);
+
     /// The event's `Type` is the action point in PascalCase, over EVERY value of the
     /// model's `ActionPoint` enum (`crate::ops::types::ACTION_POINT_VALUES`) rather than
     /// the one the report cited.
@@ -1897,5 +1903,138 @@ mod tests {
             Some("arn:aws:sqs:us-west-2:210987654321:other"),
             "case \"a queue in another Region\": expected the supplied ARN, got {actual:?}"
         );
+    }
+
+    /// The event a tick is handed states where the rollout stands AT THE INSTANT the
+    /// invocation is made: a deployment the clock has already carried through growth
+    /// intervals that nothing had materialised yet is brought up to that instant first
+    /// ([`current_tick_event`]), so the tick reports the position it is asking about rather
+    /// than the one the record was last left at — and a deployment the clock has finished
+    /// with is not ticked at all.
+    ///
+    /// The rows differ along how much of the rollout the invocation's instant has made due:
+    /// none of it, one interval in, part way, the last share before every target, the whole
+    /// rollout with a bake window still to run, and the whole rollout of a strategy that
+    /// declared none, which leaves nothing in flight.
+    #[test]
+    fn a_dispatched_point_states_the_position_the_clock_has_already_made_due() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let interval = super::super::STAGE_DURATION;
+        // A rollout growing by a quarter of its targets per interval, so it passes through
+        // four shares before reaching every target. `bake` is the strategy's final bake
+        // time: a row declaring one is still in flight once the rollout is over.
+        let rows: [TickPositionRow; 6] = [
+            (
+                "before the first interval elapsed",
+                10,
+                Duration::ZERO,
+                Some(0.0),
+            ),
+            ("one interval in", 10, interval, Some(25.0)),
+            ("part way through the rollout", 10, interval * 2, Some(50.0)),
+            (
+                "the last share before every target",
+                10,
+                interval * 3,
+                Some(75.0),
+            ),
+            (
+                "every target reached, with a bake window still to run",
+                10,
+                interval * 4,
+                Some(100.0),
+            ),
+            (
+                "a deployment the clock has already finished with",
+                0,
+                interval * 4,
+                None,
+            ),
+        ];
+        for (case, bake, elapsed, expected) in rows {
+            let strategy = super::super::DeploymentStrategy {
+                id: "strat1".to_string(),
+                name: "strat".to_string(),
+                description: None,
+                deployment_duration_in_minutes: 1,
+                growth_type: super::super::GROWTH_LINEAR.to_string(),
+                growth_factor: 25.0,
+                final_bake_time_in_minutes: bake,
+                replicate_to: super::super::REPLICATE_TO_NONE.to_string(),
+                tags: HashMap::new(),
+            };
+            let mut store = ServiceStore::default();
+            let application = super::super::Application::new(
+                "app1234".to_string(),
+                "app".to_string(),
+                None,
+                HashMap::new(),
+            );
+            store
+                .try_insert_application(application)
+                .unwrap_or_else(|| panic!("case {case:?}: the application is stored"));
+            let environment = super::super::Environment::new(
+                "env1234".to_string(),
+                "app1234".to_string(),
+                "env".to_string(),
+                None,
+                Vec::new(),
+                HashMap::new(),
+            );
+            let application = store
+                .application_mut("app1234")
+                .unwrap_or_else(|| panic!("case {case:?}: the application is stored"));
+            application
+                .try_insert_environment(environment)
+                .unwrap_or_else(|| panic!("case {case:?}: the environment is stored"));
+            let deployment = Deployment::start(
+                super::super::NewDeployment {
+                    deployment_number: 1,
+                    application_id: "app1234".to_string(),
+                    environment_id: "env1234".to_string(),
+                    configuration_profile_id: "cfg1234".to_string(),
+                    configuration_name: "config".to_string(),
+                    configuration_location_uri: "hosted".to_string(),
+                    configuration_version: "1".to_string(),
+                    description: None,
+                    kms_key_identifier: None,
+                    version_label: None,
+                    applied_extensions: Vec::new(),
+                    tags: HashMap::new(),
+                },
+                &strategy,
+                started_at,
+            );
+            application
+                .environments
+                .get_mut("env1234")
+                .unwrap_or_else(|| panic!("case {case:?}: the environment is stored"))
+                .deployments
+                .insert(1, deployment);
+
+            // The store is handed to the dispatch exactly as the clock left it — nothing
+            // materialises it first — so the position the event states is the one the clock
+            // owed at this instant only if the dispatch brings the record forward itself.
+            let now = started_at + elapsed + Duration::from_millis(600);
+            let event = current_tick_event(
+                &mut store,
+                "app1234",
+                "env1234",
+                1,
+                super::super::TRIGGERED_BY_APPCONFIG,
+                now,
+            );
+            let actual = event.as_ref().and_then(|event| {
+                event
+                    .members
+                    .get("PercentageComplete")
+                    .and_then(Value::as_f64)
+            });
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the tick to state the position {expected:?}, got \
+                 {actual:?}"
+            );
+        }
     }
 }

@@ -124,7 +124,8 @@ enum Addressed {
 /// One row: a repository in one Region's registry, the revision and the service that name it.
 struct Row {
     case: &'static str,
-    /// The Region whose registry holds the repository — the one its URI must name.
+    /// The Region whose registry holds the repository — the one the record reported beside
+    /// its URI must name.
     region: &'static str,
     repository: &'static str,
     family: &'static str,

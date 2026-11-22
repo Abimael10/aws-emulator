@@ -241,6 +241,10 @@ struct ObservedTick {
 /// one single read's position would instead be asking whether a growth interval elapsed
 /// between two independently timed observations, which is a statement about how fast the
 /// host runs rather than about the rule.
+///
+/// That the position is EXACTLY the one due at the instant the tick was dispatched is
+/// checked where it can be, against a clock a test owns: `state::extension_actions`'
+/// `a_dispatched_point_states_the_position_the_clock_has_already_made_due`.
 async fn settled(
     router: &MultiServiceRouter,
     case: &str,
