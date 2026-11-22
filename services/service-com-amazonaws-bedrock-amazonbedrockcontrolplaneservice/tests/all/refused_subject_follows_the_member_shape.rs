@@ -22,10 +22,16 @@
 //! operations), and the FORM of the value refused (a full resource ARN, a bare identifier,
 //! the wrong case, the wrong length, several list elements at once).
 //!
-//! [`a_shape_outside_the_catalogue_keeps_the_value_it_refused`] is the contrast: the SAME
-//! member name over another identifier shape, another label-bound identifier shape, and a
-//! query-bound member still quote what they refused — so what these rows pin is the shape
-//! and not a sentence that quotes nothing anywhere.
+//! [`a_shape_outside_the_catalogue_keeps_the_value_it_refused`] is the contrast: another
+//! label-bound identifier shape and two query-bound members, in NEITHER catalogue, still
+//! quote what they refused by their member's binding — so what these rows pin is the shape
+//! and not a sentence that quotes nothing anywhere. And
+//! [`a_quoted_shape_is_quoted_wherever_the_model_reaches_it`] is the other side of the same
+//! metadata: the evaluation-job identifier is a shape this service QUOTES, so it is quoted
+//! both in the URI label the model binds it to and as the element of the body collection its
+//! batch delete takes — where the binding alone would have stated the position only. The two
+//! shapes meet at one member NAME and one binding, which is what makes the decision the
+//! shape's.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation")` / `query="shape"`), never from a recorded response
@@ -37,7 +43,8 @@ use serde_json::{json, Value};
 
 use crate::support::{emulator, label, Emulator};
 use crate::validation_message_wording::{
-    apo_element_set, pattern_requirement, APO_JOB_IDENTIFIER, TEST_CASE_ID,
+    apo_element_set, evaluation_element_set, pattern_requirement, APO_JOB_IDENTIFIER,
+    EVALUATION_JOB_IDENTIFIER, TEST_CASE_ID,
 };
 
 /// `GuardrailIdentifier`'s `@pattern`, unanchored (`query="shape"`, shape
@@ -45,12 +52,6 @@ use crate::validation_message_wording::{
 /// as the catalogued ones are.
 const GUARDRAIL_IDENTIFIER: &str =
     r"(([a-z0-9]+)|(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))";
-
-/// `EvaluationJobIdentifier`'s `@pattern`, unanchored (`query="shape"`, shape
-/// `EvaluationJobIdentifier`) — the other shape the model declares the member NAME
-/// `jobIdentifier` over.
-const EVALUATION_JOB_IDENTIFIER: &str =
-    r"(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})";
 
 /// A well-formed `AutomatedReasoningPolicyArn` for the rows whose subject is another label:
 /// the policy need not exist, since the constraint walk refuses the request before any
@@ -101,11 +102,11 @@ fn get_job_path(identifier: &str) -> String {
     format!("/advanced-prompt-optimization-jobs/{}", label(identifier))
 }
 
-/// The requirement a `jobIdentifiers` element violation states: the element shape's whole
-/// constraint set, nested in the collection clause
-/// (`tests/all/validation_message_wording.rs` is the rule for the set itself).
-fn job_identifiers_requirement() -> String {
-    format!("Member must satisfy constraint: [{}]", apo_element_set())
+/// The requirement a collection clause states around `element_set`: the element shape's
+/// whole constraint set, nested once (`tests/all/validation_message_wording.rs` is the rule
+/// for the sets themselves).
+fn collection_requirement(element_set: String) -> String {
+    format!("Member must satisfy constraint: [{element_set}]")
 }
 
 /// The rows reaching a shape this service states by position alone: two shapes, three
@@ -207,7 +208,7 @@ fn catalogued_rows() -> Vec<Row> {
             member: "jobIdentifiers",
             carried: "arn:aws:bedrock:us-west-2:000000000000:advanced-prompt-optimization-job/NOPE"
                 .to_string(),
-            requirement: job_identifiers_requirement(),
+            requirement: collection_requirement(apo_element_set()),
         },
         Row {
             // The same collection with SEVERAL offending elements: the clause is one, and
@@ -220,7 +221,7 @@ fn catalogued_rows() -> Vec<Row> {
             })),
             member: "jobIdentifiers",
             carried: "dashes-in-here".to_string(),
-            requirement: job_identifiers_requirement(),
+            requirement: collection_requirement(apo_element_set()),
         },
     ]
 }
@@ -257,26 +258,14 @@ async fn a_catalogued_shape_states_the_members_position_and_quotes_no_value() {
     }
 }
 
-/// The contrast: a shape outside the catalogue keeps the value it refused, so the subject
+/// The contrast: a shape in NEITHER catalogue keeps the value it refused, so the subject
 /// follows the SHAPE and not the member name, the constraint class or a blanket rule — the
-/// rows reach the same member NAME as a catalogued shape, another label-bound identifier
-/// shape, and a query-bound member, over three constraint classes.
+/// rows reach another label-bound identifier shape and two query-bound members, over three
+/// constraint classes, and their subject is the one the member's BINDING decides.
 #[tokio::test]
 async fn a_shape_outside_the_catalogue_keeps_the_value_it_refused() {
     let emulator: Emulator = emulator();
     let rows = vec![
-        Row {
-            // The member NAME a catalogued shape is also reached under
-            // (`query="operation"`, `GetEvaluationJob`: `jobIdentifier` is a `@httpLabel`
-            // over `EvaluationJobIdentifier`).
-            case: "GetEvaluationJob jobIdentifier: the same member name, another shape",
-            method: "GET",
-            path: format!("/evaluation-jobs/{}", label("not-a-job-identifier")),
-            body: None,
-            member: "jobIdentifier",
-            carried: "not-a-job-identifier".to_string(),
-            requirement: pattern_requirement(EVALUATION_JOB_IDENTIFIER),
-        },
         Row {
             // Another identifier shape in a `@httpLabel` (`query="operation"`,
             // `GetGuardrail`): declared the way the catalogued ones are, and quoted.
@@ -311,6 +300,95 @@ async fn a_shape_outside_the_catalogue_keeps_the_value_it_refused() {
             carried: "sideways".to_string(),
             requirement: "Member must satisfy enum value set: [Ascending, Descending]"
                 .to_string(),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let reply = emulator.call(row.method, &row.path, row.body.clone()).await;
+        let stated = reply.get("message").as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            (reply.status, reply.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: expected 400 ValidationException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        let expected = with_value(&row);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
+}
+
+/// The requirement a `jobIdentifiers` element violation of the evaluation job's batch delete
+/// states: that element shape's whole constraint set, nested in the collection clause.
+fn evaluation_identifiers_requirement() -> String {
+    collection_requirement(evaluation_element_set())
+}
+
+/// The other side of the same recorded metadata: a shape this service QUOTES is quoted
+/// wherever the model reaches it — in the URI label it binds the identifier to, and as the
+/// ELEMENT of the BODY collection its batch delete takes, where a member's binding alone
+/// would have stated the position only.
+///
+/// The rows reach ONE shape over two member paths (`jobIdentifier`, `jobIdentifiers`), two
+/// bindings (a `@httpLabel`, a body list), three operations and two methods, and two forms
+/// of refused value (a bare identifier that is no ARN, an identifier of the right length in
+/// the wrong case) — and the collection rows quote the whole list the request carried, the
+/// valid element included. The member NAME and the binding are the ones
+/// [`a_catalogued_shape_states_the_members_position_and_quotes_no_value`] reaches for the
+/// position-alone shapes, so what separates the two sentences is the shape alone.
+#[tokio::test]
+async fn a_quoted_shape_is_quoted_wherever_the_model_reaches_it() {
+    let emulator: Emulator = emulator();
+    let well_formed = "arn:aws:bedrock:us-west-2:000000000000:evaluation-job/abc123def456";
+    let rows = vec![
+        Row {
+            // `query="operation"`, `GetEvaluationJob`: the shape in a `@httpLabel`.
+            case: "GetEvaluationJob with an identifier that is no ARN",
+            method: "GET",
+            path: format!("/evaluation-jobs/{}", label("not-a-job-identifier")),
+            body: None,
+            member: "jobIdentifier",
+            carried: "not-a-job-identifier".to_string(),
+            requirement: pattern_requirement(EVALUATION_JOB_IDENTIFIER),
+        },
+        Row {
+            // The same shape in another label, on another operation and method
+            // (`query="operation"`, `StopEvaluationJob`:
+            // POST /evaluation-job/{jobIdentifier}/stop).
+            case: "StopEvaluationJob with an identifier of the right length in upper case",
+            method: "POST",
+            path: format!("/evaluation-job/{}/stop", label("ABC123DEF456")),
+            body: None,
+            member: "jobIdentifier",
+            carried: "ABC123DEF456".to_string(),
+            requirement: pattern_requirement(EVALUATION_JOB_IDENTIFIER),
+        },
+        Row {
+            // `query="operation"`, `BatchDeleteEvaluationJob`: the same shape as the ELEMENT
+            // of a required BODY list, so the clause is reported at the collection with the
+            // element shape's whole constraint set — and quotes the list the member held.
+            case: "BatchDeleteEvaluationJob with one offending identifier",
+            method: "POST",
+            path: "/evaluation-jobs/batch-delete".to_string(),
+            body: Some(json!({ "jobIdentifiers": ["not-a-job-identifier"] })),
+            member: "jobIdentifiers",
+            carried: "[not-a-job-identifier]".to_string(),
+            requirement: evaluation_identifiers_requirement(),
+        },
+        Row {
+            // The same collection, one valid element beside the offending one: the value
+            // quoted is the member's, so the valid element is in it too.
+            case: "BatchDeleteEvaluationJob with one valid and one offending identifier",
+            method: "POST",
+            path: "/evaluation-jobs/batch-delete".to_string(),
+            body: Some(json!({ "jobIdentifiers": [well_formed, "NOT-AN-ID"] })),
+            member: "jobIdentifiers",
+            carried: format!("[{well_formed}, NOT-AN-ID]"),
+            requirement: evaluation_identifiers_requirement(),
         },
     ];
 

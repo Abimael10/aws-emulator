@@ -18,8 +18,9 @@
 //!    members over different element shapes, one and several offending elements, an
 //!    element that breaks two of its shape's constraints at once, and — as the contrast —
 //!    a violation on the collection's OWN `@length`, which is not nested.
-//! 3. **A clause quotes the value the member held only where the model binds that member to
-//!    the request URI**, so an enum-constrained member in the BODY states
+//! 3. **A clause quotes the value the member held where the SHAPE reached at that member is
+//!    one this service is recorded quoting, and otherwise only where the model binds that
+//!    member to the request URI**, so an enum-constrained member in the BODY states
 //!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
 //!    [ … ]` while one in the QUERY string quotes the token it refused. The rows span
 //!    enum-constrained members of three operations, in the body and in the query string,
@@ -27,7 +28,13 @@
 //!    membership AND the order the service lists it in, which
 //!    `tests/all/enum_value_set_listing.rs` is the rule for. The binding rule itself is
 //!    asserted across every constraint class in
-//!    `tests/all/refused_value_is_quoted_by_binding.rs`.
+//!    `tests/all/refused_value_is_quoted_by_binding.rs`, and the shape catalogs that decide
+//!    it ahead of the binding in `tests/all/refused_subject_follows_the_member_shape.rs`.
+//! 4. **The value a clause stated at a COLLECTION member quotes is the value that MEMBER
+//!    held** — the whole list the request carried, in position order, comma-separated,
+//!    inside one pair of brackets — **and not the elements that offended**, for a collection
+//!    whose clause quotes at all
+//!    ([`a_collection_clause_quotes_the_whole_list_the_request_carried`]).
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation")` / `query="shape"`), never from a recorded response
@@ -60,7 +67,10 @@ const GUARDRAIL_NUMERICAL_VERSION: &str = r"[1-9][0-9]{0,7}";
 
 /// `EvaluationJobIdentifier`'s `@pattern`, unanchored. Model:
 /// `^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})$`.
-const EVALUATION_JOB_IDENTIFIER: &str =
+///
+/// `pub(crate)` because `tests/all/refused_subject_follows_the_member_shape.rs` quotes the
+/// same expression for the same shape rather than keeping a second copy of it.
+pub(crate) const EVALUATION_JOB_IDENTIFIER: &str =
     r"(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})";
 
 /// `AdvancedPromptOptimizationJobIdentifier`'s `@pattern`, unanchored. Model:
@@ -100,11 +110,11 @@ pub(crate) fn pattern_requirement(expression: &str) -> String {
     format!("Member must satisfy regular expression pattern: {expression}")
 }
 
-/// The subject a clause opens with: the value the request carried, quoted, for a member the
-/// model binds to the request URI, and the position ALONE for one the service reads out of
-/// the request body or whose SHAPE this service states by position alone
-/// (`src/service/validation.rs`, rule 2 — the shapes are the rule of
-/// `tests/all/refused_subject_follows_the_member_shape.rs`).
+/// The subject a clause opens with: the value the request carried, quoted, for a member
+/// whose SHAPE this service quotes or that the model binds to the request URI, and the
+/// position ALONE for one the service reads out of the request body or whose SHAPE this
+/// service states by position alone (`src/service/validation.rs`, rule 2 — the shapes are
+/// the rule of `tests/all/refused_subject_follows_the_member_shape.rs`).
 fn subject(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("Value '{value}'"),
@@ -130,7 +140,10 @@ pub(crate) fn apo_element_set() -> String {
 
 /// The element constraint set of `EvaluationJobIdentifiers`' member: the same `@length`
 /// and the evaluation-job `@pattern` (`query="shape"`, shape `EvaluationJobIdentifiers`).
-fn evaluation_element_set() -> String {
+///
+/// `pub(crate)` because `tests/all/refused_subject_follows_the_member_shape.rs` states the
+/// same set for the same member rather than keeping a second copy of it.
+pub(crate) fn evaluation_element_set() -> String {
     format!(
         "Member must have length less than or equal to 1011, \
          Member must have length greater than or equal to 0, \
@@ -452,56 +465,83 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
     let emulator = emulator();
     let evaluation_arn =
         |suffix: &str| format!("arn:aws:bedrock:us-east-1:000000000000:evaluation-job/{suffix}");
-    // (case, path, body, the member, the element set). Every collection of this model is
-    // a BODY member, so the clause states the position alone (rule 2) whatever the
-    // offending elements were.
-    let rows: Vec<(&str, &str, Value, &str, String)> = vec![
-        (
-            "BatchDeleteEvaluationJob, one offending element",
-            "/evaluation-jobs/batch-delete",
-            json!({ "jobIdentifiers": [evaluation_arn("nonexistent")] }),
-            "jobIdentifiers",
-            evaluation_element_set(),
-        ),
-        (
-            "BatchDeleteEvaluationJob, two offending elements",
-            "/evaluation-jobs/batch-delete",
-            json!({ "jobIdentifiers": [evaluation_arn("first"), evaluation_arn("second")] }),
-            "jobIdentifiers",
-            evaluation_element_set(),
-        ),
-        (
-            "BatchDeleteAdvancedPromptOptimizationJob, one offending element",
-            "/advanced-prompt-optimization-job/batch-delete",
-            json!({ "jobIdentifiers": ["NOT-AN-ID"] }),
-            "jobIdentifiers",
-            apo_element_set(),
-        ),
-        (
-            "BatchDeleteAdvancedPromptOptimizationJob, three offending elements",
-            "/advanced-prompt-optimization-job/batch-delete",
-            json!({ "jobIdentifiers": ["A", "BB", "CCC"] }),
-            "jobIdentifiers",
-            apo_element_set(),
-        ),
-        (
-            "UntagResource, an element below the element shape's minimum length",
-            "/untagResource",
-            json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": [""] }),
-            "tagKeys",
-            tag_key_element_set(),
-        ),
-        (
-            "UntagResource, an element outside the element shape's pattern",
-            "/untagResource",
-            json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": ["no*stars"] }),
-            "tagKeys",
-            tag_key_element_set(),
-        ),
+    // One row: a request whose only fault is an element of a collection, the member the
+    // clause is reported at, the element set it must state, and the value it quotes.
+    // Whether the clause quotes the collection is rule 3's question, decided by the ELEMENT
+    // shape and then by the member's binding: the evaluation-job identifier is a shape this
+    // service quotes wherever it is reached, and the value quoted is the whole list the
+    // request carried (rule 4); every other collection here holds an element shape the
+    // service states by position alone or one in neither catalog at a body member, so its
+    // clause quotes nothing (`tests/all/refused_subject_follows_the_member_shape.rs` is the
+    // rule for the catalogs).
+    struct ElementRow {
+        case: &'static str,
+        path: &'static str,
+        body: Value,
+        member: &'static str,
+        element_set: String,
+        quoted: Option<String>,
+    }
+    let rows: Vec<ElementRow> = vec![
+        ElementRow {
+            case: "BatchDeleteEvaluationJob, one offending element",
+            path: "/evaluation-jobs/batch-delete",
+            body: json!({ "jobIdentifiers": [evaluation_arn("nonexistent")] }),
+            member: "jobIdentifiers",
+            element_set: evaluation_element_set(),
+            quoted: Some(format!("[{}]", evaluation_arn("nonexistent"))),
+        },
+        ElementRow {
+            case: "BatchDeleteEvaluationJob, two offending elements",
+            path: "/evaluation-jobs/batch-delete",
+            body: json!({
+                "jobIdentifiers": [evaluation_arn("first"), evaluation_arn("second")],
+            }),
+            member: "jobIdentifiers",
+            element_set: evaluation_element_set(),
+            quoted: Some(format!(
+                "[{}, {}]",
+                evaluation_arn("first"),
+                evaluation_arn("second")
+            )),
+        },
+        ElementRow {
+            case: "BatchDeleteAdvancedPromptOptimizationJob, one offending element",
+            path: "/advanced-prompt-optimization-job/batch-delete",
+            body: json!({ "jobIdentifiers": ["NOT-AN-ID"] }),
+            member: "jobIdentifiers",
+            element_set: apo_element_set(),
+            quoted: None,
+        },
+        ElementRow {
+            case: "BatchDeleteAdvancedPromptOptimizationJob, three offending elements",
+            path: "/advanced-prompt-optimization-job/batch-delete",
+            body: json!({ "jobIdentifiers": ["A", "BB", "CCC"] }),
+            member: "jobIdentifiers",
+            element_set: apo_element_set(),
+            quoted: None,
+        },
+        ElementRow {
+            case: "UntagResource, an element below the element shape's minimum length",
+            path: "/untagResource",
+            body: json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": [""] }),
+            member: "tagKeys",
+            element_set: tag_key_element_set(),
+            quoted: None,
+        },
+        ElementRow {
+            case: "UntagResource, an element outside the element shape's pattern",
+            path: "/untagResource",
+            body: json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": ["no*stars"] }),
+            member: "tagKeys",
+            element_set: tag_key_element_set(),
+            quoted: None,
+        },
     ];
 
-    for (case, path, body, member, element_set) in rows {
-        let reply = refuse(&emulator, "POST", path, Some(body)).await;
+    for row in rows {
+        let (case, member) = (row.case, row.member);
+        let reply = refuse(&emulator, "POST", row.path, Some(row.body)).await;
         assert_eq!(
             (reply.status, reply.error.as_deref()),
             (400, Some("ValidationException")),
@@ -510,8 +550,10 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             reply.message
         );
         let expected = format!(
-            "1 validation error detected: Value at '{member}' failed to satisfy \
-             constraint: Member must satisfy constraint: [{element_set}]"
+            "1 validation error detected: {} at '{member}' failed to satisfy \
+             constraint: Member must satisfy constraint: [{}]",
+            subject(row.quoted.as_deref()),
+            row.element_set
         );
         assert_eq!(
             reply.message, expected,
@@ -522,6 +564,122 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             !reply.message.contains(".member"),
             "case {case}: the clause must name the collection member, not an indexed \
              element position, got {:?}",
+            reply.message
+        );
+    }
+}
+
+/// Rule 4: the value a clause stated at a COLLECTION quotes is the value that MEMBER held —
+/// the whole list the request carried, in position order, inside one pair of brackets — and
+/// not the elements that offended.
+///
+/// Driven over `BatchDeleteEvaluationJob`, whose `jobIdentifiers` list holds a shape this
+/// service quotes wherever it is reached (rule 3). The rows differ along what the rule
+/// generalises over: how many elements the list carries (one, two, three, and the maximum
+/// the model declares, `EvaluationJobIdentifiers` `@length(min: 1, max: 25)`), how many of
+/// them offend (one, several, all), WHERE the offender sits (first, middle, last), and the
+/// FORM each offending element takes — a full job ARN whose resource id is outside the
+/// element shape's character class, a value that is no ARN at all, and one past the element
+/// shape's `@length(max: 1011)`.
+#[tokio::test]
+async fn a_collection_clause_quotes_the_whole_list_the_request_carried() {
+    let emulator = emulator();
+    // The ARN of an evaluation job whose resource id is `id`: twelve characters of
+    // `[a-z0-9]` is inside `EvaluationJobIdentifier`'s `@pattern` and anything else is
+    // outside it. No job need exist, since the constraint walk refuses the request before
+    // any handler reads state.
+    let job = |id: &str| format!("arn:aws:bedrock:us-east-1:000000000000:evaluation-job/{id}");
+    // The largest list the model admits, with its LAST element offending: the elements the
+    // list is filled with are valid identifiers, so the clause is still one.
+    let max_elements = 25;
+    let full_batch: Vec<String> = (0..max_elements)
+        .map(|position| {
+            if position + 1 == max_elements {
+                job("LAST")
+            } else {
+                job(&format!("{:0>12}", format!("job{position}")))
+            }
+        })
+        .collect();
+    // (case, the list the request carries, in position order)
+    let rows: Vec<(&str, Vec<String>)> = vec![
+        (
+            "one element, a job ARN outside the element shape's pattern",
+            vec![job("NOT-AN-ID")],
+        ),
+        (
+            "one element, a bare identifier that is no ARN at all",
+            vec!["not-a-job-identifier".to_string()],
+        ),
+        (
+            "one element, a value past the element shape's maximum length",
+            vec!["z".repeat(1012)],
+        ),
+        (
+            "two elements, both offending",
+            vec![job("FIRST"), job("SECOND")],
+        ),
+        (
+            "two elements, the second offending: the VALID element is quoted too",
+            vec![job("abc123def456"), job("NOPE")],
+        ),
+        (
+            "three elements, the first offending",
+            vec![job("UPPER"), job("abc123def456"), job("aaaaaaaaaaaa")],
+        ),
+        (
+            "three elements, the middle one offending",
+            vec![
+                job("abc123def456"),
+                "short".to_string(),
+                job("aaaaaaaaaaaa"),
+            ],
+        ),
+        ("the modelled maximum of 25 elements, the last offending", full_batch),
+    ];
+
+    for (case, submitted) in rows {
+        let reply = refuse(
+            &emulator,
+            "POST",
+            "/evaluation-jobs/batch-delete",
+            Some(json!({ "jobIdentifiers": submitted })),
+        )
+        .await;
+        assert_eq!(
+            (reply.status, reply.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: expected 400 ValidationException, got {} {:?}",
+            reply.status,
+            reply.message
+        );
+        let expected = format!(
+            "1 validation error detected: {} at 'jobIdentifiers' failed to satisfy \
+             constraint: Member must satisfy constraint: [{}]",
+            subject(Some(&format!("[{}]", submitted.join(", ")))),
+            evaluation_element_set()
+        );
+        assert_eq!(
+            reply.message, expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            reply.message
+        );
+        // The two invariants the whole-message assertion rests on, stated on their own so a
+        // failure names which one broke: EVERY element the request carried is quoted, valid
+        // ones included, and the clause names the collection member rather than an indexed
+        // element position.
+        for element in &submitted {
+            assert!(
+                reply.message.contains(element.as_str()),
+                "case {case}: the value quoted is the whole list the member held, so every \
+                 element must be in it, got {:?}",
+                reply.message
+            );
+        }
+        assert!(
+            !reply.message.contains(".member"),
+            "case {case}: the clause names the collection member, not an indexed element \
+             position, got {:?}",
             reply.message
         );
     }
@@ -579,10 +737,11 @@ async fn an_element_breaking_two_constraints_states_one_clause() {
 /// A collection only PARTLY invalid still names the member and the element shape's whole
 /// constraint set.
 ///
-/// Nothing of the collection is quoted: it is a member the service reads out of the request
-/// body, so the clause states its position and what every element of it must satisfy
-/// (rule 2) — which is also what keeps the elements the structured refusal does not carry
-/// out of the sentence.
+/// Nothing of the collection is quoted: its element shape is one this service states by
+/// position alone wherever it is reached, so the clause states the member's position and
+/// what every element of it must satisfy (rule 3). The contrast is
+/// [`a_collection_clause_quotes_the_whole_list_the_request_carried`], where a partly invalid
+/// list of the QUOTED shape is echoed whole.
 #[tokio::test]
 async fn a_partly_invalid_collection_names_the_member_and_its_element_constraint_set() {
     let emulator = emulator();

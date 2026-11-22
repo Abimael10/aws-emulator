@@ -294,6 +294,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the code is the modelled `ValidationException` (HTTP 400) the framework would
         // also have named: only the words change.
         match refusal {
+            // The seam's own wording is [`worded_refusal`], which [`worded_refusal_quoting`]
+            // is the same sentence over the collections a request carried. [`Gated`] reaches
+            // the second directly, because this seam is handed the violations alone, so a
+            // rule added to this arm belongs in that one function and not here.
             Refusal::Invalid(violations) => worded_refusal(violations),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no wording of
             // its own for keeps the framework's — an authentication refusal, say, which is
@@ -423,17 +427,33 @@ impl<Op, Eng> Gated<Op, Eng> {
 /// guardrail entry quota, then the one formatter in [`validation`] for every other
 /// input-constraint failure.
 ///
-/// Reached from `override_refusal` AND from [`Gated`], which answers the same refusal one
-/// layer earlier for the request whose value the validating walk withheld — so both states
-/// one refusal in one voice.
+/// Reached from `override_refusal`, which the framework calls with the violations ALONE, so
+/// the collections the request carried are not knowable there ([`worded_refusal_quoting`] is
+/// the same wording over the ones that are).
 fn worded_refusal(violations: &[Violation]) -> Option<Refused> {
+    worded_refusal_quoting(violations, &HashMap::new())
+}
+
+/// [`worded_refusal`], with the value each COLLECTION member of the request held
+/// (`lists`, keyed by the member path the walk reports that collection at).
+///
+/// Reached from [`Gated`], which answers the same refusal one layer earlier for the request
+/// whose value the validating walk withheld — so both state one refusal in one voice. The
+/// lists are what a clause stated at a collection quotes: no violation carries the value
+/// that MEMBER held, only the elements that offended, so the list comes from the one read of
+/// the request that collected the violations and is handed to the formatter here rather than
+/// through the `override_refusal` seam, which is called with the violations alone.
+fn worded_refusal_quoting(
+    violations: &[Violation],
+    lists: &HashMap<String, String>,
+) -> Option<Refused> {
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message: violations
             .iter()
             .find_map(refused_arn)
             .or_else(|| violations.iter().find_map(refused_policy_entry_quota))
-            .or_else(|| validation::envelope(violations))?,
+            .or_else(|| validation::envelope(violations, lists))?,
     })
 }
 
@@ -474,16 +494,20 @@ impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, En
             // reading of the REQUEST restores them: the validating walk withholds the value
             // of a `@sensitive` member as it records the violation, and that seam is handed
             // the violations alone, so a clause of this service that quotes the value has
-            // to be worded where the request is still in hand. A refusal the seam declines
-            // is left to the walk behind the delegate exactly as before, and the violations
-            // are the framework's own, so nothing is refused here that it would accept.
-            let refused =
-                ::service_common::validation::refusing_violations::<Op>(
+            // to be worded where the request is still in hand. That same one read yields the
+            // value each COLLECTION member held — the whole list, which no violation carries
+            // and which a clause stated at a collection quotes — so the wording is reached
+            // through [`worded_refusal_quoting`], the seam's own formatter over both. A
+            // refusal it declines is left to the walk behind the delegate exactly as before,
+            // and the violations are the framework's own, so nothing is refused here that it
+            // would accept.
+            let (refused, lists) =
+                ::service_common::validation::refusing_violations_with_lists::<Op>(
                     svc.definition().protocol(),
                     req,
                 );
             if !refused.is_empty() {
-                if let Some(stated) = svc.override_refusal(&Refusal::Invalid(refused.clone())) {
+                if let Some(stated) = worded_refusal_quoting(&refused, &lists) {
                     return svc.definition().refusal_response(
                         ProtocolError::Invalid(refused),
                         Some(stated),

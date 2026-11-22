@@ -21,15 +21,18 @@
 //!    ([`envelope`]);
 //! 2. a clause states its member's dotted path and the requirement it failed, and whether
 //!    it also QUOTES the value the member held is decided by the SHAPE reached at that
-//!    member and then by the member's HTTP binding ([`quotes_the_value`]): a shape whose
-//!    refusals this service is recorded stating without a value ([`VALUE_FREE_SHAPES`]) is
-//!    reported by its position alone, and every other member is quoted exactly where the
-//!    model binds it to the request URI — a `@httpLabel` path segment or a `@httpQuery`
-//!    parameter, the tokens the service reads off the request line
-//!    ([`URI_BOUND_MEMBERS`]). A member the service reads out of the request BODY is
-//!    reported by its position alone either way
-//!    (`Value at '<path>' failed to satisfy constraint: …`), so no body content a caller
-//!    submitted reaches the sentence. Neither decision is the violation's CLASS, so one
+//!    member, and only where the shape cannot be told apart by the member's HTTP binding
+//!    ([`quotes_the_value`]): a shape whose refusals this service is recorded stating
+//!    without a value ([`VALUE_FREE_SHAPES`]) is reported by its position alone, a shape
+//!    whose refusals it is recorded QUOTING ([`VALUE_QUOTING_SHAPES`]) is quoted — either
+//!    way wherever that shape is reached, whatever operation, binding, member path and
+//!    constraint class gets there, in a URI token or in the request body, on its own or as
+//!    a collection's element. A clause about no recorded shape is quoted exactly where the
+//!    model binds its member to the request URI — a `@httpLabel` path segment or a
+//!    `@httpQuery` parameter, the tokens the service reads off the request line
+//!    ([`URI_BOUND_MEMBERS`]) — and is reported by its position alone
+//!    (`Value at '<path>' failed to satisfy constraint: …`) for a member the service reads
+//!    out of the request BODY. Neither decision is the violation's CLASS, so one
 //!    rule covers a `@length`, a `@range`, a `@pattern` and an enum alike; a member the
 //!    request OMITTED held no value at all and is stated as `Value null` whatever its
 //!    binding.
@@ -75,12 +78,13 @@
 //! [`ElementConstraintsTrait`](aws_smithy_schema_server::constraints::ElementConstraintsTrait),
 //! and [`ELEMENT_CONSTRAINTS`] indexes them for every input shape of this service.
 //!
-//! What the refusal does NOT carry is the value a collection member held — only the
-//! elements that offended, each already elided to the framework's echo cap — so the VALUE a
-//! URI-bound collection's clause states is the one formed from those elements. That
-//! divergence, and why closing it belongs elsewhere, is recorded on [`Clause::render`]; a
-//! collection the service reads out of the BODY states no value at all (rule 2), so it
-//! cannot reach it.
+//! What the structured refusal does NOT carry is the value a collection MEMBER held — only
+//! the elements that offended, each already elided to the framework's echo cap — so a
+//! clause that quotes a collection quotes the list the REQUEST carried, read off the same
+//! one walk that collects the violations
+//! (`service_common::validation::refusing_violations_with_lists`, handed to [`envelope`] as
+//! `lists`). A collection that walk does not offer keeps the list formed from the offending
+//! elements, which is the fail-safe direction: see [`Clause::render`].
 //!
 //! A violation class this module has no wording for falls back to the FRAMEWORK's own
 //! clause for that one violation ([`ViolationKind`] is `#[non_exhaustive]`, so a class can
@@ -280,6 +284,16 @@ const ADVANCED_PROMPT_OPTIMIZATION_JOB_IDENTIFIER: &str =
 /// `testCaseIds` list a test workflow takes.
 const AUTOMATED_REASONING_POLICY_TEST_CASE_ID: &str = "^[0-9A-Z]{12}$";
 
+/// The `@pattern` the model declares for an identifier shape whose refusals this service
+/// states WITH the value ([`VALUE_QUOTING_SHAPES`]).
+///
+/// `EvaluationJobIdentifier` (`query="shape"`, shape `EvaluationJobIdentifier`): reached as
+/// the `jobIdentifier` label of an evaluation job's read and stop, and as the element of
+/// the `jobIdentifiers` list its batch delete takes — a body member, so the binding rule
+/// below would state it by position alone while this service's refusals quote it.
+const EVALUATION_JOB_IDENTIFIER: &str =
+    "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})$";
+
 /// The SHAPES whose refusals this service states by the member's position alone, each as
 /// the `@pattern` the model declares for it — the shape's identity in the model, and what a
 /// `@pattern` violation carries, which is how [`crate::service`]'s own ARN seam identifies
@@ -311,13 +325,37 @@ fn value_free_shape(pattern: &str) -> bool {
     VALUE_FREE_SHAPES.contains(&pattern)
 }
 
+/// The SHAPES whose refusals this service QUOTES the value of wherever they are reached,
+/// each as the `@pattern` the model declares for it — the other half of the same recorded
+/// metadata [`VALUE_FREE_SHAPES`] holds, and identified the same way.
+///
+/// An entry is needed for a shape the model reaches at a member the service reads out of
+/// the request BODY, where the binding rule alone would state the clause by position: this
+/// service's refusals quote an evaluation-job identifier whatever carries it — the
+/// `@httpLabel` of the job's read and stop, and the body list its batch delete takes — so
+/// the quoting follows the shape and not the binding, exactly as the eliding does. A shape
+/// reached only in a URI token needs no entry, because the binding rule already quotes it.
+///
+/// Keyed by the SHAPE rather than by the member NAME, for the reason [`VALUE_FREE_SHAPES`]
+/// is: that is what lets one member name be stated both ways — the model declares
+/// `jobIdentifiers` over this shape in one operation and over the
+/// advanced-prompt-optimization identifier in another — and what applies an entry to every
+/// operation, binding, member path and constraint class reaching the shape.
+const VALUE_QUOTING_SHAPES: &[&str] = &[EVALUATION_JOB_IDENTIFIER];
+
+/// Whether `pattern` is the expression a shape this service quotes the value of declares.
+fn value_quoting_shape(pattern: &str) -> bool {
+    VALUE_QUOTING_SHAPES.contains(&pattern)
+}
+
 /// Whether a clause reported at `member_path` QUOTES the value the request carried there,
 /// given the `@pattern`s the shapes reached at that path declare (`declared`).
 ///
 /// Two rules, in order:
 ///
 /// 1. the SHAPE decides it where this service is recorded stating that shape's refusals
-///    without a value ([`VALUE_FREE_SHAPES`]) — whatever constraint class failed, whatever
+///    without a value ([`VALUE_FREE_SHAPES`]) or recorded QUOTING them
+///    ([`VALUE_QUOTING_SHAPES`]) — whatever constraint class failed, whatever
 ///    binding carried it, and whichever operation reached it. Only when EVERY shape the
 ///    clause can be about is such a shape: `declared` holds the expressions the clause's own
 ///    violations carried, which name the shape the request actually broke, and falls back to
@@ -342,8 +380,13 @@ fn quotes_the_value(member_path: &str, declared: &[&str]) -> bool {
     } else {
         declared
     };
-    if !shapes.is_empty() && shapes.iter().all(|pattern| value_free_shape(pattern)) {
-        return false;
+    if !shapes.is_empty() {
+        if shapes.iter().all(|pattern| value_free_shape(pattern)) {
+            return false;
+        }
+        if shapes.iter().all(|pattern| value_quoting_shape(pattern)) {
+            return true;
+        }
     }
     URI_BOUND_MEMBERS.contains(member_path)
 }
@@ -733,27 +776,27 @@ struct Clause {
     /// framework hands a `@sensitive` member's violation over with no value and says so,
     /// which is what separates `Value` from the `Value null` an omitted member earns.
     withheld: bool,
+    /// The value the COLLECTION member held, as the request carried it, for a clause stated
+    /// at one: the whole list, which no violation carries and which the walk that collected
+    /// them reads off the same request ([`envelope`]'s `lists`). `None` for a clause that is
+    /// not about a collection, and for a collection that walk does not offer.
+    submitted: Option<String>,
 }
 
 impl Clause {
     /// The clause as the envelope states it.
     ///
-    /// KNOWN DIVERGENCE, recorded rather than papered over, in the VALUE a collection
-    /// clause echoes. Two limits come from what the structured refusal carries:
+    /// The value a COLLECTION clause quotes is the list the REQUEST carried
+    /// ([`Self::submitted`]), not the elements the structured refusal named: those are only
+    /// the OFFENDING ones, so a collection whose elements are partly valid would otherwise be
+    /// echoed as the collection formed from the invalid ones (`["<valid>", "bad"]` ->
+    /// `Value '[bad]'`) where AWS echoes the whole list.
     ///
-    /// * it carries the OFFENDING elements, not the collection they came from, so a
-    ///   collection whose elements are only partly invalid is echoed as the collection
-    ///   formed from the invalid ones (`["<valid>", "bad"]` -> `Value '[bad]'`) where AWS
-    ///   echoes the whole list. The member path and the constraint set — what tells a
-    ///   caller WHICH member is wrong and what it must satisfy — are exact either way;
-    /// * `Violation::value` is the framework's ELIDED echo, so a value past its cap carries
-    ///   the `… [N bytes]` marker.
-    ///
-    /// Both are fixed in the same place, and it is not this seam: the refusal would have to
-    /// carry the value the caller submitted (`services/common/src/validation.rs`
-    /// `with_submitted_values` restores it from the deserialized input, which only an
-    /// operation-level seam holds). Inventing the missing elements here would echo bytes the
-    /// caller never sent, which is worse than echoing fewer of them.
+    /// A collection the collecting walk does not offer — one whose leaves it could not take
+    /// in full, one whose elements have no string rendering — keeps that elements-only form:
+    /// inventing the missing elements here would echo bytes the caller never sent, which is
+    /// worse than echoing fewer of them. The member path and the constraint set — what tells
+    /// a caller WHICH member is wrong and what it must satisfy — are exact either way.
     fn render(&self) -> String {
         if let Some(verbatim) = &self.verbatim {
             return verbatim.clone();
@@ -778,9 +821,12 @@ impl Clause {
                     .map(|(_, value)| value.as_str())
                     .unwrap_or_default()
             )
+        } else if let Some(submitted) = &self.submitted {
+            // The value the collection MEMBER held, as the request carried it.
+            format!("Value '{submitted}'")
         } else {
             // One bracket per collection step, over the elements the refusal named (see the
-            // divergence noted above).
+            // fail-safe noted above).
             let values: Vec<&str> = self
                 .values
                 .iter()
@@ -804,6 +850,12 @@ impl Clause {
 /// (`N validation error(s) detected: `) over one clause per offending member, in the order
 /// the walk found them.
 ///
+/// `lists` carries the value each COLLECTION member of the request held, keyed by the
+/// member path the walk reports that collection at
+/// (`service_common::validation::refusing_violations_with_lists`): the value a clause stated
+/// at a collection quotes, which no violation holds. Empty for a refusal whose collections
+/// that walk could not offer, and for one reached with the violations alone.
+///
 /// TWO passes over the violations, so the cost stays linear in their number: the first
 /// resolves each collection member's element constraint set, and the second groups every
 /// violation into the clause it belongs to (its member path and the requirement it states),
@@ -814,7 +866,10 @@ impl Clause {
 /// the request.
 ///
 /// `None` only when there is nothing to state.
-pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
+pub(crate) fn envelope(
+    violations: &[Violation],
+    lists: &HashMap<String, String>,
+) -> Option<String> {
     // The element constraint set a collection member's clause states, resolved ONCE per
     // member from every requirement its elements broke (see [`element_constraint_set`]):
     // every element violation of that member then states the same requirement, which is
@@ -897,6 +952,10 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
                         declared.get(path).map(Vec::as_slice).unwrap_or_default(),
                     ),
                     withheld: false,
+                    // The list the request carried at this member, for a clause stated at a
+                    // collection: a property of the MEMBER, so it is the same for every
+                    // violation that folds into this clause.
+                    submitted: lists.get(path).cloned(),
                 })
             }
         };
@@ -1307,7 +1366,7 @@ mod tests {
                 "case {path:?}: only a top-level member carries an HTTP binding"
             );
         }
-        // Every entry of the recorded shape catalog is an expression the model declares at
+        // Every entry of the recorded shape catalogs is an expression the model declares at
         // some input member, so no entry is dead; and the member paths it reaches are what
         // the entry applies to, whatever operation or binding gets there.
         for declared in VALUE_FREE_SHAPES {
@@ -1329,6 +1388,30 @@ mod tests {
                 );
             }
         }
+        for declared in VALUE_QUOTING_SHAPES {
+            assert!(
+                !value_free_shape(declared),
+                "case {declared:?}: a shape is stated one way, so no entry may be in both \
+                 catalogs"
+            );
+            let reached: Vec<&String> = DECLARED_PATTERNS
+                .iter()
+                .filter(|(_, patterns)| patterns.contains(declared))
+                .map(|(path, _)| path)
+                .collect();
+            assert!(
+                !reached.is_empty(),
+                "case {declared:?}: no input member of this model declares that pattern, so \
+                 the entry reaches nothing"
+            );
+            for path in reached {
+                assert!(
+                    quotes_the_value(path, &[declared]),
+                    "case {declared:?}: the entry must reach every member declaring it, \
+                     {path:?} states its position alone"
+                );
+            }
+        }
         // (the member path, the `@pattern`s its clause can be reporting, the subject).
         // A recorded shape against the OTHER shapes the same member name is declared over,
         // a query parameter, a path label, a body member, a member nested in one, and the
@@ -1339,8 +1422,7 @@ mod tests {
         // `CreateModelInvocationJob` reaches `s3Uri` inside it; `resourceArn` is a path
         // label on the resource-policy operations and a body member on others, which a
         // violation's path cannot tell apart, so an ambiguous name keeps the body form).
-        let evaluation_job_identifier =
-            "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})$";
+        let evaluation_job_identifier = EVALUATION_JOB_IDENTIFIER;
         let guardrail_identifier = "^(([a-z0-9]+)|(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:\
                                     [0-9]{12}:guardrail/[a-z0-9]+))$";
         for (path, declared, quotes) in [
@@ -1360,8 +1442,11 @@ mod tests {
                 vec![AUTOMATED_REASONING_POLICY_TEST_CASE_ID],
                 false,
             ),
-            // The same member NAME over another shape: the binding decides it again.
+            // The same member NAMES over the shape this service is recorded QUOTING: the
+            // value is stated in a URI label and in a body collection alike.
             ("jobIdentifier", vec![evaluation_job_identifier], true),
+            ("jobIdentifiers", vec![evaluation_job_identifier], true),
+            // A shape in neither catalog: the binding decides it.
             ("guardrailIdentifier", vec![guardrail_identifier], true),
             // A clause whose violations carry no expression falls back to the shapes the
             // model declares at that path: unanimous for `testCaseId`, several for
