@@ -29,7 +29,8 @@ pub fn start_crawler_not_found(name: &str) -> String {
     format!("Crawler with name {name} does not exist")
 }
 
-/// `StartCrawlerSchedule` for a `CrawlerName` no crawler in this account has.
+/// The schedule-STATE toggles — `StartCrawlerSchedule` and `StopCrawlerSchedule` — for a
+/// `CrawlerName` no crawler in this account has.
 ///
 /// Recorded template, reproduced as the service words this error class and NOT shortened:
 /// the sentence names the crawler the request addressed — the only variable part, read off
@@ -38,13 +39,14 @@ pub fn start_crawler_not_found(name: &str) -> String {
 /// with the generic one, exactly as the classifier read's miss
 /// ([`classifier_not_found`]) does. A client matching on the refusal sees that doubled
 /// wording, so dropping the second half would be a divergence rather than a tidy-up. This
-/// is why this operation's miss is not [`crawler_not_found`], the sentence the
+/// is why these operations' miss is not [`crawler_not_found`], the sentence the
 /// crawler-definition reads answer with.
 ///
-/// Pinned for THIS operation only, which is the one the corpus records. The sibling
-/// schedule writes (`StopCrawlerSchedule`, `UpdateCrawlerSchedule`) keep their own
-/// wording, which no recording pins, rather than being reworded on this operation's
-/// evidence.
+/// Shared by BOTH toggles, which the corpus records answering one and the same sentence for
+/// one and the same absent name: the pair decides only the schedule's `State`, so the miss
+/// belongs to the schedule surface that answers it. `UpdateCrawlerSchedule` writes the
+/// crawler's DEFINITION instead (it replaces or removes the cron expression), so it keeps
+/// the definition reads' wording above; no recording pins any other sentence for it.
 pub fn schedule_crawler_not_found(name: &str) -> String {
     format!("Crawler with name {name} does not exist not found.")
 }

@@ -550,11 +550,21 @@ async fn a_suspend_against_an_absent_crawler_is_the_modelled_miss() {
     )
     .await;
 
+    // `NameString`, the shape `StopCrawlerScheduleRequest$CrawlerName` targets, is `len 1..255`
+    // with the pattern `^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$` (source:
+    // `smithy_query shape=NameString`), so the rows sit on both published length bounds and
+    // span the characters the pattern admits beside the names closest to a stored crawler's.
+    let shortest = "x".to_string();
+    let longest = "l".repeat(255);
     for (case, name) in [
         ("never created", "absent-crawler"),
         ("differs only in case", "PRESENT-CRAWLER"),
         ("differs only in one letter's case", "present-Crawler"),
         ("a name with a space", "present crawler"),
+        ("the shortest name the model admits", shortest.as_str()),
+        ("the longest name the model admits", longest.as_str()),
+        ("a name with a tab", "absent\tcrawler"),
+        ("a non-ASCII name", "crawler-ausgeführt-日本"),
     ] {
         let (status, body) = call(&router, "StopCrawlerSchedule", &json!({ "CrawlerName": name }))
             .await;
@@ -566,10 +576,13 @@ async fn a_suspend_against_an_absent_crawler_is_the_modelled_miss() {
             error_code(&body).contains("EntityNotFoundException"),
             "case {case}: expected EntityNotFoundException, got {body}"
         );
+        // The schedule surface's own recorded sentence, stated as the literal template here
+        // so a reworded helper cannot pass this row unnoticed.
+        let expected = format!("Crawler with name {name} does not exist not found.");
         assert_eq!(
             error_message(&body),
-            messages::crawler_not_found(name),
-            "case {case}: expected the crawler miss for {name}, got {body}"
+            expected,
+            "case {case}: expected {expected:?}, got {body}"
         );
 
         // The refused call created nothing under that name, and left the crawler it

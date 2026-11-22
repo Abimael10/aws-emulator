@@ -169,9 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account has is a miss whatever state a schedule under that name would be in.
         let mut store = state.lock();
         let Some(entry) = store.crawlers.get_mut(&input.crawler_name) else {
+            // Worded as the SCHEDULE surface words this miss — the same sentence
+            // `StartCrawlerSchedule` answers for the same absent name — and not as the
+            // crawler-definition reads word theirs: the refusal belongs to the component
+            // that answers it ([`crate::state::messages::schedule_crawler_not_found`]).
             return Err(StopCrawlerScheduleErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::crawler_not_found(
+                    message: Some(crate::state::messages::schedule_crawler_not_found(
                         &input.crawler_name,
                     )),
                     from_federation_source: None,
