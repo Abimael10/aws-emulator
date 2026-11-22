@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What the pure readings of a custom domain name's front door make of a record and a
-//! path: which base path mapping answers a request, and where a record's mutual-TLS
-//! truststore is.
+//! What the pure readings of a custom domain name's front door make of a record: where its
+//! mutual-TLS truststore is, and which client certificates that truststore trusts.
+//!
+//! WHICH base path mapping of the record answers a request's path — the reading this socket
+//! asks before it relays anything — is the data plane's own, and is pinned beside it in
+//! [`crate::service::invoke::custom_domain_arrival`].
 //!
 //! The wire behaviour — the handshake, the mutual-TLS outcomes and the stage that answers —
 //! is driven end to end over a real socket in
@@ -10,11 +13,7 @@
 
 use super::*;
 
-use crate::state::{BasePathMappingEntry, DomainNameEntry, NONE_BASE_PATH};
-
-/// One row of the base-path table: the request path, and the api, stage and remaining path
-/// it reaches (`None` for a path no mapping answers).
-type MatchRow<'a> = (&'a str, Option<(&'a str, Option<&'a str>, &'a str)>);
+use crate::state::DomainNameEntry;
 
 /// One row of the truststore table: the `(truststoreUri, truststoreVersion)` the record
 /// carries, and the `(bucket, key, version)` it addresses.
@@ -23,91 +22,13 @@ type TruststoreRow<'a> = (
     Option<(&'a str, &'a str, Option<&'a str>)>,
 );
 
-/// A record carrying one mapping per `(base path, api, stage)` row.
-fn record_with(mappings: &[(&str, &str, Option<&str>)]) -> DomainNameEntry {
-    let mut record = DomainNameEntry {
+/// A record carrying no base path mapping: what the readings below make of a record is about
+/// its truststore alone, and which mapping answers a path is pinned where that reading lives
+/// ([`crate::service::invoke::custom_domain_arrival`]).
+fn record() -> DomainNameEntry {
+    DomainNameEntry {
         domain_name: "api.example.com".to_string(),
         ..DomainNameEntry::default()
-    };
-    for (sequence, (base_path, api, stage)) in mappings.iter().enumerate() {
-        record.base_path_mappings.insert(
-            (*base_path).to_string(),
-            BasePathMappingEntry {
-                base_path: (*base_path).to_string(),
-                rest_api_id: (*api).to_string(),
-                stage: stage.map(str::to_string),
-                sequence: sequence as u64,
-            },
-        );
-    }
-    record
-}
-
-/// RULE: the longest base path that is a prefix of the request path ON A SEGMENT BOUNDARY
-/// serves it, the `(none)` mapping serves every path no other mapping claims, and a path no
-/// mapping answers to reaches no api.
-#[test]
-fn the_longest_base_path_on_a_segment_boundary_serves_the_path() {
-    let record = record_with(&[
-        ("shop", "api-shop", Some("live")),
-        ("shop/admin", "api-admin", Some("beta")),
-        ("stageless", "api-stageless", None),
-    ]);
-    // The rows span what the match generalises over: an exact base path, a path under it, a
-    // longer base path winning over a shorter prefix, a segment that merely starts with a
-    // base path, a mapping that names no stage, a path carrying a relative segment in either
-    // spelling, and a path no mapping claims.
-    let cases: &[MatchRow<'_>] = &[
-        ("/shop", Some(("api-shop", Some("live"), ""))),
-        ("/shop/items/9", Some(("api-shop", Some("live"), "items/9"))),
-        ("/shop/admin/users", Some(("api-admin", Some("beta"), "users"))),
-        ("/shopping", None),
-        ("/stageless/live/x", Some(("api-stageless", None, "live/x"))),
-        ("/shop/./items", None),
-        ("/shop/../shop/items", None),
-        ("/shop/%2e%2e/items", None),
-        ("/shop/%2E./items", None),
-        ("/", None),
-    ];
-    for (path, expected) in cases {
-        let matched = matching_mapping(&record, path).map(|(mapping, remainder)| {
-            (
-                mapping.rest_api_id.clone(),
-                mapping.stage.clone(),
-                remainder.to_string(),
-            )
-        });
-        let rendered = matched
-            .as_ref()
-            .map(|(api, stage, remainder)| (api.as_str(), stage.as_deref(), remainder.as_str()));
-        assert_eq!(
-            rendered, *expected,
-            "case {path:?}: expected {expected:?}, got {rendered:?}"
-        );
-    }
-}
-
-/// RULE: the `(none)` mapping answers every path no other mapping claims, whole.
-#[test]
-fn the_none_mapping_answers_every_other_path() {
-    let record = record_with(&[
-        (NONE_BASE_PATH, "api-root", Some("live")),
-        ("shop", "api-shop", Some("live")),
-    ]);
-    let cases: &[(&str, &str, &str)] = &[
-        ("/", "api-root", ""),
-        ("/pets", "api-root", "pets"),
-        ("/pets/9", "api-root", "pets/9"),
-        ("/shop/items", "api-shop", "items"),
-    ];
-    for (path, api, remainder) in cases {
-        let matched = matching_mapping(&record, path);
-        let rendered = matched.map(|(mapping, left)| (mapping.rest_api_id.clone(), left.to_string()));
-        assert_eq!(
-            rendered.as_ref().map(|(api, left)| (api.as_str(), left.as_str())),
-            Some((*api, *remainder)),
-            "case {path:?}: expected {api} and {remainder:?}, got {rendered:?}"
-        );
     }
 }
 
@@ -138,7 +59,7 @@ fn a_truststore_uri_reads_as_the_object_it_addresses() {
         (None, None),
     ];
     for (configured, expected) in cases {
-        let mut record = record_with(&[]);
+        let mut record = record();
         record.mutual_tls_authentication = configured.map(|(uri, version)| {
             crate::ops::types::MutualTlsAuthentication {
                 truststore_uri: Some(uri.to_string()),

@@ -7,6 +7,47 @@ Issue-Commit: b99723d2552fb1e14ee46a597822867680795a41
 
 # acm__apigateway__s3: the mutual-TLS REGIONAL custom domain still never becomes observable — neither a trusted nor an absent client certificate gets an answer, and the check is killed at the 60 s cap
 
+## Resolution
+
+The last item of this report's own Fix list — "route a trusted request through the matching base
+path mapping to its integration" — did not hold for the api shape this check builds, and it is
+FIXED. Everything else the Fix list names (the leaf selected by `ClientHello` SNI, the mandatory
+client certificate, the truststore resolved from `truststoreUri`/`truststoreVersion` through Amazon
+S3, the TLS-layer refusal of a client presenting none, and `403` `{"message":"Forbidden"}` with
+`x-amzn-ErrorType: ForbiddenException` for one signed outside the truststore) was already served by
+`services/service-com-amazonaws-apigateway-backplanecontrolservice/src/service/custom_domain_socket.rs`
+and stays pinned by that crate's `tests/all/regional_custom_domain_front_door.rs` and
+`tests/all/issued_certificate_fronts_a_mutual_tls_domain.rs`.
+
+Two emulator-side defects stood between a TRUSTED client and the stage:
+
+* the api this check creates carries `disableExecuteApiEndpoint=true`, and the data plane refused
+  EVERY request of such an api `403` whatever endpoint it arrived at — while the member turns off
+  the default `execute-api` endpoint alone ("To require that clients use a custom domain name to
+  invoke your API, disable the default endpoint"). The plane now resolves a request addressed to a
+  custom domain name of the account as its own addressing and refuses only the default endpoint
+  (`src/service/invoke.rs`, `src/service/invoke/custom_domain_arrival.rs`);
+* the front door RE-ADDRESSED the request it relayed to the api's own reserved data-plane path, so
+  the SigV4 signature of the `AWS_IAM` method this check invokes was verified against a request no
+  client ever sent. The relay now hands the plane the client's own request — verb, path, query,
+  headers, body — and the api and stage are read from the record's base path mappings instead
+  (`src/service/custom_domain_socket.rs`).
+
+Both rules are pinned over tables of inputs by that crate's `tests/all/custom_domain_arrival.rs`,
+which dials the address the record publishes.
+
+What REMAINS for this check, and it is not this service crate's to serve: the check dials
+`regionalDomainName:443`, while the front door answers on the port the core assigned it.
+`Listeners::tcp_plaintext` (`vendor/server/src/listeners.rs`, binding through `bind_tokio`/
+`bind_std`) takes no requested port — it binds an OS-assigned port, or the first free port in
+`EMULATOR_LISTENER_PORT_RANGE` — and the emulator's own data port presents the one process
+certificate with no per-connection certificate resolver, so nothing inside `services/` can make a
+custom domain's front door answer on 443. That is the same core gap recorded for the sibling check
+in `issues/things-that-now-work/20261114T121226Z-acm-apigateway-a-regional-custom-domain-s-data.md`
+and in `core/router/tests/all/apigateway_custom_domain_dns_alias.rs`; until the core listener API
+accepts a port, this check's four beats stay unobservable however faithfully the data plane behind
+them answers.
+
 > _Note: this issue was identified against the code base at commit `b99723d2552fb1e14ee46a597822867680795a41`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

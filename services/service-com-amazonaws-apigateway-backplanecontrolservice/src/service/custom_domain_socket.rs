@@ -85,7 +85,17 @@
 //! path mapping names, and every method, authorizer and integration of that stage stays in
 //! [`super::invoke`], which serves the same request however it was addressed. A request this
 //! socket accepts is handed to that plane over the in-process transport this emulator reaches
-//! itself on, addressed as the reserved data-plane path of the api the mapping names.
+//! itself on, AS THE CLIENT SENT IT — the same verb, path, query, headers and body.
+//!
+//! Nothing of it is re-addressed, because that is what a SigV4 signature covers: the verb,
+//! the path, the query, the headers the request's own `SignedHeaders` element declares and
+//! the payload. A leg that re-addressed the request to the api's own endpoint would present
+//! the stage a request no client ever signed, so every correctly signed caller of an
+//! `AWS_IAM` method would be refused a signature it computed correctly. WHICH api and stage
+//! the path reaches is read from this record's own base path mappings where the request is
+//! served ([`super::invoke::custom_domain_arrival`]) — the one reading this socket asks
+//! before it relays anything, so a path no mapping of the record answers, and a host this
+//! domain name is not reached at, are refused here instead.
 //!
 //! Every status, header and byte is computed from what a create or an update persisted, and
 //! this module writes NOTHING: serving traffic moves no status, consumes no quota and bumps
@@ -120,14 +130,13 @@ use ::rustls::client::{danger as handshake_signatures};
 use ::rustls::server::{danger as client_certificates};
 
 use crate::state::{
-    BasePathMappingEntry, ComAmazonawsApigatewayBackplanecontrolserviceState as ApiGatewayState,
-    DomainNameEntry,
+    ComAmazonawsApigatewayBackplanecontrolserviceState as ApiGatewayState, DomainNameEntry,
 };
 
-/// The host the forwarded leg addresses this service's own data plane at: the endpoint that
-/// names THIS service, so the emulator's front door resolves the request to the plane it is
-/// meant for.
-const SERVICE_ENDPOINT: &str = "apigateway.amazonaws.com";
+/// Which api, stage and resource path a request addressed to this domain name reaches, and
+/// which hosts address the record at all — the one reading this socket and the data plane
+/// that serves the relayed request share.
+use super::invoke::custom_domain_arrival;
 
 /// The most truststore bytes this socket reads into the process per connection.
 ///
@@ -148,12 +157,13 @@ fn in_flight() -> Arc<Semaphore> {
     Arc::clone(IN_FLIGHT.get_or_init(|| Arc::new(Semaphore::new(listener_caps::MAX_HTTP_INFLIGHT))))
 }
 
-/// The headers the forwarded leg does not copy from the client's request.
+/// The headers neither leg of this hop copies.
 ///
-/// `Host` is this socket's own address, which the forwarded request replaces with the
-/// endpoint that names this service (the plane resolves the api from the reserved path
-/// instead), and the two framing headers describe a body this leg re-frames itself.
-const HEADERS_NOT_FORWARDED: [&str; 3] = ["host", "content-length", "transfer-encoding"];
+/// The two framing headers, which describe a body this hop re-frames itself — the request's
+/// on the way in and the answer's on the way out. Every other header the client sent is
+/// relayed, `Host` included: the host a request stated is what the plane resolves the custom
+/// domain name from, and it is one of the headers a signature covers.
+const HEADERS_NOT_FORWARDED: [&str; 2] = ["content-length", "transfer-encoding"];
 
 /// How long one request may take, from its first header byte to the answer: the core's own
 /// HTTP request deadline, so this address bounds a request exactly as the core's HTTP
@@ -362,9 +372,14 @@ impl CustomDomainSocket {
         mut conn: ListenerConn,
         plan: &ConnectionPlan,
     ) -> Option<(ListenerConn, ClientVerdict)> {
+        // WHAT the client opened with, under the same deadline the handshake itself is given:
+        // a client that completes TCP and then sends nothing at all would otherwise hold the
+        // connection permit the core issued for it for as long as it keeps the socket open,
+        // and no later bound of this address — the handshake deadline, the header-read
+        // timeout, the request deadline — is reached before the first byte arrives.
         let mut first = [0u8; 1];
-        match conn.read(&mut first).await {
-            Ok(1) => {}
+        match ::tokio::time::timeout(HANDSHAKE_DEADLINE, conn.read(&mut first)).await {
+            Ok(Ok(1)) => {}
             _ => return None,
         }
         let prefixed: ListenerConn = Box::new(Prefixed::new(first.to_vec(), conn));
@@ -713,9 +728,11 @@ async fn answer(
         return forbidden();
     }
     let (parts, body) = request.into_parts();
-    // Which api and stage this path reaches, from the record's base path mappings — read
-    // per request, so a mapping created after the connection was opened serves it.
-    let Some(target) = invoke_target(&state, &domain_key, parts.uri.path()) else {
+    // WHETHER this request reaches an api of the account at all: the host it stated has to be
+    // one this domain name is reached at, and some base path mapping of the record has to
+    // answer its path — read per request, so a mapping created after the connection was
+    // opened serves it. WHICH api and stage it reaches is read where it is served.
+    let Some(host) = addressed(&state, &domain_key, &parts) else {
         return forbidden();
     };
     // One permit per request IN FLIGHT, taken BEFORE a byte of the body is read: what the
@@ -731,7 +748,7 @@ async fn answer(
         let Ok(collected) = limited.collect().await else {
             return generated(PAYLOAD_TOO_LARGE, BODY_TOO_LARGE);
         };
-        let Some(forwarded) = forwarded(parts, collected.to_bytes(), &target) else {
+        let Some(forwarded) = forwarded(parts, collected.to_bytes(), &host) else {
             return generated(BAD_GATEWAY, NO_STAGE);
         };
         match callback.http_connector().call(forwarded).await {
@@ -739,6 +756,16 @@ async fn answer(
                 let status = response.status().as_u16();
                 let mut answer = ::http::Response::builder().status(status);
                 for (name, value) in response.headers().iter() {
+                    // The answer's body is re-framed on this hop, so the two headers that
+                    // DESCRIBE a framing are left to the body written below rather than
+                    // copied: a copied length would describe the inner answer's body and not
+                    // the one this address sends.
+                    if HEADERS_NOT_FORWARDED
+                        .iter()
+                        .any(|framing| name.eq_ignore_ascii_case(framing))
+                    {
+                        continue;
+                    }
                     answer = answer.header(name, value);
                 }
                 let body = Bytes::from(
@@ -761,146 +788,84 @@ async fn answer(
     served.unwrap_or_else(|_| generated(GATEWAY_TIMEOUT, REQUEST_TIMED_OUT))
 }
 
-/// The api, the stage and the path one request reaches through the record's base path
-/// mappings.
-struct InvokeTarget {
-    api_id: String,
-    /// The stage the mapping names, and `None` for a mapping that names none — where the
-    /// stage is the first segment of the path the client sent, as it is on an api's own
-    /// invoke endpoint.
-    stage: Option<String>,
-    /// The path under the base path, without a leading `/`.
-    path: String,
-}
-
-/// Which api, stage and path the request path `path` reaches on the custom domain name
-/// `domain_key`, or `None` when it reaches none — a domain name this store no longer holds,
-/// and a path no base path mapping of it answers to.
+/// The host a request on this socket addresses, when this socket serves it at all, and
+/// `None` when it reaches no api of the account: a client that addressed a host this domain
+/// name is not reached at, a path no base path mapping of the record answers, and a domain
+/// name this store no longer holds.
 ///
-/// "Specify '(none)' if you do not want callers to specify any base path name after the
-/// domain name" (`BasePathMapping$basePath`), so the mapping stored under that spelling
-/// answers every path no other mapping claims, and the LONGEST base path that is a prefix of
-/// the path — on a segment boundary, since a base path is a path segment and not a string
-/// prefix — is the one that serves it.
-fn invoke_target(
+/// A client states the host it addressed, and that host has to be one THIS record is reached
+/// at — its own name, however cased, or the `host:port` it published
+/// ([`custom_domain_arrival::addressed_record`]) — so a connection to this address cannot be
+/// used to address another record, another api or another plane of this process. A client
+/// that states no host at all addressed the one name this socket serves, which is the host
+/// the relayed request then carries.
+fn addressed(
     state: &::engine::ServiceState<ApiGatewayState>,
     domain_key: &str,
-    path: &str,
-) -> Option<InvokeTarget> {
+    parts: &::http::request::Parts,
+) -> Option<String> {
     let store = state.lock();
     let record = store.domain_names.get(domain_key)?;
-    let (mapping, remainder) = matching_mapping(record, path)?;
-    Some(InvokeTarget {
-        api_id: mapping.rest_api_id.clone(),
-        stage: mapping.stage.clone(),
-        path: remainder.to_string(),
-    })
-}
-
-/// The base path mapping of `record` that answers `path`, and the path left under it; see
-/// [`invoke_target`].
-///
-/// A path carrying a DOT SEGMENT (`.` or `..`) answers to no mapping: such a segment is a
-/// relative reference, and what a mapping selects is the api and stage the path under its
-/// base path is served by — a remainder that could climb back out of that prefix selects
-/// something the mapping does not name, so it reaches no api at all.
-fn matching_mapping<'r>(
-    record: &'r DomainNameEntry,
-    path: &'r str,
-) -> Option<(&'r BasePathMappingEntry, &'r str)> {
-    if carries_a_dot_segment(path) {
-        return None;
-    }
-    let requested = path.trim_start_matches('/');
-    let mut best: Option<(&BasePathMappingEntry, &str)> = None;
-    for (base_path, mapping) in &record.base_path_mappings {
-        if base_path == crate::state::NONE_BASE_PATH {
-            continue;
+    let host = match stated_host(parts) {
+        Some(stated) => {
+            let addressed = custom_domain_arrival::addressed_record(&store, stated)?;
+            (addressed.domain_name == record.domain_name).then(|| stated.to_string())?
         }
-        let base = base_path.trim_matches('/');
-        let Some(under) = requested.strip_prefix(base) else {
-            continue;
-        };
-        let remainder = match under.strip_prefix('/') {
-            Some(remainder) => remainder,
-            // The path IS the base path, with nothing under it.
-            None if under.is_empty() => under,
-            // A longer segment that merely starts with the base path is a different path.
-            None => continue,
-        };
-        if best.is_none_or(|(held, _)| held.base_path.trim_matches('/').len() < base.len()) {
-            best = Some((mapping, remainder));
-        }
-    }
-    best.or_else(|| {
-        record
-            .base_path_mappings
-            .get(crate::state::NONE_BASE_PATH)
-            .map(|mapping| (mapping, requested))
-    })
-}
-
-/// Whether `path` carries a segment that is a relative reference — `.` or `..`, in the
-/// percent-encoded spellings a URI may write them in as well, since nothing between a client
-/// and this address decodes them.
-fn carries_a_dot_segment(path: &str) -> bool {
-    path.split('/').any(|segment| {
-        let decoded = segment
-            .replace("%2e", ".")
-            .replace("%2E", ".");
-        decoded == "." || decoded == ".."
-    })
-}
-
-/// The request the data plane is handed for one client request: the same method, body and
-/// headers, addressed to this service's own endpoint under the reserved data-plane path of
-/// the api the base path mapping names, with the stage that mapping names ahead of the path
-/// the client sent.
-///
-/// `None` when the client's own request does not render as one, which addresses nothing —
-/// and when the rendered path does not stay under the reserved prefix of the api the mapping
-/// names, which is the one thing this leg must not let a request leave.
-fn forwarded(
-    parts: ::http::request::Parts,
-    body: Bytes,
-    target: &InvokeTarget,
-) -> Option<RtRequest> {
-    let query = parts
-        .uri
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    let prefix = match target.stage.as_deref() {
-        Some(stage) => format!(
-            "/{}/{}/{}/{stage}",
-            crate::service::invoke::EMULATOR_PATH_NAMESPACE,
-            crate::service::invoke::EXECUTE_API_LABEL,
-            target.api_id
-        ),
-        None => format!(
-            "/{}/{}/{}",
-            crate::service::invoke::EMULATOR_PATH_NAMESPACE,
-            crate::service::invoke::EXECUTE_API_LABEL,
-            target.api_id
-        ),
+        None => record.domain_name.clone(),
     };
-    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}/{}{query}", target.path);
+    custom_domain_arrival::reaches_a_mapping(record, parts.uri.path()).then_some(host)
+}
+
+/// The host the request STATED, or `None` for a request carrying none.
+fn stated_host(parts: &::http::request::Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+}
+
+/// The request the data plane is handed for one client request: the CLIENT'S OWN request —
+/// the same verb, the same path and query, the same headers and the same body — addressed to
+/// the host it stated.
+///
+/// Nothing is re-addressed, because a SigV4 signature covers exactly those: the verb, the
+/// path, the query, the headers the request's own `SignedHeaders` element declares and the
+/// payload (see this module's own documentation). WHICH api and stage the path reaches is
+/// read where the request is served, from this record's base path mappings
+/// ([`custom_domain_arrival`]).
+///
+/// `host` is the host the relayed request addresses — the one the client stated, or this
+/// record's own name for a client that stated none ([`addressed`]). It is a LABEL the
+/// in-process transport resolves this emulator's own data plane by, never an address
+/// anything dials: the leg is made over [`EmbeddedEmulator::http_connector`], which
+/// dispatches the request through this same process's router.
+///
+/// `None` when the client's own request does not render as one, which addresses nothing.
+fn forwarded(parts: ::http::request::Parts, body: Bytes, host: &str) -> Option<RtRequest> {
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(::http::uri::PathAndQuery::as_str)
+        .unwrap_or("/");
     let mut builder = ::http::Request::builder()
         .method(parts.method.clone())
-        .uri(uri)
-        .header(::http::header::HOST, SERVICE_ENDPOINT);
+        .uri(format!("https://{host}{target}"));
     for (name, value) in parts.headers.iter() {
         if HEADERS_NOT_FORWARDED.contains(&name.as_str()) {
             continue;
         }
         builder = builder.header(name, value);
     }
+    // A client that stated no host is relayed under the one name this socket serves: the
+    // plane resolves the custom domain name from the host, and a request carrying none would
+    // reach no record at all. Its signature covers no `Host` header either, so adding one
+    // changes nothing a signature was computed over.
+    if stated_host(&parts).is_none() {
+        builder = builder.header(::http::header::HOST, host);
+    }
     let built = builder.body(SdkBody::from(body)).ok()?;
-    // What the leg addresses is READ BACK off the rendered request and checked to still name
-    // the reserved prefix of the api the mapping named: the path under a base path is the
-    // client's own, so this is the assertion that nothing it carried moved the request to
-    // another api, another stage or another plane of this process.
-    (built.uri().path().starts_with(&prefix)).then_some(())?;
     RtRequest::try_from(built).ok()
 }
 

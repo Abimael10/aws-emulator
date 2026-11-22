@@ -275,6 +275,13 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # 53's OWN `ChangeResourceRecordSets`
 # (`tests/all/issued_certificate_fronts_a_mutual_tls_domain.rs`).
 service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+# A request that arrived on a custom domain name is authenticated against the request the
+# client sent, so the suite that pins that (`tests/all/custom_domain_arrival.rs`) signs its
+# requests with the keys this emulator published rather than fabricating a credential: the
+# signer and the credential type are the SDK's own, the same ones the router's signed-invoke
+# suite uses.
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
 
 [lints]
 workspace = true

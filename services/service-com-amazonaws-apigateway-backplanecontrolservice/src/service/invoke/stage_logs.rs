@@ -414,11 +414,17 @@ fn planned<Eng: Send + Sync + 'static>(
     recorded: &Recorded,
 ) -> Option<Planned> {
     let state = crate::state::service_state(engine)?;
+    // Which api, stage and resource path this request reaches is the same reading the serving
+    // makes, so the request a custom domain name's front door relayed is logged under the api
+    // and stage its base path mapping names — read, like there, before the store is held.
+    let addressed = super::Addressed::of_request(req);
+    let arrival = super::custom_domain_arrival::arrival_of(&state, addressed.host, addressed.path);
+    let addressed = addressed.arriving_on(arrival.as_ref());
     let store = state.lock();
     // The account's CloudWatch role is what API Gateway writes as; see the module docs. It is
     // carried through to the deliveries, which are the calls it makes as that role.
     let role_arn = store.account.cloudwatch_role_arn.clone()?;
-    let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
+    let resolved = super::resolve(&store, &addressed)?;
     let api = resolved.api;
     let (stage_name, resource_path) = super::split_stage(resolved.invoke_path)?;
     let stage = api.stages.get(stage_name)?;

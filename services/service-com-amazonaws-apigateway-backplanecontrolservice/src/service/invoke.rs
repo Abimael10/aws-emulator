@@ -266,6 +266,10 @@ pub mod aws_integration;
 mod canary_release;
 pub mod cognito_user_pools;
 mod custom_authorizer;
+/// Which api, stage and resource path a request addressed to a CUSTOM DOMAIN NAME of this
+/// account reaches, through that domain name's own base path mappings — the one reading the
+/// socket in front of such a domain name and this plane share.
+pub(crate) mod custom_domain_arrival;
 pub mod execute_api_authorization;
 /// What an authorizer's `identitySource` declaration extracts from a request, read the one
 /// way by this data plane and by a SIMULATED request ([`simulated_authorizer`]).
@@ -637,6 +641,14 @@ pub struct Addressed<'a> {
     /// ([`serve_resolved`]), which is why a caller cannot name an endpoint its request did
     /// not arrive through.
     delivered_through: Option<&'a str>,
+    /// What the CUSTOM DOMAIN NAME this request's host names resolves it to, when it names
+    /// one: the api, the stage and the resource path its base path mappings select
+    /// ([`custom_domain_arrival`]).
+    ///
+    /// Read against this service's own records, so it is asked ONCE before the request is
+    /// resolved rather than inside the resolution: what the resolution then needs of it is
+    /// the answer, not a borrow of the records it was read from.
+    arrival: Option<&'a custom_domain_arrival::Arrival>,
 }
 
 impl<'a> Addressed<'a> {
@@ -650,6 +662,7 @@ impl<'a> Addressed<'a> {
                 .get(API_ID_HEADER)
                 .and_then(|value| value.to_str().ok()),
             delivered_through: None,
+            arrival: None,
         }
     }
 
@@ -663,7 +676,17 @@ impl<'a> Addressed<'a> {
             path: path_of(req.uri()),
             api_id_header: req.headers().get(API_ID_HEADER),
             delivered_through: None,
+            arrival: None,
         }
+    }
+
+    /// The same addressing, read against the account's own custom domain names: `arrival` is
+    /// what the record this request's host names resolves it to, for a host that names one
+    /// ([`custom_domain_arrival::arrival_of`], which every caller of [`resolve`] asks ahead
+    /// of it).
+    fn arriving_on(mut self, arrival: Option<&'a custom_domain_arrival::Arrival>) -> Self {
+        self.arrival = arrival;
+        self
     }
 
     /// The same addressing, of a request this plane DELIVERED through `endpoint`.
@@ -680,17 +703,30 @@ impl<'a> Addressed<'a> {
 #[derive(Debug)]
 struct Resolved<'s, 'r> {
     api: &'s RestApiEntry,
+    /// A SLICE of the request's own path for every addressing that carries the invoke path
+    /// whole, and the path a base path mapping SELECTED for a request that arrived on a
+    /// custom domain name ([`Addressed::arrival`]).
     invoke_path: &'r str,
     /// The id of the interface VPC endpoint the request ARRIVED through: the one this plane
     /// delivered it through ([`Addressed::delivered_through`]), else the one whose
     /// endpoint-specific DNS name it was addressed on. `None` on every other addressing —
     /// where the request arrived through no endpoint this service can name.
     source_vpce: Option<&'r str>,
+    /// The CUSTOM DOMAIN NAME the request was addressed to, for a request that arrived on
+    /// one, and `None` for one addressed to the api's own default `execute-api` endpoint in
+    /// any of its spellings.
+    ///
+    /// Which endpoint a request arrived at is what `disableExecuteApiEndpoint` is about:
+    /// "specifies whether clients can invoke your API by using the default `execute-api`
+    /// endpoint… To require that clients use a custom domain name to invoke your API,
+    /// disable the default endpoint", so an api that turned the default endpoint off is
+    /// still served on its custom domain names.
+    custom_domain: Option<&'r str>,
 }
 
 /// What `addressed` addresses, or `None` when this data plane serves it not at all.
 ///
-/// FIVE addressings resolve, because a client reaches this emulator at a different
+/// SIX addressings resolve, because a client reaches this emulator at a different
 /// address than it reaches AWS at:
 ///
 /// * HOST-STYLE, the addressing `RestApi$disableExecuteApiEndpoint` documents: the host's
@@ -725,6 +761,13 @@ struct Resolved<'s, 'r> {
 ///   that resource's ([`answered_by_another_service`], applied to every addressing here
 ///   before any of them is read), and an interface VPC endpoint's own DNS name, whose
 ///   addressing above names the endpoint the request arrived through;
+/// * CUSTOM DOMAIN NAME, the addressing a client uses once a caller has put a custom domain
+///   name in front of an api: the host is that DOMAIN NAME — or the `host:port` the record
+///   published as its `regionalDomainName`, which is the address a client of this emulator
+///   dials — and the api, the stage and the resource path are read out of the base path
+///   mappings of that record ([`custom_domain_arrival`]), since the request itself names
+///   none of them. It is the ONE addressing that did not arrive at the api's own default
+///   `execute-api` endpoint, which is what `disableExecuteApiEndpoint` is about;
 /// * PATH-STYLE: the api id is the FIRST PATH SEGMENT and the invoke path is what follows
 ///   it. A client on the machine this emulator runs on resolves
 ///   `{api_id}.execute-api.{region}.amazonaws.com` nowhere, so it reaches the emulator's own
@@ -777,6 +820,7 @@ fn resolve<'s, 'r>(
                 // arrived, whatever name it was addressed on; a request nothing delivered
                 // arrived at the endpoint whose own name it names.
                 source_vpce: addressed.delivered_through.or(Some(endpoint)),
+                custom_domain: None,
             });
     }
     // PREFIXED PATH-STYLE before the host's own api id: the path names this data plane and
@@ -791,6 +835,20 @@ fn resolve<'s, 'r>(
             api,
             invoke_path,
             source_vpce: addressed.delivered_through,
+            custom_domain: None,
+        });
+    }
+    // A CUSTOM DOMAIN NAME of this account, before the path addressings below: the host names
+    // the front door a caller put in front of an api rather than the api's own endpoint, so
+    // what the path means is decided by that record's base path mappings — a first segment
+    // that happens to equal an api id or a stage name is part of the path a mapping answers,
+    // not an addressing of its own.
+    if let Some(arrival) = addressed.arrival {
+        return store.rest_apis.get(&arrival.api_id).map(|api| Resolved {
+            api,
+            invoke_path: &arrival.invoke_path,
+            source_vpce: addressed.delivered_through,
+            custom_domain: Some(&arrival.domain_name),
         });
     }
     if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
@@ -798,6 +856,7 @@ fn resolve<'s, 'r>(
             api,
             invoke_path: addressed.path,
             source_vpce: addressed.delivered_through,
+            custom_domain: None,
         });
     }
     let (first, rest) = split_first_segment(addressed.path)?;
@@ -819,6 +878,7 @@ fn resolve<'s, 'r>(
             api,
             invoke_path: rest,
             source_vpce: addressed.delivered_through,
+            custom_domain: None,
         });
     }
     if host_service.is_some() {
@@ -842,6 +902,7 @@ fn resolve<'s, 'r>(
         api,
         invoke_path: addressed.path,
         source_vpce: addressed.delivered_through,
+        custom_domain: None,
     })
 }
 
@@ -925,21 +986,32 @@ pub fn claims_parts<Eng: Send + Sync + 'static>(
     engine: &Eng,
     parts: &http::request::Parts,
 ) -> bool {
-    claims(engine, &Addressed::of_parts(parts))
+    claims(engine, Addressed::of_parts(parts))
 }
 
 /// [`claims_parts`] for the runtime-API request the two serving seams are handed.
 pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
-    claims(engine, &Addressed::of_request(req))
+    claims(engine, Addressed::of_request(req))
 }
 
 /// Whether this data plane serves `addressed`.
-fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> bool {
+///
+/// Taken by value because the claim asks the same question of it the serving does, and that
+/// starts with whether the request arrived on a custom domain name of the account
+/// ([`Addressed::arriving_on`]): a request this plane serves is one it claims.
+fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: Addressed<'_>) -> bool {
     if answered_by_another_service(engine, addressed.host) {
         return false;
     }
-    crate::state::service_state(engine)
-        .is_some_and(|state| resolve(&state.lock(), addressed).is_some())
+    let Some(state) = crate::state::service_state(engine) else {
+        return false;
+    };
+    let arrival = custom_domain_arrival::arrival_of(&state, addressed.host, addressed.path);
+    let addressed = addressed.arriving_on(arrival.as_ref());
+    // The store is taken LAST, so it is released before `addressed` and the arrival it
+    // borrows are dropped.
+    let store = state.lock();
+    resolve(&store, &addressed).is_some()
 }
 
 /// Whether the host this request ADDRESSED is an address this emulator published for another
@@ -1214,6 +1286,11 @@ async fn serving<Eng: Send + Sync + 'static>(
         },
     };
     let addressed = Addressed::of_request(req).delivered_through(delivered_through);
+    // WHETHER this request arrived on a custom domain name of the account, and what that
+    // record's base path mappings make of its path: read ONCE, before the store is held, and
+    // carried into every pass of the resolution below ([`custom_domain_arrival`]).
+    let arrival = custom_domain_arrival::arrival_of(&state, addressed.host, addressed.path);
+    let addressed = addressed.arriving_on(arrival.as_ref());
     // What this request RESOLVES to: the integration that is to answer it, what VALIDATING
     // its payload needs, and what METERING it is subject to. All three are read under a
     // shared read of the store, which is RELEASED before any of them runs: validating a
@@ -1241,10 +1318,14 @@ async fn serving<Eng: Send + Sync + 'static>(
                 break 'planned Planned::Answered(Box::new(refusal_response(None, FORBIDDEN)));
             };
             let api = resolved.api;
-            if api.disable_execute_api_endpoint {
+            if api.disable_execute_api_endpoint && resolved.custom_domain.is_none() {
                 // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API
-                // by using the default execute-api endpoint." Turned off, the endpoint serves
-                // nothing.
+                // by using the default execute-api endpoint… To require that clients use a
+                // custom domain name to invoke your API, disable the default endpoint."
+                // Turned off, that DEFAULT endpoint serves nothing — and a request that
+                // arrived on one of the api's custom domain names arrived at another endpoint
+                // entirely ([`Resolved::custom_domain`]), which is the endpoint turning the
+                // default one off requires clients to use.
                 break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             }
             // A PRIVATE api is reachable ONLY through an interface VPC endpoint: its
@@ -2205,6 +2286,11 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
     req: &RtRequest,
 ) -> (EdgeOutcome, Option<waf_logs::LoggedRecord>) {
     let addressed = Addressed::of_request(req);
+    // The same reading of a request that arrived on a custom domain name the serving makes,
+    // so the web ACL in front of a stage inspects the invoke path of the api its base path
+    // mapping names — read before this service's store is held.
+    let arrival = custom_domain_arrival::arrival_of(state, addressed.host, addressed.path);
+    let addressed = addressed.arriving_on(arrival.as_ref());
     // The stage's ARN, and the invoke path WITHIN the api — which is the path AWS's
     // edge inspects, `/{stage}/{resource-path}`, whichever addressing the client
     // reached this emulator by.
