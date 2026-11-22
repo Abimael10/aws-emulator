@@ -3230,6 +3230,20 @@ impl Interpreter<'_> {
             // evaluated with the context of the attempt they are on.
             let context = with_retry_count(context, me.retry_count);
             let (mut outcome, end) = me.run_map_items(&plan, &effective, &context, at, &mut tally);
+            // An iteration's offset into the run is this walk's LOGICAL clock, which the
+            // calls its states made do not advance — so an item whose work really took
+            // time finished at an instant later than its offset says. Each child
+            // execution's own offset is therefore raised to the span this walk has REALLY
+            // spent, read ONCE here, before anything reports a child: the records the
+            // store keeps and the results a `ResultWriter` writes are both derived from
+            // this offset ([`Interpreter::settle`]), so they cannot disagree, and neither
+            // reports a child as having stopped at an instant inside the work it did.
+            let spent = super::super::now()
+                .duration_since(me.start)
+                .unwrap_or_default();
+            for child in &mut tally.children {
+                child.finished_at = child.finished_at.max(spent);
+            }
             // "ResultWriter — specifies the Amazon S3 location where Step Functions
             // writes all child workflow execution results": writing them is part of
             // what this ATTEMPT does, so it happens here — whichever status the items

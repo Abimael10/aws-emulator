@@ -3401,6 +3401,9 @@ struct Interpreter<'tasks> {
     /// run writes report the dates its children ran between and the store records those
     /// children as stopping when the clock makes their outcome due — so what is written
     /// to S3 and what `DescribeExecution` answers for the same child cannot disagree.
+    /// Both read one offset per child, which the walk raises to the time its items really
+    /// took as soon as they are done ([`Interpreter::map_state`]), so neither reports a
+    /// child as having stopped at an instant inside the work that child did.
     settle: Duration,
     base_context: Value,
     /// What a `Task` state's service integration is performed by, for the one walk

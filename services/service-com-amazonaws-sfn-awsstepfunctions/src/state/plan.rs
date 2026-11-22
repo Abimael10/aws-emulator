@@ -708,7 +708,15 @@ fn plan_from_run(
     // answer, which is a change to [`asl::run`] and its shared logical clock (the
     // branches of a `Parallel` share it, so no call may move it) rather than a further
     // clamp here.
-    let due_at = after(start, settle.saturating_add(run.elapsed)).max(after(super::now(), settle));
+    //
+    // The Map Runs this walk started and their items are held to the same floor, for the
+    // same reason and from the same reading of the clock: their items' work was all done
+    // inside this walk, so neither may be reported finished at an instant that was already
+    // past when the walk ended. A CHILD execution's own instant is raised by the walk
+    // itself ([`asl::Interpreter::settle`]), because the results written for a Map Run
+    // report it as well and the two cannot disagree.
+    let no_sooner_than = after(super::now(), settle);
+    let due_at = after(start, settle.saturating_add(run.elapsed)).max(no_sooner_than);
     // What this attempt ENDED with, which is what the event it ends on reports: a
     // later attempt of the same execution computes its own outcome, and the event
     // this one wrote stays in the history.
@@ -747,8 +755,10 @@ fn plan_from_run(
     // Every Map Run the walk started, with its offsets turned into instants against
     // the execution's own start: it started when its `Map` state was entered, and
     // reaches the status the walk computed one `settle` after its items finished —
-    // the same delay the execution's own outcome is owed after, so a Map Run never
-    // reports a terminal status before the execution around it could.
+    // the same delay the execution's own outcome is owed after, and never sooner than
+    // the floor every instant this walk owes is held to, so a Map Run never reports a
+    // terminal status before the execution around it could nor a window shorter than
+    // the work its items really did.
     let map_runs: Vec<PlannedMapRun> = run
         .map_runs
         .into_iter()
@@ -757,29 +767,33 @@ fn plan_from_run(
             label: map_run.label,
             status: map_run.status.to_string(),
             start_date: after(start, map_run.started_at),
-            due_at: after(start, settle.saturating_add(map_run.stopped_at)),
+            due_at: after(start, settle.saturating_add(map_run.stopped_at)).max(no_sooner_than),
             max_concurrency: map_run.max_concurrency,
             tolerated_failure_count: map_run.tolerated_failure_count,
             tolerated_failure_percentage: map_run.tolerated_failure_percentage,
             total_items: map_run.total_items,
             // Each ITEM is owed the same way the Map Run around it is: its iteration
             // finished at its own offset into the walk, and is counted one `settle`
-            // after that instant — so the last item to finish comes due exactly when
-            // the Map Run's own status does, and no item is counted in the call that
-            // started the execution.
+            // after that instant, under the same floor — so the last item to finish
+            // comes due exactly when the Map Run's own status does, and no item is
+            // counted in the call that started the execution.
             items: map_run
                 .items
                 .into_iter()
                 .map(|item| MapRunItem {
-                    due_at: after(start, settle.saturating_add(item.finished_at)),
+                    due_at: after(start, settle.saturating_add(item.finished_at))
+                        .max(no_sooner_than),
                     failed: item.failed,
                 })
                 .collect(),
-            // And each CHILD execution the same way: it started when its own
-            // iteration did, and the terminal status that iteration produced is owed
-            // one `settle` after the instant it finished — so a caller reading a
-            // child straight after the start sees it RUNNING, exactly as the Map Run
-            // and the execution around it are.
+            // And each CHILD execution: it started when its own iteration did, and the
+            // terminal status that iteration produced is owed one `settle` after the
+            // instant it finished — an offset the WALK already raised to the time its
+            // items really took, because the results written for a child report it too
+            // ([`asl::Interpreter::settle`]) — so a caller reading a child straight after
+            // the start sees it RUNNING, exactly as the Map Run and the execution around
+            // it are, and the window the child reports covers the work its own iteration
+            // really did.
             children: map_run
                 .children
                 .into_iter()
