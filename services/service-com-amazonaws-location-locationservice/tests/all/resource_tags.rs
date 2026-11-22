@@ -53,6 +53,11 @@ const RESERVED_PREFIX_REFUSAL: &str =
 /// with a resource."
 const TOO_MANY_TAGS_REFUSAL: &str = "'Tags' must not take the resource past 50 tags.";
 
+/// The whole sentence the tag plane's not-found refusal carries, whatever the ARN named:
+/// fixed text, with no part of the request in it. Written out here rather than read off
+/// the crate, so this suite pins the wording itself.
+const TAG_PLANE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
 /// One taggable resource kind: how a test creates one, where its ARN comes back, where
 /// its own read lives, and the ARN `resourcetype` segment its ARN carries.
 struct TaggableKind {
@@ -182,6 +187,26 @@ async fn untag(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> Answer 
     .await
 }
 
+/// The status this plane's two MUTATIONS answer a success with. `TagResourceResponse`
+/// and `UntagResourceResponse` model no members, so the answer has nothing for a caller
+/// to parse and the status is the whole of it; the plane's READ keeps 200, which carries
+/// the `Tags` member.
+const TAG_MUTATION_STATUS: u16 = 204;
+
+/// Assert one served tag mutation: the plane's success status, and no body at all.
+fn assert_mutation_served(case: &str, what: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status, TAG_MUTATION_STATUS,
+        "case {case:?}: {what} must answer {TAG_MUTATION_STATUS}, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert!(
+        answer.body.is_empty(),
+        "case {case:?}: {what} must answer with no body, got {:?}",
+        answer.body
+    );
+}
+
 /// Create one resource of `kind` and answer the ARN its create reported.
 async fn create_resource(router: &MultiServiceRouter, kind: &TaggableKind, name: &str) -> String {
     let created = call(
@@ -306,17 +331,26 @@ fn assert_tags_refusal(case: &str, refused: &Answer, sentence: &str) {
     assert_field_refusal(case, refused, "Tags", sentence);
 }
 
-/// Assert one 404: the status, the modelled code, and the sentence.
+/// The status and the wire error CODE the shared tagging frontend in front of the three
+/// ARN-addressed tag operations answers for an ARN that resolves to no resource: its own
+/// `NotFoundException`, not the `ResourceNotFoundException` the model declares for those
+/// operations and the name-addressed reads answer. Written out here rather than read off
+/// the crate, so this suite pins the wire contract itself.
+const TAG_PLANE_NOT_FOUND_STATUS: u16 = 404;
+const TAG_PLANE_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// Assert one not-found of the tag plane: its status, that frontend's error code, and the
+/// sentence.
 fn assert_not_found(case: &str, refused: &Answer, sentence: &str) {
     assert_eq!(
-        refused.status, 404,
-        "case {case:?}: expected a 404, got {} {:?}",
+        refused.status, TAG_PLANE_NOT_FOUND_STATUS,
+        "case {case:?}: expected a {TAG_PLANE_NOT_FOUND_STATUS}, got {} {:?}",
         refused.status, refused.body
     );
     assert_eq!(
         refused.error_code(),
-        "ResourceNotFoundException",
-        "case {case:?}: expected error code ResourceNotFoundException, got {:?} ({:?})",
+        TAG_PLANE_NOT_FOUND_CODE,
+        "case {case:?}: expected error code {TAG_PLANE_NOT_FOUND_CODE}, got {:?} ({:?})",
         refused.error_code(),
         refused.body
     );
@@ -376,11 +410,7 @@ async fn tag_list_and_untag_round_trip_on_every_taggable_resource_kind() {
 
         // The first write: two new keys.
         let tagged = tag(&router, &arn, tag_body(&[("env", "dev"), ("team", "fleet")])).await;
-        assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: TagResource must succeed, got {} {:?}",
-            tagged.status, tagged.body
-        );
+        assert_mutation_served(case, "TagResource", &tagged);
         assert_eq!(
             reported_tags(case, &list_tags(&router, &arn).await),
             expected_tags(&[("env", "dev"), ("team", "fleet")]),
@@ -395,11 +425,7 @@ async fn tag_list_and_untag_round_trip_on_every_taggable_resource_kind() {
             tag_body(&[("env", "prod"), ("cost.center", "42")]),
         )
         .await;
-        assert_eq!(
-            merged.status, 200,
-            "case {case:?}: a second TagResource must succeed, got {} {:?}",
-            merged.status, merged.body
-        );
+        assert_mutation_served(case, "a second TagResource", &merged);
         let after_merge = expected_tags(&[("cost.center", "42"), ("env", "prod"), ("team", "fleet")]);
         assert_eq!(
             reported_tags(case, &list_tags(&router, &arn).await),
@@ -424,11 +450,7 @@ async fn tag_list_and_untag_round_trip_on_every_taggable_resource_kind() {
         // One held key and one absent key in ONE request: the held one goes, the absent
         // one is a no-op, and the request still succeeds.
         let untagged = untag(&router, &arn, &["team", "never-set"]).await;
-        assert_eq!(
-            untagged.status, 200,
-            "case {case:?}: UntagResource must succeed, got {} {:?}",
-            untagged.status, untagged.body
-        );
+        assert_mutation_served(case, "UntagResource", &untagged);
         let after_untag = expected_tags(&[("cost.center", "42"), ("env", "prod")]);
         assert_eq!(
             reported_tags(case, &list_tags(&router, &arn).await),
@@ -438,11 +460,7 @@ async fn tag_list_and_untag_round_trip_on_every_taggable_resource_kind() {
 
         // `@idempotent`: the same removal again answers the same way and changes nothing.
         let again = untag(&router, &arn, &["team", "never-set"]).await;
-        assert_eq!(
-            again.status, 200,
-            "case {case:?}: repeating UntagResource must succeed, got {} {:?}",
-            again.status, again.body
-        );
+        assert_mutation_served(case, "a repeated UntagResource", &again);
         assert_eq!(
             reported_tags(case, &list_tags(&router, &arn).await),
             after_untag,
@@ -525,19 +543,11 @@ async fn a_tag_write_merges_the_keys_it_carries_and_leaves_the_rest_alone() {
 
         if !case.held.is_empty() {
             let held = tag(&router, &arn, tag_body(case.held)).await;
-            assert_eq!(
-                held.status, 200,
-                "case {label:?}: storing the held tags must succeed, got {} {:?}",
-                held.status, held.body
-            );
+            assert_mutation_served(label, "storing the held tags", &held);
         }
 
         let written = tag(&router, &arn, tag_body(case.write)).await;
-        assert_eq!(
-            written.status, 200,
-            "case {label:?}: TagResource must succeed, got {} {:?}",
-            written.status, written.body
-        );
+        assert_mutation_served(label, "TagResource", &written);
         assert_eq!(
             reported_tags(label, &list_tags(&router, &arn).await),
             expected_tags(case.after),
@@ -618,19 +628,11 @@ async fn untagging_removes_exactly_the_named_keys() {
 
         if !case.held.is_empty() {
             let held = tag(&router, &arn, tag_body(case.held)).await;
-            assert_eq!(
-                held.status, 200,
-                "case {label:?}: storing the held tags must succeed, got {} {:?}",
-                held.status, held.body
-            );
+            assert_mutation_served(label, "storing the held tags", &held);
         }
 
         let removed = untag(&router, &arn, case.remove).await;
-        assert_eq!(
-            removed.status, 200,
-            "case {label:?}: UntagResource must succeed, got {} {:?}",
-            removed.status, removed.body
-        );
+        assert_mutation_served(label, "UntagResource", &removed);
         assert_eq!(
             reported_tags(label, &list_tags(&router, &arn).await),
             expected_tags(case.after),
@@ -654,11 +656,7 @@ async fn a_reserved_tag_key_is_refused_by_a_tag_write_and_stores_nothing() {
         let router = emulator();
         let arn = create_resource(&router, &TAGGABLE_KINDS[0], "reserved").await;
         let held = tag(&router, &arn, tag_body(&[("env", "dev")])).await;
-        assert_eq!(
-            held.status, 200,
-            "case {key:?}: the positive control must be stored, got {} {:?}",
-            held.status, held.body
-        );
+        assert_mutation_served(key, "the positive control", &held);
 
         // A reserved key beside an acceptable one refuses the WHOLE write.
         let refused = tag(&router, &arn, tag_body(&[(key, "x"), ("fine", "y")])).await;
@@ -720,20 +718,12 @@ async fn a_merge_past_the_documented_tag_ceiling_is_refused_and_writes_nothing()
         let router = emulator();
         let arn = create_resource(&router, &TAGGABLE_KINDS[3], "bounded").await;
         let stored = tag(&router, &arn, generated_tags("held", *held)).await;
-        assert_eq!(
-            stored.status, 200,
-            "case {label:?}: storing {held} tags must succeed, got {} {:?}",
-            stored.status, stored.body
-        );
+        assert_mutation_served(label, &format!("storing {held} tags"), &stored);
 
         if *added > 0 {
             let more = tag(&router, &arn, generated_tags("more", *added)).await;
             if *accepted {
-                assert_eq!(
-                    more.status, 200,
-                    "case {label:?}: {added} more tags must be accepted, got {} {:?}",
-                    more.status, more.body
-                );
+                assert_mutation_served(label, &format!("{added} more tags"), &more);
             } else {
                 assert_tags_refusal(label, &more, TOO_MANY_TAGS_REFUSAL);
             }
@@ -752,16 +742,16 @@ async fn a_merge_past_the_documented_tag_ceiling_is_refused_and_writes_nothing()
     let router = emulator();
     let arn = create_resource(&router, &TAGGABLE_KINDS[3], "replaced").await;
     let stored = tag(&router, &arn, generated_tags("held", ceiling)).await;
-    assert_eq!(
-        stored.status, 200,
-        "case \"replace at the ceiling\": storing {ceiling} tags must succeed, got {} {:?}",
-        stored.status, stored.body
+    assert_mutation_served(
+        "replace at the ceiling",
+        &format!("storing {ceiling} tags"),
+        &stored,
     );
     let replaced = tag(&router, &arn, tag_body(&[("held0", "replacement")])).await;
-    assert_eq!(
-        replaced.status, 200,
-        "case \"replace at the ceiling\": replacing a held key must succeed, got {} {:?}",
-        replaced.status, replaced.body
+    assert_mutation_served(
+        "replace at the ceiling",
+        "replacing a held key",
+        &replaced,
     );
     let tags = reported_tags("replace at the ceiling", &list_tags(&router, &arn).await);
     assert_eq!(
@@ -794,29 +784,21 @@ async fn an_arn_naming_no_stored_resource_is_not_found_on_every_tag_operation() 
                 kind.arn_resource_type
             );
             let case = format!("{} {name}", kind.arn_resource_type);
-            let sentence = format!(
-                "{} not found: {name}.",
-                state::TaggedKind::ALL
-                    .iter()
-                    .find(|resolvable| resolvable.arn_resource_type() == kind.arn_resource_type)
-                    .expect("the table's kind is one the crate resolves")
-                    .resource_label()
-            );
 
             assert_not_found(
                 &format!("{case} TagResource"),
                 &tag(&router, &arn, tag_body(&[("env", "dev")])).await,
-                &sentence,
+                TAG_PLANE_NOT_FOUND_MESSAGE,
             );
             assert_not_found(
                 &format!("{case} ListTagsForResource"),
                 &list_tags(&router, &arn).await,
-                &sentence,
+                TAG_PLANE_NOT_FOUND_MESSAGE,
             );
             assert_not_found(
                 &format!("{case} UntagResource"),
                 &untag(&router, &arn, &["env"]).await,
-                &sentence,
+                TAG_PLANE_NOT_FOUND_MESSAGE,
             );
         }
     }
@@ -842,21 +824,20 @@ async fn an_arn_of_this_vendor_naming_a_resource_the_store_lacks_is_not_found() 
     create_resource(&router, &TAGGABLE_KINDS[0], "exists").await;
 
     for arn in &arns {
-        let sentence = format!("Resource not found: {arn}.");
         assert_not_found(
             &format!("{arn} TagResource"),
             &tag(&router, arn, tag_body(&[("env", "dev")])).await,
-            &sentence,
+            TAG_PLANE_NOT_FOUND_MESSAGE,
         );
         assert_not_found(
             &format!("{arn} ListTagsForResource"),
             &list_tags(&router, arn).await,
-            &sentence,
+            TAG_PLANE_NOT_FOUND_MESSAGE,
         );
         assert_not_found(
             &format!("{arn} UntagResource"),
             &untag(&router, arn, &["env"]).await,
-            &sentence,
+            TAG_PLANE_NOT_FOUND_MESSAGE,
         );
     }
 }
@@ -881,11 +862,7 @@ async fn an_arn_of_another_vendor_is_a_bad_request_and_reaches_no_resource() {
     let router = emulator();
     let own_arn = create_resource(&router, &TAGGABLE_KINDS[0], "exists").await;
     let held = tag(&router, &own_arn, tag_body(&[("env", "dev")])).await;
-    assert_eq!(
-        held.status, 200,
-        "the positive control must be stored, got {} {:?}",
-        held.status, held.body
-    );
+    assert_mutation_served("an ARN of another vendor", "the positive control", &held);
 
     for arn in &arns {
         assert_field_refusal(

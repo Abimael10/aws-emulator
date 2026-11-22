@@ -38,21 +38,28 @@
 //! A sixth seam, `override_protocol`, is the one this service DOES take: it serves the
 //! model's `restJson1` codec with every timestamp in the ISO 8601 `date-time` form this
 //! model's only timestamp shape declares, in both directions (see
-//! [`date_time_timestamps`]).
+//! [`date_time_timestamps`]), and with an answer whose status carries no content framed as
+//! carrying none (see [`no_content_answers`]).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// How a timestamp is read from, and written to, the JSON wire — the one difference from
 /// the model's own `restJson1` codec this service takes.
 pub mod date_time_timestamps;
+
+/// Which answers of this service carry no content, and where their status and their framing
+/// come from — both `service_common`'s, named here once.
+pub(crate) mod no_content_answers;
+
+/// How a failure of this service names its error shape in the `x-amzn-errortype` response
+/// header, and why that name carries nothing beside it.
+pub mod error_type_locator;
 
 /// The `com-amazonaws-location-locationservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.

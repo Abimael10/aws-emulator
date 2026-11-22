@@ -6,6 +6,10 @@
 //! read-only in fact: it resolves the ARN and projects the tags the resource holds,
 //! writing nothing, so what a later caller reads is what the last tag write left.
 //!
+//! An ARN that resolves to no resource of this service earns the shared tagging
+//! frontend's own not-found refusal, which this whole plane answers
+//! ([`crate::state::tagged_resource_not_found`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,26 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN of another vendor, or a value that is no ARN at all, names nothing in
         // this service's namespace: a bad request, refused on the input. A resource ARN
-        // of this vendor naming a resource the store does not hold is a not-found.
+        // of this vendor resolving to no resource the store holds is the tagging
+        // frontend's own not-found, which every operation of this plane answers.
         let target = crate::state::TagTarget::of_arn(&input.resource_arn).map_err(|why| {
             match why {
                 crate::state::UnresolvedArn::NotAnArnOfThisService(sentence) => {
-                    field_validation_failed(crate::state::RESOURCE_ARN_MEMBER, sentence)
+                    field_validation_failed(crate::state::RESOURCE_ARN_MEMBER, sentence).into()
                 }
-                crate::state::UnresolvedArn::NotFound(message) => {
-                    ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
+                crate::state::UnresolvedArn::NotFound => {
+                    crate::state::tagged_resource_not_found()
                 }
             }
         })?;
 
         let store = state.lock();
-        let tags = store.resource_tags(&target).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: target.not_found(),
-            })
-        })?;
+        let tags = store
+            .resource_tags(&target)
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         Ok(ListTagsForResourceOutput {
             // Projected unconditionally, as every resource read in this crate projects

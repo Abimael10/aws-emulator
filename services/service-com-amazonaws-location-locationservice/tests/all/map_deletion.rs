@@ -128,9 +128,40 @@ fn map_resolving_paths(name: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A refusal's status, wire error code, `x-amzn-errortype` header and message.
+/// The status, the wire error CODE and the whole message the shared tagging frontend in
+/// front of the ARN-addressed tag operations answers for an ARN that resolves to no
+/// resource: its own `NotFoundException` and one fixed sentence, rather than the modelled
+/// `ResourceNotFoundException` and the map-naming sentence a call that named the map in
+/// its own URI earns. Written out here rather than read off the crate, so this suite pins
+/// the wire contract itself.
+const TAG_PLANE_NOT_FOUND_CODE: &str = "NotFoundException";
+const TAG_PLANE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// A refusal's status, wire error code, `x-amzn-errortype` header and message, for a
+/// call that named the map in its own URI: the MODELLED `ResourceNotFoundException`.
 fn assert_not_found(answer: &Answer, name: &str, case: &str) {
-    let message = format!("Map not found: {name}.");
+    assert_refused_as_missing(
+        answer,
+        "ResourceNotFoundException",
+        &format!("Map not found: {name}."),
+        case,
+    );
+}
+
+/// The same class from the ARN-addressed tag plane, which the shared tagging frontend
+/// serves: one route over every taggable resource, so it answers that frontend's own error
+/// code and its single fixed sentence instead of naming the map.
+fn assert_tag_plane_not_found(answer: &Answer, case: &str) {
+    assert_refused_as_missing(
+        answer,
+        TAG_PLANE_NOT_FOUND_CODE,
+        TAG_PLANE_NOT_FOUND_MESSAGE,
+        case,
+    );
+}
+
+/// One 404: the status, the header, the wire code and the sentence the caller expects.
+fn assert_refused_as_missing(answer: &Answer, code: &str, message: &str, case: &str) {
     assert_eq!(
         answer.status, 404,
         "case {case:?}: expected HTTP 404, got {} {:?}",
@@ -143,8 +174,8 @@ fn assert_not_found(answer: &Answer, name: &str, case: &str) {
     );
     assert_eq!(
         answer.error_code(),
-        "ResourceNotFoundException",
-        "case {case:?}: expected error code ResourceNotFoundException, got {:?} ({:?})",
+        code,
+        "case {case:?}: expected error code {code}, got {:?} ({:?})",
         answer.error_code(),
         answer.body
     );
@@ -210,12 +241,11 @@ async fn a_delete_retires_the_map_so_every_later_read_of_the_name_is_refused() {
         // names nothing there either.
         let arn = format!("arn:aws:geo:{REGION}:{ACCOUNT}:map/{name}");
         let encoded_arn = encode(&arn);
-        assert_not_found(
+        assert_tag_plane_not_found(
             &call(&router, "GET", &format!("/tags/{encoded_arn}"), None).await,
-            name,
             &format!("{}: ListTagsForResource after delete", row.case),
         );
-        assert_not_found(
+        assert_tag_plane_not_found(
             &call(
                 &router,
                 "POST",
@@ -223,7 +253,6 @@ async fn a_delete_retires_the_map_so_every_later_read_of_the_name_is_refused() {
                 Some(json!({ "Tags": { "late": "tag" } })),
             )
             .await,
-            name,
             &format!("{}: TagResource after delete", row.case),
         );
 

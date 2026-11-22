@@ -34,9 +34,10 @@ mod ring_geometry;
 /// resources' own reads all reach the same per-resource tag map.
 mod resource_tags;
 pub use resource_tags::{
-    merge_tags, not_an_arn_of_this_service, remove_tags, unresolvable_arn_not_found,
-    validate_tag_keys, TagTarget, TaggedKind, UnresolvedArn, ANY_RESOURCE, ARN_VENDOR,
-    MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, RESOURCE_ARN_MEMBER, TAGS_MEMBER,
+    merge_tags, not_an_arn_of_this_service, remove_tags, tagged_resource_not_found,
+    validate_tag_keys, TagTarget, TaggedKind, UnresolvedArn, ARN_VENDOR, MAX_TAGS_PER_RESOURCE,
+    RESERVED_TAG_KEY_PREFIX, RESOURCE_ARN_MEMBER, TAGS_MEMBER, TAG_PLANE_NOT_FOUND_CODE,
+    TAG_PLANE_NOT_FOUND_STATUS, TAG_PLANE_RESOURCE_NOT_FOUND,
 };
 
 /// The geofence collection a `ConsumerArn` names and the cursor a tracker's

@@ -8,18 +8,62 @@
 //! the SAME per-resource tag map the creates fill and the describes report: there is one
 //! tag map per resource, not a second tag store beside it, so a tag written through the
 //! tag plane is what that resource's own read reports.
+//!
+//! The refusal that plane answers for an ARN resolving to nothing is here for the same
+//! reason: all three operations answer the one refusal, so they cannot word it
+//! differently ([`tagged_resource_not_found`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::{
-    ComAmazonawsLocationLocationserviceState, GEOFENCE_COLLECTION_RESOURCE, MAP_RESOURCE,
-    PLACE_INDEX_RESOURCE, ROUTE_CALCULATOR_RESOURCE, TRACKER_RESOURCE,
-};
+use super::ComAmazonawsLocationLocationserviceState;
 
-/// How a refusal names a resource whose ARN carries a `resourcetype` this service
-/// holds no resources of: there is no resource kind to name, so the sentence names the
-/// ARN the request sent instead.
-pub const ANY_RESOURCE: &str = "Resource";
+/// The wire error CODE this service's ARN-addressed TAG plane answers for an ARN that
+/// names no resource.
+///
+/// It is NOT the `ResourceNotFoundException` the rest of this service answers and the
+/// model declares for these three operations: the ARN-addressed tag operations are served
+/// by the shared tagging frontend in front of this service, which answers its own
+/// `NotFoundException`. That shape is in no operation's modelled error set, so the refusal
+/// travels through [`crate::scaffolded::Scaffolded::unmodeled`].
+///
+/// The STATUS and the SENTENCE below are recorded for this service; this code is not —
+/// the recording withholds the header value and reports only that the shape of the one the
+/// emulator sent differed. It is taken from the refusal that same frontend is recorded
+/// answering in front of other services' tag planes, where the code and this exact
+/// sentence appear together. A later recording that does assert the header for this
+/// service is the thing to check it against.
+pub const TAG_PLANE_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The HTTP status that frontend answers an absent resource with — the same 404 the
+/// modelled `ResourceNotFoundException` carries, so only the shape differs.
+pub const TAG_PLANE_NOT_FOUND_STATUS: u16 = 404;
+
+/// The whole `message` that refusal carries, whatever the ARN named.
+///
+/// The plane is ARN-generic — one route (`/tags/{ResourceArn}`) in front of every taggable
+/// resource of this service — and the sentence is FIXED: it names neither the kind of
+/// resource the ARN carried nor the name parsed out of it, so a caller learns only that
+/// the ARN resolved to nothing. That is why the per-resource `<Resource> not found:
+/// <name>.` sentence the name-addressed reads state (see [`super::resource_not_found`]) is
+/// NOT what this plane answers: those operations name the resource in their own URI, this
+/// one does not.
+pub const TAG_PLANE_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The refusal EVERY tag operation answers for a `ResourceArn` that resolves to no
+/// resource this store holds: the tagging frontend's [`TAG_PLANE_NOT_FOUND_CODE`] at
+/// [`TAG_PLANE_NOT_FOUND_STATUS`], stating [`TAG_PLANE_RESOURCE_NOT_FOUND`].
+///
+/// Shared by all three, so they cannot answer it differently. The code is not a modelled
+/// shape's, which is why this goes out through the unmodelled channel rather than through
+/// a `ResourceNotFoundException` — whose own sentence belongs to the refusals the
+/// name-addressed resource operations of this service answer.
+pub fn tagged_resource_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        TAG_PLANE_NOT_FOUND_CODE,
+        TAG_PLANE_NOT_FOUND_STATUS,
+        TAG_PLANE_RESOURCE_NOT_FOUND,
+    )
+}
 
 /// The member a tag write's refusal names, as the model spells it.
 pub const TAGS_MEMBER: &str = "Tags";
@@ -74,18 +118,6 @@ impl TaggedKind {
         }
     }
 
-    /// How a refusal about this kind names it — the same label every other refusal
-    /// about that resource uses.
-    pub const fn resource_label(self) -> &'static str {
-        match self {
-            Self::Tracker => TRACKER_RESOURCE,
-            Self::GeofenceCollection => GEOFENCE_COLLECTION_RESOURCE,
-            Self::Map => MAP_RESOURCE,
-            Self::RouteCalculator => ROUTE_CALCULATOR_RESOURCE,
-            Self::PlaceIndex => PLACE_INDEX_RESOURCE,
-        }
-    }
-
     /// The kind an ARN's `resourcetype` segment names, or `None` when this service
     /// holds no resources of that type.
     fn of_arn_resource_type(resource_type: &str) -> Option<Self> {
@@ -123,9 +155,10 @@ pub enum UnresolvedArn {
     /// The value is not a resource ARN of this service's vendor: a 400
     /// `ValidationException` naming `ResourceArn`, carrying this sentence.
     NotAnArnOfThisService(String),
-    /// A resource ARN of this service's vendor naming a resource this service does not
-    /// hold: a 404 `ResourceNotFoundException` carrying this sentence.
-    NotFound(String),
+    /// A resource ARN of this service's vendor that resolves to no resource this service
+    /// holds: the tagging frontend's own refusal ([`tagged_resource_not_found`]), which
+    /// carries nothing the request supplied and so needs no value here.
+    NotFound,
 }
 
 /// The resource a tag operation addresses, resolved from its `ResourceArn` once so the
@@ -151,10 +184,10 @@ impl TagTarget {
         let parsed = ::service_common::arn::parse_of(arn, ARN_VENDOR)
             .ok_or_else(|| UnresolvedArn::NotAnArnOfThisService(not_an_arn_of_this_service()))?;
         let kind = TaggedKind::of_arn_resource_type(parsed.resource_type())
-            .ok_or_else(|| UnresolvedArn::NotFound(unresolvable_arn_not_found(arn)))?;
+            .ok_or(UnresolvedArn::NotFound)?;
         let name = ::service_common::arn::resource_id_of_type(arn, kind.arn_resource_type())
             .filter(|name| !name.is_empty())
-            .ok_or_else(|| UnresolvedArn::NotFound(unresolvable_arn_not_found(arn)))?;
+            .ok_or(UnresolvedArn::NotFound)?;
         Ok(Self {
             kind,
             name: name.to_string(),
@@ -170,19 +203,6 @@ impl TagTarget {
     pub fn name(&self) -> &str {
         &self.name
     }
-
-    /// The `ResourceNotFoundException` sentence stated when this service holds no
-    /// resource of that kind under that name.
-    pub fn not_found(&self) -> String {
-        super::resource_not_found(self.kind.resource_label(), &self.name)
-    }
-}
-
-/// The `ResourceNotFoundException` sentence stated for an ARN that names no resource
-/// kind this service holds: the ARN is all the request said about the resource, so the
-/// sentence names the ARN.
-pub fn unresolvable_arn_not_found(arn: &str) -> String {
-    super::resource_not_found(ANY_RESOURCE, arn)
 }
 
 impl ComAmazonawsLocationLocationserviceState {

@@ -407,12 +407,16 @@ impl ServerProtocol for DateTimeRestJson {
         operation_name: &str,
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
-        self.inner.serialize_output(
+        let rendered = self.inner.serialize_output(
             &DateTimes(output),
             output_schema,
             operation_name,
             success_status,
-        )
+        )?;
+        // The status and every header are the protocol's: only an answer whose status
+        // carries no content is emptied of the body rendered for it, by the tree's one
+        // reading of that framing (`super::no_content_answers`).
+        Ok(super::no_content_answers::without_content(rendered))
     }
 
     fn serialize_error(
@@ -425,7 +429,9 @@ impl ServerProtocol for DateTimeRestJson {
         // Wrapped for the same reason the success body is: the seam is uniform, so a
         // timestamp member an error shape of this model gains later cannot silently go
         // out in the protocol's default form. The wrapper is a no-op for a shape that
-        // holds no timestamp, which is every error shape this model declares today.
+        // holds no timestamp, which is every error shape this model declares today. No
+        // framing correction is needed here: every error this model declares carries a
+        // 4xx or 5xx envelope, so no failure is a no-content answer.
         self.inner
             .serialize_error(&DateTimes(error), error_schema, error_code, http_status)
     }

@@ -10,7 +10,10 @@ build = "build.rs"
 engine = { workspace = true }
 # `service-common` carries the workspace's ONE caller-supplied-ARN parse, which the tag
 # operations read their `ResourceArn` against — the vendor field before any lookup, then
-# the resource type and id the ARN addresses — rather than splitting the value here.
+# the resource type and id the ARN addresses — rather than splitting the value here; the
+# status and the framing of an answer that carries no content, which this service's tag
+# mutations answer at (`no_content_responses`); and the one reader of the error shape a
+# failure names in `x-amzn-errortype` (`error_type_locator`).
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

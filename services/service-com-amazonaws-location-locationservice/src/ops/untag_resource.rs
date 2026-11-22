@@ -7,6 +7,11 @@
 //! resource does not hold is removed by doing nothing, so a repeated call answers
 //! exactly like the first.
 //!
+//! A served removal answers 204 No Content (see `SUCCESS_STATUS` below), and an ARN that
+//! resolves to no resource of this service earns the shared tagging frontend's own
+//! not-found refusal, which this whole plane answers
+//! ([`crate::state::tagged_resource_not_found`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -145,7 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful removal answers 204 No Content, the same way `TagResource` does and
+    // for the same reason: `UntagResourceResponse` models no members, so the status is
+    // the whole answer, and this plane's mutations report "nothing to read" with the
+    // status that says so rather than with the protocol's defaulted 200. The status is the
+    // tree's shared one, named through `crate::service::no_content_answers`.
+    const SUCCESS_STATUS: u16 = crate::service::no_content_answers::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,
@@ -163,26 +173,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN of another vendor, or a value that is no ARN at all, names nothing in
         // this service's namespace: a bad request, refused on the input. A resource ARN
-        // of this vendor naming a resource the store does not hold is a not-found.
+        // of this vendor resolving to no resource the store holds is the tagging
+        // frontend's own not-found, which every operation of this plane answers.
         let target = crate::state::TagTarget::of_arn(&input.resource_arn).map_err(|why| {
             match why {
                 crate::state::UnresolvedArn::NotAnArnOfThisService(sentence) => {
-                    field_validation_failed(crate::state::RESOURCE_ARN_MEMBER, sentence)
+                    field_validation_failed(crate::state::RESOURCE_ARN_MEMBER, sentence).into()
                 }
-                crate::state::UnresolvedArn::NotFound(message) => {
-                    UntagResourceErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
+                crate::state::UnresolvedArn::NotFound => {
+                    crate::state::tagged_resource_not_found()
                 }
             }
         })?;
 
         let mut store = state.lock();
-        let tags = store.resource_tags_mut(&target).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: target.not_found(),
-            })
-        })?;
+        let tags = store
+            .resource_tags_mut(&target)
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
         crate::state::remove_tags(tags, &input.tag_keys);
 
         Ok(UntagResourceOutput {})
