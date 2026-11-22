@@ -13,11 +13,11 @@
 //! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries is the recorded
 //! contract of the ROUTE that looked it up:
 //!
-//! * a call ADDRESSED by the INFRASTRUCTURE configuration's own ARN — its read and its delete
-//!   — reports the ARN the request carried, quoted: "The resource ARN '<arn>' was not found.",
-//!   which names no kind.
+//! * a call ADDRESSED by a CONFIGURATION's own ARN to READ it — either configuration family's
+//!   read, and the infrastructure configuration's delete — reports the ARN the request
+//!   carried, quoted: "The resource ARN '<arn>' was not found.", which names no kind.
 //! * everywhere else — the components, recipes, pipelines, images, workflows, and a
-//!   distribution configuration a read, a delete, an update, a policy write, a tagging write
+//!   distribution configuration a delete, an update, a policy write, a tagging write
 //!   or a reference names — the required resource it is: "The following required resource
 //!   '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN identifies.
 //!
@@ -168,7 +168,7 @@ fn assert_reported_missing(
 }
 
 /// Assert `status` and the answer are the not-found report the rule requires for a call
-/// ADDRESSED by the INFRASTRUCTURE configuration's own ARN: HTTP 404, the same modelled error
+/// ADDRESSED by a CONFIGURATION's own ARN to read it: HTTP 404, the same modelled error
 /// type, and the message that quotes `arn` and names no kind.
 fn assert_arn_not_found(case: &str, status: u16, body: &Value, arn: &str) {
     assert_not_found_shape(case, status, body);
@@ -504,15 +504,15 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             );
         }
         "DistributionConfiguration" => {
-            // Every lookup of this family names the kind its ARN identifies — the read as much
-            // as the delete and the update — where the sibling configuration family's read
-            // quotes its ARN alone.
+            // The READ is addressed by the configuration's own ARN, so it quotes that ARN
+            // alone, exactly as the sibling configuration family's read does; the delete and
+            // the update have to RESOLVE a reference to it, so they name the kind.
             push(
                 "GetDistributionConfiguration",
                 "GET",
                 format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
                 None,
-                MissingReport::RequiredResource,
+                MissingReport::ConfigurationArn,
             );
             push(
                 "DeleteDistributionConfiguration",

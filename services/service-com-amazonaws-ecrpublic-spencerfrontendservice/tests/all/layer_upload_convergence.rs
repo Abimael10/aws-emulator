@@ -32,7 +32,7 @@ use crate::layer_upload_completion::{
     availability, digest_of, given_parts, given_upload, layer_bytes, reported_layers,
 };
 use crate::layer_upload_sessions::{
-    call, error_code, given_repository, ok, service_with_engine, stored_uploads, REGISTRY_ALIAS,
+    call, error_code, given_repository, ok, service_with_engine, stored_uploads, registry_alias,
     REGISTRY_ID,
 };
 
@@ -116,6 +116,7 @@ fn winner_facts(body: &Value) -> (String, String, String, String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_completions_of_one_upload_commit_the_layer_exactly_once() {
     // (case, racers, layer length, how many parts, the `registryId` named)
+    let alias = registry_alias();
     let rows: Vec<(&str, usize, usize, usize, Option<&str>)> = vec![
         ("two racers, one byte in one part, no registryId", 2, 1, 1, None),
         (
@@ -130,7 +131,7 @@ async fn racing_completions_of_one_upload_commit_the_layer_exactly_once() {
             5,
             1024,
             3,
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
         ),
         (
             "eight racers, an uneven size in four parts",

@@ -19,12 +19,16 @@
 
 use serde_json::{json, Value};
 
-use crate::repository_image_lifecycle::{digest_of, ok, refused, service, REGISTRY_ID};
+use crate::repository_image_lifecycle::{
+    digest_of, ok, refused, registry_alias, service, REGISTRY_ID,
+};
 
-/// This registry's alias (`state::DEFAULT_REGISTRY_ALIAS`), which `registryId` accepts
-/// in place of the account id: a request naming it must still see the account id in the
-/// message, because the message reports the registry the call RESOLVED to.
-const REGISTRY_ALIAS: &str = "emulator";
+/// The alias this account's registry is assigned (`state::default_registry_alias`), which
+/// `registryId` accepts in place of the account id: a request naming it must still see the
+/// account id in the message, because the message reports the registry the call RESOLVED to.
+fn named_by_alias() -> String {
+    registry_alias()
+}
 
 /// The `$.message` of a refused call.
 fn message(body: &Value, case: &str) -> String {
@@ -44,6 +48,7 @@ async fn put_image_names_the_requested_digest_repository_and_registry_on_a_misma
     // (case, repositoryName, the manifest pushed, the digest claimed for it, the
     // `registryId` the request names)
     let mismatch_digest = digest_of(&manifest("some other manifest"));
+    let alias = named_by_alias();
     let rows: Vec<(&str, &str, String, String, Option<&str>)> = vec![
         (
             "single-segment name, all-zero digest, no registryId",
@@ -64,7 +69,7 @@ async fn put_image_names_the_requested_digest_repository_and_registry_on_a_misma
             "a_b.c-d",
             manifest("separators"),
             "deadbeef".to_string(),
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
         ),
         (
             "deeply nested name, uppercase hex digest",
@@ -228,13 +233,14 @@ async fn describe_images_renders_the_whole_requested_image_identifier_when_it_re
 async fn create_repository_names_the_repository_and_registry_of_a_name_already_taken() {
     // Names spanning the forms the modelled `repositoryName` pattern admits, plus the
     // ways the second request can name the registry.
+    let alias = named_by_alias();
     let rows: [(&str, &str, Option<&str>); 4] = [
         ("single segment, no registryId", "probe", None),
         ("nested name, registryId by account id", "team/app", Some(REGISTRY_ID)),
         (
             "separator-rich name, registryId by alias",
             "a_b.c-d2",
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
         ),
         ("deeply nested name", "org/team/sub/app", None),
     ];

@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let store = state.lock();
             (
                 store.registry_id.clone(),
-                registry_of(&store, &crate::state::announced_gallery_authority(ctx)),
+                registry_of(&store, &crate::state::published_gallery_authority(ctx)),
             )
         };
 
@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// This registry as the modelled `Registry` shape, published on the endpoint this answer
-/// is served at (`crate::state::announced_gallery_authority`).
+/// is served at (`crate::state::published_gallery_authority`).
 ///
 /// `verified` is "whether the account is a verified Amazon Web Services Marketplace
 /// vendor" (`Registry$verified`) — a standing outside this API, which no operation of

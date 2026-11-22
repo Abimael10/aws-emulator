@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every reported repository is published under the registry URI this caller reached
         // the emulator at: the URI is the push/pull ADDRESS, so a client that enumerates
         // repositories and then pulls from each one reaches this registry.
-        let registry_uri = store.registry_uri(&crate::state::announced_gallery_authority(ctx));
+        let registry_uri = store.registry_uri(&crate::state::published_gallery_authority(ctx));
         let selected: Vec<(String, Repository)> = match input.repository_names.as_ref() {
             None => store
                 .repositories

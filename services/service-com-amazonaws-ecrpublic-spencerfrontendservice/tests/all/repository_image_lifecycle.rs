@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
-    API_REGION, DEFAULT_REGISTRY_ALIAS,
+    default_registry_alias, API_REGION,
 };
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
@@ -33,38 +33,37 @@ pub(crate) const REGISTRY_ID: &str = "000000000000";
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
 pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 
-/// The `host[:port]` this emulator is SERVED at, whose ZONE and port every URI this registry
-/// publishes is built on: a repository's and the registry's own URI are the addresses a
-/// container client dials, so each carries the public-registry label layout over a zone this
-/// emulator answers in rather than a name AWS resolves. No call in this target arrives on a
-/// socket, so that address is the authority of the unserved base
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`), a name RFC 6761 reserves.
-pub(crate) fn announced_endpoint() -> &'static str {
-    let base = smithy_server_runtime::UNSERVED_URL_BASE;
-    base.split_once("://").map_or(base, |(_scheme, authority)| authority)
-}
-
 /// The two fixed labels every ECR Public registry authority AWS publishes leads with, as the
-/// service states them (`state::registry_address::GALLERY_HOST_LABELS`) — the spelling every
-/// authority this registry publishes LEADS with, and the one a reference written BY HAND
-/// carries.
+/// service states them (`state::registry_address::GALLERY_HOST_LABELS`) — the spelling a
+/// reference written BY HAND on the gallery AWS serves carries.
 pub(crate) const PUBLIC_REGISTRY_LABELS: [&str; 2] =
     service_com_amazonaws_ecrpublic_spencerfrontendservice::state::registry_address::GALLERY_HOST_LABELS;
 
-/// The AUTHORITY every URI this registry publishes leads with: a public-registry host — the
-/// fixed labels above over the ZONE of the endpoint this emulator answers the reader at
-/// ([`announced_endpoint`]), which for this target is the unserved base's own name, and that
-/// endpoint's port when it names one (it names none here).
+/// The AUTHORITY every URI this registry publishes leads with: the `host[:port]` this
+/// emulator answers the reader at — a repository's and the registry's own URI are the
+/// addresses a container client dials, so each carries an address that leads back to this
+/// process rather than a name AWS resolves. No call in this target arrives on a socket, so
+/// that address is the authority of the unserved base
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`), a name RFC 6761 reserves.
 pub(crate) fn published_authority() -> String {
-    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
-    format!("{public}.{ecr}.{}", announced_endpoint())
+    let base = smithy_server_runtime::UNSERVED_URL_BASE;
+    base.split_once("://")
+        .map_or(base, |(_scheme, authority)| authority)
+        .to_string()
 }
 
-/// The leading segments of every `repositoryUri`: the endpoint this registry is published
-/// at and this registry's alias (`state::DEFAULT_REGISTRY_ALIAS`), which is the registry's
-/// own URI with the trailing separator.
+/// The alias this account's public registry is assigned
+/// (`state::default_registry_alias`), which is the segment every `repositoryUri` carries
+/// between the universal prefix and the repository name.
+pub(crate) fn registry_alias() -> String {
+    default_registry_alias(REGISTRY_ID)
+}
+
+/// The leading segments of every `repositoryUri`: the universal prefix this registry is
+/// published on and this registry's alias, which is the registry's own URI with the trailing
+/// separator.
 pub(crate) fn uri_prefix() -> String {
-    format!("{}/{DEFAULT_REGISTRY_ALIAS}/", published_authority())
+    format!("{}/{}/", published_authority(), registry_alias())
 }
 
 /// A router with just this service mounted on a fresh engine.

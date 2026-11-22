@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The repository's URI is the one ADDRESS in the answer, so it is published on the
         // endpoint this caller reached the emulator at rather than stored with the record:
         // a client that pushes to the URI it was handed has to arrive back here.
-        let registry_uri = store.registry_uri(&crate::state::announced_gallery_authority(ctx));
+        let registry_uri = store.registry_uri(&crate::state::published_gallery_authority(ctx));
         let output = CreateRepositoryOutput {
             repository: Some(repository.as_repository(&registry_uri)),
             catalog_data: Some(repository.catalog_data.clone()),

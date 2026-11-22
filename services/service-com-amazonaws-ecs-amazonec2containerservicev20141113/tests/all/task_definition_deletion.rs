@@ -272,7 +272,10 @@ async fn deleting_deregistered_revisions_moves_only_those_to_delete_in_progress(
             // delete owns is as it was deregistered.
             let mut stored_after = stored.clone();
             stored_after["status"] = json!("DELETE_IN_PROGRESS");
-            stored_after["deleteRequestedAt"] = json!(stamp);
+            // The instant itself is asserted above; carried over as the response spelled
+            // it, so a whole-second stamp (which JSON renders without a fractional part)
+            // compares as the same number rather than as a different JSON form of it.
+            stored_after["deleteRequestedAt"] = reported["deleteRequestedAt"].clone();
             // The ENTRY is that revision plus the status it held when the call arrived.
             let mut expected = stored_after.clone();
             expected["previousStatus"] = json!("INACTIVE");

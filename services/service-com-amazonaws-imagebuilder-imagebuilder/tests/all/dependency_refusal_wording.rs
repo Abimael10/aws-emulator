@@ -228,9 +228,9 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report a call ADDRESSED by the INFRASTRUCTURE configuration's own ARN
-/// carries, quoting the ARN the request named: its read and its delete word a missing
-/// configuration this way.
+/// The not-found report a call ADDRESSED by a CONFIGURATION's own ARN to READ it carries,
+/// quoting the ARN the request named: both configuration families' reads, and the
+/// infrastructure configuration's delete, word a missing configuration this way.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -653,8 +653,9 @@ struct Row {
     dependency: String,
     /// The report a READ answers once it is gone.
     missing: String,
-    /// The report a REPEAT DELETE answers once it is gone: the same sentence as the read's,
-    /// because the template follows the resource's kind rather than the operation.
+    /// The report a REPEAT DELETE answers once it is gone, which is the read's sentence for
+    /// every kind whose read resolves a reference, and the kind-naming one where the read is
+    /// addressed by the resource's own ARN.
     missing_on_delete: String,
 }
 
@@ -812,10 +813,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     echoed: "distributionConfigurationArn",
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&distribution),
-                    missing: required_resource_message(
-                        "DistributionConfiguration",
-                        &distribution,
-                    ),
+                    missing: configuration_not_found_message(&distribution),
                     missing_on_delete: required_resource_message(
                         "DistributionConfiguration",
                         &distribution,

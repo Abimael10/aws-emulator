@@ -59,7 +59,7 @@ pub mod published_images;
 
 pub use logo_asset::{logo_asset_route, logo_url, StoredLogo};
 pub use logo_socket::{ensure_logo_asset_base, LogoAssetSocket};
-pub use registry_address::announced_gallery_authority;
+pub use registry_address::published_gallery_authority;
 pub use policy_document::canonical_policy_document;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,20 +165,44 @@ pub fn unsupported_in_region(
 /// this registry ([`gallery_pull::parse_gallery_reference`]).
 ///
 /// It is not the authority this service PUBLISHES: this name resolves to the real public
-/// registry rather than to this process, so a URI this registry hands out carries the same
-/// label layout over the zone this emulator answers in instead
-/// ([`registry_address::announced_gallery_authority`]).
+/// registry rather than to this process, so a URI this registry hands out carries the address
+/// this emulator answers the reader at instead
+/// ([`registry_address::published_gallery_authority`]).
 pub const GALLERY_HOST: &str = "public.ecr.aws";
 
-/// The registry alias this emulator's single public registry is assigned.
+/// The registry alias ECR Public assigns the public registry of the account `registry_id`.
 ///
 /// `RegistryAlias$defaultRegistryAlias` documents that "when the first public repository
-/// is created, your public registry is assigned a default registry alias"; the real
-/// service mints an opaque one per account. The emulator has exactly one registry, so it
-/// carries one fixed alias instead — it satisfies `RegistryAliasName`'s modelled
-/// `^[a-z][a-z0-9]+(?:[._-][a-z0-9]+)*$` and 2..50 length, and being stable is what lets
-/// a `repositoryUri` be compared across calls.
-pub const DEFAULT_REGISTRY_ALIAS: &str = "emulator";
+/// is created, your public registry is assigned a default registry alias", and the alias is
+/// "displayed in both the repository URL and the image URI used in the docker pull commands"
+/// (`RegistryAlias$primaryRegistryAlias`): an OPAQUE identifier the service mints for the
+/// account, eight characters long alternating a lowercase letter and a digit, which satisfies
+/// `RegistryAliasName`'s modelled `^[a-z][a-z0-9]+(?:[._-][a-z0-9]+)*$` and its 2..50 length
+/// (`smithy_query(query="shape", shape="RegistryAliasName")`).
+///
+/// One is minted here the same way, from the OWNING ACCOUNT alone: the alias belongs to the
+/// registry rather than to any call, so every read of it reports the same value and a
+/// `repositoryUri` a client composed a container reference on keeps resolving, while two
+/// accounts are named apart as they are on AWS. Nothing about the alias is read back out of
+/// it: which registry a request names is decided against the stored alias
+/// ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]).
+#[must_use]
+pub fn default_registry_alias(registry_id: &str) -> String {
+    /// The characters an even position of the alias carries.
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    /// The characters an odd position carries.
+    const DIGITS: &[u8] = b"0123456789";
+    /// How many characters an alias AWS mints is long.
+    const ALIAS_LENGTH: usize = 8;
+
+    let digest = Sha256::digest(registry_id.as_bytes());
+    (0..ALIAS_LENGTH)
+        .map(|position| {
+            let alphabet = if position % 2 == 0 { LETTERS } else { DIGITS };
+            char::from(alphabet[usize::from(digest[position]) % alphabet.len()])
+        })
+        .collect()
+}
 
 /// The status every alias of this registry carries.
 ///
@@ -847,7 +871,7 @@ impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
     fn default() -> Self {
         Self {
             registry_id: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
-            registry_alias: DEFAULT_REGISTRY_ALIAS.to_string(),
+            registry_alias: default_registry_alias(::engine::EMULATOR_ACCOUNT_ID),
             repositories: BTreeMap::new(),
             registry_display_name: None,
             uploads: BTreeMap::new(),
@@ -872,9 +896,9 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("registry/{}", self.registry_id))
     }
 
-    /// The URI of the registry, on the endpoint this emulator answers the reader at (read
-    /// with [`announced_gallery_authority`]): `Registry$registryUri` documents it as "a
-    /// universal prefix and the registry alias", so it is that endpoint scoped by this
+    /// The URI of the registry, on the address this emulator answers the reader at (read
+    /// with [`published_gallery_authority`]): `Registry$registryUri` documents it as "a
+    /// universal prefix and the registry alias", so it is that authority scoped by this
     /// registry's own alias — which is the `repositoryUri` form without the trailing
     /// repository segment.
     pub fn registry_uri(&self, gallery_authority: &str) -> String {

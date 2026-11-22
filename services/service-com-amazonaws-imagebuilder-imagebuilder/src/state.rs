@@ -4681,14 +4681,14 @@ pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String
 /// Why a call addressing a CONFIGURATION resource this Region holds nothing under to READ it
 /// reports it missing.
 ///
-/// The sentence a call carries when it addresses an INFRASTRUCTURE configuration by its own
-/// ARN: it quotes the ARN the request carried and names no kind. That family's read and its
-/// delete carry it (`GetInfrastructureConfiguration`, `DeleteInfrastructureConfiguration`).
-/// Every other missing-resource report of this service — a reference a create or an update
-/// names, a tagging write, the versioned families' own lookups, and every route that resolves
-/// a DISTRIBUTION configuration — names the kind the ARN identifies through
-/// [`required_resource_not_found_message`], so which sentence a route carries is that route's
-/// own recorded contract rather than a service-wide rule; see the note there.
+/// The sentence a READ carries when it is addressed by a configuration's own ARN: it quotes
+/// the ARN the request carried and names no kind. Both configuration families' reads carry it
+/// (`GetDistributionConfiguration`, `GetInfrastructureConfiguration`), as does the
+/// infrastructure configuration's delete. Every route that has to RESOLVE A REFERENCE to a
+/// resource — one a create or an update names, a tagging write, a delete, the versioned
+/// families' own lookups — names the kind the ARN identifies through
+/// [`required_resource_not_found_message`] instead, so which sentence a route carries is that
+/// route's own recorded contract rather than a service-wide rule; see the note there.
 #[must_use]
 pub fn resource_arn_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")

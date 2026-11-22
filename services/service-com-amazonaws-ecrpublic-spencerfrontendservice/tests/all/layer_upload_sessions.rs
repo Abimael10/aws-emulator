@@ -33,8 +33,11 @@ const TARGET_PREFIX: &str = "SpencerFrontendService";
 pub(crate) const REGISTRY_ID: &str = "000000000000";
 
 /// This registry's alias, which `RegistryIdOrAlias` also admits in place of the account
-/// id (`state::DEFAULT_REGISTRY_ALIAS`).
-pub(crate) const REGISTRY_ALIAS: &str = "emulator";
+/// id: the identifier this account's registry is assigned
+/// (`state::default_registry_alias`).
+pub(crate) fn registry_alias() -> String {
+    state::default_registry_alias(REGISTRY_ID)
+}
 
 /// The ceiling on one layer part, which the service reads from the model:
 /// `UploadLayerPart$layerPartBlob` is `@length(min: 0, max: 20971520)`
@@ -296,7 +299,7 @@ async fn an_upload_is_opened_only_in_this_registry() {
         ),
         (
             "this registry, by alias",
-            json!({"repositoryName": "scoped", "registryId": REGISTRY_ALIAS}),
+            json!({"repositoryName": "scoped", "registryId": registry_alias()}),
             None,
         ),
         (

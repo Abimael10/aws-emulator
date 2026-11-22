@@ -12,13 +12,13 @@
 //! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the one
 //! the ROUTE's own recorded contract gives it:
 //!
-//! * a READ addressed by the INFRASTRUCTURE configuration's own ARN reports the ARN the
-//!   request carried, quoted, naming no kind: "The resource ARN '<arn>' was not found."; that
-//!   family's DELETE reports it the same way;
+//! * a READ addressed by a CONFIGURATION's own ARN reports the ARN the request carried,
+//!   quoted, naming no kind: "The resource ARN '<arn>' was not found."; the infrastructure
+//!   configuration's DELETE reports it the same way;
 //! * every other report names the resource KIND the ARN identifies — "The following required
 //!   resource '<Kind>' cannot be found: '<arn>'." — whether the call reads one of the
-//!   versioned families, reads a distribution configuration, deletes one, updates one, tags
-//!   one or resolves a reference to one.
+//!   versioned families, deletes a distribution configuration, updates one, tags one or
+//!   resolves a reference to one.
 //!
 //! The rows span what the rule generalises over: which configuration family the ARN names,
 //! which operation performs the lookup, the form of the configuration name the ARN carries,
@@ -310,7 +310,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
-    sentence: Sentence::Kind("DistributionConfiguration"),
+    sentence: Sentence::Arn,
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`, as the modelled

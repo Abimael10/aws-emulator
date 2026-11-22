@@ -199,7 +199,10 @@ async fn deregistering_one_revision_marks_only_that_revision_inactive() {
         // deregistration owns is as it was registered.
         let mut stored_after = before.clone();
         stored_after["status"] = json!("INACTIVE");
-        stored_after["deregisteredAt"] = json!(stamp);
+        // The instant itself is asserted above; carried over as the response spelled it, so
+        // a whole-second stamp (which JSON renders without a fractional part) compares as
+        // the same number rather than as a different JSON form of it.
+        stored_after["deregisteredAt"] = deregistered["deregisteredAt"].clone();
         // The RESPONSE is that revision plus the status it held when the call arrived, so a
         // caller comparing the two members sees the transition this call made.
         let mut expected = stored_after.clone();

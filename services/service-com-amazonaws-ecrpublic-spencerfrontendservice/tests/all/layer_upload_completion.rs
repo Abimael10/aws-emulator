@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::layer_upload_sessions::{
-    call, error_code, given_repository, ok, service_with_engine, stored_uploads, REGISTRY_ALIAS,
+    call, error_code, given_repository, ok, service_with_engine, stored_uploads, registry_alias,
     REGISTRY_ID,
 };
 
@@ -179,6 +179,7 @@ fn reported_failures(report: &Value, case: &str) -> Vec<(String, String)> {
 #[tokio::test]
 async fn completing_an_upload_commits_the_layer_its_parts_carried() {
     // (case, repositoryName, layer length, how many parts, the `registryId` named)
+    let alias = registry_alias();
     let rows: Vec<(&str, &str, usize, usize, Option<&str>)> = vec![
         ("one byte in one part, no registryId", "one-byte", 1, 1, None),
         (
@@ -193,7 +194,7 @@ async fn completing_an_upload_commits_the_layer_its_parts_carried() {
             "two-parts",
             1024,
             2,
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
         ),
         (
             "an uneven size in three parts",
@@ -627,6 +628,7 @@ async fn a_completion_is_scoped_to_the_upload_repository_and_registry_it_names()
 
     // (case, repositoryName, uploadId, registryId, expected error code — `None` for a
     // completion that must be accepted)
+    let alias = registry_alias();
     let rows: Vec<ScopeRow<'_>> = vec![
         (
             "a repository this registry does not hold",
@@ -674,7 +676,7 @@ async fn a_completion_is_scoped_to_the_upload_repository_and_registry_it_names()
             "every name correct, registry by alias",
             "scoped-two",
             &other,
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
             None,
         ),
     ];

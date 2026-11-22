@@ -33,7 +33,7 @@ use service_com_amazonaws_ecrpublic_spencerfrontendservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::layer_upload_sessions::{
-    call, error_code, given_repository, ok, service_with_engine, upload_bytes, REGISTRY_ALIAS,
+    call, error_code, given_repository, ok, service_with_engine, upload_bytes, registry_alias,
     REGISTRY_ID,
 };
 
@@ -541,6 +541,7 @@ async fn a_part_reaches_only_an_upload_this_repository_was_issued() {
 
     // (case, the repositoryName sent, the uploadId sent, the registryId sent, the
     // modelled error code expected — `None` for an accepted part)
+    let alias = registry_alias();
     let rows: Vec<ScopeRow> = vec![
         (
             "no registryId: the default public registry is assumed",
@@ -560,7 +561,7 @@ async fn a_part_reaches_only_an_upload_this_repository_was_issued() {
             "this registry, by alias",
             "scoped",
             upload_id.as_str(),
-            Some(REGISTRY_ALIAS),
+            Some(alias.as_str()),
             None,
         ),
         (
