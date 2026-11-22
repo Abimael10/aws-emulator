@@ -11,11 +11,12 @@
 //! The suite asserts the RULE rather than one request:
 //! `BatchModifyClusterSnapshots` applies one manual retention period to every
 //! snapshot its list names, reports the ones it acted on in `Resources` in
-//! request order and the ones it could not act on in `Errors` — each as a
-//! `SnapshotErrorMessage` whose `FailureCode` is the wire code of the fault
-//! `ModifyClusterSnapshot` raises for that same condition — and refuses the WHOLE
-//! call only for what the request itself gets wrong: a list longer than the
-//! published batch limit, or a period outside the published range.
+//! request order and the ones it could not act on in `Errors` in the reverse of
+//! that order — each as a `SnapshotErrorMessage` whose `FailureCode` names the
+//! SHAPE of the fault `ModifyClusterSnapshot` raises for that same condition —
+//! and refuses the WHOLE call only for what the request itself gets wrong: a
+//! list longer than the published batch limit, or a period outside the published
+//! range.
 //!
 //! It is asserted over a TABLE of list LENGTHS and periods (the sentinel, both
 //! published bounds, values inside the range), over the entry FORM (a stored
@@ -461,7 +462,9 @@ async fn an_entry_that_cannot_be_acted_on_is_reported_per_entry() {
         );
     }
 
-    // Every bad entry in ONE list is reported, each in the order it was named.
+    // Every bad entry in ONE list is reported, the LAST entry the request names
+    // first: `Errors` is the reverse of the order the request lists the
+    // identifiers.
     let together = batch_modify(
         &emulator,
         &[
@@ -485,11 +488,12 @@ async fn an_entry_that_cannot_be_acted_on_is_reported_per_entry() {
     assert_eq!(
         codes,
         vec![
-            state::SNAPSHOT_FAILURE_NOT_FOUND,
-            state::SNAPSHOT_FAILURE_INVALID_STATE,
             state::SNAPSHOT_FAILURE_INVALID_RETENTION_PERIOD,
+            state::SNAPSHOT_FAILURE_INVALID_STATE,
+            state::SNAPSHOT_FAILURE_NOT_FOUND,
         ],
-        "case every bad entry in one list: expected one error per bad entry in request order, got {codes:?} with body {}",
+        "case every bad entry in one list: expected one error per bad entry, the last entry \
+         named first, got {codes:?} with body {}",
         together.body
     );
 }

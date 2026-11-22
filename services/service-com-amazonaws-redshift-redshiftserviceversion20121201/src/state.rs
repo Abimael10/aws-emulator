@@ -1168,25 +1168,26 @@ pub enum ClusterNotFoundWording {
 /// it, so no operation can quietly inherit another one's sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterSnapshotNotFoundWording {
-    /// `ClusterSnapshot not found: <SnapshotIdentifier>` — what the operations
-    /// that ACT on the snapshot they name answer (`DeleteClusterSnapshot`,
-    /// `ModifyClusterSnapshot`, `CopyClusterSnapshot`,
-    /// `AuthorizeSnapshotAccess`, `RevokeSnapshotAccess`,
-    /// `RestoreFromClusterSnapshot`), the same shape of sentence the operations
-    /// that act on a named cluster answer for a cluster
+    /// `ClusterSnapshot not found: <SnapshotIdentifier>` — the modelled shape's
+    /// own name as the noun, which is what `DeleteClusterSnapshot`,
+    /// `ModifyClusterSnapshot` and `CopyClusterSnapshot` answer, and what
+    /// `BatchModifyClusterSnapshots` reports as the `FailureReason` of an entry
+    /// naming no stored snapshot. The same shape of sentence the operations that
+    /// act on a named cluster answer for a cluster
     /// ([`ClusterNotFoundWording::NotFoundThenIdentifier`]) and the
     /// parameter-group operations answer for a group.
     NotFoundThenIdentifier,
     /// `Snapshot <SnapshotIdentifier> not found.` — what the snapshot READ,
-    /// `DescribeClusterSnapshots`, answers: the fixed text is an attribute of
-    /// the OPERATION, so a read and a write word the same fault differently for
-    /// the same name.
+    /// `DescribeClusterSnapshots`, and the two operations that share a snapshot
+    /// out, `AuthorizeSnapshotAccess` and `RevokeSnapshotAccess`, answer: the
+    /// fixed text is an attribute of the OPERATION, so operations acting on the
+    /// same name word the same fault differently.
     SnapshotThenNotFound,
     /// `Snapshot not found: <SnapshotIdentifier>` — the same shape of sentence
     /// as [`Self::NotFoundThenIdentifier`] with the noun the service puts on the
-    /// wire rather than the modelled shape's name, which is what the
-    /// reserved-node exchange reads answer for a snapshot they are asked to plan
-    /// an exchange from.
+    /// wire rather than the modelled shape's name, which is what the operations
+    /// that plan work FROM a snapshot answer: `RestoreFromClusterSnapshot` and
+    /// the reserved-node exchange reads.
     SnapshotNotFoundThenIdentifier,
 }
 
@@ -1343,25 +1344,27 @@ pub const BATCH_SNAPSHOT_IDENTIFIER_LIMIT: usize = 100;
 /// `SnapshotErrorMessage$FailureCode` is "the failure code for the error"
 /// (`smithy_query(query="shape", shape="SnapshotErrorMessage")`), and a batch
 /// operation reports per entry the same condition the one-snapshot operation
-/// raises as a fault — so the code is that fault's own wire code,
-/// `smithy_query(query="shape", shape="ClusterSnapshotNotFoundFault")` →
-/// `awsQueryError` code `ClusterSnapshotNotFound`.
-pub const SNAPSHOT_FAILURE_NOT_FOUND: &str = "ClusterSnapshotNotFound";
+/// raises as a fault — so the code NAMES that fault's shape, as
+/// `smithy_query(query="shape", shape="ClusterSnapshotNotFoundFault")` spells it.
+/// A per-entry failure code is a value in a 200 body, not the `Error$Code` of a
+/// refusal, so it is the shape name rather than the shorter `awsQueryError` code
+/// that same shape carries for the wire envelope.
+pub const SNAPSHOT_FAILURE_NOT_FOUND: &str = "ClusterSnapshotNotFoundFault";
 
 /// The `SnapshotErrorMessage$FailureCode` for an entry naming a snapshot whose
 /// state carries nothing the call can act on.
 ///
-/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]:
-/// `smithy_query(query="shape", shape="InvalidClusterSnapshotStateFault")` →
-/// `awsQueryError` code `InvalidClusterSnapshotState`.
-pub const SNAPSHOT_FAILURE_INVALID_STATE: &str = "InvalidClusterSnapshotState";
+/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]: the shape name
+/// `smithy_query(query="shape", shape="InvalidClusterSnapshotStateFault")`
+/// declares.
+pub const SNAPSHOT_FAILURE_INVALID_STATE: &str = "InvalidClusterSnapshotStateFault";
 
 /// The `SnapshotErrorMessage$FailureCode` for an entry whose snapshot would fall
 /// outside the requested retention window.
 ///
-/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]:
-/// `smithy_query(query="shape", shape="InvalidRetentionPeriodFault")` →
-/// `awsQueryError` code `InvalidRetentionPeriodFault`.
+/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]: the shape name
+/// `smithy_query(query="shape", shape="InvalidRetentionPeriodFault")` declares,
+/// which for this fault is also its `awsQueryError` code.
 pub const SNAPSHOT_FAILURE_INVALID_RETENTION_PERIOD: &str = "InvalidRetentionPeriodFault";
 
 /// How many clusters the store holds before `CreateCluster` refuses with the

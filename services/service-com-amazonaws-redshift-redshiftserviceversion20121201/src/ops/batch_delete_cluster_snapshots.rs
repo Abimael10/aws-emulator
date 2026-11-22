@@ -164,21 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The per-entry failure code of an entry naming a snapshot this account holds
-/// none of, and the text that failure reports.
+/// What the failure of an entry naming a snapshot this account holds none of
+/// reports under `SnapshotErrorMessage$FailureReason`.
 ///
 /// A batch reports what one entry got wrong as that entry's own failure
-/// (`SnapshotErrorMessage$FailureCode` is "the failure code for the error" and
-/// `FailureReason` "the text message describing the error"), so the code names the
-/// modelled fault the one-snapshot path would have refused with and the reason is
-/// fixed text for this failure class, with no part taken from the request.
-const FAILURE_CODE_NOT_FOUND: &str = "ClusterSnapshotNotFoundFault";
-/// The text [`FAILURE_CODE_NOT_FOUND`] reports. See that constant.
+/// (`FailureCode` is "the failure code for the error" and `FailureReason` "the
+/// text message describing the error"), so the code names the modelled fault the
+/// one-snapshot path would have refused with
+/// ([`crate::state::SNAPSHOT_FAILURE_NOT_FOUND`]) and the reason is THIS
+/// operation's own fixed text for the failure class, with no part taken from the
+/// request — where the batch modify, which words it as the one-snapshot refusal
+/// does, names the snapshot its entry asked about.
 const FAILURE_REASON_NOT_FOUND: &str = "Snapshot does not exist for the customer.";
-/// The per-entry failure code of an entry naming a snapshot that cannot be
-/// deleted as it stands — see [`FAILURE_CODE_NOT_FOUND`] for why the code is the
-/// modelled fault's name.
-const FAILURE_CODE_INVALID_STATE: &str = "InvalidClusterSnapshotStateFault";
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> BatchDeleteClusterSnapshots<Eng> {
     /// The delete itself: the identifiers it removed and the per-entry failures.
@@ -256,8 +253,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> BatchDeleteCluste
             let Some(index) = found else {
                 errors.push(SnapshotErrorMessage {
                     snapshot_identifier: Some(requested.snapshot_identifier.clone()),
-                    snapshot_cluster_identifier: None,
-                    failure_code: Some(FAILURE_CODE_NOT_FOUND.to_string()),
+                    // The entry's whole LOCATOR is reported back, so a caller
+                    // iterating `Errors` reads the pair it sent on every entry:
+                    // the snapshot it could not be resolved to carries no
+                    // cluster of its own, so this is the cluster the entry named
+                    // — present with no value when the entry named none.
+                    snapshot_cluster_identifier: Some(
+                        requested
+                            .snapshot_cluster_identifier
+                            .clone()
+                            .unwrap_or_default(),
+                    ),
+                    failure_code: Some(st::SNAPSHOT_FAILURE_NOT_FOUND.to_string()),
                     failure_reason: Some(FAILURE_REASON_NOT_FOUND.to_string()),
                 });
                 continue;
@@ -282,8 +289,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> BatchDeleteCluste
             if let Some(reason) = refusal {
                 errors.push(SnapshotErrorMessage {
                     snapshot_identifier: Some(identifier),
-                    snapshot_cluster_identifier: cluster_identifier,
-                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
+                    // As on the not-found path: the member is always present,
+                    // carrying the cluster the located snapshot was taken of,
+                    // and the one the entry named if the store holds none.
+                    snapshot_cluster_identifier: Some(
+                        cluster_identifier
+                            .or_else(|| requested.snapshot_cluster_identifier.clone())
+                            .unwrap_or_default(),
+                    ),
+                    failure_code: Some(st::SNAPSHOT_FAILURE_INVALID_STATE.to_string()),
                     failure_reason: Some(reason),
                 });
                 continue;

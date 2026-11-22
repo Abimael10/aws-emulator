@@ -25,8 +25,8 @@
 //! on its own schedule, one still being taken, one another account may restore,
 //! and a snapshot an earlier call in the same suite already deleted). The
 //! not-found refusal's own wording is pinned too, over the OPERATIONS that act
-//! on the snapshot they name, beside the different sentence the snapshot READ
-//! words the same fault with for the same name.
+//! on the snapshot they name — three sentences across six operations — beside the
+//! one the snapshot READ words the same fault with for the same name.
 
 use std::time::Duration;
 
@@ -64,6 +64,10 @@ struct DeleteCase<'a> {
 /// One row of a refusal table: the case name, the request parameters, and the
 /// `(status, error code)` the service must answer with.
 type RefusalCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
+
+/// One row of the not-found wording table: the operation, the request parameters
+/// it needs, and the sentence it words the fault with.
+type WordingCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
 
 /// An emulator holding both clusters and one manual snapshot per
 /// `(identifier, retention period)` pair, every one of them `available`.
@@ -431,21 +435,29 @@ async fn only_an_available_manual_snapshot_nobody_else_may_restore_is_deleted() 
     .await;
 }
 
-/// The snapshot-not-found refusal is worded as the OPERATION words it: every
-/// operation that acts on the snapshot it names answers the one sentence, and
-/// the snapshot read answers its own for the very same name.
+/// The snapshot-not-found refusal is worded as the OPERATION words it: each
+/// operation answers its own sentence for the very same name, including the
+/// snapshot read.
+///
+/// The same catalog over a TABLE of identifier forms is asserted in
+/// [`crate::snapshot_not_found_wording_and_batch_payloads`].
 #[tokio::test]
 async fn the_not_found_refusal_is_worded_per_operation() {
     let emulator = seeded_emulator(&[(BYSTANDER, None)]).await;
     let missing = "delete-snapshot-absent";
 
     // The rows are the operations that ACT on the snapshot their request names,
-    // each with the other members its model requires, so the one sentence is
-    // read off more than the operation this suite is about.
-    let rows: Vec<(&str, Vec<(&str, &str)>)> = vec![
+    // each with the other members its model requires and the sentence recorded
+    // for it — three sentences across six operations, so the wording is read off
+    // as an attribute of the operation rather than of the fault.
+    let shape_then_identifier = format!("ClusterSnapshot not found: {missing}");
+    let snapshot_then_not_found = format!("Snapshot {missing} not found.");
+    let snapshot_not_found_then_identifier = format!("Snapshot not found: {missing}");
+    let rows: Vec<WordingCase> = vec![
         (
             "DeleteClusterSnapshot",
             vec![("SnapshotIdentifier", missing)],
+            &shape_then_identifier,
         ),
         (
             "ModifyClusterSnapshot",
@@ -453,20 +465,7 @@ async fn the_not_found_refusal_is_worded_per_operation() {
                 ("SnapshotIdentifier", missing),
                 ("ManualSnapshotRetentionPeriod", "7"),
             ],
-        ),
-        (
-            "AuthorizeSnapshotAccess",
-            vec![
-                ("SnapshotIdentifier", missing),
-                ("AccountWithRestoreAccess", GRANTEE_ACCOUNT),
-            ],
-        ),
-        (
-            "RevokeSnapshotAccess",
-            vec![
-                ("SnapshotIdentifier", missing),
-                ("AccountWithRestoreAccess", GRANTEE_ACCOUNT),
-            ],
+            &shape_then_identifier,
         ),
         (
             "CopyClusterSnapshot",
@@ -474,6 +473,23 @@ async fn the_not_found_refusal_is_worded_per_operation() {
                 ("SourceSnapshotIdentifier", missing),
                 ("TargetSnapshotIdentifier", "delete-snapshot-copy-target"),
             ],
+            &shape_then_identifier,
+        ),
+        (
+            "AuthorizeSnapshotAccess",
+            vec![
+                ("SnapshotIdentifier", missing),
+                ("AccountWithRestoreAccess", GRANTEE_ACCOUNT),
+            ],
+            &snapshot_then_not_found,
+        ),
+        (
+            "RevokeSnapshotAccess",
+            vec![
+                ("SnapshotIdentifier", missing),
+                ("AccountWithRestoreAccess", GRANTEE_ACCOUNT),
+            ],
+            &snapshot_then_not_found,
         ),
         (
             "RestoreFromClusterSnapshot",
@@ -481,16 +497,16 @@ async fn the_not_found_refusal_is_worded_per_operation() {
                 ("SnapshotIdentifier", missing),
                 ("ClusterIdentifier", "delete-snapshot-restored"),
             ],
+            &snapshot_not_found_then_identifier,
         ),
     ];
 
-    let expected = format!("ClusterSnapshot not found: {missing}");
-    for (case, params) in rows {
+    for (case, params, expected) in rows {
         let answer = emulator.call(case, &params).await;
         assert_refused(case, &answer, 404, "ClusterSnapshotNotFound");
         assert_eq!(
             answer.text("Message").as_deref(),
-            Some(expected.as_str()),
+            Some(expected),
             "case {case}: expected the message {expected:?}, got {:?} with body {}",
             answer.text("Message"),
             answer.body

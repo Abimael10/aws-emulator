@@ -13,10 +13,13 @@
 //! snapshot — the period is applied through
 //! [`crate::state::apply_manual_retention`], the one rule for it, so a later
 //! `DescribeClusterSnapshots` reports what this call persisted. An entry the call
-//! acted on is listed in `Resources`; an entry it could not act on is reported in
-//! `Errors` as a `SnapshotErrorMessage` carrying the wire code of the fault the
-//! one-snapshot operation would have raised, and leaves its snapshot untouched —
-//! one bad entry never fails the batch.
+//! acted on is listed in `Resources`, in the order the request named it; an entry
+//! it could not act on is reported in `Errors` as a `SnapshotErrorMessage` naming
+//! the fault SHAPE the one-snapshot operation would have raised and carrying that
+//! operation's own sentence as the reason, and leaves its snapshot untouched —
+//! one bad entry never fails the batch. `Errors` comes back in the reverse of the
+//! order the request names the identifiers: the most recently decided entry
+//! first.
 //!
 //! A snapshot whose retention window has already ended under the requested period
 //! is such an entry, unless the request carries `Force`, which deletes that
@@ -222,7 +225,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     snapshot_identifier: Some(requested.clone()),
                     snapshot_cluster_identifier: None,
                     failure_code: Some(st::SNAPSHOT_FAILURE_NOT_FOUND.to_string()),
-                    failure_reason: Some(format!("Cluster snapshot {requested} not found.")),
+                    // The entry is refused for the very condition
+                    // `ModifyClusterSnapshot` raises its
+                    // `ClusterSnapshotNotFoundFault` for, so the reason is that
+                    // operation's own sentence for it, naming the snapshot this
+                    // entry asked about — the one catalog of snapshot
+                    // not-found wordings, so the two cannot drift.
+                    failure_reason: Some(st::cluster_snapshot_not_found_message(
+                        st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                        requested,
+                    )),
                 });
                 continue;
             };
@@ -305,6 +317,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             st::apply_manual_retention(&mut stored.snapshot, period, now);
             resources.push(identifier);
         }
+
+        // What the call acted on is reported in the order the request named it,
+        // and what it could not act on in the REVERSE of that order: Amazon
+        // Redshift answers a batch modify with the most recently decided entry's
+        // failure first, so the last entry the list names heads `Errors`. The
+        // two lists are built in one pass over the request and only `Errors` is
+        // turned around, so an entry's own failure is never moved onto another
+        // entry's identifier.
+        errors.reverse();
 
         Ok(BatchModifyClusterSnapshotsOutput {
             resources: Some(resources),

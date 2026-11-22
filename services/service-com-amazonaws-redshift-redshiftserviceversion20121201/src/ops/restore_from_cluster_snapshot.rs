@@ -351,6 +351,18 @@ impl From<RestoreFromClusterSnapshotErrorModeled> for RestoreFromClusterSnapshot
     }
 }
 
+/// How THIS operation words the `ClusterSnapshotNotFoundFault` it raises for a
+/// snapshot it cannot locate.
+///
+/// The fault's status and `awsQueryError` code are what the model fixes; the
+/// fixed text around the identifier is an attribute of the operation, and the
+/// sentence recorded for this one is `Snapshot not found: <SnapshotIdentifier>`
+/// — the same one the reserved-node exchange reads answer for the snapshot they
+/// plan an exchange from. Named once here so every path in this handler that
+/// raises the fault carries the same sentence.
+const SNAPSHOT_NOT_FOUND_WORDING: crate::state::ClusterSnapshotNotFoundWording =
+    crate::state::ClusterSnapshotNotFoundWording::SnapshotNotFoundThenIdentifier;
+
 /// The `RestoreFromClusterSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -685,8 +697,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             return Err(
                 RestoreFromClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
                     ClusterSnapshotNotFoundFault {
+                        // The sentence is an attribute of the OPERATION — see
+                        // the per-operation catalog
+                        // [`st::ClusterSnapshotNotFoundWording`].
                         message: Some(st::cluster_snapshot_not_found_message(
-                            st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                            SNAPSHOT_NOT_FOUND_WORDING,
                             snapshot_identifier.or(snapshot_arn).unwrap_or_default(),
                         )),
                     },
@@ -703,9 +718,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                 return Err(
                     RestoreFromClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
                         ClusterSnapshotNotFoundFault {
-                            message: Some(format!(
-                                "Cluster snapshot {} of cluster {wanted} not found.",
-                                snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                            // The locator named no snapshot, which is the one
+                            // fault this path raises — so it carries this
+                            // operation's own sentence for it, naming the
+                            // snapshot the request asked about.
+                            message: Some(st::cluster_snapshot_not_found_message(
+                                SNAPSHOT_NOT_FOUND_WORDING,
+                                snapshot.snapshot_identifier.as_deref().unwrap_or_default(),
                             )),
                         },
                     )
