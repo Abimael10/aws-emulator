@@ -32,6 +32,12 @@
 //! has to remember to announce itself. The queue it feeds is bounded
 //! ([`MAX_PENDING_EVENTS`], oldest dropped first) because every transition appends to it.
 //!
+//! The same comparison is where a SERVICE learns that a launch it asked for was lost: a task
+//! Amazon ECS could not launch the containers of at all is an action of the scheduler that
+//! placed it, published as an `ECS Service Action`
+//! ([`super::service_action_events::SERVICE_TASK_CONFIGURATION_FAILURE`]) beside the task's
+//! own move, from the one place that already sees every move exactly once.
+//!
 //! A queued change is published with no lock held ([`publish_pending`]): EventBridge is
 //! reached the way every emulated service reaches another, through the framework's
 //! in-process callback, so this crate names no other service's crate. Publication is best
@@ -153,12 +159,35 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.published_task_status
             .retain(|task_arn, _| tasks.contains_key(task_arn));
         let mut observed: Vec<(String, TaskStatusPair, TaskStateChange)> = Vec::new();
+        // The launches a SERVICE lost in this comparison, as the action the scheduler took by
+        // losing them names them: `(serviceArn, clusterArn, the instant it was lost at)`.
+        let mut lost_launches: Vec<(String, String, SystemTime)> = Vec::new();
         for task in self.tasks.values() {
             let reported = (task.last_status.clone(), task.desired_status.clone());
-            if self.published_task_status.get(&task.task_arn) == Some(&reported) {
+            let published = self.published_task_status.get(&task.task_arn);
+            if published == Some(&reported) {
                 continue;
             }
             let at = status_instant(task).unwrap_or(now);
+            // A task Amazon ECS could not launch the containers of AT ALL is a launch the
+            // scheduler that asked for it LOST ([`TaskRecord::failed_to_launch`]), and losing
+            // one is an action of that scheduler's: it is published beside the task's own move
+            // as an `ECS Service Action`
+            // ([`super::service_action_events::SERVICE_TASK_CONFIGURATION_FAILURE`]), so a
+            // client watching the service learns that what it asked for cannot be launched
+            // without reading every task the scheduler keeps replacing. Only on the move that
+            // TURNED the task away from running — the published pair still wanted it running —
+            // so the steps it then takes on its way out publish the action once rather than
+            // once per status.
+            let turned_away = published.is_none_or(|(_, desired)| desired == STATUS_RUNNING);
+            if task.failed_to_launch() && turned_away {
+                if let Some(service) = task.service_name.as_deref().and_then(|name| {
+                    self.services
+                        .get(&(task.cluster_name.clone(), name.to_string()))
+                }) {
+                    lost_launches.push((service.arn.clone(), service.cluster_arn.clone(), at));
+                }
+            }
             observed.push((
                 task.task_arn.clone(),
                 reported,
@@ -170,6 +199,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             ));
         }
         observed.sort_by_key(|(_, _, change)| change.at);
+        lost_launches.sort_by_key(|(_, _, at)| *at);
+        for (service_arn, cluster_arn, at) in lost_launches {
+            self.record_service_action(
+                &service_arn,
+                &cluster_arn,
+                SERVICE_TASK_CONFIGURATION_FAILURE,
+                at,
+            );
+        }
         for (task_arn, reported, change) in observed {
             self.published_task_status.insert(task_arn, reported);
             while self.pending_task_events.len() >= MAX_PENDING_EVENTS {

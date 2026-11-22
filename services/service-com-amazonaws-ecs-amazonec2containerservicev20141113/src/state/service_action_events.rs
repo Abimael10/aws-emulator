@@ -22,7 +22,12 @@
 //! [`SERVICE_STEADY_STATE`], and the one a task set of a service whose deployments another
 //! controller drives settles into is [`TASKSET_STEADY_STATE`]: both are confirmations the
 //! CLOCK materialises, so both are published from the pass that materialises them and
-//! neither needs a writer to remember to announce it.
+//! neither needs a writer to remember to announce it. The scheduler also acts when it CANNOT
+//! launch a service's tasks at all — the configuration it was given names something the
+//! launch cannot obtain — and that action is an error rather than progress
+//! ([`SERVICE_TASK_CONFIGURATION_FAILURE`]), published from the comparison that observes the
+//! launch the service lost ([`super::task_events`]), so every door and the clock pump reach
+//! it alike.
 //!
 //! # How an action becomes an event
 //!
@@ -49,6 +54,11 @@ pub const SERVICE_ACTION_DETAIL_TYPE: &str = "ECS Service Action";
 /// The `eventType` of an action that reports the scheduler making progress.
 pub const SERVICE_ACTION_INFO: &str = "INFO";
 
+/// The `eventType` of an action that reports the scheduler getting NOWHERE: an action it
+/// takes because it cannot do what the service asks of it is an error for the client watching
+/// that service, not progress.
+pub const SERVICE_ACTION_ERROR: &str = "ERROR";
+
 /// The `eventName` of the action the scheduler takes when a service's rollout reaches the
 /// steady state it was rolling out
 /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::settle_services`]).
@@ -58,14 +68,27 @@ pub const SERVICE_STEADY_STATE: &str = "SERVICE_STEADY_STATE";
 /// — the same confirmation `TaskSet$stabilityStatus` reports to a caller that reads it.
 pub const TASKSET_STEADY_STATE: &str = "TASKSET_STEADY_STATE";
 
+/// The `eventName` of the action the scheduler takes when it CANNOT launch a task of the
+/// service at all: Amazon ECS never started that task's containers, which is the stop such a
+/// launch earns ([`STOP_CODE_TASK_FAILED_TO_START`]), so what the launch failed on is the
+/// CONFIGURATION the service was given rather than anything the task then did.
+///
+/// This is the action an event-driven client alerts a service's owner on: the tasks the
+/// scheduler keeps launching never run, and what has to change is the service's own
+/// configuration — the image reference no registry serves, the execution resources the agent
+/// could not retrieve, the logger it could not initialise — rather than the capacity the
+/// cluster holds.
+pub const SERVICE_TASK_CONFIGURATION_FAILURE: &str = "SERVICE_TASK_CONFIGURATION_FAILURE";
+
 /// How serious each action this service publishes is: the `eventType` that goes with the
 /// `eventName`, as the Amazon ECS Developer Guide's service action events record the pair.
 ///
 /// The severity belongs to the action, not to the call that materialised it, so it is read
 /// off this table rather than passed in by the pass that records the action.
-pub const SERVICE_ACTION_SEVERITIES: [(&str, &str); 2] = [
+pub const SERVICE_ACTION_SEVERITIES: [(&str, &str); 3] = [
     (SERVICE_STEADY_STATE, SERVICE_ACTION_INFO),
     (TASKSET_STEADY_STATE, SERVICE_ACTION_INFO),
+    (SERVICE_TASK_CONFIGURATION_FAILURE, SERVICE_ACTION_ERROR),
 ];
 
 /// How serious the action `event_name` is, or `None` for a name this service does not
