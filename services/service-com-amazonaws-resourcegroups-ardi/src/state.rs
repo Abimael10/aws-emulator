@@ -37,8 +37,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 pub mod inventory;
+pub mod stacks;
 
 pub use inventory::TaggedResource;
+pub use stacks::StackRecord;
 
 use crate::ops::types::{
     AccountSettings, FailedResource, Group, GroupConfiguration, GroupConfigurationItem,
@@ -678,11 +680,14 @@ pub const STACK_NOT_EXISTING_QUERY_ERROR: &str = "CLOUDFORMATION_STACK_NOT_EXIST
 ///   `inventory` — the account's tagged resources, read through
 ///   [`inventory::tagged_resources`] before this store was locked — is resolved
 ///   against beside this store's own records;
-/// * a [`STACK_QUERY_TYPE`] query names ONE CloudFormation stack, and this
-///   service records no stack and no stack's members, so no stack of the account
-///   answers it: that is the condition [`STACK_NOT_EXISTING_QUERY_ERROR`] names,
-///   reported beside no resource the way the model documents `QueryErrors`
-///   ("each error contains an ErrorCode and Message") rather than refused.
+/// * a [`STACK_QUERY_TYPE`] query names ONE CloudFormation stack, and selects the
+///   resources THAT stack holds whose type its [`RESOURCE_TYPE_FILTERS_ELEMENT`]
+///   admits, each under the ARN the service that owns it minted (`stacks`, the
+///   account's stacks read through [`stacks::stacks_in`] before this store was
+///   locked). An identifier the account holds no stack under is the condition
+///   [`STACK_NOT_EXISTING_QUERY_ERROR`] names, reported beside no resource the way
+///   the model documents `QueryErrors` ("each error contains an ErrorCode and
+///   Message") rather than refused.
 ///
 /// `Err` carries the message a refusal reports for a document that defines no
 /// membership for its type. A STORED query cannot reach it — the one place a
@@ -693,17 +698,12 @@ pub fn run_resource_query(
     region: &str,
     query: &ResourceQueryRecord,
     inventory: &[TaggedResource],
+    stacks: &[StackRecord],
 ) -> Result<(Vec<MemberRecord>, Vec<QueryError>), String> {
     let document = query_document(&query.query)?;
     if query.query_type == STACK_QUERY_TYPE {
-        let stack = stack_identifier(&document)?;
-        return Ok((
-            Vec::new(),
-            vec![QueryError {
-                error_code: Some(STACK_NOT_EXISTING_QUERY_ERROR.to_string()),
-                message: Some(format!("Stack with id {stack} does not exist")),
-            }],
-        ));
+        let identifier = stack_identifier(&document)?;
+        return Ok(stack_membership(stacks, identifier, &query.resource_type_limit()));
     }
     // The tag filters the query matches resources on, read out of the document;
     // a document that carries none matches on resource type alone.
@@ -717,10 +717,49 @@ pub fn run_resource_query(
     ))
 }
 
-/// Whether a resource of type `resource_type` is one a query admits: any type
-/// when the query names no limit, else one the limit lists. A resource whose type
-/// this emulator has no name for is admitted by no limit, since a limit lists type
-/// NAMES.
+/// The membership the stack `identifier` names defines, beside the modelled
+/// `QueryError` entries resolving it produced: the resources that stack holds whose
+/// type `limit` admits, in ARN order, and no error — or no resource and
+/// [`STACK_NOT_EXISTING_QUERY_ERROR`] when the account holds no stack under that
+/// identifier.
+///
+/// A stack's resources are reported under the type the STACK records for each of
+/// them, which is the vocabulary a `ResourceIdentifier$ResourceType` is written in,
+/// so a type limit is judged against the same names a tag query's matches are
+/// ([`query_admits_type`]).
+fn stack_membership(
+    stacks: &[StackRecord],
+    identifier: &str,
+    limit: &Option<Vec<String>>,
+) -> (Vec<MemberRecord>, Vec<QueryError>) {
+    let Some(stack) = stacks::resolve(stacks, identifier) else {
+        return (
+            Vec::new(),
+            vec![QueryError {
+                error_code: Some(STACK_NOT_EXISTING_QUERY_ERROR.to_string()),
+                message: Some(format!("Stack with id {identifier} does not exist")),
+            }],
+        );
+    };
+    let members = stack
+        .resources
+        .iter()
+        .filter(|resource| {
+            query_admits_type(Some(resource.resource_type.as_str()), limit.as_deref())
+        })
+        .map(|resource| MemberRecord {
+            resource_arn: resource.resource_arn.clone(),
+            resource_type: Some(resource.resource_type.clone()),
+            // A resource a query selects is selected NOW: there is no
+            // asynchronous addition left to report a modelled
+            // `ResourceStatusValue` for.
+            status: None,
+        })
+        .collect();
+    // Resolving a stack the account holds leaves nothing to report: every error
+    // code the model declares is about a stack that could not be resolved.
+    (members, Vec::new())
+}
 ///
 /// [`RESOURCE_TYPE_FILTERS_ELEMENT`] values are compared exactly: the modelled
 /// `ResourceType` pattern `^AWS::[a-zA-Z0-9]+::\w+$` admits one spelling of each

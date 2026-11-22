@@ -19492,6 +19492,7 @@ dependencies = [
  "http",
  "regex",
  "serde_json",
+ "service-com-amazonaws-cloudformation-cloudformation",
  "service-com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126",
  "service-common",
  "sha2 0.10.9",

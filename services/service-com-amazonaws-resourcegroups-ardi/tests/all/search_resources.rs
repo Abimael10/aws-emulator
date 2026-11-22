@@ -18,9 +18,9 @@
 //! * a query's `TagFilters` narrow across keys and widen across one key's values, so
 //!   a match carries every key and, for each, one of its values (or any value, for a
 //!   filter that names none);
-//! * a `CLOUDFORMATION_STACK_1_0` query names a stack this service holds none of, so
-//!   it is answered with the modelled `CLOUDFORMATION_STACK_NOT_EXISTING` query
-//!   error and no resource;
+//! * a `CLOUDFORMATION_STACK_1_0` query names one stack, and this emulator holds no
+//!   stack under the identifiers below, so it is answered with the modelled
+//!   `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource;
 //! * a page carries at most `MaxResults` matches and resumes from the `NextToken` of
 //!   the page before, and a request whose query or token is not valid is
 //!   `BadRequestException` (400);
@@ -533,9 +533,10 @@ async fn a_token_from_another_search_is_bad_request() {
     }
 }
 
-/// A CloudFormation-stack query names a stack, and this service records no stack at
-/// all, so it is answered with the modelled `CLOUDFORMATION_STACK_NOT_EXISTING`
-/// query error, no resource and no token — not with a refusal.
+/// A CloudFormation-stack query names a stack, and nothing in this emulator holds a
+/// stack under these identifiers, so it is answered with the modelled
+/// `CLOUDFORMATION_STACK_NOT_EXISTING` query error, no resource and no token — not
+/// with a refusal.
 #[tokio::test]
 async fn a_stack_query_reports_the_modelled_stack_query_error() {
     let fixtures = Fixtures::new().await;
@@ -558,7 +559,8 @@ async fn a_stack_query_reports_the_modelled_stack_query_error() {
         let answered = arns_of(stack, &page);
         assert!(
             answered.is_empty(),
-            "case {stack:?}: expected no resource for a stack this service holds none of, got {answered:?}",
+            "case {stack:?}: expected no resource for an identifier the account holds no stack \
+             under, got {answered:?}",
         );
         assert!(
             page["NextToken"].is_null(),

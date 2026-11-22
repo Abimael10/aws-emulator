@@ -17,9 +17,9 @@
 //!   `ResourceTypeFilters` admits (every type, for `AWS::AllSupported` or for no
 //!   such element) and whose tags satisfy every one of its `TagFilters`, where the
 //!   keys narrow and one key's values widen;
-//! * a `CLOUDFORMATION_STACK_1_0` query names a stack this service records none of,
-//!   so it is answered with the modelled `CLOUDFORMATION_STACK_NOT_EXISTING` query
-//!   error and no resource;
+//! * a `CLOUDFORMATION_STACK_1_0` query names one stack, and this emulator holds no
+//!   stack under the identifiers below, so it is answered with the modelled
+//!   `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource;
 //! * the membership is what the group's CURRENT query selects, so updating the
 //!   query moves it, and a `resource-type` filter narrows it;
 //! * a query runs over the group's own region and reaches no other region's
@@ -383,8 +383,8 @@ async fn query_derived_items_carry_the_derived_type_and_no_status() {
     }
 }
 
-/// A `CLOUDFORMATION_STACK_1_0` query names one stack, and this service records no
-/// CloudFormation stack, so the listing reports the modelled
+/// A `CLOUDFORMATION_STACK_1_0` query names one stack, and nothing in this emulator
+/// holds a stack under these identifiers, so the listing reports the modelled
 /// `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource — over the
 /// identifier forms the model documents (a stack ARN, and a stack name).
 #[tokio::test]

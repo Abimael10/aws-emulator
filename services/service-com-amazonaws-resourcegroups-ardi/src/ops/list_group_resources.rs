@@ -13,8 +13,9 @@
 //! — the account's TAGGED resources, whatever service owns them
 //! ([`crate::state::inventory`]), beside the groups this service records and their
 //! memberships. A `TAG_FILTERS_1_0` query selects by resource type and tags; a
-//! `CLOUDFORMATION_STACK_1_0` query names a stack this service records none of, which
-//! is reported in `QueryErrors` beside no resource. A group created without a query
+//! `CLOUDFORMATION_STACK_1_0` query selects the resources the CloudFormation stack it
+//! names holds ([`crate::state::stacks`]), and reports an identifier the account holds
+//! no stack under in `QueryErrors` beside no resource. A group created without a query
 //! holds the memberships `GroupResources` recorded against it, minus any removed.
 //!
 //! A `resource-type` filter is judged against the resource types the addressed
@@ -259,6 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in-memory state the account already holds and copies no resource a query
         // does not select.
         let inventory = crate::state::inventory::tagged_resources(&*self.engine, &region);
+        // The account's CloudFormation stacks, which a stored stack query resolves
+        // its membership out of, read before this service's store is locked for the
+        // same reason and for every request for the same one.
+        let stacks = crate::state::stacks::stacks_in(&*self.engine, &region);
 
         let store = state.lock();
         let not_found = || {
@@ -320,8 +325,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A stored query cannot fail to define a membership: the one place a
             // query is accepted refuses such a document, so the refusal here is
             // unreachable for a group this store holds.
-            Some(query) => crate::state::run_resource_query(&store, &key.region, query, &inventory)
-                .map_err(bad_request)?,
+            Some(query) => crate::state::run_resource_query(
+                &store,
+                &key.region,
+                query,
+                &inventory,
+                &stacks,
+            )
+            .map_err(bad_request)?,
             // A group with no query holds exactly the memberships recorded against
             // it by `GroupResources`, minus any `UngroupResources` removed.
             None => (group.members.clone(), Vec::new()),

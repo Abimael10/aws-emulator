@@ -18,10 +18,11 @@
 //!
 //! A `TAG_FILTERS_1_0` query selects the resources whose type its
 //! `ResourceTypeFilters` admits and whose tags satisfy every one of its
-//! `TagFilters`, and a `CLOUDFORMATION_STACK_1_0` query names a stack this service
-//! holds none of, so such a query reports the modelled
-//! `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource. Both are run
-//! through the one shared resolution ([`crate::state::run_resource_query`]).
+//! `TagFilters`, and a `CLOUDFORMATION_STACK_1_0` query selects the resources the
+//! CloudFormation stack it names holds ([`crate::state::stacks`]), reporting the
+//! modelled `CLOUDFORMATION_STACK_NOT_EXISTING` query error only for an identifier
+//! the account holds no stack under. Both are run through the one shared resolution
+//! ([`crate::state::run_resource_query`]).
 //!
 //! ## Shape of an operation
 //!
@@ -226,6 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // BEFORE this service's store is locked, so the stores of the services that
         // own those resources and this one are never locked in two orders.
         let inventory = crate::state::inventory::tagged_resources(&*self.engine, &region);
+        // The account's CloudFormation stacks, which a stack query is resolved
+        // against, read before this service's store is locked for the same reason.
+        let stacks = crate::state::stacks::stacks_in(&*self.engine, &region);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match crate::state::decode_page_token(&region, &listing, token) {
@@ -245,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // membership of this service is resolved by, so a search and a group's own
         // listing select the same resources for the same query.
         let (matched, query_errors) =
-            crate::state::run_resource_query(&store, &region, &query, &inventory)
+            crate::state::run_resource_query(&store, &region, &query, &inventory, &stacks)
                 .map_err(bad_request)?;
         drop(store);
         let mut matched: Vec<ResourceIdentifier> = matched
