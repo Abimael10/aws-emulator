@@ -336,7 +336,9 @@ pub mod instance_requirements;
 /// and the placement of the instance it moved.
 pub mod activity_records;
 
-pub use activity_records::{ActivityMilestone, ActivityRecord};
+pub use activity_records::{
+    user_requested_instance_move_cause, ActivityMilestone, ActivityRecord, TAKEN_OUT_OF_SERVICE,
+};
 
 /// How long a lifecycle transition this service owes takes to come due.
 ///
@@ -610,13 +612,16 @@ pub fn capacity_shortfall_cause(from: i32, to: i32) -> String {
     format!("{CAPACITY_SHORTFALL_REASON}, increasing the capacity from {from} to {to}.")
 }
 
-/// What the activities of a termination request record as the reason they began: a
+/// What the CONVERGENCE a termination request triggers records as the reason it began: a
 /// caller named the instance, which is what tells the activity log a manual termination
 /// apart from the scale-in a capacity change chose for itself.
 ///
 /// Reads as the subject of [`AutoScalingState::capacity_change_cause`] when the request
 /// also asked for the desired capacity to be decremented, and as a sentence of its own
-/// when it did not.
+/// when it did not. This is the reason the launch a request WITHOUT that decrement leaves
+/// the group owing records; the activity of each instance the request took out of service
+/// carries the sentence this service words that class with
+/// ([`user_requested_instance_move_cause`]).
 pub const TERMINATE_INSTANCE_REASON: &str =
     "a user request explicitly terminated an instance of the group";
 
@@ -2559,7 +2564,10 @@ impl AutoScalingState {
         } else {
             desired_capacity
         };
-        let cause = if should_decrement {
+        // The clause the CONVERGENCE this request triggers records as what asked for the
+        // capacity it launches ([`TERMINATE_INSTANCE_REASON`]), naming the capacities the
+        // request moved the group between when it moved them.
+        let convergence_cause = if should_decrement {
             Self::capacity_change_cause(
                 now,
                 TERMINATE_INSTANCE_REASON,
@@ -2576,9 +2584,22 @@ impl AutoScalingState {
         // lifecycle step of a group's instance goes down, so a termination a caller named
         // is announced exactly like one a capacity change chose. The activity it stored is
         // what this call answers with, read back by the id that path minted.
+        //
+        // Its CAUSE is the one this class of activity is worded with: the instance the
+        // request named, taken out of service at that request
+        // ([`user_requested_instance_move_cause`]), with the capacities the group moved
+        // between when the request decremented its capacity. One cause per instance,
+        // because the sentence names the instance its own activity is about.
         let activity_ids: Vec<String> = taken
             .iter()
             .map(|instance_id| {
+                let instance_cause = user_requested_instance_move_cause(
+                    now,
+                    instance_id,
+                    TAKEN_OUT_OF_SERVICE,
+                    desired_capacity,
+                    new_desired_capacity,
+                );
                 self.record_instance_lifecycle_change(
                     engine,
                     &InstanceLifecycleChange {
@@ -2586,7 +2607,7 @@ impl AutoScalingState {
                         group_name,
                         group_arn: &arn,
                         instance_id,
-                        cause: &cause,
+                        cause: &instance_cause,
                         start_time: now,
                         due,
                     },
@@ -2601,7 +2622,7 @@ impl AutoScalingState {
         // decrement there is nothing to replace, and without it every instance this call
         // took out of service is replaced — the same convergence, and the same cooldown,
         // as every other change to the group's size.
-        self.apply_capacity(engine, group_name, new_desired_capacity, &cause, now);
+        self.apply_capacity(engine, group_name, new_desired_capacity, &convergence_cause, now);
         activities
     }
 

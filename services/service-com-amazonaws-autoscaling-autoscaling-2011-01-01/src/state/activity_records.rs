@@ -58,6 +58,50 @@ const DETAILS_SUBNET_ID: &str = "Subnet ID";
 /// above identifies.
 const DETAILS_AVAILABILITY_ZONE: &str = "Availability Zone";
 
+/// The move a termination a CALLER NAMED states: the instance the request named went out
+/// of service at that caller's request.
+///
+/// Reads as the `moved` clause of [`user_requested_instance_move_cause`], beside the
+/// standby moves that word the same class ([`super::standby`]).
+pub const TAKEN_OUT_OF_SERVICE: &str = "was taken out of service";
+
+/// The `Activity$Cause` of the activity ONE instance a CALLER NAMED records: when the move
+/// began, which instance moved, that a user asked for it and — when the group's desired
+/// capacity moved with the instance — the capacities it moved between.
+///
+/// THE ONE wording of this class in this crate. An instance a REQUEST named and a capacity
+/// change the group chose for itself are different activities: the second states the
+/// difference the group was closing ([`InstanceLifecycle::convergence_sentence`]), while
+/// this one states the instance and the move the caller asked for. A park a caller asked
+/// for ([`super::standby`]) and a termination a caller asked for
+/// ([`AutoScalingState::terminate_instances_in_group`]) are both of this class, so they
+/// read the same way and differ only in the move each names.
+///
+/// The fixed text states that a user asked for the move and the direction the capacity went
+/// with it; the variable parts are the instant, the instance id from the request and the
+/// two capacities from the group's own state. `moved` is the move itself, in the past tense
+/// the sentence reads in (`was moved to standby`, [`TAKEN_OUT_OF_SERVICE`]). A move that
+/// left the group's capacity where it was states no capacity clause: there is no change for
+/// it to name. The instant is stated by [`clause`], the one place a cause states one.
+#[must_use]
+pub fn user_requested_instance_move_cause(
+    at: SystemTime,
+    instance_id: &str,
+    moved: &str,
+    from: i32,
+    to: i32,
+) -> String {
+    let asked = format!("instance {instance_id} {moved} in response to a user request");
+    if from == to {
+        return clause(at, &format!("{asked}."));
+    }
+    let direction = if to > from { "increasing" } else { "shrinking" };
+    clause(
+        at,
+        &format!("{asked}, {direction} the capacity from {from} to {to}."),
+    )
+}
+
 /// The milestone a scaling activity that is still running has reached.
 ///
 /// WHICH milestone is a fact of the transition the activity records, so the door that

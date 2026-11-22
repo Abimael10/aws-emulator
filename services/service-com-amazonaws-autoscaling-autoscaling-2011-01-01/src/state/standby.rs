@@ -100,26 +100,16 @@ impl StandbyMove {
     /// move began, which instance moved, that a user asked for it, and — when the group's
     /// desired capacity moved with the instance — the capacities it moved between.
     ///
-    /// The fixed text states the direction the instance went and the direction the capacity
-    /// went with it; the variable parts are the instant, the instance id from the request
-    /// and the two capacities from the group's own state. A move that left the capacity
-    /// where it was (a park without the decrement, a return of a group already at its
-    /// `MaxSize`) states no capacity clause: there is no change for it to name.
+    /// Worded by the one writer of this class
+    /// ([`super::user_requested_instance_move_cause`]), which a termination a caller named
+    /// reads the same way: this move states only WHICH move it was.
     #[must_use]
     fn activity_cause(self, at: SystemTime, instance_id: &str, from: i32, to: i32) -> String {
         let moved = match self {
             Self::Enter => "was moved to standby",
             Self::Exit => "was moved out of standby",
         };
-        let at = super::whole_seconds_text(at);
-        if from == to {
-            return format!("At {at} instance {instance_id} {moved} in response to a user request.");
-        }
-        let direction = if to > from { "increasing" } else { "shrinking" };
-        format!(
-            "At {at} instance {instance_id} {moved} in response to a user request, \
-             {direction} the capacity from {from} to {to}."
-        )
+        super::user_requested_instance_move_cause(at, instance_id, moved, from, to)
     }
 
     /// The milestone the activity of this move is at while it runs.
