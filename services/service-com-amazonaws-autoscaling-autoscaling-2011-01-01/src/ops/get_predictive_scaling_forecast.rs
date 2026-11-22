@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(policy) = state.scaling_policies.get(&key) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::policy_execution::absent_policy_message(&policy_name),
+                    crate::state::predictive_forecast::absent_policy_message(&policy_name),
                 ));
             };
             // This operation reports the forecast OF a predictive scaling policy, so a name

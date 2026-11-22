@@ -27,12 +27,17 @@
 //!   each hour of the day ([`daily_profile`]) — and each hour of the requested range is
 //!   forecast as the pattern's value for the hour of the day it falls in. Fewer than
 //!   [`MIN_HISTORY_PERIODS`] hours observed is less than the minimum the operation documents,
-//!   so such a policy has NO forecast to report: its load and capacity series are reported
-//!   empty rather than invented;
+//!   so such a policy has no PATTERN to forecast from: the hours it was asked for are still
+//!   the hours it reports, and every one of them carries NO VALUE (not a number) rather than
+//!   a load invented from a few observations — which is what a forecast of a policy created
+//!   moments ago reads as, and what an hour of the day the pattern never observed reads as
+//!   too;
 //! * the capacity each hour needs is the smallest that keeps every metric specification at
 //!   its own `TargetValue` ([`PredictiveScalingMetricSpecification$TargetValue`]), held
 //!   between the group's own `MinSize` and — unless the policy may raise it
-//!   ([`super::scaling_policies::DEFAULT_MAX_CAPACITY_BREACH_BEHAVIOR`]) — its `MaxSize`.
+//!   ([`super::scaling_policies::DEFAULT_MAX_CAPACITY_BREACH_BEHAVIOR`]) — its `MaxSize`; an
+//!   hour no load was predicted for needs no number either, so the two series always cover
+//!   the same hours.
 //!
 //! Nothing here writes: a forecast is a report of what the store holds, and two reads taken
 //! at one instant report the same series. A specification naming a form this forecast cannot
@@ -187,6 +192,22 @@ pub fn not_a_predictive_scaling_policy_message(policy_name: &str) -> String {
     format!("Policy {policy_name} is not a predictive scaling policy.")
 }
 
+/// The refusal of a policy NAME the group a request names holds no policy under, as this
+/// operation states it.
+///
+/// The same subject as this service's other sentence about a policy a request names
+/// ([`super::policy_execution::absent_policy_message`]) — the resource word, the name asked
+/// for verbatim, and that nothing answers to it — closed as a SENTENCE, the way this
+/// operation states its refusals about a policy
+/// ([`not_a_predictive_scaling_policy_message`]). The name is its only variable part.
+#[must_use]
+pub fn absent_policy_message(policy_name: &str) -> String {
+    format!(
+        "{}.",
+        super::policy_execution::absent_policy_message(policy_name)
+    )
+}
+
 /// Whether `policy` is the type this operation reports a forecast for.
 #[must_use]
 pub fn is_predictive_scaling(policy: &StoredScalingPolicy) -> bool {
@@ -297,11 +318,15 @@ pub fn forecast<Eng: Send + Sync + 'static>(
                 ..LoadForecast::default()
             };
             for period in &periods {
-                if let Some(value) = pattern.and_then(|pattern| pattern.get(&period_of_day(*period)))
-                {
-                    forecast.timestamps.push(super::to_date_time(*period));
-                    forecast.values.push(*value);
-                }
+                let predicted = pattern
+                    .and_then(|pattern| pattern.get(&period_of_day(*period)).copied());
+                // Every forecast period is reported, whether or not the pattern states a
+                // load for it: a forecast made from too little data — or from none — covers
+                // the hours it was asked for and carries NO VALUE for them rather than
+                // dropping them, so a reader sees which hours were forecast and that nothing
+                // was predicted for them.
+                forecast.timestamps.push(super::to_date_time(*period));
+                forecast.values.push(predicted.unwrap_or(f64::NAN));
             }
             forecast
         })
@@ -309,12 +334,12 @@ pub fn forecast<Eng: Send + Sync + 'static>(
 
     let mut capacity = CapacityForecast::default();
     for period in &periods {
-        if let Some(needed) =
-            needed_capacity(bounds, policy, &specifications, &per_specification, *period)
-        {
-            capacity.timestamps.push(super::to_date_time(*period));
-            capacity.values.push(needed);
-        }
+        let needed =
+            needed_capacity(bounds, policy, &specifications, &per_specification, *period);
+        // The capacity of a period no load was predicted for is as unpredicted as that
+        // load, so the two series cover the same hours.
+        capacity.timestamps.push(super::to_date_time(*period));
+        capacity.values.push(needed.unwrap_or(f64::NAN));
     }
     Ok(Forecast { load, capacity })
 }
@@ -336,14 +361,18 @@ fn series_identity(series: &TrackedSeries) -> SeriesIdentity {
 /// The whole hours of `[start, end)` a forecast covers, in order.
 ///
 /// The hours are the lattice of whole hours from the epoch, so the periods of two reads of
-/// one range are the same instants. The lattice is held to [`MAX_FORECAST_RANGE`] from its own
-/// start: a request past that span is REFUSED before this is reached
+/// one range are the same instants — and the first of them is the whole hour at or AFTER the
+/// range's start, because the range is read from its "inclusive start time" to its "exclusive
+/// end time" (`GetPredictiveScalingForecastType$StartTime`, `$EndTime`): an hour that began
+/// before the start is not an hour the range holds. The lattice is held to
+/// [`MAX_FORECAST_RANGE`] from its own start: a request past that span is REFUSED before this
+/// is reached
 /// ([`time_range_refusal`]), so this is the backstop that bounds what one read computes
 /// whatever reaches it.
 fn forecast_periods(start: SystemTime, end: SystemTime) -> Vec<SystemTime> {
     let last = end.min(start.checked_add(MAX_FORECAST_RANGE).unwrap_or(end));
     let mut periods = Vec::new();
-    let mut period = whole_period(start);
+    let mut period = first_period_from(start);
     while period < last {
         periods.push(period);
         period = match period.checked_add(FORECAST_PERIOD) {
@@ -352,6 +381,16 @@ fn forecast_periods(start: SystemTime, end: SystemTime) -> Vec<SystemTime> {
         };
     }
     periods
+}
+
+/// The first whole period at or after `at`: the one a range beginning at `at` opens with.
+fn first_period_from(at: SystemTime) -> SystemTime {
+    let whole = whole_period(at);
+    if whole < at {
+        whole.checked_add(FORECAST_PERIOD).unwrap_or(at)
+    } else {
+        whole
+    }
 }
 
 /// `at` rounded DOWN to the whole forecast period it falls in.
@@ -583,7 +622,8 @@ fn hourly_history(
 ///
 /// `None` for a history shorter than [`MIN_HISTORY_PERIODS`] — the minimum the operation
 /// documents a forecast can be made from — so a policy whose metric the account holds too
-/// little of reports no forecast at all rather than one made up from a few observations.
+/// little of has no pattern at all, and every hour it is asked about carries no value instead
+/// of a load made up from a few observations ([`forecast`]).
 fn daily_profile(history: &BTreeMap<i64, f64>) -> Option<BTreeMap<i64, f64>> {
     if history.len() < MIN_HISTORY_PERIODS {
         return None;

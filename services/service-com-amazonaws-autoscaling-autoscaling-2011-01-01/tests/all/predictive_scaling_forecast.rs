@@ -552,7 +552,7 @@ async fn a_policy_of_another_type_has_no_forecast() {
     let (status, code, message, body) = get_forecast(&router, group, "nonesuch", start, end).await;
     assert_eq!(
         (status, code.as_str(), message.as_str()),
-        (400, "ValidationError", "Policy nonesuch not found"),
+        (400, "ValidationError", "Policy nonesuch not found."),
         "case \"absent policy\": got {status} {code:?} {message:?} with {body}"
     );
     let (status, code, message, body) =
@@ -674,9 +674,10 @@ async fn the_forecast_is_computed_from_the_observed_history() {
     }
 }
 
-/// RULE 3: fewer than the documented minimum hours of data is no forecast at all.
+/// RULE 3: fewer than the documented minimum hours of data is no PATTERN to forecast from, so
+/// the hours asked for are reported with no value at all rather than dropped.
 #[tokio::test]
-async fn too_little_history_forecasts_nothing() {
+async fn too_little_history_predicts_no_value() {
     let group = "forecast-short";
     let (router, engine) = emulator();
     create_group(&router, group, GROUP_MAX_SIZE).await;
@@ -691,8 +692,9 @@ async fn too_little_history_forecasts_nothing() {
     )
     .await;
 
+    let periods = 6_u64;
     let start = whole_hour(now) + PERIOD;
-    let end = start + Duration::from_secs(6 * PERIOD.as_secs());
+    let end = start + Duration::from_secs(periods * PERIOD.as_secs());
     let (status, code, message, body) =
         get_forecast(&router, group, "forecast-policy", start, end).await;
     assert_eq!(
@@ -700,12 +702,30 @@ async fn too_little_history_forecasts_nothing() {
         "the forecast must be served, got {status} {code:?} {message:?}"
     );
     let (load, capacity) = forecasts(&body);
+    let expected_hours: Vec<i64> = (0..periods)
+        .map(|index| {
+            let at = start + Duration::from_secs(index * PERIOD.as_secs());
+            i64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        (load.timestamps.clone(), capacity.timestamps.clone()),
+        (expected_hours.clone(), expected_hours),
+        "expected both series to cover every hour of the range, got {load:?} and \
+         {capacity:?} in {body}"
+    );
     assert_eq!(
         (load.values.len(), capacity.values.len()),
-        (0, 0),
-        "expected no forecast from fewer than {MIN_HISTORY_PERIODS} hours of data, got \
-         {load:?} and {capacity:?} in {body}"
+        (periods as usize, periods as usize),
+        "expected a value per hour in both series, got {load:?} and {capacity:?} in {body}"
     );
+    for (slot, (predicted, needed)) in load.values.iter().zip(&capacity.values).enumerate() {
+        assert!(
+            predicted.is_nan() && needed.is_nan(),
+            "expected no value from fewer than {MIN_HISTORY_PERIODS} hours of data: hour \
+             {slot} reports the load {predicted} needing {needed} in {body}"
+        );
+    }
 }
 
 /// RULE 4: the forecast capacity is held to the group's `MaxSize` while the policy honours
@@ -1024,3 +1044,4 @@ async fn the_span_a_request_may_ask_a_forecast_over() {
         );
     }
 }
+
