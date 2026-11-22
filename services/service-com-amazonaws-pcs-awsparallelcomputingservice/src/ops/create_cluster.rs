@@ -212,11 +212,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateClusterErrorModeled::ValidationException(refusal).into());
         }
 
+        let slurm = input.slurm_configuration.as_ref();
+
+        // The accounting purge time this create would PERSIST. The member's `@range`
+        // admits the one value its documentation excludes — a `@range` states an interval
+        // and cannot leave a hole inside it — so the exclusion is enforced here, before
+        // anything is stored ([`crate::state::purge_time_violation`]).
+        if let Some(refusal) = crate::state::purge_time_violation(
+            slurm
+                .and_then(|slurm| slurm.accounting.as_ref())
+                .and_then(|accounting| accounting.default_purge_time_in_days),
+        ) {
+            return Err(CreateClusterErrorModeled::ValidationException(refusal).into());
+        }
+
         // The caller-sized lists this create would PERSIST. The model bounds none of
         // them, so one request could otherwise size one stored record arbitrarily.
         // `tags` needs no entry: `RequestTagMap` is modelled `@length(min: 1, max: 200)`
         // with bounded keys and values, all enforced at the boundary.
-        let slurm = input.slurm_configuration.as_ref();
         let stored_lists: [(&str, usize); 5] = [
             (
                 "networking.subnetIds",

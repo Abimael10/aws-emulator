@@ -1059,6 +1059,36 @@ pub fn length_at_least_constraint(entries: usize) -> String {
     format!("Member must have length greater than or equal to {entries}")
 }
 
+/// The constraint clause stated for a value a member's documentation EXCLUDES although the
+/// member's own `@range` admits it — a hole inside the range, which a `@range` cannot
+/// express ([`excluded_value_violation`]).
+pub fn value_excluded_constraint(excluded: i32) -> String {
+    format!("Member must not have value equal to {excluded}")
+}
+
+/// The modelled `ValidationException` a member whose documentation EXCLUDES this value is
+/// refused with, or `None` when the request carries another value or omits the member.
+///
+/// THE RULE: a value a member's documentation rules out is one the service refuses, even
+/// when the member's `@range` admits it. A `@range` states an interval, so it cannot
+/// exclude a value INSIDE that interval; where the documentation does
+/// (`defaultPurgeTimeInDays` is `@range(min: -1, max: 10000)` and its documentation adds
+/// "`0` isn't a valid value" — [`EXCLUDED_PURGE_TIME_IN_DAYS`]), the exclusion is the
+/// service's to state, and it is stated once here so every path that WRITES such a member
+/// refuses the same value in the same words.
+///
+/// The refusal is worded the way every other modelled-constraint violation of this service
+/// is ([`constraint_violations`]), because that is what failed: a constraint on the member
+/// the request names, reported against the member's full path.
+pub fn excluded_value_violation(
+    member: &str,
+    excluded: i32,
+    requested: Option<i32>,
+) -> Option<ValidationException> {
+    (requested == Some(excluded))
+        .then(|| field_validation(member, value_excluded_constraint(excluded)))
+}
+
 /// The modelled `ValidationException` for ONE member whose value failed `constraint`:
 /// [`constraint_violations`] over a single violation.
 pub fn field_validation(member: &str, constraint: String) -> ValidationException {
@@ -1293,6 +1323,30 @@ pub fn scaling_range_violation(
             "Member must specify a minInstanceCount at most its maxInstanceCount".to_string(),
         )
     })
+}
+
+/// The purge time an accounting configuration admits structurally and the service
+/// excludes: "`0` isn't a valid value"
+/// (`AccountingRequest$defaultPurgeTimeInDays`, worded identically on
+/// `UpdateAccountingRequest$defaultPurgeTimeInDays`), while the member is modelled
+/// `@range(min: -1, max: 10000)` — an interval that admits it. `-1`, the member's
+/// documented default, means records persist as long as the cluster exists, and every
+/// other value in the range is a number of days.
+pub const EXCLUDED_PURGE_TIME_IN_DAYS: i32 = 0;
+
+/// How a refusal names the purge time a request carried: the path of
+/// `defaultPurgeTimeInDays` inside the request, which is the same path on the create and
+/// the update ([`crate::ops::types::AccountingRequest`] and
+/// [`crate::ops::types::UpdateAccountingRequest`] are both reached through
+/// `slurmConfiguration.accounting`).
+pub const PURGE_TIME_MEMBER: &str = "slurmConfiguration.accounting.defaultPurgeTimeInDays";
+
+/// The modelled `ValidationException` a cluster's accounting purge time is refused with, or
+/// `None` when the service accepts it: [`excluded_value_violation`] for the one value the
+/// member's documentation excludes, asked by every path that stores an accounting
+/// configuration so the create and the update cannot disagree about it.
+pub fn purge_time_violation(requested: Option<i32>) -> Option<ValidationException> {
+    excluded_value_violation(PURGE_TIME_MEMBER, EXCLUDED_PURGE_TIME_IN_DAYS, requested)
 }
 
 /// The modelled `ValidationException` (HTTP 400) `CreateCluster` refuses a scheduler

@@ -201,8 +201,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The caller-sized lists this update would PERSIST, bounded for the same reason
-        // the create's are: the model bounds none of them.
+        // the create's are: the model bounds none of them. The accounting purge time it
+        // would persist is held to the same exclusion the create path holds it to — the
+        // member's `@range` admits the one value its documentation excludes, because a
+        // `@range` states an interval and cannot leave a hole inside it. Both are decided
+        // before the store is touched, so a refused update leaves the cluster as it was.
         if let Some(slurm) = input.slurm_configuration.as_ref() {
+            if let Some(refusal) = crate::state::purge_time_violation(
+                slurm
+                    .accounting
+                    .as_ref()
+                    .and_then(|accounting| accounting.default_purge_time_in_days),
+            ) {
+                return Err(UpdateClusterErrorModeled::ValidationException(refusal).into());
+            }
+
             let stored_lists: [(&str, usize); 3] = [
                 (
                     "slurmConfiguration.slurmCustomSettings",

@@ -28,6 +28,11 @@ mod compute_node_group_update;
 #[path = "cluster_update_and_endpoints/scheduler_version_ordering.rs"]
 mod scheduler_version_ordering;
 
+// Which accounting purge times a cluster keeps — the value the member's own documentation
+// EXCLUDES although its `@range` admits it — is its own suite, declared the same way.
+#[path = "cluster_update_and_endpoints/accounting_purge_time.rs"]
+mod accounting_purge_time;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 
