@@ -738,6 +738,28 @@ pub fn entity_framework(entity_type: &str) -> Option<&'static str> {
     }
 }
 
+/// The framework one `FrameworkFilters` member filters by, and the delivery
+/// option that member narrows to.
+///
+/// `FrameworkFilters` is "framework-specific filters … Set exactly one member,
+/// corresponding to the framework you want to filter by", and each member's own
+/// documentation names its framework ("filters that apply to assessments
+/// performed against the AMI Security framework"), so the member a request
+/// names IS a framework of [`ASSESSMENT_FRAMEWORKS`] — which is what lets a
+/// caller's own `FrameworkId` be compared with the framework its filters belong
+/// to, as well as what selects records.
+pub fn framework_filters_scope(filters: &FrameworkFilters) -> (&'static str, Option<&str>) {
+    match filters {
+        FrameworkFilters::AMISecurityFilters(filter) => {
+            (FRAMEWORK_AMI_SECURITY, filter.delivery_option_id.as_deref())
+        }
+        FrameworkFilters::ContainerSecurityFilters(filter) => (
+            FRAMEWORK_CONTAINER_SECURITY,
+            filter.delivery_option_id.as_deref(),
+        ),
+    }
+}
+
 /// How long an assessment stays valid: the span between an assessment's
 /// `CreatedAt` and its `ExpiresAt`.
 ///
@@ -1692,15 +1714,7 @@ impl AssessmentRecord {
     /// framework" — so the member chosen selects the framework, and the
     /// `DeliveryOptionId` it carries narrows further.
     pub fn matches_framework_filters(&self, filters: &FrameworkFilters) -> bool {
-        let (framework, delivery_option) = match filters {
-            FrameworkFilters::AMISecurityFilters(filter) => {
-                (FRAMEWORK_AMI_SECURITY, filter.delivery_option_id.as_deref())
-            }
-            FrameworkFilters::ContainerSecurityFilters(filter) => (
-                FRAMEWORK_CONTAINER_SECURITY,
-                filter.delivery_option_id.as_deref(),
-            )
-        };
+        let (framework, delivery_option) = framework_filters_scope(filters);
         self.framework == framework
             && delivery_option.is_none_or(|wanted| self.delivery_option_id.as_deref() == Some(wanted))
     }
@@ -4348,23 +4362,32 @@ fn is_version_suffix(version: &str) -> bool {
         && !version.contains("..")
 }
 
-/// Whether `framework_id` names a framework this catalog assesses against: one
-/// of [`ASSESSMENT_FRAMEWORKS`] on its own — the unversioned form
-/// `ListAssessmentsRequest$FrameworkId` documents ("For example, AMISecurity")
-/// — or that framework at a version, the `frameworkId@version` form
-/// `VersionedFrameworkId` states.
+/// The framework of [`ASSESSMENT_FRAMEWORKS`] `framework_id` names, or `None`
+/// for a value naming no framework this catalog assesses against: one of them on
+/// its own — the unversioned form `ListAssessmentsRequest$FrameworkId` documents
+/// ("For example, AMISecurity") — or that framework at a version, the
+/// `frameworkId@version` form `VersionedFrameworkId` states.
 ///
 /// The member's own `@length` and `@pattern` are judged at the boundary, so what
 /// is left is the one thing a published set decides: whether the value names a
 /// framework this catalog HAS. One that does not names no framework an
 /// assessment can have been performed against.
-pub fn is_assessment_framework_id(framework_id: &str) -> bool {
+pub fn assessment_framework(framework_id: &str) -> Option<&'static str> {
     let framework = match framework_id.split_once('@') {
         Some((framework, version)) if is_version_suffix(version) => framework,
-        Some(_) => return false,
+        Some(_) => return None,
         None => framework_id,
     };
-    ASSESSMENT_FRAMEWORKS.contains(&framework)
+    ASSESSMENT_FRAMEWORKS
+        .iter()
+        .copied()
+        .find(|published| *published == framework)
+}
+
+/// Whether `framework_id` names a framework this catalog assesses against —
+/// [`assessment_framework`] as a predicate.
+pub fn is_assessment_framework_id(framework_id: &str) -> bool {
+    assessment_framework(framework_id).is_some()
 }
 
 /// The modelled `ValidationException` payload for a `FrameworkId` naming no

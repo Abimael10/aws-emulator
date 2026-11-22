@@ -197,6 +197,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "Framework-specific filters … Set exactly one member, corresponding to
+        // the framework you want to filter by" — a `FrameworkFilters` member
+        // carries the filters of ONE framework, so the member a request names is
+        // itself a framework the request scopes to. Naming it beside a
+        // `FrameworkId` of a DIFFERENT framework asks for the assessments of two
+        // frameworks at once, which no assessment can have been performed
+        // against, so such a request is refused before anything is selected —
+        // rather than answered with the empty page the two predicates select
+        // together — the same judgement `ListEntities` makes of a per-type filter
+        // member against the type being listed. `FrameworkId` is read as the
+        // framework it names (versioned or not), so the two are compared as
+        // frameworks and not as strings.
+        if let (Some(framework_id), Some(filters)) = (
+            input.framework_id.as_deref(),
+            input.framework_filters.as_ref(),
+        ) {
+            let (filtered, _) = crate::state::framework_filters_scope(filters);
+            if crate::state::assessment_framework(framework_id) != Some(filtered) {
+                return Err(ListAssessmentsErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "FrameworkFilters",
+                        format!(
+                            "{filtered}Filters filters the {filtered} framework, \
+                             not {framework_id:?}"
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
         // "Filters the list of assessments to those performed against a specific
         // entity or change set" — both members are optional, and one the filter
         // leaves absent constrains nothing (`AssessmentRecord::matches_target`), so
