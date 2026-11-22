@@ -74,8 +74,13 @@ use crate::provisioning_loop::{action, call, p};
 
 /// The two series the rate is the quotient of, and the target-class series no request of this
 /// traffic ended in — Elastic Load Balancing's own names for them.
-const ERROR_SERIES: &str = "HTTPCode_Target_5XX_Count";
-const REQUEST_SERIES: &str = "RequestCount";
+///
+/// The first two are `pub(crate)` with the readings below: the sibling suite that grades the SAME
+/// two alarm configurations over traffics of different error mixes
+/// ([`crate::alb_target_5xx_rate_alarm_by_traffic_mix`]) reads these very series, so the two cannot
+/// name, derive or read them differently.
+pub(crate) const ERROR_SERIES: &str = "HTTPCode_Target_5XX_Count";
+pub(crate) const REQUEST_SERIES: &str = "RequestCount";
 const UNFED_SERIES: &str = "HTTPCode_Target_4XX_Count";
 
 /// How much of the current period has to be LEFT before the traffic is sent, so every datapoint of
@@ -84,23 +89,23 @@ const UNFED_SERIES: &str = "HTTPCode_Target_4XX_Count";
 /// rate of each half would not be the rate of the traffic. Polled for rather than slept through.
 /// That the traffic really did land in one window is then asserted on the DATAPOINTS it left rather
 /// than on the clock, and a run the period ran out on is driven again ([`ATTEMPTS`]).
-const ROOM_IN_PERIOD: f64 = 30.0;
+pub(crate) const ROOM_IN_PERIOD: f64 = 30.0;
 
 /// How many times the traffic may be driven, at a FRESH load balancer and target group each time,
 /// because the period ran out while it was being sent: a machine under heavy load can take longer
 /// over the exchanges than the room left in a period, and the rate of half a traffic is not the rate
 /// of the traffic. Each run publishes into the series of its own load balancer and group, so a run
 /// the clock cut short leaves the series the alarms below grade untouched.
-const ATTEMPTS: usize = 4;
+pub(crate) const ATTEMPTS: usize = 4;
 
 /// The `StateValue` values the four alarms must reach.
-const ALARM: &str = "ALARM";
-const OK: &str = "OK";
+pub(crate) const ALARM: &str = "ALARM";
+pub(crate) const OK: &str = "OK";
 
 /// The comparison every alarm here grades with, and the treatment every one of them gives a window
 /// no datapoint reached.
-const GREATER_THAN: &str = "GreaterThanThreshold";
-const NOT_BREACHING: &str = "notBreaching";
+pub(crate) const GREATER_THAN: &str = "GreaterThanThreshold";
+pub(crate) const NOT_BREACHING: &str = "notBreaching";
 
 /// The function every request is forwarded to, the role it runs as, and the queue it reports each
 /// invocation to.
@@ -118,10 +123,10 @@ const TARGET_GROUP: &str = "alb-5xx-rate-tg";
 /// target returned rather than one the load balancer generated ([`package`]).
 const SUCCESS_PATH: &str = "/differential/ok";
 const FAILURE_PATH: &str = "/differential/fail";
-const SUCCESS_BODY: &str = "TARGET-OK";
-const FAILURE_BODY: &str = "TARGET-FAILED";
-const SUCCESS_STATUS: u16 = 200;
-const FAILURE_STATUS: u16 = 500;
+pub(crate) const SUCCESS_BODY: &str = "TARGET-OK";
+pub(crate) const FAILURE_BODY: &str = "TARGET-FAILED";
+pub(crate) const SUCCESS_STATUS: u16 = 200;
+pub(crate) const FAILURE_STATUS: u16 = 500;
 
 /// The traffic: the requests the target answers as a success, and the ONE it answers with a server
 /// error of its own. A low error RATE and a COUNT of one, which is the mix a client's rate-vs-count
@@ -275,7 +280,11 @@ fn traffic() -> Vec<Request> {
 /// in a server error the TARGET returned, as a percentage, with the error series `FILL`ed so a
 /// window that carried requests and no error is a rate of zero rather than a hole. It names the two
 /// reads by their query ids, which is how a math expression refers to the queries it reads.
-fn rate_expression() -> String {
+///
+/// `pub(crate)` with the two readings below: the sibling suite that grades this very rate over
+/// traffics of different error mixes derives it by the SAME arithmetic, so the two cannot grade two
+/// different rates.
+pub(crate) fn rate_expression() -> String {
     format!("100 * FILL({ERRORS_ID}, 0) / {REQUESTS_ID}")
 }
 
@@ -311,7 +320,7 @@ fn alarm_request(row: &AlarmRow, dimensions: &Value) -> Value {
 ///
 /// Both come out of the SAME read, so a look cannot pair one evaluation's state with another's
 /// record.
-async fn looked_at(router: &MultiServiceRouter, name: &str) -> (String, Vec<f64>) {
+pub(crate) async fn looked_at(router: &MultiServiceRouter, name: &str) -> (String, Vec<f64>) {
     let body = cloudwatch_ok(
         router,
         "DescribeAlarms",
@@ -336,7 +345,7 @@ async fn looked_at(router: &MultiServiceRouter, name: &str) -> (String, Vec<f64>
 
 /// Every state one alarm has TRANSITIONED into, oldest first, as its own history records them: the
 /// `newState.stateValue` of each `StateUpdate` item `DescribeAlarmHistory` reports for it.
-async fn transitions(router: &MultiServiceRouter, name: &str) -> Vec<String> {
+pub(crate) async fn transitions(router: &MultiServiceRouter, name: &str) -> Vec<String> {
     let body = cloudwatch_ok(
         router,
         "DescribeAlarmHistory",
