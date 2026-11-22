@@ -60,6 +60,11 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # The GZIP framing a subscription filter's destination is handed the delivered log events
 # in ("they are Base64 encoded and compressed with the GZIP format").
 flate2 = "1"
+# An S3 Table Integration is CloudWatch Observability Admin's record — `CreateS3TableIntegration`
+# is what establishes one — so the `integrationArn` of the S3-table-source family is resolved
+# where those integrations live, through the shared engine, which needs the owning service's
+# state TYPE and its ARN form.
+service-com-amazonaws-observabilityadmin-observabilityadmin = { workspace = true }
 # `arn`: the one reading of a caller-supplied resource ARN, used to resolve which service
 # and Region a subscription filter's `destinationArn` names.
 service-common = { path = "../common" }
@@ -148,6 +153,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # suite about that gate mounts EC2 beside this service on the same engine and creates every
 # endpoint a case names through EC2's OWN API rather than writing one into a store by hand.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The S3 Table Integration an `integrationArn` names is CloudWatch Observability Admin's
+# record, so the suites about that family stand one up through that service's own record type
+# on the shared engine and mount that service beside this one to create one through its API.
+# Already a dependency of `src/`; an integration test reaches it only through this list.
+service-com-amazonaws-observabilityadmin-observabilityadmin = { workspace = true }
 
 [lints]
 workspace = true

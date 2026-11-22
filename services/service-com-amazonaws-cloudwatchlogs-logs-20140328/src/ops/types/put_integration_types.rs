@@ -26,7 +26,17 @@ pub enum ResourceConfig {
     openSearchResourceConfig(OpenSearchResourceConfig),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#OpenSearchResourceConfig")]
+// `retentionDays` is the member whose modelled `@range` this OPERATION judges itself. The
+// service accepts a retention far past the 30 days the model's trait stops at — up to ten
+// years — and states that bound in its own refusal, so the trait is no bound on what the
+// service takes. `skip_validation` drops only this member's constraint traits, so
+// `crate::state::config_constraint_envelope` can apply the bounds the service enforces and
+// refuse with this operation's own modelled `InvalidParameterException`; every other member
+// of this shape is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudwatchlogs#OpenSearchResourceConfig",
+    skip_validation = ["retentionDays"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct OpenSearchResourceConfig {
     pub kms_key_arn: Option<String>,

@@ -193,6 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every member of the configuration the SERVICE holds to a constraint of its own is
+        // judged FIRST, together: the length an ARN takes on each `Arn`-typed member — an ARN
+        // member is a constrained string before it is a reference to a resource — and the
+        // retention bounds, which the member carries `skip_validation` for because the
+        // service accepts far more than the model's trait stops at. Every member that breaks
+        // one is counted into one envelope, each clause stating its own position and
+        // requirement, and only values inside them are read as the resources they name.
+        if let Some(message) = crate::state::config_constraint_envelope(config) {
+            return Err(invalid(message));
+        }
+
         // Every ARN-typed member of the configuration is parsed before anything is stored,
         // with the service's validation-error message naming the member and the value it
         // could not parse, and then held to the KIND of resource its own documentation says

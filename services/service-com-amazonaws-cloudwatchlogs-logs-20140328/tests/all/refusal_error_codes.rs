@@ -59,8 +59,8 @@ struct Row {
 
 /// A `PutIntegration` body that satisfies every other modelled constraint, so a row can
 /// violate exactly one. `ResourceConfig` is a union with one member, and
-/// `OpenSearchResourceConfig` requires the role, the viewer principals and a retention
-/// in `1..30`.
+/// `OpenSearchResourceConfig` requires the role, the viewer principals and a retention the
+/// service holds to `1..3650`.
 fn put_integration(integration_type: &str, retention_days: i64) -> Value {
     json!({
         "integrationName": "opensearch-integration",
@@ -171,11 +171,11 @@ fn rows() -> Vec<Row> {
             expected: INVALID_PARAMETER,
         },
         Row {
-            // `CollectionRetentionDays` is `range 1..30`, reached through the
-            // `ResourceConfig` union and the `OpenSearchResourceConfig` structure.
+            // `retentionDays` is reached through the `ResourceConfig` union and the
+            // `OpenSearchResourceConfig` structure; the service accepts up to 3650 days.
             case: "a violation nested inside a union and a structure",
             operation: "PutIntegration",
-            body: put_integration("OPENSEARCH", 31),
+            body: put_integration("OPENSEARCH", 3651),
             member: "retentionDays",
             expected: INVALID_PARAMETER,
         },

@@ -432,6 +432,11 @@ impl IntegrationRecord {
     /// integration has finished provisioning none of them is there
     /// ([`OPENSEARCH_RESOURCE_STATUS_NOT_FOUND`]), once it is active they all are, and an
     /// integration that failed reports them in error.
+    ///
+    /// The status MESSAGE is "additional information about the status of this resource", and
+    /// a resource whose status says everything there is to say about it has none to add — so
+    /// the member is reported EMPTY rather than omitted, which is what the service answers
+    /// for every resource of an integration it set up.
     pub(super) fn resource_status(&self) -> crate::ops::types::OpenSearchResourceStatus {
         let status = match self.status.as_str() {
             INTEGRATION_STATUS_ACTIVE => OPENSEARCH_RESOURCE_STATUS_ACTIVE,
@@ -440,7 +445,7 @@ impl IntegrationRecord {
         };
         crate::ops::types::OpenSearchResourceStatus {
             status: Some(status.to_string()),
-            status_message: None,
+            status_message: Some(NO_STATUS_MESSAGE.to_string()),
         }
     }
 
@@ -452,7 +457,8 @@ impl IntegrationRecord {
     /// one integration report the same resources. No endpoint is reported: this emulator
     /// stands up no OpenSearch Service collection or application, so there is no host a
     /// client could reach, and `applicationEndpoint` / `collectionEndpoint` are left absent
-    /// rather than filled with one nothing answers on.
+    /// rather than filled with one nothing answers on. The status MESSAGE is reported on
+    /// every one of them ([`Self::resource_status`]).
     pub fn details(&self) -> crate::ops::types::IntegrationDetails {
         let status = self.resource_status();
         crate::ops::types::IntegrationDetails::openSearchIntegrationDetails(
@@ -496,6 +502,324 @@ impl IntegrationRecord {
         )
     }
 }
+
+/// The `OpenSearchResourceStatus$statusMessage` of a resource whose status needs nothing
+/// added to it: the member is "a message with additional information about the status", and
+/// there is none for a resource the setup simply created, so the message is EMPTY. It is
+/// still reported rather than omitted, because a client reads the member on every resource.
+pub const NO_STATUS_MESSAGE: &str = "";
+
+/// The characters an ARN takes at least, which every `Arn`-typed member of the
+/// S3-Table-Integration family is held to before anything tries to resolve a resource from
+/// it. That family's requests are judged by the modelled request validator, so the refusal
+/// is the standard constraint clause naming the member and this bound
+/// ([`short_arn_message`]) rather than a complaint about parsing.
+pub const MIN_ARN_CHARS: usize = 20;
+
+/// The refusal for an ARN-typed member shorter than the [`MIN_ARN_CHARS`] an ARN takes:
+/// the one-violation constraint clause naming the member and that minimum, which is what
+/// tooling reading a refusal parses out of it. `None` for a value long enough to be an ARN.
+pub fn short_arn_message(member: &str, value: &str) -> Option<String> {
+    (value.chars().count() < MIN_ARN_CHARS).then(|| {
+        validation_message(
+            member,
+            &format!("Member must have length greater than or equal to {MIN_ARN_CHARS}"),
+        )
+    })
+}
+
+/// The refusal for an `Arn`-typed member of the S3-Table-Integration family this service
+/// cannot read an ARN out of: too short to be one at all ([`short_arn_message`]), and
+/// otherwise long enough but unparsable ([`unparsable_arn_message`]). `None` when the value
+/// parses as an ARN, whatever resource it names.
+pub fn malformed_arn_message(member: &str, value: &str) -> Option<String> {
+    short_arn_message(member, value).or_else(|| unparsable_arn_message(member, value))
+}
+
+/// The resource an S3 Table Integration's ARN names, read from the service that OWNS one
+/// rather than spelled again here: `s3tableintegration/{integration-id}`, the form
+/// `ListSourcesForS3TableIntegration` states when it is handed an ARN of another resource.
+pub const S3_TABLE_INTEGRATION_RESOURCE_PREFIX: &str =
+    ::service_com_amazonaws_observabilityadmin_observabilityadmin::state::S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX;
+
+/// The ARN of the S3 Table Integration `id` in `region`: the handle the service that OWNS
+/// one mints for it, which is the only form an `integrationArn` of this family names an
+/// integration by — built by that service's own ARN function, so the two cannot drift.
+///
+/// An integration is reachable only from the account and Region it was created in, so the
+/// partition, the Region and the account are part of the handle and not decoration: an ARN
+/// differing in any of them names no integration this account can associate a source with.
+pub fn s3_table_integration_arn(region: &str, id: &str) -> String {
+    ::service_com_amazonaws_observabilityadmin_observabilityadmin::state::s3_table_integration_arn(
+        region, id,
+    )
+}
+
+/// Whether `arn`'s RESOURCE is the one an S3 Table Integration's ARN carries:
+/// `s3tableintegration/{integration-id}`, with a non-empty id. The form the reader states
+/// when it is handed an ARN of another resource type
+/// ([`not_an_s3_table_integration_arn_message`]).
+pub fn names_an_s3_table_integration_resource(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .and_then(|(_service, resource)| {
+            resource.strip_prefix(S3_TABLE_INTEGRATION_RESOURCE_PREFIX)
+        })
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// Whether `arn` is the HANDLE of an S3 Table Integration a caller signed for `region` could
+/// hold: an ARN the owning service could have minted there for this account
+/// ([`s3_table_integration_arn`]), carrying a non-empty integration id. Whether the account
+/// actually holds it is a further question ([`holds_s3_table_integration`]).
+pub fn names_an_s3_table_integration(region: &str, arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .and_then(|(_service, resource)| {
+            resource.strip_prefix(S3_TABLE_INTEGRATION_RESOURCE_PREFIX)
+        })
+        .is_some_and(|id| !id.is_empty() && arn == s3_table_integration_arn(region, id))
+}
+
+/// Whether the account HOLDS the S3 Table Integration `arn` names, as of a request signed
+/// for `region`.
+///
+/// An S3 Table Integration is a record of the service that owns them, which this service
+/// reads through the shared engine rather than keeping a second reading of which
+/// integrations exist: an integration that service does not hold is one no source can be
+/// given query access through. An emulator that is not serving that service holds none.
+pub fn holds_s3_table_integration<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    arn: &str,
+) -> bool {
+    ::service_com_amazonaws_observabilityadmin_observabilityadmin::state::service_state(engine)
+        .is_some_and(|state| state.lock().s3_table_integration(region, arn).is_some())
+}
+
+/// The refusal for an `integrationArn` whose RESOURCE is not an integration's: the fixed
+/// sentence stating the resource form an integration's ARN carries, followed by the ARN the
+/// request gave — the one variable part, so a caller can see which of its ARNs was in the
+/// wrong form.
+pub fn not_an_s3_table_integration_arn_message(arn: &str) -> Option<String> {
+    (!names_an_s3_table_integration_resource(arn)).then(|| {
+        format!(
+            "Invalid S3 table integration ARN format. Expected: \
+             {S3_TABLE_INTEGRATION_RESOURCE_PREFIX}{{integration-id}}: {arn}"
+        )
+    })
+}
+
+/// The refusal for an `integrationArn` naming an integration of ANOTHER account: query
+/// access is given through an integration of the CALLER's own account, and an ARN carrying
+/// another account's id is refused by stating that limit and the ARN that named it. `None`
+/// for an ARN of this account, and for one that names no account at all.
+pub fn cross_account_integration_message(arn: &str) -> Option<String> {
+    let account = ::service_common::arn::parse(arn)?.account;
+    (!account.is_empty() && account != ::engine::emulator_account_id()).then(|| {
+        format!("Cross account access not supported for S3 Table Integrations: {arn}")
+    })
+}
+
+/// The refusal for an `integrationArn` that is not the handle of any integration this caller
+/// could hold — an ARN of another service, partition or Region
+/// ([`names_an_s3_table_integration`]): the fixed text and the ARN it named.
+pub fn invalid_integration_arn_message(region: &str, arn: &str) -> Option<String> {
+    (!names_an_s3_table_integration(region, arn)).then(|| format!("Invalid integration ARN: {arn}"))
+}
+
+/// The refusal for an `integrationArn` that IS such a handle and names an integration the
+/// account does not hold: the fixed text and the ARN it named.
+pub fn integration_not_found_arn_message(arn: &str) -> String {
+    format!("Integration not found: {arn}")
+}
+
+/// The refusal an operation of this family answers for an `integrationArn` it cannot resolve
+/// an S3 Table Integration from, or `None` when the account holds the one it names.
+///
+/// ONE ladder, shared by the associate and the reader so the two cannot disagree about which
+/// ARN names which integration, each rung worded as this service words it: a resource that
+/// is not an integration's is told the form one carries, another account's integration is
+/// told that access is not given across accounts, an ARN of another service, partition or
+/// Region is told it names no integration, and a handle the account holds nothing under is
+/// told the integration is not there.
+///
+/// The value has already been read as an ARN by the caller
+/// ([`malformed_arn_message`]), which is what the length and the parse are stated by.
+pub fn unresolved_integration_message<
+    Eng: ::std::marker::Send + ::std::marker::Sync + 'static,
+>(
+    engine: &Eng,
+    region: &str,
+    arn: &str,
+) -> Option<String> {
+    if let Some(message) = not_an_s3_table_integration_arn_message(arn) {
+        return Some(message);
+    }
+    if let Some(message) = cross_account_integration_message(arn) {
+        return Some(message);
+    }
+    if let Some(message) = invalid_integration_arn_message(region, arn) {
+        return Some(message);
+    }
+    (!holds_s3_table_integration(engine, region, arn))
+        .then(|| integration_not_found_arn_message(arn))
+}
+
+/// The fixed sentences CloudWatch Logs refuses a data source whose NAME or whose TYPE
+/// carries a character a source cannot hold with. Each states the RULE and carries no
+/// variable part — nothing of the submitted value is reflected back.
+pub const DATA_SOURCE_NAME_MESSAGE: &str =
+    "Source name must only contain letters, numbers, and underscores";
+/// See [`DATA_SOURCE_NAME_MESSAGE`].
+pub const DATA_SOURCE_TYPE_MESSAGE: &str =
+    "Source type must only contain letters, numbers, and underscores";
+
+/// Whether `value` is spelled in the characters a data source's name and type are spelled
+/// in: letters, digits and underscores — the character set the names of this service's own
+/// data sources use (`amazon_vpc`, `aws_cloudtrail`).
+fn is_data_source_word(value: &str) -> bool {
+    value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The refusal for a `dataSource` whose NAME carries anything but those characters
+/// ([`DATA_SOURCE_NAME_MESSAGE`]). `None` for a name inside that set.
+pub fn invalid_data_source_name_message(name: &str) -> Option<&'static str> {
+    (!is_data_source_word(name)).then_some(DATA_SOURCE_NAME_MESSAGE)
+}
+
+/// The refusal for a `dataSource` whose TYPE carries anything but those characters
+/// ([`DATA_SOURCE_TYPE_MESSAGE`]) — the same rule the name is held to, stated for the type.
+/// `None` for a type inside that set, and for a request that names no type at all
+/// ([`missing_data_source_type_message`] is what states that).
+pub fn invalid_data_source_type_message(source_type: Option<&str>) -> Option<&'static str> {
+    source_type
+        .filter(|source_type| !is_data_source_word(source_type))
+        .map(|_| DATA_SOURCE_TYPE_MESSAGE)
+}
+
+/// The position the service validates the TYPE of an associate's data source at. The request
+/// spells that member `dataSource.type`; the refusal names the position the service holds it
+/// at, which is the one a caller reads out of the message.
+const DATA_SOURCE_TYPE_MEMBER: &str = "sourceType";
+
+/// The refusal for an associate whose `dataSource` names no TYPE: the service requires one —
+/// a data source "categorizes logs by originating service and log type", so a source with no
+/// type categorizes nothing.
+///
+/// Both the requirement and the position it is stated at are recorded behavior: the service
+/// refuses an associate carrying a `dataSource` with no type, and names that position
+/// `sourceType` rather than the `dataSource.type` path the request spells the member under.
+/// The clause and the envelope are the crate's single wording layer's
+/// ([`crate::service::absent_member_clause`], which is where the `Value null at` subject this
+/// one refusal states is documented).
+pub fn missing_data_source_type_message() -> String {
+    let clause = crate::service::absent_member_clause(
+        DATA_SOURCE_TYPE_MEMBER,
+        "Member must not be null",
+    );
+    ::service_common::validation_message::envelope_over(::std::slice::from_ref(&clause))
+        .unwrap_or(clause)
+}
+
+/// The requirement a `retentionDays` outside the bounds the service holds it to
+/// ([`MIN_OPENSEARCH_RETENTION_DAYS`]..[`MAX_OPENSEARCH_RETENTION_DAYS`]) failed, or `None`
+/// for a value inside them.
+fn retention_days_requirement(retention_days: i32) -> Option<String> {
+    if retention_days < MIN_OPENSEARCH_RETENTION_DAYS {
+        return Some(format!(
+            "Member must have value greater than or equal to {MIN_OPENSEARCH_RETENTION_DAYS}"
+        ));
+    }
+    if retention_days > MAX_OPENSEARCH_RETENTION_DAYS {
+        return Some(format!(
+            "Member must have value less than or equal to {MAX_OPENSEARCH_RETENTION_DAYS}"
+        ));
+    }
+    None
+}
+
+/// The input position a clause names one of a `PutIntegration` configuration's members at:
+/// the path from the request inwards, through the `resourceConfig` union's OpenSearch
+/// variant, which is how the modelled walk spells a member nested inside a union and a
+/// structure.
+fn config_member_path(member: &str) -> String {
+    format!("resourceConfig.openSearchResourceConfig.{member}")
+}
+
+/// The constraint set a clause states for the ELEMENTS of a list of ARNs: a collection's
+/// clause states what its elements have to satisfy rather than what one element happened to
+/// break, so the requirement is nested inside the element-set wrapper every service words
+/// one with.
+///
+/// The set is the bound this service is KNOWN to hold an ARN member to — the characters an
+/// ARN takes at least ([`MIN_ARN_CHARS`]), which its recorded refusals state. No further
+/// requirement is stated: a bound nothing records is a bound this service would be inventing.
+fn arn_element_set() -> String {
+    ::service_common::validation_message::element_set_requirement(&[format!(
+        "Member must have length greater than or equal to {MIN_ARN_CHARS}"
+    )])
+}
+
+/// The refusal for a `PutIntegration` configuration whose members break the constraints the
+/// SERVICE holds them to: the length an ARN takes on every `Arn`-typed member — an ARN
+/// member is a constrained string before it is a reference to a resource — and the retention
+/// bounds on `retentionDays`.
+///
+/// EVERY member that breaks one is reported, in one envelope, each clause naming the
+/// member's own path and the requirement it failed; the list member states the element
+/// shape's whole set ([`arn_element_set`]), which is how a collection's clause states one.
+/// The clauses are stated in the ascending order of the member names, which is the order the
+/// service counts them in. `None` when the configuration breaks none.
+pub fn config_constraint_envelope(
+    config: &crate::ops::types::OpenSearchResourceConfig,
+) -> Option<String> {
+    let arn_length = format!("Member must have length greater than or equal to {MIN_ARN_CHARS}");
+    let short = |value: &str| value.chars().count() < MIN_ARN_CHARS;
+    let mut refused: Vec<(&str, String)> = Vec::new();
+    // `dashboardViewerPrincipals` is a LIST of ARNs: its clause states its ELEMENTS'
+    // constraint set, once however many of them failed it.
+    if config
+        .dashboard_viewer_principals
+        .iter()
+        .any(|principal| short(principal))
+    {
+        refused.push(("dashboardViewerPrincipals", arn_element_set()));
+    }
+    for (member, value) in [
+        ("applicationArn", config.application_arn.as_deref()),
+        (
+            "dataSourceRoleArn",
+            Some(config.data_source_role_arn.as_str()),
+        ),
+        ("kmsKeyArn", config.kms_key_arn.as_deref()),
+    ] {
+        if value.is_some_and(short) {
+            refused.push((member, arn_length.clone()));
+        }
+    }
+    if let Some(requirement) = retention_days_requirement(config.retention_days) {
+        refused.push(("retentionDays", requirement));
+    }
+    refused.sort_by_key(|(member, _)| *member);
+    let clauses: Vec<String> = refused
+        .into_iter()
+        .map(|(member, requirement)| {
+            crate::service::clause_at(&config_member_path(member), &requirement)
+        })
+        .collect();
+    ::service_common::validation_message::envelope_over(&clauses)
+}
+
+/// The days of retention `OpenSearchResourceConfig$retentionDays` admits at least.
+pub const MIN_OPENSEARCH_RETENTION_DAYS: i32 = 1;
+
+/// The days of retention `OpenSearchResourceConfig$retentionDays` admits at most: ten years,
+/// the bound the SERVICE enforces and states in its refusal. The model's own `@range` on that
+/// member stops at 30, which the service does not — a retention of several hundred days is
+/// accepted — so the member carries `skip_validation` and this bound is applied here
+/// ([`crate::ops::types::OpenSearchResourceConfig`]).
+pub const MAX_OPENSEARCH_RETENTION_DAYS: i32 = 3650;
 
 /// One data-source association of an S3 Table Integration as it is stored: the model's
 /// `S3TableIntegrationSource` plus the integration it belongs to (the `integrationArn` the
@@ -604,6 +928,64 @@ impl S3TableIntegrationSourceRecord {
             status_reason: None,
             created_time_stamp: Some(self.created_time_stamp_ms),
             parent_source_identifier: self.parent_source_identifier.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: an `Arn`-typed member of this family is held to the minimum length an ARN
+    /// takes before anything is parsed out of it, and only a value long enough to be an ARN
+    /// is refused as unparsable.
+    #[test]
+    fn an_arn_member_is_held_to_its_minimum_length_before_it_is_parsed() {
+        let twenty = "arn:aws:logs:::aaaa";
+        assert_eq!(
+            twenty.chars().count(),
+            MIN_ARN_CHARS - 1,
+            "the case below is one character short of the bound"
+        );
+        // (case, the value, the refusal expected for it)
+        let cases: [(&str, &str, Option<String>); 4] = [
+            (
+                "a value far shorter than an ARN",
+                "arn:aws",
+                Some(validation_message(
+                    "integrationArn",
+                    "Member must have length greater than or equal to 20",
+                )),
+            ),
+            (
+                "one character short of the bound",
+                twenty,
+                Some(validation_message(
+                    "integrationArn",
+                    "Member must have length greater than or equal to 20",
+                )),
+            ),
+            (
+                "long enough, but not an ARN",
+                "not-an-arn-but-long-enough",
+                Some(
+                    "1 validation error detected: Unable to parse integrationArn \
+                     not-an-arn-but-long-enough"
+                        .to_string(),
+                ),
+            ),
+            (
+                "an ARN",
+                "arn:aws:logs:eu-west-2:000000000000:s3tableintegration/abc",
+                None,
+            ),
+        ];
+        for (case, value, expected) in cases {
+            let actual = malformed_arn_message("integrationArn", value);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
         }
     }
 }

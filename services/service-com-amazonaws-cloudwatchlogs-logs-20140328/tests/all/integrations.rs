@@ -20,8 +20,8 @@
 //!
 //! The tables span what the rule generalises over rather than one request: integration
 //! names of the shortest and longest length `IntegrationName`'s `@length(1..50)` admits and
-//! every character class its `@pattern` admits, `retentionDays` at both published bounds of
-//! `CollectionRetentionDays`' `@range(1..30)` and one past each, a KMS key named and not, an
+//! every character class its `@pattern` admits, `retentionDays` at both bounds the SERVICE
+//! enforces (`1..3650`) and one past each, a KMS key named and not, an
 //! existing OpenSearch Service application named and not, dashboard viewer principals of
 //! zero, one and two ARNs and of both kinds the member documents, EVERY value of the
 //! model's `IntegrationStatus` enum as a `ListIntegrations` filter (source:
@@ -136,6 +136,20 @@ fn rows() -> Vec<Row> {
         Row {
             retention_days: 30,
             ..Row::bare("retentionDays at the published maximum of 30", "retain-30")
+        },
+        Row {
+            retention_days: 3650,
+            ..Row::bare(
+                "retentionDays at the maximum of 3650 the service enforces",
+                "retain-3650",
+            )
+        },
+        Row {
+            retention_days: 365,
+            ..Row::bare(
+                "retentionDays past the bound the model's stale trait declares",
+                "retain-365",
+            )
         },
         Row {
             kms_key_arn: Some(kms_key_arn()),
@@ -358,7 +372,7 @@ async fn a_created_integration_is_reported_back_exactly_as_it_was_configured() {
         let named: [(&str, &str, String); 8] = [
             ("dataSource", "dataSourceName", row.name.clone()),
             ("application", "applicationArn", expected_application_arn),
-            ("application", "applicationId", expected_application_id),
+            ("application", "applicationId", expected_application_id.clone()),
             (
                 "collection",
                 "collectionArn",
@@ -413,7 +427,7 @@ async fn a_created_integration_is_reported_back_exactly_as_it_was_configured() {
             ("collection", "collectionEndpoint"),
         ] {
             assert_eq!(
-                details.get(resource).and_then(|r| r.get(key)),
+                details.get(resource).and_then(|reported| reported.get(key)),
                 None,
                 "case {case:?}: no {resource}.{key} is reported, got {details}"
             );
@@ -829,11 +843,11 @@ async fn a_put_the_service_will_not_accept_persists_nothing() {
             INVALID_PARAMETER,
         ),
         (
-            "retentionDays one above the published maximum of 30",
+            "retentionDays one above the maximum of 3650 the service enforces",
             put_with_config(json!({
                 "dataSourceRoleArn": role_arn(),
                 "dashboardViewerPrincipals": [role_arn()],
-                "retentionDays": 31,
+                "retentionDays": 3651,
             })),
             INVALID_PARAMETER,
         ),

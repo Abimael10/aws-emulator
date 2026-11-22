@@ -16,13 +16,20 @@
 //! call — has finished it, after which it is gone. An `integrationArn` that is not an ARN
 //! and an identifier no association is stored under persist nothing and are refused.
 //!
+//! Every `integrationArn` here names an S3 Table Integration of the account and Region the
+//! calls are signed for, and every data source is named in the letters, digits and
+//! underscores a source name is spelled in; the refusals for the other forms are the
+//! subject of `s3_table_source_validation`.
+//!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
 //! response that is not computed from the shared store cannot pass.
 //!
-//! The tables span what the rule generalises over rather than one request: integration ARNs
-//! of three services, two partitions and two Regions; data sources named from one character
-//! to 256, with and without a `type`, and two data sources differing only in their type;
+//! The tables span what the rule generalises over rather than one request: four integrations
+//! of the account, their ids both plain names and in the UUID form the owning service mints;
+//! data sources named from one character
+//! to 256, two data sources differing only in their type, and several data sources of one
+//! integration;
 //! several associations per integration and several integrations per account; `maxResults`
 //! at both published bounds of `ListSourcesForS3TableIntegrationMaxResults`' `@range(1..100)`
 //! and one past each (source:
@@ -70,33 +77,49 @@ fn not_found_message(identifier: &str) -> String {
     format!("Association not found for identifier: {identifier}")
 }
 
-/// The account every ARN this emulator mints carries, and the one the tests' ARNs name.
-const ACCOUNT: &str = "000000000000";
+/// The ARN that is the handle on the S3 Table Integration `id`, which is what every
+/// `integrationArn` of this family names: the one the service that OWNS an S3 Table
+/// Integration mints, in the account and Region the calls are signed for.
+fn arn_of(id: &str) -> String {
+    crate::harness::s3_table_integration_arn(REGION, id)
+}
 
-/// An S3 Tables table ARN: the kind of resource an S3 Table Integration's query access is
-/// served from.
+/// Stand up every integration this suite's rows name, so each `integrationArn` below names
+/// one the account HOLDS. They are the owning service's records; see
+/// [`crate::harness::seed_s3_table_integration`] for why they are seeded rather than created.
+fn seed_integrations(logs: &Logs) {
+    for id in [
+        "logs-lake",
+        "s3-tables-lake",
+        "6f5a0b2c-1d3e-4f50-8a9b-0c1d2e3f4a5b",
+        "analytics-lake",
+        "empty-lake",
+        "other-lake",
+    ] {
+        crate::harness::seed_s3_table_integration(logs, REGION, id);
+    }
+}
+
+/// One integration of the account, named by a plain id.
 fn table_arn() -> String {
-    format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/logs-lake/table/cloudwatch")
+    arn_of("logs-lake")
 }
 
-/// A CloudWatch Logs integration ARN, in the same Region as the calls.
+/// A SECOND integration of the account, so a row proves each integration reports its own
+/// associations.
 fn logs_integration_arn() -> String {
-    format!("arn:aws:logs:{REGION}:{ACCOUNT}:integration/s3-tables-lake")
+    arn_of("s3-tables-lake")
 }
 
-/// The ARN of an S3 Table Integration as the telemetry control plane names one, which is
-/// the form a caller of this family holds.
+/// A third integration, whose id is in the UUID form the owning service mints.
 fn telemetry_integration_arn() -> String {
-    format!(
-        "arn:aws:observabilityadmin:{REGION}:{ACCOUNT}:s3-table-integration/\
-         6f5a0b2c-1d3e-4f50-8a9b-0c1d2e3f4a5b"
-    )
+    arn_of("6f5a0b2c-1d3e-4f50-8a9b-0c1d2e3f4a5b")
 }
 
-/// An ARN in another partition and another Region, so a row proves the association is kept
-/// against the ARN the request gave rather than one rebuilt from the call's own scope.
+/// A fourth integration, so a row proves the association is kept against the ARN the request
+/// gave rather than one rebuilt from the call's own scope.
 fn gov_arn() -> String {
-    format!("arn:aws-us-gov:s3tables:us-gov-west-1:{ACCOUNT}:bucket/gov-lake")
+    arn_of("analytics-lake")
 }
 
 /// One association to make: the integration it is made against and the data source it gives
@@ -209,43 +232,44 @@ fn pin_removal_due(logs: &Logs, identifier: &str, due_ms: i64) {
 #[tokio::test]
 async fn an_associated_source_is_reported_for_its_own_integration() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let long_name = "a".repeat(256);
     let rows = [
         Row {
             case: "an S3 Tables table, a typed data source",
             integration_arn: table_arn(),
-            name: "AWS::EC2::VPCFlowLogs".to_string(),
+            name: "amazon_vpc".to_string(),
             source_type: Some("VPC_FLOW_LOGS"),
         },
         Row {
             case: "the same integration, the same name under another type",
             integration_arn: table_arn(),
-            name: "AWS::EC2::VPCFlowLogs".to_string(),
+            name: "amazon_vpc".to_string(),
             source_type: Some("OCSF_VPC_FLOW_LOGS"),
         },
         Row {
-            case: "the same integration, a data source with no type",
+            case: "the same integration, another data source",
             integration_arn: table_arn(),
-            name: "aws/lambda/orders.fn".to_string(),
-            source_type: None,
+            name: "aws_lambda_orders".to_string(),
+            source_type: Some("LAMBDA_LOGS"),
         },
         Row {
-            case: "a logs integration ARN, a one-character name",
+            case: "a second integration, a one-character name",
             integration_arn: logs_integration_arn(),
             name: "w".to_string(),
             source_type: Some("WAF_LOGS"),
         },
         Row {
-            case: "another partition and Region, a 256-character name",
+            case: "another integration, a 256-character name",
             integration_arn: gov_arn(),
             name: long_name.clone(),
             source_type: Some("CLOUDTRAIL"),
         },
         Row {
-            case: "a telemetry S3 Table Integration ARN",
+            case: "an integration whose id is a UUID",
             integration_arn: telemetry_integration_arn(),
-            name: "AWS::Logs::LogGroup".to_string(),
+            name: "amazon_logs".to_string(),
             source_type: Some("CLOUDWATCH_LOGS"),
         },
     ];
@@ -331,7 +355,7 @@ async fn an_associated_source_is_reported_for_its_own_integration() {
     }
 
     // An integration nothing was associated with is read successfully and holds nothing.
-    let untouched = format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/empty-lake");
+    let untouched = arn_of("empty-lake");
     let listed = sources(&logs, &untouched, None).await;
     assert!(
         listed.is_empty(),
@@ -345,19 +369,20 @@ async fn an_associated_source_is_reported_for_its_own_integration() {
 #[tokio::test]
 async fn associating_a_pair_that_already_has_access_names_the_same_association() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let rows = [
         Row {
             case: "a typed data source",
             integration_arn: table_arn(),
-            name: "AWS::EC2::VPCFlowLogs".to_string(),
+            name: "amazon_vpc".to_string(),
             source_type: Some("VPC_FLOW_LOGS"),
         },
         Row {
-            case: "a data source with no type",
+            case: "another data source",
             integration_arn: logs_integration_arn(),
-            name: "aws/lambda/orders.fn".to_string(),
-            source_type: None,
+            name: "aws_lambda_orders".to_string(),
+            source_type: Some("LAMBDA_LOGS"),
         },
     ];
 
@@ -385,19 +410,20 @@ async fn associating_a_pair_that_already_has_access_names_the_same_association()
 #[tokio::test]
 async fn a_disassociated_source_is_deleting_until_the_clock_has_removed_it() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let rows = [
         Row {
             case: "a typed data source",
             integration_arn: table_arn(),
-            name: "AWS::EC2::VPCFlowLogs".to_string(),
+            name: "amazon_vpc".to_string(),
             source_type: Some("VPC_FLOW_LOGS"),
         },
         Row {
-            case: "a data source with no type",
+            case: "another data source",
             integration_arn: table_arn(),
-            name: "aws/lambda/orders.fn".to_string(),
-            source_type: None,
+            name: "aws_lambda_orders".to_string(),
+            source_type: Some("LAMBDA_LOGS"),
         },
         Row {
             case: "another integration",
@@ -501,11 +527,12 @@ async fn a_disassociated_source_is_deleting_until_the_clock_has_removed_it() {
 #[tokio::test]
 async fn reading_an_integrations_sources_changes_nothing() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let row = Row {
         case: "one association, read twice",
         integration_arn: table_arn(),
-        name: "AWS::EC2::VPCFlowLogs".to_string(),
+        name: "amazon_vpc".to_string(),
         source_type: Some("VPC_FLOW_LOGS"),
     };
     let identifier = associate(&logs, &row).await;
@@ -532,6 +559,7 @@ async fn reading_an_integrations_sources_changes_nothing() {
 #[tokio::test]
 async fn pagination_walks_each_association_once() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let integration_arn = table_arn();
     let mut expected: Vec<String> = Vec::new();
@@ -539,8 +567,12 @@ async fn pagination_walks_each_association_once() {
         let row = Row {
             case: "one of five associations",
             integration_arn: integration_arn.clone(),
-            name: format!("aws/vended/{index}"),
-            source_type: (index % 2 == 0).then_some("VENDED_LOGS"),
+            name: format!("aws_vended_{index}"),
+            source_type: Some(if index % 2 == 0 {
+                "VENDED_LOGS"
+            } else {
+                "CLOUDTRAIL"
+            }),
         };
         expected.push(associate(&logs, &row).await);
     }
@@ -592,6 +624,7 @@ async fn pagination_walks_each_association_once() {
 #[tokio::test]
 async fn a_request_the_family_cannot_accept_is_refused_and_stores_nothing() {
     let logs = Logs::new();
+    seed_integrations(&logs);
 
     let integration_arn = table_arn();
     let stored = associate(
@@ -599,34 +632,42 @@ async fn a_request_the_family_cannot_accept_is_refused_and_stores_nothing() {
         &Row {
             case: "the one association the refusals must not disturb",
             integration_arn: integration_arn.clone(),
-            name: "AWS::EC2::VPCFlowLogs".to_string(),
+            name: "amazon_vpc".to_string(),
             source_type: Some("VPC_FLOW_LOGS"),
         },
     )
     .await;
 
-    // (case, the value handed to `integrationArn`) — values that are not ARNs at all.
-    let not_arns: [(&str, &str); 4] = [
-        ("an empty value", ""),
-        ("a bare name", "logs-lake"),
-        ("a prefix with no segments", "arn:"),
-        ("too few segments", "arn:aws:s3tables:eu-west-2"),
+    // (case, the value handed to `integrationArn`, the refusal it must answer) — a value
+    // shorter than the length an ARN takes is refused on that bound, and a longer one that
+    // is still not an ARN on being unparsable.
+    let short_arn = "1 validation error detected: Value at 'integrationArn' failed to satisfy \
+                     constraint: Member must have length greater than or equal to 20";
+    let not_arns: [(&str, &str, &str); 4] = [
+        ("an empty value", "", short_arn),
+        ("a bare name", "logs-lake", short_arn),
+        ("a prefix with no segments", "arn:", short_arn),
+        (
+            "long enough, but too few segments",
+            "arn:aws:s3tables:eu-west-2",
+            "1 validation error detected: Unable to parse integrationArn \
+             arn:aws:s3tables:eu-west-2",
+        ),
     ];
-    for (case, value) in not_arns {
+    for (case, value, expected) in not_arns {
         for operation in [ASSOCIATE, LIST] {
             let mut body = json!({"integrationArn": value});
             if operation == ASSOCIATE {
-                body["dataSource"] = data_source("AWS::EC2::VPCFlowLogs", Some("VPC_FLOW_LOGS"));
+                body["dataSource"] = data_source("amazon_vpc", Some("VPC_FLOW_LOGS"));
             }
             let (code, message) = logs.refusal(operation, &body).await;
             assert_eq!(
                 code, VALIDATION,
                 "case {operation} with {case}: expected {VALIDATION}, got {code} {message}"
             );
-            assert!(
-                message.contains("integrationArn") && message.contains(value),
-                "case {operation} with {case}: expected a message naming integrationArn and \
-                 {value:?}, got {message:?}"
+            assert_eq!(
+                message, expected,
+                "case {operation} with {case}: expected {expected:?}, got {message:?}"
             );
         }
     }
@@ -646,7 +687,7 @@ async fn a_request_the_family_cannot_accept_is_refused_and_stores_nothing() {
     }
 
     // A token this integration's walk never issued, and one issued for another integration.
-    let other = format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/other-lake");
+    let other = arn_of("other-lake");
     associate(
         &logs,
         &Row {
@@ -729,6 +770,7 @@ async fn a_request_the_family_cannot_accept_is_refused_and_stores_nothing() {
 #[tokio::test]
 async fn an_associate_past_the_store_cap_retains_nothing() {
     let logs = Logs::new();
+    seed_integrations(&logs);
     let integration_arn = table_arn();
 
     // Fill the store to its cap. Nothing a client sends chooses how many associations the
@@ -748,7 +790,7 @@ async fn an_associate_past_the_store_cap_retains_nothing() {
                     &identifier,
                     &integration_arn,
                     &DataSource {
-                        name: format!("aws/seeded/{seq}"),
+                        name: format!("aws_seeded_{seq}"),
                         r#type: Some("VENDED_LOGS".to_string()),
                     },
                     now_ms(),
@@ -759,7 +801,7 @@ async fn an_associate_past_the_store_cap_retains_nothing() {
 
     let body = json!({
         "integrationArn": integration_arn,
-        "dataSource": data_source("one-too-many", Some("VENDED_LOGS")),
+        "dataSource": data_source("one_too_many", Some("VENDED_LOGS")),
     });
     let (code, message) = logs.refusal(ASSOCIATE, &body).await;
     assert_eq!(

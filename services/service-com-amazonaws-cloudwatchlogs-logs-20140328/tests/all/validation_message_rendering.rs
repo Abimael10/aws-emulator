@@ -38,6 +38,14 @@ use crate::harness::{error_code, Logs};
 /// the only violation in the response.
 const SOME_ARN: &str = "arn:aws:logs:eu-west-2:123456789012:log-group:probe";
 
+/// The ARN of an S3 Table Integration, which is the ONE form
+/// `ListSourcesForS3TableIntegration$integrationArn` resolves an integration from — the ARN
+/// the service that owns one mints, in this account and the Region the calls are signed for
+/// — so a row about another member of that operation is refused for THAT member and not for
+/// its ARN.
+const S3_TABLE_INTEGRATION_ARN: &str =
+    "arn:aws:observabilityadmin:eu-west-2:000000000000:s3tableintegration/probe";
+
 /// One refused request and the whole message this service must answer it with.
 struct Case {
     /// What this row is about, named in every assertion.
@@ -211,14 +219,14 @@ fn cases() -> Vec<Case> {
         Case {
             name: "ListSourcesForS3TableIntegration maxResults one past the maximum",
             operation: "ListSourcesForS3TableIntegration",
-            body: json!({"integrationArn": SOME_ARN, "maxResults": 101}),
+            body: json!({"integrationArn": S3_TABLE_INTEGRATION_ARN, "maxResults": 101}),
             code: VALIDATION,
             message: at("maxResults", "Member must have value less than or equal to 100"),
         },
         Case {
             name: "ListSourcesForS3TableIntegration maxResults one below the minimum",
             operation: "ListSourcesForS3TableIntegration",
-            body: json!({"integrationArn": SOME_ARN, "maxResults": 0}),
+            body: json!({"integrationArn": S3_TABLE_INTEGRATION_ARN, "maxResults": 0}),
             code: VALIDATION,
             message: at(
                 "maxResults",
@@ -319,20 +327,23 @@ async fn a_refused_request_states_the_position_and_the_constraint_only() {
 #[tokio::test]
 async fn a_value_on_either_published_bound_is_not_refused() {
     let logs = Logs::new();
+    // The integration the S3-table rows read: an `integrationArn` is resolved against the
+    // integrations the account holds, so a row about `maxResults` needs one to exist.
+    crate::harness::seed_s3_table_integration(&logs, "eu-west-2", "probe");
     // (case, operation, member, request, the status the request must reach)
     let rows: [(&str, &str, &str, Value, u16); 4] = [
         (
             "ListSourcesForS3TableIntegration maxResults at the minimum",
             "ListSourcesForS3TableIntegration",
             "maxResults",
-            json!({"integrationArn": SOME_ARN, "maxResults": 1}),
+            json!({"integrationArn": S3_TABLE_INTEGRATION_ARN, "maxResults": 1}),
             200,
         ),
         (
             "ListSourcesForS3TableIntegration maxResults at the maximum",
             "ListSourcesForS3TableIntegration",
             "maxResults",
-            json!({"integrationArn": SOME_ARN, "maxResults": 100}),
+            json!({"integrationArn": S3_TABLE_INTEGRATION_ARN, "maxResults": 100}),
             200,
         ),
         (
@@ -378,7 +389,11 @@ async fn two_violations_render_as_two_clauses_without_values() {
     let (status, parsed) = logs
         .call(
             "ListSourcesForS3TableIntegration",
-            &json!({"integrationArn": SOME_ARN, "maxResults": 101, "nextToken": ""}),
+            &json!({
+                "integrationArn": S3_TABLE_INTEGRATION_ARN,
+                "maxResults": 101,
+                "nextToken": "",
+            }),
         )
         .await;
     assert_eq!(status, 400, "expected HTTP 400, got {status} {parsed}");

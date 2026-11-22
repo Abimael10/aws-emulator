@@ -4,8 +4,10 @@
 //! Implemented: gives ONE data source query access through the S3 Table Integration the
 //! request's `integrationArn` names, stores that association ACTIVE and hands back the
 //! unique identifier it is stored under — the stored one when the pair already has access,
-//! because an association IS that pairing. Refuses an `integrationArn` that is not an ARN,
-//! and an associate past this emulator's association cap. This is the ONLY file to touch
+//! because an association IS that pairing. Refuses a `dataSource` whose name or type is not
+//! spelled in letters, digits and underscores and one that names no type at all; refuses an
+//! `integrationArn` this service cannot resolve an integration of this account from; and
+//! refuses an associate past this emulator's association cap. This is the ONLY file to touch
 //! for this operation.
 //!
 //! ## Shape of an operation
@@ -148,29 +150,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata: the integration this association is made
-        // against is the one the request's own ARN names, and the identifier handed back is
-        // minted from the store, so nothing here is read from the request's Region.
-        let _ = ctx;
+        // The Region the request was signed for: an S3 Table Integration is reachable only
+        // from the account and Region it was created in, so it is part of the handle the
+        // request's own `integrationArn` has to carry.
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: String| {
+            AssociateSourceToS3TableIntegrationError::from(
+                AssociateSourceToS3TableIntegrationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
 
         // "The Amazon Resource Name (ARN) of the S3 Table Integration to associate the data
-        // source with": the member is modelled as an `Arn`, so a value that is not an ARN at
-        // all names no integration and is refused with the validation-error template this
-        // service words an unparsable ARN with, naming the member.
-        //
-        // It is held to nothing further. `PutIntegration`'s `integrationType` admits only
-        // `OPENSEARCH`, so no operation of this service creates an S3 Table Integration:
-        // the integration is a resource of another service, and a well-formed ARN naming
-        // one is all this service can know about it.
+        // source with": the member is modelled as an `Arn`, so a value this service cannot
+        // read an ARN out of names no integration. It is held FIRST to the length an ARN
+        // takes — stated in the standard constraint clause, naming the member and the
+        // bound — and only a value long enough to be an ARN is then refused as unparsable.
         if let Some(message) =
-            crate::state::unparsable_arn_message("integrationArn", &input.integration_arn)
+            crate::state::malformed_arn_message("integrationArn", &input.integration_arn)
         {
-            return Err(AssociateSourceToS3TableIntegrationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
-            .into());
+            return Err(invalid(message));
+        }
+
+        // "The data source to associate with the S3 Table Integration. Contains the name and
+        // type of the data source": a source NAME is spelled in letters, digits and
+        // underscores, so a name carrying anything else names no data source — refused with
+        // the sentence stating that rule, before anything is stored for it.
+        if let Some(message) =
+            crate::state::invalid_data_source_name_message(&input.data_source.name)
+        {
+            return Err(invalid(message.to_string()));
+        }
+
+        // A data source "categorizes logs by originating service and log type", so the TYPE
+        // is required here even though the model leaves the member optional: a request that
+        // names none is refused at the position the service validates it at, and one that
+        // names a type outside the character set a source is spelled in is refused by the
+        // same rule the NAME is held to.
+        if input.data_source.r#type.is_none() {
+            return Err(invalid(crate::state::missing_data_source_type_message()));
+        }
+        if let Some(message) =
+            crate::state::invalid_data_source_type_message(input.data_source.r#type.as_deref())
+        {
+            return Err(invalid(message.to_string()));
+        }
+
+        // The ARN has to name an S3 Table Integration this caller holds: the integrations of
+        // an account are the records of the service that owns them, so the ARN is resolved
+        // where they live and the rung it fails is what the refusal states.
+        if let Some(message) = crate::state::unresolved_integration_message(
+            &*self.engine,
+            &region,
+            &input.integration_arn,
+        ) {
+            return Err(invalid(message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

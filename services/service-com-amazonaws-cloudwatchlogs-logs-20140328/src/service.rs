@@ -83,7 +83,13 @@
 //! * the subject is `Value at '<member path>'` whether a value reached the member or not:
 //!   the recorded refusal for an ABSENT `@required` member states
 //!   `Value at 'storageTier' failed to satisfy constraint: Member must not be null`,
-//!   with no `null` in the subject, exactly as a present-but-invalid value's clause reads;
+//!   with no `null` in the subject, exactly as a present-but-invalid value's clause reads.
+//!   The ONE exception is a member the newer S3-table-source surface requires and the
+//!   BOUNDARY walk cannot see, because the model leaves it optional: the recorded refusal
+//!   of an associate carrying a data source with no type states
+//!   `Value null at 'sourceType' failed to satisfy constraint: Member must not be null`,
+//!   so that absent-member subject is worded by [`absent_member_clause`] and belongs to
+//!   that surface alone;
 //! * an enum's admissible set is listed in the order AWS PUBLISHES for that enum
 //!   ([`PUBLISHED_ENUM_ORDERS`]) — the order its own documentation and its model
 //!   declaration state the values in — and, for an enum this service publishes no order
@@ -202,6 +208,10 @@ pub mod management_events;
 /// The layer that counts every call this service answers into the usage telemetry it
 /// publishes about its own API ([`crate::state::api_usage`]).
 pub mod api_usage;
+
+/// The members an integration response carries on the wire beside the ones its modelled
+/// output shape declares, each derived from the modelled members of the same response.
+pub mod integration_wire_members;
 
 /// The operations the generated routing table cannot serve: each one's output member
 /// targets a `@streaming` union (`StartLiveTail$responseStream`,
@@ -514,8 +524,27 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
 /// The clause a member at `path` is refused with: the position and the requirement, with
 /// no value — the one subject form this service states, for a value it rejected and for a
 /// member the request never carried alike.
-fn clause_at(path: &str, requirement: &str) -> String {
+///
+/// `pub(crate)` for the refusals a HANDLER words itself: one of them states SEVERAL clauses
+/// in one envelope ([`crate::state::config_constraint_envelope`]), so it needs the clause
+/// without the envelope that [`one_violation_message`] wraps a single one in.
+pub(crate) fn clause_at(path: &str, requirement: &str) -> String {
     format!("{SUBJECT} '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// How the newer S3-table-source surface names the subject of a clause about a member the
+/// request did not carry: `Value null at '<member path>'`, the ONE place this service states
+/// a `null` in the subject (see "How this service words a refusal" for the recording).
+const ABSENT_MEMBER_SUBJECT: &str = "Value null at";
+
+/// The clause a member the request did NOT carry is refused with on that surface: the
+/// position, the `null` subject it states there, and the requirement.
+///
+/// `pub(crate)` for the same reason [`clause_at`] is: the handler words the refusal, because
+/// the member is modelled optional and the validating walk has nothing to report at it
+/// ([`crate::state::missing_data_source_type_message`]).
+pub(crate) fn absent_member_clause(path: &str, requirement: &str) -> String {
+    format!("{ABSENT_MEMBER_SUBJECT} '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The envelope one clause is wrapped in.
@@ -672,11 +701,16 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The dispatch `override_operation` hands back, which carries the served
     /// operation's refusal code into [`Service::override_refusal`] — under the layer that
     /// names the request its response answers, over the layer that counts the call into this
-    /// service's own usage telemetry ([`api_usage::Metered`]), and over the audited table
-    /// whose every row is served behind the IAM decision. Held on the service because that
+    /// service's own usage telemetry ([`api_usage::Metered`]), over the layer that adds the
+    /// members an integration response carries on the wire beyond its modelled output shape
+    /// ([`integration_wire_members::WithWireMembers`]), and over the audited table whose
+    /// every row is served behind the IAM decision. Held on the service because that
     /// seam returns a borrow of `self`.
     refusal_scope: stated_request_id::StatedRequestIdOperation<
-        api_usage::Metered<Eng, OperationScopedRefusal>,
+        api_usage::Metered<
+            Eng,
+            integration_wire_members::WithWireMembers<OperationScopedRefusal>,
+        >,
     >,
     /// One of this service's two event-stream operations, `StartLiveTail`. It is NOT in the
     /// entry's routing table in a servable form: the generated `ErasedOperation` shim of
@@ -744,7 +778,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 stated_request_id::report,
             ),
             refusal_scope: stated_request_id::StatedRequestIdOperation::new(
-                api_usage::Metered::new(Arc::clone(&engine), OperationScopedRefusal),
+                api_usage::Metered::new(
+                    Arc::clone(&engine),
+                    integration_wire_members::WithWireMembers::new(OperationScopedRefusal),
+                ),
             ),
             start_live_tail: authorized(
                 START_LIVE_TAIL_OPERATION,

@@ -228,6 +228,42 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
 }
 
+/// The ARN that is the handle on the S3 Table Integration `id` in `region`: the one the
+/// service that OWNS an S3 Table Integration mints, which is what an `integrationArn` of
+/// CloudWatch Logs' S3-table-source family names.
+pub fn s3_table_integration_arn(region: &str, id: &str) -> String {
+    service_com_amazonaws_observabilityadmin_observabilityadmin::state::s3_table_integration_arn(
+        region, id,
+    )
+}
+
+/// Stand up the S3 Table Integration `id` in `region`, as the service that OWNS one holds
+/// it, and answer the ARN that is the handle on it.
+///
+/// An S3 Table Integration is CloudWatch Observability Admin's record, and that service's
+/// own create admits ONE per Region; a suite about what CloudWatch Logs resolves from an
+/// integration's ARN needs several of them in one Region, so they are seeded here through
+/// that service's own record type on the SHARED engine — the same store its reads serve from
+/// — and everything the suite then asserts goes over the wire like any client's call.
+pub fn seed_s3_table_integration(logs: &Logs, region: &str, id: &str) -> String {
+    use service_com_amazonaws_observabilityadmin_observabilityadmin::state as owner;
+
+    let arn = s3_table_integration_arn(region, id);
+    let state = logs
+        .engine()
+        .state::<owner::ComAmazonawsObservabilityadminObservabilityadminState>();
+    state
+        .lock()
+        .insert_s3_table_integration(owner::StoredS3TableIntegration {
+            id: id.to_string(),
+            region: region.to_string(),
+            arn: arn.clone(),
+            created_timestamp_ms: now_ms(),
+            ..owner::StoredS3TableIntegration::default()
+        });
+    arn
+}
+
 /// The request id the SDK error envelope in `said` reports, asserted to carry the 8-4-4-4-12
 /// lowercase-hex form every AWS request id has.
 ///
