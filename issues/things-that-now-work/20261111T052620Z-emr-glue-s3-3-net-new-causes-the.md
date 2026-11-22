@@ -10,6 +10,8 @@ Issue-Commit: 41e8aa3f6ef6702105d7e1e39f8f06aa9334e793
 
 # emr__glue__s3: 3 net-new causes — the Glue crawler ignores its role's S3 permissions, CreateCrawler accepts an S3 target in a nonexistent bucket (no 404 S3-target validation, so CloudFormation reports CREATE_COMPLETE), and crawler completion drives no EventBridge rule
 
+> _Annotation (added while fixing `20261115T181212Z-glue-2-net-new-causes-createcrawler-never-accepts.md`): Cause 2's create-time S3-target validation is no longer in force, and the five crawler checks of that issue are why. They record AWS SERVING `CreateCrawler` over an Amazon S3 path whose bucket the caller's account does not hold, while this issue records AWS REFUSING one with the S3 404 — both are real, because only a bucket that exists NOWHERE answers Glue's probe `NoSuchBucket` while one owned elsewhere answers `AccessDenied`, and this emulator's object store cannot tell those apart: it answers 404 for every bucket it does not hold. One rule had to be chosen, and keying it on a bucket NAME is no rule at all, so the emulator now stores a crawler's targets as written and leaves the reading of a target to the crawl. Cause 2's expectation therefore no longer holds; Causes 1 and 3 are untouched._
+
 > _Note: this issue was identified against the code base at commit `41e8aa3f6ef6702105d7e1e39f8f06aa9334e793`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

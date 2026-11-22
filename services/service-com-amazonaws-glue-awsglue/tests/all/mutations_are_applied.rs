@@ -585,9 +585,9 @@ async fn a_partition_update_is_read_back_from_the_store() {
             row.updated
                 .get("Parameters")
                 .cloned()
-                // A partition whose update submitted no parameters declares none, which
-                // the catalog reports as the empty map rather than as an absent member.
-                .unwrap_or_else(|| json!({})),
+                // A partition whose update submitted no parameters declares none, which the
+                // catalog reports by withholding the member rather than inventing a map.
+                .unwrap_or(Value::Null),
             "case {case}: the read must report the parameters the update wrote, got {partition}"
         );
         assert_eq!(

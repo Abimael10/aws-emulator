@@ -168,27 +168,15 @@ pub(crate) const SETTABLE_MEMBERS: [&str; 4] = [
 /// Assert that `member`, which a write did not submit, carries nothing in the definition
 /// a read reports back for `values`.
 ///
-/// What "nothing" looks like differs by member, because the catalog reports the
-/// key-value PROPERTIES of a definition it holds definitely: a partition whose
-/// `Parameters` a write cleared declares no property, which the catalog reports as the
-/// empty map `{}` rather than as an absent member, while every other member a write
-/// omitted is simply absent.
+/// The catalog serves a definition as it was written, so EVERY member a write omitted —
+/// the key-value `Parameters` the client supplies included — is absent from the read.
 pub(crate) fn assert_member_cleared(case: &str, values: &[&str], member: &str, partition: &Value) {
     let actual = partition.get(member);
-    if member == "Parameters" {
-        assert_eq!(
-            actual,
-            Some(&json!({})),
-            "case {case}: partition {values:?} must report an empty Parameters map, which the \
-             write left carrying nothing, got {actual:?}"
-        );
-    } else {
-        assert!(
-            actual.is_none_or(Value::is_null),
-            "case {case}: partition {values:?} must not report {member}, which the write \
-             omitted, got {actual:?}"
-        );
-    }
+    assert!(
+        actual.is_none_or(Value::is_null),
+        "case {case}: partition {values:?} must not report {member}, which the write \
+         omitted, got {actual:?}"
+    );
 }
 
 /// Read one partition that must be there, and return it.

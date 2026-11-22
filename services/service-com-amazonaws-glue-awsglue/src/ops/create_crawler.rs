@@ -20,9 +20,9 @@
 //! NAMES the grant those policies withhold, and a role nothing can be shown about is not
 //! refused (see [`crate::state::crawl_target_grant_refusal`]).
 //!
-//! Each S3 target's `Path` is RESOLVED against the object store, and a path whose bucket the
-//! store does not hold is refused with `InvalidInputException` with nothing persisted (see
-//! [`crate::state::s3_target_refusal`]).
+//! An S3 target's `Path` names the data a LATER crawl walks rather than a resource this
+//! service owns, so it is persisted as written: the object store is not asked whether it holds
+//! that bucket yet, because a crawler is registered before the data it crawls exists.
 //!
 //! ## Shape of an operation
 //!
@@ -274,25 +274,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `S3Target$Path` is the Amazon S3 path a crawl of this crawler would walk, so each
-        // one is RESOLVED against the object store before the crawler is stored: a path
-        // whose bucket the store does not hold backs no crawl, so the create is refused
-        // naming that target and the store's own answer about it, and nothing is persisted
-        // (see `crate::state::s3_target_refusal`). Only what the store ANSWERED refuses the
-        // create, and a prefix holding no object yet is not refused — a crawler is
-        // routinely registered before the data it crawls is written. Awaited before the
-        // store is locked.
-        if let Some(message) =
-            crate::state::s3_target_refusal(ctx, &region, &input.targets).await
-        {
-            return Err(CreateCrawlerErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(message),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
+        // `S3Target$Path` is the Amazon S3 path a LATER crawl of this crawler would walk, not
+        // a resource this create brings into being: the crawler definition merely REFERS to
+        // it, and the operation models no not-found error for one. So the path is stored as
+        // written and the object store is never asked whether it holds that bucket — a
+        // crawler is routinely registered before the bucket or the data behind it exists,
+        // and a crawl that cannot read a target reports that on the crawl itself (see
+        // `crate::state::crawl`).
 
         // A target the crawl reads through ANOTHER service's data plane is read as the
         // crawler's `Role`, so the policies in force on that role have to admit the calls

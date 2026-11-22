@@ -100,16 +100,14 @@ pub(crate) async fn get_table(router: &MultiServiceRouter, database: &str) -> Va
 /// What a `TableInput` member reads back as on a definition that does NOT carry it.
 ///
 /// Absent is absent for every member the model declares nullable, and awsJson omits
-/// those. `Retention` is the one member of `com.amazonaws.glue#TableInput` that is a
-/// plain (non-nullable) integer (source: `smithy_query shape=TableInput`), so a
-/// definition that carries no retention reads back as the zero it defaults to rather
-/// than as nothing. `Parameters` is the table's own key-value property map, part of the
-/// definition the catalog holds, so a definition that declares no property reads back as
-/// the EMPTY map rather than as nothing.
+/// those — the table's own key-value property map `Parameters` included, since those
+/// properties are the client's to supply and the catalog invents none. `Retention` is the
+/// one member of `com.amazonaws.glue#TableInput` that is a plain (non-nullable) integer
+/// (source: `smithy_query shape=TableInput`), so a definition that carries no retention
+/// reads back as the zero it defaults to rather than as nothing.
 fn absence_reads_as(member: &str) -> Value {
     match member {
         "Retention" => json!(0),
-        "Parameters" => json!({}),
         _ => Value::Null,
     }
 }

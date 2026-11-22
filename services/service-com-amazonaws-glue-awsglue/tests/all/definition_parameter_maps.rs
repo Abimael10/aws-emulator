@@ -3,16 +3,17 @@
 //! The `Parameters` maps the Data Catalog reports on a definition it holds.
 //!
 //! The key-value properties of a table, of a partition, and of the storage and SerDe a
-//! definition describes, are part of the definition the catalog stores — `Table$Parameters`
-//! "these key-value pairs define properties associated with the table",
-//! `Partition$Parameters` "these key-value pairs define partition parameters",
-//! `StorageDescriptor$Parameters` "the user-supplied properties in key-value form", and
-//! `SerDeInfo$Parameters` (source: `smithy_query shape=Table,Partition,StorageDescriptor,
-//! SerDeInfo` on this crate's model). A definition that declares no property therefore has
-//! an EMPTY set of properties rather than an unknown one, so every read reports `{}` — just
-//! as the same projection already reports a descriptor's `Columns` and `SortColumns` as
-//! `[]`. A client may then read or merge the map without telling "no properties" apart from
-//! "member not returned".
+//! definition describes are the CLIENT's to supply — `Table$Parameters` "these key-value
+//! pairs define properties associated with the table", `Partition$Parameters` "these
+//! key-value pairs define partition parameters", `StorageDescriptor$Parameters` "the
+//! user-supplied properties in key-value form", and `SerDeInfo$Parameters` (source:
+//! `smithy_query shape=Table,Partition,StorageDescriptor,SerDeInfo` on this crate's model,
+//! where none of the four carries `@required` or `@default`). So the catalog serves a
+//! definition as it was WRITTEN: a map the write supplied comes back as supplied, an
+//! explicitly empty one included, and a map no write ever supplied is ABSENT from the
+//! response rather than materialised empty. A client that diffs a read against the input it
+//! submitted then sees no property it never set, and one that branches on the PRESENCE of a
+//! property map reads what the catalog was told.
 //!
 //! Each suite is a table: the rows differ along what the rule generalises over — which of
 //! the three maps a definition declares, whether the declaration is absent or an explicitly
@@ -26,17 +27,27 @@ use serde_json::{json, Value};
 
 use crate::wire::{emulator, ok};
 
+/// What a read must report for one `Parameters` map: the map the definition was written
+/// with, or ABSENT for a definition that supplied none.
+#[derive(Clone)]
+enum Properties {
+    /// The member must not be in the response at all.
+    Absent,
+    /// The member must be in the response, carrying this map.
+    Reported(Value),
+}
+
 /// What a read must report for the three `Parameters` maps of one table definition.
 struct Expected {
     /// `Table.Parameters`.
-    parameters: Value,
+    parameters: Properties,
     /// `Table.StorageDescriptor.Parameters`, or `None` when the definition carries no
-    /// storage descriptor at all — the catalog holds the properties OF a descriptor it
+    /// storage descriptor at all — the catalog reports the properties OF a descriptor it
     /// stores, not whether there is one.
-    storage: Option<Value>,
+    storage: Option<Properties>,
     /// `Table.StorageDescriptor.SerdeInfo.Parameters`, or `None` when the stored
     /// descriptor names no SerDe.
-    serde: Option<Value>,
+    serde: Option<Properties>,
 }
 
 /// One row of the table suite: the definition created, and what the reads must report.
@@ -52,13 +63,13 @@ struct PartitionCase {
     case: &'static str,
     input: Value,
     /// `Partition.Parameters`.
-    parameters: Value,
+    parameters: Properties,
     /// `Partition.StorageDescriptor.Parameters`, or `None` for a partition stored without
     /// a descriptor.
-    storage: Option<Value>,
+    storage: Option<Properties>,
     /// `Partition.StorageDescriptor.SerdeInfo.Parameters`, or `None` when the stored
     /// descriptor names no SerDe.
-    serde: Option<Value>,
+    serde: Option<Properties>,
 }
 
 /// A map of `entries` properties, for the rows that move the entry COUNT.
@@ -69,13 +80,27 @@ fn properties(entries: usize) -> Value {
     Value::Object(map)
 }
 
+/// Assert one projected definition's `Parameters` member is what the definition was written
+/// with, naming which read answered it and which member is under test.
+fn assert_properties(case: &str, reader: &str, member: &str, held: &Value, want: &Properties) {
+    let reported = held.get("Parameters");
+    match want {
+        Properties::Absent => assert!(
+            reported.is_none(),
+            "case {case}: {reader} must report no {member} for a definition that supplied \
+             none, got {reported:?}"
+        ),
+        Properties::Reported(map) => assert_eq!(
+            reported,
+            Some(map),
+            "case {case}: {reader} must report {member} {map}, got {reported:?}"
+        ),
+    }
+}
+
 /// Assert the three maps of one projected table, naming which read answered it.
 fn assert_table_maps(case: &str, reader: &str, table: &Value, expected: &Expected) {
-    assert_eq!(
-        table["Parameters"], expected.parameters,
-        "case {case}: {reader} must report Table.Parameters {}, got {:?}",
-        expected.parameters, table["Parameters"]
-    );
+    assert_properties(case, reader, "Table.Parameters", table, &expected.parameters);
     match &expected.storage {
         None => assert!(
             table["StorageDescriptor"].is_null(),
@@ -83,10 +108,12 @@ fn assert_table_maps(case: &str, reader: &str, table: &Value, expected: &Expecte
              stores none, got {:?}",
             table["StorageDescriptor"]
         ),
-        Some(storage) => assert_eq!(
-            table["StorageDescriptor"]["Parameters"], *storage,
-            "case {case}: {reader} must report StorageDescriptor.Parameters {storage}, got {:?}",
-            table["StorageDescriptor"]["Parameters"]
+        Some(storage) => assert_properties(
+            case,
+            reader,
+            "StorageDescriptor.Parameters",
+            &table["StorageDescriptor"],
+            storage,
         ),
     }
     match &expected.serde {
@@ -96,10 +123,12 @@ fn assert_table_maps(case: &str, reader: &str, table: &Value, expected: &Expecte
              got {:?}",
             table["StorageDescriptor"]["SerdeInfo"]
         ),
-        Some(serde) => assert_eq!(
-            table["StorageDescriptor"]["SerdeInfo"]["Parameters"], *serde,
-            "case {case}: {reader} must report SerdeInfo.Parameters {serde}, got {:?}",
-            table["StorageDescriptor"]["SerdeInfo"]["Parameters"]
+        Some(serde) => assert_properties(
+            case,
+            reader,
+            "SerdeInfo.Parameters",
+            &table["StorageDescriptor"]["SerdeInfo"],
+            serde,
         ),
     }
 }
@@ -125,16 +154,16 @@ fn table_cases() -> Vec<TableCase> {
                 }
             }),
             expected: Expected {
-                parameters: json!({}),
-                storage: Some(json!({})),
-                serde: Some(json!({})),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Absent),
+                serde: Some(Properties::Absent),
             },
         },
         TableCase {
             case: "no storage descriptor at all",
             input: json!({ "Name": "no_storage", "TableType": "EXTERNAL_TABLE" }),
             expected: Expected {
-                parameters: json!({}),
+                parameters: Properties::Absent,
                 storage: None,
                 serde: None,
             },
@@ -147,8 +176,8 @@ fn table_cases() -> Vec<TableCase> {
                 "StorageDescriptor": { "Location": "s3://bucket/no_serde/" }
             }),
             expected: Expected {
-                parameters: json!({}),
-                storage: Some(json!({})),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Absent),
                 serde: None,
             },
         },
@@ -164,9 +193,9 @@ fn table_cases() -> Vec<TableCase> {
                 }
             }),
             expected: Expected {
-                parameters: json!({ "classification": "csv" }),
-                storage: Some(json!({})),
-                serde: Some(json!({})),
+                parameters: Properties::Reported(json!({ "classification": "csv" })),
+                storage: Some(Properties::Absent),
+                serde: Some(Properties::Absent),
             },
         },
         TableCase {
@@ -181,12 +210,16 @@ fn table_cases() -> Vec<TableCase> {
                 }
             }),
             expected: Expected {
-                parameters: json!({}),
-                storage: Some(json!({ "skip.header.line.count": "1" })),
-                serde: Some(json!({ "field.delim": "," })),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Reported(
+                    json!({ "skip.header.line.count": "1" }),
+                )),
+                serde: Some(Properties::Reported(json!({ "field.delim": "," }))),
             },
         },
         TableCase {
+            // A map the write SUPPLIED is reported as supplied, even with nothing in it:
+            // the catalog drops no property set it was told about.
             case: "all three maps sent explicitly empty",
             input: json!({
                 "Name": "explicitly_empty",
@@ -199,9 +232,9 @@ fn table_cases() -> Vec<TableCase> {
                 }
             }),
             expected: Expected {
-                parameters: json!({}),
-                storage: Some(json!({})),
-                serde: Some(json!({})),
+                parameters: Properties::Reported(json!({})),
+                storage: Some(Properties::Reported(json!({}))),
+                serde: Some(Properties::Reported(json!({}))),
             },
         },
         TableCase {
@@ -219,9 +252,9 @@ fn table_cases() -> Vec<TableCase> {
                 }
             }),
             expected: Expected {
-                parameters: properties(12),
-                storage: Some(properties(1)),
-                serde: Some(json!({})),
+                parameters: Properties::Reported(properties(12)),
+                storage: Some(Properties::Reported(properties(1))),
+                serde: Some(Properties::Absent),
             },
         },
         TableCase {
@@ -233,16 +266,17 @@ fn table_cases() -> Vec<TableCase> {
                 "StorageDescriptor": { "SerdeInfo": { "Name": "view" } }
             }),
             expected: Expected {
-                parameters: json!({}),
-                storage: Some(json!({})),
-                serde: Some(json!({})),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Absent),
+                serde: Some(Properties::Absent),
             },
         },
     ]
 }
 
-/// Every read that projects a stored TABLE reports its three `Parameters` maps: the
-/// properties the definition declares, and an empty map where it declares none.
+/// Every read that projects a stored TABLE reports its three `Parameters` maps as the
+/// definition was written: the properties it declared, and no member at all where it
+/// declared none.
 #[tokio::test]
 async fn every_table_read_reports_the_definitions_parameter_maps() {
     let router = emulator();
@@ -309,7 +343,7 @@ fn partition_cases() -> Vec<PartitionCase> {
         PartitionCase {
             case: "a partition that declares nothing and stores no descriptor",
             input: json!({ "Values": ["2026-01-01"] }),
-            parameters: json!({}),
+            parameters: Properties::Absent,
             storage: None,
             serde: None,
         },
@@ -325,9 +359,9 @@ fn partition_cases() -> Vec<PartitionCase> {
                     }
                 }
             }),
-            parameters: json!({}),
-            storage: Some(json!({})),
-            serde: Some(json!({})),
+            parameters: Properties::Absent,
+            storage: Some(Properties::Absent),
+            serde: Some(Properties::Absent),
         },
         PartitionCase {
             case: "a partition that declares properties everywhere",
@@ -340,9 +374,11 @@ fn partition_cases() -> Vec<PartitionCase> {
                     "SerdeInfo": { "Parameters": { "separatorChar": "," } }
                 }
             }),
-            parameters: json!({ "rows": "17" }),
-            storage: Some(json!({ "skip.header.line.count": "1" })),
-            serde: Some(json!({ "separatorChar": "," })),
+            parameters: Properties::Reported(json!({ "rows": "17" })),
+            storage: Some(Properties::Reported(
+                json!({ "skip.header.line.count": "1" }),
+            )),
+            serde: Some(Properties::Reported(json!({ "separatorChar": "," }))),
         },
         PartitionCase {
             case: "a partition whose maps are sent explicitly empty",
@@ -355,9 +391,9 @@ fn partition_cases() -> Vec<PartitionCase> {
                     "SerdeInfo": { "Parameters": {} }
                 }
             }),
-            parameters: json!({}),
-            storage: Some(json!({})),
-            serde: Some(json!({})),
+            parameters: Properties::Reported(json!({})),
+            storage: Some(Properties::Reported(json!({}))),
+            serde: Some(Properties::Reported(json!({}))),
         },
         PartitionCase {
             case: "a partition carrying eight properties",
@@ -366,16 +402,16 @@ fn partition_cases() -> Vec<PartitionCase> {
                 "Parameters": properties(8),
                 "StorageDescriptor": { "Location": "s3://bucket/events/dt=2026-01-05/" }
             }),
-            parameters: properties(8),
-            storage: Some(json!({})),
+            parameters: Properties::Reported(properties(8)),
+            storage: Some(Properties::Absent),
             serde: None,
         },
     ]
 }
 
 /// A PARTITION is a definition the catalog holds the same way, so every read that projects
-/// one reports its own properties and those of the storage it describes: declared where the
-/// write declared them, and empty where it declared none.
+/// one reports its own properties and those of the storage it describes exactly as the write
+/// declared them, and no member where it declared none.
 #[tokio::test]
 async fn every_partition_read_reports_the_definitions_parameter_maps() {
     let router = emulator();
@@ -446,10 +482,12 @@ async fn every_partition_read_reports_the_definitions_parameter_maps() {
             .clone();
 
         for (reader, projected) in [("GetPartition", &partition), ("GetPartitions", &from_list)] {
-            assert_eq!(
-                projected["Parameters"], row.parameters,
-                "case {case}: {reader} must report Partition.Parameters {}, got {:?}",
-                row.parameters, projected["Parameters"]
+            assert_properties(
+                case,
+                reader,
+                "Partition.Parameters",
+                projected,
+                &row.parameters,
             );
             match &row.storage {
                 None => assert!(
@@ -458,11 +496,12 @@ async fn every_partition_read_reports_the_definitions_parameter_maps() {
                      that stores none, got {:?}",
                     projected["StorageDescriptor"]
                 ),
-                Some(storage) => assert_eq!(
-                    projected["StorageDescriptor"]["Parameters"], *storage,
-                    "case {case}: {reader} must report StorageDescriptor.Parameters {storage}, \
-                     got {:?}",
-                    projected["StorageDescriptor"]["Parameters"]
+                Some(storage) => assert_properties(
+                    case,
+                    reader,
+                    "StorageDescriptor.Parameters",
+                    &projected["StorageDescriptor"],
+                    storage,
                 ),
             }
             match &row.serde {
@@ -472,10 +511,12 @@ async fn every_partition_read_reports_the_definitions_parameter_maps() {
                      stores none, got {:?}",
                     projected["StorageDescriptor"]["SerdeInfo"]
                 ),
-                Some(serde) => assert_eq!(
-                    projected["StorageDescriptor"]["SerdeInfo"]["Parameters"], *serde,
-                    "case {case}: {reader} must report SerdeInfo.Parameters {serde}, got {:?}",
-                    projected["StorageDescriptor"]["SerdeInfo"]["Parameters"]
+                Some(serde) => assert_properties(
+                    case,
+                    reader,
+                    "SerdeInfo.Parameters",
+                    &projected["StorageDescriptor"]["SerdeInfo"],
+                    serde,
                 ),
             }
         }
@@ -488,12 +529,12 @@ async fn every_partition_read_reports_the_definitions_parameter_maps() {
 }
 
 /// An UPDATE that omits the properties the create declared leaves the definition declaring
-/// none, which every read reports as the empty map rather than as a member it withholds:
-/// the projection is of the definition as it now stands, not of the write that made it.
+/// none, which every read reports by withholding the member: the projection is of the
+/// definition as it now stands, not of the write that made it.
 ///
 /// The rows differ along which maps the create declared and which the update keeps.
 #[tokio::test]
-async fn a_cleared_parameter_map_is_reported_empty() {
+async fn a_cleared_parameter_map_is_reported_absent() {
     let router = emulator();
     ok(
         &router,
@@ -525,9 +566,11 @@ async fn a_cleared_parameter_map_is_reported_empty() {
                 }
             }),
             Expected {
-                parameters: json!({}),
-                storage: Some(json!({ "skip.header.line.count": "1" })),
-                serde: Some(json!({ "field.delim": "," })),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Reported(
+                    json!({ "skip.header.line.count": "1" }),
+                )),
+                serde: Some(Properties::Reported(json!({ "field.delim": "," }))),
             },
         ),
         (
@@ -550,9 +593,9 @@ async fn a_cleared_parameter_map_is_reported_empty() {
                 }
             }),
             Expected {
-                parameters: json!({ "classification": "csv" }),
-                storage: Some(json!({})),
-                serde: Some(json!({})),
+                parameters: Properties::Reported(json!({ "classification": "csv" })),
+                storage: Some(Properties::Absent),
+                serde: Some(Properties::Absent),
             },
         ),
         (
@@ -571,8 +614,8 @@ async fn a_cleared_parameter_map_is_reported_empty() {
                 "StorageDescriptor": { "Location": "s3://bucket/cleared_everything/" }
             }),
             Expected {
-                parameters: json!({}),
-                storage: Some(json!({})),
+                parameters: Properties::Absent,
+                storage: Some(Properties::Absent),
                 serde: None,
             },
         ),

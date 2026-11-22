@@ -1,40 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a CloudFormation stack does with an `AWS::Glue::Crawler` whose Amazon S3 target names a
-//! bucket that is not there.
+//! bucket that is not there, and with one whose declaration AWS Glue itself refuses.
 //!
-//! The rule under test: **a crawler is registered against the targets it will crawl, so AWS Glue
-//! resolves every `S3Target$Path` against the object store when the crawler is written and
-//! refuses a path whose BUCKET the store does not hold with the operation's modelled
-//! `InvalidInputException` — naming that target and the store's own 404 — with nothing stored;
-//! a resource the owning service refuses is a resource CloudFormation reports as failed, so the
-//! stack does not reach `CREATE_COMPLETE`: it ends rolled back, the crawler is held by nobody,
-//! and every other resource that create had already made — here the stack's own
-//! `AWS::Glue::Database` — is released with it, so a read of that database answers
-//! `EntityNotFoundException` with `Database <name> not found.`.** Only what the store ANSWERED
-//! refuses the write: a bucket it serves is accepted whether or not anything is under the path
-//! yet, because a crawler is routinely declared before the data it crawls is written, and such a
-//! stack reaches `CREATE_COMPLETE` with both entities readable through AWS Glue's own API.
+//! The rules under test:
 //!
-//! Four crates have to agree for that to hold (CloudFormation makes the create calls and owns the
-//! rollback, IAM answers for the crawl role, AWS Glue resolves the target and refuses the create,
-//! and Amazon S3 is the store the target is resolved against), so the suite lives here: a
-//! crate-local test can only ever see one side of it. The whole emulator is assembled, exactly as
-//! the production entrypoint assembles it.
+//! 1. **An `S3Target$Path` names the data a LATER crawl would walk — a reference to another
+//!    service's store rather than a resource the create brings into being — so neither AWS Glue
+//!    nor the deployment resolves it when the crawler is written: a declaration whose target
+//!    names a bucket the object store does not hold is DEPLOYED, the stack reaches
+//!    `CREATE_COMPLETE`, and the crawler is readable through AWS Glue's own API carrying exactly
+//!    the targets that were declared.** A crawler is routinely declared before the bucket or the
+//!    data behind it exists, and `CreateCrawler` models no not-found error for a target; whether
+//!    a crawl can READ one is decided by the crawl, on the crawl
+//!    ([`crate::cloudformation_deployed_crawler_crawls_its_s3_target`]).
+//! 2. **A resource the owning service really does refuse is a resource CloudFormation reports as
+//!    failed, so the stack does not reach `CREATE_COMPLETE`: it ends rolled back, the crawler is
+//!    held by nobody, and every other resource that create had already made — here the stack's
+//!    own `AWS::Glue::Database` — is released with it, so a read of that database answers
+//!    `EntityNotFoundException` with `Database <name> not found.`.** The refusal that stands is
+//!    about the REQUEST: "at least one crawl target must be specified, in the s3Targets field,
+//!    the jdbcTargets field, or the DynamoDBTargets field" (`CreateCrawler`), which a declaration
+//!    carrying an empty target list satisfies for none.
+//!
+//! Four crates have to agree for either to hold (CloudFormation makes the create calls and owns
+//! the rollback, IAM answers for the crawl role, AWS Glue judges the declaration, and Amazon S3
+//! is the store the declared target refers to), so the suite lives here: a crate-local test can
+//! only ever see one side of it. The whole emulator is assembled, exactly as the production
+//! entrypoint assembles it.
 //!
 //! What is asserted ELSEWHERE, and deliberately not repeated here:
 //! `services/service-com-amazonaws-glue-awsglue/tests/all/crawler_s3_target_resolution.rs` pins
-//! the refusal AWS Glue's own `CreateCrawler`/`UpdateCrawler` answers for each shape of target
-//! path, and `core/router/tests/all/cloudformation_deployed_crawler_crawls_its_s3_target.rs` pins
-//! what a crawler a stack DID deploy then crawls. What only this suite reaches is the deployment
-//! outcome: the stack's own verdict, the per-resource reason a client reads it from, and the
-//! sibling resource the rollback takes with it.
+//! what AWS Glue's own `CreateCrawler`/`UpdateCrawler` store for each shape of target path, and
+//! `core/router/tests/all/cloudformation_deployed_crawler_crawls_its_s3_target.rs` pins what a
+//! crawler a stack deployed then crawls. What only this suite reaches is the deployment outcome:
+//! the stack's own verdict, the per-resource reason a client reads it from, and the sibling
+//! resource a rollback takes with it.
 //!
-//! The declared case — one crawler over a path in a never-created bucket — is ONE row of the
-//! table below; the rows differ along what the rule generalises over: how the refused path is
-//! written (a prefix with a trailing separator, one without, a bucket root), whether the
-//! declaration also names a target the store DOES hold, and whether a held bucket's prefix
-//! carries any object at all.
+//! The rows differ along what the rule generalises over: how an unresolvable path is written (a
+//! prefix with a trailing separator, one without, a bucket root), whether the declaration also
+//! names a target the store DOES hold, whether a held bucket's prefix carries any object at all,
+//! and — for rule 2 — a declaration that names no crawl target at all.
 //!
 //! Neither clock is waited for: the stack's due instants are pulled into the past
 //! ([`crate::cloudformation_stack_clock::settle_the_stacks`]), so every transition here is the
@@ -50,8 +56,8 @@ use crate::cloudformation_provisions_glue_jobs::{cloudformation, error_code, glu
 use crate::cloudformation_stack_clock::settle_the_stacks;
 use crate::query_wire::{elements, members_of, opt_element, outputs_of};
 
-/// The Region every stack here is deployed in, and the Region the targets are resolved through:
-/// a create resolves its targets through the endpoint it was called on.
+/// The Region every stack here is deployed in, and the Region the catalog entities are created
+/// in: a create is served by the endpoint it was called on.
 const REGION: &str = "us-east-1";
 
 /// The logical ids every row's template gives the three resources it declares.
@@ -69,11 +75,9 @@ const DATABASE_OUTPUT: &str = "CatalogDatabaseName";
 /// rollback that conclusion makes due), and no round waits for the wall clock.
 const SETTLING_ROUNDS: usize = 200;
 
-/// The fixed text of the refusal a target whose bucket the store does not hold earns, and the
-/// store's own status code in its diagnostic clause: the two halves the failure reason has to
-/// carry, whatever path was declared.
-const S3_TARGET: &str = "S3 target";
-const NOT_FOUND_STATUS: &str = "404";
+/// The whole fixed text AWS Glue refuses a declaration naming no crawl target with, written out
+/// here rather than read from that crate's constant so this suite pins the wording.
+const TARGETS_NOT_DEFINED: &str = "Targets are not defined";
 
 /// The `HandlerErrorCode` class CloudFormation reports a resource its owning service refused
 /// the REQUEST for under, which is what tells a client the declaration — and not a passing
@@ -86,22 +90,29 @@ const REFUSED_REQUEST_CLASS: &str = "HandlerErrorCode: InvalidRequest";
 const ROLLED_BACK: [&str; 2] = ["ROLLBACK_COMPLETE", "CREATE_FAILED"];
 
 /// One row: the buckets the object store holds before the deploy, the Amazon S3 targets the
-/// declaration names, and the path the deploy must be refused for — `None` for a declaration
-/// every target of which resolves.
+/// declaration names, and whether the declaration is one AWS Glue refuses.
 struct Row {
     case: &'static str,
     /// The buckets created before the deploy (no underscore: `CreateBucket` refuses one).
     held_buckets: &'static [&'static str],
     /// The objects staged in those buckets, as `(bucket, key, body)`.
     objects: &'static [(&'static str, &'static str, &'static str)],
-    /// The `S3Targets[].Path` values the declaration carries, in order.
+    /// The `S3Targets[].Path` values the declaration carries, in order. Empty for the row whose
+    /// declaration names no crawl target at all.
     paths: &'static [&'static str],
-    /// The path whose bucket is not there, for a row the create must be refused for.
-    refused_path: Option<&'static str>,
 }
 
-/// The rows: three shapes of unresolvable path, one declaration mixing a resolvable target with
-/// an unresolvable one, and two declarations every target of which resolves.
+impl Row {
+    /// Whether AWS Glue refuses this declaration: the one refusal about the REQUEST that stands
+    /// here is a `Targets` naming no data store, which is a declaration carrying no path.
+    fn is_refused(&self) -> bool {
+        self.paths.is_empty()
+    }
+}
+
+/// The rows: three shapes of path in a bucket nobody created, one declaration mixing such a path
+/// with one the store holds, two declarations every target of which the store holds, and one
+/// declaration naming no crawl target at all.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -109,21 +120,18 @@ fn rows() -> Vec<Row> {
             held_buckets: &[],
             objects: &[],
             paths: &["s3://cfn-crawler-rollback-absent/data/"],
-            refused_path: Some("s3://cfn-crawler-rollback-absent/data/"),
         },
         Row {
             case: "a target with no trailing separator in a bucket nobody created",
             held_buckets: &[],
             objects: &[],
             paths: &["s3://cfn-crawler-rollback-absent-two/data"],
-            refused_path: Some("s3://cfn-crawler-rollback-absent-two/data"),
         },
         Row {
             case: "the root of a bucket nobody created",
             held_buckets: &[],
             objects: &[],
             paths: &["s3://cfn-crawler-rollback-absent-three"],
-            refused_path: Some("s3://cfn-crawler-rollback-absent-three"),
         },
         Row {
             case: "a target the store holds beside one in a bucket nobody created",
@@ -137,7 +145,6 @@ fn rows() -> Vec<Row> {
                 "s3://cfn-crawler-rollback-held/data/",
                 "s3://cfn-crawler-rollback-absent-four/other/",
             ],
-            refused_path: Some("s3://cfn-crawler-rollback-absent-four/other/"),
         },
         Row {
             // A crawler is routinely declared before the data it crawls is written.
@@ -145,7 +152,6 @@ fn rows() -> Vec<Row> {
             held_buckets: &["cfn-crawler-rollback-empty"],
             objects: &[],
             paths: &["s3://cfn-crawler-rollback-empty/not-written-yet/"],
-            refused_path: None,
         },
         Row {
             case: "a prefix of a held bucket that carries data",
@@ -156,13 +162,20 @@ fn rows() -> Vec<Row> {
                 "id,name\n1,ada\n",
             )],
             paths: &["s3://cfn-crawler-rollback-data/data/"],
-            refused_path: None,
+        },
+        Row {
+            // Rule 2: the declaration names no data store to crawl, which AWS Glue refuses.
+            case: "a declaration naming no crawl target at all",
+            held_buckets: &[],
+            objects: &[],
+            paths: &[],
         },
     ]
 }
 
-/// The emulator as it is ASSEMBLED, on one engine: the stack's calls, the target resolution and
-/// the catalog it writes all land in the same store the production entrypoint serves from.
+/// The emulator as it is ASSEMBLED, on one engine: the stack's calls, the object store the
+/// declared targets refer to and the catalog it writes all land in the same store the production
+/// entrypoint serves from.
 fn assembled_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
@@ -181,7 +194,7 @@ fn s3_authorization() -> String {
 }
 
 /// One Amazon S3 request against the Region's path-style endpoint, which is the endpoint a
-/// crawler's targets are resolved through.
+/// crawl of a declared target would read it through.
 async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> (u16, String) {
     let request = http::Request::builder()
         .method(method)
@@ -275,7 +288,7 @@ async fn deploy(
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: the template must be ADMITTED and the refusal be the resource's, got \
+        "case {case:?}: the template must be ADMITTED and any refusal be the resource's, got \
          {status} with {answer}"
     );
 
@@ -341,8 +354,9 @@ fn error_message(payload: &Value) -> String {
 }
 
 /// Assert the stack ended rolled back over the crawler resource, with the per-resource reason a
-/// client diagnoses it from: the refusal's own fixed text, the offending path and the store's 404.
-fn assert_rolled_back(case: &str, described: &str, reasons: &[String], refused_path: &str) {
+/// client diagnoses it from: AWS Glue's own fixed refusal and the class CloudFormation reports a
+/// refused request under.
+fn assert_rolled_back(case: &str, described: &str, reasons: &[String]) {
     let reported = opt_element(described, "StackStatus").unwrap_or_default();
     assert!(
         ROLLED_BACK.contains(&reported.as_str()),
@@ -360,14 +374,14 @@ fn assert_rolled_back(case: &str, described: &str, reasons: &[String], refused_p
          got no reason on it in {described}"
     );
     let carried = reasons.iter().any(|reason| {
-        [S3_TARGET, refused_path, NOT_FOUND_STATUS, REFUSED_REQUEST_CLASS]
+        [TARGETS_NOT_DEFINED, REFUSED_REQUEST_CLASS]
             .iter()
             .all(|held| reason.contains(held))
     });
     assert!(
         carried,
-        "case {case:?}: expected a reason on {CRAWLER_LOGICAL_ID} carrying {S3_TARGET:?}, \
-         {refused_path:?}, {NOT_FOUND_STATUS:?} and {REFUSED_REQUEST_CLASS:?}, got {reasons:?}"
+        "case {case:?}: expected a reason on {CRAWLER_LOGICAL_ID} carrying \
+         {TARGETS_NOT_DEFINED:?} and {REFUSED_REQUEST_CLASS:?}, got {reasons:?}"
     );
 }
 
@@ -376,28 +390,28 @@ fn assert_rolled_back(case: &str, described: &str, reasons: &[String], refused_p
 // ---------------------------------------------------------------------------
 
 /// A stack whose `AWS::Glue::Crawler` names an Amazon S3 target in a bucket the object store does
-/// not hold does not reach `CREATE_COMPLETE`: the resource fails with AWS Glue's own refusal, the
-/// stack is rolled back, and neither the crawler nor the database the stack would have owned is
-/// left behind. A declaration every target of which resolves is deployed and both entities are
-/// readable through AWS Glue's own API.
+/// not hold DEPLOYS: the crawler is stored with the declared targets and both entities are
+/// readable through AWS Glue's own API. A declaration AWS Glue really does refuse — one naming no
+/// crawl target — fails its resource instead, and neither the crawler nor the database the stack
+/// would have owned is left behind.
 #[tokio::test]
-async fn a_crawler_over_a_bucket_nobody_created_fails_its_stack() {
+async fn a_crawler_over_a_bucket_nobody_created_still_deploys() {
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;
         let (router, engine) = assembled_emulator();
         stage(&router, &row).await;
 
         // Lower case with no separator: AWS Glue folds a database name, so the name a client
-        // reads back — and the one the refusal states — is the name as declared.
+        // reads back — and the one a refusal states — is the name as declared.
         let database = format!("crawlerrollbackdb{index}");
         let crawler = format!("crawler-rollback-{index}");
         let stack = format!("crawler-rollback-stack-{index}");
         let body = template(&row, &database, &crawler);
         let described = deploy(&router, &engine, case, &stack, &body).await;
 
-        let Some(refused_path) = row.refused_path else {
-            // The positive control: every target resolves, so the stack deployed, and both
-            // handles it publishes are the names AWS Glue answers for.
+        if !row.is_refused() {
+            // Rule 1: the declared target is a reference nothing resolves at create time, so the
+            // stack deployed and both handles it publishes are the names AWS Glue answers for.
             assert_eq!(
                 opt_element(&described, "StackStatus").as_deref(),
                 Some("CREATE_COMPLETE"),
@@ -445,10 +459,11 @@ async fn a_crawler_over_a_bucket_nobody_created_fails_its_stack() {
                  {read}"
             );
             continue;
-        };
+        }
 
+        // Rule 2: the declaration is one the owning service refuses, so the resource failed.
         let reasons = crawler_failure_reasons(&router, case, &stack).await;
-        assert_rolled_back(case, &described, &reasons, refused_path);
+        assert_rolled_back(case, &described, &reasons);
 
         // Nothing the failed create made is left behind: the crawler was never stored, and the
         // database the rollback took with it is held by nobody.

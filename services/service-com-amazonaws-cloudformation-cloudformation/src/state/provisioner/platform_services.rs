@@ -2983,6 +2983,9 @@ pub(super) async fn describe_glue_database(
 /// resource's physical id) set inside that input on the way out.
 ///
 /// The type publishes no `Tags` property, so nothing is propagated to a table.
+///
+/// The definition submitted is a WHOLE one, with the property maps of the table, its storage
+/// and its SerDe stated ([`whole_glue_table_input`]).
 pub(super) async fn create_glue_table(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -2998,6 +3001,7 @@ pub(super) async fn create_glue_table(
         GLUE_TABLE_INPUT_PROPERTY,
         &resource.physical_resource_id,
     );
+    whole_glue_table_input(&mut request);
     call_glue(ctx, region, "CreateTable", &Value::Object(request)).await?;
     Ok(Created::default())
 }
@@ -3006,7 +3010,8 @@ pub(super) async fn create_glue_table(
 ///
 /// `UpdateTable` takes the same `TableInput` the create did, against the database that holds
 /// the table — so a declaration that states another schema, another location or other
-/// parameters reaches AWS Glue as that input, and the table keeps its identity.
+/// parameters reaches AWS Glue as that input, stated as whole as the create's
+/// ([`whole_glue_table_input`]), and the table keeps its identity.
 ///
 /// The table's own name is the one it is HELD under, for the reason
 /// [`update_glue_database`] records: a renamed table is a different resource, which the
@@ -3030,6 +3035,7 @@ pub(super) async fn update_glue_table(
             .remove(GLUE_TABLE_INPUT_PROPERTY)
             .unwrap_or_else(|| Value::Object(Map::new())),
     );
+    whole_glue_table_input(&mut request);
     call_glue(ctx, region, "UpdateTable", &Value::Object(request)).await?;
     Ok(Created::default())
 }
@@ -3226,6 +3232,65 @@ pub(super) fn named_glue_input(request: &mut Map<String, Value>, property: &str,
         Value::String(name.to_string()),
     );
     request.insert(property.to_string(), Value::Object(input));
+}
+
+/// The member of `TableInput`, of its `StorageDescriptor` and of that descriptor's
+/// `SerdeInfo` that carries the key-value properties a client supplies for the definition.
+const GLUE_PARAMETERS_MEMBER: &str = "Parameters";
+
+/// The `TableInput` member that describes the table's storage, and the member of THAT
+/// structure describing its serialization: the two nested definitions that carry a property
+/// map of their own.
+const GLUE_STORAGE_DESCRIPTOR_MEMBER: &str = "StorageDescriptor";
+const GLUE_SERDE_INFO_MEMBER: &str = "SerdeInfo";
+
+/// State the property maps of the table definition this type submits, so the table a stack
+/// deploys is created from a WHOLE `TableInput` rather than from the subset the template
+/// bothered to write.
+///
+/// CloudFormation resolves an `AWS::Glue::Table` into one definition and submits that
+/// definition: the key-value property maps of the table, of the storage it describes and of
+/// that storage's SerDe are stated — empty where the declaration states no property — which
+/// is what a client reading the deployed table back through `glue GetTable` observes on each
+/// of them. The Data Catalog itself invents no such map (it reports a definition as it was
+/// written), so a deployed table carries them because the deployment supplied them.
+///
+/// The evidence is one recorded deployment read back that way, so the rule is stated here
+/// rather than on the catalog: a later observation of a provider that omits one of the three
+/// is answered by narrowing THIS submission, with the catalog's own echo left untouched.
+///
+/// Only the maps of the structures the declaration actually states are filled: a declaration
+/// that describes no storage submits no storage descriptor, and one whose descriptor names no
+/// SerDe submits none.
+fn whole_glue_table_input(request: &mut Map<String, Value>) {
+    let Some(input) = request
+        .get_mut(GLUE_TABLE_INPUT_PROPERTY)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    stated_parameters(input);
+    let Some(storage) = input
+        .get_mut(GLUE_STORAGE_DESCRIPTOR_MEMBER)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    stated_parameters(storage);
+    if let Some(serde) = storage
+        .get_mut(GLUE_SERDE_INFO_MEMBER)
+        .and_then(Value::as_object_mut)
+    {
+        stated_parameters(serde);
+    }
+}
+
+/// State `definition`'s property map as empty where it states none, leaving a map it does
+/// state exactly as declared.
+fn stated_parameters(definition: &mut Map<String, Value>) {
+    definition
+        .entry(GLUE_PARAMETERS_MEMBER.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
 }
 
 /// The catalog a request about one of the two catalog entities is scoped to: the

@@ -310,6 +310,35 @@ impl CrawlerEntry {
         self.last_updated = now;
     }
 
+    /// Whether this crawler's crawl has ALREADY been asked to stop and has not finished:
+    /// the one state ([`CRAWLER_STATE_STOPPING`]) in which another stop has nothing left to
+    /// ask for.
+    pub fn crawl_is_stopping(&self) -> bool {
+        self.state == CRAWLER_STATE_STOPPING
+    }
+
+    /// Ask the crawl in flight to STOP: the crawler leaves [`CRAWLER_STATE_RUNNING`] for
+    /// [`CRAWLER_STATE_STOPPING`] and the clock owes it its way back to
+    /// [`CRAWLER_STATE_READY`] [`CRAWL_SETTLES_AFTER`] from this call, so a caller that reads
+    /// the crawler straight after the stop still observes the crawl coming to rest.
+    ///
+    /// The crawl it stops ends CANCELLED — "`CANCELLED`" is the modelled `LastCrawlStatus`
+    /// of a crawl that neither succeeded nor failed — and keeps everything it had already
+    /// recorded, the tables it wrote included: a stop ends the crawl, it does not undo it.
+    /// Nothing is published here, for the reason [`Self::start_crawl`] gives: the crawl's
+    /// report reaches a reader when the clock settles it ([`Self::settle_crawl_if_due`]).
+    ///
+    /// The crawler's definition is untouched, so `Version` does not move; `LastUpdated` does,
+    /// because the crawler record did change.
+    pub fn stop_crawl(&mut self, now: SystemTime) {
+        self.state = CRAWLER_STATE_STOPPING.to_string();
+        self.crawl_settles_at = Some(now.checked_add(CRAWL_SETTLES_AFTER).unwrap_or(now));
+        if let Some(record) = self.pending_crawl.as_mut() {
+            record.status = LAST_CRAWL_STATUS_CANCELLED.to_string();
+        }
+        self.last_updated = now;
+    }
+
     /// Move this crawler into the state the clock owed it at `now`, if it owed one.
     ///
     /// The crawl was due to finish at [`Self::crawl_settles_at`] whether or not anybody

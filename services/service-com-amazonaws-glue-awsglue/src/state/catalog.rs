@@ -1314,9 +1314,9 @@ impl PartitionEntry {
             // descriptor the same way.
             storage_descriptor: self.storage_descriptor.as_ref().map(to_storage_descriptor),
             // Reported the way a table's own properties are
-            // ([`to_definition_parameters`]): a partition is a definition the catalog
-            // holds, so the properties it declares none of are an empty set.
-            parameters: to_definition_parameters(self.parameters.as_ref()),
+            // ([`stored_definition_parameters`]): a partition is a definition the catalog
+            // holds as it was written, so a partition that declares no property has none.
+            parameters: stored_definition_parameters(self.parameters.as_ref()),
             last_analyzed_time: self.last_analyzed_time,
             catalog_id: Some(table.catalog_id.clone()),
         }
@@ -1826,8 +1826,8 @@ impl TableEntry {
             view_expanded_text: self.view_expanded_text.clone(),
             table_type: self.table_type.clone(),
             // The table's own key-value properties, reported the way the catalog reports
-            // the properties of any definition it holds ([`to_definition_parameters`]).
-            parameters: to_definition_parameters(self.parameters.as_ref()),
+            // the properties of any definition it holds ([`stored_definition_parameters`]).
+            parameters: stored_definition_parameters(self.parameters.as_ref()),
             created_by: self.created_by.clone(),
             is_registered_with_lake_formation: false,
             target_table: self.target_table.clone(),
@@ -1893,10 +1893,10 @@ pub fn database_identity(answered: &Database) -> Database {
 /// table" — both are part of the definition the catalog holds, so a descriptor that lists
 /// no column and defines no sort order has an EMPTY list of each rather than an unknown
 /// one, and the catalog reports `[]`. A client that iterates either then loops zero times
-/// instead of having to handle an absent member. The same holds for the two key-value
-/// PROPERTY maps of a stored descriptor — `StorageDescriptor$Parameters` "the
-/// user-supplied properties in key-value form" and `SerDeInfo$Parameters` — which are
-/// reported through [`to_definition_parameters`].
+/// instead of having to handle an absent member. The two key-value PROPERTY maps of a
+/// stored descriptor — `StorageDescriptor$Parameters` "the user-supplied properties in
+/// key-value form" and `SerDeInfo$Parameters` — are USER-SUPPLIED, so they are reported
+/// only where the definition supplies them ([`stored_definition_parameters`]).
 ///
 /// A SerDe is projected only when the descriptor stores one: the catalog determines the
 /// properties OF a SerDe it holds, not whether the descriptor has one. Every other member
@@ -1907,36 +1907,48 @@ pub fn to_storage_descriptor(stored: &StorageDescriptor) -> StorageDescriptor {
     StorageDescriptor {
         columns: Some(stored.columns.clone().unwrap_or_default()),
         sort_columns: Some(stored.sort_columns.clone().unwrap_or_default()),
-        parameters: to_definition_parameters(stored.parameters.as_ref()),
+        parameters: stored_definition_parameters(stored.parameters.as_ref()),
         serde_info: stored.serde_info.as_ref().map(to_serde_info),
         ..stored.clone()
     }
 }
 
 /// Project a stored `SerDeInfo` the way the Data Catalog reports one: its
-/// serialization/deserialization properties are part of the definition the catalog holds,
-/// so they are reported as a map ([`to_definition_parameters`]) and its name and
-/// serialization library exactly as they were stored.
+/// serialization/deserialization properties are those the definition supplied
+/// ([`stored_definition_parameters`]) and its name and serialization library exactly as
+/// they were stored.
 pub fn to_serde_info(stored: &SerDeInfo) -> SerDeInfo {
     SerDeInfo {
-        parameters: to_definition_parameters(stored.parameters.as_ref()),
+        parameters: stored_definition_parameters(stored.parameters.as_ref()),
         ..stored.clone()
     }
 }
 
 /// The `Parameters` map of a stored definition, as the Data Catalog reports it: the
-/// properties that were stored, and an EMPTY map for a definition that carries none.
+/// properties the definition was WRITTEN with, and nothing at all for a definition that
+/// supplied none.
 ///
-/// The key-value properties of a table, of a partition and of the storage a definition
-/// describes are part of the definition the catalog holds — "these key-value pairs define
+/// Every one of these maps is the client's to supply — "these key-value pairs define
 /// properties associated with the table" (`Table$Parameters`), the partition parameters
 /// (`Partition$Parameters`), "the user-supplied properties in key-value form"
-/// (`StorageDescriptor$Parameters`) — so a definition that declares no property has an
-/// empty set of them rather than an unknown one, exactly as a descriptor that lists no
-/// column has an empty column list. Reporting `{}` lets a client read or merge the map
-/// without telling "no properties" apart from "member not returned".
-pub fn to_definition_parameters(
+/// (`StorageDescriptor$Parameters`), `SerDeInfo$Parameters` — and none of them carries a
+/// modelled `@default`, so the catalog neither invents one nor drops one: a map the write
+/// supplied is reported as supplied, an explicitly empty map included, and a map no write
+/// ever supplied stays ABSENT. A client that diffs a read of a definition against the input
+/// it submitted then sees no property it never set.
+///
+/// A registration that is defined by a WHOLE table object rather than by the members a
+/// client sent — a Hive metastore client's, which is how an Athena `CREATE EXTERNAL TABLE`
+/// reaches this catalog — materialises these maps when it STORES the definition
+/// ([`super::hive_registration`]), so such a table is read back with them present without
+/// this projection inventing them for every other table.
+///
+/// It is therefore a plain clone of what is stored. The projection stays NAMED, and every
+/// reader of one of the four maps goes through it, so there is one place the rule above is
+/// stated and one place a reading that departed from it would have to be written.
+#[inline]
+pub fn stored_definition_parameters(
     stored: Option<&HashMap<String, String>>,
 ) -> Option<HashMap<String, String>> {
-    Some(stored.cloned().unwrap_or_default())
+    stored.cloned()
 }

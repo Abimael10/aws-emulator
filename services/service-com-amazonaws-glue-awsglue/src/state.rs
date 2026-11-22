@@ -740,9 +740,9 @@ pub const EXIST_CONDITION_MUST_EXIST: &str = "MUST_EXIST";
 pub const EXIST_CONDITION_NOT_EXIST: &str = "NOT_EXIST";
 
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
-/// the moment `CreateCrawler` returns, and the only one this emulator stores until
-/// `StartCrawler`/`StopCrawler` are implemented. One of the modelled `CrawlerState`
-/// values (`READY`, `RUNNING`, `STOPPING`).
+/// the moment `CreateCrawler` returns, and the one a crawl comes back to once it has
+/// finished or been stopped. One of the modelled `CrawlerState` values (`READY`,
+/// `RUNNING`, `STOPPING`).
 pub const CRAWLER_STATE_READY: &str = "READY";
 
 /// The `CrawlerState` of a crawler whose crawl is in progress — "indicates whether the

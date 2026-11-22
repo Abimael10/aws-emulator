@@ -89,8 +89,7 @@ const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// the memory and not the calls: a bucket past the ceiling is asked about again rather than
 /// remembered, which is the same answer read a second time. A crawl stays well inside it in
 /// practice — a target's bucket is asked about once for the listing and once for the object
-/// read, and the targets one crawler carries are themselves resolved under a ceiling
-/// ([`MAX_RESOLVED_S3_TARGETS`]).
+/// read.
 pub const MAX_CRAWLED_BUCKET_POLICIES: usize = 32;
 
 /// What the account's records say the crawl may read: the role it runs as, the documents in

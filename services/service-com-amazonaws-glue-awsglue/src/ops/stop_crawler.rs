@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCrawler
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopCrawler`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopCrawler::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the crawl of a crawler whose crawl is under way: "if the specified crawler is
+//! running, stops the crawl". The crawler leaves `RUNNING` for `STOPPING` and the clock owes
+//! it its way back to `READY`, where the crawl it stopped is reported with the modelled
+//! `LastCrawlStatus` `CANCELLED` (see [`crate::state::CrawlerEntry::stop_crawl`]) — so a
+//! caller that reads the crawler straight after this call still observes the crawl coming to
+//! rest, and one that polls reads the cancelled crawl.
+//!
+//! A crawler with no crawl under way has none to stop (`CrawlerNotRunningException`), one
+//! whose crawl is already stopping has nothing left to ask for (`CrawlerStoppingException`),
+//! and a name no crawler in this account has is `EntityNotFoundException` carrying the
+//! sentence every crawler lookup answers with.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +143,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopCrawler` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopCrawlerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopCrawler"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported as
+            // the operation's own timeout error, the same way `StartCrawler` reports it.
+            return Err(StopCrawlerErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut store = state.lock();
+            // Everything the clock already owed the stored crawlers is materialised before
+            // they are consulted, so a crawl the clock has already finished is not stopped a
+            // second time — exactly as the start settles them before it decides.
+            store.settle_due_crawls(now);
+            // The crawler is taken MUTABLY once: what the refusals read and what the stop
+            // writes are then the same record, so a stop that gets past them always performs.
+            let Some(crawler) = store.crawlers.get_mut(&input.name) else {
+                return Err(StopCrawlerErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::crawler_not_found(&input.name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // "If the specified crawler is running, stops the crawl": a crawler with no crawl
+            // under way has none to stop, and one whose crawl was already asked to stop has
+            // nothing left to ask for. Each is the operation's own modelled class.
+            if crawler.crawl_is_stopping() {
+                return Err(StopCrawlerErrorModeled::CrawlerStoppingException(
+                    CrawlerStoppingException {
+                        message: Some(crate::state::messages::crawler_stopping(&input.name)),
+                    },
+                )
+                .into());
+            }
+            if !crawler.crawl_in_progress() {
+                return Err(StopCrawlerErrorModeled::CrawlerNotRunningException(
+                    CrawlerNotRunningException {
+                        message: Some(crate::state::messages::crawler_not_running(&input.name)),
+                    },
+                )
+                .into());
+            }
+            crawler.stop_crawl(now);
+        }
+
+        // The way back to `READY` the clock now owes this crawler is handed to the store's
+        // own clock pump, which waits for the due instant, materialises it and publishes the
+        // crawler state change onto the account's default event bus — so a client that reacts
+        // to the stopped crawl through EventBridge alone still observes it. The same seam the
+        // start hands its own finish to.
+        crate::state::drive_clock(ctx.callback(), &state);
+
+        ::tracing::info!(
+            operation = "StopCrawler",
+            crawler = %input.name,
+            "stopped a Glue crawl"
+        );
+
+        Ok(StopCrawlerOutput {})
     }
 }

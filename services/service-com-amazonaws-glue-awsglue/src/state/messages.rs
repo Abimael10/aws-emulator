@@ -50,6 +50,26 @@ pub fn crawler_already_started(name: &str) -> String {
     format!("Crawler with name {name} has already started")
 }
 
+/// `StopCrawler` for a crawler that has no crawl under way: "if the specified crawler is
+/// running, stops the crawl", so a crawler sitting in the state with no run in it
+/// ([`super::CRAWLER_STATE_READY`]) has no crawl for the call to stop.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `CrawlerNotRunningException` — and, like the crawler-running refusal above, a sentence
+/// carrying only the requested `Name`, worded as this service words that family.
+pub fn crawler_not_running(name: &str) -> String {
+    format!("Crawler with name {name} is not running")
+}
+
+/// `StopCrawler` for a crawler whose crawl has ALREADY been asked to stop and has not
+/// finished ([`super::CRAWLER_STATE_STOPPING`]): the stop it asks for is already under way,
+/// which is the operation's own modelled `CrawlerStoppingException`.
+///
+/// NOT recorded, on the same grounds as [`crawler_not_running`].
+pub fn crawler_stopping(name: &str) -> String {
+    format!("Crawler with name {name} is stopping")
+}
+
 /// A request to suspend the schedule of a crawler that has NO schedule at all — one
 /// carrying no cron expression to run ([`super::CrawlerEntry::has_schedule`]) — so there
 /// is no scheduler for the call to stop. A crawler whose schedule is merely suspended is
@@ -546,24 +566,6 @@ pub fn dynamodb_target_grant_missing(table: &str) -> String {
     )
 }
 
-/// `CreateCrawler`/`UpdateCrawler` for an S3 target whose `Path` names a bucket the object
-/// store does not hold ([`super::s3_target_refusal`]).
-///
-/// NOT recorded verbatim: what is pinned is the behaviour — 400 with the operation's modelled
-/// `InvalidInputException`, nothing stored — and the message states it the way this service
-/// states a refusal its framework raised, with two variable parts: the `Path` the target
-/// named, exactly as the request supplied it, and the store's own answer about it in the
-/// diagnostic clause ([`with_diagnostic`]), which is the 404 a bucket that is not there is
-/// raised with.
-pub fn s3_target_not_found(path: &str) -> String {
-    with_diagnostic(
-        &format!("S3 target {path} does not exist"),
-        DIAGNOSTIC_SERVICE_S3,
-        DIAGNOSTIC_STATUS_NOT_FOUND,
-        DIAGNOSTIC_CODE_NO_SUCH_BUCKET,
-    )
-}
-
 /// A job run addressed by the (job name, run id) PAIR that this endpoint holds no run
 /// under — the read (`GetJobRun`), the retry a start names (`StartJobRun$JobRunId`) and
 /// each entry of a stop the job holds no such run for (`BatchStopJobRun`).
@@ -821,17 +823,6 @@ const DIAGNOSTIC_SERVICE_JOB_EXECUTOR: &str = "AWSGlueJobExecutor";
 
 /// The `Error Code` a clause states for a reference that resolved to nothing.
 const DIAGNOSTIC_CODE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
-
-/// The component a diagnostic clause names for an answer the OBJECT STORE gave: the
-/// component this service resolves a crawler's Amazon S3 target against
-/// ([`s3_target_not_found`]).
-const DIAGNOSTIC_SERVICE_S3: &str = "Amazon S3";
-
-/// The `Error Code` the object store's own answer carries for a bucket it does not hold,
-/// which is the code the clause of [`s3_target_not_found`] states — and the one answer the
-/// resolution that raises it matches on ([`super::s3_target_refusal`]), so the code the store
-/// is read for and the code the message states cannot diverge.
-pub(super) const DIAGNOSTIC_CODE_NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// The `Error Code` a clause states for a request the service would not accept.
 const DIAGNOSTIC_CODE_INVALID_INPUT: &str = "InvalidInputException";
