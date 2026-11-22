@@ -106,37 +106,11 @@ pub const INSTANCE_DELETION_DELAY: Duration = Duration::from_secs(3);
 /// from here at projection time) so the stored instance carries its own version.
 pub const INSTANCE_VERSION_NUMBER: f64 = 2.0;
 
-/// The DNS zone an instance's WebApp hostname and its IAM Identity Center portal hostname
-/// sit under.
-///
-/// Its SOURCE is the recorded wire response of the instance operations, and the model's own
-/// documentation of `webAppDnsDomain` corroborates it — "The DNS subdomain of the web app.
-/// This would be \"example\" in the URL \"example.scn.global.on.aws\"" — so the instance's
-/// own domain label is the only variable part of either hostname and this suffix is fixed
-/// text.
-pub const WEB_APP_ZONE: &str = "scn.global.on.aws";
-
-/// The hostname an instance's domain `label` resolves to: the label followed by the
-/// service's WebApp zone ([`WEB_APP_ZONE`]). Stated once, here, so the hostnames the
-/// `Instance` projection reports cannot drift from each other.
-pub fn web_app_zone_hostname(label: &str) -> String {
-    format!("{label}.{WEB_APP_ZONE}")
-}
-
-/// The `webAppDnsDomain` an instance gets when its create request named none: AWS answers
-/// such a create with an instance that still has a WebApp domain — the service generates
-/// the label — so one is generated here rather than left absent. The generated VALUE is the
-/// emulator's own (AWS's is a per-run server-generated token, so no value reproduces it);
-/// what it has to satisfy is the member's modelled form and its invariants.
-///
-/// The instance's own id is the label: it satisfies `InstanceWebAppDnsDomain`'s modelled
-/// pattern (`^(?![-])[a-zA-Z0-9-]{1,62}[a-zA-Z0-9]$` — 36 characters of lowercase hex and
-/// hyphens, starting and ending alphanumeric), it is stable for the life of the instance,
-/// and no other instance can hold it, so a generated domain never collides with the domain
-/// another live instance holds.
-pub fn generated_web_app_dns_domain(instance_id: &str) -> String {
-    instance_id.to_string()
-}
+/// The DNS names an instance ANNOUNCES, and the WebApp domain label a create that named
+/// none is answered with: the one place this service decides which host it hands a client,
+/// so no handler composes an address of its own.
+mod instance_domains;
+pub use instance_domains::*;
 
 /// The number of instances this store holds.
 ///
@@ -214,8 +188,8 @@ impl InstanceRecord {
     /// `webAppDnsDomain`, `tags`) are left absent for the caller to fill from the
     /// request, so a member the request omitted stays absent rather than being
     /// invented — except `webAppDnsDomain`, which every instance has: the create either
-    /// echoes the one the request named or generates one
-    /// ([`generated_web_app_dns_domain`]).
+    /// echoes the one the request named or mints one
+    /// ([`ComAmazonawsSupplychainGalaxypublicapigatewayState::fresh_web_app_dns_domain`]).
     pub fn new(instance_id: String, now: SystemTime, creation_seq: u64) -> Self {
         Self {
             instance_id,
@@ -236,17 +210,24 @@ impl InstanceRecord {
         }
     }
 
-    /// This record as the `Instance` shape every instance operation returns.
+    /// This record as the `Instance` shape every instance operation returns, with its web
+    /// app announced at `endpoint` — the `host[:port]` the request being answered reached
+    /// this emulator at ([`announced_instance_endpoint`]).
     ///
-    /// `primaryDomain` and `idcPortalDomain` are the instance's WebApp hostname and its
-    /// IAM Identity Center portal hostname: both are the instance's own `webAppDnsDomain`
-    /// under the service's WebApp zone ([`web_app_zone_hostname`]), so an instance with no
-    /// domain label reports neither rather than a bare zone.
-    pub fn to_wire(&self) -> Instance {
-        let hostname = self
-            .web_app_dns_domain
-            .as_deref()
-            .map(web_app_zone_hostname);
+    /// `primaryDomain` and `idcPortalDomain` are where a client reaches the instance's web
+    /// app and its IAM Identity Center portal: this emulator serves both at the one address
+    /// it answers on, so both members carry that address — the endpoint the client is
+    /// already talking to — and neither names a host nothing here serves. The instance's own
+    /// identity stays in `webAppDnsDomain` and `instanceId`, the members this API carries it
+    /// in; the recorded responses assert the two host members shape-only, pinning no second
+    /// host.
+    ///
+    /// The address is passed in rather than read here, because it is a property of the
+    /// REQUEST being answered while this record is the stored instance: an instance reached
+    /// through one addressing is never answered another addressing's host, and nothing about
+    /// the announced hosts is persisted.
+    pub fn to_wire(&self, endpoint: &str) -> Instance {
+        let announced = endpoint.to_string();
         Instance {
             instance_id: self.instance_id.clone(),
             aws_account_id: self.aws_account_id.clone(),
@@ -259,8 +240,8 @@ impl InstanceRecord {
             instance_description: self.instance_description.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
             version_number: Some(self.version_number),
-            primary_domain: hostname.clone(),
-            idc_portal_domain: hostname,
+            primary_domain: Some(announced.clone()),
+            idc_portal_domain: Some(announced),
         }
     }
 

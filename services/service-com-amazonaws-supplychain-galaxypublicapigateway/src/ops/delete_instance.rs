@@ -154,7 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Where this instance's web app is announced is a property of the request being
+        // answered (the address it reached this emulator at).
+        let endpoint = crate::state::announced_instance_endpoint(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteInstanceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -188,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.begin_deletion(now);
 
         Ok(DeleteInstanceOutput {
-            instance: record.to_wire(),
+            instance: record.to_wire(&endpoint),
         })
     }
 }

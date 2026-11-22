@@ -169,7 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Where this instance's web app is announced is a property of the request being
+        // answered (the address it reached this emulator at), so it is read once here and
+        // handed to the projection.
+        let endpoint = crate::state::announced_instance_endpoint(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateInstanceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -192,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(existing) = store.idempotency.get(token).cloned() {
                 if let Some(record) = store.instances.get(&existing) {
                     return Ok(CreateInstanceOutput {
-                        instance: record.to_wire(),
+                        instance: record.to_wire(&endpoint),
                     });
                 }
             }
@@ -202,11 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // isn't already being used by someone else" (the member's own documentation), so
         // a subdomain a live instance already holds is a conflict.
         if let Some(domain) = input.web_app_dns_domain.as_deref() {
-            if let Some(holder) = store
-                .instances
-                .values()
-                .find(|record| record.web_app_dns_domain.as_deref() == Some(domain))
-            {
+            if let Some(holder) = store.web_app_dns_domain_holder(domain) {
                 return Err(CreateInstanceErrorModeled::ConflictException(ConflictException {
                     message: Some(format!(
                         "webAppDnsDomain {domain} is already used by instance {}",
@@ -246,21 +245,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.instance_description = input.instance_description;
         record.kms_key_arn = input.kms_key_arn;
         // Every instance HAS a WebApp domain: the request's own value when it named one
-        // ("You can set this to a custom value"), and one the service generates when it did
-        // not — which is what the instance's WebApp and Identity-Center hostnames are built
-        // from, so leaving it absent would leave the instance unaddressable.
-        record.web_app_dns_domain = Some(
-            input
-                .web_app_dns_domain
-                .unwrap_or_else(|| crate::state::generated_web_app_dns_domain(&instance_id)),
-        );
+        // ("You can set this to a custom value"), and one the service MINTS when it did not
+        // — which is what the instance's WebApp and Identity-Center hostnames are built
+        // from, so leaving it absent would leave the instance unaddressable. The minted
+        // value is a DNS LABEL of the member's own modelled form, drawn independently of
+        // the `instanceId`: the label and the id are two different identities of this API.
+        let web_app_dns_domain = match input.web_app_dns_domain {
+            Some(named) => named,
+            None => {
+                let Some(minted) = store.fresh_web_app_dns_domain() else {
+                    return Err(CreateInstanceErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some("could not mint a fresh webAppDnsDomain".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                minted
+            }
+        };
+        record.web_app_dns_domain = Some(web_app_dns_domain);
         if let Some(tags) = input.tags {
             record.tags = tags.into_iter().collect();
         }
 
         // The response is projected from the record that is about to be persisted, so
         // nothing in it can differ from what a later GetInstance reports.
-        let instance = record.to_wire();
+        let instance = record.to_wire(&endpoint);
         store.instances.insert(instance_id.clone(), record);
         if let Some(token) = input.client_token {
             store.idempotency.insert(token, instance_id);

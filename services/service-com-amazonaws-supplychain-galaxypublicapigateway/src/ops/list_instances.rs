@@ -162,7 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Where each listed instance's web app is announced is a property of the request
+        // being answered (the address it reached this emulator at), so one page announces
+        // one address.
+        let endpoint = crate::state::announced_instance_endpoint(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListInstancesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -268,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 break;
             }
-            instances.push(record.to_wire());
+            instances.push(record.to_wire(&endpoint));
         }
 
         Ok(ListInstancesOutput {
