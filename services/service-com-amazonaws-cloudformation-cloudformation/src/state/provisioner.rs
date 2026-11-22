@@ -643,6 +643,32 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 /// ([`super::provisioning::logs_resources`]), so there is one spelling of that opener.
 pub(in crate::state) const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
 
+/// How a resource provider built on the CloudFormation resource-provider plugin words a
+/// refusal it classifies as that plugin's NOT-FOUND failure: the plugin's own sentence, which
+/// names the resource that is not there by its CLOUDFORMATION TYPE and by the identifier the
+/// handler was given for it, and carries nothing of the owning service's own wording.
+///
+/// The sentence is the plugin's and therefore uniform across every resource type, so tooling
+/// that triages a rolled-back deployment reads "a resource the template named is missing" off
+/// any type's event without knowing the service that answered. That is what a provider's own
+/// message would not say — a service names the thing in its own terms and no CloudFormation
+/// type at all.
+///
+/// `resource_type` is the type of the resource the refusal is ABOUT, which for a refusal
+/// naming a resource the declaration merely REFERENCES is that referenced type rather than
+/// the type being deployed, and `identifier` is the identifier the declaration stated for it.
+///
+/// The wording itself is NOT stated here: it is the one uniform not-found sentence this crate
+/// has ([`super::early_validation::not_found`], which the pre-deployment plans report an
+/// absent resource with and which holds it once for every API that reports one), exactly as
+/// the converse collision sentence is reported through
+/// [`network_and_delivery::already_in_use`]. This is only the seam the per-type arms reach it
+/// through, beside [`INVALID_REQUEST_PROVIDED`], so a provider that reports a refusal this
+/// way and a plan that reports the same absence cannot drift apart.
+pub(in crate::state) fn provider_resource_not_found(resource_type: &str, identifier: &str) -> String {
+    super::early_validation::not_found(resource_type, identifier)
+}
+
 /// How the resource providers of the `AWS::MSK::*` types OPEN the message they report for a
 /// refusal of Amazon MSK: the token of the resource request they were answering, in square
 /// brackets, before the service's own message

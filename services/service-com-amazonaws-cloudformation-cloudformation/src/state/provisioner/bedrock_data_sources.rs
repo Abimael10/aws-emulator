@@ -42,6 +42,17 @@
 //! No `clientToken` is sent. That member is an `@idempotencyToken`, so a token derived from
 //! the resource would make the create of a REPLACEMENT data source replay the one the stack
 //! already had instead of attaching a new one.
+//!
+//! ## A refusal about the knowledge base the declaration REFERENCES
+//!
+//! The create names TWO resources: the data source it makes, and the knowledge base it asks to
+//! attach that data source to — which the declaration only references, by the id stated in
+//! `KnowledgeBaseId`. A `ResourceNotFoundException` answered to the create can therefore be
+//! about the referenced knowledge base alone, the data source not existing yet, and this
+//! provider reports such a refusal in the resource-provider plugin's own not-found sentence
+//! naming that resource's CloudFormation type and the stated identifier
+//! ([`referenced_knowledge_base_not_found`]) rather than forwarding the owning service's
+//! sentence, which names no CloudFormation type at all.
 
 use super::*;
 
@@ -130,7 +141,8 @@ pub(super) async fn create_bedrock_data_source(
         &data_sources_uri(&knowledge_base_id),
         Some(&Value::Object(request)),
     )
-    .await?;
+    .await
+    .map_err(|refusal| referenced_knowledge_base_not_found(refusal, &knowledge_base_id))?;
     let attributes = data_source_attributes(&answered)?;
     Ok(Created {
         physical_resource_id: Some(template::bedrock_data_source_identity(
@@ -142,6 +154,33 @@ pub(super) async fn create_bedrock_data_source(
         )),
         attributes,
     })
+}
+
+/// How this type's provider reports a create Amazon Bedrock Agent refused because the
+/// KNOWLEDGE BASE the declaration REFERENCES is not there: in the resource-provider plugin's
+/// own not-found sentence ([`provider_resource_not_found`]), naming the CloudFormation TYPE of
+/// the resource that is missing — the knowledge base's, not the data source's — and the
+/// identifier the declaration stated for it.
+///
+/// The create is the one call on a data source whose not-found answer can be about nothing
+/// else: the data source does not exist yet, so the only resource the request names is the
+/// knowledge base it asks to attach to, which is the resource the declaration references. The
+/// `knowledgeBaseId` the declaration stated is therefore the identifier the refusal is about,
+/// carried through exactly as the template wrote it.
+///
+/// Judged on the CODE Amazon Bedrock Agent answered ([`BEDROCK_RESOURCE_NOT_FOUND`]), never on
+/// its message — the message carries the request's own values, while the code is what says
+/// what kind of refusal this is. Every other refusal is reported as that service worded it,
+/// and the CODE travels untouched either way, so the `HandlerErrorCode` class the event
+/// carries is the one the refusal falls in.
+fn referenced_knowledge_base_not_found(refusal: Refusal, knowledge_base_id: &str) -> Refusal {
+    if refusal.code != BEDROCK_RESOURCE_NOT_FOUND {
+        return refusal;
+    }
+    Refusal {
+        message: provider_resource_not_found(template::BEDROCK_KNOWLEDGE_BASE, knowledge_base_id),
+        code: refusal.code,
+    }
 }
 
 /// Whether Amazon Bedrock Agent has finished settling the data source a stack created.
@@ -444,4 +483,104 @@ fn failed_reason(physical_resource_id: &str, status: &str, data_source: &Value) 
         return reported;
     }
     format!("{reported}: {}", reasons.join("; "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: a create this service refused because the knowledge base the declaration
+    /// REFERENCES is not there is reported in the plugin's own not-found sentence, naming the
+    /// referenced resource's CloudFormation type and the identifier the declaration stated;
+    /// every other refusal is reported as that service worded it, and the code travels
+    /// untouched either way.
+    ///
+    /// The rows differ along the identifier's FORM (the whole of the modelled
+    /// `^[0-9a-zA-Z]{10}$` character set: digits, lower case, upper case and mixed) and along
+    /// the CODE the refusal carried.
+    #[test]
+    fn a_missing_referenced_knowledge_base_is_reported_in_the_plugins_own_sentence() {
+        let rows: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "a knowledge base of digits that service does not hold",
+                BEDROCK_RESOURCE_NOT_FOUND,
+                "KnowledgeBase with id 0123456789 is not found.",
+                "0123456789",
+                "Resource of type 'AWS::Bedrock::KnowledgeBase' with identifier '0123456789' \
+                 was not found.",
+            ),
+            (
+                "one of lower-case letters",
+                BEDROCK_RESOURCE_NOT_FOUND,
+                "KnowledgeBase with id abcdefghij is not found.",
+                "abcdefghij",
+                "Resource of type 'AWS::Bedrock::KnowledgeBase' with identifier 'abcdefghij' \
+                 was not found.",
+            ),
+            (
+                "one of upper-case letters",
+                BEDROCK_RESOURCE_NOT_FOUND,
+                "KnowledgeBase with id ABCDEFGHIJ is not found.",
+                "ABCDEFGHIJ",
+                "Resource of type 'AWS::Bedrock::KnowledgeBase' with identifier 'ABCDEFGHIJ' \
+                 was not found.",
+            ),
+            (
+                "one of mixed case and digits",
+                BEDROCK_RESOURCE_NOT_FOUND,
+                "KnowledgeBase with id aB3dE6gH9j is not found.",
+                "aB3dE6gH9j",
+                "Resource of type 'AWS::Bedrock::KnowledgeBase' with identifier 'aB3dE6gH9j' \
+                 was not found.",
+            ),
+            (
+                "a declaration that states no knowledge base at all",
+                BEDROCK_RESOURCE_NOT_FOUND,
+                "KnowledgeBase with id  is not found.",
+                "",
+                "Resource of type 'AWS::Bedrock::KnowledgeBase' with identifier '' was not \
+                 found.",
+            ),
+            (
+                "a create that service refused for the declaration itself",
+                "ValidationException",
+                "1 validation error detected",
+                "aB3dE6gH9j",
+                "1 validation error detected",
+            ),
+            (
+                "a create that service would not serve at all",
+                "AccessDeniedException",
+                "User is not authorized to perform this action",
+                "aB3dE6gH9j",
+                "User is not authorized to perform this action",
+            ),
+            (
+                "a name already in use",
+                "ConflictException",
+                "A data source with that name already exists.",
+                "aB3dE6gH9j",
+                "A data source with that name already exists.",
+            ),
+        ];
+        for (case, code, message, knowledge_base_id, expected) in rows {
+            let reported = referenced_knowledge_base_not_found(
+                Refusal {
+                    code: (*code).to_string(),
+                    message: (*message).to_string(),
+                },
+                knowledge_base_id,
+            );
+            assert_eq!(
+                reported.message, *expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                reported.message
+            );
+            assert_eq!(
+                reported.code, *code,
+                "case {case:?}: expected the code {code:?} to travel untouched, got {:?}",
+                reported.code
+            );
+        }
+    }
 }
