@@ -9,10 +9,11 @@
 //! outside that span is refused with the modelled `InvalidParameterException` (HTTP 400),
 //! whether it lies above the highest cursor or below the first one.
 //!
-//! All four paginated operations of this crate the cases drive (`ListComponents`,
-//! `ExportComponents`, `ExportForms`, `ExportThemes`) share one token validator, so each
-//! case here is driven against every one of them, each with a token of the collection it
-//! pages: the cursor bound is a property of the token, not of the operation that reads it.
+//! All seven paginated operations of this crate the cases drive (`ListComponents`,
+//! `ExportComponents`, `ListForms`, `ExportForms`, `ListThemes`, `ExportThemes`,
+//! `ListCodegenJobs`) share one token validator, so each case here is driven against every
+//! one of them, each with a token of the collection it pages: the cursor bound is a
+//! property of the token, not of the operation that reads it.
 //!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
@@ -138,6 +139,12 @@ fn minimal_theme(name: &str) -> Value {
     json!({"name": name, "values": []})
 }
 
+/// A codegen job carries no name: `StartCodegenJobData` requires only `renderConfig`, a
+/// union, so the smallest payload names one of its variants.
+fn minimal_codegen_job() -> Value {
+    json!({"renderConfig": {"react": {}}})
+}
+
 /// Where an entity kind of this app environment is created and listed.
 fn collection_uri(kind: &str) -> String {
     format!("/app/{APP_ID}/environment/{ENVIRONMENT}/{kind}")
@@ -169,6 +176,38 @@ struct Paginated {
     collection: &'static str,
 }
 
+/// The crate's operation contract, rendered from this service's Smithy model: the source
+/// of which operations carry `@paginated`. Embedded at compile time so the set the table
+/// below is checked against is derived from the contract rather than copied out of it.
+const OPERATION_CONTRACT: &str = include_str!("../../OPERATIONS.md");
+
+/// Every operation the contract marks `@paginated`, in the order it lists them: the
+/// operation of each `## <Operation>` heading whose `- **Traits:**` line carries that
+/// trait. Checked against the table below, so a paginated operation added to the model — or
+/// a row dropped from the table — fails here instead of leaving the claim that every one of
+/// them is driven unchecked.
+fn paginated_in_the_contract() -> Vec<&'static str> {
+    let mut operation: Option<&'static str> = None;
+    let mut paginated: Vec<&'static str> = Vec::new();
+    for line in OPERATION_CONTRACT.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            operation = Some(heading.trim());
+        }
+        if line.starts_with("- **Traits:**") && line.contains("@paginated") {
+            paginated.push(operation.unwrap_or_else(|| {
+                panic!("the contract must name an operation before its traits: {line:?}")
+            }));
+        }
+    }
+    assert!(
+        !paginated.is_empty(),
+        "the operation contract must mark at least one operation @paginated, got none in {} \
+         bytes",
+        OPERATION_CONTRACT.len()
+    );
+    paginated
+}
+
 fn paginated_operations() -> Vec<Paginated> {
     vec![
         Paginated {
@@ -182,14 +221,29 @@ fn paginated_operations() -> Vec<Paginated> {
             collection: "components",
         },
         Paginated {
+            operation: "ListForms",
+            uri: collection_uri("forms"),
+            collection: "forms",
+        },
+        Paginated {
             operation: "ExportForms",
             uri: export_uri("forms"),
             collection: "forms",
         },
         Paginated {
+            operation: "ListThemes",
+            uri: collection_uri("themes"),
+            collection: "themes",
+        },
+        Paginated {
             operation: "ExportThemes",
             uri: export_uri("themes"),
             collection: "themes",
+        },
+        Paginated {
+            operation: "ListCodegenJobs",
+            uri: collection_uri("codegen-jobs"),
+            collection: "codegen-jobs",
         },
     ]
 }
@@ -249,6 +303,23 @@ async fn issued_tokens(
     tokens
 }
 
+/// The last token a one-record-at-a-time walk of `collection` issued: a token of that
+/// collection the service really handed out, which is what a row driving an operation that
+/// pages it needs to forge a cursor under the right scope digest.
+async fn fixture_token(
+    router: &MultiServiceRouter,
+    collection: &str,
+    pages_at_most: usize,
+) -> String {
+    issued_tokens(router, collection, pages_at_most)
+        .await
+        .last()
+        .unwrap_or_else(|| {
+            panic!("a walk of the {collection} one at a time must issue at least one token")
+        })
+        .clone()
+}
+
 /// A token whose cursor is outside the span the service hands out is refused by every
 /// paginated operation, while one carrying a cursor it did hand out — the FIRST one as
 /// much as the highest — is served.
@@ -259,12 +330,28 @@ async fn issued_tokens(
 #[tokio::test]
 async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_operation() {
     let router = emulator();
+    let mut driven: Vec<&str> = paginated_operations()
+        .iter()
+        .map(|row| row.operation)
+        .collect();
+    let mut in_the_contract = paginated_in_the_contract();
+    driven.sort_unstable();
+    in_the_contract.sort_unstable();
+    assert_eq!(
+        driven, in_the_contract,
+        "case the table: every operation the contract marks @paginated must have a row, and no \
+         row may name one it does not; driven {driven:?}, @paginated in the contract \
+         {in_the_contract:?}"
+    );
 
-    // Themes and forms first, then components, so the newest cursor the store has handed
-    // out belongs to a component and the walk below can read it off an issued token.
-    for index in 0..2 {
+    // Themes, forms and codegen jobs first, then components, so the newest cursor the store
+    // has handed out belongs to a component and the walk below can read it off an issued
+    // token.
+    let fixtures_per_collection = 2;
+    for index in 0..fixtures_per_collection {
         create(&router, "themes", minimal_theme(&format!("theme-{index}"))).await;
         create(&router, "forms", minimal_form(&format!("form-{index}"))).await;
+        create(&router, "codegen-jobs", minimal_codegen_job()).await;
     }
     let components = 4;
     for index in 0..components {
@@ -296,29 +383,36 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
     assert!(
         highest >= u64::try_from(components).expect("the fixture count fits in u64"),
         "case issued token: the newest cursor must count every entity created, got {highest} \
-         after four other entities and {components} components"
+         after the other collections' fixtures and {components} components"
     );
 
-    // One token each of the other two collections' lists really issued, so every row below
+    // One token each of the other three collections' lists really issued, so every row below
     // is driven with a token of the collection its operation pages: a token names a page of
-    // ONE collection, and the scope digest it carries is what says which.
-    let fixtures_per_collection = 2;
-    let form_token = issued_tokens(&router, "forms", fixtures_per_collection)
-        .await
-        .last()
-        .unwrap_or_else(|| panic!("a walk of {fixtures_per_collection} forms must issue a token"))
-        .clone();
-    let theme_token = issued_tokens(&router, "themes", fixtures_per_collection)
-        .await
-        .last()
-        .unwrap_or_else(|| panic!("a walk of {fixtures_per_collection} themes must issue a token"))
-        .clone();
+    // ONE collection, and the digest it carries — over the app environment AND the collection
+    // the page was served over — is what says which.
+    let form_token = fixture_token(&router, "forms", fixtures_per_collection).await;
+    let theme_token = fixture_token(&router, "themes", fixtures_per_collection).await;
+    let codegen_job_token = fixture_token(&router, "codegen-jobs", fixtures_per_collection).await;
     let token_of = |collection: &str| -> String {
         match collection {
             "components" => issued.clone(),
             "forms" => form_token.clone(),
             "themes" => theme_token.clone(),
+            "codegen-jobs" => codegen_job_token.clone(),
             other => panic!("no fixture token for the {other} collection"),
+        }
+    };
+
+    // How many records each collection holds, so a page resumed at the floor of the span —
+    // the head of the list — can be asserted to carry every one of them rather than merely
+    // to carry a list.
+    let records_of = |collection: &str| -> usize {
+        match collection {
+            "components" => components,
+            "forms" => fixtures_per_collection,
+            "themes" => fixtures_per_collection,
+            "codegen-jobs" => fixtures_per_collection,
+            other => panic!("no fixture count for the {other} collection"),
         }
     };
 
@@ -360,6 +454,20 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
                      entities list, got {:?}",
                     answer.body
                 );
+                // At the floor the page starts at the head of the list, so it carries every
+                // record of the collection this operation pages: a page served from a cursor
+                // of ANOTHER collection would be short or empty here. Above the floor the
+                // cursor belongs to a component, so how many records of the other collections
+                // sit at or after it is not a property of the rule under test.
+                if *cursor == first {
+                    assert_eq!(
+                        answer.entity_count(),
+                        Some(records_of(collection)),
+                        "case {operation} / {case} (cursor {cursor}): a page resumed at the head \
+                         must carry every record of the {collection}, got {:?}",
+                        answer.body
+                    );
+                }
             } else {
                 assert_eq!(
                     answer.status, 400,
