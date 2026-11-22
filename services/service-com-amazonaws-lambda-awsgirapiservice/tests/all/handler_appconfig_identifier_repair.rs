@@ -351,7 +351,10 @@ async fn invoke(
 }
 
 /// The bytes the handler reported being served, decoded from the base64 it carried them in.
-fn reported_bytes(case: &str, payload: &Value) -> Vec<u8> {
+///
+/// `pub(crate)` so a sibling suite whose handler reports its bytes the same way reads them
+/// through this one rather than through a second copy of it.
+pub(crate) fn reported_bytes(case: &str, payload: &Value) -> Vec<u8> {
     let encoded = payload["bytes"].as_str().unwrap_or_else(|| {
         panic!("case {case:?}: expected the bytes the handler was served, got {payload}")
     });
