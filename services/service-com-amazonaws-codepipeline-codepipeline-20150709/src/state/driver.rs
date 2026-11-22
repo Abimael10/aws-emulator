@@ -701,7 +701,7 @@ fn step_stage(
                     action
                         .error
                         .as_ref()
-                        .map(|(_, message)| message.clone())
+                        .map(|failure| failure.message.clone())
                         .unwrap_or_else(|| "no detail reported".to_string())
                 );
                 record.stages[stage].status = Some(STAGE_FAILED.to_string());
@@ -1440,11 +1440,37 @@ fn declared_environment_overrides(declared: &str) -> Result<EnvironmentOverrides
     Ok(overrides)
 }
 
-/// Record a failure against one action.
+/// Record a failure against one action, with this service's own account of the work that
+/// failed as its message — the text every reader of the action reports, because it is a
+/// statement about this run rather than a provider's classification of the declaration.
 fn fail_action(
     action: &mut super::execution::ActionRun,
     code: &str,
     message: &str,
+    now: SystemTime,
+) {
+    record_failure(action, code, message, false, now);
+}
+
+/// Record a failure the action PROVIDER classified itself, whose one sentence is the
+/// provider's summary for the action execution
+/// ([`super::execution::ActionFailure::provider_summary`]).
+fn fail_action_as_classified(
+    action: &mut super::execution::ActionRun,
+    code: &str,
+    summary: &str,
+    now: SystemTime,
+) {
+    record_failure(action, code, summary, true, now);
+}
+
+/// The body both of the above share: the action is settled as `Failed` and carries the
+/// `FailureType`, the text, and whether that text is the provider's own summary.
+fn record_failure(
+    action: &mut super::execution::ActionRun,
+    code: &str,
+    message: &str,
+    provider_summary: bool,
     now: SystemTime,
 ) {
     action.status = Some(ACTION_FAILED.to_string());
@@ -1454,10 +1480,11 @@ fn fail_action(
     // Each of the two members carrying this failure is held to the length it is
     // modelled with, so a relayed answer cannot take either past it.
     action.summary = Some(within(message.to_string(), MAX_EXECUTION_SUMMARY));
-    action.error = Some((
-        code.to_string(),
-        within(message.to_string(), MAX_ERROR_MESSAGE),
-    ));
+    action.error = Some(super::execution::ActionFailure {
+        code: code.to_string(),
+        message: within(message.to_string(), MAX_ERROR_MESSAGE),
+        provider_summary,
+    });
     action.last_status_change = now;
 }
 
@@ -1634,6 +1661,12 @@ fn record_outcome(
         } => {
             fail_action(action, &code, &message, now);
             action.external_execution_id = external_id;
+        }
+        // A declaration the provider classified as unrunnable: its sentence is the one
+        // the action reports, and nothing external ran to report an id for.
+        JobOutcome::Misconfigured { code, summary } => {
+            fail_action_as_classified(action, &code, &summary, now);
+            action.external_execution_id = None;
         }
         // The work is RUNNING in another service: the action keeps the `InProgress`
         // status it already reports, the run it is waiting for is recorded on it, and the
@@ -2140,14 +2173,13 @@ async fn run_code_commit_source(
             if service.is_some_and(
                 ::aws_sdk_codecommit::operation::get_branch::GetBranchError::is_branch_does_not_exist_exception,
             ) {
-                return JobOutcome::Failed {
+                return JobOutcome::Misconfigured {
                     code: FAILURE_CONFIGURATION_ERROR.to_string(),
-                    message: code_commit_branch_not_found_summary(
+                    summary: code_commit_branch_not_found_summary(
                         branch,
                         repository,
                         ::aws_smithy_types::error::metadata::ProvideErrorMetadata::message(&err),
                     ),
-                    external_id: None,
                 };
             }
             let code = if service.is_some_and(|err| {
@@ -2487,22 +2519,61 @@ fn zip_of(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
 /// itself, rather than the revision in it, is missing.
 const S3_NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
-/// The `FailureType` a source action's failed READ of its object is reported under.
+/// What an Amazon S3 source action reports when the BUCKET its configuration names is
+/// not there at all — the provider's own sentence about that misconfiguration.
+///
+/// The Amazon S3 source provider CLASSIFIES this failure rather than relaying the read
+/// that ran into it: the bucket an action's `S3Bucket` configuration names is not
+/// something a later run could find, so what the action publishes is the provider's
+/// statement that no bucket of that name exists. The words are the provider's fixed text
+/// and the one value from the request is the configured bucket name, so a console, a
+/// notification and a CI gate reading
+/// `ActionExecutionResult$externalExecutionSummary` ("the action provider's summary for
+/// the action execution") and `ErrorDetails$message` get the same actionable sentence
+/// however the read was answered — and nothing of this emulator's own call to S3 reaches
+/// either member (see [`service_error_detail`], which states the same for a failure of a
+/// kind no provider sentence covers).
+fn s3_source_bucket_not_found_summary(bucket: &str) -> String {
+    format!("[No bucket with the name {bucket} was found]")
+}
+
+/// How a source action's failed READ of its object is reported: the `FailureType` it
+/// carries, and the text BOTH the action's `errorDetails$message` and its summary state.
+///
+/// The two are decided together, from the one answer, so the classification cannot drift
+/// from the sentence that explains it.
 ///
 /// The OBJECT (at the version the execution pinned, or at its current version) IS the
 /// revision an S3 source action sources, so an object the bucket does not hold is a
-/// revision that is not available — [`FAILURE_REVISION_UNAVAILABLE`]. A bucket the
-/// service does not hold at all is the other fact: the declaration names a source this
-/// pipeline cannot read from, which is a configuration error, the same way a repository
-/// no registry holds is for the other source providers.
-fn source_failure_code<E, R>(error: &::aws_smithy_runtime_api::client::result::SdkError<E, R>) -> &'static str
+/// revision that is not available — [`FAILURE_REVISION_UNAVAILABLE`], reported as the
+/// read that could not be performed with the answering service's own error relayed
+/// inside it. A bucket the service does not hold at all is the other fact: the
+/// declaration names a source this pipeline cannot read from, which is a configuration
+/// error the provider has its own sentence for
+/// ([`s3_source_bucket_not_found_summary`]), the same way a branch no repository holds
+/// is for the CodeCommit source provider.
+fn source_read_failure<E, R>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<E, R>,
+    bucket: &str,
+    key: &str,
+) -> JobOutcome
 where
     ::aws_smithy_runtime_api::client::result::SdkError<E, R>:
         ::aws_smithy_types::error::metadata::ProvideErrorMetadata,
 {
     match ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(error) {
-        Some(S3_NO_SUCH_BUCKET) => FAILURE_CONFIGURATION_ERROR,
-        _ => FAILURE_REVISION_UNAVAILABLE,
+        Some(S3_NO_SUCH_BUCKET) => JobOutcome::Misconfigured {
+            code: FAILURE_CONFIGURATION_ERROR.to_string(),
+            summary: s3_source_bucket_not_found_summary(bucket),
+        },
+        _ => JobOutcome::Failed {
+            code: FAILURE_REVISION_UNAVAILABLE.to_string(),
+            message: format!(
+                "the source object s3://{bucket}/{key} could not be read: {}",
+                service_error_detail(error)
+            ),
+            external_id: None,
+        },
     }
 }
 
@@ -2580,16 +2651,7 @@ async fn run_source(
         .await;
     let object = match read {
         Ok(object) => object,
-        Err(err) => {
-            return JobOutcome::Failed {
-                code: source_failure_code(&err).to_string(),
-                message: format!(
-                    "the source object s3://{bucket}/{key} could not be read: {}",
-                    service_error_detail(&err)
-                ),
-                external_id: None,
-            }
-        }
+        Err(err) => return source_read_failure(&err, bucket, key),
     };
     let version = object.version_id().map(str::to_string);
     let etag = object.e_tag().map(|etag| etag.trim_matches('"').to_string());

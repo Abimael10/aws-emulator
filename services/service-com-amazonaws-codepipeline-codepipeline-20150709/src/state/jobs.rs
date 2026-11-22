@@ -447,8 +447,15 @@ pub fn record_failure(
     run.status = Some(ACTION_FAILED.to_string());
     run.summary = Some(failure.message.clone());
     // `FailureDetails$type` is the `FailureType` the worker chose for this failure, so it
-    // is reported as the action's error code rather than replaced by one of ours.
-    run.error = Some((failure.r#type.clone(), failure.message.clone()));
+    // is reported as the action's error code rather than replaced by one of ours, and
+    // `FailureDetails$message` is the worker's OWN statement about the work it performed:
+    // the party that failed published it, so every reader of the action reports it
+    // ([`super::execution::ActionFailure::provider_summary`]).
+    run.error = Some(super::execution::ActionFailure {
+        code: failure.r#type.clone(),
+        message: failure.message.clone(),
+        provider_summary: false,
+    });
     // `FailureDetails$externalExecutionId` is "the external ID of the run of the action
     // that failed", which is exactly what the action execution reports as its provider's
     // external id: a worker that named the run it failed in is reported with THAT id

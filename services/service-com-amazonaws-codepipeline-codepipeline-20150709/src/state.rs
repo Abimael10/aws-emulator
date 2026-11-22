@@ -3400,9 +3400,15 @@ fn action_execution_output(
             // state reports as its `summary`.
             external_execution_summary: action_run.summary.clone(),
             external_execution_url: None,
-            error_details: action_run.error.as_ref().map(|(code, message)| ErrorDetails {
-                code: Some(code.clone()),
-                message: Some(message.clone()),
+            error_details: action_run.error.as_ref().map(|failure| ErrorDetails {
+                code: Some(failure.code.clone()),
+                // A sentence the action PROVIDER published about a failure it classified
+                // is its summary for the execution, reported once — as
+                // `externalExecutionSummary` above — rather than again here. A message
+                // the party that failed published about its own work is that party's own
+                // statement, so the history reports it beside the code
+                // ([`execution::ActionFailure::provider_summary`]).
+                message: (!failure.provider_summary).then(|| failure.message.clone()),
             }),
             log_stream_arn: None,
         }),

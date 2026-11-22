@@ -418,6 +418,50 @@ pub(crate) async fn status_of(emulator: &Emulator, pipeline: &str, execution: &s
         .to_string()
 }
 
+/// One action execution of `execution`, by action name, as `ListActionExecutions`
+/// reports it.
+///
+/// `pub(crate)` with the harness: every suite that reads what one attempt reported goes
+/// through this one lookup rather than growing a copy of it.
+pub(crate) async fn action_detail(
+    emulator: &Emulator,
+    pipeline: &str,
+    execution: &str,
+    action: &str,
+) -> Value {
+    let page = emulator
+        .ok(
+            "ListActionExecutions",
+            &json!({"pipelineName": pipeline, "filter": {"pipelineExecutionId": execution}}),
+        )
+        .await;
+    page["actionExecutionDetails"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|detail| detail["actionName"] == json!(action))
+        .cloned()
+        .unwrap_or_else(|| panic!("the run of {action} is reported, got {page}"))
+}
+
+/// The `latestExecution` `GetPipelineState` reports for one action, wherever its stage is.
+///
+/// `pub(crate)` with the harness, for the same reason as [`action_detail`]: the state's
+/// view of one action is read in one place.
+pub(crate) async fn latest_execution(emulator: &Emulator, pipeline: &str, action: &str) -> Value {
+    let state = emulator
+        .ok("GetPipelineState", &json!({"name": pipeline}))
+        .await;
+    state["stageStates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|stage| stage["actionStates"].as_array().into_iter().flatten())
+        .find(|reported| reported["actionName"] == json!(action))
+        .map(|reported| reported["latestExecution"].clone())
+        .unwrap_or_else(|| panic!("the state reports the run of {action}, got {state}"))
+}
+
 /// A zip archive of `entries`, built by the `zip` crate (the same crate the deploy
 /// action reads one with).
 ///

@@ -23,10 +23,11 @@
 //! real actions through the emulated S3 service and every assertion goes through the
 //! router.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::execution_engine::{
-    artifact_bucket, declaration, deploy_stage, source_stage, wait_for_terminal, Emulator,
+    action_detail, artifact_bucket, declaration, deploy_stage, latest_execution, source_stage,
+    wait_for_terminal, Emulator,
 };
 
 /// The bucket the source object lives in.
@@ -43,23 +44,6 @@ const ARTIFACT: &str = "SourceArtifact";
 
 /// The value the pipeline-level variable every declaration here carries resolves to.
 const ENV_VALUE: &str = "staging";
-
-/// One action execution of `execution`, by action name.
-async fn action_detail(emulator: &Emulator, pipeline: &str, execution: &str, action: &str) -> Value {
-    let page = emulator
-        .ok(
-            "ListActionExecutions",
-            &json!({"pipelineName": pipeline, "filter": {"pipelineExecutionId": execution}}),
-        )
-        .await;
-    page["actionExecutionDetails"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|detail| detail["actionName"] == json!(action))
-        .cloned()
-        .unwrap_or_else(|| panic!("the run of {action} is reported, got {page}"))
-}
 
 /// RULE: the resolved configuration an action execution reports is the one the engine
 /// ran it with — every reference the execution carries a value for replaced, in whatever
@@ -219,44 +203,74 @@ async fn the_built_in_execution_id_resolves_per_execution() {
     }
 }
 
+/// One row of the table below: a source read that cannot produce a revision.
+struct MissingRevision {
+    /// What this row is.
+    case: &'static str,
+    /// Whether the source bucket exists.
+    bucket_exists: bool,
+    /// Whether the source object exists.
+    object_exists: bool,
+    /// The object version the execution pins, when it pins one.
+    pinned: Option<&'static str>,
+    /// The `FailureType` the action reports.
+    expected_code: &'static str,
+    /// The value the failure's text names.
+    named: &'static str,
+}
+
 /// RULE: the OBJECT an S3 source action names is the revision it sources, so an object
 /// (or an object version) the bucket does not hold is a revision that is not available —
 /// while a bucket the service does not hold at all is a source the declaration cannot
-/// read from, which is a configuration error. Either way nothing is delivered
-/// downstream.
+/// read from, which is a configuration error the provider classifies itself, naming that
+/// bucket (`tests/all/provider_classified_failures.rs` holds that sentence's own rule).
+/// Either way nothing is delivered downstream.
 #[tokio::test]
 async fn a_revision_that_cannot_be_obtained_fails_with_revision_unavailable() {
-    // (case, the source bucket exists, the object exists, the object version pinned,
-    //  the `FailureType` the action reports)
-    let rows: Vec<(&str, bool, bool, Option<&str>, &str)> = vec![
-        ("no such object", true, false, None, "RevisionUnavailable"),
-        (
-            "an object version the bucket does not hold",
-            true,
-            true,
-            Some("00000000000000000000000000000001"),
-            "RevisionUnavailable",
-        ),
-        (
-            "no such bucket",
-            false,
-            false,
-            None,
-            "ConfigurationError",
-        ),
+    let rows: Vec<MissingRevision> = vec![
+        MissingRevision {
+            case: "no such object",
+            bucket_exists: true,
+            object_exists: false,
+            pinned: None,
+            expected_code: "RevisionUnavailable",
+            named: SOURCE_KEY,
+        },
+        MissingRevision {
+            case: "an object version the bucket does not hold",
+            bucket_exists: true,
+            object_exists: true,
+            pinned: Some("00000000000000000000000000000001"),
+            expected_code: "RevisionUnavailable",
+            named: SOURCE_KEY,
+        },
+        MissingRevision {
+            case: "no such bucket",
+            bucket_exists: false,
+            object_exists: false,
+            pinned: None,
+            expected_code: "ConfigurationError",
+            named: SOURCE_BUCKET,
+        },
     ];
 
-    for (index, (case, make_bucket, write_source, pinned, expected_code)) in
-        rows.into_iter().enumerate()
-    {
+    for (index, row) in rows.into_iter().enumerate() {
+        let MissingRevision {
+            case,
+            bucket_exists,
+            object_exists,
+            pinned,
+            expected_code,
+            named,
+        } = row;
         let emulator = Emulator::new();
         let pipeline = format!("revision-gone-{index}");
         emulator.bucket(&artifact_bucket(&pipeline)).await;
         emulator.bucket(DEPLOY_BUCKET).await;
-        if make_bucket {
+        if bucket_exists {
             emulator.bucket(SOURCE_BUCKET).await;
         }
-        if write_source {
+        if object_exists {
             emulator
                 .put_object(SOURCE_BUCKET, SOURCE_KEY, b"the wrong revision")
                 .await;
@@ -300,12 +314,13 @@ async fn a_revision_that_cannot_be_obtained_fails_with_revision_unavailable() {
             error["code"], json!(expected_code),
             "case {case:?}: unexpected failure type, got {error}"
         );
+        // The text explaining the failure, which the action's STATE carries whoever
+        // stated it — this service's account of the read that failed, or the provider's
+        // own sentence about the source it could not read from.
+        let message = action_error_message(&emulator, &pipeline, "Src").await;
         assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(SOURCE_KEY)),
-            "case {case:?}: the reason names the object that could not be read, \
-             got {error}"
+            message.contains(named),
+            "case {case:?}: the reason names {named:?}, got {message:?}"
         );
         let (status, _) = emulator.get_object(DEPLOY_BUCKET, "gone.zip").await;
         assert_eq!(
@@ -339,17 +354,19 @@ const MAX_ACTION_SUMMARY: usize = 2_048;
 
 /// The `summary` the state reports for one action's latest execution.
 async fn action_summary(emulator: &Emulator, pipeline: &str, action: &str) -> String {
-    let state = emulator
-        .ok("GetPipelineState", &json!({"name": pipeline}))
-        .await;
-    state["stageStates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|stage| stage["actionStates"].as_array().into_iter().flatten())
-        .find(|state| state["actionName"] == json!(action))
-        .and_then(|state| state["latestExecution"]["summary"].as_str())
-        .unwrap_or_else(|| panic!("the state reports the run of {action}, got {state}"))
+    latest_execution(emulator, pipeline, action)
+        .await["summary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run of {action} reports a summary"))
+        .to_string()
+}
+
+/// The `errorDetails$message` the state reports for one action's latest execution.
+async fn action_error_message(emulator: &Emulator, pipeline: &str, action: &str) -> String {
+    latest_execution(emulator, pipeline, action)
+        .await["errorDetails"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the failed run of {action} states a message"))
         .to_string()
 }
 
@@ -360,7 +377,9 @@ async fn action_summary(emulator: &Emulator, pipeline: &str, action: &str) -> St
 /// arrived in is not part of either.
 ///
 /// The rows differ along the error the source read is answered with, each a different
-/// fact about the read: the key, the version, and the bucket.
+/// fact about the read: the key and the version. A failure the action PROVIDER classifies
+/// itself publishes its own sentence instead of relaying anything, which is a rule of its
+/// own (`tests/all/provider_classified_failures.rs`).
 #[tokio::test]
 async fn a_failure_relays_the_answering_services_error_and_none_of_the_client_object() {
     // (case, the source bucket exists, the object exists, the object version pinned,
@@ -374,7 +393,6 @@ async fn a_failure_relays_the_answering_services_error_and_none_of_the_client_ob
             Some("00000000000000000000000000000001"),
             "NoSuchVersion",
         ),
-        ("no such bucket", false, false, None, "NoSuchBucket"),
     ];
 
     for (index, (case, make_bucket, write_source, pinned, answered_code)) in

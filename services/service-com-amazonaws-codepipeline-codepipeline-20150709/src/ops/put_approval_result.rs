@@ -302,10 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action.last_status_change = now;
             action.token = None;
             if !approved {
-                action.error = Some((
-                    "JobFailed".to_string(),
-                    format!("the approval was rejected: {}", input.result.summary),
-                ));
+                // The REVIEWER stated why the approval was rejected
+                // (`ApprovalResult$summary`), so the failure's message is a statement
+                // about this action's outcome rather than a provider's classification of
+                // the declaration, and every reader of the action reports it.
+                action.error = Some(crate::state::execution::ActionFailure {
+                    code: "JobFailed".to_string(),
+                    message: format!("the approval was rejected: {}", input.result.summary),
+                    provider_summary: false,
+                });
             }
             record.last_update_time = now;
             return Ok(PutApprovalResultOutput {

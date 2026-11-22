@@ -555,7 +555,8 @@ async fn a_run_reports_what_it_holds_as_an_empty_list_rather_than_omitting_it() 
 /// action provider's own `ConfigurationError` sentence about that misconfiguration, whose
 /// only variable parts are the branch and repository names the action's configuration
 /// states — and the same sentence is what the action's state reports as its error
-/// message.
+/// message, while the history reports it once, as the provider's summary for the
+/// execution, with the provider's code alone in its error details.
 ///
 /// The rows differ along what the rule generalises over: the branch the declaration
 /// names, the repository's name, and whether the repository holds another branch or none
@@ -626,13 +627,9 @@ async fn a_missing_branch_fails_with_the_providers_configuration_error_sentence(
                 result["errorDetails"]["code"].clone(),
                 result["errorDetails"]["message"].clone()
             ),
-            (
-                json!(expected),
-                json!(CONFIGURATION_ERROR),
-                json!(expected)
-            ),
-            "case {case:?}: the provider's summary and message are its own sentence, got \
-             {source}"
+            (json!(expected), json!(CONFIGURATION_ERROR), Value::Null),
+            "case {case:?}: the provider's sentence is its summary for the execution, and \
+             the history states its code alone beside it, got {source}"
         );
 
         let state = emulator

@@ -309,6 +309,36 @@ pub struct ArtifactRef {
     pub encryption: Option<String>,
 }
 
+/// Why one action failed: the `FailureType` it is reported under, the text explaining
+/// it, and WHO stated that text.
+///
+/// The last of those is a fact about the failure rather than a presentation choice,
+/// because the two readers of a failed action report it differently. `ErrorDetails` is
+/// "information about an error in CodePipeline", carrying a `code` ("the system ID or
+/// number code of the error") and a `message` ("the text of the error message").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionFailure {
+    /// `ErrorDetails$code`: a `FailureType` value
+    /// (`smithy_query query="shape" shape="FailureType"`).
+    pub code: String,
+    /// `ErrorDetails$message`: the text explaining the failure.
+    pub message: String,
+    /// Whether that text is the action PROVIDER's own summary of a failure it
+    /// classified itself, rather than a statement about the work that failed.
+    ///
+    /// An action provider that classifies a failure publishes ONE sentence about it, and
+    /// that sentence is the provider's summary for the action execution
+    /// (`ActionExecutionResult$externalExecutionSummary` is "the action provider's summary
+    /// for the action execution"): the action-execution history reports it there and
+    /// carries the provider's code alone in its `errorDetails`, rather than repeating the
+    /// one sentence in two members of one structure. A message the party that failed
+    /// PUBLISHED about its own work (`FailureDetails$message`, the text a job worker
+    /// reports with its result) is that party's own statement and is reported beside the
+    /// code. Either way the action's STATE reports both
+    /// (`ActionState$latestExecution` -> `ActionExecution$errorDetails`).
+    pub provider_summary: bool,
+}
+
 /// One action of one stage of one execution, as the engine runs it.
 ///
 /// It carries only what the RUN is: what the action IS — its type, its configuration,
@@ -336,7 +366,7 @@ pub struct ActionRun {
     /// Who last moved the action (the approver, for an approval).
     pub last_updated_by: Option<String>,
     /// Why the action failed, when it did.
-    pub error: Option<(String, String)>,
+    pub error: Option<ActionFailure>,
     /// When the action's status last changed.
     pub last_status_change: SystemTime,
     /// When the execution STARTED this action, or `None` while it has not reached it.
@@ -403,9 +433,12 @@ impl ActionRun {
                 external_execution_id: self.external_execution_id.clone(),
                 external_execution_url: None,
                 percent_complete: self.percent_complete,
-                error_details: self.error.as_ref().map(|(code, message)| ErrorDetails {
-                    code: Some(code.clone()),
-                    message: Some(message.clone()),
+                // The action's STATE states both facts about its failure: the
+                // `FailureType` it is reported under and the text explaining it,
+                // whoever stated that text.
+                error_details: self.error.as_ref().map(|failure| ErrorDetails {
+                    code: Some(failure.code.clone()),
+                    message: Some(failure.message.clone()),
                 }),
                 log_stream_arn: None,
             }),
@@ -1193,6 +1226,20 @@ pub enum JobOutcome {
         message: String,
         /// The id of the external run the work was attempted as, when it reached one.
         external_id: Option<String>,
+    },
+    /// The action cannot run AS DECLARED, and its provider classified that itself: the
+    /// declaration names a source or a target that is not there at all.
+    ///
+    /// What the provider publishes about such a failure is ONE sentence — its summary for
+    /// the action execution ([`ActionFailure::provider_summary`]) — rather than a relayed
+    /// account of the call that ran into it, so the outcome carries that sentence and the
+    /// `FailureType` the provider classified it as. Nothing external ran, so the action
+    /// reports no external execution for it.
+    Misconfigured {
+        /// A `FailureType` value: the classification the provider made.
+        code: String,
+        /// The provider's own sentence about the misconfiguration.
+        summary: String,
     },
     /// The work was STARTED in another service and has not finished: the action stays
     /// `InProgress`, and the run it is waiting for is read again when its next step falls
