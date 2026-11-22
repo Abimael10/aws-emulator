@@ -181,6 +181,10 @@ impl<Eng> CreateFormType<Eng> {
     }
 }
 
+/// The member the refusal of a bad form type NAME names, as the wire and the validation
+/// envelope spell it (smithy_query operation="CreateFormType").
+const FORM_TYPE_NAME_MEMBER: &str = "name";
+
 /// The modelled length range of the `Model` union's only member, `smithy`, 1..100000
 /// (smithy_query shape="Model"). Checked in this handler because it constrains a UNION
 /// member, which the centralized request walk does not validate either.
@@ -211,10 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !is_form_type_name(&input.name) {
             return Err(CreateFormTypeErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "name {} does not satisfy the constraint: Member must satisfy regular \
-                     expression pattern: {FORM_TYPE_NAME_PATTERN}",
-                    input.name
+                // The member is `@sensitive` (smithy_query shape="FormTypeName"), so the
+                // name the request sent is withheld and the clause names the member
+                // alone. The whole sentence — envelope, clause and reported pattern — is
+                // the one every DataZone constraint refusal is worded by.
+                message: crate::service::validation_message::pattern_violation_message(
+                    FORM_TYPE_NAME_MEMBER,
+                    FORM_TYPE_NAME_PATTERN,
+                    None,
                 ),
             })
             .into());

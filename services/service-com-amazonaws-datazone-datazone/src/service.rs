@@ -24,8 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service DOES take it, for the one part of a
+//!   constraint violation's sentence the shared renderer cannot derive: the form a
+//!   modelled `@pattern` is REPORTED in (see [`validation_message`]). Every refusal
+//!   that reports no pattern keeps the framework's wording.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. This service DOES take it: the entry's own
 //!   protocol-correct answer, with the one difference a FAILURE's body carries
@@ -41,9 +43,10 @@
 //! express — what a FAILURE's body carries (see [`rest_json_error_body`]) and the member
 //! name the live wire renders a domain listing's summaries under (see
 //! [`recorded_response_members`]). Those differences are properties of this service's wire
-//! envelope, not of one renderer, so both seams this service takes — the protocol (a failure
-//! a handler raised, and every success body) and the routing error (a request no modeled
-//! operation serves) — answer through it.
+//! envelope, not of one renderer, so both seams that WRITE a body here — the protocol (a
+//! failure a handler raised, and every success body) and the routing error (a request no
+//! modeled operation serves) — answer through it. (The refusal seam writes no body: it
+//! chooses only the code and the message inside the envelope the framework renders.)
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -66,6 +69,10 @@ pub mod recorded_response_members;
 /// Replacing the body of a response this service has already rendered, which both of the
 /// seams above do.
 pub mod response_body;
+
+/// How a refusal of the INPUT is worded: the one part of a constraint violation's sentence
+/// the shared renderer cannot derive, the reported `@pattern`.
+pub mod validation_message;
 
 /// The route that answers at the data portal address a domain reports, which this emulator
 /// publishes on its own endpoint.
@@ -143,15 +150,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // TAKEN for the one part of a violation's sentence the shared renderer cannot
+        // derive: a modelled `@pattern` is a FIND expression, while the expression a
+        // refusal REPORTS is that constraint's whole-value form (see
+        // [`validation_message`]). Everything else about the refusal — the envelope, every
+        // other clause, and withholding a `@sensitive` member's value — stays the
+        // framework's, and a refusal reporting no pattern keeps its wording untouched,
+        // which is what `None` asks for.
+        validation_message::reworded(refusal)
     }
 
     fn override_routing_error(
