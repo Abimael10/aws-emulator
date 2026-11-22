@@ -2294,6 +2294,246 @@ async fn a_timestamp_travels_in_the_form_its_model_declares() {
     }
 }
 
+/// How many fractional-second digits an instant a reader of this API can HOLD carries: six,
+/// a whole microsecond, which is the resolution of the date-time value a generated client
+/// parses a `date-time` member into (a Python `datetime`, a Java `Instant` rendered back
+/// through one, the `DateTime` these suites parse with). A rendering finer than that denotes
+/// an instant no reader of it can repeat.
+const MICROSECOND_DIGITS: usize = 6;
+
+/// The fractional-second digits of one rendered `date-time`, as it was written: what stands
+/// between the `.` and the zone, and the empty string for a rendering that carries no
+/// fraction at all.
+fn fraction_digits(rendered: &str) -> &str {
+    match rendered.split_once('.') {
+        Some((_, fraction)) => fraction.trim_end_matches(|c: char| !c.is_ascii_digit()),
+        None => "",
+    }
+}
+
+/// One rendered `date-time` as a typed client holds it and sends it back: the same instant
+/// with its fraction cut to the whole microsecond such a client carries
+/// ([`MICROSECOND_DIGITS`]). A rendering already at that resolution comes back unchanged,
+/// which is the point of the rule below.
+fn as_a_client_holds_it(rendered: &str) -> String {
+    let digits = fraction_digits(rendered);
+    if digits.len() <= MICROSECOND_DIGITS {
+        return rendered.to_string();
+    }
+    let (whole, _) = rendered
+        .split_once('.')
+        .expect("a rendering with a fraction carries the point it was found by");
+    format!("{whole}.{}Z", &digits[..MICROSECOND_DIGITS])
+}
+
+/// RULE: an instant this service records is ONE value — every path that reports it renders
+/// the same `date-time`, and that rendering is at a resolution its readers hold (a whole
+/// microsecond), so the instant a client parses out of one read is the instant the service
+/// holds and the value it can send back.
+///
+/// The rows span every resource this service records an instant for and every member it
+/// reports one in, with the tasks differing along the shot count and the device so no two
+/// rows share an instant.
+#[tokio::test]
+async fn a_recorded_instant_is_served_at_the_resolution_its_readers_hold() {
+    use crate::spending_limits::{a_device, create_limit, limit_body, limits_on, now_epoch, period};
+
+    let braket = Braket::new();
+    let simulator = braket.an_online_device().await;
+    let qpu = a_device(&braket, "QPU", "ONLINE").await;
+
+    // (case, device, shots) — three tasks, so three unrelated instants are rendered.
+    let task_rows: Vec<(&str, &String, i64)> = vec![
+        ("a one-shot task on a simulator", &simulator, 1),
+        ("a many-shot task on a simulator", &simulator, 100),
+        ("a task on a quantum processor", &qpu, 10),
+    ];
+
+    let mut rendered: Vec<(String, String)> = Vec::new();
+    for (index, (case, device, shots)) in task_rows.iter().enumerate() {
+        let created = braket
+            .create_task(create_body(
+                &format!("instant-resolution-{index}"),
+                device,
+                *shots,
+            ))
+            .await;
+        assert_eq!(
+            created.status, CREATE_STATUS,
+            "case {case:?}: creating the task, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        let terminal = poll_until_terminal(&braket, &arn).await;
+        let searched = braket
+            .search_tasks(json!({
+                "filters": [{ "name": "quantumTaskArn", "operator": "EQUAL", "values": [arn] }],
+            }))
+            .await;
+        let summary = searched
+            .body
+            .get("quantumTasks")
+            .and_then(Value::as_array)
+            .and_then(|tasks| tasks.first())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the search reports no task: {}", searched.body)
+            });
+        for (member_name, read, searched) in [
+            ("createdAt", terminal.get("createdAt"), summary.get("createdAt")),
+            ("endedAt", terminal.get("endedAt"), summary.get("endedAt")),
+        ] {
+            let read = read.and_then(Value::as_str).unwrap_or_else(|| {
+                panic!("case {case:?}: GetQuantumTask reports no {member_name}: {terminal}")
+            });
+            rendered.push((format!("{case} {member_name}"), read.to_string()));
+            // The two read paths report ONE instant, so they render one text.
+            assert_eq!(
+                searched.and_then(Value::as_str),
+                Some(read),
+                "case {case:?}: expected the search to report the {member_name} \
+                 {read:?} the read reports, got {searched:?}"
+            );
+        }
+    }
+
+    // A hybrid job, and a spending limit, which records two instants.
+    let job = braket
+        .create_job(crate::hybrid_job_loop::job_body(
+            "instant-resolution-job",
+            "instant-resolution-job",
+            &simulator,
+        ))
+        .await;
+    assert_eq!(
+        job.status, 201,
+        "creating the job to read: got {} {}",
+        job.status, job.body
+    );
+    let job_read = braket.get_job(&job.str_member("jobArn")).await;
+    rendered.push((
+        "a hybrid job createdAt".to_string(),
+        job_read
+            .body
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("GetJob reports no createdAt: {}", job_read.body))
+            .to_string(),
+    ));
+
+    let start = now_epoch();
+    let mut body = limit_body("instant-resolution-limit", &qpu, "5.00");
+    body["timePeriod"] = period(start, start + 3_600);
+    let minted = create_limit(&braket, body).await;
+    assert!(
+        minted.status < 300,
+        "creating the limit to read: got {} {}",
+        minted.status,
+        minted.body
+    );
+    let limit = limits_on(&braket, &qpu)
+        .await
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("SearchSpendingLimits reports no limit on {qpu}"));
+    for member_name in ["createdAt", "updatedAt"] {
+        rendered.push((
+            format!("a spending limit {member_name}"),
+            limit
+                .get(member_name)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("SearchSpendingLimits reports no {member_name}: {limit}")
+                })
+                .to_string(),
+        ));
+    }
+
+    for (case, instant) in &rendered {
+        let digits = fraction_digits(instant);
+        assert!(
+            digits.len() <= MICROSECOND_DIGITS,
+            "case {case:?}: expected an instant at a resolution its readers hold \
+             ({MICROSECOND_DIGITS} fractional digits at most), got {instant:?} with \
+             {} of them",
+            digits.len()
+        );
+        // The rendering a client holds is therefore the rendering the service served, so
+        // the instant travels back unchanged.
+        assert_eq!(
+            as_a_client_holds_it(instant),
+            *instant,
+            "case {case:?}: expected the instant a client holds to be the one served, \
+             got {:?}",
+            as_a_client_holds_it(instant)
+        );
+    }
+}
+
+/// RULE: the instant a read reports is the instant the service compares a filter against, so
+/// a `createdAt` a client read back — held at the resolution that client's own date-time type
+/// carries — selects the very task it came from. The rows differ along the shot count and the
+/// device, so each row's filter bound is its own instant.
+#[tokio::test]
+async fn a_created_at_read_back_selects_the_task_it_came_from() {
+    let braket = Braket::new();
+    let simulator = braket.an_online_device().await;
+    let qpu = crate::spending_limits::a_device(&braket, "QPU", "ONLINE").await;
+
+    // (case, device, shots)
+    let rows: Vec<(&str, &String, i64)> = vec![
+        ("a one-shot task on a simulator", &simulator, 1),
+        ("a many-shot task on a simulator", &simulator, 50),
+        ("a task on a quantum processor", &qpu, 10),
+    ];
+
+    for (index, (case, device, shots)) in rows.iter().enumerate() {
+        let created = braket
+            .create_task(create_body(
+                &format!("instant-round-trip-{index}"),
+                device,
+                *shots,
+            ))
+            .await;
+        assert_eq!(
+            created.status, CREATE_STATUS,
+            "case {case:?}: creating the task, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        let read = braket.get_task(&arn).await;
+        let reported = read
+            .body
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: no createdAt in {}", read.body))
+            .to_string();
+        // What a typed client holds after parsing that value, and so what it sends back.
+        let held = as_a_client_holds_it(&reported);
+        let searched = braket
+            .search_tasks(json!({
+                "filters": [{ "name": "createdAt", "operator": "EQUAL", "values": [held] }],
+            }))
+            .await;
+        assert_eq!(
+            searched.status, 200,
+            "case {case:?}: filtering on the createdAt read back, got {} {}",
+            searched.status, searched.body
+        );
+        let selected: Vec<&str> = searched
+            .body
+            .get("quantumTasks")
+            .and_then(Value::as_array)
+            .map(|tasks| tasks.iter().map(|task| member(task, "quantumTaskArn")).collect())
+            .unwrap_or_default();
+        assert!(
+            selected.contains(&arn.as_str()),
+            "case {case:?}: expected the createdAt {held:?} read back to select {arn}, \
+             got {selected:?}"
+        );
+    }
+}
+
 /// RULE: a quantum task's `tags` are reported as a map, empty when the task carries none.
 /// The rows span the tag sets a create may carry, and both read paths report the same set.
 #[tokio::test]

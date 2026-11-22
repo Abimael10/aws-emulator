@@ -447,6 +447,25 @@ async fn a_deployed_stack_publishes_the_spending_limit_braket_minted() {
                      summary reports ({reported}) to the microsecond, got {published:?} \
                      ({drift} microseconds apart) against {summary}"
                 );
+                // ...and ONE instant exactly, rather than a second rendering of it: the
+                // attribute carries the instant that service recorded as that service
+                // reports it, so a client that reads the stack's output and compares it
+                // with the value the API answers for the same limit reads one instant.
+                let reported_text = summary
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: expected the reported createdAt to be the \
+                             date-time its model declares, got {summary}"
+                        )
+                    });
+                assert_eq!(
+                    published.as_str(),
+                    reported_text,
+                    "case {case:?}: expected the published CreatedAt to be the instant \
+                     Amazon Braket reports ({reported_text:?}), got {published:?}"
+                );
             }
         }
     }

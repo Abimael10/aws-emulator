@@ -2012,15 +2012,30 @@ pub fn time_period_refusal(period: &TimePeriod) -> Option<String> {
     })
 }
 
-/// A `SystemTime` as the modelled `Timestamp` the wire carries.
+/// How fine an instant this service records is held, in nanoseconds: ONE MICROSECOND
+/// ([`INSTANT_RESOLUTION_NANOS`]).
 ///
-/// The conversion is deterministic — one instant always renders to the same
-/// `Timestamp` — so a value read twice is the same value. Its resolution is that of
-/// an `f64` of seconds since the epoch, which is sub-microsecond at present dates and
-/// finer than the `date-time` form the protocol writes.
+/// Every `Timestamp` this service reports travels in the `date-time` form its model
+/// declares, and that form carries a whole microsecond: a rendering is read back as the
+/// same instant only up to that digit. An instant held FINER than the form it is served
+/// in is therefore an instant no reader can repeat — the value a caller read back names
+/// no record of this service, and a second service publishing it republishes a different
+/// rendering of it. So the remainder below a microsecond is dropped when the instant is
+/// recorded rather than when it is written, which is what makes one instant render
+/// identically on every path that reports it.
+const INSTANT_RESOLUTION_NANOS: u32 = 1_000;
+
+/// A `SystemTime` as the modelled `Timestamp` the wire carries, held at the resolution the
+/// form it travels in carries ([`INSTANT_RESOLUTION_NANOS`]).
+///
+/// The conversion is deterministic — one instant always renders to the same `Timestamp` —
+/// so a value read twice is the same value, and a value read back is the value this
+/// service compares a filter bound against.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    let seconds = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
+    let nanos = since_epoch.subsec_nanos() / INSTANT_RESOLUTION_NANOS * INSTANT_RESOLUTION_NANOS;
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(seconds, nanos)
 }
 
 /// A modelled `Timestamp` as whole nanoseconds since the epoch, so two `Timestamp`s
