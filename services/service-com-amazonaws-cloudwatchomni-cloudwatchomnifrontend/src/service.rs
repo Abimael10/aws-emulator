@@ -50,6 +50,11 @@ use std::sync::Arc;
 /// Private: it is reached through `override_refusal` below, not by a caller.
 mod validation;
 
+/// The route that answers at a domain's announced endpoint — the addresses
+/// `domainEndpointUrl` and `customEndpointUrls` publish on this emulator's own endpoint.
+/// Private: it is reached through `can_handle` and `override_routing_error` below.
+mod domain_endpoint;
+
 /// The `com-amazonaws-cloudwatchomni-cloudwatchomnifrontend` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -57,6 +62,10 @@ mod validation;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same shared engine the operations hold, for the ONE address this service answers
+    /// that no modelled operation describes: a domain's announced endpoint, served from the
+    /// stored domain ([`domain_endpoint`]).
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -65,7 +74,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -79,6 +89,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // The endpoint a domain reports (`domainEndpointUrl`, and every `customEndpointUrls`
+        // entry) is opened by whatever browser, probe or test holds that URL: anonymously,
+        // with no credential scope and no target header naming this service — only the path
+        // this service itself minted, under the plane segment that is this service's alone.
+        // A fetch of exactly that path is therefore claimed whatever host the client
+        // addressed, so the domain is reachable at the address it was advertised on.
+        if domain_endpoint::claimed(parts) {
+            return true;
+        }
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
@@ -124,10 +143,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // The ONE address this service serves that the Smithy model does not describe: a
+        // domain's announced endpoint, which `domainEndpointUrl` and `customEndpointUrls`
+        // publish for a client to open. It is answered here because the router consults this
+        // seam before it authenticates anything, which is how AWS serves its own domain
+        // host — unauthenticated, and as a web page rather than a modelled API call. Every
+        // other unrouted request keeps the generated entry's protocol-correct answer, which
+        // is what `None` renders.
+        domain_endpoint::answer(&*self.engine, req)
     }
 
     fn override_framework_error(

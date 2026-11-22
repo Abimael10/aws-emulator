@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = store
             .domains
             .get(&input.domain_id)
-            .map(|stored| stored.domain.clone())
+            .map(|stored| crate::state::announced_domain(ctx, &stored.domain))
         else {
             audit(ctx, &input.domain_id, "refused_unknown_domain");
             return Err(

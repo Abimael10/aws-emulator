@@ -395,9 +395,18 @@ async fn a_redirect_is_admitted_only_at_the_domains_own_callback() {
     let omni = Omni::new();
     let domain = omni.domain("omni-redirects").await;
     let endpoint = domain.domain_endpoint_url.clone();
-    let host = endpoint
+    // The address the endpoint is published at, split into the authority a client dials and
+    // the path this emulator serves the domain under: a row that moves the host, the port or
+    // the path builds on these.
+    let (authority, path) = endpoint
         .strip_prefix("https://")
-        .expect("a domain endpoint is an https URL")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(authority, path)| (authority.to_string(), format!("/{path}")))
+        .expect("a domain endpoint is an https URL carrying the domain's own path");
+    let host = authority
+        .split(':')
+        .next()
+        .expect("an authority names a host")
         .to_string();
     let name_endpoint = domain
         .custom_endpoint_urls
@@ -422,7 +431,8 @@ async fn a_redirect_is_admitted_only_at_the_domains_own_callback() {
     }
 
     // Rows differ along the condition each one fails: the text is not a URL, the scheme, the
-    // host, the port (a different origin of the same host), the path, the query string and
+    // host, the port (a different origin of the same host), the path — another path of the
+    // domain's endpoint, and the callback path outside that endpoint — the query string and
     // the fragment.
     let refused: Vec<(&str, String, &str)> = vec![
         (
@@ -432,27 +442,32 @@ async fn a_redirect_is_admitted_only_at_the_domains_own_callback() {
         ),
         (
             "an http URL at the domain",
-            format!("http://{host}{CALLBACK_PATH}"),
+            format!("http://{authority}{path}{CALLBACK_PATH}"),
             "scheme must be https",
         ),
         (
             "another host entirely",
-            format!("https://attacker.example{CALLBACK_PATH}"),
+            format!("https://attacker.example{path}{CALLBACK_PATH}"),
             "unrecognized domain",
         ),
         (
             "the domain's host as a prefix of another",
-            format!("https://{host}.attacker.example{CALLBACK_PATH}"),
+            format!("https://{host}.attacker.example{path}{CALLBACK_PATH}"),
             "unrecognized domain",
         ),
         (
             "the domain's host on another port",
-            format!("https://{host}:8443{CALLBACK_PATH}"),
+            format!("https://{host}:8443{path}{CALLBACK_PATH}"),
             "unrecognized domain",
         ),
         (
             "another path at the domain",
             format!("{endpoint}/auth/elsewhere"),
+            "path must be /auth/callback",
+        ),
+        (
+            "the callback path outside the domain's own endpoint",
+            format!("https://{authority}{CALLBACK_PATH}"),
             "path must be /auth/callback",
         ),
         (

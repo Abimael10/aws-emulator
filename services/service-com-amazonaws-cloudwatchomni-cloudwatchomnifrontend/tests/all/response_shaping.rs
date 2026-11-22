@@ -56,8 +56,8 @@ use omni::ops::types::{
 };
 use omni::state::{
     ACCESS_GRANT_ARN_RESOURCE_TYPE, ACCESS_PROFILE_ARN_RESOURCE_TYPE, ACCESS_PROFILE_RESOURCE_TYPE,
-    ALERT_ARN_RESOURCE_TYPE, ASSUME_ACCESS_PROFILE_ACTION, DOMAIN_ENDPOINT_HOST,
-    OMNI_DASHBOARD_ARN_RESOURCE_TYPE, VIEW_ARN_RESOURCE_TYPE,
+    ALERT_ARN_RESOURCE_TYPE, ASSUME_ACCESS_PROFILE_ACTION, OMNI_DASHBOARD_ARN_RESOURCE_TYPE,
+    VIEW_ARN_RESOURCE_TYPE,
 };
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -882,13 +882,15 @@ async fn a_resources_own_aggregate_members_are_reported_empty_rather_than_omitte
             "case {case:?}: the reported configuration is {reported:?}"
         );
 
-        // The endpoint URLs a domain publishes are global: the domain id and the name
-        // under the application host, with no region anywhere.
+        // The endpoint URLs a domain publishes are addresses on THIS emulator: the id
+        // addresses one and the name the other, both under the path this emulator serves the
+        // domain at, and neither carrying a region.
         assert_eq!(
             fetched.domain_endpoint_url,
             format!(
-                "https://{}.cloudwatch-omni.{DOMAIN_ENDPOINT_HOST}",
-                fetched.domain_id
+                "{}{}",
+                smithy_server_runtime::UNSERVED_URL_BASE,
+                omni::state::domain_endpoint_path(&fetched.domain_id)
             ),
             "case {case:?}: domainEndpointUrl is {:?}",
             fetched.domain_endpoint_url
@@ -896,7 +898,12 @@ async fn a_resources_own_aggregate_members_are_reported_empty_rather_than_omitte
         assert_eq!(
             fetched.custom_endpoint_urls.as_deref(),
             Some(
-                [format!("https://{name}.cloudwatch-omni.{DOMAIN_ENDPOINT_HOST}")].as_slice()
+                [format!(
+                    "{}{}",
+                    smithy_server_runtime::UNSERVED_URL_BASE,
+                    omni::state::domain_name_endpoint_path(&name)
+                )]
+                .as_slice()
             ),
             "case {case:?}: customEndpointUrls are {:?}",
             fetched.custom_endpoint_urls

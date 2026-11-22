@@ -256,13 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `customEndpointUrls` are "Additional endpoint URLs derived from the domain name",
-        // so they follow the name the patch leaves the domain with. `domainEndpointUrl` is
-        // built from the domain's id rather than from its name, so a rename does not move
-        // it — and neither does `domainArn`, for the same reason.
-        let custom_endpoint_urls = name
-            .as_deref()
-            .map(crate::state::custom_endpoint_urls)
-            .or_else(|| stored.domain.custom_endpoint_urls.clone());
+        // so they follow the name the patch leaves the domain with; `domainEndpointUrl` is
+        // addressed by the domain's id rather than by its name, so a rename does not move it
+        // — and neither does `domainArn`, for the same reason. Both are announced at the
+        // address this request reached the emulator on, which is where this emulator serves
+        // the domain (`crate::state::announced_domain`).
+        let custom_endpoint_urls = Some(crate::state::custom_endpoint_urls(ctx, name.as_deref()));
 
         // `identityCenterApplicationArn` is "Absent for IAM-only domains", so it exists
         // exactly while the domain lists the IDC provider. The application itself is a
@@ -302,6 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.domain.updated_at
         };
 
+        let domain_endpoint_url = crate::state::domain_endpoint_url(ctx, &stored.domain.domain_id);
         stored.domain = Domain {
             name,
             identity_providers,
@@ -309,6 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             custom_endpoint_urls,
             identity_center_application_arn,
             updated_at,
+            domain_endpoint_url,
             ..stored.domain.clone()
         };
         let domain = stored.domain.clone();

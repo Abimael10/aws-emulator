@@ -37,6 +37,9 @@ url = "2.5.9"
 # `sha2`: a one-time deep-link code is recorded as its SHA-256 digest, never as the code —
 # see `state::deep_link`.
 sha2 = { workspace = true }
+# `html-escape`: the page a fetch of a domain's announced endpoint renders writes the stored
+# domain's values through it rather than inlining them — see `state::domain_endpoint`.
+html-escape = "0.2"
 # `service-common` carries the workspace's ONE wording of a constraint-violation refusal —
 # the clause, the envelope, the `@pattern` rendering and the order an enumerated type's
 # value set is listed in — which `service::validation` delegates to.

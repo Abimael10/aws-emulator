@@ -690,8 +690,8 @@ async fn create_domain_persists_a_record_get_domain_returns_it_verbatim() {
         );
         assert_eq!(
             domain.domain_endpoint_url,
-            format!("https://{}.cloudwatch-omni.global.app.aws", domain.domain_id),
-            "case {case:?}: domainEndpointUrl {:?} is not the domain's global endpoint",
+            domain_endpoint_url(&domain.domain_id),
+            "case {case:?}: domainEndpointUrl {:?} is not the address this emulator serves the domain at",
             domain.domain_endpoint_url
         );
         assert!(
@@ -702,8 +702,8 @@ async fn create_domain_persists_a_record_get_domain_returns_it_verbatim() {
         let custom = domain.custom_endpoint_urls.clone().unwrap_or_default();
         assert_eq!(
             custom,
-            vec![format!("https://{name}.cloudwatch-omni.global.app.aws")],
-            "case {case:?}: customEndpointUrls {custom:?} are not the name's global endpoint"
+            vec![custom_endpoint_url(&name)],
+            "case {case:?}: customEndpointUrls {custom:?} are not the name's endpoint on this emulator"
         );
         // `identityCenterApplicationArn` is "Absent for IAM-only domains".
         assert_eq!(
@@ -2012,9 +2012,24 @@ const OTHER_IDC_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-fedcba098765
 /// `Domain.customEndpointUrls` is "Additional endpoint URLs derived from the domain
 /// name", against `domainEndpointUrl`'s "The HTTPS endpoint URL for accessing the
 /// domain", which [`create_domain_persists_a_record_get_domain_returns_it_verbatim`]
-/// already pins to the domain's ID.
+/// already pins to the domain's ID. Both are rooted on the address THIS emulator is
+/// reached at, which for an in-process call is the unserved base
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]) this suite drives the handlers through.
 fn custom_endpoint_url(name: &str) -> String {
-    format!("https://{name}.cloudwatch-omni.global.app.aws")
+    format!(
+        "{}{}",
+        smithy_server_runtime::UNSERVED_URL_BASE,
+        omni::state::domain_name_endpoint_path(name)
+    )
+}
+
+/// The endpoint URL a domain of this ID is addressed by, read the same way.
+fn domain_endpoint_url(domain_id: &str) -> String {
+    format!(
+        "{}{}",
+        smithy_server_runtime::UNSERVED_URL_BASE,
+        omni::state::domain_endpoint_path(domain_id)
+    )
 }
 
 /// The members of a domain that `UpdateDomain`'s input cannot name, rendered for

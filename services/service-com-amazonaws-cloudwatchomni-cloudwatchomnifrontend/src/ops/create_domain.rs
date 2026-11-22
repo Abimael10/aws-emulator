@@ -188,8 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&client_token)
             .and_then(|domain_id| store.domains.get(domain_id))
         {
+            // Announced at the address THIS request reached the emulator on, like every
+            // other answer that carries a domain: the record's endpoint members are where
+            // the emulator serves the domain, not a value the first create froze.
             return Ok(CreateDomainOutput {
-                domain: existing.domain.clone(),
+                domain: crate::state::announced_domain(ctx, &existing.domain),
             });
         }
 
@@ -215,8 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_arn: crate::state::domain_arn(&region, &domain_id),
             name: Some(input.name.clone()),
             identity_providers: input.identity_providers.clone(),
-            domain_endpoint_url: crate::state::domain_endpoint_url(&domain_id),
-            custom_endpoint_urls: Some(crate::state::custom_endpoint_urls(&input.name)),
+            domain_endpoint_url: crate::state::domain_endpoint_url(ctx, &domain_id),
+            custom_endpoint_urls: Some(crate::state::custom_endpoint_urls(
+                ctx,
+                Some(input.name.as_str()),
+            )),
             identity_center_application_arn: crate::state::identity_center_application_arn(
                 &input.identity_providers,
                 input.identity_provider_configuration.as_ref(),

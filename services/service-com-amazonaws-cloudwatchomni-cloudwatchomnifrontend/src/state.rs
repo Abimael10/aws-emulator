@@ -1004,26 +1004,6 @@ pub fn caller_principal(ctx: &::smithy_server_runtime::OperationContext<'_>) -> 
     ::engine::emulator_arn("iam", "", &format!("user/{access_key_id}"))
 }
 
-/// The host a domain's user-facing endpoint URL lives under.
-///
-/// A domain's endpoint is the address a console or deep-link client navigates to, and it
-/// is GLOBAL rather than regional: the host is this service's endpoint prefix under one
-/// application host for every region, so the URL carries no region at all.
-pub const DOMAIN_ENDPOINT_HOST: &str = "global.app.aws";
-
-/// A domain's HTTPS endpoint URL, built from its id and the global application host.
-pub fn domain_endpoint_url(domain_id: &str) -> String {
-    format!("https://{domain_id}.{ENDPOINT_PREFIX}.{DOMAIN_ENDPOINT_HOST}")
-}
-
-/// The additional endpoint URLs the model describes as "derived from the domain
-/// name": the same endpoint addressed by name rather than by id.
-pub fn custom_endpoint_urls(name: &str) -> Vec<String> {
-    vec![format!(
-        "https://{name}.{ENDPOINT_PREFIX}.{DOMAIN_ENDPOINT_HOST}"
-    )]
-}
-
 /// The Identity Center application ARN for a domain, or `None` — the model says it
 /// is "Absent for IAM-only domains", so it exists exactly when the domain lists the
 /// `IDC` identity provider. When the request named an Identity Center instance the
@@ -1643,6 +1623,19 @@ pub use principal_search::{
 /// is admitted under. It lives beside the store because a code belongs to a domain — the
 /// endpoints it may redirect to and the URL it is redeemed at are the domain's own.
 mod deep_link;
+
+/// The addresses a domain is ANNOUNCED at, the route that answers there and the page it
+/// renders. It lives beside the store because the addresses are a fact about where this
+/// emulator serves the stored domain, read by every operation that reports one.
+mod domain_endpoint;
+
+pub use domain_endpoint::{
+    announced_authority, announced_domain, custom_endpoint_urls, domain_endpoint_not_found_page,
+    domain_endpoint_page, domain_endpoint_path, domain_endpoint_route, domain_endpoint_url,
+    domain_name_endpoint_path, DomainEndpointRoute, DOMAIN_BY_ID_SEGMENT, DOMAIN_BY_NAME_SEGMENT,
+    DOMAIN_ENDPOINT_MEDIA_TYPE, DOMAIN_PLANE,
+};
+
 
 pub use deep_link::{
     deep_link_code_digest, deep_link_expiry, deep_link_url, mint_deep_link_code,

@@ -18,7 +18,7 @@
 //!   whichever endpoint of that domain the browser is already on, rather than pinning it to
 //!   one of the endpoints the domain record reports;
 //! * "in the domain" is a question about the domain's endpoints, so an admissible redirect
-//!   is one whose origin is one of them ([`redirect_url_rejection`]);
+//!   is one of them followed by the callback path ([`redirect_url_rejection`]);
 //! * the code is single-use and short-lived, so it is RECORDED against the domain with the
 //!   instant it falls due ([`StoredDeepLinkCode`]) rather than merely returned.
 //!
@@ -218,10 +218,16 @@ pub fn deep_link_expiry(
 /// Why `redirect_url` is not a redirect `domain` may be sent to, or `None` when it is.
 ///
 /// The three conditions `redirectUrl`'s model doc states, each reported as its own reason:
-/// the URL has to be an HTTPS URL, its origin has to be one of the domain's own endpoints
-/// ("in the domain"), its path has to be exactly `/auth/callback`, and it may carry neither
-/// a query string nor a fragment. A port or a host the domain does not serve is a different
-/// origin, so it is outside the domain just as another host is.
+/// the URL has to be an HTTPS URL, it has to be one of the domain's own endpoints ("in the
+/// domain"), the path it addresses BENEATH that endpoint has to be the one callback path,
+/// and it may carry neither a query string nor a fragment. A port or a host the domain does
+/// not serve is a different origin, so it is outside the domain just as another host is.
+///
+/// "A path of /auth/callback" is a path of the DOMAIN's endpoint: a domain reached at the
+/// root of a host answers that path at the host's root, and one this emulator serves under a
+/// path of its own endpoint ([`super::domain_endpoint_path`]) answers it under that path. So
+/// the admissible redirect is an endpoint of the domain followed by the callback path,
+/// whichever of the two forms the endpoint takes.
 pub fn redirect_url_rejection(domain: &Domain, redirect_url: &str) -> Option<String> {
     let Ok(requested) = ::url::Url::parse(redirect_url) else {
         return Some(invalid_redirect_uri(MALFORMED_REDIRECT_URI));
@@ -229,16 +235,32 @@ pub fn redirect_url_rejection(domain: &Domain, redirect_url: &str) -> Option<Str
     if requested.scheme() != HTTPS_SCHEME {
         return Some(invalid_redirect_uri(REDIRECT_MUST_BE_HTTPS));
     }
-    if !domain_endpoints(domain).any(|endpoint| same_origin(&requested, endpoint)) {
+    let at_the_domain: Vec<::url::Url> = domain_endpoints(domain)
+        .filter_map(|endpoint| ::url::Url::parse(endpoint).ok())
+        .filter(|endpoint| endpoint.origin() == requested.origin())
+        .collect();
+    if at_the_domain.is_empty() {
         return Some(invalid_redirect_uri(UNRECOGNIZED_DOMAIN));
     }
-    if requested.path() != DEEP_LINK_REDIRECT_PATH {
+    if !at_the_domain
+        .iter()
+        .any(|endpoint| requested.path() == callback_path_of(endpoint))
+    {
         return Some(invalid_redirect_uri(REDIRECT_PATH_REQUIRED));
     }
     if requested.query().is_some() || requested.fragment().is_some() {
         return Some(invalid_redirect_uri(REDIRECT_CARRIES_QUERY_OR_FRAGMENT));
     }
     None
+}
+
+/// The one path a redirect of the domain endpoint `endpoint` may address: that endpoint's
+/// own path, then the callback path the member's doc fixes.
+fn callback_path_of(endpoint: &::url::Url) -> String {
+    format!(
+        "{}{DEEP_LINK_REDIRECT_PATH}",
+        endpoint.path().trim_end_matches('/')
+    )
 }
 
 /// How a refused `redirectUrl` is worded: the fixed prefix, then the condition that failed.
@@ -258,12 +280,6 @@ fn domain_endpoints(domain: &Domain) -> impl Iterator<Item = &str> {
             .flatten()
             .map(String::as_str),
     )
-}
-
-/// Whether `requested` is at the same origin as the endpoint URL `endpoint` — the same
-/// scheme, host and port. An `endpoint` that does not parse as a URL matches nothing.
-fn same_origin(requested: &::url::Url, endpoint: &str) -> bool {
-    ::url::Url::parse(endpoint).is_ok_and(|endpoint| requested.origin() == endpoint.origin())
 }
 
 impl super::ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
@@ -327,9 +343,13 @@ pub type DeepLinkCodes = HashMap<String, StoredDeepLinkCode>;
 mod tests {
     use super::*;
 
+    /// The `host[:port]` the test domain's endpoints are announced at, standing for the
+    /// address an emulator is reached on.
+    const TEST_AUTHORITY: &str = "127.0.0.1:9297";
+
     /// A domain reached at one endpoint addressed by its id and one derived from its name,
-    /// which is what [`super::super::domain_endpoint_url`] and
-    /// [`super::super::custom_endpoint_urls`] put on every created domain.
+    /// both rooted on the address this emulator serves the domain at — which is what
+    /// [`super::super::announced_domain`] puts on every domain this service reports.
     fn test_domain() -> Domain {
         Domain {
             domain_id: "d-omni".to_string(),
@@ -337,8 +357,14 @@ mod tests {
             name: Some("omni-one".to_string()),
             identity_providers: vec![super::super::IDENTITY_PROVIDER_IDC.to_string()],
             identity_provider_configuration: None,
-            domain_endpoint_url: super::super::domain_endpoint_url("d-omni"),
-            custom_endpoint_urls: Some(super::super::custom_endpoint_urls("omni-one")),
+            domain_endpoint_url: format!(
+                "https://{TEST_AUTHORITY}{}",
+                super::super::domain_endpoint_path("d-omni")
+            ),
+            custom_endpoint_urls: Some(vec![format!(
+                "https://{TEST_AUTHORITY}{}",
+                super::super::domain_name_endpoint_path("omni-one")
+            )]),
             identity_center_application_arn: None,
             region: "us-west-2".to_string(),
             created_at: ::aws_smithy_types::DateTime::from_secs(1_700_000_000),
@@ -369,38 +395,44 @@ mod tests {
         }
 
         // Rows differ along the condition each one fails: the text is not a URL, the scheme,
-        // the host, the port (a different origin of the same host), the path, the query
-        // string and the fragment.
+        // the host, the port (a different origin of the same host), the path — another path
+        // of the domain's endpoint, and the callback path at the origin's root rather than at
+        // the endpoint — the query string and the fragment.
         let endpoint = domain.domain_endpoint_url.clone();
-        let host = endpoint
-            .strip_prefix("https://")
-            .expect("a domain endpoint is an https URL")
+        let path = ::url::Url::parse(&endpoint)
+            .expect("a domain endpoint is a URL")
+            .path()
             .to_string();
         for (case, requested, reason) in [
             ("not a URL at all", "/auth/callback".to_string(), MALFORMED_REDIRECT_URI),
             (
                 "an http URL at the domain",
-                format!("http://{host}{DEEP_LINK_REDIRECT_PATH}"),
+                format!("http://{TEST_AUTHORITY}{path}{DEEP_LINK_REDIRECT_PATH}"),
                 REDIRECT_MUST_BE_HTTPS,
             ),
             (
                 "another host entirely",
-                format!("https://attacker.example{DEEP_LINK_REDIRECT_PATH}"),
+                format!("https://attacker.example{path}{DEEP_LINK_REDIRECT_PATH}"),
                 UNRECOGNIZED_DOMAIN,
             ),
             (
                 "the host as a prefix of another",
-                format!("https://{host}.attacker.example{DEEP_LINK_REDIRECT_PATH}"),
+                format!("https://127.0.0.1.attacker.example{path}{DEEP_LINK_REDIRECT_PATH}"),
                 UNRECOGNIZED_DOMAIN,
             ),
             (
                 "the domain's host on another port",
-                format!("https://{host}:8443{DEEP_LINK_REDIRECT_PATH}"),
+                format!("https://127.0.0.1:8443{path}{DEEP_LINK_REDIRECT_PATH}"),
                 UNRECOGNIZED_DOMAIN,
             ),
             (
                 "another path",
                 format!("{endpoint}/auth/elsewhere"),
+                REDIRECT_PATH_REQUIRED,
+            ),
+            (
+                "the callback path outside the domain's own endpoint",
+                format!("https://{TEST_AUTHORITY}{DEEP_LINK_REDIRECT_PATH}"),
                 REDIRECT_PATH_REQUIRED,
             ),
             (
@@ -519,17 +551,19 @@ mod tests {
                 "a redirect at the endpoint the domain's id addresses",
                 "d-0",
                 "eu-central-1",
-                Some("https://d-0.cloudwatch-omni.global.app.aws/auth/callback"),
+                Some("https://127.0.0.1:9297/_aws/cloudwatch-omni/domain/d-0/auth/callback"),
                 "/auth/code?code=abc&domainId=d-0&region=eu-central-1\
-                 &redirect=https%3A%2F%2Fd-0.cloudwatch-omni.global.app.aws%2Fauth%2Fcallback",
+                 &redirect=https%3A%2F%2F127.0.0.1%3A9297%2F_aws%2Fcloudwatch-omni%2Fdomain\
+                 %2Fd-0%2Fauth%2Fcallback",
             ),
             (
                 "a redirect at the endpoint derived from the domain's name",
                 "d-0",
                 "ap-southeast-2",
-                Some("https://omni-one.cloudwatch-omni.global.app.aws/auth/callback"),
+                Some("https://127.0.0.1:9297/_aws/cloudwatch-omni/domain-name/omni-one/auth/callback"),
                 "/auth/code?code=abc&domainId=d-0&region=ap-southeast-2\
-                 &redirect=https%3A%2F%2Fomni-one.cloudwatch-omni.global.app.aws%2Fauth%2Fcallback",
+                 &redirect=https%3A%2F%2F127.0.0.1%3A9297%2F_aws%2Fcloudwatch-omni%2Fdomain-name\
+                 %2Fomni-one%2Fauth%2Fcallback",
             ),
         ] {
             let actual = deep_link_url(domain_id, region, "abc", redirect_url);
