@@ -11,9 +11,9 @@
 //! carry an INTERNAL load balancer, whose nodes have only private addresses. The attachment
 //! is read LIVE from EC2 on every call: attaching a gateway — with no route added — makes the
 //! same refused request succeed, and detaching it again refuses it afresh. What each accepted
-//! load balancer PUBLISHES follows the same scheme: an internal Application Load Balancer's
-//! `DNSName` carries the reserved `internal-` prefix Elastic Load Balancing puts on the host
-//! of a load balancer reachable only from inside the VPC, and a public one's does not.**
+//! load balancer PUBLISHES is the address this emulator serves it at, whatever the scheme:
+//! the two reads of a created load balancer — the create's own answer and a later describe —
+//! report the one `DNSName` a client dials.**
 //!
 //! The rows differ along what the rule generalises over: the scheme (`internal`,
 //! `internet-facing`), the load balancer TYPE (`application`, `network`, and `gateway`, the
@@ -37,7 +37,6 @@ use crate::target_security_group_health_check::{ec2_ok, emulator_with_ec2, repor
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
     check_internet_gateway, network::InternetGatewayLookup, no_internet_gateway_message,
     LoadBalancerFamily, INTERNAL_SCHEME, INTERNET_FACING_SCHEME,
-    RESERVED_LOAD_BALANCER_NAME_PREFIX,
 };
 
 /// The network every wire row runs in: one VPC, and two subnets of it in different zones,
@@ -303,25 +302,29 @@ async fn assert_served(router: &MultiServiceRouter, row: &WireRow, network: &Net
         "case {case:?}: expected the scheme {expected_scheme:?} to be reported, got {}",
         read.body
     );
-    // What the load balancer publishes follows that scheme: the reserved prefix Elastic Load
-    // Balancing puts on the host of a load balancer reachable only from inside the VPC is
-    // carried by an internal Application Load Balancer's `DNSName` and by no public one's.
-    // Both reads — the create's own answer and the later describe — are held to it.
-    let internal = expected_scheme == INTERNAL_SCHEME && row.lb_type == "application";
+    // What the load balancer publishes is the address this emulator serves it at, whichever
+    // scheme it carries: `Scheme` decides which clients may reach it in a real network, not
+    // whether the published value is the address it answers on. Both reads — the create's own
+    // answer and the later describe — report that one value. The whole table of published
+    // forms is `load_balancer_dns_name_form.rs`.
+    let mut published_values: Vec<(&str, String)> = Vec::new();
     for (source, body) in [("the create", &reply), ("a later read", &read)] {
         let published = body
             .text("DNSName")
             .unwrap_or_else(|| panic!("case {case:?}: no DNSName in {}", body.body));
-        assert_eq!(
-            published
-                .to_lowercase()
-                .starts_with(RESERVED_LOAD_BALANCER_NAME_PREFIX),
-            internal,
-            "case {case:?}: {source} published {published:?}, which must {}begin with \
-             {RESERVED_LOAD_BALANCER_NAME_PREFIX:?}",
-            if internal { "" } else { "not " }
-        );
+        if row.lb_type != "gateway" {
+            assert!(
+                published.parse::<std::net::SocketAddr>().is_ok(),
+                "case {case:?}: {source} published {published:?}, which is no address a client \
+                 can dial"
+            );
+        }
+        published_values.push((source, published));
     }
+    assert_eq!(
+        published_values[0].1, published_values[1].1,
+        "case {case:?}: the two reads must report one published address, got {published_values:?}"
+    );
 }
 
 #[tokio::test]

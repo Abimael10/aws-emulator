@@ -57,3 +57,44 @@ Cause 2:
 2. Create a CloudFront VPC origin over that ALB and a distribution using it; wait for Deployed.
 3. GET the distribution domain with and without X-Origin-Secret.
 Observed: the request cannot be sent — the announced elb.amazonaws.com host is not the served endpoint. Expected: the marker body with the header, the fixed 403 body without it.
+
+## Resolution
+
+Cause 1 was already closed before this change: `CreateVpcOrigin` refuses a
+`VpcOriginEndpointConfig$Name` the account already holds a VPC origin under with the modelled
+`EntityAlreadyExists` and its fixed sentence, minting nothing
+(`services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/ops/create_vpc_origin.rs`
+over `state::holds_vpc_origin_named` / `state::vpc_origin_already_exists`), pinned by
+`tests/all/vpc_origin_create_refusals.rs`. The replay reports that cause fixed.
+
+Cause 2 was implemented in both halves this change owns.
+
+* The address publication: `CreateLoadBalancer` now opens a core-owned loopback listener for
+  every load balancer whose listeners carry a client's own request — the Application and the
+  Network family — under EITHER scheme, and publishes that socket's `host:port` as `DNSName`
+  (`services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/src/ops/create_load_balancer.rs`,
+  `src/state/load_balancer_endpoint.rs`). `Scheme` decides which clients may reach a load
+  balancer in a real network, not whether the published value is the address it answers on; a
+  Gateway Load Balancer keeps the host Elastic Load Balancing's own zone gives it, its `GENEVE`
+  listeners carrying no request of that kind.
+* The VPC-origin data path: the edge now reads the protocol policy and the ports of a
+  VPC-origin fetch off the `VpcOriginEndpointConfig` the VPC origin resource holds, instead of
+  addressing such an origin as an Amazon S3 one
+  (`services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/service/edge.rs`), so a
+  distribution over a VPC origin serves what the load balancer answers the origin request —
+  its rule's body for the request carrying the origin's `CustomHeaders`, its default action's
+  for the one that does not. Pinned end to end by
+  `core/router/tests/all/cloudfront_vpc_origin_over_an_internal_load_balancer.rs`.
+
+Residual gap, recorded rather than left implicit: the recorded check
+`cloudfront__ec2__elbv2.vpc-origin-internal-alb-serves-marker-at-the-edge` still does not pass.
+It hands the published value to a DNS resolver (`socket.gethostbyname_ex(host)`), so it needs a
+BARE host that resolves plus a server on the scheme's default port. The core listener API vends
+a port of its own choosing and takes no requested port (`vendor/server/src/listeners.rs`,
+`serve_native` binding `bind_ip_from_env()` within `listener_port_range_from_env()`), and a bare
+loopback host would announce an address nothing answers — and would make one host the `DNSName`
+of every load balancer, so the data plane could resolve none of them. The same residual is
+recorded in `issues/things-that-now-work/20261110T183056Z-elb-classic-2-net-new-causes-the-published.md`
+and as cause C of
+`issues/things-that-do-not-work/20261118T090000Z-elbv2-target-health-on-silence-alpn-poll-ssl-policy-and-dnsname-port-addressing-remain-open.md`,
+which owns the core change it needs.

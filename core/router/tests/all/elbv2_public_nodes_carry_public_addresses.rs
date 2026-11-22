@@ -20,15 +20,17 @@
 //!   association, and neither do a Gateway Load Balancer's: "You can't specify a scheme for a
 //!   Gateway Load Balancer".
 //! * THE NAME IT PUBLISHES. `LoadBalancer$DNSName` is "the public DNS name of the load
-//!   balancer" — the address a client then sends traffic to — so a load balancer whose nodes
-//!   carry public addresses and whose listeners carry a client's own traffic publishes an
-//!   address a client ON THIS MACHINE can dial, the `host:port` of the socket this emulator
-//!   opened for it. Both the Application and the Network family's listeners carry that
-//!   traffic; every other load balancer's client sits inside this emulator, so it keeps the
-//!   host Elastic Load Balancing's own zone gives it. The whole table of host FORMS is the
-//!   ELBv2 crate's `tests/all/load_balancer_dns_name_form.rs`; what this suite adds is that
-//!   the two rules agree — the load balancer that publishes a dialable address is the one
-//!   whose nodes carry public addresses.
+//!   balancer" — the address a client then sends traffic to — so a load balancer whose
+//!   listeners carry a client's own traffic publishes an address a client ON THIS MACHINE can
+//!   dial, the `host:port` of the socket this emulator opened for it. Both the Application and
+//!   the Network family's listeners carry that traffic, under EITHER scheme: `Scheme` decides
+//!   which clients may reach the load balancer in a real network, and in this emulator every
+//!   such client reaches it at the one address the emulator serves it on. A Gateway Load
+//!   Balancer's `GENEVE` listeners carry no request of that kind, so it keeps the host Elastic
+//!   Load Balancing's own zone gives it. The whole table of host FORMS is the ELBv2 crate's
+//!   `tests/all/load_balancer_dns_name_form.rs`; what this suite adds is that a published
+//!   address really ACCEPTS a connection, beside the addresses the same load balancer's nodes
+//!   carry.
 //!
 //! The rows span what the rules generalise over: every family the model's
 //! `LoadBalancerTypeEnum` names against both schemes its `LoadBalancerSchemeEnum` names, and
@@ -83,7 +85,7 @@ const ROWS: &[Row] = &[
         scheme: "internal",
         subnets: 2,
         public_nodes: false,
-        dialable: false,
+        dialable: true,
     },
     Row {
         case: "an internet-facing network load balancer in one subnet",
@@ -101,7 +103,7 @@ const ROWS: &[Row] = &[
         scheme: "internal",
         subnets: 2,
         public_nodes: false,
-        dialable: false,
+        dialable: true,
     },
     Row {
         case: "a gateway load balancer, whose nodes carry no scheme at all",
@@ -248,11 +250,10 @@ fn a_load_balancers_nodes_carry_the_addresses_its_scheme_gives_them() {
                 let dns_name = element(&created.text, "DNSName");
 
                 // The name it published is an address a client can dial exactly where its
-                // listeners carry a client's own traffic and its nodes are public — and where
-                // it is, the address really ACCEPTS a connection. What each family then serves
-                // on it, over a dialled connection, is
-                // `elbv2_serves_an_instance_targets_own_response.rs`; what is under test here
-                // is the address.
+                // listeners carry a client's own traffic — and where it is, the address really
+                // ACCEPTS a connection. What each family then serves on it, over a dialled
+                // connection, is `elbv2_serves_an_instance_targets_own_response.rs`; what is
+                // under test here is the address.
                 let address = dns_name.parse::<std::net::SocketAddr>().ok();
                 assert_eq!(
                     address.is_some(),

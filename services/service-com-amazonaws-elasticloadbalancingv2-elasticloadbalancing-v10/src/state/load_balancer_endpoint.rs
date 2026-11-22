@@ -21,19 +21,18 @@
 //! `source-ip` condition is evaluated against, what an `append` of `X-Forwarded-For` adds,
 //! and the `client:port` of its own access-log record.
 //!
-//! Only a load balancer whose listeners carry the traffic a client on this machine sends, and
-//! whose nodes carry PUBLIC addresses, gets one. Those listeners are the Application family's,
-//! which answer the client's own request, and the Network family's, which hand the connection
-//! they accept to what their target group selects; the internet-facing scheme is the one whose
-//! "nodes … have public IP addresses" (`CreateLoadBalancerInput$Scheme`). An INTERNAL load
-//! balancer's nodes "have only private IP addresses", so "internal load balancers can route
-//! requests only from clients with access to the VPC for the load balancer" — and the client
-//! with that access sits INSIDE this emulator, which is where the name Elastic Load
-//! Balancing's own zone gives it resolves. A Gateway Load Balancer keeps that name too: its
-//! `GENEVE` listeners carry no request of this kind. Their traffic is served all the same — a
-//! listener of theirs is reached by the name it published
-//! ([`crate::service::data_plane`]) — and a port published for a client that cannot be its
-//! client would be worse than a name.
+//! Only a load balancer whose listeners carry the traffic a client sends gets one. Those
+//! listeners are the Application family's, which answer the client's own request, and the
+//! Network family's, which hand the connection they accept to what their target group
+//! selects; BOTH SCHEMES get one. `Scheme` decides which clients may reach the load balancer
+//! in a real network — an internet-facing one's "nodes … have public IP addresses", while an
+//! internal one's "have only private IP addresses", so "internal load balancers can route
+//! requests only from clients with access to the VPC for the load balancer" — and in this
+//! emulator every such client reaches a load balancer at the one address this emulator serves
+//! it on, so that address is what both schemes publish. A Gateway Load Balancer keeps the
+//! name Elastic Load Balancing's own zone would give it: its `GENEVE` listeners carry no
+//! request of this kind, and its traffic is served on that name all the same — a listener of
+//! its is reached by the name it published ([`crate::service::data_plane`]).
 //!
 //! The socket is the ADDRESS, not the data plane: everything a request is answered BY — the
 //! listener it reached, the rules, the web ACL in front of the load balancer and the target

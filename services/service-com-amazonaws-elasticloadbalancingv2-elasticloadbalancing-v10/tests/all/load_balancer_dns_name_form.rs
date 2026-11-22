@@ -3,31 +3,23 @@
 //! The host a load balancer publishes as its `DNSName`, over the wire.
 //!
 //! One rule: the value is the address a client that honours it reaches the load balancer
-//! AT, and the FAMILY and the SCHEME decide what that is:
+//! AT, and the FAMILY decides what that is:
 //!
-//! * an INTERNET-FACING Application or Network Load Balancer — the load balancer a client on
-//!   this machine dials DIRECTLY, because its listeners carry that client's own traffic (an
-//!   Application Load Balancer's answer its request, a Network Load Balancer's hand the
-//!   connection to what its target group selects) and its "nodes … have public IP
-//!   addresses" — publishes the `host:port` of the socket the emulator opened for it, an
-//!   address that client can dial;
-//! * an INTERNAL Application Load Balancer, whose nodes "have only private IP addresses" and
-//!   which "can route requests only from clients with access to the VPC", gets no socket of
-//!   its own: its client sits inside this emulator, so it keeps the host Elastic Load
-//!   Balancing's own zone gives it,
-//!   `internal-<name>-<decimal id>.<region>.elb.amazonaws.com`, whose reserved `internal-`
-//!   prefix is the one no caller may begin a load balancer name with;
-//! * an INTERNAL Network Load Balancer and a Gateway Load Balancer of either scheme get no
-//!   socket either, so each keeps the host
-//!   Elastic Load Balancing's own zone gives it:
+//! * an Application or Network Load Balancer — whose listeners carry a client's own traffic
+//!   (an Application Load Balancer's answer its request, a Network Load Balancer's hand the
+//!   connection to what its target group selects) — publishes the `host:port` of the socket
+//!   the emulator opened for it, an address a client can dial. BOTH schemes publish it:
+//!   `Scheme` decides which clients may reach the load balancer in a real network (an
+//!   internet-facing one's "nodes … have public IP addresses", while an internal one's "have
+//!   only private IP addresses" and "can route requests only from clients with access to the
+//!   VPC for the load balancer"), and in this emulator every such client — a function, an
+//!   instance, a CloudFront VPC origin, a client on this machine — reaches the load balancer
+//!   at the one address this emulator serves it on;
+//! * a Gateway Load Balancer of either scheme gets no socket: its `GENEVE` listeners carry no
+//!   request of that kind, so it keeps the host Elastic Load Balancing's own zone gives it,
 //!   `<name>-<hexadecimal id>.elb.<region>.amazonaws.com`
 //!   (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`), whose id
-//!   is the very one its ARN carries, and whose host states its scheme nowhere. Such a load
-//!   balancer's traffic IS served on that name — a Network Load Balancer's listener hands the
-//!   connection to what its target group names (`network_load_balancer_pass_on.rs`) — and the
-//!   client of an internal one sits inside this emulator (an API Gateway private integration,
-//!   for one), which is where that name resolves; a port published for a client that cannot be
-//!   its client would be worse than a name.
+//!   is the very one its ARN carries, and whose host states its scheme nowhere.
 //!
 //! The rows span what the rule generalises over: every family the model's
 //! `LoadBalancerTypeEnum` names, both schemes its `LoadBalancerSchemeEnum` names, names of
@@ -43,17 +35,14 @@
 //! `alb_https_listener_tls.rs`; what this suite holds is the FORM each family publishes.
 
 use crate::provisioning_loop::{action, call_in_region, emulator, p, Reply};
-use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
-    APPLICATION_DNS_ID_DIGITS, INTERNAL_SCHEME, RESERVED_LOAD_BALANCER_NAME_PREFIX,
-};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The two Regions the rows run in: the one every other suite signs for, and a second one,
 /// so a host that hard-coded a Region would fail a row.
 const REGIONS: [&str; 2] = ["us-west-2", "eu-west-1"];
 
-/// How many hexadecimal digits the id a Network or Gateway Load Balancer publishes has: the
-/// width of the id its own ARN carries.
+/// How many hexadecimal digits the id a Gateway Load Balancer publishes has: the width of the
+/// id its own ARN carries.
 const HEX_ID_DIGITS: usize = 16;
 
 /// One row: the case name, the load balancer's `Name`, the `Type` and `Scheme` it is
@@ -152,28 +141,17 @@ enum Published {
 enum ZoneId {
     /// The very hexadecimal id the load balancer's own ARN carries.
     ArnHex,
-    /// A DECIMAL number minted for the host alone, which no ARN carries.
-    MintedDecimal,
 }
 
 impl Published {
     /// The published value for `row` in `region`.
     fn of(row: &Row, region: &str) -> Self {
-        match (row.lb_type, row.scheme) {
-            // The load balancer a client on this machine dials directly answers on a socket
-            // of its own, and publishes that socket's address.
-            ("application" | "network", scheme) if scheme != INTERNAL_SCHEME => Self::Dialable,
-            // An internal Application Load Balancer carries only private addresses, so it
-            // keeps the host its own zone gives it — the reserved prefix ahead of its name,
-            // and a decimal id minted for the host alone.
-            ("application", _) => Self::Zone {
-                head: format!("{RESERVED_LOAD_BALANCER_NAME_PREFIX}{}-", row.name),
-                tail: format!(".{region}.elb.amazonaws.com"),
-                digits: APPLICATION_DNS_ID_DIGITS as usize,
-                id: ZoneId::MintedDecimal,
-            },
-            // An internal Network Load Balancer's host, and a Gateway Load Balancer's,
-            // state the scheme nowhere.
+        match row.lb_type {
+            // A load balancer whose listeners carry a client's own traffic answers on a socket
+            // of its own, and publishes that socket's address — whatever its scheme.
+            "application" | "network" => Self::Dialable,
+            // A Gateway Load Balancer's host states the scheme nowhere, and the id beside its
+            // name is the very one its ARN carries.
             _ => Self::Zone {
                 head: format!("{}-", row.name),
                 tail: format!(".elb.{region}.amazonaws.com"),
@@ -185,7 +163,7 @@ impl Published {
 
     /// The id `host` carries AND the ARN must carry too, or an explanation of how it breaks
     /// this form. `None` for a published address, which carries no id at all — it carries a
-    /// port — and for a host whose id is minted for the host alone, which belongs to no ARN.
+    /// port.
     fn id_of(&self, host: &str) -> Result<Option<String>, String> {
         let (head, tail, digits, kind) = match self {
             Self::Dialable => {
@@ -217,12 +195,6 @@ impl Published {
                     return Err(format!("expected a hexadecimal id, got {id:?}"));
                 }
                 Ok(Some(id.to_string()))
-            }
-            ZoneId::MintedDecimal => {
-                if !id.chars().all(|c| c.is_ascii_digit()) {
-                    return Err(format!("expected a decimal id, got {id:?}"));
-                }
-                Ok(None)
             }
         }
     }
@@ -278,9 +250,8 @@ async fn the_published_host_follows_the_form_of_its_family() {
                 .id_of(&host)
                 .unwrap_or_else(|why| panic!("case {:?} in {region}: {why}, host {host:?}", row.case));
 
-            // A Network or Gateway Load Balancer publishes the very id its ARN carries; an
-            // Application Load Balancer publishes either an address, which carries no id at
-            // all, or a host whose decimal id was minted for the host alone.
+            // A Gateway Load Balancer publishes the very id its ARN carries; a load balancer
+            // that publishes an address of its own carries no id at all — it carries a port.
             let arn_id = arn.rsplit('/').next().unwrap_or_default().to_string();
             if let Some(id) = id {
                 assert_eq!(

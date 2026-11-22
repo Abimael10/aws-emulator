@@ -22,12 +22,12 @@
 //! already exists.
 //!
 //! What the create itself fills: the ARN and the `DNSName` the load balancer publishes —
-//! the `host:port` of the socket this emulator opens for a PUBLIC Application Load Balancer
-//! ([`crate::state::open_load_balancer_endpoint`]), which is the address a client that
-//! honours that name can actually reach it at, and otherwise the form its FAMILY and SCHEME
-//! publish ([`crate::state::load_balancer_dns_name`]) — and, for an Application Load Balancer
-//! a request names no `SecurityGroups` for, the default security group of the VPC it is
-//! placed in ([`starting_security_groups`]).
+//! the `host:port` of the socket this emulator opens for every load balancer whose listeners
+//! carry a client's own traffic ([`crate::state::open_load_balancer_endpoint`]), which is the
+//! address a client that honours that name can actually reach it at, and otherwise the form
+//! its FAMILY and SCHEME publish ([`crate::state::load_balancer_dns_name`]) — and, for an
+//! Application Load Balancer a request names no `SecurityGroups` for, the default security
+//! group of the VPC it is placed in ([`starting_security_groups`]).
 //!
 //! ## Shape of an operation
 //!
@@ -499,32 +499,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The ADDRESS this load balancer answers on, opened BEFORE the store is locked
-        // because opening a socket is asynchronous. The load balancer a client ON THIS
-        // MACHINE dials directly gets one and publishes it; any other keeps the name Elastic
+        // because opening a socket is asynchronous. A load balancer whose listeners carry a
+        // client's own traffic gets one and publishes it; any other keeps the name Elastic
         // Load Balancing's own zone would carry, which is the name its own traffic is served
-        // on in process ([`crate::service::data_plane`]) — a port published for a client that
-        // cannot be its client would be worse than a name. A create this request goes on to
+        // on in process ([`crate::service::data_plane`]). A create this request goes on to
         // refuse drops the handle, which closes the port again.
         //
-        // That is every family whose listeners carry the traffic a client on this machine
-        // sends — the Application family, whose listeners answer the client's own request,
-        // and the Network family, whose listeners hand the connection they accept to what
-        // their target group selects — and, of those, the load balancers whose nodes carry
-        // PUBLIC addresses: "the nodes of an internal load balancer have only private IP
-        // addresses … internal load balancers can route requests only from clients with
-        // access to the VPC for the load balancer" (`Scheme`), and the client with that
-        // access is the one INSIDE this emulator, which is where the name its own zone gives
-        // it resolves ([`crate::state::load_balancer_dns_name`]). A Gateway Load Balancer's
-        // `GENEVE` listeners carry no request of this kind at all, so it keeps the name.
+        // That is every family whose listeners carry the traffic a client sends — the
+        // Application family, whose listeners answer the client's own request, and the Network
+        // family, whose listeners hand the connection they accept to what their target group
+        // selects — WHATEVER its scheme: `Scheme` decides which clients may reach the load
+        // balancer in a real network ("the nodes of an internal load balancer have only
+        // private IP addresses … internal load balancers can route requests only from clients
+        // with access to the VPC for the load balancer"), and in this emulator every such
+        // client — a function, an instance, a CloudFront VPC origin, a client on this machine
+        // — reaches it at the one address the emulator serves it on, so the published value is
+        // that address for both schemes. A Gateway Load Balancer's `GENEVE` listeners carry no
+        // request of this kind at all, so it keeps the name.
         let endpoint = match family {
             crate::state::LoadBalancerFamily::Application
-            | crate::state::LoadBalancerFamily::Network
-                if candidate.scheme != crate::state::INTERNAL_SCHEME =>
-            {
+            | crate::state::LoadBalancerFamily::Network => {
                 crate::state::open_load_balancer_endpoint(&*self.engine, ctx.callback().clone())
                     .await
             }
-            _ => None,
+            crate::state::LoadBalancerFamily::Gateway => None,
         };
 
         let mut guard = state.lock();

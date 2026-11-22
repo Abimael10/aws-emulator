@@ -27,10 +27,9 @@
 //! `stack_outputs.rs` builds and the `StackResource` reader `stack_resources.rs` builds,
 //! so what it asserts is what a client reading the stack it just deployed sees. The rows
 //! span the class the rule generalises over: the load-balancer kind that decides the
-//! `app`/`net`/`gwy` segment of its ARN, the scheme that decides whether its DNS name
-//! begins `internal-`, whether the template NAMES the resource or leaves CloudFormation to
-//! generate the name, how deep the chain of embedded identifiers runs (load balancer →
-//! listener → rule) and both template spellings.
+//! `app`/`net`/`gwy` segment of its ARN, the scheme it is placed under, whether the template
+//! NAMES the resource or leaves CloudFormation to generate the name, how deep the chain of
+//! embedded identifiers runs (load balancer → listener → rule) and both template spellings.
 //!
 //! An `AWS::ECS::Cluster` and an `AWS::ECS::Service` are CREATED in Amazon ECS, so the row
 //! that declares a service declares the cluster it runs on too: a service is created in the
@@ -43,10 +42,9 @@
 //! minted and each row declares the VPC and the subnets its load balancer is placed in — a
 //! placement that service resolves against Amazon EC2 before it creates anything. That is
 //! also why the host a load balancer publishes is asserted as an ADDRESS a client can dial
-//! for the APPLICATION family, whose traffic this emulator serves — the `DNSName` is then the
-//! `host:port` of the listener it opened for the load balancer — and as the name that family
-//! publishes for the others, which it serves no traffic for
-//! (`my-nlb-1234567890abcdef.elb.us-west-2.amazonaws.com`).
+//! for the APPLICATION and NETWORK families, whose traffic this emulator serves — the
+//! `DNSName` is then the `host:port` of the listener it opened for the load balancer, whatever
+//! the load balancer's scheme.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -144,9 +142,9 @@ struct Expect {
     generated: bool,
     /// Whether the whole value is an ADDRESS a client on this machine can dial — the
     /// `host:port` of the listener the emulator opened for a load balancer, which is what an
-    /// APPLICATION load balancer publishes as its `DNSName` because this emulator serves
-    /// that family's traffic. Nothing else about such a value is fixed: the port is the one
-    /// the socket was given.
+    /// APPLICATION or NETWORK load balancer publishes as its `DNSName` because this emulator
+    /// serves those families' traffic. Nothing else about such a value is fixed: the port is
+    /// the one the socket was given.
     address: bool,
     tail: String,
 }
@@ -444,10 +442,9 @@ Outputs:
             ],
         },
         Case {
-            // The kind of load balancer decides the segment its ARN carries, and the
-            // scheme decides whether its DNS name begins `internal-`. Neither is named by
-            // the template, so each identifier is built from the name CloudFormation
-            // generated. JSON spelling, long-form intrinsics.
+            // The kind of load balancer decides the segment its ARN carries. Neither load
+            // balancer is named by the template, so each identifier is built from the name
+            // CloudFormation generated. JSON spelling, long-form intrinsics.
             case: "a network and a gateway load balancer the template does not name",
             stack_name: "unnamed-lbs",
             template: r#"{"Resources":{
@@ -487,19 +484,14 @@ Outputs:
                     "NlbConventionalArn",
                     embedding(format!("{elb}loadbalancer/"), "NlbFullName"),
                 ),
-                // The host a NETWORK load balancer publishes is the name that family's own
-                // guide publishes — its name, the very hexadecimal id its ARN carries, and
-                // the `elb`-first host of its Region, with the scheme stated nowhere in it.
-                // This emulator serves the traffic of the APPLICATION family, and publishes
-                // an address only for the family it serves ([`Expect::address`]).
+                // The host a NETWORK load balancer publishes is the address this emulator
+                // serves it at: the listeners of that family carry a client's own connection,
+                // so the emulator opens a socket for one and publishes it, whatever the load
+                // balancer's scheme ([`Expect::address`]).
                 (
                     "NlbDns",
                     Expect {
-                        head: String::new(),
-                        embeds: Some("NlbName"),
-                        separator: "-",
-                        digits: ELBV2_ID_DIGITS,
-                        tail: format!(".elb.{REGION}.amazonaws.com"),
+                        address: true,
                         ..Expect::default()
                     },
                 ),

@@ -821,25 +821,16 @@ async fn load_balancer_identity_follows_name_scheme_and_type() {
         // What each load balancer publishes as its `DNSName`: a Gateway Load Balancer's
         // `GENEVE` listeners carry no traffic of this kind, so it keeps the host Elastic Load
         // Balancing's own zone gives it (the ARN's own id, the `elb` label ahead of the
-        // Region, its scheme stated nowhere), an INTERNAL load balancer — whose nodes carry
-        // only private addresses, so its client sits inside this emulator — keeps the host
-        // that zone gives IT, and an internet-facing Application or Network Load Balancer
-        // publishes the address of the socket this emulator opened for it — an address a
-        // client can dial. The whole table of forms is `load_balancer_dns_name_form.rs`.
+        // Region, its scheme stated nowhere), while an Application or Network Load Balancer —
+        // whose listeners carry a client's own traffic — publishes the address of the socket
+        // this emulator opened for it, an address a client can dial, whatever its scheme. The
+        // whole table of forms is `load_balancer_dns_name_form.rs`.
         let dns_name = reply.text("DNSName").unwrap_or_default();
-        if lb_type == "gateway" || (lb_type == "network" && scheme == "internal") {
+        if lb_type == "gateway" {
             let host = format!("{name}-{id}.elb.{REGION}.amazonaws.com");
             assert_eq!(
                 dns_name, host,
                 "case {name}/{lb_type}/{scheme}: unexpected DNS name {dns_name:?}"
-            );
-        } else if scheme == "internal" {
-            let head = format!("internal-{name}-");
-            let tail = format!(".{REGION}.elb.amazonaws.com");
-            assert!(
-                dns_name.starts_with(&head) && dns_name.ends_with(&tail),
-                "case {name}/{lb_type}/{scheme}: expected a host of the form \
-                 {head}<id>{tail}, got {dns_name:?}"
             );
         } else {
             assert!(

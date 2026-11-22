@@ -1177,24 +1177,12 @@ fn is_load_balancer_arn(value: &str, type_code: &str, name: &str) -> bool {
 }
 
 /// Whether `value` is an address a client on this machine can DIAL: the `host:port` of a
-/// listener this emulator opened for the load balancer, which is what an APPLICATION load
-/// balancer publishes as its `DNSName` — "the public DNS name of the load balancer" is the
-/// address a client reaches it at, and this emulator serves that family's traffic itself.
+/// listener this emulator opened for the load balancer, which is what an APPLICATION or
+/// NETWORK load balancer publishes as its `DNSName` — "the public DNS name of the load
+/// balancer" is the address a client reaches it at, and this emulator serves those families'
+/// traffic itself, whatever the load balancer's scheme.
 fn is_published_address(value: &str) -> bool {
     value.parse::<std::net::SocketAddr>().is_ok()
-}
-
-/// Whether `value` is the host a NETWORK load balancer named `name` publishes: that family's
-/// guide puts the `elb` label ahead of the Region and the id beside the name is the very
-/// hexadecimal one its ARN carries
-/// (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`), with the scheme
-/// stated nowhere in it. The emulator serves no traffic for that family, so it publishes the
-/// name rather than an address.
-fn is_network_dns_name(value: &str, name: &str) -> bool {
-    value
-        .strip_prefix(&format!("{name}-"))
-        .and_then(|rest| rest.strip_suffix(&format!(".elb.{REGION}.amazonaws.com")))
-        .is_some_and(is_elb_id)
 }
 
 /// Whether `value` is the `<type>/<name>/<id>` path a load balancer's
@@ -1376,8 +1364,8 @@ fn cases() -> Vec<Case> {
                 ),
                 form(
                     "LoadBalancerDnsName",
-                    "warehouse-internal-<id>.elb.us-east-1.amazonaws.com",
-                    |value| is_network_dns_name(value, "warehouse-internal"),
+                    "<the address this emulator serves the load balancer at>",
+                    is_published_address,
                 ),
                 value("LoadBalancerName", "warehouse-internal".to_string()),
                 form(

@@ -214,7 +214,7 @@ use compression::Encoding;
 use crate::ops::types::{
     AllowedMethods, CacheBehavior, CustomErrorResponse, DefaultCacheBehavior, ForwardedValues,
     FunctionAssociations, LambdaFunctionAssociations, Origin, ResponseHeadersPolicyConfig,
-    TrustedKeyGroups,
+    TrustedKeyGroups, VpcOriginEndpointConfig,
 };
 use crate::state::{
     managed_cache_policy, matches_path_pattern, same_domain, CachedEdgeResponse,
@@ -828,6 +828,16 @@ fn bare_host(host: &str) -> &str {
         .split(':')
         .next()
         .unwrap_or(without_userinfo)
+}
+
+/// Whether an authority STATES a port of its own — `host:port`, a bracketed IPv6 literal
+/// with a port after the closing bracket included.
+///
+/// Read with the same rule [`bare_host`] strips one by, so the two cannot disagree about
+/// where a host ends and its port begins.
+fn states_a_port(authority: &str) -> bool {
+    let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    without_userinfo.len() != bare_host(authority).len()
 }
 
 /// Whether THIS data plane serves the request these parts came from — the data-plane half
@@ -2387,8 +2397,14 @@ fn plan_resolved(
     // configuration: what it says about this fetch is decided after the lock is released
     // (see [`origin_access`]), because the origin's own resource policy is read from the
     // origin's own service.
+    //
+    // A VPC ORIGIN names its endpoint declaration rather than carrying one: the protocol
+    // policy and the ports its fetch is addressed under are the VPC origin resource's own
+    // ([`vpc_origin_endpoint`]), read from this store while it is held.
+    let vpc_endpoint = vpc_origin_endpoint(store, origin);
     let uri = origin_uri(
         origin,
+        vpc_endpoint,
         generated_headers::viewer_scheme(req.uri()),
         // WHICH object the origin is asked for, which is the viewer's own path everywhere but
         // at the distribution's root ([`origin_object_path`]).
@@ -2649,27 +2665,84 @@ fn names_a_service_endpoint(host: &str) -> bool {
 /// [`AWS_ENDPOINT_SUFFIXES`] that names no service endpoint.
 const EDGE_ZONE_SUFFIX: &str = ".cloudfront.net";
 
+/// The PROTOCOL an origin is addressed under: the policy that chooses the scheme, and the
+/// port each scheme is reached on.
+///
+/// Two kinds of origin state one: a `CustomOriginConfig` states it on the distribution's own
+/// origin, and a VPC ORIGIN states it on the VPC origin resource the origin NAMES — its
+/// `VpcOriginEndpointConfig` carries the very three members (`OriginProtocolPolicy`,
+/// `HTTPPort`, `HTTPSPort`) a custom origin carries, because a VPC origin is the same
+/// endpoint declaration held as a resource of its own. An origin stating neither is an Amazon
+/// S3 origin, which is reached over HTTPS on that scheme's own port.
+struct OriginProtocol<'a> {
+    policy: &'a str,
+    http_port: i32,
+    https_port: i32,
+}
+
+impl<'a> OriginProtocol<'a> {
+    /// The protocol `origin` is addressed under, reading the VPC origin's own endpoint
+    /// configuration for an origin that names one, or `None` for an Amazon S3 origin.
+    fn of(origin: &'a Origin, vpc_endpoint: Option<&'a VpcOriginEndpointConfig>) -> Option<Self> {
+        if let Some(custom) = origin.custom_origin_config.as_ref() {
+            return Some(Self {
+                policy: custom.origin_protocol_policy.as_str(),
+                http_port: custom.http_port,
+                https_port: custom.https_port,
+            });
+        }
+        vpc_endpoint.map(|vpc| Self {
+            policy: vpc.origin_protocol_policy.as_str(),
+            http_port: vpc.http_port,
+            https_port: vpc.https_port,
+        })
+    }
+}
+
+/// The VPC ORIGIN ENDPOINT CONFIGURATION the origin names, for an origin that names one.
+///
+/// `Origin$VpcOriginConfig` carries only "the VPC origin ID", so everything about WHERE and
+/// HOW that endpoint is reached — the protocol policy and the two ports — is held on the VPC
+/// origin resource itself, read here from this service's own store. `None` for an origin
+/// naming no VPC origin, and for one naming a VPC origin the store no longer holds.
+fn vpc_origin_endpoint<'s>(
+    store: &'s ComAmazonawsCloudfrontCloudfront20200531State,
+    origin: &Origin,
+) -> Option<&'s VpcOriginEndpointConfig> {
+    let config = origin.vpc_origin_config.as_ref()?;
+    store
+        .vpc_origin(&config.vpc_origin_id)
+        .map(|stored| &stored.endpoint_config)
+}
+
 /// The absolute URI of the origin request: the origin's own host, its `OriginPath`, the
 /// viewer path and the viewer query.
 ///
 /// `Origin$OriginPath` is "an optional path that CloudFront appends to the origin domain
-/// name when CloudFront requests content". The scheme and port come from the origin's own
-/// configuration: an `S3OriginConfig` origin is reached over HTTPS, and a
-/// `CustomOriginConfig` one over the protocol its `OriginProtocolPolicy` names, on the
-/// matching port — `http-only` is "CloudFront uses only HTTP to access the origin",
-/// `https-only` only HTTPS, and `match-viewer` is CloudFront "communicating with your
-/// origin using HTTP or HTTPS, depending on the protocol of the viewer request", which is
-/// what `viewer_scheme` carries.
-fn origin_uri(origin: &Origin, viewer_scheme: &str, viewer_path: &str, query: &str) -> String {
-    let (scheme, port) = match &origin.custom_origin_config {
-        Some(custom) => match custom.origin_protocol_policy.as_str() {
-            ORIGIN_HTTP_ONLY => (PLAINTEXT_SCHEME, custom.http_port),
+/// name when CloudFront requests content". The scheme and port come from the protocol the
+/// origin is addressed under ([`OriginProtocol`]): an Amazon S3 origin is reached over
+/// HTTPS, and an origin stating a policy — a `CustomOriginConfig`, or the
+/// `VpcOriginEndpointConfig` of the VPC origin it names — over the protocol that
+/// `OriginProtocolPolicy` names, on the matching port: `http-only` is "CloudFront uses only
+/// HTTP to access the origin", `https-only` only HTTPS, and `match-viewer` is CloudFront
+/// "communicating with your origin using HTTP or HTTPS, depending on the protocol of the
+/// viewer request", which is what `viewer_scheme` carries.
+fn origin_uri(
+    origin: &Origin,
+    vpc_endpoint: Option<&VpcOriginEndpointConfig>,
+    viewer_scheme: &str,
+    viewer_path: &str,
+    query: &str,
+) -> String {
+    let (scheme, port) = match OriginProtocol::of(origin, vpc_endpoint) {
+        Some(protocol) => match protocol.policy {
+            ORIGIN_HTTP_ONLY => (PLAINTEXT_SCHEME, protocol.http_port),
             ORIGIN_MATCH_VIEWER if viewer_scheme == PLAINTEXT_SCHEME => {
-                (PLAINTEXT_SCHEME, custom.http_port)
+                (PLAINTEXT_SCHEME, protocol.http_port)
             }
             // `https-only`, `match-viewer` for a viewer that dialled HTTPS, and a policy
             // value this emulator does not know: the origin is reached over TLS.
-            _ => (SECURE_SCHEME, custom.https_port),
+            _ => (SECURE_SCHEME, protocol.https_port),
         },
         None => (SECURE_SCHEME, HTTPS_DEFAULT_PORT),
     };
@@ -2677,6 +2750,11 @@ fn origin_uri(origin: &Origin, viewer_scheme: &str, viewer_path: &str, query: &s
         (PLAINTEXT_SCHEME, HTTP_DEFAULT_PORT) | (SECURE_SCHEME, HTTPS_DEFAULT_PORT) => {
             origin.domain_name.clone()
         }
+        // A domain name that already states a PORT is the whole address the endpoint is
+        // served at — which is what the services of this emulator publish for a resource
+        // whose listener answers on a port of its own — so the configured port is not written
+        // after it: an authority states one port, and two would address nothing.
+        _ if states_a_port(&origin.domain_name) => origin.domain_name.clone(),
         _ => format!("{}:{port}", origin.domain_name),
     };
     let origin_path = origin
@@ -2744,9 +2822,11 @@ const MAX_ORIGIN_READ_TIMEOUT_SECONDS: u64 = 120;
 
 /// How long the edge waits for the origin's response.
 ///
-/// `CustomOriginConfig$OriginReadTimeout` / `S3OriginConfig$OriginReadTimeout`, in
-/// seconds, and [`DEFAULT_ORIGIN_READ_TIMEOUT`] for an origin that names none, clamped to
-/// the range that member documents.
+/// `CustomOriginConfig$OriginReadTimeout` / `S3OriginConfig$OriginReadTimeout` /
+/// `VpcOriginConfig$OriginReadTimeout`, in seconds — each the same "how long, in seconds,
+/// CloudFront waits for a response from the origin" on the configuration the origin carries —
+/// and [`DEFAULT_ORIGIN_READ_TIMEOUT`] for an origin that names none, clamped to the range
+/// those members document.
 fn origin_read_timeout(origin: &Origin) -> Duration {
     let seconds = origin
         .custom_origin_config
@@ -2757,6 +2837,12 @@ fn origin_read_timeout(origin: &Origin) -> Duration {
                 .s3_origin_config
                 .as_ref()
                 .and_then(|s3| s3.origin_read_timeout)
+        })
+        .or_else(|| {
+            origin
+                .vpc_origin_config
+                .as_ref()
+                .and_then(|vpc| vpc.origin_read_timeout)
         })
         .unwrap_or(DEFAULT_ORIGIN_READ_TIMEOUT);
     let seconds = u64::try_from(seconds).unwrap_or(0);
@@ -3729,7 +3815,7 @@ mod tests {
         };
         // (case, the origin, the scheme the viewer dialled, the viewer path, the query, the
         // origin URI)
-        let cases: [(&str, Origin, &str, &str, &str, &str); 8] = [
+        let cases: [(&str, Origin, &str, &str, &str, &str); 9] = [
             (
                 "an https-only origin on the default port",
                 origin(Some(custom("https-only", 80, 443)), None),
@@ -3794,9 +3880,95 @@ mod tests {
                 "a=1",
                 "https://origin.example.com/key?a=1",
             ),
+            (
+                // A domain name that already states a port is the whole address, so the
+                // configured port is not written after it.
+                "an origin whose domain name states the address it is served at",
+                Origin {
+                    domain_name: "127.0.0.1:34567".to_string(),
+                    ..origin(Some(custom("http-only", 8080, 443)), None)
+                },
+                "https",
+                "/index.html",
+                "",
+                "http://127.0.0.1:34567/index.html",
+            ),
         ];
         for (case, origin, viewer_scheme, viewer_path, query, expected) in cases {
-            let actual = origin_uri(&origin, viewer_scheme, viewer_path, query);
+            let actual = origin_uri(&origin, None, viewer_scheme, viewer_path, query);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the origin URI {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A VPC ORIGIN states the protocol policy and the ports of its fetch on the VPC origin
+    /// resource the origin NAMES, so an origin carrying no `CustomOriginConfig` at all is
+    /// addressed by that endpoint configuration rather than as an Amazon S3 origin.
+    #[test]
+    fn a_vpc_origins_request_uri_is_addressed_by_its_endpoint_configuration() {
+        let endpoint = |policy: &str, http_port: i32, https_port: i32| VpcOriginEndpointConfig {
+            name: "endpoint".to_string(),
+            arn: "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/edge/0"
+                .to_string(),
+            http_port,
+            https_port,
+            origin_protocol_policy: policy.to_string(),
+            ..VpcOriginEndpointConfig::default()
+        };
+        let origin = |domain: &str| Origin {
+            id: "vpc".to_string(),
+            domain_name: domain.to_string(),
+            vpc_origin_config: Some(crate::ops::types::VpcOriginConfig {
+                vpc_origin_id: "vo_0123456789abcdef".to_string(),
+                ..crate::ops::types::VpcOriginConfig::default()
+            }),
+            ..Origin::default()
+        };
+        // (case, the origin, the endpoint configuration of the VPC origin it names, the
+        // scheme the viewer dialled, the origin URI)
+        let cases: [(&str, Origin, VpcOriginEndpointConfig, &str, &str); 5] = [
+            (
+                "http-only on the default port, to a host",
+                origin("origin.example.com"),
+                endpoint("http-only", 80, 443),
+                "https",
+                "http://origin.example.com/index.html",
+            ),
+            (
+                "https-only on a port of its own",
+                origin("origin.example.com"),
+                endpoint("https-only", 80, 8443),
+                "http",
+                "https://origin.example.com:8443/index.html",
+            ),
+            (
+                "match-viewer for a viewer that dialled plaintext",
+                origin("origin.example.com"),
+                endpoint("match-viewer", 8080, 8443),
+                "http",
+                "http://origin.example.com:8080/index.html",
+            ),
+            (
+                "match-viewer for a viewer that dialled TLS",
+                origin("origin.example.com"),
+                endpoint("match-viewer", 8080, 8443),
+                "https",
+                "https://origin.example.com:8443/index.html",
+            ),
+            (
+                // The address the load balancer behind a VPC origin publishes names its own
+                // port, and that address is where the fetch goes.
+                "http-only, to the address the endpoint is served at",
+                origin("127.0.0.1:34567"),
+                endpoint("http-only", 80, 443),
+                "https",
+                "http://127.0.0.1:34567/index.html",
+            ),
+        ];
+        for (case, origin, endpoint, viewer_scheme, expected) in cases {
+            let actual = origin_uri(&origin, Some(&endpoint), viewer_scheme, "/index.html", "");
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected the origin URI {expected:?}, got {actual:?}"
