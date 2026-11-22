@@ -13,9 +13,10 @@
 //!    risk rules it defines, and whether it carries a description — because the document is
 //!    the resource, so every shape of it must round-trip.
 //! 2. A payload that is not a lens imports NOTHING and is refused 400
-//!    `ValidationException`, with `CANNOT_PARSE` when it is not JSON at all and
-//!    `FIELD_VALIDATION_FAILED` when it is JSON that breaks a rule of the lens JSON
-//!    format specification.
+//!    `ValidationException`, whose `Message` names the RULE of the lens JSON format
+//!    specification the document broke — the lens document is content this service
+//!    validates itself, so the refusal is worded semantically rather than as the schema
+//!    finding the front door states about a request's own members.
 //! 3. A `LensAlias` that is an ARN updates THAT lens; a request without one creates
 //!    another lens. An unknown custom ARN is a 404 and an Amazon Web Services official
 //!    lens is refused, on both the import and the export side.
@@ -400,202 +401,296 @@ async fn the_recorded_definition_matches_the_document_that_was_imported() {
 /// valid document.
 ///
 /// Either way the request carried a document that is not a lens, so it never became what it
-/// had to be: `Reason` is carried unclassified and no field finding is reported. A document
-/// the service cannot read as JSON at all is answered by naming `JSONString` alone; one it
-/// DID read is answered with what the lens format's schema found in it, in the same voice a
-/// finding about the request's own body is stated in — the property that is missing, the
-/// type the instance has against the types admitted, the string that was measured with its
-/// character count and the published bound, the value against the set the format declares.
-/// The rows below state each of those findings in full.
+/// had to be: `Reason` is carried unclassified and no field finding is reported. A value that
+/// is no lens document AT ALL — not JSON, or JSON that is not an object — is answered by
+/// naming `JSONString` alone, because no rule about a lens was reached. A document the
+/// service DID read is answered SEMANTICALLY: the rule of the lens JSON format specification
+/// the document broke, named in prose behind this service's failure-class tag, which is one
+/// phrase of the class of the defect plus the property of the document the rule holds on as
+/// the format spells it — never the internal report of whatever read the document.
+///
+/// The rows below break ONE rule each and state the whole message, spanning the classes: a
+/// property the document does not declare, a list it declares no entry in (whether it leaves
+/// the property out, carries no value in it or declares it empty), a value the format does
+/// not admit there (another type, past a published bound, outside a declared value set, or a
+/// risk-rule list ordered any other way), an empty text, and an id that identifies an entry
+/// declared twice.
 #[tokio::test]
 async fn a_payload_that_is_not_a_lens_is_refused_and_imports_nothing() {
-    /// The whole `Message` a row expects for a document the service could not read as JSON
-    /// at all: the member named as invalid, with nothing about the document in it.
-    const UNPARSABLE: &str = "[Validation] Invalid JSONString";
+    /// The whole `Message` a row expects for a value that is not a lens document at all:
+    /// the member named as invalid, with nothing about the value in it.
+    const UNREADABLE: &str = "[Validation] Invalid JSONString";
 
-    /// The whole `Message` for a document the service read: the finding, listed the way
-    /// every finding of this service is listed, behind the failure-class tag.
-    fn finding(found: &str) -> String {
-        format!("[Validation] [{found}]")
+    /// The whole `Message` for a document the service READ: the phrase naming the rule of
+    /// the lens JSON format specification it broke, behind the failure-class tag. The
+    /// recorded refusal of a document that declares no pillar is the
+    /// `"Empty pillars list"` row below.
+    fn defect(phrase: &str) -> String {
+        format!("[Validation] {phrase}")
     }
 
-    /// The finding for a property the document does not carry.
-    fn missing(property: &str) -> String {
-        finding(&format!(
-            "object has missing required properties ([\"{property}\"])"
-        ))
-    }
-
-    /// The finding for an instance of another type than the format admits there.
-    fn wrong_type(found: &str, allowed: &str) -> String {
-        finding(&format!(
-            "instance type ({found}) does not match any allowed primitive type (allowed: \
-             [\"{allowed}\"])"
-        ))
-    }
-
-    /// The finding for a value outside the set the format declares, which lists that set in
-    /// the order the format declares it.
-    fn not_in_set(value: &str, permitted: &[&str]) -> String {
-        let quoted: Vec<String> = permitted
-            .iter()
-            .map(|admitted| format!("\"{admitted}\""))
-            .collect();
-        finding(&format!(
-            "instance value (\"{value}\") not found in enum (possible values: [{}])",
-            quoted.join(",")
-        ))
-    }
-
-    /// The two findings for a string outside the bounds the format publishes for it.
-    fn too_short(value: &str, min: usize) -> String {
-        finding(&format!(
-            "string \"{value}\" is too short (length: {}, required minimum: {min})",
-            value.chars().count()
-        ))
-    }
-
-    fn too_long(value: &str, max: usize) -> String {
-        finding(&format!(
-            "string \"{value}\" is too long (length: {}, maximum allowed: {max})",
-            value.chars().count()
-        ))
-    }
-
-    /// The finding for an array the format requires an element of.
-    fn empty_array() -> String {
-        finding("array is too short: must have at least 1 elements but instance has 0 elements")
+    /// `document` without the property `property`, reached by the path `at` — how a row
+    /// spells a document that does not declare one.
+    fn without(document: &Value, at: &[&str], property: &str) -> Value {
+        let mut document = document.clone();
+        let mut target = &mut document;
+        for step in at {
+            target = match step.parse::<usize>() {
+                Ok(index) => &mut target[index],
+                Err(_) => &mut target[*step],
+            };
+        }
+        target
+            .as_object_mut()
+            .expect("the lens document's parts are JSON objects")
+            .remove(property);
+        document
     }
 
     let valid = lens_document("Valid lens", None, &[("governance", 1, 2)]);
+    let described = lens_document("Described lens", Some("a described lens"), &[(
+        "governance",
+        1,
+        2,
+    )]);
+
     // Rows: each a document breaking ONE rule of the lens JSON format specification,
-    // plus the two payloads that are not lens documents at all.
+    // plus the payloads that are not lens documents at all.
+    let no_schema_version = without(&valid, &[], "schemaVersion");
+    let mut wrong_schema_version = valid.clone();
+    wrong_schema_version["schemaVersion"] = json!("2020-07-02");
+    let no_name = without(&valid, &[], "name");
+    let mut name_not_a_string = valid.clone();
+    name_not_a_string["name"] = json!(7);
+    let mut empty_name = valid.clone();
+    empty_name["name"] = json!("");
+    let mut long_name = valid.clone();
+    long_name["name"] = json!("n".repeat(129));
+    let mut empty_description = described.clone();
+    empty_description["description"] = json!("");
+    let mut long_description = described.clone();
+    long_description["description"] = json!("d".repeat(1025));
+
+    // The pillars list, broken the three ways a document can declare no pillar, plus one
+    // that declares something that is not a list at all.
+    let absent_pillars = without(&valid, &[], "pillars");
+    let mut null_pillars = valid.clone();
+    null_pillars["pillars"] = Value::Null;
+    let mut empty_pillars = valid.clone();
+    empty_pillars["pillars"] = json!([]);
+    let mut pillars_not_a_list = valid.clone();
+    pillars_not_a_list["pillars"] = json!("governance");
+
+    // The same rule one and two levels down: the questions of a pillar, the choices and the
+    // risk rules of a question.
+    let absent_questions = without(&valid, &["pillars", "0"], "questions");
+    let mut empty_questions = valid.clone();
+    empty_questions["pillars"][0]["questions"] = json!([]);
+    let mut empty_choices = valid.clone();
+    empty_choices["pillars"][0]["questions"][0]["choices"] = json!([]);
+    let mut empty_risk_rules = valid.clone();
+    empty_risk_rules["pillars"][0]["questions"][0]["riskRules"] = json!([]);
+
+    // The id and the title of a nested entry.
+    let pillar_without_id = without(&valid, &["pillars", "0"], "id");
+    let question_without_title = without(&valid, &["pillars", "0", "questions", "0"], "title");
+    let mut empty_choice_title = valid.clone();
+    empty_choice_title["pillars"][0]["questions"][0]["choices"][0]["title"] = json!("");
+    let mut long_choice_id = valid.clone();
+    long_choice_id["pillars"][0]["questions"][0]["choices"][0]["id"] = json!("c".repeat(129));
+
+    // The two rules the format states about a question's risk rules.
     let mut broken_default = valid.clone();
     broken_default["pillars"][0]["questions"][0]["riskRules"] =
         json!([{ "condition": "default", "risk": "HIGH_RISK" }, { "condition": "governance_q0_c0", "risk": "NO_RISK" }]);
     let mut unmodelled_risk = valid.clone();
     unmodelled_risk["pillars"][0]["questions"][0]["riskRules"][0]["risk"] = json!("LOW_RISK");
+
+    // An id the format identifies an entry by, declared twice \u2014 once per kind of entry.
     let mut duplicate_choice = valid.clone();
     duplicate_choice["pillars"][0]["questions"][0]["choices"][1]["id"] = json!("governance_q0_c0");
     let mut duplicate_question = lens_document("Duplicate questions", None, &[("governance", 2, 2)]);
     duplicate_question["pillars"][0]["questions"][1]["id"] = json!("governance_q0");
-    let mut no_choices = valid.clone();
-    no_choices["pillars"][0]["questions"][0]["choices"] = json!([]);
-    let mut no_questions = valid.clone();
-    no_questions["pillars"][0]["questions"] = json!([]);
-    let mut wrong_schema = valid.clone();
-    wrong_schema["schemaVersion"] = json!("2020-07-02");
-    let mut empty_name = valid.clone();
-    empty_name["name"] = json!("");
-    let mut long_name = valid.clone();
-    long_name["name"] = json!("n".repeat(129));
-    let mut long_description = valid.clone();
-    long_description["description"] = json!("d".repeat(1025));
-    let mut no_pillars = valid.clone();
-    no_pillars["pillars"] = json!([]);
-    let mut name_not_a_string = valid.clone();
-    name_not_a_string["name"] = json!(7);
+    let mut duplicate_pillar = lens_document("Duplicate pillars", None, &[
+        ("governance", 1, 2),
+        ("security", 1, 2),
+    ]);
+    duplicate_pillar["pillars"][1]["id"] = json!("governance");
+
+    // The optional content entries the format declares on a question and on a choice: a
+    // document that declares one declares it as the format does.
+    let mut helpful_resource_not_an_object = valid.clone();
+    helpful_resource_not_an_object["pillars"][0]["questions"][0]["helpfulResource"] =
+        json!("https://example.test/helpful");
+    let mut improvement_plan_without_text = valid.clone();
+    improvement_plan_without_text["pillars"][0]["questions"][0]["choices"][0]["improvementPlan"] =
+        json!({ "url": "https://example.test/plan" });
 
     let cases: Vec<(&str, String, String)> = vec![
-        // The two documents the service cannot read as JSON at all: no rule of the format
-        // was reached, so nothing about the document is reported.
+        // The payloads that are not lens documents at all: no rule of the format was
+        // reached, so nothing about the value is reported.
         (
             "not-json-at-all",
             "this is not a lens document".to_string(),
-            UNPARSABLE.to_string(),
+            UNREADABLE.to_string(),
         ),
         (
             "truncated-json",
             "{\"schemaVersion\": ".to_string(),
-            UNPARSABLE.to_string(),
+            UNREADABLE.to_string(),
         ),
         (
             "json-but-not-an-object",
             json!([valid.clone()]).to_string(),
-            wrong_type("array", "object"),
+            UNREADABLE.to_string(),
         ),
         (
-            "missing-schema-version",
-            json!({ "name": "No version", "pillars": valid["pillars"].clone() }).to_string(),
-            missing("schemaVersion"),
+            "json-but-a-string",
+            json!("a lens document").to_string(),
+            UNREADABLE.to_string(),
+        ),
+        // The recorded refusal: a document that declares no pillar. It reads the same
+        // whether the property is absent, carries no value or is declared empty, because
+        // one rule is broken \u2014 the lens declares no pillar.
+        (
+            "absent-pillars",
+            absent_pillars.to_string(),
+            defect("Empty pillars list"),
         ),
         (
-            "wrong-schema-version",
-            wrong_schema.to_string(),
-            not_in_set("2020-07-02", &[state::LENS_SCHEMA_VERSION]),
+            "null-pillars",
+            null_pillars.to_string(),
+            defect("Empty pillars list"),
         ),
         (
-            "missing-name",
-            json!({ "schemaVersion": "2021-11-01", "pillars": valid["pillars"].clone() })
-                .to_string(),
-            missing("name"),
+            "empty-pillars",
+            empty_pillars.to_string(),
+            defect("Empty pillars list"),
+        ),
+        (
+            "pillars-not-a-list",
+            pillars_not_a_list.to_string(),
+            defect("Invalid pillars"),
+        ),
+        (
+            "absent-schema-version",
+            no_schema_version.to_string(),
+            defect("Missing schemaVersion"),
+        ),
+        (
+            "unsupported-schema-version",
+            wrong_schema_version.to_string(),
+            defect("Invalid schemaVersion"),
+        ),
+        (
+            "absent-name",
+            no_name.to_string(),
+            defect("Missing name"),
         ),
         (
             "name-not-a-string",
             name_not_a_string.to_string(),
-            wrong_type("integer", "string"),
+            defect("Invalid name"),
         ),
+        ("empty-name", empty_name.to_string(), defect("Empty name")),
         // `LensName` is @length(1, 128) and `LensDescription` @length(1, 1024)
         // (smithy_query: shape Lens), so one character past each is refused.
         (
-            "name-below-the-minimum",
-            empty_name.to_string(),
-            too_short("", 1),
-        ),
-        (
             "name-above-the-maximum",
             long_name.to_string(),
-            too_long(&"n".repeat(129), 128),
+            defect("Invalid name"),
+        ),
+        (
+            "empty-description",
+            empty_description.to_string(),
+            defect("Empty description"),
         ),
         (
             "description-above-the-maximum",
             long_description.to_string(),
-            too_long(&"d".repeat(1025), 1024),
-        ),
-        ("no-pillars", no_pillars.to_string(), empty_array()),
-        (
-            "missing-pillars",
-            json!({ "schemaVersion": "2021-11-01", "name": "No pillars" }).to_string(),
-            missing("pillars"),
+            defect("Invalid description"),
         ),
         (
             "pillar-without-questions",
-            no_questions.to_string(),
-            empty_array(),
+            empty_questions.to_string(),
+            defect("Empty questions list"),
+        ),
+        (
+            "pillar-not-declaring-questions",
+            absent_questions.to_string(),
+            defect("Empty questions list"),
         ),
         (
             "question-without-choices",
-            no_choices.to_string(),
-            empty_array(),
+            empty_choices.to_string(),
+            defect("Empty choices list"),
         ),
         (
-            // A rule the format states that no schema can: the condition that applies when
-            // no other matched belongs to the last rule and to no other.
+            "question-without-risk-rules",
+            empty_risk_rules.to_string(),
+            defect("Empty riskRules list"),
+        ),
+        (
+            "pillar-without-an-id",
+            pillar_without_id.to_string(),
+            defect("Missing id"),
+        ),
+        (
+            "question-without-a-title",
+            question_without_title.to_string(),
+            defect("Missing title"),
+        ),
+        (
+            "choice-with-an-empty-title",
+            empty_choice_title.to_string(),
+            defect("Empty title"),
+        ),
+        // Every id this API reports is modelled @length(1, 128)
+        // (smithy_query: shape ChoiceId), so one character past that is refused.
+        (
+            "choice-id-above-the-maximum",
+            long_choice_id.to_string(),
+            defect("Invalid id"),
+        ),
+        (
+            // A rule the format states about the risk-rule list as a whole: the condition
+            // that applies when no other matched belongs to the last rule and to no other.
             "default-risk-rule-not-last",
             broken_default.to_string(),
-            finding(
-                "array must carry the \"default\" condition on its last risk rule and on no \
-                 other",
-            ),
+            defect("Invalid riskRules"),
         ),
         (
             "unmodelled-risk",
             unmodelled_risk.to_string(),
-            not_in_set("LOW_RISK", state::LENS_JSON_RISK_VALUES),
+            defect("Invalid risk"),
         ),
         (
-            // The other rule of that kind: an id names one choice of a question and one
-            // question of a lens, so two of them cannot share it.
+            // An id names one choice of a question, one question of a lens and one pillar
+            // of a lens, so two of them cannot share it; the refusal names the id that is
+            // declared twice, which is what says WHICH entry to fix.
             "duplicate-choice-id",
             duplicate_choice.to_string(),
-            finding(
-                "array must not carry a duplicate id (\"governance_q0_c0\") within one question",
-            ),
+            defect("Duplicate choice id governance_q0_c0"),
         ),
         (
             "duplicate-question-id",
             duplicate_question.to_string(),
-            finding("array must not carry a duplicate id (\"governance_q0\") within one lens"),
+            defect("Duplicate question id governance_q0"),
+        ),
+        (
+            "duplicate-pillar-id",
+            duplicate_pillar.to_string(),
+            defect("Duplicate pillar id governance"),
+        ),
+        (
+            "helpful-resource-not-an-object",
+            helpful_resource_not_an_object.to_string(),
+            defect("Invalid helpfulResource"),
+        ),
+        (
+            "improvement-plan-without-display-text",
+            improvement_plan_without_text.to_string(),
+            defect("Missing displayText"),
         ),
     ];
 
