@@ -875,3 +875,314 @@ async fn a_batch_past_the_identifier_maximum_quotes_the_identifiers_it_was_sent(
         );
     }
 }
+
+/// The values the model's `TargetStore` enum declares.
+///
+/// Source: `smithy_query(query="shape", shape="TargetStore")` on this crate's
+/// `smithy-model/` — rendered as `TARGET_STORE_VALUES` in `ops::types::shared_types`.
+const TARGET_STORES: [&str; 2] = ["OfflineStore", "OnlineStore"];
+
+/// The record identifier the `TargetStores` cases are sent for.
+const TARGETED_RECORD: &str = "R1";
+
+/// The `TargetStores` a row names, or `None` where the request omits the member.
+type NamedStores<'a> = Option<&'a [&'a str]>;
+
+/// How a write renders the body it posts for a given `TargetStores`.
+type BodyFor = fn(NamedStores<'_>) -> Value;
+
+/// One write of this data plane that reads a `TargetStores` list: its operation name, and
+/// how it is sent for a given list.
+struct Write {
+    operation: &'static str,
+    method: &'static str,
+    /// The URI the call goes to, which is where a query-bound `TargetStores` is carried.
+    uri: fn(NamedStores<'_>) -> String,
+    /// The body the call posts, or `None` for a call that binds every member to the URI.
+    body: Option<BodyFor>,
+}
+
+/// The `&TargetStores=<value>` query parameters a query-bound list is carried as.
+fn target_stores_query(stores: NamedStores<'_>) -> String {
+    stores
+        .unwrap_or_default()
+        .iter()
+        .map(|store| format!("&TargetStores={store}"))
+        .collect()
+}
+
+/// `members` with a `TargetStores` member only where the row names one.
+fn with_target_stores(mut members: Value, stores: NamedStores<'_>) -> Value {
+    if let Some(stores) = stores {
+        members["TargetStores"] = json!(stores);
+    }
+    members
+}
+
+/// Every write of this data plane that reads a `TargetStores` list, each sent against
+/// [`GROUP`] for [`TARGETED_RECORD`].
+fn writes() -> Vec<Write> {
+    vec![
+        Write {
+            operation: "PutRecord",
+            method: "PUT",
+            uri: |_| format!("/FeatureGroup/{GROUP}"),
+            body: Some(|stores| {
+                with_target_stores(
+                    json!({ "Record": [
+                        feature(IDENTIFIER_FEATURE, TARGETED_RECORD),
+                        feature(EVENT_TIME_FEATURE, SEEDED_EVENT_TIME)
+                    ] }),
+                    stores,
+                )
+            }),
+        },
+        Write {
+            operation: "UpdateRecord",
+            method: "POST",
+            uri: |_| format!("/FeatureGroup/{GROUP}/Record"),
+            body: Some(|stores| {
+                with_target_stores(
+                    json!({
+                        "RecordIdentifierValueAsString": TARGETED_RECORD,
+                        "Features": [feature("feature_a", "updated")]
+                    }),
+                    stores,
+                )
+            }),
+        },
+        Write {
+            operation: "DeleteRecord",
+            method: "DELETE",
+            uri: |stores| {
+                format!(
+                    "/FeatureGroup/{GROUP}?RecordIdentifierValueAsString={TARGETED_RECORD}\
+                     &EventTime={SEEDED_EVENT_TIME}{}",
+                    target_stores_query(stores)
+                )
+            },
+            body: None,
+        },
+        Write {
+            operation: "BatchWriteRecord",
+            method: "POST",
+            uri: |_| "/BatchWriteRecord".to_owned(),
+            body: Some(|stores| {
+                let entry = with_target_stores(
+                    json!({
+                        "FeatureGroupName": GROUP,
+                        "Record": [
+                            feature(IDENTIFIER_FEATURE, TARGETED_RECORD),
+                            feature(EVENT_TIME_FEATURE, SEEDED_EVENT_TIME)
+                        ]
+                    }),
+                    stores,
+                );
+                json!({ "Entries": [entry] })
+            }),
+        },
+    ]
+}
+
+/// The lists the guard ADMITS: every value one the model's `TargetStore` enum declares.
+/// The rows span the declared values, both orders of the pair the modelled `len 1..2`
+/// admits, and the absent list.
+///
+/// (case, the TargetStores the request carries)
+fn declared_lists() -> Vec<(&'static str, Option<Vec<&'static str>>)> {
+    vec![
+        ("no TargetStores at all", None),
+        ("the OnlineStore alone", Some(vec!["OnlineStore"])),
+        ("the OfflineStore alone", Some(vec!["OfflineStore"])),
+        ("both stores", Some(vec!["OnlineStore", "OfflineStore"])),
+        (
+            "both stores, the other order",
+            Some(vec!["OfflineStore", "OnlineStore"]),
+        ),
+    ]
+}
+
+/// The lists the guard REFUSES, and the value each refusal must name. The rows span the
+/// FORM the undeclared value takes — a truncation of a declared value, a case variant, a
+/// declared value with a suffix, a value of another enum of this service — and the
+/// POSITION it holds in the list, since the guard names the FIRST undeclared value.
+///
+/// (case, the TargetStores the request carries, the value the refusal must name)
+fn undeclared_lists() -> Vec<(&'static str, Vec<&'static str>, &'static str)> {
+    vec![
+        ("a truncation of a declared value", vec!["Online"], "Online"),
+        ("a lowercase spelling", vec!["onlinestore"], "onlinestore"),
+        (
+            "an uppercase spelling",
+            vec!["OFFLINESTORE"],
+            "OFFLINESTORE",
+        ),
+        (
+            "a declared value with a suffix",
+            vec!["OnlineStores"],
+            "OnlineStores",
+        ),
+        (
+            "a value of another enum of this service",
+            vec!["SoftDelete"],
+            "SoftDelete",
+        ),
+        (
+            "the undeclared value after a declared one",
+            vec!["OnlineStore", "Offline"],
+            "Offline",
+        ),
+        (
+            "the undeclared value before a declared one",
+            vec!["Offline", "OnlineStore"],
+            "Offline",
+        ),
+        (
+            "both values undeclared: the first is the one named",
+            vec!["Offline", "Online"],
+            "Offline",
+        ),
+    ]
+}
+
+/// The crate's ONE statement of the `TargetStores` guard, read directly: the function
+/// every write of this data plane guards itself with.
+///
+/// Over the wire the framework's boundary validator refuses an undeclared enum value
+/// before any handler runs, so this is where the handlers' own guard — and the single
+/// wording it states — is observable at all.
+#[test]
+fn the_one_target_stores_guard_admits_the_declared_values_and_names_the_first_other() {
+    use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::state::undeclared_target_store;
+
+    assert!(
+        undeclared_target_store(None).is_none(),
+        "case \"no TargetStores at all\": expected the guard to admit an absent list, got \
+         {:?}",
+        undeclared_target_store(None)
+    );
+    for (case, stores) in declared_lists() {
+        let Some(stores) = stores else { continue };
+        let owned: Vec<String> = stores.iter().map(|store| (*store).to_owned()).collect();
+        let stated = undeclared_target_store(Some(&owned));
+        assert!(
+            stated.is_none(),
+            "case {case:?}: expected the guard to admit {stores:?}, got {stated:?}"
+        );
+    }
+
+    for (case, stores, unknown) in undeclared_lists() {
+        let owned: Vec<String> = stores.iter().map(|store| (*store).to_owned()).collect();
+        let stated = undeclared_target_store(Some(&owned)).unwrap_or_default();
+        // One wording for the whole crate: it names the member, the value the request
+        // supplied and the values the enum declares, so a client reads which value was
+        // refused and what it may send instead.
+        assert!(
+            stated.starts_with("TargetStores: ")
+                && stated.contains(&format!("'{unknown}'"))
+                && TARGET_STORES.iter().all(|value| stated.contains(value)),
+            "case {case:?}: expected the guard to state the TargetStores member, the value \
+             {unknown:?} and the declared values {TARGET_STORES:?}, got {stated:?}"
+        );
+    }
+}
+
+/// The same guard, end to end through every write that reads a `TargetStores` list — the
+/// three single-record writes and the batch one — so each of them is shown to read the
+/// list through it: a declared list is admitted and the call served, an undeclared value
+/// is refused before the write and nothing is written.
+///
+/// Which LAYER answers the refusal is the framework's: the boundary enum validation runs
+/// before a handler does, so these rows assert the class of the answer (400, the value and
+/// the declared values named, the record untouched) and the test above pins the handlers'
+/// own wording. The status/error-code side of the same typo is also covered, for PutRecord
+/// and DeleteRecord alone, by `online_store_record_lifecycle`'s enum-value test; these rows
+/// are the whole class: every write that carries the member, the wording, and the state.
+#[tokio::test]
+async fn every_write_reads_its_target_stores_through_the_one_guard() {
+    let writes = writes();
+
+    for (case, stores) in declared_lists() {
+        let named = stores.as_deref();
+        for write in &writes {
+            let emulator = Emulator::new();
+            emulator.create_feature_group(GROUP, None);
+            // A record to update and to delete: the guard is read before the write either
+            // way, and a served call answers 200 rather than failing on a missing record.
+            let (seeded, body) = emulator.put_record(TARGETED_RECORD, SEEDED_EVENT_TIME).await;
+            assert_eq!(
+                seeded, 200,
+                "case {case:?}/{}: the seeding PutRecord must be served, got {seeded} with \
+                 {body:?}",
+                write.operation
+            );
+
+            let uri = (write.uri)(named);
+            let body = write.body.map(|build| build(named));
+            let (status, answered) = emulator.send(write.method, &uri, body).await;
+            let reported = batch_errors(&answered);
+            assert_eq!(
+                (status, reported.clone()),
+                (200, Vec::new()),
+                "case {case:?}/{}: expected the write to be served with no per-element \
+                 error, got {status} with {answered:?}",
+                write.operation
+            );
+        }
+    }
+
+    // The other side of the same guard: a value the enum does not declare is refused
+    // before the write, whichever write carries it, and nothing is written.
+    for (case, stores, unknown) in undeclared_lists() {
+        let named = Some(stores.as_slice());
+        for write in &writes {
+            let emulator = Emulator::new();
+            emulator.create_feature_group(GROUP, None);
+            let (seeded, body) = emulator.put_record(TARGETED_RECORD, SEEDED_EVENT_TIME).await;
+            assert_eq!(
+                seeded, 200,
+                "case {case:?}/{}: the seeding PutRecord must be served, got {seeded} with \
+                 {body:?}",
+                write.operation
+            );
+            let before = emulator.record_pairs(TARGETED_RECORD).await;
+            assert!(
+                !before.is_empty(),
+                "case {case:?}/{}: the seeded record must be held before the refused write, \
+                 got {before:?}",
+                write.operation
+            );
+
+            let uri = (write.uri)(named);
+            let body = write.body.map(|build| build(named));
+            let (status, answered) = emulator.send(write.method, &uri, body).await;
+            let stated = message(&answered);
+            assert_eq!(
+                status, 400,
+                "case {case:?}/{}: expected HTTP 400 for a TargetStores value the \
+                 TargetStore enum does not declare, got {status} with {answered:?}",
+                write.operation
+            );
+            // One wording, whichever write carried the value: it names the value the
+            // request supplied and the values the enum declares, so a client reads which
+            // value was refused and what it may send instead.
+            assert!(
+                stated.contains(&format!("'{unknown}'"))
+                    && TARGET_STORES.iter().all(|value| stated.contains(value)),
+                "case {case:?}/{}: expected a refusal naming {unknown:?} and the declared \
+                 values {TARGET_STORES:?}, got {stated:?}",
+                write.operation
+            );
+
+            // Nothing was written: the seeded record still stands, unchanged and
+            // undeleted, so the refusal came before the write and not after half of it.
+            let after = emulator.record_pairs(TARGETED_RECORD).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}/{}: expected the refused write to leave the record as it \
+                 was ({before:?}), got {after:?}",
+                write.operation
+            );
+        }
+    }
+}

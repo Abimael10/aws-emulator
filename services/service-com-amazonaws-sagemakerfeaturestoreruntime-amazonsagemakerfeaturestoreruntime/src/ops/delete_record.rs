@@ -214,14 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value outside the `TargetStore` / `DeletionMode` enums would be read below
         // as "not the OnlineStore" or "not a HardDelete" and silently change what the
         // call does. The boundary validator refuses an undeclared enum value first;
-        // these are the handler's own guards, against the model's own value lists.
-        if let Some(stores) = input.target_stores.as_ref() {
-            if let Some(unknown) = crate::state::undeclared_value(stores, TARGET_STORE_VALUES) {
-                return Err(validation(format!(
-                    "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
-                    TARGET_STORE_VALUES.join(", ")
-                )));
-            }
+        // these are the handler's own guards, against the model's own value lists. The
+        // `TargetStores` one is the crate's single statement of that rule
+        // ([`crate::state::undeclared_target_store`]), which every write of this data
+        // plane guards itself with, so no two of them word the refusal differently.
+        if let Some(message) = crate::state::undeclared_target_store(input.target_stores.as_ref()) {
+            return Err(validation(message));
         }
         if let Some(mode) = input.deletion_mode.as_deref() {
             if !DELETION_MODE_VALUES.contains(&mode) {
