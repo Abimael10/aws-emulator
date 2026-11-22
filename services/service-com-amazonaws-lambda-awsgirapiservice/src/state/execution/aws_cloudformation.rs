@@ -54,7 +54,8 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::aws_api::{Answer, CallerIdentity, Refusal};
 use super::sdk_call::{
-    insert_flag, insert_number, insert_text, insert_timestamp, Input, Observed, PROVIDER_NAME,
+    insert_flag, insert_number, insert_structures, insert_text, insert_timestamp, some_list, Input,
+    Observed, PROVIDER_NAME,
 };
 
 /// The service a refusal of one of these calls names, as the AWS SDKs name it.
@@ -706,12 +707,6 @@ fn rollback_configuration(
     ))
 }
 
-/// A list member as the SDK's setter takes it: `None` where the call carried none, so a member
-/// the handler left out is left out of the request rather than sent empty.
-fn some_list<T>(values: Vec<T>) -> Option<Vec<T>> {
-    (!values.is_empty()).then_some(values)
-}
-
 /// Put a list-of-text member on an answer's document, where the answer carried entries.
 fn insert_list(document: &mut Map<String, Value>, name: &str, values: Vec<String>) {
     if values.is_empty() {
@@ -720,23 +715,6 @@ fn insert_list(document: &mut Map<String, Value>, name: &str, values: Vec<String
     document.insert(
         name.to_string(),
         Value::Array(values.into_iter().map(Value::String).collect()),
-    );
-}
-
-/// Put a list-of-structures member on it, each entry rendered by `render`: a list the answer
-/// carried no entry of is left off, as every other absent member is.
-fn insert_structures<T>(
-    document: &mut Map<String, Value>,
-    name: &str,
-    values: &[T],
-    render: impl Fn(&T) -> Value,
-) {
-    if values.is_empty() {
-        return;
-    }
-    document.insert(
-        name.to_string(),
-        Value::Array(values.iter().map(render).collect()),
     );
 }
 

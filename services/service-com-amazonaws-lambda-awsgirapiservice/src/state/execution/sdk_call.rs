@@ -484,6 +484,35 @@ pub(super) fn insert_timestamp(
     }
 }
 
+/// Put a list-of-STRUCTURES member on it, each entry rendered by `render`: a list the answer
+/// carried no entry of is left off, as every other absent member is.
+///
+/// Here rather than in one seam because every half of this seam that reads a listing off an
+/// answer renders its entries this one way.
+pub(super) fn insert_structures<T>(
+    document: &mut Map<String, Value>,
+    name: &str,
+    values: &[T],
+    render: impl Fn(&T) -> Value,
+) {
+    if values.is_empty() {
+        return;
+    }
+    document.insert(
+        name.to_string(),
+        Value::Array(values.iter().map(render).collect()),
+    );
+}
+
+/// A list member as an SDK setter takes it: `None` where the call carried none, so a member the
+/// handler left out is left out of the REQUEST rather than sent empty.
+///
+/// Here for the same reason: every half of this seam that carries a list member asks the same
+/// question of it.
+pub(super) fn some_list<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
+}
+
 /// Put a map-of-text member on it, the same way — the attributes an answer reports.
 pub(super) fn insert_text_map(
     document: &mut Map<String, Value>,

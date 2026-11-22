@@ -192,6 +192,12 @@ mod aws_rds;
 /// its resources, its outputs and its events — and drives a stack of its own through.
 mod aws_cloudformation;
 
+/// The Amazon EC2 half of it, for the same reason: that service's model declares `ec2Query`,
+/// so a request to it is a form-encoded action answered with an XML document — and it is what
+/// a handler that tightens or restores a security group's own rules calls, which is the whole
+/// of what a custom resource over a VPC's default group does.
+mod aws_ec2;
+
 /// What every half of that seam bound by an AWS SDK CLIENT shares: how a call's input document
 /// is read, what the answer carried, and how a refusal is handed back.
 mod sdk_call;

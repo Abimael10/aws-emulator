@@ -66,6 +66,7 @@ const MUST_REACH: &[&str] = &[
     "cloudwatch",
     "cognito-idp",
     "dynamodb",
+    "ec2",
     "events",
     "iam",
     "kinesis",
@@ -82,6 +83,11 @@ const MUST_REACH: &[&str] = &[
     "ssm",
     "xray",
 ];
+
+/// A token of a real AWS service this runtime binds no requests for, which is what the
+/// unknown-service rows below probe with: the catalog the SDK reports is read out of the
+/// sentence raised for it.
+const UNREACHABLE_TOKEN: &str = "batch";
 
 /// One row: the token a handler builds its client with, and whether the runtime's SDK answers
 /// to it.
@@ -198,7 +204,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a real AWS service this runtime binds no requests for",
-            token: "ec2",
+            token: UNREACHABLE_TOKEN,
             reachable: false,
         },
         Row {
@@ -351,7 +357,7 @@ async fn the_runtimes_sdk_answers_to_every_service_token_its_call_seam_binds() {
 
     // The catalog the runtime REPORTS is the one its call seam holds, so the sentence a guest
     // reads lists exactly the services a call may be made to.
-    let listed: Vec<String> = probed["ec2"]["sentence"]
+    let listed: Vec<String> = probed[UNREACHABLE_TOKEN]["sentence"]
         .as_str()
         .and_then(|sentence| sentence.split_once("Valid service names are: "))
         .map(|(_before, catalog)| catalog.split(", ").map(str::to_string).collect())

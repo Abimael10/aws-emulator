@@ -227,6 +227,13 @@ aws-sdk-rds = { version = "1", default-features = false }
 # handler takes, is the shape that needs it. Only the generated client is needed: the emulator
 # supplies the transport.
 aws-sdk-cloudformation = { version = "1", default-features = false }
+# Amazon EC2's model declares `ec2Query`, so a handler's `@aws-sdk/client-ec2` or
+# `boto3.client("ec2")` call is built, signed and parsed by this client
+# (`state::execution::aws_ec2`), over the same in-process callback. A function that revokes or
+# authorizes the rules of a SECURITY GROUP — the shape the provider of a CloudFormation custom
+# resource over a VPC's default group takes — is the shape that needs it. Only the generated
+# client is needed: the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
 # service: it is asked over the same in-process callback
@@ -369,9 +376,9 @@ emulator-core-build-support = { workspace = true }
 automod = { workspace = true }
 # The VPC, subnets and security groups a function's attachment is asserted against are
 # created through Amazon EC2's OWN API in the VPC-attachment tests, and the interfaces
-# Lambda stood up are read back through its `DescribeNetworkInterfaces`: this is the client
-# that builds, signs and parses those `awsQuery` calls over the in-process callback.
-aws-sdk-ec2 = { version = "1", default-features = false }
+# Lambda stood up are read back through its `DescribeNetworkInterfaces`: the client that
+# builds, signs and parses those `ec2Query` calls over the in-process callback is the one the
+# guest SDK seam holds, declared under `[dependencies]` above.
 # The key service a durable function's `DurableConfig` names a key in, mounted beside
 # lambda so a key really is disabled when the test says it is.
 service-com-amazonaws-kms-trentservice = { workspace = true }

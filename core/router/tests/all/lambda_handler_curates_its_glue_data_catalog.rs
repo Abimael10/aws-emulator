@@ -48,9 +48,10 @@ const REGION: &str = "us-west-2";
 /// `smithy_query(query="service_info",model_path="services/service-com-amazonaws-glue-awsglue/smithy-model/com-amazonaws-glue-awsglue.json")`).
 const CATALOG_TOKEN: &str = "glue";
 
-/// A token no service of this emulator answers to, which is the one case botocore's
-/// unknown-service sentence is the correct answer for.
-const UNBOUND_TOKEN: &str = "ec2";
+/// A token the RUNTIME's own SDK binds no requests for — a real AWS service whose protocol this
+/// crate's call seam does not bind, whichever services the router it runs in mounts — which is
+/// the one case botocore's unknown-service sentence is the correct answer for.
+const UNBOUND_TOKEN: &str = "batch";
 
 /// The catalog the handler curates: the database, the partitioned table and its one partition
 /// key. Names are lower case because the catalog folds a name "to lowercase when it is stored"
@@ -778,7 +779,7 @@ async fn a_handlers_own_sdk_curates_the_glue_data_catalog() {
             {
                 "id": "a token no service answers to",
                 "service": UNBOUND_TOKEN,
-                "method": "describe_regions",
+                "method": "describe_compute_environments",
                 "parameters": {},
             },
         ]),

@@ -208,6 +208,10 @@ pub enum Protocol {
     /// events — and drives a stack of its own through, built by the client this crate holds for
     /// it ([`super::aws_cloudformation`]).
     CloudFormationQuery,
+    /// Amazon EC2's `ec2Query`: a form-encoded `Action` answered with an XML document, for the
+    /// service a handler reads a SECURITY GROUP's rules through and revokes or authorizes them
+    /// on, built by the client this crate holds for it ([`super::aws_ec2`]).
+    Ec2Query,
 }
 
 impl Api {
@@ -230,7 +234,8 @@ impl Api {
             | Protocol::StsQuery
             | Protocol::IamQuery
             | Protocol::RdsQuery
-            | Protocol::CloudFormationQuery => "application/json".to_string(),
+            | Protocol::CloudFormationQuery
+            | Protocol::Ec2Query => "application/json".to_string(),
         }
     }
 }
@@ -742,6 +747,27 @@ pub const APIS: &[Api] = &[
         // The answer of such a call is read by that client out of the XML the service sent,
         // and the document this seam hands the guest is built from the output members it
         // reported ([`super::aws_cloudformation`]); none of them carries bytes.
+        answer_model: None,
+    },
+    // `services/service-com-amazonaws-ec2-amazonec2/smithy-model/
+    // com-amazonaws-ec2-amazonec2.json`: ec2Query, sigv4Name `ec2`, endpointPrefix `ec2`,
+    // sdkId `EC2`. Its operations carry their input as the parameters of a form-encoded
+    // `Action` and answer an XML document, so the request is built by [`super::aws_ec2`].
+    //
+    // A SECURITY GROUP's own rules are what a handler that polices a network changes, and what
+    // the provider of a CloudFormation custom resource over a VPC exists to change: the
+    // provider's create revokes the rules the VPC's default group came with and its delete
+    // authorizes them again. A handler that cannot reach this service answers such a request
+    // with a failure, and the stack that declared the resource rolls back.
+    Api {
+        sdk_token: "ec2",
+        signing_name: "ec2",
+        endpoint_prefix: "ec2",
+        model: Some(EC2_MODEL),
+        protocol: Protocol::Ec2Query,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_ec2`]); none of them carries bytes.
         answer_model: None,
     },
     // com-amazonaws-rdsdata-rdsdataservice.json`: restJson1, sigv4Name `rds-data`,
@@ -1414,6 +1440,10 @@ pub(super) const S3VECTORS_MODEL: &str = include_str!(
 pub(super) const TRANSFER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
      com-amazonaws-transfer-transferservice.json"
+);
+pub(super) const EC2_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-ec2-amazonec2/smithy-model/\
+     com-amazonaws-ec2-amazonec2.json"
 );
 pub(super) const CLOUDFORMATION_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-cloudformation-cloudformation/smithy-model/\
@@ -2354,6 +2384,17 @@ impl AwsAccess {
                 )
                 .await
             }
+            Protocol::Ec2Query => {
+                super::aws_ec2::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                    self.trace_header.as_deref(),
+                )
+                .await
+            }
         }
     }
 
@@ -2667,7 +2708,8 @@ async fn sent(
         | Protocol::StsQuery
         | Protocol::IamQuery
         | Protocol::RdsQuery
-        | Protocol::CloudFormationQuery => {
+        | Protocol::CloudFormationQuery
+        | Protocol::Ec2Query => {
             return Err(Sent::NotMade(format!(
                 "{} binds its requests with its own protocol rather than with a JSON one",
                 api.sdk_token
@@ -3135,6 +3177,12 @@ mod tests {
                     api.signing_name, "cloudformation",
                     "case {:?}: expected AWS CloudFormation's own signing name on its protocol \
                      entry",
+                    api.sdk_token
+                ),
+                // Amazon EC2's `ec2Query`, the same way, in `super::super::aws_ec2`.
+                super::Protocol::Ec2Query => assert_eq!(
+                    api.signing_name, "ec2",
+                    "case {:?}: expected Amazon EC2's own signing name on its protocol entry",
                     api.sdk_token
                 ),
             }

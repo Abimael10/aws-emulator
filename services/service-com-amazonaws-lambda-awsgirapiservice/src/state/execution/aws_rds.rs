@@ -71,8 +71,8 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::aws_api::{Answer, CallerIdentity, Refusal};
 use super::sdk_call::{
-    insert_double, insert_flag, insert_number, insert_text, insert_timestamp, Input, Observed,
-    PROVIDER_NAME,
+    insert_double, insert_flag, insert_number, insert_text, insert_timestamp, some_list, Input,
+    Observed, PROVIDER_NAME,
 };
 
 /// The service a refusal of one of these calls names, as the AWS SDKs name it.
@@ -457,12 +457,6 @@ async fn remove_role_from_db_instance(
         Ok(_) => observed.answer(Map::new()),
         Err(error) => observed.refused(&error),
     }
-}
-
-/// A list member as the SDK's setter takes it: `None` where the call carried none, so a
-/// member the handler left out is left out of the request rather than sent empty.
-fn some_list(values: Vec<String>) -> Option<Vec<String>> {
-    (!values.is_empty()).then_some(values)
 }
 
 /// Put a list-of-text member on an answer's document, where the answer carried entries.
