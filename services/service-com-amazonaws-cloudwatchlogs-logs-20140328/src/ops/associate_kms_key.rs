@@ -5,8 +5,9 @@
 //! account's query results — once the key itself is resolved in KMS
 //! ([`crate::state::kms_key_reference`]) and the KEY's own key policy lets CloudWatch Logs
 //! encrypt that resource's data with it ([`crate::state::kms_key_grant`]); an identifier that
-//! is not a key's ARN, a key KMS reports no usable key for, and an association the key policy
-//! does not cover are each refused and nothing is recorded. The association lives in the
+//! is not a key's ARN, a key ARN naming another Region than this one, a key KMS reports no
+//! usable key for, and an association the key policy does not cover are each refused and
+//! nothing is recorded. The association lives in the
 //! shared store, where `DescribeLogGroups` projects a log group's as `LogGroup$kmsKeyId`. This
 //! is the ONLY file to touch for this operation.
 //!
@@ -225,10 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The Amazon Resource Name (ARN) of the KMS key to use when encrypting log data":
-        // a value that is not a key's ARN names no key this member takes, which is the
-        // identifier itself being wrong — judged first, because it needs neither the store
-        // nor KMS ([`crate::state::kms_key_reference::is_key_arn`]).
-        if !crate::state::kms_key_reference::is_key_arn(&input.kms_key_id) {
+        // a value that is not a key's ARN names no key this member takes, and a key ARN naming
+        // another Region than the one this request resolves keys in names no key findable here
+        // — both are the identifier itself being wrong, and both are judged FIRST, because
+        // they need neither the store nor KMS ([`crate::state::kms_key_reference::is_key_arn`],
+        // [`crate::state::kms_key_reference::names_another_region`]).
+        if !crate::state::kms_key_reference::is_key_arn(&input.kms_key_id)
+            || crate::state::kms_key_reference::names_another_region(&input.kms_key_id, &region)
+        {
             return Err(invalid(
                 crate::state::kms_key_reference::KEY_NOT_FOUND_MESSAGE.to_string(),
             ));
@@ -291,7 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::kms_key_reference::KEY_DISABLED_MESSAGE.to_string(),
                 ));
             }
-            crate::state::kms_key_reference::KeyUsability::NotAKeyReference
+            // The two answers decided from the identifier alone are refused above, before
+            // anything is read or asked, so reaching here with one of them is impossible.
+            crate::state::kms_key_reference::KeyUsability::OutOfRegion
+            | crate::state::kms_key_reference::KeyUsability::NotAKeyReference
             | crate::state::kms_key_reference::KeyUsability::NotRefused => {}
         }
 

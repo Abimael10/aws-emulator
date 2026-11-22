@@ -13,6 +13,11 @@
 //! ([`KEY_NOT_FOUND_MESSAGE`]), or KMS reports it in a state it cannot be used in
 //! ([`KEY_DISABLED_MESSAGE`]).
 //!
+//! A key is resolved through the endpoint the request reached, and a KMS key ARN addresses one
+//! key in one Region, so a key ARN naming another Region names no key findable here
+//! ([`names_another_region`]) — it is the first condition, decided from the identifier alone,
+//! before anything is asked of KMS.
+//!
 //! This is a different question from the one [`super::kms_key_grant`] asks: that one is about
 //! the key's own key POLICY — whether the key may be used for THIS resource — and it can only
 //! be asked of a key KMS reports. This module asks whether there is such a key.
@@ -41,6 +46,24 @@ const KEY_RESOURCE_TYPE: &str = "key/";
 /// is no such key, which is the condition this gate refuses.
 const NO_SUCH_KEY_CODES: [&str; 2] = ["NotFoundException", "InvalidArnException"];
 
+/// Whether the key ARN `value` names a Region OTHER than `region`, the Region the key is being
+/// resolved in.
+///
+/// A KMS key is a regional resource — its ARN "addresses one key in one Region" — and a
+/// `kmsKeyId` is resolved through the endpoint this request reached, so a key ARN carrying
+/// another Region's label names no key that can be found here, whatever KMS holds in that
+/// other Region.
+///
+/// Only a Region LABEL is read as naming a Region ([`::service_common::arn::region_of`]): an
+/// ARN whose Region field is empty or is not a label names no Region to compare, so it is left
+/// to KMS to report on rather than refused here.
+#[must_use]
+pub fn names_another_region(value: &str, region: &str) -> bool {
+    let resolved_in = ::service_common::arn::region_label(region).unwrap_or(super::DEFAULT_REGION);
+    ::service_common::arn::region_of(value, KMS_VENDOR)
+        .is_some_and(|named| named != resolved_in)
+}
+
 /// Whether `value` is the ARN of a KMS KEY — the form `kmsKeyId` documents ("The Amazon
 /// Resource Name (ARN) of the KMS key to use when encrypting log data").
 ///
@@ -59,9 +82,9 @@ pub fn is_key_arn(value: &str) -> bool {
 }
 
 /// The refusal CloudWatch Logs answers for a `kmsKeyId` that names no key it can find: a value
-/// that is not a key's ARN at all, an alias (which is a name for a key rather than a key), and
-/// a well-formed key ARN KMS holds no key under. Fixed text for the class, carrying nothing of
-/// the request.
+/// that is not a key's ARN at all, an alias (which is a name for a key rather than a key), a
+/// key ARN of another Region ([`names_another_region`]), and a well-formed key ARN of this
+/// Region KMS holds no key under. Fixed text for the class, carrying nothing of the request.
 pub const KEY_NOT_FOUND_MESSAGE: &str = "The specified KMS Key Id could not be found.";
 
 /// The refusal it answers for a key KMS does report, in a state it cannot encrypt with: "if you
@@ -79,6 +102,10 @@ pub enum KeyUsability {
     /// The value is not a key's ARN, so it names no key this member takes: nothing was asked
     /// of KMS, because there is nothing to ask about.
     NotAKeyReference,
+    /// The value is a key's ARN naming another Region than the one the key is resolved in, so
+    /// no key it could name is findable here ([`names_another_region`]): nothing was asked of
+    /// KMS, because this endpoint serves no key of that Region.
+    OutOfRegion,
     /// KMS reports no key under the ARN: it holds none, or it cannot read the ARN as a key's.
     NoSuchKey,
     /// KMS reports the key in a state it cannot encrypt in.
@@ -103,6 +130,11 @@ pub async fn usability(
     // KMS: it names no key this member accepts.
     if !is_key_arn(kms_key_id) {
         return KeyUsability::NotAKeyReference;
+    }
+    // A key of another Region is not a key this endpoint can resolve at all, so it is told apart
+    // from what KMS answers about the keys it does serve.
+    if names_another_region(kms_key_id, region) {
+        return KeyUsability::OutOfRegion;
     }
     let narrowed = ::service_common::arn::region_label(region).unwrap_or(super::DEFAULT_REGION);
     let client = callback_client!(aws_sdk_kms, ctx.callback(), "kms", narrowed);
@@ -151,7 +183,7 @@ pub async fn refusal_for(
     kms_key_id: &str,
 ) -> Option<String> {
     match usability(ctx, region, kms_key_id).await {
-        KeyUsability::NotAKeyReference | KeyUsability::NoSuchKey => {
+        KeyUsability::NotAKeyReference | KeyUsability::OutOfRegion | KeyUsability::NoSuchKey => {
             Some(KEY_NOT_FOUND_MESSAGE.to_string())
         }
         KeyUsability::Disabled => Some(KEY_DISABLED_MESSAGE.to_string()),
@@ -171,7 +203,55 @@ fn is_enabled(metadata: &::aws_sdk_kms::types::KeyMetadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_key_arn;
+    use super::{is_key_arn, names_another_region};
+
+    /// RULE: a key ARN resolves only in the Region it names, so one naming another Region than
+    /// the request's names no key findable there; an ARN that names no Region label at all
+    /// names no Region to disagree with.
+    #[test]
+    fn a_key_arn_resolves_only_in_the_region_it_names() {
+        const REGION: &str = "eu-west-2";
+        for (case, value, expected) in [
+            (
+                "a key ARN of the request's own Region",
+                "arn:aws:kms:eu-west-2:000000000000:key/4b2f1a60",
+                false,
+            ),
+            (
+                "a key ARN of another Region",
+                "arn:aws:kms:us-east-1:000000000000:key/4b2f1a60",
+                true,
+            ),
+            (
+                "a key ARN of another Region of another partition",
+                "arn:aws-us-gov:kms:us-gov-west-1:000000000000:key/4b2f1a60",
+                true,
+            ),
+            (
+                "a key ARN whose Region field is empty",
+                "arn:aws:kms::000000000000:key/4b2f1a60",
+                false,
+            ),
+            (
+                "a key ARN whose Region field is no Region label",
+                "arn:aws:kms:EU-WEST-2:000000000000:key/4b2f1a60",
+                false,
+            ),
+            (
+                "an ARN of another vendor in another Region",
+                "arn:aws:logs:us-east-1:000000000000:log-group:g",
+                false,
+            ),
+            ("a value that is no ARN", "not-an-arn", false),
+        ] {
+            let actual = names_another_region(value, REGION);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected names_another_region({value:?}, {REGION:?}) == \
+                 {expected}, got {actual}"
+            );
+        }
+    }
 
     /// RULE: `kmsKeyId` takes the ARN of a KMS KEY and nothing else — not an alias (a
     /// re-targetable name), not a bare identifier, not another vendor's ARN.
