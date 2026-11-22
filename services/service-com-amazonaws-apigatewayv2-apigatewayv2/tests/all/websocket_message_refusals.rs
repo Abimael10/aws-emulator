@@ -23,11 +23,14 @@
 //!
 //! The rows span what the rule generalises over: the frame's opcode (text, binary), the
 //! payload under it (empty, bytes that are not UTF-8, bytes that ARE a message a route
-//! serves), the framing (one frame, fragments), and the size against each published bound (far
-//! under it, at it, one byte past it, half again past it).
+//! serves), the framing (one frame, fragments), the size against each published bound (far
+//! under it, at it, one byte past it, half again past it), and the connection's own state when
+//! the refused frame arrives (fresh from the handshake, or one that has already served a
+//! message).
 //!
 //! The suites that own the rest of this socket are not restated here: the handshake's own
-//! statuses and the dispatch of a served message are `websocket_transport_data_plane.rs`.
+//! statuses, the dispatch of a served message and the LIFETIME of a connection that serves one
+//! message after another are `websocket_transport_data_plane.rs`.
 
 use std::time::Duration;
 
@@ -315,6 +318,59 @@ async fn a_client_data_frame_that_is_not_text_is_refused_with_close_1003() {
         if matches!(row.expected, Answer::Close(_, _)) {
             ended(case, &mut socket).await;
         }
+    }
+}
+
+/// A refusal carries the SAME close on a connection that has already been serving: what it
+/// ends is a working connection, and the message before it was answered as ever.
+#[tokio::test]
+async fn a_refusal_of_a_connection_that_has_been_serving_carries_the_same_close() {
+    /// One row: the frames that are refused once the connection has served a message, and the
+    /// close the api must answer them with.
+    struct Row {
+        case: &'static str,
+        frames: Vec<Message>,
+        expected: Answer,
+    }
+
+    // The rows span the two refusals a SINGLE frame can carry: an opcode this plane does not
+    // serve, and a frame past the frame quota.
+    let rows = vec![
+        Row {
+            case: "a binary frame on a connection that has served a message",
+            frames: vec![Message::Binary(Bytes::from_static(b"\x00\x01binary"))],
+            expected: closed(CLOSE_UNSUPPORTED_DATA),
+        },
+        Row {
+            case: "a frame past the frame quota on a connection that has served a message",
+            frames: vec![Message::Text(text_of(FRAGMENT_BYTES + 1).into())],
+            expected: close_past_frame_quota(FRAGMENT_BYTES),
+        },
+    ];
+
+    let emulator = emulator();
+    let api = deployed_api(&emulator, "a refusal on a serving connection", "serving-api").await;
+
+    for row in rows {
+        let case = row.case;
+        // A refusal ends the connection, so every row drives one of its own — and serves a
+        // message over it first, so the close ends a connection that was carrying traffic.
+        let mut socket = connect(case, &api).await;
+        let selecting = json!({ "action": "$default" }).to_string();
+        let served = answer(case, &mut socket, vec![Message::Text(selecting.into())]).await;
+        assert_eq!(
+            served,
+            Answer::Reply(SERVED_REPLY.to_string()),
+            "case {case:?}: the connection must serve before the refusal, got {served:?}"
+        );
+
+        let answered = answer(case, &mut socket, row.frames).await;
+        assert_eq!(
+            answered, row.expected,
+            "case {case:?}: expected {:?}, got {answered:?}",
+            row.expected
+        );
+        ended(case, &mut socket).await;
     }
 }
 

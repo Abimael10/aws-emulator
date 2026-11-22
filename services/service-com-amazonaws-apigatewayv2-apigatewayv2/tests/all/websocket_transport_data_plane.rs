@@ -30,12 +30,37 @@
 //! > CURRENT expression is the one a deployed stage selects by, so a frame sent after the
 //! > expression was changed and the stage redeployed is routed by the new path.
 //!
+//! And the LIFETIME of the connection the handshake established, which the last two cases
+//! below own:
+//!
+//! > A connection that completed the handshake LASTS: it carries message after message, each
+//! > dispatched to the route the api's expression selects for it, and it stays the same
+//! > connection throughout. Every frame the client reads over it is a payload the api
+//! > PRODUCED — byte for byte what the serving route's selected integration response
+//! > rendered, or byte for byte the `Data` a `PostToConnection` posted — and never a document
+//! > the gateway substituted for it.
+//!
+//! What ENDS such a connection belongs to the suite that owns every refusal of a client
+//! message, `websocket_message_refusals.rs`: a message this plane does not serve is answered
+//! with a CLOSE frame carrying the RFC 6455 §7.4.1 status code of that refusal, never a bare
+//! transport close, and that suite's last case is the one that drives it on a connection which
+//! has already been serving. The same division holds with `websocket_lambda_routes.rs`, which
+//! owns every frame a route fronting a FUNCTION is answered with — including the gateway's own
+//! `Internal server error` frame and the byte-for-byte reply of a function's body; the cases
+//! here drive MOCK integrations only, so what they add is the connection's LIFETIME (a
+//! sequence over one socket, and a push interleaved with it), not another reading of a route's
+//! reply.
+//!
 //! The rows span what the rule generalises over: the stage's state (deployed, not deployed,
 //! absent), the `$connect` route's integration (absent, a MOCK that selects a `2xx`, a MOCK
 //! that selects nothing, one fronting a backend), the selecting status (`200`, `404`, a
 //! status no pattern matches, none at all), the integration-response key forms (`/2\d\d/`,
 //! `/4\d{2}/`, `$default`), whether the serving route is two-way, and the message's own
-//! shape (a selected action, an unselected action, no action member, text that is not JSON).
+//! shape (a selected action, an unselected action, no action member, text that is not JSON);
+//! and for the connection's lifetime, the message's place in the sequence (first, repeated,
+//! after another route's message, after a push) and the payload's own form (a JSON document,
+//! text that is no JSON document, a document shaped like the gateway's own envelope, no bytes
+//! at all, several kilobytes).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +73,10 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api_lifecycle::{as_str, call, emulator};
+// The ONE reading, in this test binary, of "is this frame the gateway's own `Internal server
+// error` rather than a payload a route produced": the suite that owns the gateway frame holds
+// it, and the lifetime cases below ask it of every frame they read.
+use crate::websocket_lambda_routes::is_gateway_frame;
 
 /// How long a case waits for one frame before failing: generous for a loaded test machine,
 /// and bounded so a case that will never be answered fails instead of hanging the suite.
@@ -1462,3 +1491,237 @@ async fn a_redeployed_stage_selects_routes_by_the_apis_updated_expression() {
         );
     }
 }
+
+/// Each route of [`lasting_api`]: its `RouteKey`, and what its MOCK integration's `$default`
+/// integration response renders.
+///
+/// `whoami` renders the CONNECTION's own id, which is how a client learns the id the
+/// `@connections` calls address; every other route renders a payload of its own, spanning a
+/// JSON document and text that is no JSON document, so a frame read back names the route that
+/// produced it.
+const LASTING_ROUTES: [(&str, &str); 4] = [
+    ("whoami", "$context.connectionId"),
+    ("alpha", r#"{"route":"alpha"}"#),
+    ("beta", "beta route plain text, which is no JSON document"),
+    (DEFAULT_ROUTE_KEY, r#"{"route":"default"}"#),
+];
+
+/// What the route keyed `route_key` renders.
+fn rendered_by(case: &str, route_key: &str) -> &'static str {
+    LASTING_ROUTES
+        .iter()
+        .find_map(|(key, rendered)| (*key == route_key).then_some(*rendered))
+        .unwrap_or_else(|| panic!("case {case:?}: no route of the api is keyed {route_key:?}"))
+}
+
+/// A deployed WEBSOCKET api holding one TWO-WAY route per entry of [`LASTING_ROUTES`], each
+/// over a MOCK integration that selects a `2xx` and renders that entry's payload.
+async fn lasting_api(emulator: &MultiServiceRouter, case: &str) -> Api {
+    let api = create_api(emulator, case, "lasting-connection-api").await;
+    for (route_key, rendered) in LASTING_ROUTES {
+        let integration = create_integration(
+            emulator,
+            case,
+            &api.api_id,
+            json!({
+                "integrationType": "MOCK",
+                "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+            }),
+        )
+        .await;
+        create_integration_response(
+            emulator,
+            case,
+            &api.api_id,
+            &integration,
+            json!({
+                "integrationResponseKey": "$default",
+                "responseTemplates": { "$default": rendered }
+            }),
+        )
+        .await;
+        create_route(emulator, case, &api.api_id, route_key, &integration, true).await;
+    }
+    create_stage(emulator, case, &api.api_id, CONNECTIONS_STAGE, true).await;
+    api
+}
+
+/// The message that reaches the `whoami` route, which renders the connection's own id.
+fn whoami() -> String {
+    json!({ "action": "whoami" }).to_string()
+}
+
+/// An established connection carries a SEQUENCE of messages: each is dispatched to the route
+/// the api's expression selects for it and answered with exactly what that route rendered, the
+/// connection stays the one the handshake established, and no frame is the gateway's own
+/// envelope.
+#[tokio::test]
+async fn an_established_connection_carries_every_message_of_a_sequence() {
+    /// One row: the message sent, and the route key whose payload must come back.
+    struct Row {
+        case: &'static str,
+        message: String,
+        served_by: &'static str,
+    }
+
+    // The rows differ along the message's place in the sequence (first, repeated, after
+    // another route's message) and its own shape (an action naming a route, an action naming
+    // none, an action that is not text, no action member, text that is no JSON document, a
+    // message of several kilobytes).
+    let rows = vec![
+        Row {
+            case: "an action naming a route of the api",
+            message: json!({ "action": "alpha" }).to_string(),
+            served_by: "alpha",
+        },
+        Row {
+            case: "the same action again, over the same connection",
+            message: json!({ "action": "alpha" }).to_string(),
+            served_by: "alpha",
+        },
+        Row {
+            case: "another route's action, over the same connection",
+            message: json!({ "action": "beta" }).to_string(),
+            served_by: "beta",
+        },
+        Row {
+            case: "a message carrying no action member",
+            message: json!({ "hello": "world" }).to_string(),
+            served_by: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "text that is no JSON document",
+            message: "not json at all".to_string(),
+            served_by: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "an action naming a route the api does not hold",
+            message: json!({ "action": "nosuchroute" }).to_string(),
+            served_by: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "an action whose value is not text",
+            message: json!({ "action": 7 }).to_string(),
+            served_by: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "several kilobytes of message, inside the frame quota",
+            message: json!({ "action": "alpha", "filler": "x".repeat(8 * 1024) }).to_string(),
+            served_by: "alpha",
+        },
+    ];
+
+    let case = "a sequence of messages over one established connection";
+    let emulator = emulator();
+    let api = lasting_api(&emulator, case).await;
+    let mut socket = handshake(case, &api.authority, CONNECTIONS_STAGE)
+        .await
+        .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
+    let connection_id = exchanged_reply(case, &mut socket, &whoami()).await;
+    assert!(
+        !connection_id.is_empty(),
+        "case {case:?}: the connection must have an id, got {connection_id:?}"
+    );
+    // The id is the one the connection HAS, not the template that names it: a reply equal to
+    // the template text would leave the comparison below a literal against itself.
+    assert_ne!(
+        connection_id,
+        rendered_by(case, "whoami"),
+        "case {case:?}: the route must render the connection's own id, not the template text"
+    );
+
+    for row in rows {
+        let case = row.case;
+        let answered = exchanged_reply(case, &mut socket, &row.message).await;
+        assert!(
+            !is_gateway_frame(&answered),
+            "case {case:?}: expected the payload the serving route rendered, got the gateway's \
+             own error frame {answered:?}"
+        );
+        let owed = rendered_by(case, row.served_by);
+        assert_eq!(
+            answered, owed,
+            "case {case:?}: expected the payload route {:?} renders, {owed:?}, got {answered:?}",
+            row.served_by
+        );
+    }
+
+    // Every message of the sequence was carried by ONE connection: the id it reports after the
+    // whole sequence is the id it reported before it.
+    let still = exchanged_reply(case, &mut socket, &whoami()).await;
+    assert_eq!(
+        still, connection_id,
+        "case {case:?}: the sequence must be carried by the connection the handshake \
+         established, {connection_id:?}, got {still:?}"
+    );
+}
+
+/// A `PostToConnection` to a connection that has been serving messages is delivered over it as
+/// EXACTLY the bytes posted, and the connection keeps serving its routes afterwards.
+#[tokio::test]
+async fn a_push_to_a_serving_connection_is_delivered_as_exactly_the_bytes_posted() {
+    let case = "pushes interleaved with the messages a connection serves";
+    let emulator = emulator_with_connections();
+    let api = lasting_api(&emulator, case).await;
+    let mut socket = handshake(case, &api.authority, CONNECTIONS_STAGE)
+        .await
+        .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
+    let connection_id = exchanged_reply(case, &mut socket, &whoami()).await;
+
+    // The connection is serving before any push: a message of its own is answered by its route.
+    let served = exchanged_reply(case, &mut socket, &json!({ "action": "alpha" }).to_string()).await;
+    assert_eq!(
+        served,
+        rendered_by(case, "alpha"),
+        "case {case:?}: the connection must serve its routes, got {served:?}"
+    );
+
+    // The rows differ along the payload's own form: a JSON document, text that is no JSON
+    // document, a document carrying the very member names the gateway's own envelope carries
+    // (with the caller's values, so what arrives names who produced it), no bytes at all, and
+    // several kilobytes.
+    let kilobytes = "x".repeat(8 * 1024);
+    let rows: [(&str, &str); 5] = [
+        ("a JSON document", r#"{"marker":"posted-by-the-caller"}"#),
+        ("text that is no JSON document", "a plain text push"),
+        (
+            "a document shaped like the gateway's envelope, carrying the caller's own values",
+            r#"{"connectionId":"posted-by-the-caller","message":"posted by the caller","requestId":"posted-by-the-caller"}"#,
+        ),
+        ("no bytes at all", ""),
+        ("several kilobytes", kilobytes.as_str()),
+    ];
+
+    for (label, payload) in rows {
+        let (status, posted) =
+            connections_call(&emulator, "POST", &connection_id, Some(payload)).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: PostToConnection must answer 200, got {status} {posted}"
+        );
+        let delivered = read_frame(label, &mut socket, REPLY_DEADLINE)
+            .await
+            .unwrap_or_else(|| {
+                panic!("case {label:?}: the posted payload must arrive over the connection")
+            });
+        assert!(
+            !is_gateway_frame(&delivered),
+            "case {label:?}: expected the bytes the caller posted, got the gateway's own error \
+             frame {delivered:?}"
+        );
+        assert_eq!(
+            delivered, payload,
+            "case {label:?}: expected the posted bytes {payload:?}, got {delivered:?}"
+        );
+    }
+
+    // And the pushes left the connection serving: a message of its own is still answered by its
+    // route.
+    let served = exchanged_reply(case, &mut socket, &json!({ "action": "beta" }).to_string()).await;
+    assert_eq!(
+        served,
+        rendered_by(case, "beta"),
+        "case {case:?}: the connection must still serve its routes after a push, got {served:?}"
+    );
+}
+

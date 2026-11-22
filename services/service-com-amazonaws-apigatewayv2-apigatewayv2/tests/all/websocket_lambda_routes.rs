@@ -1433,7 +1433,7 @@ const RAISING_HANDLER: &str = "def lambda_handler(event, context):\n\
 
 /// The fixed text of that frame. It is the gateway's sentence for a call it could not serve,
 /// never an answer for a healthy integration.
-const INTERNAL_SERVER_ERROR_FRAME: &str = "Internal server error";
+pub(crate) const INTERNAL_SERVER_ERROR_FRAME: &str = "Internal server error";
 
 /// What one frame of the established connection must be answered with.
 #[derive(Debug, Clone, Copy)]
@@ -2791,7 +2791,10 @@ async fn relayed(
 
 /// Whether `answered` is the gateway's own `Internal server error` frame rather than a route's
 /// reply.
-fn is_gateway_frame(answered: &str) -> bool {
+///
+/// The one reading of that distinction in this test binary: the lifetime cases of
+/// `websocket_transport_data_plane.rs` ask it of every frame they read too.
+pub(crate) fn is_gateway_frame(answered: &str) -> bool {
     serde_json::from_str::<Value>(answered)
         .is_ok_and(|document| member(&document, "/message") == json!(INTERNAL_SERVER_ERROR_FRAME))
 }
