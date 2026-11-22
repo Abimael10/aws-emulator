@@ -70,6 +70,13 @@ const AMBIGUOUS: &str = "Configuration is ambiguously defined. Cannot have overl
                          suffixes in two rules if the prefixes are overlapping for the same \
                          event type.";
 
+/// The `<Message>` S3 sends for a container carrying more configurations than one bucket may
+/// hold — FIXED text naming the cap itself, with nothing of the request in it: the count the
+/// request carried is no part of the sentence, so every container past the cap is refused with
+/// the same one.
+const TOO_MANY_CONFIGURATIONS: &str =
+    "Too many configurations submitted. The maximum number of configurations is 100";
+
 /// The `<Message>` S3 sends for a document that does not validate against the schema it
 /// publishes, which is what a value breaking a modelled constraint it states no sentence of
 /// its own for is refused with.
@@ -973,10 +980,14 @@ async fn a_refused_notification_configuration_changes_nothing() {
             UNPARSEABLE_DESTINATION,
         ),
         (
+            // The count is the one refusal of this container that is about no single
+            // configuration in it, so it carries S3's own `InvalidRequest` and the fixed
+            // sentence naming the cap — see
+            // [`the_configuration_cap_refusal_names_the_cap_whatever_the_count`].
             "one configuration past the bound",
             past_the_bound,
-            "InvalidArgument",
-            "",
+            "InvalidRequest",
+            TOO_MANY_CONFIGURATIONS,
         ),
     ];
 
@@ -1009,6 +1020,142 @@ async fn a_refused_notification_configuration_changes_nothing() {
         // "The PUT notification is an atomic operation … Amazon S3 will not add the
         // configuration to your bucket": the stored configuration is untouched.
         assert_reports(&router, bucket, case, &stored, true).await;
+    }
+}
+
+/// `count` distinct destination configurations of one event, each under a prefix of its own
+/// so no two of them would ever match the same key — the ambiguity refusal is about the
+/// FILTERS and would otherwise be what fires — spread over the three destination kinds when
+/// `spread`, and all queues otherwise.
+fn configurations_of_count(count: usize, spread: bool) -> Vec<Configuration> {
+    const KINDS: [Destination; 3] = [
+        Destination::Topic,
+        Destination::Queue,
+        Destination::LambdaFunction,
+    ];
+    (0..count)
+        .map(|index| {
+            let destination = if spread {
+                KINDS[index % KINDS.len()]
+            } else {
+                Destination::Queue
+            };
+            Configuration::new(destination, &["s3:ObjectCreated:Put"])
+                .with_id(&format!("configuration-{index}"))
+                .with_filter_rules(&[("prefix", &format!("category-{index}/"))])
+        })
+        .collect()
+}
+
+/// `configurations` in the order a read REPORTS them: the container carries one list per
+/// destination kind (`smithy_query(query="shape",shape="NotificationConfiguration")`), so a
+/// document mixing the kinds reads back grouped by kind — topics, then queues, then Lambda
+/// functions — each kind in the order the request carried it, which a stable sort is exactly.
+fn in_reported_order(configurations: &[Configuration]) -> Vec<Configuration> {
+    let mut ordered = configurations.to_vec();
+    ordered.sort_by_key(|configuration| match configuration.destination {
+        Destination::Topic => 0,
+        Destination::Queue => 1,
+        Destination::LambdaFunction => 2,
+    });
+    ordered
+}
+
+/// RULE: the per-bucket event-notification configuration count is capped at a fixed,
+/// non-adjustable 100, and a container carrying more is refused as a request Amazon S3 cannot
+/// carry out — `InvalidRequest` (HTTP 400) with the one fixed sentence naming that cap, naming
+/// no argument and echoing nothing of the request — while a container at the cap is recorded
+/// in full.
+///
+/// The rows differ along what the rule generalises over: how many configurations the container
+/// carries (the cap itself, one past it, well past it) and how they are distributed over the
+/// three destination kinds (one kind, or all three) — the count being across the three lists
+/// together, not per list.
+#[tokio::test]
+async fn the_configuration_cap_refusal_names_the_cap_whatever_the_count() {
+    // The sentence states the cap this emulator holds a bucket to, so the two cannot drift
+    // apart without this failing.
+    assert!(
+        TOO_MANY_CONFIGURATIONS
+            .ends_with(&MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET.to_string()),
+        "the refusal's sentence must name the cap {MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET}, \
+         got {TOO_MANY_CONFIGURATIONS:?}"
+    );
+
+    let router = router();
+    let cap = MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET;
+    // (case, how many configurations, whether they span all three destination kinds).
+    let rows: &[(&str, usize, bool)] = &[
+        ("exactly the cap, all of one kind", cap, false),
+        ("exactly the cap, spread over the three kinds", cap, true),
+        ("one past the cap, all of one kind", cap + 1, false),
+        ("one past the cap, spread over the three kinds", cap + 1, true),
+        ("half again as many as the cap", cap + cap / 2, false),
+    ];
+
+    for (index, (case, count, spread)) in rows.iter().enumerate() {
+        let bucket = format!("notification-cap-{index}");
+        create_bucket(&router, &bucket, None, None).await;
+        let configurations = configurations_of_count(*count, *spread);
+        let answer = put_notification(&router, &bucket, &configurations, false).await;
+
+        if *count <= cap {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: a container of {count} configurations is within the cap and must \
+                 be recorded, got {} with body {:?}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_reports(
+                &router,
+                &bucket,
+                case,
+                &in_reported_order(&configurations),
+                false,
+            )
+            .await;
+            continue;
+        }
+
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: a container of {count} configurations is past the cap and must be \
+             refused with HTTP 400, got {} with body {:?}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidRequest",
+            "case {case:?}: expected the refusal to carry InvalidRequest, got {:?}",
+            answer.error_code()
+        );
+        assert_eq!(
+            answer.error_message(),
+            TOO_MANY_CONFIGURATIONS,
+            "case {case:?}: expected the refusal's message to be {TOO_MANY_CONFIGURATIONS:?}, \
+             got {:?}",
+            answer.error_message()
+        );
+        // Nothing of the request is in the document: the refusal is about the container as a
+        // whole, so it names no argument and reports no count of its own.
+        assert_eq!(
+            answer.element("ArgumentName"),
+            None,
+            "case {case:?}: the refusal must name no argument, got {:?}",
+            answer.element("ArgumentName")
+        );
+        assert!(
+            !answer.error_message().contains(&count.to_string()),
+            "case {case:?}: the sentence must not echo the submitted count {count}, got {:?}",
+            answer.error_message()
+        );
+        // "The PUT notification is an atomic operation … Amazon S3 will not add the
+        // configuration to your bucket": a refused container records nothing at all.
+        assert_reports(&router, &bucket, case, &[], false).await;
     }
 }
 

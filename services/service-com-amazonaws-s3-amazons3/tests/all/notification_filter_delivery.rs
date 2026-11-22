@@ -23,6 +23,11 @@
 //! The harness is [`super::object_event_notifications`]'s, which also asserts the `s3:TestEvent`
 //! a validated queue destination receives when the configuration is INSTALLED — so each row
 //! below reads only what its own object changes delivered.
+//!
+//! A second table spans the same rule for a filter value carrying PERCENT ESCAPES: such a
+//! value is stored and reported back verbatim and url-decoded before it is compared with a
+//! key, so the rule admits the keys its escapes stand for and not the keys whose own text
+//! carries `%xx`.
 
 use serde_json::Value;
 
@@ -165,6 +170,176 @@ async fn a_configurations_filter_decides_which_writes_reach_its_queue() {
             late.is_empty(),
             "case {:?}: expected the rejected keys {:?} to deliver nothing, got {late:?}",
             row.case,
+            row.rejected
+        );
+    }
+}
+
+/// One row of the DECODING table: the rules the configuration's `Filter` carries as the
+/// request spells them, the key the decoded rules admit (with the form a delivered record
+/// spells it in), and the keys they do not.
+struct DecodingRow {
+    case: &'static str,
+    /// `(Name, Value)` per `FilterRule`, carrying the value verbatim — percent escapes and
+    /// all — which is also what a read of the configuration has to report back.
+    filter_rules: &'static [(&'static str, &'static str)],
+    /// A key every rule admits once its value is url-decoded.
+    admitted: &'static str,
+    /// That same key as a delivered record spells it: "URL encoded" (Amazon S3 User Guide,
+    /// *Event message structure*), with a space as a `+`.
+    admitted_published: &'static str,
+    /// Keys at least one rule rejects, among them the key whose own literal text IS the
+    /// rule's value as spelled.
+    rejected: &'static [&'static str],
+}
+
+/// The decoding table. The rows span which rule kind carries the escape (`prefix`, `suffix`,
+/// both), which character the escape stands for (`=`, a space, `+`, a non-ASCII character),
+/// the case of its hex digits, a `%` that opens no escape at all, and values with no escape
+/// in them.
+fn decoding_rows() -> Vec<DecodingRow> {
+    vec![
+        DecodingRow {
+            case: "a prefix whose escape stands for an equals sign",
+            filter_rules: &[("prefix", "folder%3Dtag/")],
+            admitted: "folder=tag/decoded-hit.txt",
+            admitted_published: "folder%3Dtag/decoded-hit.txt",
+            rejected: &["folder%3Dtag/literal-encoded-miss.txt", "folder/tag.txt"],
+        },
+        DecodingRow {
+            case: "a prefix whose escape is spelled with lower-case hex digits",
+            filter_rules: &[("prefix", "folder%3dtag/")],
+            admitted: "folder=tag/lower-case-escape.txt",
+            admitted_published: "folder%3Dtag/lower-case-escape.txt",
+            rejected: &["folder%3dtag/literal-lower-case.txt"],
+        },
+        DecodingRow {
+            case: "a prefix whose escape stands for a space",
+            filter_rules: &[("prefix", "my%20files/")],
+            admitted: "my files/report.txt",
+            admitted_published: "my+files/report.txt",
+            rejected: &["my%20files/report.txt", "myfiles/report.txt"],
+        },
+        DecodingRow {
+            case: "a prefix whose escapes stand for a non-ASCII character",
+            filter_rules: &[("prefix", "caf%C3%A9/")],
+            admitted: "café/menu.txt",
+            admitted_published: "caf%C3%A9/menu.txt",
+            rejected: &["caf%C3%A9/menu.txt", "cafe/menu.txt"],
+        },
+        DecodingRow {
+            case: "a suffix whose escape stands for a plus",
+            filter_rules: &[("suffix", "%2Bfinal.csv")],
+            admitted: "reports/q3+final.csv",
+            admitted_published: "reports/q3%2Bfinal.csv",
+            rejected: &["reports/q3%2Bfinal.csv", "reports/q3-final.csv"],
+        },
+        DecodingRow {
+            case: "an escaped prefix beside a plain suffix, both of which must hold",
+            filter_rules: &[("prefix", "data%3Draw/"), ("suffix", ".csv")],
+            admitted: "data=raw/day.csv",
+            admitted_published: "data%3Draw/day.csv",
+            rejected: &["data=raw/day.json", "data%3Draw/day.csv"],
+        },
+        DecodingRow {
+            // A `%` that opens no escape is no escape: decoding leaves it alone, so the rule
+            // admits the key whose own text carries it.
+            case: "a prefix carrying a percent that opens no escape",
+            filter_rules: &[("prefix", "50%off/")],
+            admitted: "50%off/deal.txt",
+            admitted_published: "50%25off/deal.txt",
+            rejected: &["50off/deal.txt"],
+        },
+        DecodingRow {
+            // The control row: a value with no escape in it is its own decoding, so such a
+            // filter admits exactly what it always did.
+            case: "rules with no escape in them at all",
+            filter_rules: &[("prefix", "plain/"), ("suffix", ".txt")],
+            admitted: "plain/note.txt",
+            admitted_published: "plain/note.txt",
+            rejected: &["other/note.txt", "plain/note.log"],
+        },
+    ]
+}
+
+/// RULE: a key-name `FilterRule` value is stored and reported back exactly as the request
+/// spelled it, and is URL-DECODED before it is compared with an object key — so such a rule
+/// admits the keys its escapes stand for and not the keys whose own text carries `%xx`.
+///
+/// The control plane cannot tell the two behaviours apart on its own (the read-back is
+/// identical under both), so each row asserts the read-back AND which write reaches the queue.
+#[tokio::test]
+async fn a_filter_rule_value_is_echoed_verbatim_and_url_decoded_before_matching() {
+    for (index, row) in decoding_rows().into_iter().enumerate() {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let bucket = format!("notification-filter-decoding-bucket-{index}");
+        let queue = format!("notification-filter-decoding-queue-{index}");
+        emulator.create_bucket(&bucket).await;
+        let queue_url = emulator.create_queue(&queue).await;
+        let arn = queue_arn(&queue);
+        emulator
+            .put_notification(
+                &bucket,
+                &Destination::queue(&arn),
+                &[CREATED],
+                row.filter_rules,
+                false,
+            )
+            .await;
+
+        // The configured value comes back character for character: the decoding is about
+        // MATCHING and about nothing else.
+        let reported = emulator
+            .s3_xml("GET", &format!("/{bucket}?notification"), "")
+            .await;
+        assert_eq!(
+            reported.status, 200,
+            "case {case:?}: GetBucketNotificationConfiguration must answer 200, got {} with {}",
+            reported.status,
+            reported.text()
+        );
+        let document = reported.text();
+        for (name, value) in row.filter_rules {
+            let element = format!("<Value>{value}</Value>");
+            assert!(
+                document.contains(&element),
+                "case {case:?}: the {name} rule's value must be reported verbatim as \
+                 {element:?}, got {document}"
+            );
+        }
+
+        // The rejected keys first, so the admitted key's record is the barrier that proves
+        // the delivery path ran — the same ordering the filter table above uses. Each write
+        // is asserted to have succeeded by the harness itself
+        // ([`super::object_event_notifications::Emulator::put_object`]), so a key a filter
+        // rejects cannot deliver nothing merely because the write of it was refused.
+        for key in row.rejected {
+            emulator.put_object(&bucket, key, b"rejected").await;
+        }
+        emulator.put_object(&bucket, row.admitted, b"admitted").await;
+
+        let delivered = emulator.delivered(&queue_url).await.unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the key {:?} the decoded rules admit must be delivered",
+                row.admitted
+            )
+        });
+        let records = records_of(&delivered);
+        assert_eq!(
+            records,
+            vec![(
+                row.admitted_published.to_string(),
+                CREATED_BY_PUT.to_string()
+            )],
+            "case {case:?}: expected one record naming {:?}, got {records:?} in {delivered}",
+            row.admitted_published
+        );
+        let late = emulator.nothing_delivered(&queue_url).await;
+        assert!(
+            late.is_empty(),
+            "case {case:?}: expected the keys {:?} the decoded rules reject to deliver \
+             nothing, got {late:?}",
             row.rejected
         );
     }

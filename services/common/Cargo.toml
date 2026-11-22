@@ -251,7 +251,9 @@ rand = "0.9"
 bumpalo = "=3.20.3"
 # `feature_store_offline_store`: the caller-supplied Amazon S3 URI a feature group's offline
 # store is configured with is read by the maintained URL parser rather than split by hand.
-url = "2"
+# At least 2.5.9: that release is where `Url::origin()` stops recursing through a nested
+# `blob:` URL, which an earlier release overflowed the stack on.
+url = "2.5.9"
 # `posix_shell_session`: the POSIX/bash TOKENIZER AND GRAMMAR every service that performs
 # caller-supplied shell text reads it with. The PARSER only: it is a library that computes
 # over data in process — it builds a syntax tree and runs nothing, opens nothing and reaches

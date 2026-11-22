@@ -10,6 +10,12 @@
 //! (400), naming each failed destination and its reason, rather than recorded.
 //! `GetBucketNotificationConfiguration` reports what this stored.
 //!
+//! A container whose values are each acceptable and which still carries more configurations
+//! than the fixed per-bucket cap ([`crate::state::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`])
+//! is refused `InvalidRequest` (400) instead: nothing is wrong with any one configuration in
+//! it, so the refusal names no argument
+//! ([`crate::state::NotificationConfigurationRejection::code`]).
+//!
 //! Two values of the container Amazon S3 judges ITSELF rather than against the published
 //! schema: a key-name filter rule's `Name`, read case-insensitively (the capitalised spelling
 //! a read reports is accepted as readily as the enum's lower-case token), and each `Events`
@@ -403,27 +409,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The refusal S3 answers a `NotificationConfiguration` it cannot apply with: the
-/// `InvalidArgument` code and status every one of these carries, the sentence the rejection
-/// publishes, and the `<ArgumentName>` / `<ArgumentValue>` pair for a class whose document
-/// names the field it is about
+/// The refusal S3 answers a `NotificationConfiguration` it cannot apply with: the code and
+/// status the rejection carries ([`crate::state::NotificationConfigurationRejection::code`]),
+/// the sentence it publishes, and the `<ArgumentName>` / `<ArgumentValue>` pair for a class
+/// whose document names the field it is about
 /// ([`crate::state::NotificationConfigurationRejection::argument`]).
 ///
 /// ONE place, so the two passes that can refuse a container — the DOCUMENT's own vocabulary,
 /// read from the bytes the request carried, and the configuration parsed out of it — answer
-/// identically. `InvalidArgument` is a code this service's model declares no shape for, so the
-/// refusal goes out through the unmodelled channel with the code and status S3 sends.
+/// identically. This service's model declares a shape for neither code, so the refusal goes
+/// out through the unmodelled channel with the code and status S3 sends.
 fn refusal(
     rejection: &crate::state::NotificationConfigurationRejection,
 ) -> PutBucketNotificationConfigurationError {
     let message = rejection.to_string();
     match rejection.argument() {
-        Some((argument, value)) => {
+        // The pair is the `InvalidArgument` document's own, so only a refusal answered with
+        // that code carries one.
+        Some((argument, value)) if rejection.code() == crate::state::INVALID_ARGUMENT_CODE => {
             crate::scaffolded::Scaffolded::invalid_argument(argument, value, message)
         }
-        None => crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::INVALID_ARGUMENT_CODE,
-            crate::state::INVALID_ARGUMENT_STATUS,
+        _ => crate::scaffolded::Scaffolded::unmodeled(
+            rejection.code(),
+            rejection.status(),
             message,
         ),
     }

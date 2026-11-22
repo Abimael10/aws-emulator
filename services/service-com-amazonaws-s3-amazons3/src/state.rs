@@ -2535,15 +2535,22 @@ pub struct NotificationTarget {
 }
 
 impl NotificationTarget {
-    /// The value this configuration filters keys by for one rule KIND (`prefix` /
+    /// The value this configuration MATCHES keys by for one rule KIND (`prefix` /
     /// `suffix`), empty when it carries no rule of that kind — which restricts nothing, so
     /// it is the value a configuration with no `Filter` filters by too.
-    fn filtered_by(&self, kind: &str) -> &str {
+    ///
+    /// URL-decoded, the one reading of a rule value a key is compared with
+    /// ([`notifications::matched_filter_value`]): two rules that restrict to the same keys
+    /// restrict to the same keys however either was spelled, which is what the overlap of
+    /// two configurations is read off ([`filters_overlap`]).
+    fn filtered_by(&self, kind: &str) -> std::borrow::Cow<'_, str> {
         self.filter_rules
             .iter()
             .flatten()
             .find(|rule| rule.kind() == Some(kind))
-            .map_or("", NotificationFilterRule::filtered_value)
+            .map_or(std::borrow::Cow::Borrowed(""), |rule| {
+                notifications::matched_filter_value(rule)
+            })
     }
 }
 
@@ -2616,9 +2623,9 @@ impl BucketNotificationConfiguration {
 
 /// Why a `NotificationConfiguration` cannot be applied to a bucket.
 ///
-/// Every one of these is a request S3 refuses with `InvalidArgument` (HTTP 400) rather
-/// than recording, so a refused put leaves the bucket's current configuration exactly as
-/// it was.
+/// Every one of these is a request S3 refuses with HTTP 400 rather than recording, so a
+/// refused put leaves the bucket's current configuration exactly as it was. WHICH code the
+/// 400 carries follows from what is wrong with the container ([`Self::code`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationConfigurationRejection {
     /// An event outside [`EVENT_VALUES`]. The sentence S3 sends for this is FIXED text, so
@@ -2711,10 +2718,11 @@ pub enum NotificationConfigurationRejection {
         arn: String,
     },
     /// More configurations than [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`].
-    TooManyConfigurations {
-        /// How many the request carried.
-        count: usize,
-    },
+    ///
+    /// Carries nothing of the request: the cap is fixed and non-adjustable, so the sentence
+    /// S3 answers this with states that cap and nothing else — how many the request carried
+    /// is no part of it.
+    TooManyConfigurations,
 }
 
 impl std::fmt::Display for NotificationConfigurationRejection {
@@ -2745,16 +2753,45 @@ impl std::fmt::Display for NotificationConfigurationRejection {
             Self::FifoDestination { destination, .. } => {
                 f.write_str(fifo_destination_unsupported_message(*destination))
             }
-            Self::TooManyConfigurations { count } => write!(
+            Self::TooManyConfigurations => write!(
                 f,
-                "A notification configuration may carry at most \
-                 {MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET} configurations, got {count}"
+                "Too many configurations submitted. The maximum number of configurations \
+                 is {MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET}"
             ),
         }
     }
 }
 
 impl NotificationConfigurationRejection {
+    /// The wire error code S3 answers this refusal with.
+    ///
+    /// Two codes from S3's published "Error responses" list, both HTTP 400, told apart the
+    /// way [`WebsiteConfigurationRejection::code`] tells them apart: a VALUE the container
+    /// carries that the member it arrived on cannot accept — an unpublished event, a filter
+    /// rule name that is no `FilterRuleName`, a destination reference that is no ARN of its
+    /// service, two configurations that cannot hold beside each other — is
+    /// [`INVALID_ARGUMENT_CODE`], and the refusal names that field in its `<ArgumentName>` /
+    /// `<ArgumentValue>` pair ([`Self::argument`]). A container whose every value is
+    /// acceptable and which still asks for more than the service carries out — more
+    /// configurations than the fixed, non-adjustable per-bucket cap
+    /// [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] — is [`INVALID_REQUEST_CODE`]: nothing
+    /// is wrong with any one configuration in it, so no argument is named either.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::TooManyConfigurations => INVALID_REQUEST_CODE,
+            _ => INVALID_ARGUMENT_CODE,
+        }
+    }
+
+    /// The HTTP status this refusal is rendered with: 400 for both codes ([`Self::code`]),
+    /// read from that code's own constant rather than repeated here.
+    pub fn status(&self) -> u16 {
+        match self.code() {
+            INVALID_REQUEST_CODE => INVALID_REQUEST_STATUS,
+            _ => INVALID_ARGUMENT_STATUS,
+        }
+    }
+
     /// The request field this refusal is ABOUT, as S3 names it in the `<ArgumentName>` of
     /// its `InvalidArgument` document, beside the value that field carried — or `None` for a
     /// refusal whose document names no argument.
@@ -3076,7 +3113,7 @@ pub fn validate_notification_configuration(
 ) -> Result<(), NotificationConfigurationRejection> {
     let count = configuration.configuration_count();
     if count > MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET {
-        return Err(NotificationConfigurationRejection::TooManyConfigurations { count });
+        return Err(NotificationConfigurationRejection::TooManyConfigurations);
     }
 
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
@@ -3367,13 +3404,17 @@ pub const EVENT_VALUES_FIT_ONE_MASK: usize = u64::BITS as usize;
 /// configuration carrying no rule of that kind restricts nothing, which overlaps every
 /// value. Two configurations whose prefixes are disjoint, or whose suffixes are, can
 /// therefore never both match one key and are both kept, however their events compare.
+///
+/// Read off the values the keys are MATCHED by ([`NotificationTarget::filtered_by`]), not off
+/// the text each rule was spelled with: two rules that restrict to the same keys leave the
+/// document just as unable to say which rule an object matches, whichever spelling each used.
 fn filters_overlap(one: &NotificationTarget, other: &NotificationTarget) -> bool {
     prefixes_overlap(
-        one.filtered_by(FILTER_RULE_PREFIX),
-        other.filtered_by(FILTER_RULE_PREFIX),
+        &one.filtered_by(FILTER_RULE_PREFIX),
+        &other.filtered_by(FILTER_RULE_PREFIX),
     ) && suffixes_overlap(
-        one.filtered_by(FILTER_RULE_SUFFIX),
-        other.filtered_by(FILTER_RULE_SUFFIX),
+        &one.filtered_by(FILTER_RULE_SUFFIX),
+        &other.filtered_by(FILTER_RULE_SUFFIX),
     )
 }
 

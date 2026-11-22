@@ -413,6 +413,29 @@ pub fn event_matches(configured: &str, actual: &str) -> bool {
         .is_some_and(|detail| detail.starts_with(EVENT_DETAIL_SEPARATOR))
 }
 
+/// The value one key-name filter rule MATCHES object keys by: what the rule carries
+/// ([`super::NotificationFilterRule::filtered_value`]), URL-DECODED.
+///
+/// A rule's value is recorded and reported back exactly as the request spelled it — that is
+/// what [`super::NotificationFilterRule::value`] holds — and the text it is COMPARED with a
+/// key by is that value with its percent escapes resolved, so a filter authored through an
+/// SDK or a console that percent-encodes the characters of a key (`=`, a space, anything
+/// non-ASCII) restricts to the keys the author meant rather than to keys whose own text
+/// carries `%xx`. Object keys themselves are held decoded, which is the form this is compared
+/// against.
+///
+/// Only the escapes are resolved: a `+` is a `+` in a key, so a rule value carrying one
+/// filters for that character rather than for a space.
+///
+/// Lossy for a value whose escapes do not spell UTF-8 — a key name is "a sequence of Unicode
+/// characters whose UTF-8 encoding is at most 1,024 bytes long" (Amazon S3 User Guide,
+/// *Object key naming guidelines*), so no key can carry what such a value would decode to and
+/// the replacement character cannot match one by accident.
+#[must_use]
+pub fn matched_filter_value(rule: &super::NotificationFilterRule) -> ::std::borrow::Cow<'_, str> {
+    ::percent_encoding::percent_decode_str(rule.filtered_value()).decode_utf8_lossy()
+}
+
 /// Whether `key` passes the key-name filter rules of one configuration.
 ///
 /// "The Amazon S3 API supports filtering based on the prefix and suffix of the object
@@ -423,14 +446,15 @@ pub fn event_matches(configured: &str, actual: &str) -> bool {
 ///
 /// A rule is read by its KIND ([`super::NotificationFilterRule::kind`]), not by the text
 /// of its `Name`: the store holds a rule under the canonical capitalised spelling and the
-/// request vocabulary spells it in lower case, and both name the same rule.
+/// request vocabulary spells it in lower case, and both name the same rule. Its VALUE is
+/// read url-decoded ([`matched_filter_value`]).
 #[must_use]
 pub fn key_matches(filter_rules: Option<&Vec<super::NotificationFilterRule>>, key: &str) -> bool {
     filter_rules.into_iter().flatten().all(|rule| {
-        let value = rule.filtered_value();
+        let value = matched_filter_value(rule);
         match rule.kind() {
-            Some(FILTER_RULE_PREFIX) => key.starts_with(value),
-            Some(FILTER_RULE_SUFFIX) => key.ends_with(value),
+            Some(FILTER_RULE_PREFIX) => key.starts_with(value.as_ref()),
+            Some(FILTER_RULE_SUFFIX) => key.ends_with(value.as_ref()),
             // The store holds no other rule name: a put naming one is refused
             // (`super::validate_notification_configuration`), so a rule that is neither
             // filters on nothing this emitter can read and is not treated as a match.

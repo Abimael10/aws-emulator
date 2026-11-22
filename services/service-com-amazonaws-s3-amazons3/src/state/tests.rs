@@ -676,7 +676,7 @@ fn a_notification_configuration_is_validated_against_the_published_sets() {
                     .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
                     .collect(),
             ),
-            Some("at most"),
+            Some("The maximum number of configurations"),
         ),
     ];
 
