@@ -174,8 +174,10 @@
 //! against ([`maintenance_window_execution_task_invocations`]), each reached by the ids the
 //! layer above it was reached by. `GetMaintenanceWindowExecution`,
 //! `GetMaintenanceWindowExecutionTask` and `GetMaintenanceWindowExecutionTaskInvocation`
-//! read one record of each layer and `DescribeMaintenanceWindowExecutionTasks` and
-//! `DescribeMaintenanceWindowExecutionTaskInvocations` list the layer below one, all through
+//! read one record of each layer and `DescribeMaintenanceWindowExecutions`,
+//! `DescribeMaintenanceWindowExecutionTasks` and
+//! `DescribeMaintenanceWindowExecutionTaskInvocations` list the layer below one — a window's
+//! runs, a run's task executions, a task execution's invocations — all through
 //! the one store below. What puts a record in any of them — and what does not — is stated in
 //! the owning modules.
 //!

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindowExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindowExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindowExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the RUNS of one maintenance window: the executions this endpoint holds for the
+//! `WindowId` the request names ([`crate::state::maintenance_window_executions`]), in the
+//! order they started, narrowed by the two documented filter keys and bounded by the
+//! modelled page size. The operation models no not-found error, so a window that has run
+//! nothing — including a `WindowId` nothing created — is reported as holding no execution
+//! rather than refused, the reading the sibling listings of this layer take
+//! ([`crate::ops::describe_maintenance_window_execution_tasks`]).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindowExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindowExecutions"))
+        use crate::state::maintenance_window_executions::{
+            execution_filter_value_rejection, execution_page_size, is_execution_filter_key,
+            MaintenanceWindowExecutionRecord, EXECUTION_FILTER_KEYS,
+        };
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        // `WindowId`'s presence, length and pattern, the filter list's length and
+        // `MaxResults`'s range are MODELLED constraints the centralized request walk has
+        // already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowExecutionsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the maintenance window execution store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for (position, filter) in filters.iter().enumerate() {
+            // A key outside the documented set names no property of a run, so the filter
+            // cannot be served at all: every filter is validated — and the request refused,
+            // naming what it refused — before anything is asked about the window. This
+            // operation models no filter error, so it is a 400 `ValidationException`.
+            let key = filter.key.as_deref().unwrap_or_default();
+            if !is_execution_filter_key(key) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Filter key '{key}' isn't one of the keys this operation narrows \
+                     maintenance window executions by: {}",
+                    EXECUTION_FILTER_KEYS.join(", ")
+                )));
+            }
+            // Both documented keys select by an instant, so a value naming none narrows
+            // nothing: it is refused rather than selecting no run in silence.
+            for (index, value) in filter
+                .values
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                if let Some(rejection) =
+                    execution_filter_value_rejection(position + 1, index + 1, value)
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation(rejection));
+                }
+            }
+        }
+
+        let page_size = execution_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the run the next page starts at, so
+        // a token naming no run of this result was not one of ours: it is refused rather than
+        // served an empty page, the rule the sibling listings of this crate take
+        // (`crate::ops::describe_maintenance_window_execution_tasks`). Which token names one
+        // is settled below, once the records of this result are known.
+        let resume_from = input
+            .next_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+
+        // A window — and so every run of it — lives in the Region its endpoint names, which is
+        // the signed credential scope's.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let matching: Vec<&MaintenanceWindowExecutionRecord> = store
+            .maintenance_window_executions_of(&region, &input.window_id)
+            .into_iter()
+            .filter(|execution| {
+                filters.iter().all(|filter| {
+                    execution.matches_filter(
+                        filter.key.as_deref().unwrap_or_default(),
+                        filter.values.as_deref().unwrap_or_default(),
+                    )
+                })
+            })
+            .collect();
+        let start = match resume_from {
+            None => 0,
+            Some(token) => match matching
+                .iter()
+                .position(|execution| execution.window_execution_id == token)
+            {
+                Some(at) => at,
+                // Names no run of this result: not a page of it to resume.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps that
+        // in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let window_executions = page
+            .iter()
+            .take(page_size)
+            .map(|execution| execution.to_execution())
+            .collect();
+        // A run is still waiting past this page: hand the caller the id it resumes at, so the
+        // next request continues where this one stopped.
+        let next_token = page
+            .get(page_size)
+            .map(|execution| execution.window_execution_id.clone());
+
+        Ok(DescribeMaintenanceWindowExecutionsOutput {
+            window_executions: Some(window_executions),
+            next_token,
+        })
     }
 }
