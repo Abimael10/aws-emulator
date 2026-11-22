@@ -56,9 +56,12 @@ use crate::provisioning_loop::{action, call, p, REGION};
 
 /// The namespace an Application Load Balancer's metrics live in, and the dimensions its series
 /// are keyed by — Elastic Load Balancing's published metric identities for that family.
-const APPLICATION_NAMESPACE: &str = "AWS/ApplicationELB";
-const LOAD_BALANCER_DIMENSION: &str = "LoadBalancer";
-const TARGET_GROUP_DIMENSION: &str = "TargetGroup";
+///
+/// `pub(crate)` with the period below: one reading of each, so two suites of this crate cannot
+/// read these series under two different identities or fold them at two different widths.
+pub(crate) const APPLICATION_NAMESPACE: &str = "AWS/ApplicationELB";
+pub(crate) const LOAD_BALANCER_DIMENSION: &str = "LoadBalancer";
+pub(crate) const TARGET_GROUP_DIMENSION: &str = "TargetGroup";
 
 /// The `X-Amz-Target` prefix CloudWatch's model declares, which every read below is addressed
 /// with.
@@ -67,10 +70,10 @@ const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 /// The width of every window this suite reads and every alarm it grades, in seconds: the finest
 /// period an alarm over a regular-resolution metric can be evaluated at, which is the resolution
 /// this service stores these series at.
-const PERIOD_SECS: i64 = 60;
+pub(crate) const PERIOD_SECS: i64 = 60;
 
 /// The same width as the clock measures it, for the window arithmetic below.
-const PERIOD: f64 = PERIOD_SECS as f64;
+pub(crate) const PERIOD: f64 = PERIOD_SECS as f64;
 
 /// How much of the current period has to be left before the traffic is sent, so every datapoint
 /// of it falls in ONE window: a metric is aggregated into periods anchored at multiples of the
@@ -103,8 +106,12 @@ const RATE_ALARM: &str = "alb-metric-rate-rate";
 const IDLE_ALARM: &str = "alb-metric-rate-idle-count";
 
 /// The query ids of the rate: the two series it reads and the expression that returns it.
-const ERRORS_ID: &str = "errors";
-const REQUESTS_ID: &str = "requests";
+///
+/// The two reads are `pub(crate)`: an expression names the queries it reads by their ids, so a
+/// suite of this crate that derives its own rate from these same two series writes that expression
+/// against these ids rather than against a second spelling of them.
+pub(crate) const ERRORS_ID: &str = "errors";
+pub(crate) const REQUESTS_ID: &str = "requests";
 const RATE_ID: &str = "rate";
 
 /// The expression the rate is derived by: the share of the requests the group answered that
@@ -128,14 +135,18 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(180);
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
 /// How close two computed values have to be to count as the same number.
-const TOLERANCE: f64 = 1e-9;
+pub(crate) const TOLERANCE: f64 = 1e-9;
 
 /// This service, Lambda, Amazon SQS, IAM, the token service and CloudWatch over ONE shared
 /// engine, as `core/router/src/lib.rs` mounts them: the function the load balancer forwards to is
 /// run by that Lambda as a session of the role IAM holds, the handler's own SDK call is
 /// dispatched back into this router, and the metric store the load balancer publishes into is the
 /// store CloudWatch's own readers below answer from.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because a suite of this crate that grades these series needs exactly these services
+/// on ONE engine, and which services those are is the point: a second builder could mount one fewer
+/// and read an empty store instead of a failure.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -226,11 +237,21 @@ pub(crate) fn now_secs() -> f64 {
         .map_or(0.0, |since| since.as_secs_f64())
 }
 
-/// Poll until at least [`ROOM_IN_PERIOD`] seconds are left of the period the clock is in.
-async fn wait_for_period_room() {
-    while PERIOD - now_secs().rem_euclid(PERIOD) < ROOM_IN_PERIOD {
+/// Poll until at least `room` seconds are left of the period the clock is in.
+///
+/// `pub(crate)` because every suite of this crate that needs a whole run of traffic to fall in ONE
+/// period waits for it this one way — how much room a suite needs is its own ([`ROOM_IN_PERIOD`]),
+/// the anchoring of the periods is not.
+pub(crate) async fn wait_for_period_room(room: f64) {
+    while PERIOD - now_secs().rem_euclid(PERIOD) < room {
         tokio::time::sleep(LOOK_AGAIN).await;
     }
+}
+
+/// The period the clock is in, as the instant it starts at: where one window of these series
+/// begins, which is the anchoring every read and every grading below is laid from.
+pub(crate) fn current_window() -> f64 {
+    (now_secs() / PERIOD).floor() * PERIOD
 }
 
 /// The `app/<name>/<id>` suffix of a load balancer ARN, which is how an Elastic Load Balancing
@@ -431,9 +452,14 @@ const SERIES: &[SeriesRow] = &[
 
 /// Create a `lambda` target group, register `function_arn` in it, and grant the invocation the
 /// group's requests need — all three through the owning API. Answers the group's ARN.
-async fn lambda_target_group(
+///
+/// `pub(crate)` because every suite of this crate that drives traffic at a `lambda` target group
+/// needs the same three calls, and the grant is one of them: a group created without it would be
+/// answered 502 for a reason that has nothing to do with what such a suite asserts.
+pub(crate) async fn lambda_target_group(
     router: &MultiServiceRouter,
     name: &str,
+    function: &str,
     function_arn: &str,
 ) -> String {
     let mut form = action("CreateTargetGroup");
@@ -465,7 +491,7 @@ async fn lambda_target_group(
     let (status, granted) = lambda(
         router,
         "POST",
-        &format!("/2015-03-31/functions/{FUNCTION}/policy"),
+        &format!("/2015-03-31/functions/{function}/policy"),
         json!({
             "StatementId": format!("elbv2-invoke-{name}"),
             "Action": "lambda:InvokeFunction",
@@ -483,7 +509,10 @@ async fn lambda_target_group(
 
 /// The `Sum` of every datapoint a `GetMetricStatistics` read of `metric` over `dimensions`
 /// answers with, and how many datapoints carried it.
-async fn statistic(
+///
+/// `pub(crate)` with [`alarm_state`] below: one shaping of each read, so two suites of this crate
+/// cannot fold one of these series, or report one alarm's state, two different ways.
+pub(crate) async fn statistic(
     router: &MultiServiceRouter,
     metric: &str,
     dimensions: &Value,
@@ -512,10 +541,14 @@ async fn statistic(
     (total, points.len())
 }
 
-/// The `Metrics` query array the rate is computed by: the two series it reads, neither of which
-/// returns data, and the expression over them that does — the ONE returning query an alarm over
+/// The `Metrics` query array a rate is computed by: the two series it reads, neither of which
+/// returns data, and `expression` over them, which does — the ONE returning query an alarm over
 /// such an array is graded on, and the one a reader asks `GetMetricData` for.
-fn rate_queries(dimensions: &Value) -> Value {
+///
+/// `pub(crate)` with [`rate_values`] below, taking the expression as a parameter: how the array is
+/// SHAPED is the same for every rate over these two series, and what differs between two suites of
+/// this crate is only the arithmetic they derive it by.
+pub(crate) fn rate_queries(dimensions: &Value, expression: &str) -> Value {
     let read = |id: &str, metric: &str| {
         json!({
             "Id": id,
@@ -536,7 +569,7 @@ fn rate_queries(dimensions: &Value) -> Value {
         read(REQUESTS_ID, "RequestCount"),
         {
             "Id": RATE_ID,
-            "Expression": RATE_EXPRESSION,
+            "Expression": expression,
             "Label": "target 5xx rate",
             "ReturnData": true,
             "Period": PERIOD_SECS,
@@ -544,10 +577,11 @@ fn rate_queries(dimensions: &Value) -> Value {
     ])
 }
 
-/// The values the rate query answers over `[start, end)`, newest last.
-async fn rate_values(
+/// The values the rate `expression` answers over `[start, end)`, newest last.
+pub(crate) async fn rate_values(
     router: &MultiServiceRouter,
     dimensions: &Value,
+    expression: &str,
     start: f64,
     end: f64,
 ) -> Vec<f64> {
@@ -555,7 +589,7 @@ async fn rate_values(
         router,
         "GetMetricData",
         &json!({
-            "MetricDataQueries": rate_queries(dimensions),
+            "MetricDataQueries": rate_queries(dimensions, expression),
             "StartTime": start,
             "EndTime": end,
             "ScanBy": "TimestampAscending",
@@ -582,7 +616,7 @@ async fn rate_values(
 
 /// The `StateValue` `DescribeAlarms` reports for one metric alarm, or the empty string for an
 /// alarm it reports no state for.
-async fn alarm_state(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn alarm_state(router: &MultiServiceRouter, name: &str) -> String {
     let body = cloudwatch_ok(
         router,
         "DescribeAlarms",
@@ -659,8 +693,8 @@ async fn the_served_traffic_is_what_cloudwatch_reads_back_and_grades() {
     // The load balancer, the address it publishes, and its two `lambda` target groups: the one
     // the listener's default action forwards to, and one a rule sends a path no request asks for.
     let (lb_arn, published) = create_load_balancer(&router, LOAD_BALANCER).await;
-    let served_arn = lambda_target_group(&router, SERVING_GROUP, &function_arn).await;
-    let idle_arn = lambda_target_group(&router, IDLE_GROUP, &function_arn).await;
+    let served_arn = lambda_target_group(&router, SERVING_GROUP, FUNCTION, &function_arn).await;
+    let idle_arn = lambda_target_group(&router, IDLE_GROUP, FUNCTION, &function_arn).await;
 
     let mut form = action("CreateListener");
     form.push(p("LoadBalancerArn", &lb_arn));
@@ -711,8 +745,8 @@ async fn the_served_traffic_is_what_cloudwatch_reads_back_and_grades() {
 
     // The whole of the traffic falls in one period, so one window holds the counts a rate is
     // derived from and an alarm grades.
-    wait_for_period_room().await;
-    let window_start = (now_secs() / PERIOD).floor() * PERIOD;
+    wait_for_period_room(ROOM_IN_PERIOD).await;
+    let window_start = current_window();
 
     for request in TRAFFIC {
         let answered = exchange(request.case, &published, request.target).await;
@@ -764,7 +798,7 @@ async fn the_served_traffic_is_what_cloudwatch_reads_back_and_grades() {
     // What the expression over two of those series derives: one window, holding the share of the
     // group's requests that ended in a status the target returned in the 5XX class.
     let expected_rate = TARGET_ERRORS / REQUESTS * 100.0;
-    let values = rate_values(&router, &keys.served, start, end).await;
+    let values = rate_values(&router, &keys.served, RATE_EXPRESSION, start, end).await;
     assert_eq!(
         values.len(),
         1,
@@ -811,7 +845,7 @@ async fn the_served_traffic_is_what_cloudwatch_reads_back_and_grades() {
         "PutMetricAlarm",
         &json!({
             "AlarmName": RATE_ALARM,
-            "Metrics": rate_queries(&keys.served),
+            "Metrics": rate_queries(&keys.served, RATE_EXPRESSION),
             "EvaluationPeriods": 1,
             "DatapointsToAlarm": 1,
             "Threshold": RATE_THRESHOLD,
