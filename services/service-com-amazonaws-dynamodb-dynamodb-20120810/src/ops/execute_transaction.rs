@@ -36,7 +36,10 @@
 //! so the transaction is cancelled and that statement's `CancellationReasons` entry
 //! carries `ResourceNotFound` ([`cancelled_absent_table`]); a table whose resource-based
 //! policy denies the caller the statement's own PartiQL action is `AccessDeniedException`,
-//! and a transaction addressing one item twice is a `ValidationException`. A statement run
+//! and a transaction addressing one item twice is a `ValidationException` — as is a
+//! statement whose change would leave an item past the documented item-size ceiling, which
+//! is the ITEM's ceiling and so is refused in the class and the sentence a single-item
+//! update of it is refused with. A statement run
 //! here performs its action INSIDE this operation, which is what a policy admitting an
 //! action only as part of a transaction tests
 //! ([`crate::state::authorization::EnclosingOperation`]).
@@ -706,6 +709,22 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // item, so it cancels the transaction. A refusal about the VALUE the request
         // carried needs no table to decide, so it stays a request-level refusal.
         let keying = |error| cancelled_by_element(at, elements, error);
+        // The documented item-size ceiling is the ITEM's and does not move with the surface
+        // an update arrives through ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]):
+        // a statement whose result would not fit in an item asks for something that cannot
+        // be served however the rest of the transaction turns out, so it refuses the CALL in
+        // the class and the sentence a single-item update of it is refused with — a request
+        // to shrink rather than a transaction to retry — exactly as the `Update` action of a
+        // `TransactWriteItems` is. Every other failure applying the change finds stays that
+        // statement's own and cancels the transaction.
+        let unless_too_large = |error: crate::state::RequestError| match &error {
+            crate::state::RequestError::Validation(message)
+                if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE =>
+            {
+                lift(error)
+            }
+            _ => keying(error),
+        };
         // A table a statement names that this region does not hold — or does not hold in a
         // status that serves items — is a failure OF THAT STATEMENT, so it cancels the
         // transaction with that statement's own reason ([`cancelled_absent_table`]).
@@ -827,11 +846,12 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 } else {
                     let mut item = before.clone().unwrap_or_default();
                     // The change is APPLIED to the stored item here, so a defect found by
-                    // applying it — an item the change grows past the documented 400 KB
-                    // ceiling among them — is this statement's own failure and cancels the
+                    // applying it is this statement's own failure and cancels the
                     // transaction ([`cancelled_by_element`]), exactly as the same defect
-                    // does in a `TransactWriteItems` `Update`.
-                    let touched = clauses.apply(&mut item).map_err(keying)?;
+                    // does in a `TransactWriteItems` `Update` — except an item the change
+                    // grows past the documented 400 KB ceiling, which refuses the call
+                    // ([`unless_too_large`]).
+                    let touched = clauses.apply(&mut item).map_err(unless_too_large)?;
                     for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
@@ -846,18 +866,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     // of it would be: the documented nesting, the 400 KB item size, and
                     // the key limits of every index it is projected into. The size
                     // refusal is the one the UPDATE path states
-                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and it
-                    // CANCELS the transaction: "an item size becomes too large (larger
-                    // than 400 KB), or a local secondary index (LSI) becomes too large,
-                    // or a similar validation error occurs because of changes made by the
-                    // transaction" is one of the circumstances a transaction is cancelled
-                    // under, and that is what this statement's change did (the
-                    // `TransactionCanceledException` doc, whose `ValidationError` reason
-                    // lists this very sentence).
+                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and it refuses
+                    // the CALL ([`unless_too_large`]); every other rule the applied item
+                    // breaks is this statement's own failure.
                     for (attribute, value) in &item {
                         crate::state::check_attribute_value(attribute, value)
                             .map_err(crate::state::stated_for_an_update)
-                            .map_err(keying)?;
+                            .map_err(unless_too_large)?;
                     }
                     // Canonicalising the applied item stays the CALL's refusal, unlike the
                     // rules above it: what is stored is already canonical (every write path
@@ -868,7 +883,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         if crate::state::update_size_exceeded(table, &item, 0) {
-                            return Err(keying(crate::state::RequestError::Validation(
+                            return Err(lift(crate::state::RequestError::Validation(
                                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
                             )));
                         }

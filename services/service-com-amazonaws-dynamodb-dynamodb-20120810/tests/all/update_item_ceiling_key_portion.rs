@@ -176,8 +176,9 @@ async fn the_update_ceiling_is_the_quota_less_what_the_key_portion_is_charged() 
 }
 
 /// RULE: `TransactWriteItems`' `Update` is bound by the standalone `UpdateItem`'s ceiling, and
-/// states a change past it as that ACTION's cancellation reason — the sentence the single-item
-/// path states, carried by the action that stated the change.
+/// states a change past it the way the single-item path does — the CALL is refused with that
+/// path's sentence, because the ceiling is the ITEM's and does not move with the surface the
+/// change arrived through.
 #[tokio::test]
 async fn a_transactional_update_shares_the_single_item_ceiling() {
     let router = emulator();
@@ -208,27 +209,20 @@ async fn a_transactional_update_shares_the_single_item_ceiling() {
             transact(&table, shape, largest + 1),
         )
         .await;
-        // An item the transaction's own change grows past the ceiling is that action's
-        // failure, so the transaction is CANCELLED and the action reports `ValidationError`
-        // with the single-item path's sentence — "an item size becomes too large (larger
-        // than 400 KB) [...] because of changes made by the transaction" is one of the
-        // circumstances DynamoDB cancels a `TransactWriteItems` request under, and this
-        // sentence is one of the messages its `ValidationError` reason lists (the
-        // `TransactionCanceledException` doc).
+        // An item the transaction's own change would grow past the ceiling cannot be
+        // stored whatever the rest of the transaction says, so the CALL is refused with the
+        // single-item path's sentence and no action is graded.
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "TransactionCanceledException"),
-            "case {:?}: expected the transaction cancelled one byte past the ceiling, got \
-             {status} with {body}",
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "ValidationException", UPDATE_TOO_BIG),
+            "case {:?}: expected the call refused one byte past the ceiling, got {status} \
+             with {body}",
             shape.case
         );
-        assert_eq!(
-            (
-                body["CancellationReasons"][0]["Code"].as_str(),
-                body["CancellationReasons"][0]["Message"].as_str(),
-            ),
-            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-            "case {:?}: expected the action to report the ceiling sentence, got {body}",
+        assert!(
+            body.get("CancellationReasons").is_none(),
+            "case {:?}: a refused call cancels nothing, so it reports no reason list, got \
+             {body}",
             shape.case
         );
         let stored = stored_length(&router, &table, shape).await;

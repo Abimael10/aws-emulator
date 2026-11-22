@@ -18,8 +18,9 @@
 //!    surfaces that carry an item (`PutItem`, `BatchWriteItem`, a transaction's `Put`, a
 //!    PartiQL `INSERT`) and the surfaces that state a CHANGE (`UpdateItem` through `SET`,
 //!    `ADD` and `list_append`, a transaction's `Update`, a PartiQL `UPDATE`) — the
-//!    transactional one as the failing action's CANCELLATION reason, which is the class a
-//!    change the transaction made earns.
+//!    PartiQL `UPDATE`) — the transactional one refusing the CALL in that same class and
+//!    sentence, because the ceiling is the ITEM's and does not move with the surface the
+//!    change arrived through.
 //! 3. A transaction is applied as one unit, so the documented 4 MB aggregate is a ceiling
 //!    on the whole CALL: a transaction whose actions add up past it is refused as the
 //!    malformed request it is, with nothing of it applied, while one whose actions add up
@@ -395,13 +396,12 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         );
     }
 
-    // The TRANSACTIONAL surface states the same sentence as the failing action's
-    // CANCELLATION reason where it is the transaction's own CHANGE that grew the item past
-    // the ceiling — the value here is inside the ceiling, so nothing the request carried is
-    // too large: "an item size becomes too large (larger than 400 KB) [...] because of
-    // changes made by the transaction" is one of the circumstances DynamoDB cancels a
-    // `TransactWriteItems` request under, and this sentence is one of the messages its
-    // `ValidationError` reason lists (the `TransactionCanceledException` doc).
+    // The TRANSACTIONAL surface states the same sentence for a change the transaction's own
+    // update would grow past the ceiling, and refuses the CALL for it as well — the value
+    // here is inside the ceiling, so nothing the request carried is too large on its own,
+    // and it is only the item the change would LEAVE that cannot be stored. An item no table
+    // may hold cannot be stored however the rest of the transaction turns out, so the class
+    // and the sentence are the single-item update's and no action is graded.
     let (status, answered) = call(
         &router,
         "TransactWriteItems",
@@ -411,19 +411,19 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&answered).as_str()),
-        (400, "TransactionCanceledException"),
-        "case \"a transactional change past the ceiling\": expected the transaction cancelled, \
-         got {status} with {answered}"
-    );
-    assert_eq!(
         (
-            answered["CancellationReasons"][0]["Code"].as_str(),
-            answered["CancellationReasons"][0]["Message"].as_str(),
+            status,
+            error_code(&answered).as_str(),
+            message(&answered).as_str()
         ),
-        (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-        "case \"a transactional change past the ceiling\": expected the action to report \
-         {UPDATE_TOO_BIG:?}, got {answered}"
+        (400, "ValidationException", UPDATE_TOO_BIG),
+        "case \"a transactional change past the ceiling\": expected the call refused with the \
+         update path's sentence, got {status} with {answered}"
+    );
+    assert!(
+        answered.get("CancellationReasons").is_none(),
+        "case \"a transactional change past the ceiling\": a refused call cancels nothing, so \
+         it reports no reason list, got {answered}"
     );
 
     // The seeded item is where it was: a refused change writes nothing.
