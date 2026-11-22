@@ -32,19 +32,21 @@
 //!
 //! # What a refusal has to be grounded in
 //!
-//! Nothing is withheld unless a document the account HOLDS says so: a crawler that names no
-//! role, an emulator with no IAM mounted to ask, a role this account holds nothing under, and a
-//! role carrying an attachment whose document cannot be read all leave the crawl to go ahead —
-//! a role is routinely provisioned out of band, so what cannot be read about it says nothing
-//! about its permissions. That is the reading [`super::role_policy_documents`] already answers
-//! `None` for. So does a crawl no document is in force over at all: a role the account holds
-//! no policy for, reading a bucket that carries no policy of its own, is decided by nothing,
-//! and a crawl of it reads its target exactly as it does with no IAM mounted. A decision is
-//! made as soon as there IS something to decide it from — one identity document in force on the
-//! role, or a policy on the bucket it reads. Where the ROLE's half is the one that cannot be
-//! read, the bucket's own policy is still a document the account holds, in force whatever the
-//! role carries: an explicit `Deny` in it withholds the call on its own, while a grant it does
-//! not make decides nothing, because the grant the role may carry is what could not be read.
+//! A call is decided as soon as the account's records can SHOW what the role carries, and IAM
+//! answers such a call by default-deny: "a request results in an implicit denial if no
+//! applicable `Allow` is found", so a role the account holds whose readable documents grant
+//! neither of the two calls — including a role carrying no identity document at all — reads
+//! nothing, whether or not the bucket carries a policy of its own.
+//!
+//! What leaves the crawl to go ahead is only a role nothing can be SHOWN about: a crawler that
+//! names no role, an emulator with no IAM mounted to ask, a role this account holds nothing
+//! under, and a role carrying an attachment whose document cannot be read — a role is routinely
+//! provisioned out of band, so what cannot be read about it says nothing about its permissions.
+//! That is the reading [`super::role_policy_documents`] already answers `None` for. Where the
+//! ROLE's half is the one that cannot be read, the bucket's own policy is still a document the
+//! account holds, in force whatever the role carries: an explicit `Deny` in it withholds the
+//! call on its own, while a grant it does not make decides nothing, because the grant the role
+//! may carry is what could not be read.
 //!
 //! The role's documents are read ONCE per crawl, under the IAM guard, and PREPARED once; each
 //! bucket's policy is read through the object store's own `GetBucketPolicy` and remembered for
@@ -183,10 +185,10 @@ impl CrawlReadAuthorization {
     /// ([`Self::of_role`]): a table of another store carries its own resource policy, served by
     /// that store's own API, and this walk asks only what the account's IAM records show about
     /// the role — the same half `CreateCrawler` decides a target's grant on
-    /// ([`super::dynamodb_target_refusal`]). Nothing is withheld unless a document the account
-    /// HOLDS says so, so a crawler naming no role, an emulator with no IAM to ask and a role
-    /// nothing can be read about each leave the read to go ahead, exactly as they do for an
-    /// object.
+    /// ([`super::dynamodb_target_refusal`]). A role the account's records SHOW is decided by
+    /// them, down to the implicit deny a role carrying no document at all falls to; a crawler
+    /// naming no role, an emulator with no IAM to ask and a role nothing can be read about each
+    /// leave the read to go ahead, exactly as they do for an object.
     ///
     /// The answer is the account of the refusal, for the crawl's own LOG, for the reason
     /// [`Self::withholds_listing`] gives.
@@ -194,9 +196,6 @@ impl CrawlReadAuthorization {
     pub fn withholds_table_read(&self, action: &str, table_arn: &str) -> Option<String> {
         let role_arn = self.role_arn.clone()?;
         let identity = self.identity.as_deref()?;
-        if identity.is_empty() {
-            return None;
-        }
         let context = [(PRINCIPAL_ARN_KEY.to_string(), role_arn)];
         let request = authorization::Request::new(action, table_arn, &self.principals)
             .with_context(&context);
@@ -216,9 +215,9 @@ impl CrawlReadAuthorization {
     ///
     /// Decided in IAM's own order: the bucket's own policy and the role's identity policies are
     /// read together, an explicit `Deny` from either refuses, and an `Allow` from either is
-    /// enough. A call no document covers is decided by nothing and so withholds nothing. Where
-    /// the role's own documents are the half that cannot be read, the bucket's policy is still
-    /// a document the account holds and in force whatever the role carries, so an explicit
+    /// enough — with no `Allow` at all, the call falls to IAM's implicit deny and is withheld.
+    /// Where the role's own documents are the half that cannot be read, the bucket's policy is
+    /// still a document the account holds and in force whatever the role carries, so an explicit
     /// `Deny` in it withholds the call on its own — while an absent grant there decides
     /// nothing, because the grant the role may carry cannot be read.
     async fn withholds(
@@ -233,12 +232,6 @@ impl CrawlReadAuthorization {
         let policy = self.bucket_policy(client, bucket).await;
         // Read after the policy lookup, which takes the whole record.
         let identity = self.identity.as_deref();
-        // Neither the role nor the bucket carries a document, so there is nothing in force
-        // over this call to decide it: the crawl reads its target the way it does where no IAM
-        // is mounted to ask at all.
-        if identity.is_none_or(<[_]>::is_empty) && policy.is_none() {
-            return None;
-        }
         let mut context: Vec<(String, String)> = vec![(PRINCIPAL_ARN_KEY.to_string(), role_arn)];
         context.extend(extra_context.iter().cloned());
         let request = authorization::Request::new(action, resource, &self.principals)

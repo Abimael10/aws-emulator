@@ -238,6 +238,9 @@ pub struct CrawlPlan {
     /// The delete behaviour in force, resolved the same way, else
     /// [`DELETE_BEHAVIOR_DEPRECATE_IN_DATABASE`].
     pub delete_behavior: String,
+    /// How the candidate tables behind one Amazon S3 include path are grouped into tables,
+    /// read off the crawler's `Configuration` ([`TableGrouping::of_configuration`]).
+    pub table_grouping: TableGrouping,
 }
 
 impl CrawlPlan {
@@ -272,6 +275,7 @@ impl CrawlPlan {
             delete_behavior: policy
                 .and_then(|policy| policy.delete_behavior.clone())
                 .unwrap_or_else(|| DELETE_BEHAVIOR_DEPRECATE_IN_DATABASE.to_string()),
+            table_grouping: TableGrouping::of_configuration(crawler.configuration.as_deref()),
         }
     }
 

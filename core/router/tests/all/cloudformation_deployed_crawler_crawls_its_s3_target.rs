@@ -19,7 +19,11 @@
 //! answers for the crawl role, AWS Glue serves the crawl and the catalog, Amazon S3 holds the
 //! data the crawl reads), so the suite lives here: a crate-local test can only ever see one
 //! side of it. The whole emulator is assembled, exactly as the production entrypoint
-//! assembles it.
+//! assembles it. The role every template declares carries the two Amazon S3 calls a crawl makes
+//! as its inline `Policies`, because a crawl reads its targets AS that role and the account's
+//! own documents decide every call it makes; WHICH documents withhold which call is the subject
+//! of [`crate::glue_crawl_reads_as_its_role_and_publishes_its_state_change`] rather than of
+//! this suite.
 //!
 //! The deployed case — one stack declaring a database and a crawler over one `s3://<bucket>/`
 //! prefix of comma-separated data — is ONE row of the table below; the rows differ along what
@@ -258,6 +262,24 @@ async fn stage(
     }
 }
 
+/// The `Policies` list the crawl role carries: the two Amazon S3 calls a crawl makes — the
+/// listing of a target's bucket and the read of the object a schema is inferred from — granted
+/// over every bucket of this account, because a crawl reads its targets AS this role and a role
+/// the account holds is decided by the documents it carries.
+fn crawl_read_policies() -> Value {
+    json!([{
+        "PolicyName": "crawl-target-read",
+        "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket", "s3:GetObject"],
+                "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"],
+            }],
+        },
+    }])
+}
+
 /// The template one row deploys: the crawl role, the catalog database the crawler writes into,
 /// and the crawler itself over the row's targets — each entity named by the stack, and both
 /// names published as outputs.
@@ -283,7 +305,10 @@ fn template(row: &Deployment, database: &str, crawler: &str) -> String {
         "Resources": {
             ROLE_LOGICAL_ID: {
                 "Type": "AWS::IAM::Role",
-                "Properties": { "AssumeRolePolicyDocument": trust }
+                "Properties": {
+                    "AssumeRolePolicyDocument": trust,
+                    "Policies": crawl_read_policies()
+                }
             },
             DATABASE_LOGICAL_ID: {
                 "Type": "AWS::Glue::Database",

@@ -8,16 +8,16 @@
 //! (`s3:ListBucket`) and the read of the object a dataset's schema is inferred from
 //! (`s3:GetObject`, on that object's own ARN). Each is decided, before it is made, against the
 //! identity-based policies in force on the role together with the target bucket's own resource
-//! policy, in IAM's order: an explicit deny from either side refuses, and within one account an
-//! allow from either is enough. A call the records withhold is one the crawl does not make, so
+//! policy, in IAM's order: an explicit deny from either side refuses, an allow from either is
+//! enough within one account, and a call neither of them allows falls to IAM's implicit deny.
+//! A call the records withhold is one the crawl does not make, so
 //! the data behind that target is never read: the crawl writes NO table and no partition for
 //! it and leaves the catalog as it was. The crawl is still carried out — it reached every
 //! target it was permitted to read — so it comes to rest having SUCCEEDED, with the crawler
 //! back at `READY` and nothing to report about what it could not read. A refusal has to be
-//! grounded in a document the account HOLDS: a role carrying a grant this account cannot read,
-//! and a crawl no document is in force over at all (a role with no policy of its own reading a
-//! bucket with no policy of its own), withhold nothing — which is also why every other crawl
-//! suite in this crate, which mounts no IAM, still crawls.
+//! grounded in what the account can SHOW about the role: a role carrying a grant this account
+//! cannot read withholds nothing, and neither does a role the account holds no record of at
+//! all — which is why every other crawl suite in this crate, which mounts no IAM, still crawls.
 //!
 //! The suite is a TABLE whose rows differ along what the rule generalises over: what the
 //! role's own documents say (nothing at all, a grant of both calls, a grant of one of them, a
@@ -26,7 +26,7 @@
 //! policy whose object grant reaches only `aws-glue-*` paths), what the bucket's own policy
 //! says (none, a deny of every principal but another role, a grant to this role alone, a grant
 //! of an action the crawl does not make, a deny of this role beside documents the account
-//! cannot read), and whether anything is in force over the crawl at all.
+//! cannot read), and whether anything the account holds can be read about the role at all.
 //!
 //! Glue, Amazon S3 and IAM are mounted on ONE shared engine and driven over the wire, so the
 //! documents the decision is made against are the records IAM holds and the policy the
@@ -219,14 +219,15 @@ fn rows() -> Vec<Row> {
             published: false,
         },
         Row {
-            case: "a role the account holds no document about, reading a bucket with no policy",
+            case: "a role the account holds with no document at all, reading a bucket with no \
+                   policy",
             bucket: "crawl-auth-bare",
             identity: None,
             attached: Vec::new(),
             bucket_policy: None,
-            // Nothing is in force over this call, so nothing withholds it: the same position a
-            // crawl is in where no IAM is mounted to ask.
-            published: true,
+            // Nothing grants either call, and the account can read every document this role
+            // carries — there are none — so both fall to IAM's implicit deny.
+            published: false,
         },
         Row {
             case: "a grant of both calls, scoped to another bucket",

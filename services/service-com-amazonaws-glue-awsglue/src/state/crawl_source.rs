@@ -10,6 +10,12 @@
 //! depth) and its COLUMNS (read off the data itself — the header and the first row of a
 //! delimited object, or the members of the first JSON document).
 //!
+//! HOW MANY TABLES one target is written as is decided before any of that: the objects are
+//! grouped by the child prefix they sit under, one schema is read per child prefix, and those
+//! candidates are either folded into one table of the include path or published one table each
+//! — the rule and the crawler's `Configuration` that selects it live in
+//! [`super::crawl_table_grouping`].
+//!
 //! The objects are read out of the emulator's OWN Amazon S3, through the framework's
 //! in-process callback ([`smithy_server_runtime::OperationContext::callback`]) — the same
 //! transport a client's own S3 request takes, so a crawl classifies exactly the bytes that
@@ -224,7 +230,9 @@ pub async fn perform_crawl<Eng: ::std::marker::Send + ::std::marker::Sync + 'sta
     }
 }
 
-/// One dataset per Amazon S3 target that holds data, in the order the crawler names them.
+/// The datasets behind each Amazon S3 target that holds data, in the order the crawler names
+/// them — one per target whose child prefixes are one table, and one per child prefix where
+/// they are not ([`datasets_of_target`]).
 ///
 /// A target that holds no object at all yields no dataset — there is nothing there to
 /// describe — and so does one whose objects nothing could be classified from: a crawl writes
@@ -304,21 +312,287 @@ async fn walk_targets(
         if objects.is_empty() {
             continue;
         }
-        let Some(name) = dataset_name(&bucket, &root) else {
-            continue;
-        };
-        let Some(dataset) =
-            describe_dataset(client, &bucket, &root, name, &objects, authorization).await?
-        else {
-            continue;
-        };
-        // Two targets that resolve to the same table name describe one dataset, and the
-        // first of them is the one that described it.
-        if named.insert(dataset.name.clone()) {
-            discovered.push(dataset);
+        for dataset in
+            datasets_of_target(client, &bucket, &root, path, &objects, plan, authorization).await?
+        {
+            // Two targets that resolve to the same table name describe one dataset, and the
+            // first of them is the one that described it.
+            if named.insert(dataset.name.clone()) {
+                discovered.push(dataset);
+            }
         }
     }
     Ok(discovered)
+}
+
+/// The TABLES one Amazon S3 target's data is written as: its child prefixes are described one
+/// by one and then either folded into a single table of the include path or published one
+/// table each, as the crawler's grouping asks ([`TableGrouping`]).
+///
+/// The candidates are the objects grouped by the first folder level below the target's root
+/// ([`candidate_groups`]), and each is described from its OWN data — so one object is read per
+/// child prefix, inside the objects the walk already listed ([`MAX_CRAWLED_OBJECTS`]), each read
+/// bounded by [`MAX_CRAWLED_SAMPLE_BYTES`] and the whole walk by [`CRAWL_BUDGET`]. A
+/// candidate whose data the crawl may not read, or could classify nothing from, is no candidate
+/// at all: it takes no part in the grouping decision and no table is written for it.
+///
+/// BOTH factors of the grouping's own work are bounded BEFORE any of it runs, because both are
+/// written by callers: how many candidates one target yields
+/// ([`MAX_CRAWLED_TABLE_CANDIDATES`]) and how many columns they carry between them
+/// ([`MAX_CRAWLED_SCHEMA_COLUMNS`], counted as each schema is read). A target past either is
+/// data this crawl did not describe, which is a crawl that failed saying so rather than one
+/// reporting part of the layout as the whole of it — the reading [`retained`] already applies to
+/// the other product this walk computes. Inside those bounds the decision and the merge are
+/// LINEAR in the columns carried ([`TableGrouping::folds`], [`merged_columns`]), and the walk
+/// hands the runtime back around each of them and every [`YIELD_EVERY_OBJECTS`] candidates, so
+/// [`CRAWL_BUDGET`] and a cancellation land inside this stage rather than only at the object
+/// store's awaits.
+async fn datasets_of_target(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    root: &str,
+    path: &str,
+    objects: &[CrawledObject],
+    plan: &CrawlPlan,
+    authorization: &mut CrawlReadAuthorization,
+) -> Result<Vec<DiscoveredTable>, String> {
+    let groups = candidate_groups(objects);
+    if groups.len() > MAX_CRAWLED_TABLE_CANDIDATES {
+        ::tracing::debug!(
+            target = ?path,
+            prefixes = groups.len(),
+            "a Glue crawl found more child prefixes under one of its targets than it describes"
+        );
+        return Err(crawl_target_unreadable(path));
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    // How many columns the candidates carry between them, which is the other factor of the
+    // grouping's work: counted as each schema arrives, so nothing past the ceiling is held.
+    let mut carried = 0usize;
+    for (walked, (child, held)) in groups.into_iter().enumerate() {
+        if walked.is_multiple_of(YIELD_EVERY_OBJECTS) {
+            ::tokio::task::yield_now().await;
+        }
+        let Some(schema) = candidate_schema(client, bucket, &held, authorization).await? else {
+            continue;
+        };
+        carried = carried.saturating_add(schema.columns.len());
+        if carried > MAX_CRAWLED_SCHEMA_COLUMNS {
+            ::tracing::debug!(
+                target = ?path,
+                columns = carried,
+                "a Glue crawl read more columns under one of its targets than it describes"
+            );
+            return Err(crawl_target_unreadable(path));
+        }
+        candidates.push(Candidate {
+            child,
+            objects: held,
+            schema,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schemas: Vec<CandidateSchema<'_>> = candidates
+        .iter()
+        .map(|candidate| candidate.schema.as_candidate())
+        .collect();
+    // The decision and the merge below are this emulator's own synchronous work, bounded by the
+    // two ceilings above; the runtime is handed back around them so the crawl's budget and a
+    // cancellation can land between them.
+    ::tokio::task::yield_now().await;
+    let folds = plan.table_grouping.folds(&schemas);
+    ::tokio::task::yield_now().await;
+    // The child prefixes are one table of the include path: it is named after the include
+    // path's own leaf folder, its columns cover every candidate's data, and the folder levels
+    // below it are its partitions.
+    if folds {
+        let Some(name) = dataset_name(bucket, root) else {
+            return Ok(Vec::new());
+        };
+        let columns = merged_columns(&schemas);
+        ::tokio::task::yield_now().await;
+        // The candidate that described the dataset first is the one whose layout a reader reads
+        // the folded table's objects with.
+        let Some(layout) = candidates.first().map(|candidate| &candidate.schema) else {
+            return Ok(Vec::new());
+        };
+        // The folded table describes the data of the candidates that WERE described: a child
+        // prefix the crawl was not permitted to read, or could classify nothing from, is no
+        // candidate at all, so neither its partitions nor its counts are the table's.
+        let described = folded_objects(objects, &candidates);
+        return Ok(vec![text_dataset(
+            name, bucket, root, &described, columns, layout,
+        )]);
+    }
+
+    // They are a table each, named after the child prefix the data sits under, whose own
+    // folder levels are that table's partitions.
+    let mut datasets: Vec<DiscoveredTable> = Vec::new();
+    for (walked, candidate) in candidates.iter().enumerate() {
+        if walked.is_multiple_of(YIELD_EVERY_OBJECTS) {
+            ::tokio::task::yield_now().await;
+        }
+        let Some(child) = candidate.child.as_deref() else {
+            continue;
+        };
+        let Some(name) = catalog_name(child) else {
+            continue;
+        };
+        let child_root = format!("{root}{child}/");
+        datasets.push(text_dataset(
+            name,
+            bucket,
+            &child_root,
+            &candidate.objects,
+            candidate.schema.columns.clone(),
+            &candidate.schema,
+        ));
+    }
+    Ok(datasets)
+}
+
+/// The objects a FOLDED table of the include path describes: the target's own objects, placed
+/// under its root, narrowed to the candidates that were described.
+///
+/// A candidate the crawl could not read or classify is no candidate, so its objects are not this
+/// table's either — they hold no partition of it and are counted in none of its figures. A
+/// candidate sitting directly under the root is the target's own one dataset, which is every
+/// object under it.
+fn folded_objects(objects: &[CrawledObject], candidates: &[Candidate]) -> Vec<CrawledObject> {
+    if candidates.iter().any(|candidate| candidate.child.is_none()) {
+        return objects.to_vec();
+    }
+    let described: HashSet<&str> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.child.as_deref())
+        .collect();
+    objects
+        .iter()
+        .filter(|object| {
+            object
+                .folders
+                .first()
+                .is_some_and(|child| described.contains(child.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// One candidate table behind a target: the child prefix its data sits under, the objects that
+/// hold it — with their folder levels taken from that child prefix — and the schema read off
+/// them.
+#[derive(Debug, Clone)]
+struct Candidate {
+    /// The child prefix below the target's root, or `None` for the data that sits directly
+    /// under the root, which is the target's own one dataset.
+    child: Option<String>,
+    /// The objects of this candidate, placed under its own root.
+    objects: Vec<CrawledObject>,
+    /// What its data was classified as.
+    schema: InferredSchema,
+}
+
+/// The candidate tables behind a target: its objects grouped by the FIRST folder level below
+/// its root.
+///
+/// An object sitting DIRECTLY under the root makes the target itself one candidate: the include
+/// path is then the root of the table, and the folder levels below it are its partitions rather
+/// than tables of their own. Otherwise every distinct first level is a candidate, in name
+/// order, holding its objects with that level stripped off — so each candidate's folder levels
+/// are the ones below its own root.
+fn candidate_groups(objects: &[CrawledObject]) -> Vec<(Option<String>, Vec<CrawledObject>)> {
+    if objects.iter().any(|object| object.folders.is_empty()) {
+        return vec![(None, objects.to_vec())];
+    }
+    let mut groups: BTreeMap<String, Vec<CrawledObject>> = BTreeMap::new();
+    for object in objects {
+        let Some((child, below)) = object.folders.split_first() else {
+            continue;
+        };
+        groups
+            .entry(child.clone())
+            .or_default()
+            .push(CrawledObject {
+                key: object.key.clone(),
+                size: object.size,
+                folders: below.to_vec(),
+            });
+    }
+    groups
+        .into_iter()
+        .map(|(child, objects)| (Some(child), objects))
+        .collect()
+}
+
+/// The schema one candidate's data carries, or `None` when nothing could be classified from it
+/// — which is also the answer for data the account's records do not permit the crawl role to
+/// read.
+///
+/// The OBJECT whose bytes the schema is read from is authorized against its own ARN, so a
+/// grant narrowed to part of a bucket decides only the objects it covers.
+async fn candidate_schema(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    objects: &[CrawledObject],
+    authorization: &mut CrawlReadAuthorization,
+) -> Result<Option<InferredSchema>, String> {
+    // The schema is inferred from the first object that holds any bytes: an empty object
+    // carries no row to read a column off.
+    let Some(sample) = objects.iter().find(|object| object.size > 0) else {
+        return Ok(None);
+    };
+    if let Some(detail) = authorization
+        .withholds_object_read(client, bucket, &sample.key)
+        .await
+    {
+        ::tracing::debug!(
+            object = ?sample.key,
+            detail = %detail,
+            "a Glue crawl is not permitted to read the data under one of its targets"
+        );
+        return Ok(None);
+    }
+    let bytes = read_sample(client, bucket, &sample.key).await?;
+    let Some(schema) = infer_schema(&bytes) else {
+        ::tracing::debug!(
+            object = ?sample.key,
+            "a Glue crawl could not classify the data under one of its targets"
+        );
+        return Ok(None);
+    };
+    Ok(Some(schema))
+}
+
+/// One dataset of objects as the crawl found it: `columns` is the schema the table declares and
+/// `layout` the classification a reader reads its objects with, while the partition keys, the
+/// partitions and the counts are read off the objects themselves.
+fn text_dataset(
+    name: String,
+    bucket: &str,
+    root: &str,
+    objects: &[CrawledObject],
+    columns: Vec<Column>,
+    layout: &InferredSchema,
+) -> DiscoveredTable {
+    let (partition_keys, partitions) = partitioning(bucket, root, objects);
+    DiscoveredTable {
+        name,
+        classification: layout.classification.clone(),
+        columns,
+        partition_keys,
+        partitions,
+        record_count: u64::try_from(objects.len()).unwrap_or(u64::MAX),
+        size_bytes: objects.iter().map(|object| object.size).sum(),
+        storage: DatasetStorage::TextObjects {
+            location: s3_url(bucket, root),
+            serialization_library: layout.serialization_library.clone(),
+            delimiter: layout.delimiter.clone(),
+            header_lines: layout.header_lines,
+        },
+    }
 }
 
 /// One object a crawl listed: its key, its size, and the relative path that places it under
@@ -474,63 +748,6 @@ async fn retained(
     Ok(kept)
 }
 
-/// The dataset behind one target: its partition keys, its partitions and the columns its
-/// data carries, or `None` when nothing could be classified from its objects — which is also
-/// the answer for a target whose data the account's records do not permit the crawl role to
-/// read.
-///
-/// The OBJECT whose bytes the schema is read from is authorized against its own ARN, so a
-/// grant narrowed to part of a bucket decides only the objects it covers.
-async fn describe_dataset(
-    client: &::aws_sdk_s3::Client,
-    bucket: &str,
-    root: &str,
-    name: String,
-    objects: &[CrawledObject],
-    authorization: &mut CrawlReadAuthorization,
-) -> Result<Option<DiscoveredTable>, String> {
-    let (partition_keys, partitions) = partitioning(bucket, root, objects);
-    // The schema is inferred from the first object that holds any bytes: an empty object
-    // carries no row to read a column off.
-    let Some(sample) = objects.iter().find(|object| object.size > 0) else {
-        return Ok(None);
-    };
-    if let Some(detail) = authorization
-        .withholds_object_read(client, bucket, &sample.key)
-        .await
-    {
-        ::tracing::debug!(
-            object = ?sample.key,
-            detail = %detail,
-            "a Glue crawl is not permitted to read the data under one of its targets"
-        );
-        return Ok(None);
-    }
-    let bytes = read_sample(client, bucket, &sample.key).await?;
-    let Some(schema) = infer_schema(&bytes) else {
-        ::tracing::debug!(
-            object = ?sample.key,
-            "a Glue crawl could not classify the data under one of its targets"
-        );
-        return Ok(None);
-    };
-    Ok(Some(DiscoveredTable {
-        name,
-        classification: schema.classification,
-        columns: schema.columns,
-        partition_keys,
-        partitions,
-        record_count: u64::try_from(objects.len()).unwrap_or(u64::MAX),
-        size_bytes: objects.iter().map(|object| object.size).sum(),
-        storage: DatasetStorage::TextObjects {
-            location: s3_url(bucket, root),
-            serialization_library: schema.serialization_library,
-            delimiter: schema.delimiter,
-            header_lines: schema.header_lines,
-        },
-    }))
-}
-
 /// The partition keys and partitions of a dataset, read off the folder levels its objects sit
 /// at.
 ///
@@ -659,6 +876,17 @@ struct InferredSchema {
     header_lines: usize,
     /// The columns, in the order the data carries them.
     columns: Vec<Column>,
+}
+
+impl InferredSchema {
+    /// This schema as the GROUPING decision sees it: what the data was classified as and the
+    /// columns it carries ([`CandidateSchema`]).
+    fn as_candidate(&self) -> CandidateSchema<'_> {
+        CandidateSchema {
+            classification: &self.classification,
+            columns: &self.columns,
+        }
+    }
 }
 
 /// Classify one object's bytes and read the dataset's columns off them, or `None` for bytes
