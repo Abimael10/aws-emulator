@@ -1550,6 +1550,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The capacity series of an Aurora Serverless v2 cluster, and the clock that keeps
+        // publishing it: a cluster created with a `ServerlessV2ScalingConfiguration` runs on a
+        // capacity no API operation reports, so the series is the only place a client can watch
+        // it, and the auto-pause an idle one is owed falls due on that same clock
+        // ([`crate::state::serverless_capacity`]). Started by the WRITE that brought the
+        // cluster into being, never by a read.
+        crate::state::serverless_capacity::drive_serverless_capacity(&self.engine);
+
         Ok(CreateDBClusterOutput {
             db_cluster: Some(db_cluster),
         })

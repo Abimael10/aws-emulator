@@ -155,6 +155,11 @@ const TEMPLATE: &str = concat!(
     "    Type: AWS::RDS::DBInstance\n",
     "    Properties:\n",
     "      Engine: mysql\n",
+    // The version the instance RUNS decides which DB parameter group family it can be given:
+    // a group "can be applied only to a DB instance running a database engine and engine
+    // version compatible with that DB parameter group family", so the template names the
+    // version of the family its group declares.
+    "      EngineVersion: 8.0.40\n",
     "      DBInstanceClass: db.t3.micro\n",
     "      AllocatedStorage: 20\n",
     "      DBSubnetGroupName: !Ref SubnetGroup\n",
@@ -360,6 +365,8 @@ async fn a_deleted_stacks_retained_group_and_final_snapshot_answer_to_the_publis
         "    UpdateReplacePolicy: Snapshot\n",
         "    Properties:\n",
         "      Engine: mysql\n",
+        // The version of the family the group above declares; see [`TEMPLATE`].
+        "      EngineVersion: 8.0.40\n",
         "      DBInstanceClass: db.t3.micro\n",
         "      AllocatedStorage: 20\n",
         "      BackupRetentionPeriod: 0\n",

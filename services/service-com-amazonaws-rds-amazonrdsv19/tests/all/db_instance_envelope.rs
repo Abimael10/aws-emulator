@@ -235,7 +235,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         identifier: "emu-env-postgres-16",
         engine: "postgres",
         requested_version: Some("16"),
-        engine_version: "16.4",
+        engine_version: "16.13",
         db_parameter_group: "default.postgres16",
         option_group: "default:postgres-16",
         license_model: "postgresql-license",
@@ -833,7 +833,7 @@ const VERSION_CASES: &[VersionCase] = &[
         identifier: "emu-ver-postgres-17",
         engine: "postgres",
         requested: Some("17"),
-        provisioned: Some("17.2"),
+        provisioned: Some("17.9"),
     },
     VersionCase {
         case: "a postgres version the catalogue publishes no entry for",
@@ -910,8 +910,8 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
 
     let rows: &[(&str, &str, &str)] = &[
         ("an exact version", "17.2", "17.2"),
-        ("a major version", "16", "16.4"),
-        ("another major version", "15", "15.8"),
+        ("a major version", "16", "16.13"),
+        ("another major version", "15", "15.17"),
     ];
     for (row_case, requested, expected) in rows {
         let modified = expect_ok(
@@ -966,6 +966,6 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
         "describe",
         &described,
         "EngineVersion",
-        "15.8",
+        "15.17",
     );
 }

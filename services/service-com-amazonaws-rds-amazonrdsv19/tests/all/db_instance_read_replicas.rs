@@ -540,7 +540,7 @@ async fn a_source_this_operation_cannot_replicate_is_refused_and_stores_nothing(
             &[
                 ("DBInstanceIdentifier", "replica-guard-served"),
                 ("SourceDBInstanceIdentifier", "guard-src-mysql"),
-                ("DBParameterGroupName", "default.mysql8.0"),
+                ("DBParameterGroupName", "default.mysql8.4"),
             ],
         )
         .await,

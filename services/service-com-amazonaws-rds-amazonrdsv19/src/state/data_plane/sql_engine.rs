@@ -1317,6 +1317,40 @@ impl InstanceDatabase {
             let _ = self.rollback_transaction(session);
         }
     }
+
+    /// How many BYTES the data this instance holds OCCUPIES, as the engine itself accounts for
+    /// it: the pages each of its databases has allocated, at the size the engine writes a page
+    /// at.
+    ///
+    /// The engine's own measurement, not an estimate over the values: `page_count` is what the
+    /// database has grown to and `page_size` the size of each of those pages, which is the
+    /// space the stored data takes — the figure the storage a DB instance has allocated is
+    /// consumed by ([`crate::state::storage_autoscaling`]). Reading it costs one pragma per
+    /// database, so it can be asked on the path that materialises what the clock owes rather
+    /// than only when a copy is taken ([`crate::state::snapshot_data_bytes`] walks the values
+    /// instead, because a SNAPSHOT reports the size of the data it carries).
+    ///
+    /// Read with the confinement lifted for the span of the read ([`Unconfined`]), because a
+    /// pragma is engine configuration and no statement a client sends may reach one; a
+    /// database whose pragma the engine refuses contributes nothing rather than failing the
+    /// measurement.
+    #[must_use]
+    pub fn stored_bytes(&self) -> i64 {
+        let mut databases = self.lock();
+        let mut bytes: i64 = 0;
+        for connection in databases.open.values_mut() {
+            let mut lifted = Unconfined::of(connection);
+            let connection = lifted.connection();
+            let pages: i64 = connection
+                .pragma_query_value(None, "page_count", |row| row.get(0))
+                .unwrap_or_default();
+            let page_size: i64 = connection
+                .pragma_query_value(None, "page_size", |row| row.get(0))
+                .unwrap_or_default();
+            bytes = bytes.saturating_add(pages.saturating_mul(page_size));
+        }
+        bytes
+    }
 }
 /// The name `name` names among `databases`, which is the one it matches ignoring case:
 /// the engines resolve a database name case-insensitively on the platforms RDS runs them

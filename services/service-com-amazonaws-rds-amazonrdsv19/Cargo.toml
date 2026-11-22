@@ -97,6 +97,12 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # the decimal AWS renders one as, which every operation of this front door is served behind
 # (`src/service/management_events.rs`).
 service-common = { path = "../common" }
+# The engine-version catalogue a cluster's Aurora Serverless v2 capacity is held to is this
+# crate's own; the CAPACITY such a cluster runs on is published as the `AWS/RDS`
+# `ServerlessDatabaseCapacity` series, appended to the CloudWatch emulator's OWN metric store on
+# the same shared engine (`src/state/serverless_capacity.rs`) — the one store `PutMetricData`
+# writes and `GetMetricStatistics` reads, so one metric has one home.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # `ManageMasterUserPassword` has RDS generate the master user password and manage it in
 # Amazon Web Services Secrets Manager: this is the Secrets Manager client the create and
 # the rotation of that secret go out over the in-process callback with

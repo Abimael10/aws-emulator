@@ -702,6 +702,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.license_model.as_deref(),
         )
         .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
+        // And the DB parameter group the request named has to be a group of the engine
+        // family that version belongs to: a group "can be applied only to a DB instance
+        // running a database engine and engine version compatible with that DB parameter
+        // group family", so a group of another family carries another engine's settings and
+        // could never apply to this instance
+        // ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::check_db_parameter_group_family`]).
+        // Refused before anything is stored, so no instance comes up reporting a foreign
+        // group in sync.
+        let requested_parameter_group_family: Option<String> = resolved_version
+            .map(|entry| entry.parameter_group_family.to_string())
+            .or_else(|| {
+                custom_version
+                    .as_ref()
+                    .map(|cev| cev.parameter_group_family.clone())
+            });
+        store
+            .check_db_parameter_group_family(
+                &region,
+                input.db_parameter_group_name.as_deref(),
+                requested_parameter_group_family.as_deref(),
+            )
+            .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
         // The region's DB instance quota, and the number of regions this store keeps
         // records for at all: a store that grows without bound is not what the real
         // service does, and the modelled fault says exactly this.
@@ -1229,6 +1251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             directory.record_monitoring(&dbi_resource_id, monitoring);
         }
+        drop(store);
+        // A `db.serverless` member joining an Aurora Serverless v2 cluster publishes a capacity
+        // series of its own, and a session on it is what keeps that cluster from pausing: the
+        // publisher is driven by this write so both follow the membership the store now holds
+        // ([`crate::state::serverless_capacity`]). The guard is released first — the publisher
+        // takes this same store.
+        crate::state::serverless_capacity::drive_serverless_capacity(&self.engine);
 
         Ok(CreateDBInstanceOutput {
             db_instance: Some(db_instance),

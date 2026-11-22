@@ -227,6 +227,12 @@ async fn a_db_instance_a_stack_declares_exists_in_rds_once_the_stack_reports_it_
                 "    Properties:\n",
                 "      DBInstanceIdentifier: cfn-probe-primary\n",
                 "      Engine: mysql\n",
+                // The version the instance RUNS decides which DB parameter group family it
+                // can be given: a group "can be applied only to a DB instance running a
+                // database engine and engine version compatible with that DB parameter group
+                // family", so the template names the version of the family its group
+                // declares.
+                "      EngineVersion: 8.0.40\n",
                 "      DBInstanceClass: db.t3.micro\n",
                 "      DBParameterGroupName: !Ref Params\n",
                 "  Secondary:\n",
@@ -528,6 +534,9 @@ async fn a_parameter_group_a_stack_declares_exists_in_rds_with_the_parameters_it
                 "    Type: AWS::RDS::DBInstance\n",
                 "    Properties:\n",
                 "      Engine: mysql\n",
+                // The version of the family the group above declares; see the row that
+                // declares `cfn-probe-primary`.
+                "      EngineVersion: 8.0.40\n",
                 "      DBInstanceClass: db.t3.micro\n",
                 "      DBParameterGroupName: !Ref Params\n",
             ),
@@ -714,6 +723,9 @@ async fn the_parameter_group_a_stack_declares_is_the_one_in_force_on_its_instanc
         "    Type: AWS::RDS::DBInstance\n",
         "    Properties:\n",
         "      Engine: mysql\n",
+        // The version of the family the group above declares; see the provisioning table's
+        // own rows.
+        "      EngineVersion: 8.0.40\n",
         "      DBInstanceClass: db.t3.micro\n",
         "      DBParameterGroupName: !Ref Params\n",
     );
@@ -759,6 +771,9 @@ async fn deleting_a_stack_deletes_the_db_parameter_group_it_created() {
         "    Properties:\n",
         "      DBInstanceIdentifier: cfn-probe-params-member\n",
         "      Engine: mysql\n",
+        // The version of the family the group above declares; see the provisioning table's
+        // own rows.
+        "      EngineVersion: 8.0.40\n",
         "      DBInstanceClass: db.t3.micro\n",
         "      DBParameterGroupName: !Ref Params\n",
     );

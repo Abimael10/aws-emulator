@@ -1107,6 +1107,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whatever it is now called.
         store.move_cluster_engine_endpoint(&key, &renamed_key);
         let db_cluster = store.cluster_to_wire(&answered);
+        drop(store);
+        // A modification can turn the Aurora Serverless v2 capacity of a cluster on, change its
+        // minimum to or from 0 ACUs, or change the idle period before an auto-pause: the series
+        // and the clock that publishes it follow the configuration the cluster now carries
+        // ([`crate::state::serverless_capacity`]). The guard is released first — the publisher
+        // takes this same store.
+        crate::state::serverless_capacity::drive_serverless_capacity(&self.engine);
 
         Ok(ModifyDBClusterOutput {
             db_cluster: Some(db_cluster),

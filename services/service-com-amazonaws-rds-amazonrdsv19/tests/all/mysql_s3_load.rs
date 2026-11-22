@@ -754,7 +754,7 @@ async fn an_rds_for_mysql_instance_reads_the_statement_and_answers_its_own_s3_co
     parameter_group(
         &router,
         "emu-s3-instance-pg",
-        "mysql8.0",
+        "mysql8.4",
         "aws_default_s3_role",
         &role_arn,
     )

@@ -656,6 +656,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // The DB parameter group a modification attaches has to be a group of the engine
+        // family the instance will be RUNNING: a group "can be applied only to a DB instance
+        // running a database engine and engine version compatible with that DB parameter
+        // group family", which is the one rule every operation that puts a group on an
+        // instance holds a request to
+        // ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::check_db_parameter_group_family`]).
+        // The version is the one this modification LEAVES the instance on — the one it asked
+        // for, or the one the instance already runs.
+        if input.db_parameter_group_name.is_some() {
+            let resulting_version = resolved_engine_version
+                .clone()
+                .or_else(|| store.db_instances[&key].engine_version.clone());
+            let resulting_family = crate::ops::describe_db_engine_versions::resolve_version(
+                &resulting_engine,
+                resulting_version.as_deref(),
+            )
+            .ok()
+            .flatten()
+            .map(|entry| entry.parameter_group_family.to_string())
+            .or_else(|| {
+                store
+                    .resolve_custom_db_engine_version(
+                        &region,
+                        &resulting_engine,
+                        resulting_version.as_deref().unwrap_or_default(),
+                    )
+                    .map(|cev| cev.parameter_group_family.clone())
+            });
+            store
+                .check_db_parameter_group_family(
+                    &region,
+                    input.db_parameter_group_name.as_deref(),
+                    resulting_family.as_deref(),
+                )
+                .map_err(ModifyDBInstanceError::invalid_parameter_combination)?;
+        }
+
         // What the Secrets Manager calls below need, read from the SAME record every
         // refusal here was decided against: the master user the secret holds the password
         // of, the secret the instance manages now, and the immutable id a new secret is

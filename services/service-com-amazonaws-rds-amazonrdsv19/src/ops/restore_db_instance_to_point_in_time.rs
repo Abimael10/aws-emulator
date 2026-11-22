@@ -736,6 +736,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
             }
+            // And it has to be a group of the engine family the restored instance RUNS: a
+            // group "can be applied only to a DB instance running a database engine and
+            // engine version compatible with that DB parameter group family", the same rule
+            // `CreateDBInstance` holds a request to
+            // ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::check_db_parameter_group_family`]).
+            store
+                .check_db_parameter_group_family(
+                    &region,
+                    input.db_parameter_group_name.as_deref(),
+                    resolved_version.map(|entry| entry.parameter_group_family),
+                )
+                .map_err(RestoreDBInstanceToPointInTimeError::invalid_parameter_combination)?;
 
             let mint = store.next_mint();
             // "Default: The same DB instance class as the original DB instance", and the same

@@ -630,6 +630,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
             }
+            // And it has to be a group of the engine family the restored instance RUNS: a
+            // group "can be applied only to a DB instance running a database engine and
+            // engine version compatible with that DB parameter group family", the same rule
+            // `CreateDBInstance` holds a request to
+            // ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::check_db_parameter_group_family`]).
+            store
+                .check_db_parameter_group_family(
+                    &region,
+                    input.db_parameter_group_name.as_deref(),
+                    resolved_version.map(|entry| entry.parameter_group_family),
+                )
+                .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_combination)?;
             // "RDS doesn't allow two DB instances with the same name": an identifier the
             // region already holds is the modelled conflict.
             if store.db_instances.contains_key(&key) {

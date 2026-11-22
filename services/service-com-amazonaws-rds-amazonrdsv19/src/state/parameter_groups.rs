@@ -186,6 +186,85 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 .db_parameter_groups
                 .contains_key(&(region.to_string(), folded))
     }
+
+    /// The `DBParameterGroupFamily` the DB parameter group `named` belongs to in `region`,
+    /// or `None` for a name this service cannot say the family of.
+    ///
+    /// A group "can be associated with one and only one DB parameter group family"
+    /// (`CreateDBParameterGroupMessage$DBParameterGroupFamily`), and there are two kinds of
+    /// group: one a caller created, whose record carries the family its create named, and one
+    /// of the default groups RDS provides per family, whose NAME carries it
+    /// ([`super::default_db_parameter_group_name`], `default.mysql8.0`). Both are resolved
+    /// here, so the family of a group is read the one way wherever the question is asked, and
+    /// the name is folded the way a group name is stored.
+    pub fn db_parameter_group_family(&self, region: &str, named: &str) -> Option<String> {
+        let folded = named.to_ascii_lowercase();
+        if let Some(family) = folded.strip_prefix(DEFAULT_PARAMETER_GROUP_PREFIX) {
+            return (!family.is_empty()).then(|| family.to_string());
+        }
+        self.db_parameter_groups
+            .get(&(region.to_string(), folded))
+            .map(|group| group.family.clone())
+    }
+
+    /// Refuse a DB parameter group a DB instance of the engine family `family` cannot run
+    /// under: one whose own `DBParameterGroupFamily` is another family's.
+    ///
+    /// A parameter group "can be applied only to a DB instance running a database engine and
+    /// engine version compatible with that DB parameter group family"
+    /// (`CreateDBParameterGroupMessage$DBParameterGroupFamily`), so the family of the group a
+    /// request names has to be the family of the engine version the instance RUNS — the
+    /// family the engine-version catalogue publishes for that version
+    /// ([`crate::ops::describe_db_engine_versions`]), or the one the account's own custom
+    /// engine version carries. The parameters of another family's group are another engine's
+    /// settings, which could never apply to this instance.
+    ///
+    /// Compared without case, as every other published name this service resolves is. A
+    /// request that names no group, an instance whose engine version resolves to no family,
+    /// and a group whose family this service cannot say ([`Self::db_parameter_group_family`])
+    /// are all admitted: the refusal rests on positive evidence that the two families differ.
+    ///
+    /// The refusal is [`db_parameter_group_family_mismatch_message`], answered as
+    /// `InvalidParameterCombination` — the request's parameters are each valid and cannot be
+    /// used together.
+    pub fn check_db_parameter_group_family(
+        &self,
+        region: &str,
+        named: Option<&str>,
+        family: Option<&str>,
+    ) -> Result<(), String> {
+        let (Some(named), Some(family)) = (named, family) else {
+            return Ok(());
+        };
+        let Some(carried) = self.db_parameter_group_family(region, named) else {
+            return Ok(());
+        };
+        if carried.eq_ignore_ascii_case(family) {
+            return Ok(());
+        }
+        Err(db_parameter_group_family_mismatch_message(
+            named, &carried, family,
+        ))
+    }
+}
+
+/// How Amazon RDS refuses a DB parameter group of ANOTHER engine family: the fixed sentence
+/// pair "The parameter group `<named>` with DBParameterGroupFamily `<carried>` can't be used
+/// for this instance. Use a parameter group with DBParameterGroupFamily `<family>`."
+///
+/// The three variable parts are the group the request named, the family that group carries,
+/// and the family the instance's own engine version belongs to — which is the one the caller
+/// has to pick a group from. Stated once here so every operation that associates a DB
+/// parameter group with an instance words the refusal the same way.
+pub fn db_parameter_group_family_mismatch_message(
+    named: &str,
+    carried: &str,
+    family: &str,
+) -> String {
+    format!(
+        "The parameter group {named} with DBParameterGroupFamily {carried} can't be used for \
+         this instance. Use a parameter group with DBParameterGroupFamily {family}."
+    )
 }
 
 /// One parameter value a caller set on a group.

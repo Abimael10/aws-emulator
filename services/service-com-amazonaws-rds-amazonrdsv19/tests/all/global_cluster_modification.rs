@@ -411,7 +411,7 @@ async fn an_engine_upgrade_runs_for_a_span_and_the_requests_that_status_refuses_
             "aurora-postgresql",
             "16.4",
             "16",
-            "16.6",
+            "16.9",
         ),
     ];
 

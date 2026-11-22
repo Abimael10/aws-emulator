@@ -213,7 +213,7 @@ async fn a_group_a_db_instance_is_using_is_refused_with_the_state_fault_then_rel
 
     for &(case, group, named_by_instance, instance) in cases {
         let router = emulator();
-        expect_ok(case, create_group(&router, REGION, group, "mysql8.0").await);
+        expect_ok(case, create_group(&router, REGION, group, "mysql8.4").await);
         expect_ok(
             case,
             create_instance_in(&router, instance, named_by_instance).await,

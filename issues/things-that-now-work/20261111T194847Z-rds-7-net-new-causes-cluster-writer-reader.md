@@ -14,6 +14,40 @@ Issue-Commit: e21bce568e55aa711693c4fe92684e1cee8c7595
 
 # rds: 7 net-new causes — cluster writer/reader endpoints are not cluster-domain hostnames, no automated snapshot is ever taken, a foreign-family parameter group is accepted, the postgres/aurora-postgresql minor catalog is below its shipped floor, Serverless v2 auto-pause/ServerlessDatabaseCapacity never report, and storage autoscaling never fires
 
+## Resolution
+
+FOUR of the seven causes are FIXED and their replay units pass: cause 2 (an automated snapshot
+is taken and listed), cause 3 (a foreign-family DB parameter group is refused with HTTP 400
+`InvalidParameterCombination` by every operation that puts a group on an instance), cause 4 (the
+engine-version catalogue's PostgreSQL-compatible families reach the builds AWS ships) and cause 5
+(`AWS/RDS` `ServerlessDatabaseCapacity` is published, a MinCapacity-0 cluster pauses after its
+`SecondsUntilAutoPause` and resumes on the next session with its rows intact).
+
+THREE causes are DECLINED, each on one blocker outside this service crate, and each still
+observable as a failing replay unit:
+
+* Cause 1 (`Endpoint` is not the `<identifier>.cluster-<suffix>` name) — the writer endpoint is
+  the one member a client dials, with the one `DBCluster$Port` beside it. Publishing the AWS DNS
+  form there was implemented and measured: the form assertion passed, and the behavioural
+  harness then REJECTED the published host ("its host is not one of the emulator's own hosts; a
+  customer of the emulator needs http(s)://127.0.0.1:<port>/… or http(s)://<own host>:<port>/…"),
+  while both Serverless v2 units regressed from reaching their data plane to
+  `PublishedUrlRejected`. It was reverted: the blocker is the platform's published-address
+  contract, which no change in this crate can satisfy together with the AWS DNS form.
+* Cause 6 (a held session must keep a MinCapacity-0 cluster awake) — the capacity half is
+  implemented and tested, but the CORE drops a silent TCP connection after
+  `caps::IDLE_TIMEOUT_SECS = 300` (`vendor/server/src/listener_guard.rs:42`) and
+  `Listeners::tcp_plaintext` (`vendor/server/src/listeners.rs:230`) gives a service no way to ask
+  for a longer idle timeout — `tcp_with_idle` does, but only for the TLS-only path. The check
+  holds one session for 360 s, so the core severs it. Required core change: a plaintext resource
+  listener that takes its idle timeout (or none) from the service that opens it.
+* Cause 7 (storage autoscaling) — the rule is implemented and driven by the storage the
+  instance's engine has really allocated (`src/state/storage_autoscaling.rs`), but the recorded
+  check must fill a 20 GiB instance past ~90% used (~18 GiB) and this data plane bounds one
+  instance to 64 MiB per database over at most 64 databases
+  (`src/state/data_plane/sql_engine.rs:87`, `:123` — about 4 GiB in all), so the low-storage
+  condition cannot be produced in-process.
+
 > _Note: this issue was identified against the code base at commit `e21bce568e55aa711693c4fe92684e1cee8c7595`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

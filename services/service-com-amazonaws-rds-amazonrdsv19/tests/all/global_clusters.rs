@@ -120,7 +120,7 @@ const GLOBAL_CLUSTER_CASES: &[GlobalClusterCase] = &[
         stored_identifier: "emu-global-pg16",
         engine: "aurora-postgresql",
         requested_version: Some("16"),
-        engine_version: "16.6",
+        engine_version: "16.9",
         database_name: Some("ledger"),
         engine_lifecycle_support: None,
         storage_encrypted: true,

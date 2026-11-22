@@ -543,7 +543,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // `DBParameterGroupName`: a name that matches no group — one a request created
             // or one of RDS's own defaults — is the modelled not-found fault, and a group of
-            // another engine's family is the combination refusal above.
+            // another engine family is the combination refusal the create answers.
             let db_parameter_group_name = match &input.db_parameter_group_name {
                 None => source.db_parameter_group_name.clone(),
                 Some(named) => {
@@ -560,19 +560,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .into(),
                         );
                     };
-                    if !crate::state::family_belongs_to_engine(&group.family, &source.engine) {
-                        return Err(
-                            CreateDBInstanceReadReplicaError::invalid_parameter_combination(
-                                format!(
-                                    "The parameter group {named} belongs to the DB parameter \
-                                     group family {}, which is not a family of the source DB \
-                                     instance's engine {}",
-                                    group.family, source.engine
-                                ),
-                            ),
-                        );
-                    }
-                    Some(group.name.clone())
+                    let group_name = group.name.clone();
+                    // A replica runs the engine version its SOURCE runs, so the family the
+                    // group has to carry is that version's — the one rule every operation
+                    // that puts a DB parameter group on an instance holds a request to
+                    // ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::check_db_parameter_group_family`]).
+                    let source_family = crate::ops::describe_db_engine_versions::resolve_version(
+                        &source.engine,
+                        source.engine_version.as_deref(),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.parameter_group_family);
+                    store
+                        .check_db_parameter_group_family(
+                            &region,
+                            Some(named.as_str()),
+                            source_family,
+                        )
+                        .map_err(
+                            CreateDBInstanceReadReplicaError::invalid_parameter_combination,
+                        )?;
+                    Some(group_name)
                 }
             };
             // `OptionGroupName`: the same rule for the option group, read from the group's

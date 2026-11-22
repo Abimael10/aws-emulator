@@ -957,14 +957,16 @@ async fn the_log_file_carries_the_statements_the_engine_executed() {
     for (index, (case, engine, parameter, value, log_file)) in
         STATEMENT_LOG_CASES.iter().enumerate()
     {
-        // One store per row: each engine's parameter group belongs to its own engine family.
+        // One store per row: each engine's parameter group belongs to its own engine family,
+        // which is the family of the version the instance is created on — a group of another
+        // family cannot be applied to it.
         let router = emulator();
         let group = format!("emu-stmt-log-{index}");
         let identifier = format!("emu-stmt-log-{index}");
         let family = if *engine == "postgres" {
             "postgres18"
         } else {
-            "mysql8.0"
+            "mysql8.4"
         };
         expect_ok(
             case,

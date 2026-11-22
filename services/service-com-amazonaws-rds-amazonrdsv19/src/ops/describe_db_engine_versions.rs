@@ -1624,6 +1624,26 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "13",
         "aurora-postgresql13",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_13,
+    ),
+    // The build each PostgreSQL-compatible family has MOVED TO, beside the older builds of
+    // the same family above it. A family's rows have to reach the builds the engine is being
+    // created with today (see the Aurora MySQL 3 row above): a client that reads the newest
+    // minor this catalogue lists for a family and creates with it is naming the version the
+    // engine still offers, and a family whose rows stop at an older build hands that client a
+    // version AWS has long since moved past. Being the family's last row, each is also its
+    // default — an in-family automatic minor upgrade moves onto the family's default build.
+    //
+    // SOURCE: the Aurora PostgreSQL release list AWS publishes per major-version family
+    // (`DescribeDBEngineVersions(Engine="aurora-postgresql")`), whose minors are the
+    // community PostgreSQL releases the family packages.
+    row(
+        "aurora-postgresql",
+        "13.20",
+        "13",
+        "aurora-postgresql13",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &AURORA_POSTGRESQL_13,
     ),
@@ -1633,12 +1653,39 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "14",
         "aurora-postgresql14",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_13,
+    ),
+    row(
+        "aurora-postgresql",
+        "14.19",
+        "14",
+        "aurora-postgresql14",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &AURORA_POSTGRESQL_13,
     ),
     row(
         "aurora-postgresql",
         "15.8",
+        "15",
+        "aurora-postgresql15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_15,
+    ),
+    row(
+        "aurora-postgresql",
+        "15.10",
+        "15",
+        "aurora-postgresql15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_15,
+    ),
+    row(
+        "aurora-postgresql",
+        "15.14",
         "15",
         "aurora-postgresql15",
         STATUS_AVAILABLE,
@@ -1671,6 +1718,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     row(
         "aurora-postgresql",
         "16.6",
+        "16",
+        "aurora-postgresql16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_15,
+    ),
+    row(
+        "aurora-postgresql",
+        "16.9",
         "16",
         "aurora-postgresql16",
         STATUS_AVAILABLE,
@@ -2557,6 +2613,22 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "13",
         "postgres13",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    // The build each RDS for PostgreSQL family has MOVED TO; the Aurora PostgreSQL rows above
+    // say why a family's newest row is the build the engine is being created with today and
+    // why that row is the family's default.
+    //
+    // SOURCE: the RDS for PostgreSQL release list AWS publishes per major-version family
+    // (`DescribeDBEngineVersions(Engine="postgres")`), whose minors are the community
+    // PostgreSQL releases of that family.
+    row(
+        "postgres",
+        "13.23",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &POSTGRES,
     ),
@@ -2566,12 +2638,30 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "14",
         "postgres14",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.22",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &POSTGRES,
     ),
     row(
         "postgres",
         "15.8",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.17",
         "15",
         "postgres15",
         STATUS_AVAILABLE,
@@ -2593,12 +2683,39 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16",
         "postgres16",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.8",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.13",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &POSTGRES,
     ),
     row(
         "postgres",
         "17.2",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.9",
         "17",
         "postgres17",
         STATUS_AVAILABLE,

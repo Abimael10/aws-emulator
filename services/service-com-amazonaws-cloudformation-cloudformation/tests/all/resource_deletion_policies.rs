@@ -122,6 +122,11 @@ const POLICY_CASES: &[PolicyCase] = &[
             "    Properties:\n",
             "      DBInstanceIdentifier: policy-retain-params-instance\n",
             "      Engine: mysql\n",
+            // The version the instance RUNS decides which DB parameter group family it can
+            // be given: a group "can be applied only to a DB instance running a database
+            // engine and engine version compatible with that DB parameter group family", so
+            // the template names the version of the family its group declares.
+            "      EngineVersion: 8.0.40\n",
             "      DBInstanceClass: db.t3.micro\n",
             "      DBParameterGroupName: !Ref Params\n",
         ),
