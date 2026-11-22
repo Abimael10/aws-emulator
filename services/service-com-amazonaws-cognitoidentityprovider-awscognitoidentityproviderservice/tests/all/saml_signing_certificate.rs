@@ -57,8 +57,9 @@ const SHA256_WITH_RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.11";
 /// verifier accepts.
 const RSA_MODULUS_BYTES: usize = 256;
 
-/// One emulator with just this service mounted.
-fn router() -> MultiServiceRouter {
+/// One emulator with just this service mounted. Shared with the sibling suite
+/// that pins WHICH Region of a replicated pool serves this operation.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(cognito_idp::EmulatedService::new(engine));
@@ -71,7 +72,7 @@ fn router() -> MultiServiceRouter {
 /// The Region travels in the request's SigV4 credential scope, which is what
 /// decides the Region a created pool lives in; the signature itself is never
 /// checked here.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -111,7 +112,12 @@ async fn call(
 }
 
 /// Call `operation`, requiring success, and return its response body.
-async fn ok(router: &MultiServiceRouter, region: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, payload) = call(router, region, operation, body).await;
     assert_eq!(
         status, 200,
@@ -121,7 +127,7 @@ async fn ok(router: &MultiServiceRouter, region: &str, operation: &str, body: &V
 }
 
 /// The `__type` of an error body, which is the wire error code.
-fn error_code(payload: &Value) -> &str {
+pub(crate) fn error_code(payload: &Value) -> &str {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -129,7 +135,7 @@ fn error_code(payload: &Value) -> &str {
 }
 
 /// The `message` of an error body.
-fn error_message(payload: &Value) -> &str {
+pub(crate) fn error_message(payload: &Value) -> &str {
     payload
         .get("message")
         .or_else(|| payload.get("Message"))
@@ -247,7 +253,7 @@ async fn create_pool(router: &MultiServiceRouter, case: &Case) -> (String, f64) 
 }
 
 /// Read the pool's signing certificate through the operation.
-async fn signing_certificate(
+pub(crate) async fn signing_certificate(
     router: &MultiServiceRouter,
     region: &str,
     user_pool_id: &str,
@@ -376,7 +382,7 @@ fn published_rsa_keys(case: &str, key_set: &Value) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// Read `certificate` the way the operator installing it at an identity provider
 /// does: the member is base64, with none of the armour or line breaks a PEM block
 /// carries, and what it decodes to is a DER X.509 certificate.
-fn parse(case: &str, certificate: &str) -> x509_cert::Certificate {
+pub(crate) fn parse(case: &str, certificate: &str) -> x509_cert::Certificate {
     assert!(
         !certificate.is_empty(),
         "case {case:?}: the certificate must not be empty"

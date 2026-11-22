@@ -8,6 +8,12 @@
 //! reads of one pool answer one certificate and a pool this service does not
 //! hold is refused.
 //!
+//! It is served in the pool's PRIMARY Region alone: the certificate is the
+//! pool's own configuration rather than anything specific to one replica, so a
+//! Region holding only a secondary replica of the pool does not serve this
+//! operation (`crate::state::PoolRegionRole`), and a Region the pool holds no
+//! replica in resolves no pool of that id at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -153,10 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
 
         // A pure read: the certificate the pool was issued is rendered, and
         // nothing about the pool moves. A renewal hands out a SECOND certificate
@@ -167,6 +175,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = guard
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // WHICH Region the request reached decides whether this pool answers it
+        // there at all. The certificate belongs to the pool rather than to one
+        // of its replicas, so only the Region holding the primary replica — the
+        // one that "supports all end user and administrator operations" — serves
+        // it; a Region holding a secondary replica serves "a limited set" that
+        // this operation is outside of, and a Region the pool was never
+        // replicated to holds no pool of this id to read a certificate from.
+        match pool.region_role(&region, now) {
+            crate::state::PoolRegionRole::Primary => {}
+            crate::state::PoolRegionRole::SecondaryReplica => {
+                return Err(operation_not_enabled_in_region())
+            }
+            crate::state::PoolRegionRole::NoReplica => {
+                return Err(user_pool_not_found(&input.user_pool_id))
+            }
+        }
+
         let certificate = pool
             .saml_signing_certificate()
             .ok_or_else(certificate_not_issued)?;
@@ -176,10 +202,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's `ResourceNotFoundException` for an absent user pool.
+/// This operation's `ResourceNotFoundException` for a user pool the Region the
+/// request reached does not hold: one no pool carries the id of, and one the
+/// named pool was never replicated to that Region.
 fn user_pool_not_found(user_pool_id: &str) -> GetSigningCertificateError {
     GetSigningCertificateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool {user_pool_id} does not exist.")),
+        message: Some(crate::state::user_pool_not_found_message(user_pool_id)),
+    })
+    .into()
+}
+
+/// This operation's `OperationNotEnabledException` for a request addressed to a
+/// Region that holds only a SECONDARY replica of the pool, where the operation
+/// is not served. Its message is the fixed text of this error class
+/// ([`crate::state::OPERATION_NOT_ENABLED_IN_REGION_MESSAGE`]): it interpolates
+/// neither the Region nor the pool.
+fn operation_not_enabled_in_region() -> GetSigningCertificateError {
+    GetSigningCertificateErrorModeled::OperationNotEnabledException(OperationNotEnabledException {
+        message: Some(crate::state::OPERATION_NOT_ENABLED_IN_REGION_MESSAGE.to_string()),
     })
     .into()
 }

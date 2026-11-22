@@ -22,6 +22,10 @@ mod user_pool;
 /// The resources a pool holds beside its users: hosted domains, replicas and app
 /// clients.
 mod pool_resources;
+/// Which Region answers for a pool: what the Region a request reached is to the
+/// pool it names, and the refusal a Region that does not serve an operation
+/// answers.
+mod pool_region_role;
 /// The order a pool holds the OAuth scopes an app client may authorize in.
 mod scope_order;
 /// The cross-member preconditions a user-pool write has to satisfy before the
@@ -97,6 +101,7 @@ pub use identity_providers::*;
 pub use mfa_challenge::*;
 pub use openid_discovery::*;
 pub use pool_preconditions::*;
+pub use pool_region_role::*;
 pub use pool_resources::*;
 pub use refresh_token_jwe::*;
 pub use refresh_token_auth::*;
