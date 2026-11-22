@@ -200,6 +200,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would against a portal that was still there.
         store.delete_portal(&input.portal_id, ::std::time::SystemTime::now());
 
+        // And nothing answers at the ADDRESS the portal published: dropping the socket's
+        // handle closes the port and severs every connection in flight on it, so a client
+        // that kept fetching the site of a deleted portal reaches nothing rather than a
+        // page the account no longer holds.
+        store.portal_transport.forget(&input.portal_id);
+
         Ok(DeletePortalOutput)
     }
 }

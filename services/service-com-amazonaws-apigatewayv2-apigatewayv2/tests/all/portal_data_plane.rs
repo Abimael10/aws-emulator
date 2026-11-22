@@ -7,7 +7,7 @@
 //! portal created with `Authorization={None:{}}` and API Gateway's default domain, published
 //! and then disabled):
 //!
-//! > A portal's own domain — the one API Gateway generated for it
+//! > A portal's own domain — the one it publishes
 //! > (`EndpointConfigurationResponse$PortalDefaultDomainName`) or the one the account
 //! > brought — serves the build of that portal's LAST SETTLED PUBLISH and nothing else: a
 //! > portal nothing has published, a portal whose publish is still in flight and a portal
@@ -23,9 +23,10 @@
 //! assert the status BEFORE and AFTER each build rather than only the `PublishStatus` the
 //! control plane reports.
 //!
-//! The rows span what the rule generalises over: how the request addresses the portal (its
-//! generated domain, the custom domain it carries, and the emulator's own endpoint with the
-//! portal's endpoint behind the reserved path marker, in both of its spellings), the
+//! The rows span what the rule generalises over: how the request addresses the portal (the
+//! address its endpoint configuration publishes, the custom domain it carries, and the
+//! emulator's own endpoint with the portal's endpoint behind the reserved path marker, in
+//! both of its spellings), the
 //! portal's `Authorization` alternative (`None` and a `CognitoConfig`), what its content
 //! carries (the required members only, and a description, a logo and two portal products
 //! with product pages and product REST endpoint pages), and the publication state the
@@ -323,7 +324,7 @@ fn cognito_portal() -> Value {
 fn rows() -> &'static [Row] {
     &[
         Row {
-            case: "the generated domain, the addressing the endpoint configuration reports",
+            case: "the address the endpoint configuration publishes",
             request: open_portal,
             address: |published| (published.default_domain.clone(), "/".to_string()),
         },
@@ -351,7 +352,7 @@ fn rows() -> &'static [Row] {
             },
         },
         Row {
-            case: "the emulator's own endpoint with the generated domain in the path",
+            case: "the emulator's own endpoint with the published address in the path",
             request: cognito_portal,
             address: |published| {
                 (
@@ -681,30 +682,23 @@ async fn the_preview_url_serves_the_portals_current_content_once_it_is_ready() {
     );
 }
 
-/// The URL a portal ANNOUNCES for its preview is an address the client that created it can
-/// fetch: a create addressed at the emulator's own endpoint announces that endpoint with the
-/// portal behind the reserved path marker, a create addressed at this service's AWS host
-/// announces the generated domain, and either way the announced URL is where the preview is
-/// served — while `portalDefaultDomainName` stays the generated DOMAIN NAME, which carries
-/// no authority and no path (asserted over its own rows in `portal_lifecycle`).
+/// The address a portal ANNOUNCES is one the client that created it can fetch, whichever
+/// endpoint that client reached this emulator at: `portalDefaultDomainName` is the
+/// `host:port` of the socket this emulator serves the portal's site on, the site is served at
+/// the ROOT of it, and the preview URL `Preview$PreviewUrl` announces is that same address
+/// with the preview's own path.
 #[tokio::test]
 async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
-    // (case, the host CreatePortal was addressed at, whether that host is the emulator's
-    // own endpoint)
-    let cases: &[(&str, &str, bool)] = &[
-        (
-            "created through the emulator's own endpoint",
-            LOCAL_ENDPOINT,
-            true,
-        ),
-        ("created through localhost", "localhost:9297", true),
+    // (case, the host CreatePortal was addressed at)
+    let cases: &[(&str, &str)] = &[
+        ("created through the emulator's own endpoint", LOCAL_ENDPOINT),
+        ("created through localhost", "localhost:9297"),
         (
             "created through this service's own AWS host",
             "apigateway.eu-west-1.amazonaws.com",
-            false,
         ),
     ];
-    for (case, host, local) in cases {
+    for (case, host) in cases {
         let emulator = emulator();
         let (status, created) = call_at_host(
             &emulator,
@@ -724,29 +718,18 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
             .get("endpointConfiguration")
             .cloned()
             .unwrap_or(Value::Null);
-        // The generated domain name is what the endpoint configuration reports, whichever
-        // endpoint this create was addressed at: it is a domain NAME.
-        let generated = crate::portal_lifecycle::generated_domain_name(&portal_id, REGION);
-        assert_eq!(
-            as_str(&endpoint, "portalDefaultDomainName"),
-            generated,
-            "case {case:?}: the portal must report its generated domain name, got {endpoint}"
+        // The address the portal publishes is one this emulator answers on, whichever
+        // endpoint this create was addressed at.
+        let announced = as_str(&endpoint, "portalDefaultDomainName");
+        assert!(
+            announced.parse::<std::net::SocketAddr>().is_ok(),
+            "case {case:?}: the portal must publish an address a client can fetch, got \
+             {endpoint}"
         );
-        // The address this emulator serves that portal's website at, which its URL-typed
-        // members name: the endpoint the creating client reached.
-        let announced = if *local {
-            format!("{host}/_aws/portal/{portal_id}")
-        } else {
-            generated.clone()
-        };
 
         // It is the address that SERVES the portal: a client that fetches what it was
         // announced reaches this portal's page once a publish has settled.
-        let (host_part, path_part) = match announced.split_once('/') {
-            Some((host, path)) => (host.to_string(), format!("/{path}/")),
-            None => (announced.clone(), "/".to_string()),
-        };
-        let page = fetch(&emulator, &host_part, &path_part).await;
+        let page = fetch(&emulator, &announced, "/").await;
         refused(
             &format!("{case}: before the publish"),
             &page,
@@ -754,7 +737,7 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
             FORBIDDEN_MESSAGE,
         );
         build(&emulator, case, &portal_id, Build::Publish).await;
-        let page = fetch_path_until_served(&emulator, case, &host_part, &path_part).await;
+        let page = fetch_path_until_served(&emulator, case, &announced, "/").await;
         served(case, &page, &portal_id);
 
         // The preview URL the service announces is built from that same address, and the
@@ -796,12 +779,11 @@ async fn a_portal_announces_a_preview_url_its_creator_can_fetch() {
             format!("https://{announced}/{PORTAL_PREVIEW_SEGMENT}"),
             "case {case:?}: the preview URL must name the announced address, got {read}"
         );
-        let preview_path =
-            format!("{}/{PORTAL_PREVIEW_SEGMENT}", path_part.trim_end_matches('/'));
+        let preview_path = format!("/{PORTAL_PREVIEW_SEGMENT}");
         let page = fetch_path_until_served(
             &emulator,
             &format!("{case}: the preview"),
-            &host_part,
+            &announced,
             &preview_path,
         )
         .await;

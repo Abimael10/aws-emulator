@@ -69,16 +69,17 @@ use ::tokio::io::AsyncReadExt as _;
 use super::websocket::endpoint_http::{Addressed, Readdress};
 use crate::state::ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore;
 
-/// The host the re-addressed request names this emulator's front door by: the endpoint that
-/// names THIS service, so the request resolves to the plane it is meant for. The api itself
-/// is named by the reserved data-plane path, not by this host.
-const SERVICE_ENDPOINT: &str = "apigateway.amazonaws.com";
+/// The host the re-addressed request names this emulator's front door by — the one every
+/// core-owned socket of this service re-addresses at
+/// (`super::data_plane::SERVICE_ENDPOINT_HOST`). The api itself is named by the reserved
+/// data-plane path, not by this host.
+const SERVICE_ENDPOINT: &str = super::data_plane::SERVICE_ENDPOINT_HOST;
 
 /// The status API Gateway's front door turns a request away with when it reaches no api of
 /// the account — here, a path no api mapping of the domain name answers to — and the sentence
 /// it carries, which is the one every refusal of this service's data planes carries
 /// (`super::data_plane::FORBIDDEN_MESSAGE`).
-const FORBIDDEN: u16 = 403;
+const FORBIDDEN: u16 = super::data_plane::FORBIDDEN_STATUS;
 const FORBIDDEN_MESSAGE: &str = super::data_plane::FORBIDDEN_MESSAGE;
 
 /// The status a request whose `Host` is not the name this address was published for is

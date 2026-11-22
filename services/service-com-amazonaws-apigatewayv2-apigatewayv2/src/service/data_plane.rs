@@ -115,6 +115,16 @@ pub const NOT_FOUND_MESSAGE: &str = "Not Found";
 /// what the data planes read are one constant.
 pub use crate::state::LOCAL_ENDPOINT_PREFIX;
 
+/// The host a core-owned SOCKET of this service names this emulator's own front door by when
+/// it re-addresses a request there: the endpoint that names THIS service, so the request
+/// resolves to the plane it is meant for. The resource itself is named by the reserved
+/// data-plane path behind [`LOCAL_ENDPOINT_PREFIX`], never by this host.
+///
+/// Read by every socket that re-addresses — a custom domain name's
+/// ([`super::domain_name_socket`]) and a portal's ([`super::portal_socket`]) — so the two
+/// cannot drift apart.
+pub const SERVICE_ENDPOINT_HOST: &str = "apigateway.amazonaws.com";
+
 /// The identity-source spellings that name a REQUEST HEADER, from
 /// `Authorizer$IdentitySource`: "this value is route.request.header.Auth … for WebSocket
 /// APIs. For HTTP APIs, use selection expressions prefixed with $, for example,

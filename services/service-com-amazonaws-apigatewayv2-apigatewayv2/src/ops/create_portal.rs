@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortal
-//! IMPLEMENTED: mints a `PortalId` and its ARN, resolves the endpoint configuration the
-//! request asked for, persists a [`crate::state::Portal`] record under that id, and
-//! answers with that STORED record. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a `PortalId` and its ARN, opens the socket this emulator serves the
+//! portal's website on (`crate::service::portal_socket`) and publishes the address it landed
+//! on as the portal's default domain, resolves the endpoint configuration the request asked
+//! for, persists a [`crate::state::Portal`] record under that id, and answers with that
+//! STORED record. This is the ONLY file to touch for this operation.
 //!
 //! A portal is created unpublished — [`crate::state::PUBLISH_STATUS_DISABLED`] — so it
 //! reports no `LastPublished` until `PublishPortal` has run.
@@ -238,53 +240,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortal"));
         };
+
+        // What this create has to weigh against the STORE, in the order this API reports
+        // those refusals. Applied twice: once before the portal's socket is opened and again
+        // under the lock the record is written through, because the first lock is released
+        // while the socket is opened and two creates in flight at once must not both pass a
+        // check made before either inserted.
+        let weigh = |store: &crate::state::ComAmazonawsApigatewayv2Apigatewayv2State,
+                     included: &[String]|
+         -> Result<(), Self::Error> {
+            // Bound the growth a caller drives: `TooManyRequestsException` is the modelled
+            // error for "a limit has been exceeded", and it names the limit in `LimitType`.
+            // The quota counts the portals the account HOLDS, so a deleted portal occupies no
+            // slot however long its tombstone is kept for `GetPortal` to report.
+            if store.live_portals().count() >= crate::state::MAX_PORTALS {
+                return Err(CreatePortalErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        limit_type: Some("Portal".to_string()),
+                        message: Some(format!(
+                            "The maximum number of portals ({}) for this account has been \
+                             reached.",
+                            crate::state::MAX_PORTALS
+                        )),
+                    },
+                )
+                .into());
+            }
+            // And the growth ONE portal drives: every product it includes is rendered into
+            // the page its domain serves, so the list it stores is bounded here. Weighed
+            // BEFORE each ARN is resolved, so a list past the bound is refused for its length
+            // whatever it names.
+            if let Err(message) = crate::state::validate_included_portal_product_count(included) {
+                return Err(CreatePortalErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        limit_type: Some("PortalProduct".to_string()),
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // Every included product has to be one the account HOLDS: the portal renders each
+            // of them, so an ARN naming a product nothing created is refused with the
+            // sentence this API reports an unresolved product with
+            // ([`crate::state::unresolved_included_portal_product`]). Checked before anything
+            // is minted, so a refused create stores nothing.
+            if let Some(message) = crate::state::unresolved_included_portal_product(
+                &store.portal_products,
+                included.iter().map(String::as_str),
+            ) {
+                return Err(bad_request(message));
+            }
+            Ok(())
+        };
+
+        // The id and the position in the account's creation order are minted together, under
+        // one lock, so the seed read here is the one THIS portal's id was minted from however
+        // many creates run beside it.
+        let (portal_id, creation_order) = {
+            let mut store = state.lock();
+            weigh(&store, &included_portal_product_arns)?;
+            let portal_id = store.mint_portal_id();
+            (portal_id, store.portal_id_seed)
+        };
+
+        // The address this record PUBLISHES has to be one a client can fetch: the socket this
+        // portal's website is reached on is opened with the store's guard released, and the
+        // record is written once it has landed — so the value `PortalDefaultDomainName`
+        // reports is the address that socket answers on, and so is every URL-typed member
+        // that sends a client to the site.
+        let opened = crate::service::portal_socket::open_for_portal(
+            &*self.engine,
+            ctx.callback().clone(),
+            &portal_id,
+        )
+        .await;
+        let (portal_default_domain_name, site_base, socket) = match opened {
+            Ok(opened) => (
+                opened.authority.clone(),
+                opened.authority,
+                Some(opened.listener),
+            ),
+            Err(reason) => {
+                // An emulator that could not open a socket for this portal publishes the name
+                // API Gateway's own zone would carry: the record is still created — its whole
+                // control plane is unaffected — and only the address nothing serves is what a
+                // client cannot reach.
+                ::tracing::warn!(
+                    %portal_id,
+                    %reason,
+                    "this portal is published under the name API Gateway's own zone would \
+                     carry: no socket of this emulator could be opened for it"
+                );
+                (
+                    crate::state::portal_default_domain_name(&portal_id, &region),
+                    crate::state::announced_portal_site_base(&portal_id, &region, ctx.parts()),
+                    ::std::option::Option::None,
+                )
+            }
+        };
+
         let mut store = state.lock();
-
-        // Bound the growth a caller drives: `TooManyRequestsException` is the modelled
-        // error for "a limit has been exceeded", and it names the limit in `LimitType`.
-        // The quota counts the portals the account HOLDS, so a deleted portal occupies no
-        // slot however long its tombstone is kept for `GetPortal` to report.
-        if store.live_portals().count() >= crate::state::MAX_PORTALS {
-            return Err(CreatePortalErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    limit_type: Some("Portal".to_string()),
-                    message: Some(format!(
-                        "The maximum number of portals ({}) for this account has been reached.",
-                        crate::state::MAX_PORTALS
-                    )),
-                },
-            )
-            .into());
+        weigh(&store, &included_portal_product_arns)?;
+        if let Some(socket) = socket {
+            // The socket's life is this record's from here on: the handle is held on the
+            // store under the portal's own id, and the delete drops it. Remembered only once
+            // the checks above pass, so a refusal DROPS it — which closes the port.
+            store.portal_transport.remember(&portal_id, socket);
         }
-        // And the growth ONE portal drives: every product it includes is rendered into
-        // the page its domain serves, so the list it stores is bounded here. Weighed BEFORE
-        // each ARN is resolved, so a list past the bound is refused for its length whatever
-        // it names.
-        if let Err(message) =
-            crate::state::validate_included_portal_product_count(&included_portal_product_arns)
-        {
-            return Err(CreatePortalErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    limit_type: Some("PortalProduct".to_string()),
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
-        // Every included product has to be one the account HOLDS: the portal renders each
-        // of them, so an ARN naming a product nothing created is refused with the sentence
-        // this API reports an unresolved product with
-        // ([`crate::state::unresolved_included_portal_product`]). Checked before anything is
-        // minted, so a refused create stores nothing.
-        if let Some(message) = crate::state::unresolved_included_portal_product(
-            &store.portal_products,
-            included_portal_product_arns.iter().map(String::as_str),
-        ) {
-            return Err(bad_request(message));
-        }
-
-        let portal_id = store.mint_portal_id();
         let created_at = ::std::time::SystemTime::now();
 
         // `PortalTheme$LogoLastUploaded` ("The timestamp when the logo was last
@@ -300,21 +362,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::Portal {
             portal_arn: crate::state::portal_arn(&region, &portal_id),
-            // The seed the id was just minted from counts the portals this account has
-            // created, so it IS this portal's position in that order — what `ListPortals`
-            // reports the collection in, since the minted id carries no ordering of its
-            // own.
-            creation_order: store.portal_id_seed,
+            // The seed the id was minted from counts the portals this account has created,
+            // so it IS this portal's position in that order — what `ListPortals` reports the
+            // collection in, since the minted id carries no ordering of its own.
+            creation_order,
             authorization: input.authorization,
-            endpoint_configuration: crate::state::resolve_portal_endpoint_configuration(
-                &portal_id,
-                &region,
+            endpoint_configuration: crate::state::portal_endpoint_configuration(
+                portal_default_domain_name,
+                crate::state::portal_domain_hosted_zone_id(&region),
                 &input.endpoint_configuration,
             ),
-            // Where this emulator SERVES that portal's website for the client that created
-            // it, which is what the portal's URL-typed members name; the generated domain
-            // name above is a domain NAME and carries no authority and no path.
-            site_base: crate::state::announced_portal_site_base(&portal_id, &region, ctx.parts()),
+            // Where this emulator SERVES that portal's website, which is what the portal's
+            // URL-typed members name: the same address its default domain publishes, since
+            // the site is served at the root of that address.
+            site_base,
             included_portal_product_arns,
             logo_uri: input.logo_uri,
             portal_content,

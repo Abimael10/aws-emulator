@@ -208,10 +208,14 @@ fn resolve<'s, 'r>(
 /// The portal whose own domain `host` is, or `None` for a host no portal of this service
 /// records.
 ///
-/// Both domains a portal reports are its own: the default one API Gateway generated and the
-/// `DomainName` the account brought ("You can provide a custom domain to override this
-/// value"). The comparison is case-insensitive and ignores any `:port` and userinfo,
-/// because a host is not case-sensitive and the port is not part of the name.
+/// Both domains a portal reports are its own: the default one it publishes — the address of
+/// the socket this emulator serves its site on ([`crate::state::portal_transport`]), which
+/// carries the PORT that address answers on — and the `DomainName` the account brought ("You
+/// can provide a custom domain to override this value").
+///
+/// A host is compared case-insensitively (RFC 4343) and without its userinfo, BOTH as the
+/// request wrote it (with the `:port`, which is what matches a published address) and with the
+/// port removed (which is what matches a name, where the port is no part of it).
 ///
 /// Only a portal the account still HOLDS claims its domains: a portal `DeletePortal` has
 /// taken away serves nothing, so the host it recorded is a host this service answers for no
@@ -220,17 +224,18 @@ fn portal_of_host<'s>(
     store: &'s ComAmazonawsApigatewayv2Apigatewayv2State,
     host: &str,
 ) -> Option<&'s Portal> {
+    let authority = host.rsplit('@').next().unwrap_or(host).trim();
     let name = host_name(host);
-    if name.is_empty() {
+    if authority.is_empty() || name.is_empty() {
         return None;
     }
+    let addresses = |reported: &str| {
+        reported.eq_ignore_ascii_case(authority) || reported.eq_ignore_ascii_case(name)
+    };
     store.live_portals().find(|portal| {
         let endpoint = &portal.endpoint_configuration;
-        endpoint.portal_default_domain_name.eq_ignore_ascii_case(name)
-            || endpoint
-                .domain_name
-                .as_deref()
-                .is_some_and(|domain| domain.eq_ignore_ascii_case(name))
+        addresses(&endpoint.portal_default_domain_name)
+            || endpoint.domain_name.as_deref().is_some_and(addresses)
     })
 }
 

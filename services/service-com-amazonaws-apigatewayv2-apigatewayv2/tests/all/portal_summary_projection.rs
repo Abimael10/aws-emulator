@@ -220,9 +220,19 @@ fn assert_preview(case: &str, portal_id: &str, item: &Value, previewed: bool) {
             .get(PREVIEW_URL)
             .and_then(Value::as_str)
             .unwrap_or_default();
-        assert!(
-            url.contains(portal_id),
-            "case {case:?}: expected a preview URL naming {portal_id}, got {preview}"
+        // The preview is served on the portal's OWN site, so the URL is built on the
+        // address that portal publishes — which is the value that names this portal
+        // rather than any other.
+        let published = item
+            .get("endpointConfiguration")
+            .and_then(|endpoint| endpoint.get("portalDefaultDomainName"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            url,
+            format!("https://{published}/preview"),
+            "case {case:?}: expected the preview URL on the address {portal_id} publishes, \
+             got {item}"
         );
     } else {
         assert_eq!(

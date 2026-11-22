@@ -150,6 +150,10 @@ pub mod websocket;
 // operation that mints a custom domain name, which is what opens that domain name's socket
 // and gives its `ApiGatewayDomainName` the address to publish.
 pub mod domain_name_socket;
+// `pub` for the same reason: `portal_socket::open_for_portal` is called by the operation that
+// mints a portal, which is what opens that portal's socket and gives its
+// `PortalDefaultDomainName` the address to publish.
+pub mod portal_socket;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;

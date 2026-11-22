@@ -16,10 +16,10 @@
 //!   `PortalTheme$LogoLastUploaded` reports the instant a logo was last uploaded, so a
 //!   patch carrying a `LogoUri` reports its own instant and a patch carrying none keeps
 //!   the instant of the upload there WAS — whatever the request itself put there, and
-//!   even when the patch rewrites the theme around it. The generated
-//!   `PortalDefaultDomainName` and `PortalDomainHostedZoneId` are the same kind of value:
-//!   derived from the portal's id and the Region it was created in, they survive a patch
-//!   signed for another Region.
+//!   even when the patch rewrites the theme around it. `PortalDefaultDomainName` and
+//!   `PortalDomainHostedZoneId` are the same kind of value: settled when the portal was
+//!   created — the address this emulator serves its site on, and the hosted zone of the
+//!   Region it was created in — they survive a patch signed for another Region.
 //! * **A patch is refused 409 `ConflictException` while a change to the portal's
 //!   publication is still in flight** — the service is publishing or removing the
 //!   configuration the patch would replace — and the refusal lifts of its own accord once
@@ -854,20 +854,17 @@ async fn a_patch_signed_for_another_region_keeps_the_generated_default_domain() 
         )),
         "case {case:?}: expected the domain the patch brought, got {endpoint}"
     );
-    // Generated from the portal's id and the Region it was created in, so the Region the
-    // patch was signed for does not move them.
+    // Settled when the portal was created, so the Region the patch was signed for does not
+    // move them: the default domain is the address this emulator serves the portal's site
+    // on, and the hosted zone is the one of the Region the portal was created in.
     for generated in ["portalDefaultDomainName", "portalDomainHostedZoneId"] {
         assert_eq!(
             as_str(&endpoint, generated),
             as_str(&before, generated),
-            "case {case:?}: expected the generated {generated} of the creating Region, got \
+            "case {case:?}: expected the {generated} the create settled, got \
              {endpoint} against {before}"
         );
     }
-    assert!(
-        as_str(&endpoint, "portalDefaultDomainName").contains(REGION),
-        "case {case:?}: expected the default domain name to name {REGION}, got {endpoint}"
-    );
 }
 
 #[tokio::test]

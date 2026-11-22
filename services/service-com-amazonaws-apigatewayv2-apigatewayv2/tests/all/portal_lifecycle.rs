@@ -21,22 +21,20 @@
 //! * **An account holds at most `MAX_PORTALS` portals**, after which a create is refused
 //!   429 `TooManyRequestsException`.
 //! * **`GetPortal` on an id nothing minted is 404 `NotFoundException`**.
-//! * **The generated default domain name is a bare DNS host name**:
-//!   `EndpointConfigurationResponse$PortalDefaultDomainName` ("This domain name is generated
-//!   and managed by API Gateway") carries dot-separated host labels and nothing else — no
-//!   scheme, no `:port`, no path — because a client prefixes a scheme to it and names it as
-//!   the target of a DNS alias record. It is generated from the portal's own id and the
-//!   Region it lives in, so every portal-reading operation reports the same value whichever
-//!   endpoint the caller reached this service at, and it is a name this emulator answers the
-//!   portal's published page on.
+//! * **The published default domain is an address this emulator SERVES the portal's site
+//!   on**: `EndpointConfigurationResponse$PortalDefaultDomainName` is the host a consumer
+//!   fetches the portal at, so it is the `host:port` of the socket this emulator opened for
+//!   the portal rather than a name under API Gateway's own zone, which nothing on the
+//!   machine this emulator runs on resolves. It is settled once, when the portal is created,
+//!   so every portal-reading operation reports the same value whichever endpoint the caller
+//!   reached this service at, and the portal's published page is served there.
 //!
 //! The rows vary what each rule generalises over: which union alternative the request
 //! names (and how many), which optional members it carries (none, some, all), the number
 //! of included portal-product ARNs (absent, empty, one, several), the region the
-//! request is signed for — the region being what the generated domain name and hosted
-//! zone id are derived from — and, for the domain-name rule, the endpoint the calls are
-//! addressed at (this service's own AWS host, an IP literal with a port and without one, a
-//! loopback name with a port).
+//! request is signed for — the region being what the hosted zone id is derived from — and,
+//! for the domain rule, the endpoint the calls are addressed at (this service's own AWS
+//! host, an IP literal with a port and without one, a loopback name with a port).
 
 use serde_json::{json, Value};
 
@@ -44,8 +42,8 @@ use crate::api_lifecycle::{
     as_str, assert_minted_id, call, call_at_host, call_in_region, emulator, error_code, instant,
 };
 
-/// The region [`call`] signs for, mirrored here because the generated endpoint values
-/// are derived from the request's region.
+/// The region [`call`] signs for, mirrored here because the hosted zone the endpoint
+/// configuration reports is derived from the request's region.
 const REGION: &str = "eu-west-1";
 
 /// A second region, so "derived from the region" is asserted over more than one value.
@@ -328,17 +326,12 @@ async fn create_portal_persists_the_record_and_get_portal_reports_it_back() {
         // `LastModified` is the instant this call stored the record.
         let last_modified = instant(case, &created, "lastModified");
 
-        // The resolved endpoint configuration: the generated default domain name always,
-        // the account's own domain and certificate only when the request brought one.
+        // The resolved endpoint configuration: the address the portal's site is published
+        // at always, the account's own domain and certificate only when the request brought
+        // one.
         let endpoint = endpoint_configuration(case, &created);
         let default_domain = as_str(&endpoint, "portalDefaultDomainName");
-        assert_eq!(
-            default_domain,
-            generated_domain_name(&portal_id, REGION),
-            "case {case:?}: expected the host AWS generates for this portal and region, got \
-             {default_domain:?}"
-        );
-        assert_domain_name(case, &default_domain);
+        assert_published_address(case, &default_domain);
         let hosted_zone = as_str(&endpoint, "portalDomainHostedZoneId");
         assert!(
             hosted_zone.starts_with('Z')
@@ -532,11 +525,9 @@ async fn the_generated_endpoint_values_follow_the_requests_region() {
         );
         let endpoint = endpoint_configuration(region, &created);
         let domain = as_str(&endpoint, "portalDefaultDomainName");
-        assert!(
-            domain.contains(region),
-            "region {region:?}: expected the default domain name to name the request's \
-             region, got {domain:?}"
-        );
+        // The default domain is the address this emulator serves the portal's site on, so it
+        // names no Region: the hosted zone the Region decides is asserted below.
+        assert_published_address(region, &domain);
         by_region.push((
             region,
             domain,
@@ -836,72 +827,36 @@ async fn an_account_holds_at_most_the_portals_its_quota_allows() {
 /// `__stringMin3Max256` (`smithy_query(query="shape", shape="EndpointConfigurationResponse")`).
 const DOMAIN_NAME_LENGTH: (usize, usize) = (3, 256);
 
-/// The longest a single label of a DNS name may be, from the preferred name syntax of
-/// RFC 1035 ("labels must be 63 characters or less").
-const MAX_DOMAIN_LABEL_LENGTH: usize = 63;
-
-/// What cannot appear anywhere in a host NAME: the scheme separator, a path separator, a
-/// port separator, the query and fragment markers, userinfo, whitespace, an empty label.
-const NOT_IN_A_HOST_NAME: &[&str] = &["://", "/", ":", "?", "#", "@", " ", ".."];
-
-/// Assert `value` is a bare DNS host name and nothing more: within the modelled length
-/// bound, at least two labels, every label a non-empty run of at most
-/// [`MAX_DOMAIN_LABEL_LENGTH`] letters, digits and inner hyphens, and none of
-/// [`NOT_IN_A_HOST_NAME`] anywhere in it.
-fn assert_domain_name(case: &str, value: &str) {
+/// Assert `value` is the address this emulator PUBLISHES a portal's site at: within the
+/// modelled length bound, and a `host:port` on this machine that a client can open a
+/// connection to — the member exists for a consumer to fetch the portal's site at, so a name
+/// nothing on this machine resolves is no value for it.
+fn assert_published_address(case: &str, value: &str) {
     let (min, max) = DOMAIN_NAME_LENGTH;
     let length = value.chars().count();
     assert!(
         (min..=max).contains(&length),
-        "case {case:?}: expected a domain name of {min}..{max} characters, got {length} in \
-         {value:?}"
+        "case {case:?}: expected a value of {min}..{max} characters, got {length} in {value:?}"
     );
-    for forbidden in NOT_IN_A_HOST_NAME {
-        assert!(
-            !value.contains(forbidden),
-            "case {case:?}: a domain name carries no {forbidden:?}, got {value:?}"
-        );
-    }
+    let address = value.parse::<std::net::SocketAddr>().unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: expected an address a client can fetch, got {value:?}: {error}"
+        )
+    });
     assert!(
-        !value.starts_with('.') && !value.ends_with('.'),
-        "case {case:?}: expected host labels only, got {value:?}"
+        address.ip().is_loopback(),
+        "case {case:?}: expected an address of this machine, got {value:?}"
     );
-    let labels: Vec<&str> = value.split('.').collect();
-    assert!(
-        labels.len() >= 2,
-        "case {case:?}: expected a multi-label host name, got {value:?}"
+    assert_ne!(
+        address.port(),
+        0,
+        "case {case:?}: expected a port a client can dial, got {value:?}"
     );
-    for label in labels {
-        assert!(
-            !label.is_empty() && label.chars().count() <= MAX_DOMAIN_LABEL_LENGTH,
-            "case {case:?}: expected a 1..{MAX_DOMAIN_LABEL_LENGTH} label, got {label:?} in \
-             {value:?}"
-        );
-        assert!(
-            label
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
-            "case {case:?}: expected a letter-digit-hyphen label, got {label:?} in {value:?}"
-        );
-        assert!(
-            !label.starts_with('-') && !label.ends_with('-'),
-            "case {case:?}: a label carries no leading or trailing hyphen, got {label:?} in \
-             {value:?}"
-        );
-    }
 }
 
-/// The generated default domain name a portal body reports.
+/// The default domain name a portal body reports.
 fn default_domain_name(case: &str, body: &Value) -> String {
     as_str(&endpoint_configuration(case, body), "portalDefaultDomainName")
-}
-
-/// The host AWS generates for a portal, written out here independently of the service's own
-/// spelling of it so these cases assert the service against the recorded AWS answer rather
-/// than against itself: `p-{portal-id}.apigw-portal.{region}.on.aws`, the form every
-/// recorded AWS portal response carries, with the portal's own id and Region filled in.
-pub(crate) fn generated_domain_name(portal_id: &str, region: &str) -> String {
-    format!("p-{portal_id}.apigw-portal.{region}.on.aws")
 }
 
 /// A domain the account owns with the certificate it is served under: the other
@@ -998,27 +953,21 @@ async fn portal_of_row(
     (as_str(&created, "portalId"), created)
 }
 
-/// `EndpointConfigurationResponse$PortalDefaultDomainName` — "This domain name is generated
-/// and managed by API Gateway" — is a bare DNS host name, generated from the portal's own id
-/// and the Region it lives in: no scheme, no `:port` and no path, whichever endpoint the
-/// caller reached this service at, and the same value on every operation that reports the
-/// portal.
+/// `EndpointConfigurationResponse$PortalDefaultDomainName` is the address the portal's site
+/// is SERVED on by the endpoint the caller is talking to — the `host:port` of the socket this
+/// emulator opened for the portal — whichever endpoint that caller reached this service at,
+/// and the same value on every operation that reports the portal.
 #[tokio::test]
-async fn every_portal_reader_reports_a_bare_generated_domain_name() {
+async fn every_portal_reader_reports_the_address_its_site_is_served_on() {
     for row in domain_rows() {
         let case = row.case;
         let emulator = emulator();
         let (portal_id, created) = portal_of_row(&emulator, &row).await;
 
-        // Generated from the portal's own id and its Region; the endpoint the caller
-        // reached this emulator at is no part of a domain NAME.
-        let expected = generated_domain_name(&portal_id, row.region);
-        let created_domain = default_domain_name(case, &created);
-        assert_eq!(
-            created_domain, expected,
-            "case {case:?}: expected the generated domain name from CreatePortal, got {created}"
-        );
-        assert_domain_name(&format!("{case}: CreatePortal"), &created_domain);
+        // Settled once, when the portal was created: the endpoint a later caller reaches
+        // this emulator at never moves it.
+        let expected = default_domain_name(case, &created);
+        assert_published_address(&format!("{case}: CreatePortal"), &expected);
 
         // A domain the account brought is reported beside it and displaces nothing.
         assert_eq!(
@@ -1046,9 +995,9 @@ async fn every_portal_reader_reports_a_bare_generated_domain_name() {
         let read_domain = default_domain_name(case, &read);
         assert_eq!(
             read_domain, expected,
-            "case {case:?}: expected the same generated domain name from GetPortal, got {read}"
+            "case {case:?}: expected the same published address from GetPortal, got {read}"
         );
-        assert_domain_name(&format!("{case}: GetPortal"), &read_domain);
+        assert_published_address(&format!("{case}: GetPortal"), &read_domain);
 
         let (status, patched) = call_at_host(
             &emulator,
@@ -1069,10 +1018,10 @@ async fn every_portal_reader_reports_a_bare_generated_domain_name() {
         let patched_domain = default_domain_name(case, &patched);
         assert_eq!(
             patched_domain, expected,
-            "case {case:?}: expected the same generated domain name from UpdatePortal, got \
+            "case {case:?}: expected the same published address from UpdatePortal, got \
              {patched}"
         );
-        assert_domain_name(&format!("{case}: UpdatePortal"), &patched_domain);
+        assert_published_address(&format!("{case}: UpdatePortal"), &patched_domain);
 
         let (status, listed) =
             call_at_host(&emulator, row.host, row.region, "GET", "/v2/portals", None).await;
@@ -1095,26 +1044,26 @@ async fn every_portal_reader_reports_a_bare_generated_domain_name() {
         let listed_domain = default_domain_name(case, &summary);
         assert_eq!(
             listed_domain, expected,
-            "case {case:?}: expected the same generated domain name in the portal's summary, \
+            "case {case:?}: expected the same published address in the portal's summary, \
              got {listed}"
         );
-        assert_domain_name(&format!("{case}: ListPortals"), &listed_domain);
+        assert_published_address(&format!("{case}: ListPortals"), &listed_domain);
     }
 }
 
-/// One portal, one domain name: portals of the same account are generated different names,
-/// however the client that created them addressed this emulator.
+/// One portal, one address: portals of the same account are published at different
+/// addresses, however the client that created them addressed this emulator.
 #[tokio::test]
-async fn each_portal_is_generated_a_domain_name_of_its_own() {
+async fn each_portal_is_published_at_an_address_of_its_own() {
     let emulator = emulator();
     let mut held: Vec<(String, String)> = Vec::new();
     for row in domain_rows() {
         let (portal_id, created) = portal_of_row(&emulator, &row).await;
         let domain = default_domain_name(row.case, &created);
-        assert_domain_name(row.case, &domain);
+        assert_published_address(row.case, &domain);
         assert!(
             !held.iter().any(|(_, seen)| seen == &domain),
-            "case {:?}: the generated domain name {domain:?} is already held, by {held:?}",
+            "case {:?}: the published address {domain:?} is already held, by {held:?}",
             row.case
         );
         held.push((portal_id, domain));
@@ -1122,16 +1071,16 @@ async fn each_portal_is_generated_a_domain_name_of_its_own() {
     assert_eq!(
         held.len(),
         domain_rows().len(),
-        "expected one generated domain name per portal, got {held:?}"
+        "expected one published address per portal, got {held:?}"
     );
 }
 
-/// The generated domain name is a name this emulator ANSWERS on, not decoration: a portal
-/// created through the emulator's own endpoint — a client that resolves no AWS host — is
-/// served its published page on the domain it was told about, and on that same endpoint with
-/// the portal behind the reserved path marker.
+/// The published default domain is an address this emulator ANSWERS on, not decoration: a
+/// portal created through the emulator's own endpoint — a client that resolves no AWS host —
+/// is served its published page at the address it was told about, and on that same endpoint
+/// with the portal behind the reserved path marker.
 #[tokio::test]
-async fn the_generated_domain_name_serves_the_portals_published_page() {
+async fn the_published_default_domain_serves_the_portals_published_page() {
     let case = "a portal created through the emulator's own endpoint";
     let local_endpoint = "127.0.0.1:44539";
     let emulator = emulator();
@@ -1147,7 +1096,7 @@ async fn the_generated_domain_name_serves_the_portals_published_page() {
     )
     .await;
     let domain = default_domain_name(case, &created);
-    assert_domain_name(case, &domain);
+    assert_published_address(case, &domain);
 
     let (status, published) = call_at_host(
         &emulator,
@@ -1163,10 +1112,10 @@ async fn the_generated_domain_name_serves_the_portals_published_page() {
         "case {case:?}: expected 202 from PublishPortal, got {status} {published}"
     );
 
-    // Both addressings of the one portal: the generated domain name as the host, and the
+    // Both addressings of the one portal: the published address as the host, and the
     // emulator's own endpoint with the portal behind the reserved path marker.
     let addressings = [
-        ("the generated domain name", domain, "/".to_string()),
+        ("the published default domain", domain, "/".to_string()),
         (
             "the emulator's own endpoint with the portal in the path",
             local_endpoint.to_string(),
