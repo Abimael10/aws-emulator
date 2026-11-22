@@ -74,11 +74,13 @@ const UNHELD_GROUP: &str = "/emulator/ecs/not-created";
 const ECS_TASKS_PRINCIPAL: &str = "ecs-tasks.amazonaws.com";
 const ASSUME_ROLE: &str = "sts:AssumeRole";
 
-/// The two actions the `awslogs` driver performs under the execution role: it creates the
-/// stream it delivers to and writes the container's lines into it (IAM Service Authorization
-/// Reference, "Actions defined by Amazon CloudWatch Logs").
+/// The actions the `awslogs` driver performs under the execution role: it creates the stream
+/// it delivers to, writes the container's lines into it, and creates the log group itself
+/// when the configuration asked it to (IAM Service Authorization Reference, "Actions defined
+/// by Amazon CloudWatch Logs").
 const CREATE_LOG_STREAM: &str = "logs:CreateLogStream";
 const PUT_LOG_EVENTS: &str = "logs:PutLogEvents";
+const CREATE_LOG_GROUP: &str = "logs:CreateLogGroup";
 
 /// `Task$stopCode` of a task Amazon ECS could not launch the containers of at all.
 const TASK_FAILED_TO_START: &str = "TaskFailedToStart";
@@ -165,8 +167,9 @@ const ROWS: &[Row] = &[
         failure: Some(ACCESS_DENIED),
     },
     Row {
-        // "awslogs-create-group": the driver creates the group as well as the stream, so a
-        // group that is not there yet is not a logger that cannot be initialised.
+        // "awslogs-create-group": the driver creates the group as well as the stream, under a
+        // role that may create it, so a group that is not there yet is not a logger that
+        // cannot be initialised.
         case: "the driver is asked to create the group it delivers to",
         group: UNHELD_GROUP,
         create_group: true,
@@ -284,7 +287,10 @@ async fn execution_role(router: &MultiServiceRouter, index: usize, row: &Row) ->
     let name = format!("loggerRole{index}");
     let document = match row.grant {
         Grant::NoRole => return None,
-        Grant::Allowed => Some(policy("Allow", &[CREATE_LOG_STREAM, PUT_LOG_EVENTS])),
+        Grant::Allowed => Some(policy(
+            "Allow",
+            &[CREATE_LOG_STREAM, PUT_LOG_EVENTS, CREATE_LOG_GROUP],
+        )),
         // A grant about another service entirely: the role carries a document, and nothing
         // in it allows the driver's actions.
         Grant::Unrelated => Some(policy("Allow", &["s3:GetObject"])),

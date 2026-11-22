@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Serving the CREATION of a log stream this service is asked for by another AWS service's
-//! LOG DRIVER, on a ROLE's behalf.
+//! Serving the CREATION of a log stream — and of the log GROUP a driver asked to create one
+//! creates it in — this service is asked for by another AWS service's LOG DRIVER, on a
+//! ROLE's behalf.
 //!
 //! A compute service that delivers a workload's output to this service does not sign a
 //! request of its own: its agent creates the stream the output goes to AS a role of the
@@ -22,6 +23,14 @@
 //! The order is IAM's: authorization is decided before the resource is looked up, so a
 //! principal that may not create the stream is told that and nothing about what the account
 //! holds.
+//!
+//! A driver that was configured to create the group it delivers into answers the second of
+//! those with a creation of its own — `logs:CreateLogGroup` ("Creates a log group with the
+//! specified name", `CreateLogGroup`) on the group it names — and that is the one further
+//! question this module serves ([`serve_log_group_creation`]): whether the role may create
+//! that group, decided over the same documents and against the same resource ARN this
+//! service decides its own signed `CreateLogGroup` against. It is asked only where the
+//! driver makes that call, which the delivering service's own driver order decides.
 //!
 //! Nothing is withheld on evidence this emulator does not have. An engine carrying no IAM
 //! store, a role that store holds no record for, and a role carrying an attachment whose
@@ -48,6 +57,11 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 /// Authorization Reference).
 pub const CREATE_LOG_STREAM_ACTION: &str = "CreateLogStream";
 
+/// The operation a log driver creates the GROUP it delivers into through, when it was
+/// configured to create one, which is the action IAM publishes for it ("Actions defined by
+/// Amazon CloudWatch Logs", IAM Service Authorization Reference).
+pub const CREATE_LOG_GROUP_ACTION: &str = "CreateLogGroup";
+
 /// Why this service did not serve a log driver's stream creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamCreationRefusal {
@@ -63,6 +77,18 @@ pub enum StreamCreationRefusal {
         /// Why nothing was created, in this service's own words.
         message: String,
     },
+}
+
+/// Why this service did not serve a log driver's creation of a log GROUP: no policy in force
+/// on the principal permits it.
+///
+/// The group's own existence is not among the reasons — a driver reaches this call exactly
+/// because there is no group — so this carries the one refusal such a creation earns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCreationRefused {
+    /// The authorization refusal itself: the sentence AWS refuses a call no policy permits
+    /// with.
+    pub message: String,
 }
 
 /// The principal a log driver's stream creation is made as.
@@ -98,8 +124,16 @@ pub fn serve_log_stream_creation<Eng: Send + Sync + 'static>(
     log_stream: &str,
     principal: Option<DeliveryPrincipal<'_>>,
 ) -> Result<(), StreamCreationRefusal> {
-    if let Some(refusal) = withheld_creation(engine, region, log_group, log_stream, principal) {
-        return Err(refusal);
+    let resource = super::log_stream_arn(region, log_group, log_stream);
+    if let Some(message) = withheld_creation(
+        engine,
+        principal,
+        CREATE_LOG_STREAM_ACTION,
+        &resource,
+        "ServeLogStreamCreation",
+        "no policy in force permits this role to create this log stream",
+    ) {
+        return Err(StreamCreationRefusal::NotAuthorized { message });
     }
     let Some(state) = crate::state::service_state(engine) else {
         // No store of this service to ask: nothing is known about the group, so the
@@ -117,15 +151,50 @@ pub fn serve_log_stream_creation<Eng: Send + Sync + 'static>(
     Ok(())
 }
 
-/// Why no policy in force on `principal` permits the creation, or `None` when one does — or
-/// when nothing of the kind can be shown (see the module docs).
-fn withheld_creation<Eng: Send + Sync + 'static>(
+/// Serve the creation of the log group `log_group` in `region`, made on behalf of
+/// `principal` by a driver that was configured to create the group it delivers into.
+///
+/// `Ok(())` for a creation this service would serve — and for every caller this gate does
+/// not bound (see the module docs) — and the refusal otherwise, which the delivering service
+/// reports in its own vocabulary. The group is not created here: the driver creates it
+/// through `CreateLogGroup`, so what this answers is whether that call would be served at
+/// all, which is what decides whether the workload the delivery is for can start.
+pub fn serve_log_group_creation<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     log_group: &str,
-    log_stream: &str,
     principal: Option<DeliveryPrincipal<'_>>,
-) -> Option<StreamCreationRefusal> {
+) -> Result<(), GroupCreationRefused> {
+    // The resource ARN this service decides a `CreateLogGroup` against is the GROUP's own
+    // ([`super::identity_authorization`]), so one group and one role are decided alike
+    // however the creation is asked for.
+    let resource = super::log_group_arn(region, log_group, false);
+    match withheld_creation(
+        engine,
+        principal,
+        CREATE_LOG_GROUP_ACTION,
+        &resource,
+        "ServeLogGroupCreation",
+        "no policy in force permits this role to create this log group",
+    ) {
+        Some(message) => Err(GroupCreationRefused { message }),
+        None => Ok(()),
+    }
+}
+
+/// Why no policy in force on `principal` permits `action_name` on `resource`, as the sentence
+/// AWS refuses it with, or `None` when one does — or when nothing of the kind can be shown
+/// (see the module docs).
+///
+/// `audit_operation` and `audit_message` name the creation in the emulator's audit log.
+fn withheld_creation<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    principal: Option<DeliveryPrincipal<'_>>,
+    action_name: &str,
+    resource: &str,
+    audit_operation: &'static str,
+    audit_message: &'static str,
+) -> Option<String> {
     let principal = principal?;
     let role_arn = principal.role_arn;
     let iam = iam_store::service_state(engine)?;
@@ -146,13 +215,10 @@ fn withheld_creation<Eng: Send + Sync + 'static>(
             store.permissions_boundary_document(role_arn),
         )
     };
-    // The RESOURCE the creation addresses: the stream itself, which is what a grant written
-    // for a log driver names (the group's ARN with the trailing wildcard covers it).
-    let resource = super::log_stream_arn(region, log_group, log_stream);
-    let action = super::identity_authorization::action_for(CREATE_LOG_STREAM_ACTION);
+    let action = super::identity_authorization::action_for(action_name);
     // An identity-based document states no `Principal` element, so the decision rests on
     // the action and the resource the creation addressed.
-    let request = iam::Request::new(&action, &resource, &[]);
+    let request = iam::Request::new(&action, resource, &[]);
     let identity = iam::identity_decision(&documents, &request);
     // IAM's own evaluation order, the order this service's gate for a signed request takes
     // too ([`super::identity_authorization`]), so one group and one role are decided alike
@@ -177,20 +243,18 @@ fn withheld_creation<Eng: Send + Sync + 'static>(
     ::tracing::info!(
         target: "emulator::audit",
         audit = true,
-        operation = "ServeLogStreamCreation",
+        operation = audit_operation,
         outcome = "refused_access_denied",
         principal = %principal.reported_arn(),
         action = %action,
         resource = %resource,
         explicit_deny = identity == Decision::Denied,
-        "no policy in force permits this role to create this log stream"
+        "{audit_message}"
     );
-    Some(StreamCreationRefusal::NotAuthorized {
-        message: iam::not_authorized_by_identity_policy(
-            principal.reported_arn(),
-            &action,
-            &resource,
-            &reason,
-        ),
-    })
+    Some(iam::not_authorized_by_identity_policy(
+        principal.reported_arn(),
+        &action,
+        resource,
+        &reason,
+    ))
 }

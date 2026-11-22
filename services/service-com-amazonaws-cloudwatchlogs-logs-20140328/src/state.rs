@@ -334,8 +334,9 @@ pub mod parameter_pairs;
 /// model declares `AccessDeniedException` asks to perform.
 pub mod identity_authorization;
 
-/// Serving another service's LOG DRIVER the log stream it delivers a workload's output to,
-/// on the role that driver acts as.
+/// Serving another service's LOG DRIVER the log stream it delivers a workload's output to —
+/// and the log group it creates that stream in when it was configured to create one — on the
+/// role that driver acts as.
 pub mod log_stream_creation;
 
 /// The HTTP INGESTION endpoints: what a client addresses them at, what a request's body
