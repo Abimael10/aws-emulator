@@ -65,7 +65,11 @@ const KEY: &str = "pk";
 
 /// The change-set name every row creates its plan under — one name per stack, the way a
 /// deploying tool reuses its own.
-const CHANGE_SET: &str = "deploy";
+///
+/// `pub(crate)` with [`settled_change_set`]: a sibling suite that deploys through the same
+/// change-set pair names its plans the same way and waits on them with the same poller,
+/// rather than carrying a second copy that can drift from this one.
+pub(crate) const CHANGE_SET: &str = "deploy";
 
 /// How long the change-set poll below waits for a creation to settle. Generous: the condition
 /// it waits for is the change set's own settled status, which the service owes from its own
@@ -232,7 +236,11 @@ fn table_arn(name: &str) -> String {
 
 /// Poll `DescribeChangeSet` the way a deploying tool's waiter does, and answer the status the
 /// creation SETTLED on with the answer it was read from.
-async fn settled_change_set(
+///
+/// `pub(crate)` for the reason [`CHANGE_SET`] is: a suite deploying a stack through
+/// `CreateChangeSet` + `ExecuteChangeSet` needs exactly this wait, on the CONDITION that the
+/// creation settled rather than on how long the host took to settle it.
+pub(crate) async fn settled_change_set(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
