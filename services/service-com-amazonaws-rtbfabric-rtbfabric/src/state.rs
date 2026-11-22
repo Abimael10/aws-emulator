@@ -112,6 +112,9 @@ pub const IDEMPOTENCY_QUOTA: usize = 2 * GATEWAY_QUOTA + LINK_QUOTA + ROUTING_RU
 pub const GATEWAY_STATUS_PENDING_CREATION: &str = "PENDING_CREATION";
 /// `RequesterGatewayStatus`/`ResponderGatewayStatus` member: the gateway is usable.
 pub const GATEWAY_STATUS_ACTIVE: &str = "ACTIVE";
+/// `RequesterGatewayStatus`/`ResponderGatewayStatus` member: a configuration
+/// change the gateway has taken is being applied to it while it is in service.
+pub const GATEWAY_STATUS_PENDING_UPDATE: &str = "PENDING_UPDATE";
 /// `RequesterGatewayStatus`/`ResponderGatewayStatus` member: terminal, the
 /// gateway is gone.
 pub const GATEWAY_STATUS_DELETED: &str = "DELETED";
@@ -214,18 +217,45 @@ pub struct ResponderGateway {
     pub external_inbound_endpoint: Option<String>,
     pub description: Option<String>,
     pub tags: HashMap<String, String>,
+    /// The `@idempotencyToken` of the most recent accepted change of this
+    /// gateway's configuration, and a digest of that call's other parameters;
+    /// `None` until one is accepted. See [`IdempotentUpdate`].
+    pub last_update: Option<IdempotentUpdate>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
 
 impl ResponderGateway {
-    /// See [`RequesterGateway::settle`].
+    /// Materialise the transition the clock has already made due — the created
+    /// gateway coming up, or a configuration change it has taken reaching
+    /// service — dated at the instant it was owed rather than now, so the record
+    /// does not depend on when it was next read. Both transitions end at
+    /// [`GATEWAY_STATUS_ACTIVE`]: a gateway that is in service is what either one
+    /// is owed.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.settles_at.filter(|due| *due <= now) {
             self.status = GATEWAY_STATUS_ACTIVE.to_string();
             self.settles_at = None;
             self.updated_at = due;
         }
+    }
+
+    /// Whether this gateway is in service, so a configuration change can be
+    /// applied to it: it is carrying traffic, or it is already applying one.
+    /// Every other status reports the gateway moving through a lifecycle of its
+    /// own, and has no configuration in service to change.
+    pub fn in_service(&self) -> bool {
+        self.status == GATEWAY_STATUS_ACTIVE || self.status == GATEWAY_STATUS_PENDING_UPDATE
+    }
+
+    /// The words a refusal carries when this gateway's current status does not
+    /// admit the transition a call asks for: the gateway the call addressed and
+    /// the status that refuses it, both from the record.
+    pub fn status_conflict_message(&self, transition: &str) -> String {
+        format!(
+            "responder gateway {} is {} and cannot be {}",
+            self.gateway_id, self.status, transition
+        )
     }
 
     /// Whether this gateway is `EXTERNAL` — the type that takes links from outside
@@ -367,6 +397,27 @@ pub struct IdempotentCreate {
     /// A digest of that call's other parameters: the documented contract is that
     /// a retry of the same token with DIFFERENT parameters fails rather than
     /// silently answering the first call's resource.
+    pub fingerprint: [u8; 32],
+}
+
+/// What the most recent accepted call carrying an `@idempotencyToken` CHANGED a
+/// stored resource to, so a retry with the same token answers with the record
+/// that call produced instead of applying the change a second time.
+///
+/// Held ON the record the call changed rather than in
+/// [`ComAmazonawsRtbfabricRtbfabricState::idempotency`], which answers for a
+/// resource a first call MINTED: an update mints nothing, and one record per
+/// resource is what stops a caller growing the store by retrying the same change
+/// under fresh tokens. Fixed size — both digests are 32 bytes — so a
+/// caller-chosen `clientToken` cannot grow the bytes retained either.
+#[derive(Debug, Clone)]
+pub struct IdempotentUpdate {
+    /// The token that call carried, as [`idempotency_key`] digests it together
+    /// with the operation's own name, so two operations' tokens never collide.
+    pub key: [u8; 32],
+    /// A digest of that call's other parameters: the documented contract is that
+    /// a retry of the same token with DIFFERENT parameters fails rather than
+    /// silently answering for parameters the caller did not send.
     pub fingerprint: [u8; 32],
 }
 

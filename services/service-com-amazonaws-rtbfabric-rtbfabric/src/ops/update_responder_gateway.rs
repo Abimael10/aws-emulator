@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResponderGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResponderGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResponderGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the configuration of a stored responder gateway: each optional member
+//! this call states replaces what the record holds, and every member it leaves
+//! out keeps the value the gateway already had, so the next reader of the gateway
+//! reports the merged configuration. `domainName`, `port` and `protocol` are
+//! stated by the caller and NOT applied — the operation's own documentation is
+//! that they cannot be changed after the create, and that changing one means
+//! deleting the gateway and creating a new one.
+//!
+//! A gateway that is in service takes the change while it carries traffic, so it
+//! is answered `PENDING_UPDATE` and the clock owes it `ACTIVE` again; a gateway
+//! moving through a lifecycle of its own has no configuration in service to
+//! change -> `ConflictException` (409), and an id that names no stored responder
+//! gateway -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +204,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResponderGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResponderGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResponderGateway"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateResponderGatewayErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // This call reports a stored status, so the transitions the clock has
+        // already made due are materialised first: each was owed at this same
+        // instant whether or not anybody called, and without this a gateway that
+        // has come up would still be refused as though it were still coming up.
+        store.settle_all(now);
+
+        // `clientToken` is an `@idempotencyToken`: the same token replays the
+        // first call's answer, and the same token with different parameters is
+        // refused rather than silently answering for parameters the caller did
+        // not send. The model declares no `IdempotentParameterMismatch`, so the
+        // refusal is this operation's `ValidationException` (400). Every member
+        // the call carries is in the fingerprint, the ones this operation does
+        // not apply included: a retry that restates them differently is a
+        // different request.
+        let fingerprint = crate::state::parameter_fingerprint(&format!(
+            "gatewayId={:?}|domainName={:?}|port={:?}|protocol={:?}|listenerConfig={:?}\
+             |trustStore={:?}|managedEndpoint={:?}|clientRoutingPolicy={:?}|description={:?}",
+            input.gateway_id,
+            input.domain_name,
+            input.port,
+            input.protocol,
+            input.listener_config,
+            input.trust_store_configuration,
+            input.managed_endpoint_configuration,
+            input.client_routing_policy,
+            input.description,
+        ));
+        let key = crate::state::idempotency_key(Self::NAME, &input.client_token);
+
+        let Some(gateway) = store.responder_gateways.get_mut(&input.gateway_id) else {
+            return Err(UpdateResponderGatewayErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The record of the change this gateway most recently took lives on the
+        // gateway itself, so a retry is answered from the resource it addressed.
+        if let Some(prior) = gateway.last_update.as_ref().filter(|prior| prior.key == key) {
+            if prior.fingerprint != fingerprint {
+                return Err(UpdateResponderGatewayErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "clientToken {} was already used for a {} request with different parameters",
+                            input.client_token,
+                            Self::NAME,
+                        ),
+                    },
+                )
+                .into());
+            }
+            // The same change under the same token: report the record it already
+            // produced rather than apply it a second time.
+            return Ok(UpdateResponderGatewayOutput {
+                gateway_id: gateway.gateway_id.clone(),
+                status: gateway.status.clone(),
+                client_routing_policy: gateway.client_routing_policy.clone(),
+            });
+        }
+
+        if !gateway.in_service() {
+            // The gateway is moving through a lifecycle of its own, so it has no
+            // configuration in service for this call to change.
+            return Err(UpdateResponderGatewayErrorModeled::ConflictException(
+                ConflictException {
+                    message: gateway.status_conflict_message("updated"),
+                },
+            )
+            .into());
+        }
+
+        // A managed endpoint serves the domain name the caller asks for only
+        // while that domain is allowlisted for managed endpoints, and an
+        // allowlist is granted outside this API — the model carries no operation
+        // that adds one and no member that presents one — so this emulator holds
+        // none. `CreateResponderGateway` refuses the pairing for that reason, and
+        // the same rule holds here: naming a managed endpoint for a gateway whose
+        // stored domain name is the caller's own is refused, and changes nothing,
+        // rather than serving a name nothing allowlisted.
+        if let (Some(domain_name), Some(_)) = (
+            gateway.domain_name.as_deref(),
+            input.managed_endpoint_configuration.as_ref(),
+        ) {
+            return Err(UpdateResponderGatewayErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Domain name '{domain_name}' for managed endpoint not allowlisted."
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A member the caller states replaces what the record holds; one it
+        // leaves out is not a request to clear the stored value. `domainName`,
+        // `port` and `protocol` are not applied at all: this operation does not
+        // change them.
+        if input.description.is_some() {
+            gateway.description = input.description;
+        }
+        if input.listener_config.is_some() {
+            // The listener configuration carries exactly the protocols list, so
+            // replacing it is what updates that list.
+            gateway.listener_config = input.listener_config;
+        }
+        if input.trust_store_configuration.is_some() {
+            gateway.trust_store_configuration = input.trust_store_configuration;
+        }
+        if input.managed_endpoint_configuration.is_some() {
+            gateway.managed_endpoint_configuration = input.managed_endpoint_configuration;
+        }
+        if input.client_routing_policy.is_some() {
+            gateway.client_routing_policy = input.client_routing_policy;
+        }
+        gateway.updated_at = now;
+        gateway.last_update = Some(crate::state::IdempotentUpdate { key, fingerprint });
+        // The gateway is in service, so the change is applied to a live gateway:
+        // this call reports the update as pending, and the clock owes the gateway
+        // its way back into service. A changed client routing policy is reported
+        // now and takes effect once that status is ACTIVE again.
+        gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
+        gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+
+        Ok(UpdateResponderGatewayOutput {
+            gateway_id: gateway.gateway_id.clone(),
+            status: gateway.status.clone(),
+            client_routing_policy: gateway.client_routing_policy.clone(),
+        })
     }
 }

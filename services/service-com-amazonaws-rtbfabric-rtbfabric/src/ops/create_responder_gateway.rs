@@ -346,6 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_routing_policy: input.client_routing_policy,
             description: input.description,
             tags: input.tags.unwrap_or_default(),
+            // Nothing has changed this gateway's configuration yet, so there is
+            // no update token to replay: `UpdateResponderGateway` writes this.
+            last_update: None,
             created_at: now,
             updated_at: now,
         };
