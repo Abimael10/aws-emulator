@@ -534,7 +534,15 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 data_source_id.to_string(),
                 key.clone(),
             );
-            match self.documents.get(&index).map(|held| held.source_digest) {
+            // The record of a document whose deletion has already run to
+            // completion is not a document the data source holds, so a crawl
+            // that finds that object again takes it in anew.
+            match self
+                .documents
+                .get(&index)
+                .filter(|held| held.is_held())
+                .map(|held| held.source_digest)
+            {
                 // Held with the same content: scanned, and nothing more.
                 Some(Some(digest)) if digest == document.digest => {}
                 Some(_) => {

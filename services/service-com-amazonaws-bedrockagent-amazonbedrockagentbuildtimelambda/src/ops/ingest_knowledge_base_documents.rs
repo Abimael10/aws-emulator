@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut fresh: Vec<&crate::state::DocumentKey> = Vec::new();
         for key in &keys {
             if state
-                .document_of(&input.knowledge_base_id, &input.data_source_id, key)
+                .held_document_of(&input.knowledge_base_id, &input.data_source_id, key)
                 .is_none()
                 && !fresh.contains(&key)
             {

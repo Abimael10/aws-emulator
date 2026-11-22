@@ -118,9 +118,11 @@
 //! [`not_found_document_detail`] as the only two projections any document
 //! operation reports. A document's status advances on the CLOCK alone, through
 //! the same `materialise_due_transitions` — including the chain an accepted
-//! deletion starts, at the end of which the record is dropped, so the data
-//! source holds nothing for that document and only the
-//! [`not_found_document_detail`] projection answers for its identity.
+//! deletion starts, at the end of which the data source HOLDS the document no
+//! more while its record stays behind carrying the terminal status the model
+//! gives a document that was not found, so the listing a client polls reports
+//! the outcome of the deletion it asked for. Only an identity nothing was ever
+//! stored under is answered by the [`not_found_document_detail`] projection.
 //!
 //! A flow's aliases (`CreateFlowAlias`, `GetFlowAlias`, `ListFlowAliases`) are
 //! backed by the
@@ -2386,6 +2388,19 @@ pub const DOCUMENT_DELETION_SPAN: Duration = DOCUMENT_INDEXING_SPAN;
 /// "NOT_FOUND – The document wasn't found."
 pub const DOCUMENT_STATUS_NOT_FOUND: &str = "NOT_FOUND";
 
+/// How many completed deletions one data source keeps a reportable detail for.
+///
+/// The terminal `NOT_FOUND` status of a deletion is what a client polling
+/// `ListKnowledgeBaseDocuments` waits for, and the detail carrying it is what
+/// names WHICH document was removed — so the record outlives the document it
+/// stood for. Not without end, though: this is the emulator's OWN bound on that
+/// history, and it is [`DOCUMENT_QUOTA`] because a data source holds no more
+/// documents than that, so no stream of ingestions and deletions can grow the
+/// store past twice the documents one data source may hold. Past it the data
+/// source keeps the most recently deleted and forgets the oldest, whose
+/// identity is answered from then on as one nothing was ever stored under.
+pub const DELETED_DOCUMENT_RECORDS_KEPT: usize = DOCUMENT_QUOTA;
+
 /// The most documents one `ListKnowledgeBaseDocuments` page reports when the
 /// request names no `maxResults`.
 ///
@@ -2484,10 +2499,12 @@ pub enum DocumentStatus {
     DeleteInProgress,
     /// The document is gone from the data source — the terminal status of a
     /// deletion, which the modelled member documents as the status of a document
-    /// that "wasn't found", so the clock owes it nothing more. A record that
-    /// reaches it is retired from the store by the same pass that applies it:
-    /// the status is the answer a targeted read gives for an identifier nothing
-    /// is held for, not a document the data source still enumerates.
+    /// that "wasn't found", so the clock owes it nothing more. The data source
+    /// HOLDS it no longer: it counts against no bound, carries no content and is
+    /// no source document. Its record stays behind so the deletion's outcome is
+    /// reportable — the listing is how a client confirms WHICH document was
+    /// removed — bounded by [`DELETED_DOCUMENT_RECORDS_KEPT`], and the identity
+    /// is free again for a later ingestion to take.
     NotFound,
 }
 
@@ -2520,6 +2537,17 @@ impl DocumentStatus {
     /// status: it is on its way out of the data source, or already out of it.
     fn is_being_deleted(self) -> bool {
         matches!(self, Self::Deleting | Self::DeleteInProgress | Self::NotFound)
+    }
+
+    /// Whether the data source still HOLDS a document reported in this status.
+    ///
+    /// Every status but the terminal one of a deletion is a document the data
+    /// source holds: it counts against the data source's bound, its content can
+    /// be retrieved and an ingestion job over a pushed data source scans it. A
+    /// document whose deletion has run to its end is held no longer — its
+    /// record stays only to report that outcome.
+    fn is_held(self) -> bool {
+        !matches!(self, Self::NotFound)
     }
 }
 
@@ -2719,9 +2747,10 @@ impl DocumentRecord {
     ///
     /// The record stays in the store while the deletion is in flight, so a
     /// poller observes the statuses the model declares for it; once the chain
-    /// reaches its terminal status the record is retired and the data source
-    /// holds nothing for this document any more. The digest of the source object
-    /// it was taken from goes,
+    /// reaches its terminal status the data source holds nothing for this
+    /// document any more, while the record stays behind reporting that terminal
+    /// status so the deletion's outcome is observable. The digest of the source
+    /// object it was taken from goes,
     /// because the data source no longer holds this document's content — so a
     /// later crawl that finds that object again ingests it anew rather than
     /// taking it for one already held.
@@ -2736,6 +2765,13 @@ impl DocumentRecord {
         // document's content, so no retrieval reports it from here on.
         self.chunk = None;
         self.updated_at = now;
+    }
+
+    /// Whether the data source still HOLDS this document, as against holding
+    /// only the record of its completed deletion
+    /// ([`DocumentStatus::is_held`]).
+    pub fn is_held(&self) -> bool {
+        self.status.is_held()
     }
 
     /// This record as the modelled `KnowledgeBaseDocumentDetail` shape: every
@@ -3171,6 +3207,10 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// The stored document `key` names, but only within this knowledge base and
     /// data source: a document is identified by the triple, so one data source
     /// never reports another's document.
+    ///
+    /// The record of a document whose deletion has run to completion is one of
+    /// them: it reports that deletion's terminal status, which is the same
+    /// answer as for an identity nothing was ever stored under.
     pub fn document_of(
         &self,
         knowledge_base_id: &str,
@@ -3184,12 +3224,65 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         ))
     }
 
+    /// The document `key` names and this data source still HOLDS: as
+    /// [`Self::document_of`], minus the record of one whose deletion has
+    /// already run to completion.
+    ///
+    /// This is what an operation asks when it needs the document itself rather
+    /// than the status reported for its identity: re-ingesting such an identity
+    /// adds a document the data source did not hold.
+    pub fn held_document_of(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        key: &DocumentKey,
+    ) -> Option<&DocumentRecord> {
+        self.document_of(knowledge_base_id, data_source_id, key)
+            .filter(|record| record.is_held())
+    }
+
+    /// Forget the completed deletions one data source keeps past
+    /// [`DELETED_DOCUMENT_RECORDS_KEPT`], oldest first, so the record of a
+    /// deletion outlives its document without the store growing for ever.
+    fn forget_oldest_deleted_documents(&mut self) {
+        let mut per_data_source: HashMap<(String, String), Vec<(SystemTime, DocumentKey)>> =
+            HashMap::new();
+        for ((knowledge_base_id, data_source_id, key), record) in &self.documents {
+            if record.is_held() {
+                continue;
+            }
+            per_data_source
+                .entry((knowledge_base_id.clone(), data_source_id.clone()))
+                .or_default()
+                .push((record.updated_at, key.clone()));
+        }
+        for ((knowledge_base_id, data_source_id), mut deleted) in per_data_source {
+            if deleted.len() <= DELETED_DOCUMENT_RECORDS_KEPT {
+                continue;
+            }
+            // The instant the deletion completed decides which are oldest, ties
+            // broken by the document's own identity, so the same records go
+            // however the store happens to be laid out.
+            deleted.sort_by(|left, right| {
+                (left.0, left.1.sort_key()).cmp(&(right.0, right.1.sort_key()))
+            });
+            let forgotten = deleted.len() - DELETED_DOCUMENT_RECORDS_KEPT;
+            for (_, key) in deleted.into_iter().take(forgotten) {
+                self.documents.remove(&(
+                    knowledge_base_id.clone(),
+                    data_source_id.clone(),
+                    key,
+                ));
+            }
+        }
+    }
+
     /// Accept the deletion of one document of this data source: it reports the
     /// modelled `DELETING` status from now on and the clock owes it the rest of
-    /// the chain, at the end of which the record is retired and the data source
-    /// holds nothing for this document — from there every read of the identifier
-    /// answers the status the model gives one nothing is stored for. `None` when
-    /// this data source holds no such document, which is not a document to
+    /// the chain, at the end of which the data source holds nothing for this
+    /// document — from there every read of the identifier answers the terminal
+    /// status the model gives a document that was not found. `None` when this
+    /// data source holds no such document, which is not a document to
     /// delete at all.
     ///
     /// A deletion already accepted is not accepted again: the document is
@@ -3213,14 +3306,19 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         Some(record.to_detail())
     }
 
-    /// How many documents this data source already holds, the count the
+    /// How many documents this data source already HOLDS, the count the
     /// per-data-source bound is checked against.
+    ///
+    /// The record of a document whose deletion has run to completion is not one
+    /// of them: the data source holds it no more, so it takes none of the room
+    /// a fresh ingestion needs.
     pub fn document_count(&self, knowledge_base_id: &str, data_source_id: &str) -> usize {
         self.documents
             .values()
             .filter(|record| {
                 record.knowledge_base_id == knowledge_base_id
                     && record.data_source_id == data_source_id
+                    && record.is_held()
             })
             .count()
     }
@@ -3334,15 +3432,16 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     .map(|(span, after)| (due + span, after));
             }
         }
-        // A document whose delete chain has reached its end is removed from the
-        // store, the same way an accepted data-source or knowledge-base removal
-        // is applied once its instant has passed: the data source holds nothing
-        // for it any more, so its listing stops enumerating it and a targeted
-        // read of the identifier answers the status the model gives one nothing
-        // is stored for. Its identity is free again, for a later ingestion to
-        // take.
-        self.documents
-            .retain(|_, document| document.status != DocumentStatus::NotFound);
+        // A document whose delete chain has reached its end is held no more:
+        // the data source counts it against no bound, keeps none of its
+        // content and offers it to no retrieval, and its identity is free for a
+        // later ingestion to take. The record itself stays, reporting that
+        // terminal status, because the listing is how a client confirms which
+        // document a delete removed. The history it forms is bounded: past
+        // `DELETED_DOCUMENT_RECORDS_KEPT` per data source the oldest completed
+        // deletions are forgotten, and from then on their identities answer as
+        // ones nothing was ever stored under.
+        self.forget_oldest_deleted_documents();
         // A removal an accepted delete put on the clock is owed the same way:
         // once its instant has passed the resource is gone, whether or not
         // anybody called. A knowledge base takes the data sources it contains
@@ -3572,14 +3671,15 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// holds, in document order and from the position `cursor` names, at most
     /// `page_size` of them, plus the token to resume from when more remain.
     ///
-    /// Every document the data source HOLDS is reported, whatever its ingestion
-    /// status — including one whose deletion is still in flight — and no other
-    /// data source's: a document is identified within the data source it was
-    /// ingested into. A document whose delete has run to completion is held no
-    /// more ([`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`]),
-    /// so it is in no page. A data source holding none reports an empty
-    /// listing — an unknown one has nothing to enumerate, which the caller
-    /// refuses as a missing resource before asking.
+    /// Every document the data source has a record for is reported, whatever
+    /// its status — one whose deletion is still in flight, and one whose
+    /// deletion has run to its terminal `NOT_FOUND` status alike, because the
+    /// listing is how a client confirms which document a delete removed — and
+    /// no other data source's: a document is identified within the data source
+    /// it was ingested into. A completed deletion the data source has forgotten
+    /// ([`DELETED_DOCUMENT_RECORDS_KEPT`]) is in no page. A data source holding
+    /// none reports an empty listing — an unknown one has nothing to enumerate,
+    /// which the caller refuses as a missing resource before asking.
     pub fn page_of_documents(
         &self,
         knowledge_base_id: &str,

@@ -196,6 +196,9 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         )) else {
             return false;
         };
+        if !record.is_held() {
+            return false;
+        }
         record.chunk = chunk;
         true
     }

@@ -228,6 +228,9 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// The keys the chunks of `(knowledge_base_id, data_source_id)` are held
     /// under in the bound index: one per document the data source holds, however
     /// that document was ingested.
+    ///
+    /// A document whose deletion has already run to completion is not one of
+    /// them: its chunk left the index when the deletion was accepted.
     pub fn document_vector_keys(
         &self,
         knowledge_base_id: &str,
@@ -238,6 +241,7 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| {
                 record.knowledge_base_id == knowledge_base_id
                     && record.data_source_id == data_source_id
+                    && record.is_held()
             })
             .map(|record| document_vector_key(&record.key))
             .collect()

@@ -14,9 +14,9 @@
 //! * `DeleteKnowledgeBaseDocuments` carries the document out of the data
 //!   source: while the delete is in flight the document reports the statuses
 //!   that say it is going, and once the chain has run to completion the data
-//!   source holds nothing for it — it is in no listing of the data source and a
-//!   targeted read answers the status the model gives an identifier nothing is
-//!   held for.
+//!   source holds nothing for it while still reporting the deletion's terminal
+//!   status — the listing and a targeted read both answer that identifier with
+//!   the status the model gives a document that was not found.
 //!
 //! Every assertion here goes through the router, so it exercises the real wire
 //! path (route matching, model constraint validation, serialization) rather
@@ -311,10 +311,11 @@ impl Emulator {
         }
     }
 
-    /// List the data source's documents until none of `identifiers` is reported
-    /// any more, or [`POLL_CAP`] passes: the removal a delete starts is owed by
-    /// the clock too, and this listing is how a client confirms it.
-    async fn poll_until_unlisted(
+    /// List the data source's documents until every one of `identifiers` is
+    /// reported with the terminal status of a deletion, or [`POLL_CAP`] passes:
+    /// the end of the chain a delete starts is owed by the clock too, and this
+    /// listing is how a client confirms it.
+    async fn poll_until_listed_not_found(
         &self,
         knowledge_base_id: &str,
         data_source_id: &str,
@@ -324,10 +325,12 @@ impl Emulator {
         loop {
             let listed = self.list_documents(knowledge_base_id, data_source_id).await;
             let gone = listed.status == 200
-                && !listed
-                    .details()
-                    .iter()
-                    .any(|detail| identifiers.contains(&detail["identifier"]));
+                && identifiers.iter().all(|identifier| {
+                    listed.details().iter().any(|detail| {
+                        &detail["identifier"] == identifier
+                            && detail["status"].as_str() == Some(NOT_FOUND)
+                    })
+                });
             if gone || Instant::now() >= deadline {
                 return listed;
             }
@@ -877,16 +880,18 @@ async fn a_deleted_document_leaves_the_data_sources_listing() {
         }
 
         // The clock carries the deletion to its end, and from there the data
-        // source holds nothing for the documents it named: the listing reports
-        // exactly the survivors.
+        // source holds nothing for the documents it named while still
+        // reporting the deletion's own terminal status for them: the listing
+        // carries every document of the data source, each with the status it
+        // stands in.
         let listed = emulator
-            .poll_until_unlisted(knowledge_base_id, &data_source_id, &doomed)
+            .poll_until_listed_not_found(knowledge_base_id, &data_source_id, &doomed)
             .await;
         assert_eq!(
             listed.details().len(),
-            held - deleted,
-            "case {case}: expected only the {} surviving documents listed, got {:?}",
-            held - deleted,
+            held,
+            "case {case}: expected all {held} documents of the data source listed, the \
+             deleted ones included, got {:?}",
             listed.body
         );
         let fetched = emulator
@@ -894,26 +899,23 @@ async fn a_deleted_document_leaves_the_data_sources_listing() {
             .await;
         for (position, identifier) in identifiers.iter().enumerate() {
             if position < deleted {
-                assert!(
-                    !listed
-                        .details()
-                        .iter()
-                        .any(|detail| &detail["identifier"] == identifier),
-                    "case {case}: ListKnowledgeBaseDocuments still reports deleted document \
-                     {position}, got {:?}",
-                    listed.body
-                );
-                let detail = fetched.detail_of(identifier);
+                for (operation, detail) in [
+                    ("ListKnowledgeBaseDocuments", listed.detail_of(identifier)),
+                    ("GetKnowledgeBaseDocuments", fetched.detail_of(identifier)),
+                ] {
+                    assert_eq!(
+                        detail["status"].as_str(),
+                        Some(NOT_FOUND),
+                        "case {case}: {operation} reports deleted document {position} as \
+                         {NOT_FOUND}, got {detail:?}"
+                    );
+                }
                 assert_eq!(
-                    detail["status"].as_str(),
-                    Some(NOT_FOUND),
-                    "case {case}: GetKnowledgeBaseDocuments reports document {position} as \
-                     {NOT_FOUND}, got {detail:?}"
-                );
-                assert!(
-                    detail["updatedAt"].is_null(),
-                    "case {case}: nothing is held for deleted document {position}, so it has \
-                     no instant it last changed, got {detail:?}"
+                    fetched.detail_of(identifier)["updatedAt"],
+                    listed.detail_of(identifier)["updatedAt"],
+                    "case {case}: the listing and the targeted read report the same instant \
+                     for deleted document {position}, got {:?}",
+                    fetched.detail_of(identifier)
                 );
                 continue;
             }
@@ -1029,8 +1031,8 @@ async fn deleting_again_and_deleting_what_was_never_held() {
 
     // Once the clock has carried the deletion to its end the data source holds
     // nothing for the document: the delete is still accepted, and reports the
-    // identifier with the status the model gives one nothing is held for and no
-    // instant it last changed.
+    // identifier with the terminal status the model gives a document that was
+    // not found, at the instant the deletion reached it.
     let gone = emulator
         .poll_until_document_not_found(&knowledge_base_id, &data_source_id, &identifier)
         .await;
@@ -1058,20 +1060,31 @@ async fn deleting_again_and_deleting_what_was_never_held() {
         "case a repeated delete of a document already gone: expected {NOT_FOUND}, got {:?}",
         again.detail(0)
     );
-    assert!(
-        again.detail(0)["updatedAt"].is_null(),
-        "case a repeated delete of a document already gone: nothing is held for it, so it \
-         has no instant it last changed, got {:?}",
+    assert_eq!(
+        again.detail(0)["updatedAt"],
+        gone.detail(0)["updatedAt"],
+        "case a repeated delete of a document already gone: a delete of what is already \
+         gone changes nothing, got {:?}",
         again.detail(0)
     );
+    // The deletion's own outcome stays reportable through the listing, which is
+    // how a client confirms WHICH document was removed.
     let listed = emulator
         .list_documents(&knowledge_base_id, &data_source_id)
         .await;
-    assert!(
-        listed.details().is_empty(),
-        "case a repeated delete of a document already gone: the data source holds no \
-         document, got {:?}",
+    assert_eq!(
+        listed.details().len(),
+        1,
+        "case a repeated delete of a document already gone: the deletion is still reported, \
+         got {:?}",
         listed.body
+    );
+    assert_eq!(
+        listed.status_at(0),
+        NOT_FOUND,
+        "case a repeated delete of a document already gone: expected the listing to report \
+         {NOT_FOUND}, got {:?}",
+        listed.detail(0)
     );
 
     // The id is free again: ingesting it is a fresh ingestion, reported from
