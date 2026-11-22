@@ -75,6 +75,9 @@
 //! sets over the value each violation itself carries.
 
 mod stated_constraints;
+mod unapplied_patterns;
+
+pub(super) use unapplied_patterns::refusing_violations;
 
 use std::collections::HashMap;
 

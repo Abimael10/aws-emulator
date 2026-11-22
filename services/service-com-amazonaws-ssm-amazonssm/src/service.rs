@@ -346,11 +346,14 @@ impl<O> StatedPerOperation<O> {
 /// answers in its own envelope.
 ///
 /// The collecting half is the tree's shared one,
-/// `service_common::validation::refusing_violations_with_echoes`: one read of the request
+/// `service_common::validation::refusing_violations_with_echoes`, reached through
+/// [`refusal::refusing_violations`]: one read of the request
 /// yields the framework's own violations (the protocol's deserializer for an absent
 /// `@required` member, `constraints::validate` over the built input), each paired with how a
 /// clause can state the value it is about — which for a COLLECTION member is the collection
-/// itself, the one thing a violation does not carry. The request is read once more for what
+/// itself, the one thing a violation does not carry; beside them travel the positions whose
+/// modelled `@pattern` that walk's own engine does not apply, which that entry point adds.
+/// The request is read once more for what
 /// no violation carries at all ([`refusal::submitted_request`]): the values the request
 /// submitted, which the constraint sets this service states beyond the model's are applied
 /// to, and the collections a clause grouped at a collection member quotes. Nothing is
@@ -360,8 +363,7 @@ fn stated_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<(Vec<Violation>, Refused)> {
-    let refused =
-        ::service_common::validation::refusing_violations_with_echoes::<O>(protocol, req);
+    let refused = refusal::refusing_violations::<O>(protocol, req);
     let violations: Vec<Violation> = refused
         .iter()
         .map(|(violation, _)| violation.clone())

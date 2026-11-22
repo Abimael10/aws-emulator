@@ -27,6 +27,15 @@
 //! exhausts that budget, are both left SATISFIED — the framework's own treatment, so no
 //! value is refused because of an expression nothing can evaluate.
 //!
+//! A model's own SPELLING can also be what an engine here will not read, and that is not a
+//! different requirement: the same expression is compiled in the readings [`compiled`] states
+//! — the literal hyphen a character class writes beside a shorthand class, which the engine
+//! AWS validates with reads as a hyphen and these engines reject as a range boundary, and the
+//! ASCII `\w`/`\d`/`\s` an ECMA-262 expression means, which is also what keeps a wide
+//! repetition of one inside an engine's own program-size ceiling. Only a text the engine
+//! itself then compiles is used, so nothing here decides that two expressions are equivalent
+//! on its own.
+//!
 //! Two service crates still carry their own copy of this rule, written before there was
 //! anywhere shared to put it
 //! (`grep -rln 'fn unapplied_violations' services/*/src` lists them: today
@@ -271,16 +280,189 @@ fn reading(pattern: &'static str) -> Reading {
     }
     let read = Reading {
         applied_at_the_boundary: ::regex::Regex::new(pattern).is_ok(),
-        compiled: ::fancy_regex::RegexBuilder::new(pattern)
-            .backtrack_limit(PATTERN_BACKTRACK_LIMIT)
-            .build()
-            .ok()
-            .map(Arc::new),
+        compiled: compiled(pattern),
     };
     locked(&READINGS)
         .entry(pattern)
         .or_insert_with(|| read.clone())
         .clone()
+}
+
+/// The flag every reading is compiled under: a `.` matches a LINE TERMINATOR too.
+///
+/// A member whose expression anchors both ends is one AWS accepts a pretty-printed document
+/// at — a resource policy, a document body — and a `.` matches no line terminator in any of
+/// these engines by default, so such an expression could match no document carrying a newline
+/// and every one of those members would be refused. This flag changes what a `.` matches and
+/// NOTHING about the anchors: `^` and `$` keep anchoring the WHOLE value, as they do for the
+/// engine AWS validates with and for the expressions the boundary compiles itself, so a value
+/// carrying a line the expression admits beside a line it does not is still refused, and the
+/// blank-document expressions of these models (`^(?!\s*$).+$`) still refuse a document whose
+/// every line is blank.
+const DOT_MATCHES_A_LINE_TERMINATOR: &str = "(?s)";
+
+/// `pattern` compiled by the look-around-capable engine, in the first of the READINGS of its
+/// text that engine accepts: the text as the model wrote it, that text with the literal
+/// hyphens of a character class escaped, and that text with the shorthand classes INSIDE a
+/// character class written as the ASCII sets an ECMA-262 expression means by them
+/// ([`respelt`]). Every reading carries [`DOT_MATCHES_A_LINE_TERMINATOR`].
+///
+/// The later readings are not other expressions: a model writes an expression for the engine
+/// AWS validates with, which reads a `-` beside a shorthand class as a hyphen and reads `\w`,
+/// `\d` and `\s` as ASCII, so recovering what the model requires is reading its text that
+/// way — and the ASCII reading is also what keeps a wide repetition of a shorthand class
+/// inside an engine's own program-size ceiling. A reading is used only once this engine has
+/// COMPILED it, and `None` — no reading compiles — leaves the value admitted, the framework's
+/// own treatment.
+fn compiled(pattern: &str) -> Option<Arc<::fancy_regex::Regex>> {
+    let readings = [
+        pattern.to_string(),
+        respelt(pattern, Shorthands::AsWritten),
+        respelt(pattern, Shorthands::AsAscii),
+    ];
+    let mut read: Vec<&String> = Vec::with_capacity(readings.len());
+    for reading in &readings {
+        if !read.contains(&reading) {
+            read.push(reading);
+        }
+    }
+    read.into_iter()
+        .find_map(|reading| {
+            ::fancy_regex::RegexBuilder::new(&format!(
+                "{DOT_MATCHES_A_LINE_TERMINATOR}{reading}"
+            ))
+                .backtrack_limit(PATTERN_BACKTRACK_LIMIT)
+                .build()
+                .ok()
+        })
+        .map(Arc::new)
+}
+
+/// Whether a reading keeps a shorthand character class as the model wrote it, or writes it as
+/// the ASCII set an ECMA-262 expression means by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shorthands {
+    /// `\w` stays `\w`, which these engines read as the Unicode set.
+    AsWritten,
+    /// `\w` is written `A-Za-z0-9_`: what ECMA-262 means by it, and a program small enough
+    /// for a wide repetition of one.
+    AsAscii,
+}
+
+impl Shorthands {
+    /// The ASCII set ECMA-262 means by the shorthand `\<escaped>` INSIDE a character class, or
+    /// `None` for an escape that is not one of them, for a complement (which a class cannot
+    /// state as a set) and for a reading that keeps them as written.
+    fn set(self, escaped: char) -> Option<&'static str> {
+        if self == Self::AsWritten {
+            return None;
+        }
+        match escaped {
+            'w' => Some("A-Za-z0-9_"),
+            'd' => Some("0-9"),
+            's' => Some(r" \t\n\r\f\x0B"),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the two characters at `at` open a SHORTHAND character class (`\w`, `\d`, `\s`,
+/// their complements, and a `\p{…}` property), which cannot be the endpoint of a range.
+fn opens_a_shorthand_class(text: &[char], at: usize) -> bool {
+    text.get(at) == Some(&'\\')
+        && text
+            .get(at + 1)
+            .is_some_and(|next| matches!(next, 'w' | 'W' | 'd' | 'D' | 's' | 'S' | 'p' | 'P'))
+}
+
+/// `regex` as the engine AWS validates with reads it: every `-` inside a character class that
+/// cannot be a RANGE operator written as the escaped literal these engines require, and every
+/// shorthand class inside a character class written per `shorthands`.
+///
+/// A `-` beside a shorthand class is such a one: `[\w-/]` is "a word character, a hyphen or a
+/// slash" to the engine AWS validates with, and an invalid range to these, which spell that
+/// same class `[\w\-/]`. A `-` at either end of a class is already a literal to all of them
+/// and is left alone, as is a `-` between two single characters, which is the range it looks
+/// like. Both rewritings are confined to character classes, and nothing else about the
+/// expression moves.
+///
+/// The LIMIT of that confinement: a POSIX class (`[:alpha:]`) closes the class it sits in as
+/// far as this scan is concerned, so a hyphen after one is read as sitting outside a class and
+/// is left as written. An expression spelled that way is simply one no reading here compiles,
+/// which leaves its values admitted — the framework's own treatment of an expression nothing
+/// evaluated, and the safe direction.
+fn respelt(regex: &str, shorthands: Shorthands) -> String {
+    let text: Vec<char> = regex.chars().collect();
+    let mut out = String::with_capacity(regex.len() + 8);
+    let mut at = 0usize;
+    let mut in_class = false;
+    // Whether the item just copied inside the class was a shorthand class, which cannot be a
+    // range's left endpoint.
+    let mut after_shorthand_class = false;
+    while let Some(&character) = text.get(at) {
+        match character {
+            '\\' => {
+                after_shorthand_class = in_class && opens_a_shorthand_class(&text, at);
+                // Inside a class, a shorthand this reading states as a SET is written as that
+                // set; everything else is copied with the character it escapes.
+                if let Some(set) = text
+                    .get(at + 1)
+                    .filter(|_| in_class)
+                    .and_then(|&escaped| shorthands.set(escaped))
+                {
+                    out.push_str(set);
+                    at += 2;
+                    continue;
+                }
+                out.push(character);
+                at += 1;
+                if let Some(&escaped) = text.get(at) {
+                    out.push(escaped);
+                    at += 1;
+                    // A `\p{…}` property carries the class name the braces hold.
+                    if matches!(escaped, 'p' | 'P') && text.get(at) == Some(&'{') {
+                        while let Some(&inner) = text.get(at) {
+                            out.push(inner);
+                            at += 1;
+                            if inner == '}' {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                after_shorthand_class = false;
+                out.push(character);
+                at += 1;
+                // A negating `^` opens the class rather than being a member of it.
+                if text.get(at) == Some(&'^') {
+                    out.push('^');
+                    at += 1;
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                after_shorthand_class = false;
+                out.push(character);
+                at += 1;
+            }
+            '-' if in_class
+                && (after_shorthand_class || opens_a_shorthand_class(&text, at + 1)) =>
+            {
+                after_shorthand_class = false;
+                out.push_str(r"\-");
+                at += 1;
+            }
+            _ => {
+                after_shorthand_class = false;
+                out.push(character);
+                at += 1;
+            }
+        }
+    }
+    out
 }
 
 /// This module's cache, locked. `into_inner` on poisoning rather than `unwrap`: a panic
@@ -449,6 +631,227 @@ mod tests {
             assert_eq!(
                 applied, expected,
                 "case {case:?}: expected applied_at_the_boundary == {expected}, got {applied}"
+            );
+        }
+    }
+
+    /// RULE: a `-` inside a character class that cannot be a range operator is written as the
+    /// escaped literal these engines require, a shorthand class inside one is written as the
+    /// ASCII set ECMA-262 means by it where the reading asks for that, and nothing else about
+    /// the expression moves.
+    #[test]
+    fn a_class_is_respelt_as_the_engine_aws_validates_with_reads_it() {
+        // (case, the model's text, as written, with the shorthands as ASCII)
+        let rows: [(&str, &str, &str, &str); 11] = [
+            (
+                "a hyphen after a shorthand class",
+                r"[\w-/]",
+                r"[\w\-/]",
+                r"[A-Za-z0-9_\-/]",
+            ),
+            (
+                "a hyphen before one",
+                r"[/-\w]",
+                r"[/\-\w]",
+                r"[/\-A-Za-z0-9_]",
+            ),
+            (
+                // `com.amazonaws.ssm#CloudConnectorIamRoleArn`
+                // (`smithy_query(query="shape", shape="CloudConnectorIamRoleArn")`).
+                "an IAM role ARN's role-name class, its redundant escape kept",
+                r"^arn:aws[a-z0-9-]*:iam::\d{12}:role\/[\w-\/.@+=,]{1,1017}$",
+                r"^arn:aws[a-z0-9-]*:iam::\d{12}:role\/[\w\-\/.@+=,]{1,1017}$",
+                r"^arn:aws[a-z0-9-]*:iam::\d{12}:role\/[A-Za-z0-9_\-\/.@+=,]{1,1017}$",
+            ),
+            (
+                "a digit shorthand, which only a class states as a set",
+                r"^\d{12}:[\d-/]$",
+                r"^\d{12}:[\d\-/]$",
+                r"^\d{12}:[0-9\-/]$",
+            ),
+            (
+                "a hyphen between two property classes, which no class states as a set",
+                r"[\p{L}-\p{N}]",
+                r"[\p{L}\-\p{N}]",
+                r"[\p{L}\-\p{N}]",
+            ),
+            (
+                "a complement, which a class cannot state as a set",
+                r"[\W-/]",
+                r"[\W\-/]",
+                r"[\W\-/]",
+            ),
+            (
+                "a range between two characters, which is the range it looks like",
+                r"[a-z0-9-]*",
+                r"[a-z0-9-]*",
+                r"[a-z0-9-]*",
+            ),
+            (
+                "a hyphen at a class's ends, already a literal to every engine",
+                r"[-a-z-]",
+                r"[-a-z-]",
+                r"[-a-z-]",
+            ),
+            (
+                "a negated class, whose opener is not a member of it",
+                r"[^\w-/]",
+                r"[^\w\-/]",
+                r"[^A-Za-z0-9_\-/]",
+            ),
+            (
+                "an escaped bracket, which opens no class",
+                r"\[\w-/\]",
+                r"\[\w-/\]",
+                r"\[\w-/\]",
+            ),
+            (
+                // The limit this scan states: a POSIX class CLOSES the class it sits in, so
+                // the hyphen after it is read outside one and left as written. Such an
+                // expression is then one no reading compiles, which leaves its values
+                // admitted — the framework's own treatment, and the safe direction.
+                "a POSIX class inside a class, which this scan does not read",
+                r"[[:alpha:]-/]",
+                r"[[:alpha:]-/]",
+                r"[[:alpha:]-/]",
+            ),
+        ];
+        for (case, declared, as_written, as_ascii) in rows {
+            for (reading, expected) in [
+                (Shorthands::AsWritten, as_written),
+                (Shorthands::AsAscii, as_ascii),
+            ] {
+                let respelt = respelt(declared, reading);
+                assert_eq!(
+                    &respelt, expected,
+                    "case {case:?} read {reading:?}: expected {expected:?}, got {respelt:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: an expression neither engine reads as written is decided by the reading of its
+    /// text that compiles, and that reading decides the values the engine AWS validates with
+    /// decides.
+    ///
+    /// The expression is the one AWS Systems Manager declares on `CloudConnectorIamRoleArn`
+    /// (`smithy_query(query="shape", shape="CloudConnectorIamRoleArn")`): its role-name class
+    /// writes a literal hyphen beside `\w`, which no engine here reads as written, and its
+    /// run is wide enough that the Unicode reading of `\w` is past an engine's own
+    /// program-size ceiling.
+    #[test]
+    fn a_respelt_expression_decides_the_values_the_model_requires() {
+        const ROLE_ARN: &str = r"^arn:aws[a-z0-9-]*:iam::\d{12}:role\/[\w-\/.@+=,]{1,1017}$";
+        assert!(
+            !applied_at_the_boundary(ROLE_ARN),
+            "the boundary's own engine does not read the class this expression writes"
+        );
+        let rows: [(&str, &str, Option<bool>); 11] = [
+            ("a role ARN", "arn:aws:iam::000000000000:role/Admin", Some(true)),
+            (
+                "a role under a path, which the class's slash admits",
+                "arn:aws:iam::000000000000:role/service-role/Admin",
+                Some(true),
+            ),
+            (
+                "every other character the class admits",
+                "arn:aws:iam::000000000000:role/a_b.c@d+e=f,g-h",
+                Some(true),
+            ),
+            (
+                "another partition, which the expression admits",
+                "arn:aws-us-gov:iam::000000000000:role/Admin",
+                Some(true),
+            ),
+            (
+                "an ARN of another service",
+                "arn:aws:s3:::not-an-iam-role",
+                Some(false),
+            ),
+            (
+                "an account that is not twelve digits",
+                "arn:aws:iam::12345:role/Admin",
+                Some(false),
+            ),
+            (
+                "no role name at all",
+                "arn:aws:iam::000000000000:role/",
+                Some(false),
+            ),
+            ("not an ARN at all", "not-an-arn", Some(false)),
+            (
+                // The anchors are the WHOLE value's: a line the expression admits does not
+                // carry a value it does not.
+                "a role ARN after a line the expression does not admit",
+                "junk\narn:aws:iam::000000000000:role/Admin",
+                Some(false),
+            ),
+            (
+                "a role ARN before one",
+                "arn:aws:iam::000000000000:role/Admin\njunk",
+                Some(false),
+            ),
+            (
+                // The class admits no line terminator, so a role name cannot carry one even
+                // where a `.` of some other expression would now match it.
+                "a role name written across lines",
+                "arn:aws:iam::000000000000:role/Ad\nmin",
+                Some(false),
+            ),
+        ];
+        for (case, value, expected) in rows {
+            let decided = satisfies(ROLE_ARN, value);
+            assert_eq!(
+                decided, expected,
+                "case {case:?}: expected the modelled expression to decide {expected:?}, got \
+                 {decided:?}"
+            );
+        }
+    }
+
+    /// RULE: a `.` of a modelled expression matches a line terminator, so a member AWS accepts
+    /// a pretty-printed document at is not refused for carrying a newline — while the ANCHORS
+    /// stay the whole value's, so the value such an expression is written to refuse still is.
+    ///
+    /// The expression is the one AWS Systems Manager declares on `Policy`
+    /// (`smithy_query(query="shape", shape="Policy")`): a resource policy is a JSON document,
+    /// which a caller writes across lines.
+    #[test]
+    fn an_anchored_expression_admits_a_document_written_across_lines() {
+        const NOT_BLANK: &str = r"^(?!\s*$).+$";
+        let rows: [(&str, &str, Option<bool>); 7] = [
+            ("a document on one line", r#"{"Version":"2012-10-17"}"#, Some(true)),
+            (
+                "the same document written across lines",
+                "{\n    \"Version\": \"2012-10-17\"\n}",
+                Some(true),
+            ),
+            (
+                // The leading terminator is part of the ONE value the expression matches,
+                // whose first character is not blank-to-the-end: this expression refuses a
+                // document that is blank, not one that opens with an empty line.
+                "a document whose first line is blank",
+                "\n{\n    \"Version\": \"2012-10-17\"\n}",
+                Some(true),
+            ),
+            ("the empty value", "", Some(false)),
+            ("a value of spaces", "   ", Some(false)),
+            ("a value of blank lines", "  \n\t\n   ", Some(false)),
+            (
+                // A document a caller's editor left a trailing terminator on is still that
+                // document: a `.` matches the terminator, and the anchor is at the value's own
+                // end.
+                "a document with a trailing line terminator",
+                "{\n    \"Version\": \"2012-10-17\"\n}\n",
+                Some(true),
+            ),
+        ];
+        for (case, value, expected) in rows {
+            let decided = satisfies(NOT_BLANK, value);
+            assert_eq!(
+                decided, expected,
+                "case {case:?}: expected the modelled expression to decide {expected:?}, got \
+                 {decided:?}"
             );
         }
     }

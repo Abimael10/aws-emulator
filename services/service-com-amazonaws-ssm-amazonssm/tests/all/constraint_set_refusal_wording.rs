@@ -36,8 +36,9 @@ use crate::parameter_store::{call, error_code, error_message, router};
 /// admits.
 const NODE: &str = "i-0abcdef0123456789";
 
-/// The envelope AWS counts `clauses` in, as the framework renders it.
-fn detected(clauses: &[String]) -> String {
+/// The envelope AWS counts `clauses` in, as the framework renders it. Shared with the
+/// sibling suites that word the same envelope (`all/cloud_connector_input_constraint_wording`).
+pub(crate) fn detected(clauses: &[String]) -> String {
     match clauses {
         [one] => format!("1 validation error detected: {one}"),
         many => format!(
@@ -48,8 +49,8 @@ fn detected(clauses: &[String]) -> String {
     }
 }
 
-/// One clause about `path`, quoting the value the request carried.
-fn clause(value: &str, path: &str, requirement: &str) -> String {
+/// One clause about `path`, quoting the value the request carried. Shared, as [`detected`] is.
+pub(crate) fn clause(value: &str, path: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
 }
 
@@ -60,8 +61,9 @@ fn valueless_clause(path: &str, requirement: &str) -> String {
     format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
-/// The requirement clause for a value outside its member's `@pattern`.
-fn pattern(expression: &str) -> String {
+/// The requirement clause for a value outside its member's `@pattern`. Shared, as
+/// [`detected`] is.
+pub(crate) fn pattern(expression: &str) -> String {
     format!("Member must satisfy regular expression pattern: {expression}")
 }
 

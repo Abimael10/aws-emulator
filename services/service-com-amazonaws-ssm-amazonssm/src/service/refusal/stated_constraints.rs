@@ -101,6 +101,20 @@ const PREVIEW_DOCUMENT_NAME_PATTERN: &str = r"^[a-zA-Z0-9_\-.:/]{3,200}$";
 /// (`smithy_query(query="shape",shape="DocumentName")`).
 const DOCUMENT_NAME_PATTERN: &str = r"^[a-zA-Z0-9_\-.]{3,128}$";
 
+/// `com.amazonaws.ssm#ConfigConnectorArn`'s expression, which this service publishes as the
+/// model declares it (`smithy_query(query="shape",shape="ConfigConnectorArn")`) — recorded
+/// behaviour, fixture `ssm-cloudconnector-create-invalid-input` step `task#1`, where a
+/// `configConnectorArn` outside it is refused with the whole-value pair still quoted.
+const CONFIG_CONNECTOR_ARN_PATTERN: &str =
+    r"^arn:aws(-cn|-us-gov)?:config:([^:]+):\d{12}:connector/.+$";
+
+/// `com.amazonaws.ssm#CloudConnectorIamRoleArn`'s expression, which this service publishes as
+/// the model declares it (`smithy_query(query="shape",shape="CloudConnectorIamRoleArn")`) —
+/// recorded behaviour, fixture `ssm-cloudconnector-create-invalid-input` step `task#2`, where
+/// a `roleArn` outside it is refused with the whole-value pair still quoted.
+const CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN: &str =
+    r"^arn:aws[a-z0-9-]*:iam::\d{12}:role\/[\w-\/.@+=,]{1,1017}$";
+
 /// The run of characters a NAME a caller chooses is held to, as the model declares it
 /// (`smithy_query(query="shape",shape="PatchGroup")`; `ActivationDefaultInstanceName`
 /// carries the same text), and as this service publishes it: a refusal of a patch group
@@ -119,6 +133,8 @@ const PUBLISHED_AS_DECLARED: &[&str] = &[
     COMMAND_ID_PATTERN,
     INVENTORY_ITEM_TYPE_NAME_PATTERN,
     PREVIEW_DOCUMENT_NAME_PATTERN,
+    CONFIG_CONNECTOR_ARN_PATTERN,
+    CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN,
     CHOSEN_NAME_PATTERN,
 ];
 
@@ -863,6 +879,37 @@ mod tests {
         }
     }
 
+    /// RULE: every expression this service publishes as declared is one the MODEL declares
+    /// for a shape of this service, or one a row above states for a shape — the service's own
+    /// requirement, which no shape of this model carries.
+    ///
+    /// So a published-as-declared entry cannot quote text no member is ever checked against,
+    /// and a model revision that rewrites one of those shapes fails here instead of silently
+    /// leaving the entry behind.
+    #[test]
+    fn a_published_expression_is_one_the_model_declares() {
+        let model = model();
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        for published in PUBLISHED_AS_DECLARED {
+            let stated_by_a_row = STATED_SHAPES
+                .iter()
+                .any(|row| row_pattern(row.constraints) == Some(*published))
+                || STATED_ELEMENTS
+                    .iter()
+                    .any(|row| row_pattern(row.constraints) == Some(*published));
+            let declared = shapes
+                .values()
+                .any(|shape| shape["traits"]["smithy.api#pattern"].as_str() == Some(*published));
+            assert!(
+                stated_by_a_row || declared,
+                "case {published:?}: no shape of the model declares this expression and no \
+                 row states it"
+            );
+        }
+    }
+
     /// RULE: inside the SCOPE a shape row holds for — every operation, or the ones it names
     /// — every member the lookup would recognise targets a shape the row is ABOUT.
     ///
@@ -1019,6 +1066,16 @@ mod tests {
                 "the command id the service itself requires",
                 COMMAND_ID_PATTERN,
                 COMMAND_ID_PATTERN,
+            ),
+            (
+                "a Config connector ARN, published as the model declares it",
+                CONFIG_CONNECTOR_ARN_PATTERN,
+                CONFIG_CONNECTOR_ARN_PATTERN,
+            ),
+            (
+                "the IAM role ARN of a cloud connector, published the same way",
+                CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN,
+                CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN,
             ),
             (
                 "a name a caller chooses, which this service publishes as the model declares it",
