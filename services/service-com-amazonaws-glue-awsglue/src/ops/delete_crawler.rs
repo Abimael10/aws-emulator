@@ -9,8 +9,10 @@
 //! "Removes a specified crawler from the Glue Data Catalog, unless the crawler state is
 //! RUNNING": a name no crawler in this account has is the modelled
 //! `EntityNotFoundException`, and a crawler whose crawl is in progress is the modelled
-//! `CrawlerRunningException` with nothing removed — the same two refusals, worded the same
-//! way, that `UpdateCrawler` makes about the crawler it addresses.
+//! `CrawlerRunningException` with nothing removed. The miss is the sentence the
+//! crawler-definition reads answer with, and the conflict is this operation's OWN sentence,
+//! which states the delete it refuses rather than the one `UpdateCrawler` words for a write
+//! to the crawler's definition.
 //!
 //! ## Shape of an operation
 //!
@@ -174,13 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "unless the crawler state is RUNNING": `READY` is the one modelled `CrawlerState`
         // with no run in progress, so every other state refuses the delete and the crawler
-        // stays where it is. (`SchedulerTransitioningException` is the refusal of a crawler
-        // whose SCHEDULE is mid-transition, a state no write this service serves leaves one
-        // in, so nothing answers it.)
+        // stays where it is. The refusal states the DELETE it refuses, in this operation's
+        // own words rather than the crawler-definition write's.
+        // (`SchedulerTransitioningException` is the refusal of a crawler whose SCHEDULE is
+        // mid-transition, a state no write this service serves leaves one in, so nothing
+        // answers it.)
         if entry.state != crate::state::CRAWLER_STATE_READY {
             return Err(DeleteCrawlerErrorModeled::CrawlerRunningException(
                 CrawlerRunningException {
-                    message: Some(crate::state::messages::crawler_running(&input.name)),
+                    message: Some(crate::state::messages::cannot_delete_running_crawler(
+                        &input.name,
+                    )),
                 },
             )
             .into());

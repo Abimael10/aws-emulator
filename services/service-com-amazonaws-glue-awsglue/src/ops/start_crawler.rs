@@ -166,13 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // as one in progress.
             store.settle_due_crawls(now);
             let Some(crawler) = store.crawler(&input.name) else {
-                return Err(StartCrawlerErrorModeled::EntityNotFoundException(
-                    EntityNotFoundException {
-                        message: Some(crate::state::messages::crawler_not_found(&input.name)),
-                        from_federation_source: None,
-                    },
-                )
-                .into());
+                return Err(not_found(&input.name));
             };
             // "If the crawler is already running, returns a CrawlerRunningException": a
             // crawl in progress is what blocks another of the SAME crawler, whatever any
@@ -226,13 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The crawler is re-read under the guard the crawl is recorded under: a delete or
         // another start that landed while the data was being walked decides this start.
         let Some(crawler) = store.crawler(&input.name) else {
-            return Err(StartCrawlerErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::crawler_not_found(&input.name)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+            return Err(not_found(&input.name));
         };
         if crawler.crawl_in_progress() {
             return Err(already_running(&input.name));
@@ -286,6 +274,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(StartCrawlerOutput {})
     }
+}
+
+/// This operation's modelled miss: "a specified entity does not exist" — a `Name` no crawler
+/// in this account has.
+///
+/// ONE constructor, so the miss reads the same whether it is seen before the data is walked
+/// or after it. The sentence is the one THIS operation words
+/// ([`crate::state::messages::start_crawler_not_found`]), not the crawler-definition read's:
+/// the two are recorded differently for one and the same absent name.
+fn not_found(name: &str) -> StartCrawlerError {
+    StartCrawlerErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::start_crawler_not_found(name)),
+        from_federation_source: None,
+    })
+    .into()
 }
 
 /// This operation's modelled conflict: "the operation cannot be performed because the

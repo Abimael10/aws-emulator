@@ -6,8 +6,27 @@
 /// A crawler lookup (`GetCrawler`, and the `UpdateCrawler` that addresses one the
 /// same way) for a name no crawler in this account has. Built from the request's
 /// `Name`, which is stored and matched exactly as sent.
+///
+/// RECORDED template for the crawler-DEFINITION reads. The run surface words the very same
+/// miss its own way ([`start_crawler_not_found`]), so neither of the two may be borrowed
+/// for the other.
 pub fn crawler_not_found(name: &str) -> String {
     format!("Crawler entry with name {name} does not exist")
+}
+
+/// `StartCrawler` for a `Name` no crawler in this account has.
+///
+/// RECORDED template, and NOT [`crawler_not_found`]: the two are recorded side by side for
+/// one and the same absent name — the crawler-definition read states "Crawler entry with
+/// name ...", the start of a crawl states "Crawler with name ..." — so the sentence belongs
+/// to the operation that refuses and not to the service. The only variable part is the
+/// request's `Name`, echoed exactly as sent; the rest is fixed text.
+///
+/// Pinned for THIS operation, the one the corpus records. The sibling run call
+/// (`StopCrawler`) keeps its own wording rather than being reworded on this operation's
+/// evidence.
+pub fn start_crawler_not_found(name: &str) -> String {
+    format!("Crawler with name {name} does not exist")
 }
 
 /// `StartCrawlerSchedule` for a `CrawlerName` no crawler in this account has.
@@ -37,6 +56,21 @@ pub fn schedule_crawler_not_found(name: &str) -> String {
 /// carrying only the requested `Name`.
 pub fn crawler_running(name: &str) -> String {
     format!("Crawler with name {name} is running")
+}
+
+/// `DeleteCrawler` for a crawler whose crawl is in progress ("removes a specified crawler
+/// from the Glue Data Catalog, unless the crawler state is RUNNING").
+///
+/// RECORDED template, reproduced as the service words this error class and NOT tidied: the
+/// fixed text that names the delete it refuses runs STRAIGHT into the crawler's `Name`, with
+/// no separating space, before the fixed tail. That is the service's own wording, so
+/// inserting the space a reader expects would be a divergence rather than a repair. The only
+/// variable part is the request's `Name`, echoed exactly as sent.
+///
+/// NOT [`crawler_running`], which is the refusal a WRITE to the crawler's definition earns
+/// and which no recording pins: each operation states the refusal it makes in its own words.
+pub fn cannot_delete_running_crawler(name: &str) -> String {
+    format!("Cannot delete crawler{name} while it's running")
 }
 
 /// `StartCrawler` for a crawler whose crawl is already in progress: "if the crawler is

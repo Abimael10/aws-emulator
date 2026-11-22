@@ -93,7 +93,10 @@ fn is_request_id(id: &str) -> bool {
 }
 
 /// Make one call that must be refused, answering its body: HTTP 400 with `expected_code`.
-async fn refused(
+///
+/// One copy, shared: every suite that reads the wording of a refusal off the body asserts the
+/// status and the error class the same way first (`tests/all/crawler_run_refusal_wording.rs`).
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,

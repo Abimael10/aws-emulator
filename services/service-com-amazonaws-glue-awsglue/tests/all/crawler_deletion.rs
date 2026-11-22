@@ -271,8 +271,9 @@ async fn deleting_a_crawler_whose_crawl_is_in_progress_is_refused() {
         );
         assert_eq!(
             error_message(&refused),
-            format!("Crawler with name {name} is running"),
-            "case {case:?}: expected the service's own crawler-running wording, got {refused}"
+            format!("Cannot delete crawler{name} while it's running"),
+            "case {case:?}: expected this operation's own delete-while-running wording, got \
+             {refused}"
         );
 
         let read = ok(&router, "GetCrawler", &json!({ "Name": name })).await;

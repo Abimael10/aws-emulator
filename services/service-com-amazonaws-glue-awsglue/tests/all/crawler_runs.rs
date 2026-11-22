@@ -71,7 +71,7 @@ pub(crate) const DATABASE: &str = "crawled_db";
 /// Amazon S3 is mounted because a crawl READS the objects under its targets: it reaches them
 /// over the emulator's own in-process callback, so the objects a test stages with `PutObject`
 /// are the objects the crawl classifies.
-fn emulator_with_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -1090,7 +1090,9 @@ async fn a_crawl_reports_what_it_could_and_could_not_do() {
 }
 
 /// A name no crawler in the account has is a miss, whatever its spelling: "a specified entity
-/// does not exist", with the catalog's own wording for a crawler.
+/// does not exist", with the wording THIS operation states that miss in (the sentence the
+/// crawler-definition read answers with is a different one; `crawler_run_refusal_wording.rs`
+/// holds the two side by side).
 ///
 /// The rows differ along the spelling of the absent name: one never created, and the stored
 /// crawler's name in another casing — a crawler is addressed by name exactly as it was
@@ -1125,7 +1127,7 @@ async fn starting_a_crawler_that_does_not_exist_is_a_miss() {
         );
         assert_eq!(
             error_message(&parsed),
-            format!("Crawler entry with name {name} does not exist"),
+            format!("Crawler with name {name} does not exist"),
             "case {case:?}: expected the miss to name the crawler, got {parsed}"
         );
     }
