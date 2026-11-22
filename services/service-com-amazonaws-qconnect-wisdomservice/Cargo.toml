@@ -30,6 +30,13 @@ service-common = { path = "../common" }
 # number over, and the hex codec that renders it (and the opaque list cursor).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The AWS SDK for Amazon SNS, driven over the in-process callback
+# (`OperationContext::callback`): the chat-streaming topic an assistant reports is a topic
+# of Amazon SNS, so `CreateAssistant` resolves the account's one topic there — creating it
+# on first need — instead of naming a topic of its own
+# (`state::chat_streaming_topic`). Only the generated client is needed; the emulator
+# supplies the transport.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -38,6 +45,10 @@ emulator-core-build-support = { workspace = true }
 # `automod` roots the one integration-test target at `tests/all/main.rs`, declaring a
 # module per suite file under `tests/all/`.
 automod = { workspace = true }
+# Amazon SNS is mounted beside this service on ONE engine wherever a suite asserts the
+# chat-streaming topic an assistant reports: the topic belongs to that service, so the
+# assertion resolves it there rather than trusting this service's own answer.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

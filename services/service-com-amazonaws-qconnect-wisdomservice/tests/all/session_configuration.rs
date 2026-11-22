@@ -23,7 +23,9 @@
 //! orchestrator entries).
 //!
 //! Every assertion goes over the wire through the same [`MultiServiceRouter`] the
-//! production emulator mounts; nothing reaches into the service's state struct.
+//! production emulator mounts; nothing reaches into the service's state struct. Amazon SNS
+//! is mounted beside this service on the same engine, as the assembled router mounts them,
+//! because the topic a session streams through is a resource of that service.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -90,7 +92,8 @@ impl Reply {
     }
 }
 
-/// An emulator with just this service mounted on a fresh engine, driven in-process
+/// An emulator with this service mounted on a fresh engine, with Amazon SNS beside it —
+/// the topic an assistant is integrated with belongs to that service — driven in-process
 /// through the production router.
 struct Emulator {
     router: MultiServiceRouter,
@@ -103,7 +106,12 @@ impl Emulator {
         // Signatures are not what these tests are about; the router still routes by the
         // SigV4 credential scope below, which is also where an ARN's region comes from.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         Self { router }
     }
 

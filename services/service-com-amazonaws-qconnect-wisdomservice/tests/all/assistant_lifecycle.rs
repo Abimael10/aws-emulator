@@ -69,7 +69,8 @@ impl Reply {
     }
 }
 
-/// An emulator with just this service mounted on a fresh engine, driven in-process
+/// An emulator with this service mounted on a fresh engine, with Amazon SNS beside it —
+/// the topic an assistant is integrated with belongs to that service — driven in-process
 /// through the production router.
 struct Emulator {
     router: MultiServiceRouter,
@@ -82,7 +83,12 @@ impl Emulator {
         // Signatures are not what these tests are about; the router still routes by the
         // SigV4 credential scope below, which is also where an ARN's region comes from.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         Self { router }
     }
 
@@ -375,8 +381,9 @@ fn assert_reported_assistant(
 
 /// The configuration members of the reported assistant: the capability it was
 /// provisioned with, the topic it streams through, a binding per default AI agent type
-/// and an (empty) orchestrator list. `tests/all/assistant_configuration.rs` is where
-/// each of those values is pinned; here they are only shown to be reported by every
+/// and an (empty) orchestrator list. `tests/all/assistant_configuration.rs` is where each
+/// of those values is pinned, and `tests/all/assistant_chat_streaming_topic.rs` where the
+/// topic is resolved in Amazon SNS; here they are only shown to be reported by every
 /// operation that reports an assistant.
 fn assert_reported_assistant_configuration(label: &str, reply: &Reply) {
     let capability = reply.string("/assistant/capabilityConfiguration/type");

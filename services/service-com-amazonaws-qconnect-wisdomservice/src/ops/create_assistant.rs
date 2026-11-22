@@ -7,7 +7,10 @@
 //! answers the create with the assistant already `ACTIVE`, so no status change is owed
 //! afterwards; a replayed `clientToken` answers with the assistant that token already
 //! created; a second live assistant under one name is the conflict `ConflictException`
-//! describes.
+//! describes. The topic it reports as the assistant's chat-message stream is a topic
+//! Amazon SNS — which owns topics — really holds: the create provisions it there
+//! (`crate::state::provision_assistant_streaming_topic`) and reports the ARN that service
+//! answered.
 //!
 //! ## Shape of an operation
 //!
@@ -176,141 +179,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(&ctx.parts().headers);
-        let mut store = state.lock();
+        // Everything this create decides and writes happens under the store's lock, in
+        // this one critical section: the section ENDS before the hop into Amazon SNS
+        // below, because that is a call into another mounted service and no in-process
+        // request may run under this service's lock. What it yields is the id of the
+        // assistant it inserted.
+        let assistant_id = {
+            let mut store = state.lock();
 
-        // The tags the create persists, read once from the request: the same map goes
-        // into the fingerprint below and onto the stored record.
-        let tags = input.tags.clone().unwrap_or_default();
+            // The tags the create persists, read once from the request: the same map goes
+            // into the fingerprint below and onto the stored record.
+            let tags = input.tags.clone().unwrap_or_default();
 
-        // What this create's `@idempotencyToken` identifies: every member the record
-        // below is built from, with the tag map fingerprinted in key order
-        // (`crate::state::tags_fingerprint`) so the same tag set written in another order
-        // is one request.
-        let fingerprint = crate::state::request_fingerprint(&[
-            input.name.clone(),
-            input.r#type.clone(),
-            input.description.clone().unwrap_or_default(),
-            format!("{:?}", input.server_side_encryption_configuration),
-            crate::state::tags_fingerprint(&tags),
-        ]);
+            // What this create's `@idempotencyToken` identifies: every member the record
+            // below is built from, with the tag map fingerprinted in key order
+            // (`crate::state::tags_fingerprint`) so the same tag set written in another
+            // order is one request.
+            let fingerprint = crate::state::request_fingerprint(&[
+                input.name.clone(),
+                input.r#type.clone(),
+                input.description.clone().unwrap_or_default(),
+                format!("{:?}", input.server_side_encryption_configuration),
+                crate::state::tags_fingerprint(&tags),
+            ]);
 
-        // A replayed `@idempotencyToken` answers with the assistant it already created
-        // rather than creating a second one, while the same token carrying a DIFFERENT
-        // request is the modelled idempotency conflict rather than a record the caller did
-        // not ask for. The token is scoped to this operation, so the same token on another
-        // create is another resource.
-        match store.replayed_create(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::Replay::Conflict => {
-                return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
-                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
-                })
-                .into())
-            }
-            crate::state::Replay::Retry(created) => {
-                if let Some(assistant) = store.assistant(&created) {
-                    return Ok(CreateAssistantOutput {
-                        assistant: Some(assistant.to_assistant_data()),
-                    });
+            // A replayed `@idempotencyToken` answers with the assistant it already created
+            // rather than creating a second one, while the same token carrying a DIFFERENT
+            // request is the modelled idempotency conflict rather than a record the caller
+            // did not ask for. The token is scoped to this operation, so the same token on
+            // another create is another resource.
+            match store.replayed_create(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+                crate::state::Replay::Conflict => {
+                    return Err(CreateAssistantErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(
+                                crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string(),
+                            ),
+                        },
+                    )
+                    .into())
                 }
+                crate::state::Replay::Retry(created) => {
+                    if let Some(assistant) = store.assistant(&created) {
+                        return Ok(CreateAssistantOutput {
+                            assistant: Some(assistant.to_assistant_data()),
+                        });
+                    }
+                }
+                crate::state::Replay::Fresh => {}
             }
-            crate::state::Replay::Fresh => {}
-        }
 
-        // An assistant's name identifies it, so a create under a name this account
-        // already holds is the modelled conflict (HTTP 409) rather than a second record.
-        if store.assistant_id_with_name(&input.name).is_some() {
-            return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::MESSAGE_NAME_IN_USE.to_string()),
-            })
-            .into());
-        }
+            // An assistant's name identifies it, so a create under a name this account
+            // already holds is the modelled conflict (HTTP 409) rather than a second
+            // record.
+            if store.assistant_id_with_name(&input.name).is_some() {
+                return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_NAME_IN_USE.to_string()),
+                })
+                .into());
+            }
 
-        // The account's assistant quota: a create beyond it is refused, which is also
-        // what keeps the store finite — a record is released only by `DeleteAssistant`.
-        if store.assistants.len() >= crate::state::MAX_ASSISTANTS {
-            return Err(CreateAssistantErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} assistants.",
-                        crate::state::MAX_ASSISTANTS
-                    )),
-                },
-            )
-            .into());
-        }
+            // The account's assistant quota: a create beyond it is refused, which is also
+            // what keeps the store finite — a record is released only by
+            // `DeleteAssistant`.
+            if store.assistants.len() >= crate::state::MAX_ASSISTANTS {
+                return Err(CreateAssistantErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The account already holds the maximum of {} assistants.",
+                            crate::state::MAX_ASSISTANTS
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let Some(assistant_id) = store.mint_assistant_id() else {
-            return Err(CreateAssistantErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "could not mint a unique assistantId; retry the request".to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
-        // The service provisions the assistant's streaming topic, its built-in SYSTEM AI
-        // agents and its own system-managed session with the assistant itself, so the
-        // create's own answer already reports them.
-        let (ai_agents, ai_agent_configuration) =
-            crate::state::default_ai_agents(&region, &assistant_id);
-        let system_session = crate::state::system_session(
-            &region,
-            &assistant_id,
-            &ai_agent_configuration,
-        );
-        let assistant = crate::state::Assistant {
-            assistant_arn: crate::state::assistant_arn(&region, &assistant_id),
-            assistant_id: assistant_id.clone(),
-            name: input.name.clone(),
-            r#type: input.r#type.clone(),
-            // The service answers the create with the assistant ready, so it stays
-            // ready: there is no later status change for the clock to owe it.
-            status: crate::state::ASSISTANT_STATUS_ACTIVE.to_string(),
-            description: input.description.clone(),
-            tags: tags.clone(),
-            server_side_encryption_configuration: input
-                .server_side_encryption_configuration
-                .clone(),
-            created_at: ::std::time::SystemTime::now(),
-            capability_type: crate::state::ASSISTANT_CAPABILITY_V2.to_string(),
-            topic_integration_arn: Some(crate::state::topic_integration_arn(
-                &region,
+            let Some(assistant_id) = store.mint_assistant_id() else {
+                return Err(CreateAssistantErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "could not mint a unique assistantId; retry the request".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            // The service provisions the assistant's built-in SYSTEM AI agents and its own
+            // system-managed session with the assistant itself, so the create's own answer
+            // already reports them.
+            let (ai_agents, ai_agent_configuration) =
+                crate::state::default_ai_agents(&region, &assistant_id);
+            let system_session =
+                crate::state::system_session(&region, &assistant_id, &ai_agent_configuration);
+            let assistant = crate::state::Assistant {
+                assistant_arn: crate::state::assistant_arn(&region, &assistant_id),
+                assistant_id: assistant_id.clone(),
+                name: input.name.clone(),
+                r#type: input.r#type.clone(),
+                // The service answers the create with the assistant ready, so it stays
+                // ready: there is no later status change for the clock to owe it.
+                status: crate::state::ASSISTANT_STATUS_ACTIVE.to_string(),
+                description: input.description.clone(),
+                tags: tags.clone(),
+                server_side_encryption_configuration: input
+                    .server_side_encryption_configuration
+                    .clone(),
+                created_at: ::std::time::SystemTime::now(),
+                capability_type: crate::state::ASSISTANT_CAPABILITY_V2.to_string(),
+                // The topic the assistant streams chat messages through is an Amazon SNS
+                // resource, so this service does not compose its ARN: it is provisioned in
+                // that service below, once this critical section has ended, and the ARN
+                // Amazon SNS answered is written onto this record.
+                topic_integration_arn: None,
+                ai_agent_configuration,
+                ai_agents,
+                // No AI agent of a fresh assistant has published a version: one is
+                // published by `CreateAIAgentVersion`, on the agent the route names.
+                ai_agent_versions: ::std::collections::HashMap::new(),
+                // A fresh assistant holds no AI guardrail: one is created by
+                // `CreateAIGuardrail`, under the assistant the route names.
+                ai_guardrails: ::std::collections::HashMap::new(),
+                // A fresh assistant holds no AI prompt either: one is created by
+                // `CreateAIPrompt`, under the assistant the route names.
+                ai_prompts: ::std::collections::HashMap::new(),
+                orchestrator_configuration_list: Vec::new(),
+                // The assistant owns the service-managed session from the moment it
+                // exists: a `GetSession` on it right after this create reports it, with no
+                // `CreateSession` in between.
+                sessions: ::std::collections::HashMap::from([(
+                    crate::state::SYSTEM_SESSION_ID.to_string(),
+                    system_session,
+                )]),
+            };
+            store.insert_assistant(assistant);
+            store.remember_create(
+                Self::NAME,
+                input.client_token.as_deref(),
+                &fingerprint,
                 &assistant_id,
-            )),
-            ai_agent_configuration,
-            ai_agents,
-            // No AI agent of a fresh assistant has published a version: one is published
-            // by `CreateAIAgentVersion`, on the agent the route names.
-            ai_agent_versions: ::std::collections::HashMap::new(),
-            // A fresh assistant holds no AI guardrail: one is created by
-            // `CreateAIGuardrail`, under the assistant the route names.
-            ai_guardrails: ::std::collections::HashMap::new(),
-            // A fresh assistant holds no AI prompt either: one is created by
-            // `CreateAIPrompt`, under the assistant the route names.
-            ai_prompts: ::std::collections::HashMap::new(),
-            orchestrator_configuration_list: Vec::new(),
-            // The assistant owns the service-managed session from the moment it exists:
-            // a `GetSession` on it right after this create reports it, with no
-            // `CreateSession` in between.
-            sessions: ::std::collections::HashMap::from([(
-                crate::state::SYSTEM_SESSION_ID.to_string(),
-                system_session,
-            )]),
+            );
+            assistant_id
         };
-        store.insert_assistant(assistant);
-        store.remember_create(
-            Self::NAME,
-            input.client_token.as_deref(),
-            &fingerprint,
-            &assistant_id,
-        );
+
+        // The streaming topic of the assistant just created, as the service that OWNS
+        // topics reports it. An assistant whose topic could not be created there is
+        // integrated with no topic and reports none, rather than reporting an ARN that
+        // resolves to nothing.
+        let topic_integration_arn =
+            crate::state::provision_assistant_streaming_topic(ctx, &region, &assistant_id)
+                .await;
+        let mut store = state.lock();
+        if let Some(assistant) = store.assistant_mut(&assistant_id) {
+            assistant.topic_integration_arn = topic_integration_arn;
+        }
 
         // Render out of the INSERTED record rather than out of the request: what this
         // call answers is what a later read of the assistant answers.
         let Some(stored) = store.assistant(&assistant_id) else {
-            // Unreachable: the insert above put this id in the map while the lock is
-            // held.
+            // Reachable only if the assistant was deleted between the insert above and
+            // this read, which leaves nothing to report it with.
             return Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistant"));
         };
         Ok(CreateAssistantOutput {

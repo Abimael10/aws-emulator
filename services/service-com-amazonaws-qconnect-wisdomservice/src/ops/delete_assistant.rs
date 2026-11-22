@@ -3,7 +3,9 @@
 //! @op DeleteAssistant
 //!
 //! Removes the assistant and the sessions it owns, then answers HTTP 204 with an empty
-//! body. Deleting an id this account never created is `ResourceNotFoundException`.
+//! body. Deleting an id this account never created is `ResourceNotFoundException`. The
+//! Amazon SNS topic the create provisioned for the assistant's chat-message stream is
+//! released with it (`crate::state::release_assistant_streaming_topic`).
 //!
 //! ## Shape of an operation
 //!
@@ -135,24 +137,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Unreachable in this emulator: the router builds one `InMemoryEngine` and
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("DeleteAssistant")
         })?;
-        let mut store = state.lock();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // The removal happens under the store's lock, in this one critical section, which
+        // ENDS before the hop into Amazon SNS below: that is a call into another mounted
+        // service and no in-process request may run under this service's lock. What it
+        // yields is the streaming topic the removed assistant was provisioned with.
+        let streaming_topic = {
+            let mut store = state.lock();
 
-        // Removing the assistant removes its sessions with it: a session is reachable
-        // only through its parent, so nothing of it survives the parent.
-        if store.remove_assistant(&input.assistant_id).is_none() {
-            return Err(DeleteAssistantErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
-                    resource_name: Some(input.assistant_id.clone()),
-                },
-            )
-            .into());
+            // Removing the assistant removes its sessions with it: a session is reachable
+            // only through its parent, so nothing of it survives the parent.
+            let Some(removed) = store.remove_assistant(&input.assistant_id) else {
+                return Err(DeleteAssistantErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into());
+            };
+            removed.topic_integration_arn
+        };
+
+        // The streaming topic was provisioned WITH the assistant and is reachable only
+        // through it, so it goes with it: the account is not left holding the topic of an
+        // assistant that no longer exists.
+        if let Some(topic_arn) = streaming_topic {
+            crate::state::release_assistant_streaming_topic(ctx, &region, &topic_arn).await;
         }
         Ok(DeleteAssistantOutput {})
     }

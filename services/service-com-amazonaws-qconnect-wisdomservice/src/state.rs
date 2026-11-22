@@ -39,6 +39,11 @@ pub use message_template_attachments::*;
 mod message_template_render;
 pub use message_template_render::*;
 
+/// The Amazon SNS topic an assistant streams chat messages through, provisioned in and
+/// resolved against the service that owns topics.
+mod chat_streaming_topic;
+pub use chat_streaming_topic::*;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
@@ -1355,19 +1360,6 @@ pub fn version_qualified_arn(resource_arn: &str, qualifier: &str) -> String {
     format!("{resource_arn}:{qualifier}")
 }
 
-/// The ARN of the SNS topic an assistant streams chat messages through, which the
-/// service provisions with the assistant: an Amazon SNS topic ARN
-/// (`arn:aws:sns:<region>:<account>:<topic>`), named after the assistant it belongs to,
-/// so one assistant's topic is never another's and a read reports the same ARN every
-/// time.
-pub fn topic_integration_arn(region: &str, assistant_id: &str) -> String {
-    ::engine::emulator_arn(
-        "sns",
-        region,
-        &format!("qconnect-assistant-{assistant_id}"),
-    )
-}
-
 /// The built-in AI agents an assistant is provisioned with, and the bindings that name
 /// them: one `SYSTEM`-origin record per [`BUILT_IN_AI_AGENTS`] entry, under that entry's
 /// service-published id and version.
@@ -1753,9 +1745,10 @@ pub struct Session {
     /// itself. Stored on the session, so every read of it reports the same bindings.
     pub ai_agent_configuration: HashMap<String, AIAgentConfigurationData>,
     /// The ARN of the SNS topic this session streams chat messages through: the topic the
-    /// parent assistant was provisioned with (see [`topic_integration_arn`]), which is
-    /// what a session of that assistant is integrated with. `None` on a session that is
-    /// integrated with no topic, which reports no integration configuration at all.
+    /// parent assistant was provisioned with (see
+    /// [`provision_assistant_streaming_topic`]), which is what a session of that assistant
+    /// is integrated with. `None` on a session that is integrated with no topic, which
+    /// reports no integration configuration at all.
     pub topic_integration_arn: Option<String>,
     /// This session's orchestrator configurations, as its create stored them: `Some` of
     /// the list a create was given — empty when it named none — and `None` on a session
@@ -2031,9 +2024,10 @@ pub struct Assistant {
     /// service — `CreateAssistant` models no capability member — so it is stored once
     /// and reported unchanged.
     pub capability_type: String,
-    /// The ARN of the SNS topic this assistant streams chat messages through. The
-    /// service provisions one with the assistant — see [`topic_integration_arn`] — so
-    /// every read of the assistant reports the same topic.
+    /// The ARN of the SNS topic this assistant streams chat messages through, as Amazon SNS
+    /// — which owns topics — answered when the create provisioned it; see
+    /// [`provision_assistant_streaming_topic`]. Stored, so every read of the assistant
+    /// reports the same topic. `None` when the assistant has no topic provisioned.
     pub topic_integration_arn: Option<String>,
     /// The AI agent bound to this assistant per `AIAgentType`, which is what
     /// `UpdateAssistantAIAgent`/`RemoveAssistantAIAgent` write. Every entry names an
