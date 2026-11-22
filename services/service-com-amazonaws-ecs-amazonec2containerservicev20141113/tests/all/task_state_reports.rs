@@ -22,6 +22,13 @@
 //!   container's outcome, each attachment's state, each managed agent's status — is
 //!   recorded, and the caller-sized members of a container entry are bounded at the size
 //!   their own docs state.
+//! * A task's stage is the word of the agent RUNNING it, identified by the container instance
+//!   that agent registered as — so Amazon ECS takes the report only where there is such an
+//!   instance to verify it against. A task placed on the infrastructure Amazon Web Services
+//!   manages runs on none, so its report is refused with HTTP 403 `AccessDeniedException`
+//!   (`smithy_query(query="operation", operation="SubmitTaskStateChange")` ->
+//!   `AccessDeniedException` httpError 403) and the task's record is left exactly where it
+//!   was, whatever stage the report named.
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a response that is not computed from persisted state cannot pass.
@@ -30,8 +37,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cluster_with_capacity, count, list, ok, refusal, service,
-    string, ACCOUNT, SIGNED_REGION,
+    answered, awsvpc_network_configuration, cluster_with_capacity, count, list, ok, poll_until,
+    refusal, service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -843,4 +850,425 @@ async fn a_container_entry_is_bounded_at_what_its_members_document() {
         (100, Some(255)),
         "case {case:?}: expected what the accepted reports left, got {stored}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Whose word the report is
+// ---------------------------------------------------------------------------
+
+/// A Fargate-capable family: `awsvpc` with task-level cpu and memory, so the same revision
+/// may be placed on the infrastructure Amazon Web Services manages or on the capacity the
+/// account registered to the cluster.
+const FARGATE_FAMILY: &str = "taskreportfargatefamily";
+
+/// The two capacity providers Amazon ECS publishes for every account in every Region
+/// ("When you use Fargate, the capacity providers are FARGATE or FARGATE_SPOT").
+const FARGATE: &str = "FARGATE";
+const FARGATE_SPOT: &str = "FARGATE_SPOT";
+
+/// The terminal stage of the ECS task lifecycle: once a task is here the clock owes its
+/// record nothing more, which is where "left exactly where it was" is observable.
+const TERMINAL_STAGE: &str = "STOPPED";
+
+/// The sentence a task state report with no verifiable reporting agent is refused with:
+/// Amazon ECS's own fixed text for this error class, pinned here as a literal so a wording
+/// this service drifts to is a failure rather than a value the assertion follows.
+const UNVERIFIED_TASK_REPORT: &str =
+    "Fargate task state changes from the agent must have the instance verified";
+
+/// Every stage the agent plane READS in a task state report, from this crate's statement of
+/// the ECS task lifecycle — so a stage added to it is covered without this suite listing one.
+const REPORTED_STAGES: [&str; 8] =
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::AGENT_REPORT_TASK_STATUSES;
+
+/// A router holding [`CLUSTER`] with registered capacity, a Fargate-capable revision of
+/// [`FARGATE_FAMILY`], and both managed capacity providers associated with the cluster — so a
+/// placement may name either of them ("A capacity provider must be associated with the
+/// cluster to be used in a capacity provider strategy").
+async fn fixture_for_both_capacities(case: &str) -> MultiServiceRouter {
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": FARGATE_FAMILY,
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [container(FIRST_CONTAINER, IMAGE)],
+        }),
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": CLUSTER,
+            "capacityProviders": [FARGATE, FARGATE_SPOT],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+    router
+}
+
+/// Run ONE task of [`FARGATE_FAMILY`] with `placement` overlaid on the request, and answer
+/// its ARN.
+async fn run_placed_task(router: &MultiServiceRouter, placement: Value, case: &str) -> String {
+    let mut request = json!({
+        "cluster": CLUSTER,
+        "taskDefinition": FARGATE_FAMILY,
+        "count": 1,
+        "networkConfiguration": awsvpc_network_configuration(),
+    });
+    let Value::Object(members) = placement else {
+        panic!("case {case:?}: a request overlay is an object");
+    };
+    for (member, value) in members {
+        request[member] = value;
+    }
+    let body = ok(router, "RunTask", request, case).await;
+    string(&list(&body, "tasks", case)[0], "taskArn", case)
+}
+
+/// A report that must be refused as the word of an agent Amazon ECS cannot verify: HTTP 403,
+/// `AccessDeniedException`, and the one fixed sentence of that condition.
+async fn denied(router: &MultiServiceRouter, request: Value, case: &str) {
+    let (status, body) = answered(router, "SubmitTaskStateChange", request).await;
+    assert_eq!(
+        (
+            status,
+            body["__type"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AccessDeniedException"),
+            body["message"].as_str().unwrap_or_default(),
+        ),
+        (403, true, UNVERIFIED_TASK_REPORT),
+        "case {case:?}: expected the unverified-agent refusal, got {status} with {body}"
+    );
+}
+
+/// Everything a task state report could WRITE, as `DescribeTasks` reports it: the task's own
+/// stage and the reason behind it, the instants only the agent observes, the version counter
+/// ("Every time a task experiences a change ... the version counter is incremented"), and
+/// what the report's container, managed-agent and attachment entries would have moved. Taken
+/// either side of a refused report, the two must be equal.
+fn report_footprint(task: &Value, case: &str) -> Value {
+    let container = container_of(task, FIRST_CONTAINER, case);
+    json!({
+        "lastStatus": task["lastStatus"],
+        "desiredStatus": task["desiredStatus"],
+        "stoppedReason": task["stoppedReason"],
+        "version": task["version"],
+        "pullStartedAt": task["pullStartedAt"],
+        "pullStoppedAt": task["pullStoppedAt"],
+        "executionStoppedAt": task["executionStoppedAt"],
+        "containerLastStatus": container["lastStatus"],
+        "containerRuntimeId": container["runtimeId"],
+        "containerManagedAgents": container["managedAgents"],
+        "attachmentStatus": only_attachment(task, case)["status"],
+    })
+}
+
+/// RULE (the other side of the gate): the stage a task reports is the SERVER's, so a task
+/// whose agent cannot be verified still moves through its lifecycle on its own while every
+/// caller's report of it is refused.
+///
+/// Driven over the whole lifecycle of one Fargate task with a sleeping container: the stage
+/// it starts at, the stage the server takes it to, and its terminal stage after a stop. Each
+/// stage is polled for rather than waited out, and the report is refused at each of them.
+#[tokio::test]
+async fn the_server_moves_a_task_whose_reports_are_refused() {
+    let case = "server-driven lifecycle";
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": FARGATE_FAMILY,
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": [FARGATE],
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [{
+                "name": FIRST_CONTAINER,
+                "image": IMAGE,
+                "command": ["sleep", "3600"],
+                "essential": true,
+            }],
+        }),
+        case,
+    )
+    .await;
+    let task_arn = run_placed_task(&router, json!({ "launchType": FARGATE }), case).await;
+
+    // The stage the launch left it at: the report is refused here, and the task is still the
+    // server's to move.
+    denied(
+        &router,
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": "RUNNING" }),
+        &format!("{case}, at the stage the launch left"),
+    )
+    .await;
+
+    // The server starts it, whether or not any caller reported anything.
+    let running = poll_until(
+        case,
+        "the server to start the task it placed",
+        || describe_task(&router, CLUSTER, &task_arn, case),
+        |task| task["lastStatus"].as_str() == Some("RUNNING"),
+    )
+    .await;
+    assert_eq!(
+        running["lastStatus"].as_str(),
+        Some("RUNNING"),
+        "case {case:?}: expected the server to start the task, got {running}"
+    );
+    denied(
+        &router,
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": TERMINAL_STAGE }),
+        &format!("{case}, at the stage the server started"),
+    )
+    .await;
+
+    // And it stops it when the caller asks through the API that owns that decision.
+    ok(
+        &router,
+        "StopTask",
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "reason": "done" }),
+        case,
+    )
+    .await;
+    let stopped = poll_until(
+        case,
+        "the server to stop the task",
+        || describe_task(&router, CLUSTER, &task_arn, case),
+        |task| task["lastStatus"].as_str() == Some(TERMINAL_STAGE),
+    )
+    .await;
+    assert_eq!(
+        stopped["lastStatus"].as_str(),
+        Some(TERMINAL_STAGE),
+        "case {case:?}: expected the server to stop the task, got {stopped}"
+    );
+    denied(
+        &router,
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": "RUNNING" }),
+        &format!("{case}, at its terminal stage"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_task_report_about_a_task_with_no_verifiable_agent_is_refused() {
+    let case = "no verifiable agent";
+    let router = fixture_for_both_capacities(case).await;
+
+    // Each row is HOW the placement reached infrastructure that registers no container
+    // instance, which is the whole of what this generalises over: the launch type, and each
+    // capacity provider Amazon ECS manages for every account.
+    let placements: [(&str, Value); 3] = [
+        ("the FARGATE launch type", json!({ "launchType": FARGATE })),
+        (
+            "the FARGATE capacity provider",
+            json!({ "capacityProviderStrategy": [{ "capacityProvider": FARGATE, "weight": 1 }] }),
+        ),
+        (
+            "the FARGATE_SPOT capacity provider",
+            json!({
+                "capacityProviderStrategy": [{ "capacityProvider": FARGATE_SPOT, "weight": 1 }],
+            }),
+        ),
+    ];
+
+    for (placement, overlay) in placements {
+        let task_arn = run_placed_task(&router, overlay, placement).await;
+        let task_reference = task_arn
+            .rsplit('/')
+            .next()
+            .expect("a task ARN ends in its id")
+            .to_string();
+
+        // Every stage the plane reads is refused: the report is refused for WHOSE word it is,
+        // so the stage it names is no part of the decision — the stage the task is already at
+        // included.
+        for status in REPORTED_STAGES {
+            let case = &format!("{placement}, a report of {status}");
+            denied(
+                &router,
+                json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": status }),
+                case,
+            )
+            .await;
+        }
+
+        // A report naming NO stage, carrying only what the agent observed, is the same call
+        // from the same unverifiable caller.
+        let case = &format!("{placement}, a report naming no stage");
+        denied(
+            &router,
+            json!({
+                "cluster": CLUSTER,
+                "task": task_arn.clone(),
+                "pullStartedAt": 1_700_000_000_i64,
+                "containers": [{ "containerName": FIRST_CONTAINER, "status": "RUNNING" }],
+            }),
+            case,
+        )
+        .await;
+
+        // And the other form the report names the task in ("The task ID or full ARN of the
+        // task in the state change request").
+        let case = &format!("{placement}, a report naming the task by its id");
+        denied(
+            &router,
+            json!({ "cluster": CLUSTER, "task": task_reference, "status": "RUNNING" }),
+            case,
+        )
+        .await;
+
+        // The ordering: a status the plane cannot read at all is refused for the VALUE it
+        // carries, ahead of any identity, and that sentence names the value the request sent.
+        for status in ["NOT_A_REAL_ECS_TASK_STATUS", "running", "PULLED"] {
+            let case = &format!("{placement}, an unreadable status {status:?}");
+            let (code, message) = refusal(
+                &router,
+                "SubmitTaskStateChange",
+                json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": status }),
+                case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (
+                    "InvalidParameterException",
+                    format!("The status {status} is not a valid status.").as_str()
+                ),
+                "case {case:?}: expected the value to be read first, got {code} with {message:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_task_report_leaves_the_task_exactly_where_it_was() {
+    let case = "terminal task";
+    let router = fixture_for_both_capacities(case).await;
+    let task_arn = run_placed_task(&router, json!({ "launchType": FARGATE }), case).await;
+
+    // Take the task to its terminal stage first: a stopped task is one the clock owes nothing
+    // more, so what the refusals below leave is the whole of what changed.
+    ok(
+        &router,
+        "StopTask",
+        json!({ "cluster": CLUSTER, "task": task_arn.clone(), "reason": "done" }),
+        case,
+    )
+    .await;
+    let stopped = poll_until(
+        case,
+        "the task to reach its terminal stage",
+        || describe_task(&router, CLUSTER, &task_arn, case),
+        |task| task["lastStatus"].as_str() == Some(TERMINAL_STAGE),
+    )
+    .await;
+    let before = report_footprint(&stopped, case);
+    let attachment = string(&only_attachment(&stopped, case), "id", case);
+
+    // A report that would run the lifecycle backwards out of its terminal stage, one
+    // restating that stage, and one carrying everything an agent observes: each is the word
+    // of a caller this task has no verified agent for, so each is refused the same way and
+    // none of them records anything.
+    let reports: [(&str, Value); 3] = [
+        (
+            "a report taking the terminal task back to RUNNING",
+            json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": "RUNNING" }),
+        ),
+        (
+            "a report restating the stage the task is at",
+            json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": TERMINAL_STAGE }),
+        ),
+        (
+            "a report carrying everything the agent observed",
+            json!({
+                "cluster": CLUSTER,
+                "task": task_arn.clone(),
+                "status": "RUNNING",
+                "reason": "an unrelated caller said so",
+                "pullStartedAt": 1_700_000_000_i64,
+                "pullStoppedAt": 1_700_000_001_i64,
+                "executionStoppedAt": 1_700_000_002_i64,
+                "containers": [{
+                    "containerName": FIRST_CONTAINER,
+                    "status": "RUNNING",
+                    "runtimeId": "0123456789abcdef",
+                }],
+                "attachments": [{ "attachmentArn": attachment, "status": "ATTACHED" }],
+                "managedAgents": [{
+                    "containerName": FIRST_CONTAINER,
+                    "managedAgentName": MANAGED_AGENT,
+                    "status": "RUNNING",
+                }],
+            }),
+        ),
+    ];
+
+    for (case, request) in reports {
+        denied(&router, request, case).await;
+
+        let after = describe_task(&router, CLUSTER, &task_arn, case).await;
+        assert_eq!(
+            report_footprint(&after, case),
+            before,
+            "case {case:?}: expected the refused report to record nothing, got {after}"
+        );
+        assert_eq!(
+            after["lastStatus"].as_str(),
+            Some(TERMINAL_STAGE),
+            "case {case:?}: expected the terminal stage to stand, got {after}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_task_report_is_taken_for_a_task_whose_agent_has_an_instance() {
+    let case = "registered capacity";
+    let router = fixture_for_both_capacities(case).await;
+
+    // The contrast rows: the gate is about the TASK's identity, not about the operation, so a
+    // task on the capacity the account registered to the cluster — named by its launch type,
+    // and by naming no placement at all — has its report taken and recorded.
+    for (case, overlay) in [
+        ("the EC2 launch type", json!({ "launchType": "EC2" })),
+        ("no placement named at all", json!({})),
+    ] {
+        let task_arn = run_placed_task(&router, overlay, case).await;
+        for status in ["ACTIVATING", "RUNNING"] {
+            let case = &format!("{case}, a report of {status}");
+            let acknowledged = ok(
+                &router,
+                "SubmitTaskStateChange",
+                json!({ "cluster": CLUSTER, "task": task_arn.clone(), "status": status }),
+                case,
+            )
+            .await;
+            assert_eq!(
+                acknowledged["acknowledgment"].as_str(),
+                Some(ACK),
+                "case {case:?}: expected the report to be taken, got {acknowledged}"
+            );
+        }
+
+        let after = describe_task(&router, CLUSTER, &task_arn, case).await;
+        assert_eq!(
+            after["lastStatus"].as_str(),
+            Some("RUNNING"),
+            "case {case:?}: the report the plane took is what the task holds, got {after}"
+        );
+    }
 }

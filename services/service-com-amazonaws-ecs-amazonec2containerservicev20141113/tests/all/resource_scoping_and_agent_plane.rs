@@ -39,8 +39,11 @@
 //!   the Amazon ECS agent"), and what it checks is the report: the VALUES it carries — a
 //!   status outside the ECS task lifecycle, and an attachment state other than `ATTACHED`,
 //!   are refused — and that the resources it names resolve inside the cluster it names. The
-//!   capacity hosting the task is no input to either, so a readable report about any task the
-//!   named cluster holds is recorded and acknowledged, and read back through `DescribeTasks`;
+//!   capacity hosting the task is no input to either, so what a report OBSERVED about a task
+//!   — its containers, its attachments — is recorded and acknowledged whatever that task runs
+//!   on, and read back through `DescribeTasks`. WHOSE word the report is is a question only
+//!   the task's own stage asks, and it is asserted beside that stage's other rules in
+//!   [`crate::task_state_reports`];
 //! * `ListServicesByNamespace$namespace` is "The namespace name or full Amazon Resource Name
 //!   (ARN) of the Cloud Map namespace", so either form names the same namespace.
 //!
@@ -95,6 +98,12 @@ const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 
 /// The sentence a report naming an attachment state the plane does not take is refused with.
 const ATTACHMENT_STATUS_SET: &str = "attachmentStatus should be one of [ATTACHED]";
+
+/// The sentence a TASK state report about a task with no container instance to verify the
+/// reporting agent against is refused with: Amazon ECS's own fixed text for this error class,
+/// pinned here as a literal, the way every other refusal sentence of this suite is.
+const UNVERIFIED_TASK_REPORT: &str =
+    "Fargate task state changes from the agent must have the instance verified";
 
 /// How many managed agents one container holds, from this crate's own statement of the
 /// bound — the most a report may leave a container with.
@@ -1081,17 +1090,20 @@ async fn container_status(
     string(&found, "lastStatus", case)
 }
 
-/// RULE: a `Submit*StateChange` report is about the resources it NAMES — the cluster, the
-/// task, the container, the attachment — and the capacity that hosts the task is not one of
-/// its inputs, so a report whose values the plane reads and whose references resolve inside
-/// the named cluster is recorded and acknowledged whatever the task runs on.
+/// RULE: what a `Submit*StateChange` report OBSERVED inside a task — its containers, its
+/// attachments — is about the resources it NAMES, and the capacity that hosts the task is not
+/// one of its inputs, so such a report is recorded and acknowledged whatever the task runs on;
+/// the TASK's own stage is the one member of the family whose reporting agent Amazon ECS
+/// verifies, so it is taken only for a task that runs on a container instance and refused
+/// with `AccessDeniedException` for one that runs on none (that rule's own table is in
+/// [`crate::task_state_reports`]).
 ///
 /// The rows differ along WHERE the task runs, which is the only thing this rule generalises
 /// over: the Fargate launch type, each managed Fargate capacity provider, and the capacity
 /// the account registered to the cluster — reached by the launch type and by naming nothing
 /// at all.
 #[tokio::test]
-async fn the_agent_plane_records_a_report_about_any_task_the_named_cluster_holds() {
+async fn the_agent_plane_records_what_a_report_observed_about_a_task_on_any_capacity() {
     let router = service();
     let case = "setup";
     let cluster = "agentscope";
@@ -1100,23 +1112,31 @@ async fn the_agent_plane_records_a_report_about_any_task_the_named_cluster_holds
     register_fargate_definition(&router, family, case).await;
     associate(&router, cluster, &[FARGATE, FARGATE_SPOT], case).await;
 
-    let rows: [(&str, Value); 5] = [
-        ("the FARGATE launch type", json!({ "launchType": "FARGATE" })),
+    // Each row is a placement and whether it runs the task on infrastructure with no
+    // container instance of this account, which is what decides the task report.
+    let rows: [(&str, Value, bool); 5] = [
+        (
+            "the FARGATE launch type",
+            json!({ "launchType": "FARGATE" }),
+            true,
+        ),
         (
             "the FARGATE capacity provider",
             json!({ "capacityProviderStrategy": [{ "capacityProvider": FARGATE, "weight": 1 }] }),
+            true,
         ),
         (
             "the FARGATE_SPOT capacity provider",
             json!({
                 "capacityProviderStrategy": [{ "capacityProvider": FARGATE_SPOT, "weight": 1 }],
             }),
+            true,
         ),
-        ("the EC2 launch type", json!({ "launchType": "EC2" })),
-        ("no placement named at all", json!({})),
+        ("the EC2 launch type", json!({ "launchType": "EC2" }), false),
+        ("no placement named at all", json!({}), false),
     ];
 
-    for (case, overlay) in rows {
+    for (case, overlay, unverifiable_agent) in rows {
         let task_arn = run(&router, cluster, family, overlay, case).await;
         let attachment = attachment_id(&router, cluster, &task_arn, case).await;
 
@@ -1129,12 +1149,42 @@ async fn the_agent_plane_records_a_report_about_any_task_the_named_cluster_holds
             "case {case:?}: expected an interface Amazon ECS has not attached yet"
         );
 
-        // Each operation of the family, with the reference each of them names the task by.
-        let reports: [(&str, Value); 3] = [
-            (
-                "SubmitTaskStateChange",
-                json!({ "cluster": cluster, "task": task_arn.clone(), "status": "RUNNING" }),
-            ),
+        // The TASK's own stage: taken for a task whose agent has a container instance to be
+        // verified against, refused for one that runs on none. The report carries a `reason`
+        // too, so a refused row can assert that nothing of the report reached the record.
+        let task_report = json!({
+            "cluster": cluster,
+            "task": task_arn.clone(),
+            "status": "RUNNING",
+            "reason": "an unrelated caller said so",
+        });
+        let report_case = &format!("SubmitTaskStateChange: {case}");
+        if unverifiable_agent {
+            let (status, body) = answered(&router, "SubmitTaskStateChange", task_report).await;
+            assert_eq!(
+                (
+                    status,
+                    body["__type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("AccessDeniedException"),
+                    body["message"].as_str().unwrap_or_default(),
+                ),
+                (403, true, UNVERIFIED_TASK_REPORT),
+                "case {report_case:?}: expected the unverified-agent refusal, got {status} with \
+                 {body}"
+            );
+        } else {
+            let acknowledged = ok(&router, "SubmitTaskStateChange", task_report, report_case).await;
+            assert_eq!(
+                acknowledged["acknowledgment"].as_str(),
+                Some("ACK"),
+                "case {report_case:?}: expected the report to be taken, got {acknowledged}"
+            );
+        }
+
+        // What the report OBSERVED is taken on every row, whatever the task runs on.
+        let reports: [(&str, Value); 2] = [
             (
                 "SubmitContainerStateChange",
                 json!({
@@ -1164,7 +1214,10 @@ async fn the_agent_plane_records_a_report_about_any_task_the_named_cluster_holds
         }
 
         // What the reports left, read back through `DescribeTasks`: every one of them is in
-        // the record the next caller sees.
+        // the record the next caller sees. The task's own stage is the report the plane
+        // refused on a row with no verifiable agent, and what that refusal leaves behind is
+        // pinned on a task in its terminal stage in [`crate::task_state_reports`], where the
+        // clock owes the record nothing more.
         assert_eq!(
             container_status(&router, cluster, &task_arn, "web", case).await,
             "RUNNING",
@@ -1186,11 +1239,18 @@ async fn the_agent_plane_records_a_report_about_any_task_the_named_cluster_holds
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {read}"));
-        assert_eq!(
-            task["lastStatus"].as_str(),
-            Some("RUNNING"),
-            "case {case:?}: the report the plane took is what the task holds, got {task}"
-        );
+        if !unverifiable_agent {
+            assert_eq!(
+                task["lastStatus"].as_str(),
+                Some("RUNNING"),
+                "case {case:?}: the report the plane took is what the task holds, got {task}"
+            );
+        } else {
+            assert!(
+                task["stoppedReason"].is_null(),
+                "case {case:?}: the refused report records nothing of itself, got {task}"
+            );
+        }
     }
 }
 

@@ -13,10 +13,13 @@
 //! out-of-set value with, [`super::value_set_message`]) — the one transition the agent makes,
 //! from the `ATTACHING` Amazon ECS leaves the interface at.
 //!
-//! WHO may report is not this plane's decision: the report's values and the resources it
-//! names are what it checks, and the capacity a task runs on is not an input to either —
-//! every task has a hosting agent, so a report about any task the named cluster holds is one
-//! the plane records and acknowledges.
+//! WHO may report is a question only the TASK report asks: a task's own `lastStatus` is
+//! written by the agent that RUNS it, and that agent is identified by the container instance
+//! it is registered as, so a task placed on infrastructure with no container instance has no
+//! agent identity to verify and its state report is refused
+//! ([`unverified_task_report_violation`]). The rest of the family — the containers and
+//! attachments a report describes — is about what the agent observed inside the task, which
+//! the plane records about a task on any capacity.
 
 use super::*;
 
@@ -104,6 +107,37 @@ pub fn out_of_order_task_status_violation(reported: &str, reached: &str) -> Opti
         }
         _ => None,
     }
+}
+
+/// `AccessDeniedException$message` for a TASK state report Amazon ECS cannot attribute to a
+/// verified container agent.
+///
+/// Entirely fixed text: the condition is that the task runs on no container instance at all,
+/// so there is no identity, no value of the request and nothing of the record to state.
+pub const UNVERIFIED_TASK_REPORT_MESSAGE: &str =
+    "Fargate task state changes from the agent must have the instance verified";
+
+/// The refusal a TASK state report about `task` earns when the agent that would be reporting
+/// it has no identity Amazon ECS can verify, or `None` when it has one.
+///
+/// The rule: a task's `lastStatus` is written by the container agent that RUNS the task
+/// ("This action is only used by the Amazon ECS agent"), and that agent's identity is the
+/// container instance it is registered as — so Amazon ECS takes the report only where such an
+/// instance exists to be verified. A task placed on the infrastructure Amazon Web Services
+/// manages runs on no container instance of this account at all
+/// ([`TaskRecord::runs_on_fargate`]), so no caller can be verified as its agent: the report is
+/// refused with `AccessDeniedException` and the task is left exactly where it was, which is
+/// what keeps `lastStatus` the server's own sequence for such a task.
+///
+/// Scoped to the TASK report: a container or attachment entry says what the agent observed
+/// INSIDE the task, and Amazon ECS takes those about a task on any capacity.
+///
+/// What is weighed here is the TASK, which is what carries the hosting identity: whether the
+/// caller holds that agent's own credentials is not a question this service answers, since the
+/// emulator verifies a request's signature and resolves no agent principal behind it.
+pub fn unverified_task_report_violation(task: &TaskRecord) -> Option<&'static str> {
+    task.runs_on_fargate()
+        .then_some(UNVERIFIED_TASK_REPORT_MESSAGE)
 }
 
 /// The refusal the attachment states a report NAMES earn, or `None` when every entry names

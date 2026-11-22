@@ -9,6 +9,12 @@
 //! — so a report carrying one reference that resolves to nothing records none of its
 //! entries, exactly as the agent plane's other reports behave.
 //!
+//! The task it resolved is also WHOSE word this is: a task's stage is written by the agent
+//! running it, identified by the container instance it registered as, so a task that runs on
+//! no container instance has no agent identity to verify and its report is refused with
+//! `AccessDeniedException` ([`crate::state::unverified_task_report_violation`]) rather than
+//! recorded.
+//!
 //! The agent retries, so a report can arrive twice or behind a later one. What this
 //! handler stores is therefore the FURTHEST stage the task has been reported at (see
 //! `crate::state::task_stage_rank`), which is what keeps a stale replay from moving a
@@ -318,6 +324,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TASK_NOT_FOUND_MESSAGE.to_string(),
             ));
         };
+
+        // "This action is only used by the Amazon ECS agent": the task's own stage is written
+        // by the agent that RUNS the task, and that agent is identified by the container
+        // instance it registered as — so the report is taken only where there is such an
+        // instance to verify it against. A task on infrastructure Amazon Web Services manages
+        // has none, so no caller can be verified as its agent and the report is refused
+        // ([`crate::state::unverified_task_report_violation`]) with the task left exactly
+        // where it was. Weighed once the task is resolved, because the task is what carries
+        // the identity, and ahead of everything the report would record.
+        if let Some(message) = crate::state::unverified_task_report_violation(task) {
+            return Err(
+                SubmitTaskStateChangeErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
 
         // Every nested reference the report carries is resolved BEFORE any of them is
         // recorded, so a report carrying one unknown reference stores nothing: it is
