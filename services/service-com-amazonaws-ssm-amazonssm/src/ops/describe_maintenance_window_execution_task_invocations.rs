@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindowExecutionTaskInvocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindowExecutionTaskInvocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! List the invocations ONE task execution of a maintenance window run reached, as the
+//! identities of those invocations. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindowExecutionTaskInvocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the invocations this service holds
+//! ([`crate::state::maintenance_window_execution_task_invocations`]): the records of the task
+//! execution the request names, in the Region the read was asked through, narrowed by the one
+//! filter key this listing documents and paged by the id a page resumes at. Nothing here
+//! mutates the store — a read must not change what a later caller sees.
+//!
+//! ## A task execution holding no invocation is REPORTED EMPTY, never refused
+//!
+//! This operation reports the EXISTENCE of invocations, which an empty list states exactly: a
+//! task execution that reached no target — including ids this endpoint has no record of at
+//! all — is answered HTTP 200 with an empty identity list (recorded behaviour), the same
+//! reading the sibling listing of a run's task executions takes
+//! ([`crate::ops::describe_maintenance_window_execution_tasks`]). The modelled
+//! `DoesNotExistException` is what the single read of ONE record answers
+//! ([`crate::ops::get_maintenance_window_execution_task_invocation`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +167,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindowExecutionTaskInvocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowExecutionTaskInvocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindowExecutionTaskInvocations"))
+        use crate::state::maintenance_window_execution_tasks::{
+            execution_task_page_size, is_execution_status_filter_key,
+            EXECUTION_STATUS_FILTER_KEYS,
+        };
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        // Both ids' presence, length and pattern, the filter list's length and `MaxResults`'s
+        // range are MODELLED constraints the centralized walk has already refused anything
+        // outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowExecutionTaskInvocationsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the maintenance window execution store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            // A key outside the documented set names no property of an invocation, so the
+            // filter cannot be served at all: the key is validated — and the request refused,
+            // naming it — before anything is asked about the task execution. This operation
+            // models no filter error, so it is a 400 `ValidationException`.
+            let key = filter.key.as_deref().unwrap_or_default();
+            if !is_execution_status_filter_key(key) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Filter key '{key}' isn't one of the keys this operation narrows \
+                     maintenance window execution task invocations by: {}",
+                    EXECUTION_STATUS_FILTER_KEYS.join(", ")
+                )));
+            }
+        }
+
+        let page_size = execution_task_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the invocation the next page starts
+        // at, so a token naming no invocation of this result was not one of ours: it is
+        // refused rather than served an empty page. Which token names one is settled below,
+        // once the records of this result are known.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(token.to_string()),
+        };
+
+        // A window — and so every run of it — lives in the Region its endpoint names, which is
+        // the signed credential scope's.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let matching: Vec<&crate::state::maintenance_window_execution_task_invocations::MaintenanceWindowExecutionTaskInvocationRecord> =
+            store
+                .maintenance_window_execution_task_invocations_of(
+                    &region,
+                    &input.window_execution_id,
+                    &input.task_id,
+                )
+                .into_iter()
+                .filter(|invocation| {
+                    filters.iter().all(|filter| {
+                        invocation.matches_filter(
+                            filter.key.as_deref().unwrap_or_default(),
+                            filter.values.as_deref().unwrap_or_default(),
+                        )
+                    })
+                })
+                .collect();
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => match matching
+                .iter()
+                .position(|invocation| invocation.invocation_id == token)
+            {
+                Some(at) => at,
+                // Names no invocation of this result: not a page of it to resume.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps that
+        // in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let identities = page
+            .iter()
+            .take(page_size)
+            .map(|invocation| invocation.to_identity())
+            .collect();
+        // An invocation is still waiting past this page: hand the caller the id it resumes at,
+        // so the next request continues where this one stopped.
+        let next_token = page
+            .get(page_size)
+            .map(|invocation| invocation.invocation_id.clone());
+
+        Ok(DescribeMaintenanceWindowExecutionTaskInvocationsOutput {
+            window_execution_task_invocation_identities: Some(identities),
+            next_token,
+        })
     }
 }

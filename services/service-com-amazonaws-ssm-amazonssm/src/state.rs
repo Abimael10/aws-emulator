@@ -168,6 +168,17 @@
 //! window's registered targets by id is the reference that makes a safe deregistration of
 //! that target one the service refuses.
 //!
+//! What a window's RUNS are is a third layer on the same key space: one record per run
+//! ([`maintenance_window_executions`]), one per task that run reached
+//! ([`maintenance_window_execution_tasks`]) and one per target such a task execution ran
+//! against ([`maintenance_window_execution_task_invocations`]), each reached by the ids the
+//! layer above it was reached by. `GetMaintenanceWindowExecution`,
+//! `GetMaintenanceWindowExecutionTask` and `GetMaintenanceWindowExecutionTaskInvocation`
+//! read one record of each layer and `DescribeMaintenanceWindowExecutionTasks` and
+//! `DescribeMaintenanceWindowExecutionTaskInvocations` list the layer below one, all through
+//! the one store below. What puts a record in any of them — and what does not — is stated in
+//! the owning modules.
+//!
 //! Then the **execution previews** ([`execution_previews`]), keyed by
 //! `(region, execution preview id)`: `StartExecutionPreview` works out what running an
 //! Automation runbook would do — from the steps that runbook declares and the resources its
@@ -431,6 +442,15 @@ pub mod maintenance_window_tasks;
 /// The RUNS of a maintenance window: the record one of its executions is held as, and how a
 /// read addresses one by the id it was executed under.
 pub mod maintenance_window_executions;
+
+/// The TASK EXECUTIONS of one run of a maintenance window: the record one is held as, how a
+/// read addresses one within its run, and how a listing of a run's own is narrowed and
+/// bounded.
+pub mod maintenance_window_execution_tasks;
+
+/// The INVOCATIONS of one task execution of a maintenance window run: the record one is held
+/// as, and how a read addresses one within its task execution.
+pub mod maintenance_window_execution_task_invocations;
 
 /// What an update that takes a `Replace` flag leaves behind: the one reading of an omitted
 /// member every such operation of this service holds to.
@@ -2398,6 +2418,27 @@ pub struct ComAmazonawsSsmAmazonssmState {
         maintenance_window_executions::MaintenanceWindowExecutionRecord,
     >,
 
+    /// Every task execution of a maintenance window run this service has recorded, keyed by
+    /// `(region, window execution id, task execution id)`: a task execution belongs to ONE
+    /// run, which is reached at the endpoint of the Region its window lives in, and is
+    /// identified within that run by the id it ran under. A `BTreeMap` so a walk over them is
+    /// stable and total. See [`maintenance_window_execution_tasks`], which is also where what
+    /// puts a record here — and what does not — is stated.
+    pub maintenance_window_execution_tasks: BTreeMap<
+        (String, String, String),
+        maintenance_window_execution_tasks::MaintenanceWindowExecutionTaskRecord,
+    >,
+
+    /// Every invocation of such a task execution, keyed by
+    /// `(region, window execution id, task execution id, invocation id)`: an invocation
+    /// belongs to ONE task execution of one run and is identified within it by the id it ran
+    /// under. A `BTreeMap` so a walk over them is stable and total. See
+    /// [`maintenance_window_execution_task_invocations`].
+    pub maintenance_window_execution_task_invocations: BTreeMap<
+        (String, String, String, String),
+        maintenance_window_execution_task_invocations::MaintenanceWindowExecutionTaskInvocationRecord,
+    >,
+
     /// Every patch snapshot this endpoint has taken, keyed by
     /// `(region, node id, snapshot id)`: a snapshot is taken through one Region's endpoint,
     /// for one node, under the id the caller asked for it with — one maintenance-window task
@@ -2470,6 +2511,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             maintenance_window_targets: BTreeMap::new(),
             maintenance_window_tasks: BTreeMap::new(),
             maintenance_window_executions: BTreeMap::new(),
+            maintenance_window_execution_tasks: BTreeMap::new(),
+            maintenance_window_execution_task_invocations: BTreeMap::new(),
             sessions: BTreeMap::new(),
             // One key per store, from the system's randomness: see `parameter_pagination`.
             page_token_key: parameter_pagination::PageTokenKey::new(),
