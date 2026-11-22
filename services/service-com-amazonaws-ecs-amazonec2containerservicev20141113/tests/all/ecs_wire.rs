@@ -582,6 +582,17 @@ pub(crate) fn awsvpc_network_configuration() -> Value {
     })
 }
 
+/// Write every member of `extra` onto `target`, which is the object a row adds them to —
+/// so a table's row states only the members it changes. Shared by every suite whose rows
+/// are built that way.
+pub(crate) fn with_members(target: &mut Value, extra: Value) {
+    if let Value::Object(members) = extra {
+        for (member, value) in members {
+            target[member] = value;
+        }
+    }
+}
+
 /// Create a cluster and return its ARN.
 pub(crate) async fn create_cluster(
     router: &MultiServiceRouter,

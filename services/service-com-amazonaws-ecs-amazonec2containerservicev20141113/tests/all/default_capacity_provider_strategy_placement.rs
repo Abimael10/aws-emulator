@@ -6,15 +6,24 @@
 //! `capacityProviderStrategy` or `launchType` is specified, the
 //! `defaultCapacityProviderStrategy` for the cluster is used"): a placement that names
 //! neither takes the cluster's own default strategy, and the task it creates reports the
-//! provider that strategy named in `capacityProviderName` and no `launchType` at all; a
-//! placement that names a strategy of its own uses THAT one instead, and one that names a
-//! launch type carries the launch type and no provider. The cluster's default strategy is
-//! itself stored as set, entry for entry, so `DescribeClusters` echoes the `base` and
-//! `weight` each entry was given.
+//! provider that strategy named in `capacityProviderName` beside the launch type that
+//! provider's capacity runs on (`Task$launchType` is "The infrastructure where your task
+//! runs on", and both Fargate providers run tasks on Fargate); a placement that names a
+//! strategy of its own uses THAT one instead, and one that names a launch type carries the
+//! launch type and no provider. The cluster's default strategy is itself stored as set,
+//! entry for entry, so `DescribeClusters` echoes the `base` and `weight` each entry was
+//! given.
 //!
-//! The table spans what the run names (nothing, a strategy, a launch type) and what the
-//! cluster has to fall back on (a default strategy, or none at all), over the predefined
-//! Fargate providers every account holds.
+//! A strategy of several providers is a DISTRIBUTION over them rather than one of them:
+//! `base` "designates how many tasks, at a minimum, to run on the specified capacity
+//! provider" and is satisfied first, and `weight` "designates the relative percentage of
+//! the total number of tasks launched that should use the specified capacity provider"
+//! once every base is met — which the second test here pins over a table of
+//! `(base, weight)` pairs.
+//!
+//! The first table spans what the run names (nothing, a strategy, a launch type) and what
+//! the cluster has to fall back on (a default strategy, or none at all), over the
+//! predefined Fargate providers every account holds.
 //!
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so nothing reaches into the state struct.
@@ -23,7 +32,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, create_cluster, list, ok, register_capacity, service, string,
+    awsvpc_network_configuration, create_cluster, list, ok, poll_until, register_capacity, service,
+    string,
 };
 
 /// A Fargate-compatible revision: Fargate validates the task definition against the
@@ -116,13 +126,16 @@ async fn a_run_that_names_no_placement_is_placed_by_the_clusters_default_strateg
             case: "the run names neither, so the cluster's default places it",
             names: Names::Nothing,
             expect_provider: Some("FARGATE_SPOT"),
-            expect_launch_type: None,
+            // The provider that placed it runs its tasks on Fargate, which is the
+            // infrastructure the task reports whichever of the two Fargate providers the
+            // placement was routed through.
+            expect_launch_type: Some("FARGATE"),
         },
         Row {
             case: "the run names a strategy of its own, which overrides the default",
             names: Names::Strategy("FARGATE"),
             expect_provider: Some("FARGATE"),
-            expect_launch_type: None,
+            expect_launch_type: Some("FARGATE"),
         },
         Row {
             case: "the run names a launch type, which is not a provider at all",
@@ -179,6 +192,304 @@ async fn a_run_that_names_no_placement_is_placed_by_the_clusters_default_strateg
             );
         }
     }
+}
+
+/// One row of the distribution table: the strategy a run names, how many tasks it asks
+/// for, and the provider each of those tasks must be placed through, in the order the run
+/// places them.
+#[derive(Debug, Clone, Copy)]
+struct SpreadRow {
+    case: &'static str,
+    /// `(capacityProvider, base, weight)` per strategy entry, in the order the request
+    /// states them.
+    strategy: &'static [(&'static str, i64, i64)],
+    expect: &'static [&'static str],
+}
+
+#[tokio::test]
+async fn a_strategy_places_its_base_first_and_spreads_the_rest_by_weight() {
+    let router = service();
+    let cluster = "spread";
+    create_cluster(&router, cluster, "setup").await;
+    register_fargate_definition(&router, "spread", "setup").await;
+    // A strategy places a task only through a provider its cluster is associated with, so
+    // both predefined Fargate providers are associated before the table runs.
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": cluster,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        "setup",
+    )
+    .await;
+
+    // The rows differ along what the two members say: a base on one provider with all the
+    // weight on the other, a base on the only unweighted provider, equal weights, weights
+    // in a 1:4 ratio (the `weight` doc's own example: "If capacityProviderA has weight 1
+    // and capacityProviderB has weight 4, then for every 1 task on A, 4 tasks will run on
+    // B"), and a provider whose weight is 0 and which therefore "can't be used to place
+    // tasks".
+    let rows = [
+        SpreadRow {
+            case: "a base on one provider, all the weight on the other",
+            strategy: &[("FARGATE", 0, 1), ("FARGATE_SPOT", 1, 0)],
+            expect: &["FARGATE_SPOT", "FARGATE", "FARGATE"],
+        },
+        SpreadRow {
+            case: "the base is taken first, then the only weighted provider",
+            strategy: &[("FARGATE", 1, 0), ("FARGATE_SPOT", 0, 1)],
+            expect: &["FARGATE", "FARGATE_SPOT"],
+        },
+        SpreadRow {
+            case: "equal weights split the tasks evenly",
+            strategy: &[("FARGATE", 0, 1), ("FARGATE_SPOT", 0, 1)],
+            expect: &["FARGATE", "FARGATE_SPOT", "FARGATE", "FARGATE_SPOT"],
+        },
+        SpreadRow {
+            case: "four times the weight takes four times the tasks",
+            strategy: &[("FARGATE", 0, 1), ("FARGATE_SPOT", 0, 4)],
+            expect: &[
+                "FARGATE_SPOT",
+                "FARGATE_SPOT",
+                "FARGATE_SPOT",
+                "FARGATE",
+                "FARGATE_SPOT",
+            ],
+        },
+        SpreadRow {
+            case: "a provider with no weight and no base places nothing",
+            strategy: &[("FARGATE", 0, 0), ("FARGATE_SPOT", 0, 1)],
+            expect: &["FARGATE_SPOT", "FARGATE_SPOT"],
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let strategy: Vec<Value> = row
+            .strategy
+            .iter()
+            .map(|(provider, base, weight)| {
+                json!({ "capacityProvider": provider, "base": base, "weight": weight })
+            })
+            .collect();
+        let body = ok(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": cluster,
+                "taskDefinition": "spread",
+                "count": row.expect.len(),
+                "capacityProviderStrategy": strategy,
+                "networkConfiguration": awsvpc_network_configuration(),
+            }),
+            case,
+        )
+        .await;
+        let tasks = list(&body, "tasks", case);
+        let placed: Vec<String> = tasks
+            .iter()
+            .map(|task| string(task, "capacityProviderName", case))
+            .collect();
+        assert_eq!(
+            placed,
+            row.expect.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "case {case:?}: unexpected distribution over the strategy, got {body}"
+        );
+        // Each of them runs on Fargate whichever of the two providers placed it, and the
+        // attribution is STORED, so the describe reports the same pair.
+        let arns: Vec<String> = tasks
+            .iter()
+            .map(|task| string(task, "taskArn", case))
+            .collect();
+        let read = ok(
+            &router,
+            "DescribeTasks",
+            json!({ "cluster": cluster, "tasks": arns }),
+            case,
+        )
+        .await;
+        for task in list(&read, "tasks", case) {
+            assert_eq!(
+                task["launchType"].as_str(),
+                Some("FARGATE"),
+                "case {case:?}: a task placed through a Fargate provider runs on Fargate, \
+                 got {task}"
+            );
+        }
+        let mut stored: Vec<String> = list(&read, "tasks", case)
+            .iter()
+            .map(|task| string(task, "capacityProviderName", case))
+            .collect();
+        stored.sort();
+        let mut expected: Vec<String> = row.expect.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            stored, expected,
+            "case {case:?}: the stored attribution must match what the run reported, got {read}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_task_a_distributed_run_places_reaches_running() {
+    // A distribution over providers is a distribution of REAL placements: each task the
+    // strategy routed somewhere is a task that goes on to run, so the run below is followed
+    // to the state every one of its tasks settles in.
+    let router = service();
+    let cluster = "spreadruns";
+    let case = "a base on one provider and the weight on the other";
+    create_cluster(&router, cluster, case).await;
+    register_fargate_definition(&router, "spreadruns", case).await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": cluster,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+
+    let body = ok(
+        &router,
+        "RunTask",
+        json!({
+            "cluster": cluster,
+            "taskDefinition": "spreadruns",
+            "count": 3,
+            "capacityProviderStrategy": [
+                { "capacityProvider": "FARGATE", "weight": 1, "base": 0 },
+                { "capacityProvider": "FARGATE_SPOT", "weight": 0, "base": 1 },
+            ],
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
+        case,
+    )
+    .await;
+    let arns: Vec<String> = list(&body, "tasks", case)
+        .iter()
+        .map(|task| string(task, "taskArn", case))
+        .collect();
+
+    // The start of each task is the CLOCK's, so the suite waits for the status rather than
+    // for a span.
+    let read = poll_until(
+        case,
+        "every task of the run to reach RUNNING",
+        || {
+            ok(
+                &router,
+                "DescribeTasks",
+                json!({ "cluster": cluster, "tasks": arns.clone() }),
+                case,
+            )
+        },
+        |body| {
+            body["tasks"].as_array().is_some_and(|tasks| {
+                tasks.len() == 3
+                    && tasks
+                        .iter()
+                        .all(|task| task["lastStatus"] == json!("RUNNING"))
+            })
+        },
+    )
+    .await;
+    for task in list(&read, "tasks", case) {
+        assert!(
+            list(&task, "containers", case)
+                .iter()
+                .all(|container| container["lastStatus"] == json!("RUNNING")),
+            "case {case:?}: every container of a running task runs, got {task}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_services_scheduler_spreads_its_tasks_over_the_same_distribution() {
+    // The same two members decide a SERVICE's placements: `CreateService
+    // $capacityProviderStrategy` is the same shape as a run's, so the scheduler places the
+    // service's tasks over it base-first and then by weight, and the service still reaches
+    // its steady state.
+    let router = service();
+    let cluster = "servicespread";
+    let case = "a service over a base on one provider and the weight on the other";
+    create_cluster(&router, cluster, case).await;
+    register_fargate_definition(&router, "servicespread", case).await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": cluster,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": cluster,
+            "serviceName": "spread",
+            "taskDefinition": "servicespread",
+            "desiredCount": 3,
+            "capacityProviderStrategy": [
+                { "capacityProvider": "FARGATE", "weight": 1, "base": 0 },
+                { "capacityProvider": "FARGATE_SPOT", "weight": 0, "base": 1 },
+            ],
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
+        case,
+    )
+    .await;
+
+    // The placements are the SCHEDULER's, so the suite waits for the count it converges on
+    // rather than for a span.
+    let listed = poll_until(
+        case,
+        "the service to hold the three tasks it wants",
+        || {
+            ok(
+                &router,
+                "ListTasks",
+                json!({ "cluster": cluster, "serviceName": "spread" }),
+                case,
+            )
+        },
+        |body| {
+            body["taskArns"]
+                .as_array()
+                .is_some_and(|arns| arns.len() == 3)
+        },
+    )
+    .await;
+    let read = ok(
+        &router,
+        "DescribeTasks",
+        json!({ "cluster": cluster, "tasks": list(&listed, "taskArns", case) }),
+        case,
+    )
+    .await;
+    let mut placed: Vec<String> = list(&read, "tasks", case)
+        .iter()
+        .map(|task| string(task, "capacityProviderName", case))
+        .collect();
+    placed.sort();
+    assert_eq!(
+        placed,
+        vec![
+            "FARGATE".to_string(),
+            "FARGATE".to_string(),
+            "FARGATE_SPOT".to_string()
+        ],
+        "case {case:?}: the base takes one task and the weight the rest, got {read}"
+    );
 }
 
 #[tokio::test]

@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, count, create_cluster, list, ok, refused, register_capacity, service,
-    string, ACCOUNT, SIGNED_REGION,
+    cluster_with_capacity, count, create_cluster, list, ok, poll_until, refused, register_capacity,
+    service, string, with_members, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms)
@@ -1567,4 +1567,360 @@ async fn cluster_and_task_references_accept_a_name_or_an_arn() {
             "case {case:?}: StopTask deletes the task's tags, got {stopped}"
         );
     }
+}
+
+/// The task ARNs one `RunTask` placed, in the order it reported them.
+async fn run_task_arns(router: &MultiServiceRouter, request: Value, case: &str) -> Vec<String> {
+    let body = ok(router, "RunTask", request, case).await;
+    list(&body, "tasks", case)
+        .iter()
+        .map(|task| string(task, "taskArn", case))
+        .collect()
+}
+
+/// `base` with every member of `extra` written over it, so a row states only the member it
+/// changes ([`crate::ecs_wire::with_members`] is the shared writer).
+fn merged(base: &Value, extra: Value) -> Value {
+    let mut merged = base.clone();
+    with_members(&mut merged, extra);
+    merged
+}
+
+#[tokio::test]
+async fn one_client_token_performs_a_run_once() {
+    // `RunTask$clientToken` is "An identifier that you provide to ensure the idempotency of
+    // the request", so the run it names is performed at most ONCE: a repeat carrying the
+    // same token and the same arguments is answered with the tasks the first call placed,
+    // and a repeat that asks for something else under that token is the conflict the
+    // operation documents ("The provided clientToken is already in use with a different
+    // RunTask request. The resourceIds are the existing task ARNs which are already
+    // associated with the clientToken").
+    let router = service();
+    let cluster_arn = cluster_with_capacity(&router, "idempotent", "setup").await;
+    cluster_with_capacity(&router, "elsewhere", "setup").await;
+    register(&router, "tokened", "app", "setup").await;
+
+    let run = |cluster: &str, token: &str| {
+        json!({
+            "cluster": cluster,
+            "taskDefinition": "tokened",
+            "clientToken": token,
+            "startedBy": "the-pipeline",
+            "group": "family:tokened",
+        })
+    };
+
+    let first_request = run("idempotent", "token-one");
+    let case = "the first run under a token";
+    let placed = run_task_arns(&router, first_request.clone(), case).await;
+    assert_eq!(
+        placed.len(),
+        1,
+        "case {case:?}: expected one task, got {placed:?}"
+    );
+
+    // A repeat is the same run whether it spells the arguments the way the first one did or
+    // the way the handler resolves them: the cluster by name or by ARN, and `count` absent
+    // or set to the `1` it defaults to.
+    let repeats = [
+        ("an identical repeat", json!({})),
+        ("the cluster spelled as an ARN", json!({ "cluster": cluster_arn })),
+        ("the defaulted count stated outright", json!({ "count": 1 })),
+    ];
+    for (case, extra) in repeats {
+        let replayed = run_task_arns(&router, merged(&first_request, extra), case).await;
+        assert_eq!(
+            replayed, placed,
+            "case {case:?}: a repeat of one run must answer that run's tasks, got {replayed:?}"
+        );
+    }
+
+    // A repeat that asks for something ELSE under the token is refused, whichever member it
+    // differs in, and the refusal carries the ARNs the token is already associated with.
+    let conflicts = [
+        ("a different count", json!({ "count": 2 })),
+        ("a different group", json!({ "group": "family:other" })),
+        ("a different startedBy", json!({ "startedBy": "a-human" })),
+        (
+            "tags the first run did not carry",
+            json!({ "tags": [{ "key": "env", "value": "test" }] }),
+        ),
+        (
+            "overrides the first run did not carry",
+            json!({ "overrides": { "containers": [{ "name": "app", "cpu": 64 }] } }),
+        ),
+    ];
+    for (case, extra) in conflicts {
+        let refusal = refused(
+            &router,
+            "RunTask",
+            merged(&first_request, extra),
+            "ConflictException",
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&refusal, "message", case),
+            "The RunTask request could not be processed due to conflicts. The provided \
+             clientToken is already in use with a different request.",
+            "case {case:?}: unexpected conflict message in {refusal}"
+        );
+        let reported: Vec<String> = list(&refusal, "resourceIds", case)
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: expected ARNs, got {refusal}"))
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            reported, placed,
+            "case {case:?}: the conflict must report the tasks the token already names, \
+             got {refusal}"
+        );
+    }
+
+    // What the token does NOT dedupe: another token, the same token in another cluster, and
+    // a run that carries no token at all.
+    let distinct = [
+        ("another token", run("idempotent", "token-two")),
+        ("the same token in another cluster", run("elsewhere", "token-one")),
+        (
+            "no token at all",
+            json!({ "cluster": "idempotent", "taskDefinition": "tokened" }),
+        ),
+        (
+            "no token at all, again",
+            json!({ "cluster": "idempotent", "taskDefinition": "tokened" }),
+        ),
+    ];
+    let mut seen = placed.clone();
+    for (case, request) in distinct {
+        let placed = run_task_arns(&router, request, case).await;
+        assert_eq!(
+            placed.len(),
+            1,
+            "case {case:?}: expected one task, got {placed:?}"
+        );
+        assert!(
+            !seen.contains(&placed[0]),
+            "case {case:?}: expected a run of its own, got {} again",
+            placed[0]
+        );
+        seen.extend(placed);
+    }
+
+    // And concurrent retries of one run: they are serialised on the store, so the token is
+    // recorded by whichever of them gets there first and the rest answer that run's task.
+    let case = "five concurrent runs sharing one token";
+    let shared = run("idempotent", "token-concurrent");
+    let (one, two, three, four, five) = tokio::join!(
+        run_task_arns(&router, shared.clone(), case),
+        run_task_arns(&router, shared.clone(), case),
+        run_task_arns(&router, shared.clone(), case),
+        run_task_arns(&router, shared.clone(), case),
+        run_task_arns(&router, shared.clone(), case),
+    );
+    let mut concurrent: Vec<String> = [one, two, three, four, five].concat();
+    concurrent.sort();
+    concurrent.dedup();
+    assert_eq!(
+        concurrent.len(),
+        1,
+        "case {case:?}: expected every racer to answer one task, got {concurrent:?}"
+    );
+}
+
+/// The `{key, value}` pairs of a reported tag list, sorted so two readers of one tag set
+/// compare equal whatever order their maps happened to yield.
+fn sorted_tags(tags: &[Value], case: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = tags
+        .iter()
+        .map(|tag| (string(tag, "key", case), string(tag, "value", case)))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// The tags stored on `task`, as `DescribeTasks` reports them.
+async fn task_tags(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    task: &str,
+    case: &str,
+) -> Vec<(String, String)> {
+    let read = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": cluster, "tasks": [task], "include": ["TAGS"] }),
+        case,
+    )
+    .await;
+    let described = list(&read, "tasks", case);
+    let task = described
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {read}"));
+    sorted_tags(&list(task, "tags", case), case)
+}
+
+/// One row of the managed-tag table: the cluster the run places into, the members it adds
+/// to the bare request, and the `{key, value}` pairs the task must end up carrying.
+struct ManagedTagRow {
+    case: &'static str,
+    cluster: &'static str,
+    extra: fn() -> Value,
+    expect: &'static [(&'static str, &'static str)],
+}
+
+#[tokio::test]
+async fn ecs_managed_tags_tag_a_standalone_task_with_the_cluster_that_runs_it() {
+    // `RunTask$enableECSManagedTags` is "Specifies whether to use Amazon ECS managed tags
+    // for the task": with it on, Amazon ECS tags the task with the resources that task
+    // belongs to, under the `aws:` prefix it keeps for its own tags. A task a client runs
+    // belongs to no service, so the cluster it runs in is the one it is tagged with —
+    // beside whatever `propagateTags` copied and whatever the request carried.
+    let router = service();
+    for cluster in ["managedtags", "othertags"] {
+        cluster_with_capacity(&router, cluster, "setup").await;
+    }
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": "managed",
+            "containerDefinitions": [container("app", "public.ecr.aws/nginx/nginx:latest")],
+            "tags": [{ "key": "from", "value": "definition" }],
+        }),
+        "setup",
+    )
+    .await;
+
+    // The rows differ along whether the managed tags were asked for, what else the task
+    // carries (nothing, the revision's tags, the request's own), and WHICH cluster runs it
+    // — so the value of the managed tag is read off the cluster rather than being a
+    // constant.
+    let rows = [
+        ManagedTagRow {
+            case: "managed tags off, nothing else to carry",
+            cluster: "managedtags",
+            extra: || json!({}),
+            expect: &[],
+        },
+        ManagedTagRow {
+            case: "managed tags off with the revision's tags propagated",
+            cluster: "managedtags",
+            extra: || json!({ "propagateTags": "TASK_DEFINITION" }),
+            expect: &[("from", "definition")],
+        },
+        ManagedTagRow {
+            case: "managed tags on, nothing else to carry",
+            cluster: "managedtags",
+            extra: || json!({ "enableECSManagedTags": true }),
+            expect: &[("aws:ecs:clusterName", "managedtags")],
+        },
+        ManagedTagRow {
+            case: "managed tags on, beside the propagated and the requested tags",
+            cluster: "managedtags",
+            extra: || {
+                json!({
+                    "enableECSManagedTags": true,
+                    "propagateTags": "TASK_DEFINITION",
+                    "tags": [{ "key": "owner", "value": "platform" }],
+                })
+            },
+            expect: &[
+                ("aws:ecs:clusterName", "managedtags"),
+                ("from", "definition"),
+                ("owner", "platform"),
+            ],
+        },
+        ManagedTagRow {
+            case: "managed tags on in another cluster, whose name is the value",
+            cluster: "othertags",
+            extra: || json!({ "enableECSManagedTags": true }),
+            expect: &[("aws:ecs:clusterName", "othertags")],
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let request = merged(
+            &json!({ "cluster": row.cluster, "taskDefinition": "managed" }),
+            (row.extra)(),
+        );
+        let placed = run_task_arns(&router, request, case).await;
+        let mut expected: Vec<(String, String)> = row
+            .expect
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            task_tags(&router, row.cluster, &placed[0], case).await,
+            expected,
+            "case {case:?}: unexpected tag set on the task {} placed", placed[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ecs_managed_tags_tag_a_services_task_with_the_cluster_and_the_service() {
+    // The other half of the same member (`CreateService$enableECSManagedTags`): a task a
+    // SERVICE placed belongs to the cluster and to that service, so it carries a managed
+    // tag for each.
+    let router = service();
+    let cluster = "servicetags";
+    let case = "a service with its managed tags on";
+    cluster_with_capacity(&router, cluster, case).await;
+    register(&router, "servicetagged", "app", case).await;
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": cluster,
+            "serviceName": "tagged",
+            "taskDefinition": "servicetagged",
+            "desiredCount": 1,
+            "launchType": "EC2",
+            "enableECSManagedTags": true,
+            "propagateTags": "SERVICE",
+            "tags": [{ "key": "owner", "value": "platform" }],
+        }),
+        case,
+    )
+    .await;
+
+    // The task is the SCHEDULER's, so the suite waits for the placement to be made rather
+    // than for a span.
+    let listed = poll_until(
+        case,
+        "the service's task to be placed",
+        || {
+            ok(
+                &router,
+                "ListTasks",
+                json!({ "cluster": cluster, "serviceName": "tagged" }),
+                case,
+            )
+        },
+        |body| {
+            body["taskArns"]
+                .as_array()
+                .is_some_and(|arns| arns.len() == 1)
+        },
+    )
+    .await;
+    let arns = list(&listed, "taskArns", case);
+    let task = arns[0]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a task ARN, got {listed}"));
+    assert_eq!(
+        task_tags(&router, cluster, task, case).await,
+        vec![
+            ("aws:ecs:clusterName".to_string(), cluster.to_string()),
+            ("aws:ecs:serviceName".to_string(), "tagged".to_string()),
+            ("owner".to_string(), "platform".to_string()),
+        ],
+        "case {case:?}: expected the service's propagated tag beside both managed tags"
+    );
 }

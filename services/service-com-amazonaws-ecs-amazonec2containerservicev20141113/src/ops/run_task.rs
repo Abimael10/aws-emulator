@@ -456,6 +456,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_arn = cluster.arn.clone();
         let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
 
+        // "An identifier that you provide to ensure the idempotency of the request": a run
+        // made under a token this store already holds is that run being made AGAIN rather
+        // than a second one, so it is answered with the tasks that run placed; a run that
+        // asks for something else under that token is the conflict the operation documents,
+        // carrying the task ARNs the token is already associated with
+        // ([`crate::state::run_task_idempotency`]). Decided before anything is placed, and
+        // under the same guard the placement below is made under, so concurrent retries of
+        // one run cannot each place tasks of their own.
+        let token_key = input
+            .client_token
+            .as_deref()
+            .map(|token| (region.clone(), cluster_name.clone(), token.to_string()));
+        let arguments = crate::state::run_task_arguments(&input, &cluster_name, count);
+        if let Some(key) = token_key.as_ref() {
+            match guard.run_task_replay(key, &arguments) {
+                Some(crate::state::RunTaskReplay::Tasks(tasks)) => {
+                    return Ok(RunTaskOutput {
+                        tasks: Some(tasks),
+                        // The failures of a run are the hosts its surplus was rejected on,
+                        // which the run that was performed reported; the repeat reports the
+                        // tasks that run left behind.
+                        failures: Some(Vec::new()),
+                    });
+                }
+                Some(crate::state::RunTaskReplay::Conflict(resource_ids)) => {
+                    return Err(RunTaskErrorModeled::ConflictException(ConflictException {
+                        resource_ids: Some(resource_ids),
+                        message: Some(
+                            crate::state::RUN_TASK_CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
+                        ),
+                    })
+                    .into());
+                }
+                None => {}
+            }
+        }
+
         // A capacity provider places this task only in a cluster it is ASSOCIATED with, so
         // a strategy naming one outside the cluster's own list places nothing and the run is
         // refused with no task created. A run states that condition in the cluster's terms
@@ -609,13 +646,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // defaultCapacityProviderStrategy for the cluster is used" — and when the
         // cluster has none either, the task runs on the EC2 capacity registered to it
         // (`effective_strategy`, resolved above where the placement was first judged).
-        let (launch_type, capacity_provider_name) = match input.launch_type.clone() {
-            Some(launch_type) => (Some(launch_type), None),
-            None => match effective_strategy.first() {
-                Some(item) => (None, Some(item.capacity_provider.clone())),
-                None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
-            },
+        let launch_type = match input.launch_type.clone() {
+            Some(launch_type) => Some(launch_type),
+            None if effective_strategy.is_empty() => {
+                Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string())
+            }
+            None => None,
         };
+        // WHICH provider of that strategy places each of the tasks this run asks for: a
+        // strategy is a distribution over its providers rather than one of them, so it is
+        // walked task by task — each `base` satisfied first, the rest spread by `weight`
+        // ([`crate::state::next_strategy_placement`]). A run placed by a launch type is
+        // routed through no provider at all ("A task can use either a launch type or a
+        // capacity provider strategy"), and neither is one in a cluster with no default
+        // strategy to fall back on.
+        let routed: &[CapacityProviderStrategyItem] = if launch_type.is_some() {
+            &[]
+        } else {
+            &effective_strategy
+        };
+        let mut distribution = vec![0_usize; routed.len()];
+        // Not sized from the count the request carried: the loop pushes one entry per task
+        // this run places, and the count is weighed against its documented bound above.
+        let mut task_providers: Vec<Option<String>> = Vec::new();
+        for _ in 0..requested {
+            let chosen = crate::state::next_strategy_placement(routed, &distribution);
+            if let Some(index) = chosen {
+                distribution[index] += 1;
+            }
+            task_providers.push(chosen.map(|index| routed[index].capacity_provider.clone()));
+        }
 
         // A public IP is attached to the task's OWN elastic network interface, which only
         // the Fargate infrastructure does — so whether this run may ask for one is decided
@@ -703,19 +763,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name no stored provider carries, and the predefined Fargate providers, name no
         // Auto Scaling group of this account, so this decides nothing about them.
         if guard.registered_container_instances(&cluster_name) == 0 {
-            if let Some(provider) = capacity_provider_name
-                .as_deref()
-                .and_then(|name| guard.capacity_providers.get(name))
+            if let Some(provider) = task_providers
+                .iter()
+                .flatten()
+                .filter_map(|name| guard.capacity_providers.get(name.as_str()))
+                .find(|provider| crate::state::needs_registered_capacity_now(provider))
             {
-                if crate::state::needs_registered_capacity_now(provider) {
-                    let message = crate::state::empty_capacity_provider_message(&provider.name);
-                    return Err(RunTaskErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(message),
-                        },
-                    )
-                    .into());
-                }
+                let message = crate::state::empty_capacity_provider_message(&provider.name);
+                return Err(RunTaskErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
             }
         }
 
@@ -758,11 +818,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or_else(Vec::new, crate::state::DistinctInstancePlacement::failures);
 
         // "Specifies whether to propagate the tags from the task definition to the
-        // task. If no value is specified, the tags aren't propagated."
-        let tags = crate::state::standalone_task_tags(
-            input.propagate_tags.as_deref(),
-            &definition,
-            input.tags.as_deref().unwrap_or_default(),
+        // task. If no value is specified, the tags aren't propagated" — and beside those,
+        // the tags AMAZON ECS adds of its own when the run turned its managed tags on
+        // ([`crate::state::with_ecs_managed_tags`]). A task a client runs belongs to no
+        // service, so the cluster is the only resource it is tagged with.
+        let tags = crate::state::with_ecs_managed_tags(
+            crate::state::standalone_task_tags(
+                input.propagate_tags.as_deref(),
+                &definition,
+                input.tags.as_deref().unwrap_or_default(),
+            ),
+            input.enable_ecs_managed_tags,
+            &cluster_name,
+            None,
         );
 
         let created_at = crate::state::now();
@@ -789,22 +857,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.overrides.as_ref(),
             &definition.container_definitions,
         );
-        // Where the placement is routed through a capacity provider that still has to
-        // ACQUIRE the capacity for it, the task has been accepted but not placed: Amazon
-        // ECS has to add a container instance first, which is what `PROVISIONING` reports,
-        // and no start is owed until it has. A placement onto capacity that already exists
-        // is `PENDING` with its start owed by the clock — unless it has to be given an
-        // interface first, which is a step of its own ([`crate::state::placement_schedule`]).
-        let awaiting_capacity = crate::state::awaits_provisioned_capacity(
-            capacity_provider_name
-                .as_deref()
-                .and_then(|name| guard.capacity_providers.get(name)),
-            guard.registered_container_instances(&cluster_name),
-        );
         let mut created = Vec::with_capacity(placing);
+        let mut placed_arns: Vec<String> = Vec::new();
         for placed in 0..placing {
+            // The provider this one task is placed through, out of the distribution the
+            // strategy was walked into above.
+            let provider = task_providers.get(placed).cloned().flatten();
+            // Where the placement is routed through a capacity provider that still has to
+            // ACQUIRE the capacity for it, the task has been accepted but not placed: Amazon
+            // ECS has to add a container instance first, which is what `PROVISIONING`
+            // reports, and no start is owed until it has. A placement onto capacity that
+            // already exists is `PENDING` with its start owed by the clock — unless it has to
+            // be given an interface first, which is a step of its own
+            // ([`crate::state::placement_schedule`]).
+            let awaiting_capacity = crate::state::awaits_provisioned_capacity(
+                provider
+                    .as_deref()
+                    .and_then(|name| guard.capacity_providers.get(name)),
+                guard.registered_container_instances(&cluster_name),
+            );
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
+            placed_arns.push(task_arn.clone());
             // The elastic network interface an `awsvpc` task is allocated, out of the
             // networking this run launches it with.
             let mut attachments = guard.mint_task_attachments(
@@ -846,6 +920,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 &mut containers,
             );
+            // `Task$launchType` is "The infrastructure where your task runs on": the launch
+            // type this run named, else the infrastructure the capacity provider that placed
+            // the task binds onto — a placement through either of the Fargate providers runs
+            // on Fargate, whichever of the two it was routed through
+            // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::capacity_provider_launch_type`]).
+            let reported_launch_type = launch_type.clone().or_else(|| {
+                provider
+                    .as_deref()
+                    .and_then(|name| guard.capacity_provider_launch_type(name))
+                    .map(ToString::to_string)
+            });
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -866,8 +951,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cpu: definition.cpu.clone(),
                 memory: definition.memory.clone(),
                 overrides: Some(overrides.clone()),
-                launch_type: launch_type.clone(),
-                capacity_provider_name: capacity_provider_name.clone(),
+                launch_type: reported_launch_type,
+                capacity_provider_name: provider.clone(),
                 platform_version: platform.platform_version.clone(),
                 platform_family: platform.platform_family.clone(),
                 // The architecture the capacity this run placed the task on runs
@@ -971,6 +1056,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             guard.tasks.insert(task_arn, record);
         }
 
+        // The token this run was made under, recorded against the tasks it placed, so a
+        // retry of the SAME run is answered with these tasks rather than placing a second
+        // run of them ([`crate::state::run_task_idempotency`]). Written under the same
+        // guard the lookup above was made under, and only for a run that placed something.
+        if let Some(key) = token_key {
+            guard.record_run_task_token(key, arguments, placed_arns, now);
+        }
         // The steps each task just placed needs taken before its containers start are
         // settled here: the execution role is assumed, and the image fetch is attempted from
         // where the task was placed — a role Amazon ECS cannot assume, or a placement with no

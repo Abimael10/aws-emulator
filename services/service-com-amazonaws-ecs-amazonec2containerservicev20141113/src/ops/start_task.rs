@@ -491,10 +491,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .group
             .clone()
             .unwrap_or_else(|| format!("family:{}", definition.family));
-        let tags = crate::state::standalone_task_tags(
-            input.propagate_tags.as_deref(),
-            &definition,
-            input.tags.as_deref().unwrap_or_default(),
+        // The tags the placement propagated or carried, and beside them the tags AMAZON ECS
+        // adds of its own when the placement turned its managed tags on
+        // ([`crate::state::with_ecs_managed_tags`]). A task a client starts belongs to no
+        // service, so the cluster is the only resource it is tagged with.
+        let tags = crate::state::with_ecs_managed_tags(
+            crate::state::standalone_task_tags(
+                input.propagate_tags.as_deref(),
+                &definition,
+                input.tags.as_deref().unwrap_or_default(),
+            ),
+            input.enable_ecs_managed_tags,
+            &cluster_name,
+            None,
         );
         let created_at = crate::state::now();
         // Where the subnets this placement names are, kept on the store beside the task

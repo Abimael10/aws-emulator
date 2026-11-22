@@ -1263,8 +1263,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // The capacity a daemon runs on is its capacity providers' ("ECS Managed
             // Daemons is only supported for Amazon ECS Managed Instances Capacity
             // Providers"), so a daemon task is placed through a provider rather than with a
-            // launch type.
-            launch_type: None,
+            // launch type of its own — and `Task$launchType` is "The infrastructure where
+            // your task runs on", which for such a placement is the capacity Amazon ECS
+            // manages ([`Self::capacity_provider_launch_type`]).
+            launch_type: capacity_provider_name
+                .as_deref()
+                .and_then(|name| self.capacity_provider_launch_type(name))
+                .map(ToString::to_string),
             capacity_provider_name,
             // A daemon task runs on the capacity its providers manage rather than on
             // Fargate, so it reports none of the Fargate-only members; its containers run
@@ -1286,12 +1291,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             daemon_arn: Some(daemon.arn.clone()),
             daemon_revision_arn: Some(revision_arn.to_string()),
             // "Specifies whether to propagate the tags from the daemon to the daemon
-            // tasks. If you don't specify a value, the tags aren't propagated."
-            tags: if daemon.propagate_tags == PROPAGATE_TAGS_DAEMON {
-                daemon.tags.clone()
-            } else {
-                Vec::new()
-            },
+            // tasks. If you don't specify a value, the tags aren't propagated" — and beside
+            // those, the tags AMAZON ECS adds of its own when the daemon turned its managed
+            // tags on ([`with_ecs_managed_tags`]). A daemon task belongs to no service, so
+            // the cluster is the only resource it is tagged with.
+            tags: with_ecs_managed_tags(
+                if daemon.propagate_tags == PROPAGATE_TAGS_DAEMON {
+                    daemon.tags.clone()
+                } else {
+                    Vec::new()
+                },
+                daemon.enable_ecs_managed_tags,
+                &daemon.cluster_name,
+                None,
+            ),
             enable_execute_command: daemon.enable_execute_command,
             created_at: reported_instant(now),
             started_at: None,

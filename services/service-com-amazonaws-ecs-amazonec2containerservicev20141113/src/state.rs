@@ -170,6 +170,21 @@ pub use cluster_idempotency::{
     RequestedClusterArguments, CLUSTER_ARGUMENTS_INCONSISTENT_MESSAGE,
 };
 
+/// Whether a `RunTask` carrying a `clientToken` is a run this store has already performed:
+/// the same arguments are answered with that run's tasks, different ones are a conflict.
+mod run_task_idempotency;
+pub use run_task_idempotency::*;
+
+/// WHICH capacity provider of a strategy places each task — `base` first, then `weight` —
+/// and the launch type the task it places reports.
+mod capacity_provider_placement;
+pub use capacity_provider_placement::*;
+
+/// The tags Amazon ECS adds to a task of its OWN when the placement turned its managed tags
+/// on.
+mod ecs_managed_tags;
+pub use ecs_managed_tags::*;
+
 /// How an ARN a REQUEST supplies is read, and what it is refused for: the Region and the
 /// account segments checked before the identifier is resolved.
 mod request_arn;
@@ -4808,6 +4823,11 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// shortfall stands, so the map is the set of clusters Amazon ECS is acquiring capacity
     /// for, and it is bounded by the clusters and providers this store holds.
     pub managed_capacity_demands: HashMap<(String, String), ManagedCapacityDemand>,
+    /// `(region, clusterName, clientToken)` -> the `RunTask` that token was used for: the
+    /// arguments it asked for and the tasks it placed, so a RETRY of that run is answered
+    /// with those tasks and a different run under the same token is refused (see
+    /// [`run_task_idempotency`]). Bounded by [`MAX_RUN_TASK_CLIENT_TOKENS`].
+    pub run_task_client_tokens: HashMap<RunTaskTokenKey, RunTaskTokenRecord>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.

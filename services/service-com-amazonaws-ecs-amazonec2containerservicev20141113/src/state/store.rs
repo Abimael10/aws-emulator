@@ -3832,8 +3832,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // is written by that pass and not by the call that gave it the work
         // ([`Self::report_placement_shortfalls`]).
         if placements > 0 && self.placement_capacity_reason(&service, &placement).is_none() {
+            // The strategy a service places through is a DISTRIBUTION over its providers
+            // rather than one of them, so each task is routed through the provider the next
+            // placement is owed to, counted from the tasks the service already holds
+            // ([`next_strategy_placement`]).
+            let strategy = service.capacity_provider_strategy.clone();
+            let mut distribution = strategy_distribution(
+                &strategy,
+                live.iter()
+                    .filter_map(|arn| self.tasks.get(arn))
+                    .filter_map(|task| task.capacity_provider_name.as_deref()),
+            );
             for _ in 0..placements {
-                self.place_service_task(&service, definition, &placement, region, now);
+                let mut routed = placement.clone();
+                if let Some(index) = next_strategy_placement(&strategy, &distribution) {
+                    distribution[index] += 1;
+                    routed.capacity_provider_name =
+                        Some(strategy[index].capacity_provider.clone());
+                }
+                self.place_service_task(&service, definition, &routed, region, now);
             }
         }
         // A task whose replacement has come up is retired one step after the pass that
@@ -3952,8 +3969,23 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 return Ok(());
             }
         }
+        // The same distribution the service's own scheduler places under: a task set's
+        // strategy is a distribution over its providers, so each placement is routed through
+        // the provider the next one is owed to ([`next_strategy_placement`]).
+        let strategy = task_set.capacity_provider_strategy.clone();
+        let mut distribution = strategy_distribution(
+            &strategy,
+            live.iter()
+                .filter_map(|arn| self.tasks.get(arn))
+                .filter_map(|task| task.capacity_provider_name.as_deref()),
+        );
         for _ in 0..to_place {
-            self.place_service_task(&service, definition, &placement, region, now);
+            let mut routed = placement.clone();
+            if let Some(index) = next_strategy_placement(&strategy, &distribution) {
+                distribution[index] += 1;
+                routed.capacity_provider_name = Some(strategy[index].capacity_provider.clone());
+            }
+            self.place_service_task(&service, definition, &routed, region, now);
         }
         Ok(())
     }
@@ -4077,6 +4109,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             PROPAGATE_TAGS_TASK_DEFINITION => definition.tags.clone(),
             _ => Vec::new(),
         };
+        // And beside those, the tags AMAZON ECS adds of its own when the service turned its
+        // managed tags on ([`with_ecs_managed_tags`]): a task a service placed belongs to
+        // the cluster AND to that service, so it is tagged with both.
+        let tags = with_ecs_managed_tags(
+            tags,
+            service.enable_ecs_managed_tags,
+            &service.cluster_name,
+            Some(&service.name),
+        );
         // The PLATFORM this placement runs on, resolved from the revision it places and the
         // placement's own launch selection, exactly as a client's own placement resolves it
         // ([`resolved_task_platform`]).
@@ -4153,7 +4194,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 None,
                 &definition.container_definitions,
             )),
-            launch_type: placement.launch_type.clone(),
+            // `Task$launchType` is "The infrastructure where your task runs on": the launch
+            // type the placement names, else the infrastructure the capacity provider that
+            // placed the task binds onto ([`Self::capacity_provider_launch_type`]).
+            launch_type: placement.launch_type.clone().or_else(|| {
+                placement
+                    .capacity_provider_name
+                    .as_deref()
+                    .and_then(|name| self.capacity_provider_launch_type(name))
+                    .map(ToString::to_string)
+            }),
             capacity_provider_name: placement.capacity_provider_name.clone(),
             platform_version: platform.platform_version.clone(),
             platform_family: platform.platform_family.clone(),

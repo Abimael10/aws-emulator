@@ -44,7 +44,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::managed_instances;
-use crate::ecs_wire::{create_cluster, list, ok, refusal, service, string, ACCOUNT, SIGNED_REGION};
+use crate::ecs_wire::{
+    create_cluster, list, ok, refusal, service, string, with_members, ACCOUNT, SIGNED_REGION,
+};
 
 /// The cluster every provider below is scoped to: "Managed instances capacity providers
 /// are cluster-scoped", so each create names one.
@@ -67,15 +69,6 @@ const PROVISIONED: Duration = Duration::from_millis(
         .as_millis() as u64
         + 400,
 );
-
-/// Write every member of `extra` onto `target`, which is the object a row adds them to.
-fn with_members(target: &mut Value, extra: Value) {
-    if let Value::Object(members) = extra {
-        for (member, value) in members {
-            target[member] = value;
-        }
-    }
-}
 
 /// The configuration a row sends: the members the model requires
 /// ([`crate::capacity_providers::managed_instances`]), plus the optional members the row
