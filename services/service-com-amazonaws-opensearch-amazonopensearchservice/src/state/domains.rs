@@ -525,8 +525,13 @@ impl Domain {
     /// `MaintenanceId` the record it created is addressed by.
     ///
     /// The action is `PENDING` when it is started and the clock owes it the rest of
-    /// its run ([`Maintenance::settle`]), so a caller reading straight after the
-    /// call still observes it waiting.
+    /// its run ([`Maintenance::settle`]), so the record walks the statuses the service
+    /// reports an action under rather than being put straight into its outcome.
+    ///
+    /// What the clock owes it falls due inside [`MAINTENANCE_STEP`], which is as short
+    /// as it is for the reason stated there: this is the one span of this service with
+    /// no state change behind it, so it is bounded by the next read a polling client
+    /// makes rather than chosen for a caller to observe.
     pub fn begin_maintenance(
         &mut self,
         action: &str,
@@ -1629,7 +1634,7 @@ pub fn logging_node_id(domain: &Domain) -> String {
 pub const MAINTAINABLE_DATA_NODES: i32 = 3;
 
 /// `MaintenanceStatus`'s `PENDING` value: the action has been accepted and has not
-/// begun yet.
+/// begun yet — the status every accepted action is written in.
 pub const MAINTENANCE_STATUS_PENDING: &str = "PENDING";
 
 /// `MaintenanceStatus`'s `IN_PROGRESS` value: the action is running on the node.
@@ -1643,14 +1648,34 @@ pub const MAINTENANCE_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// reports.
 pub const MAINTENANCE_STATUS_SUCCESS: &str = "SUCCESS";
 
-/// How long each step of a maintenance action takes.
+/// How long each step of a maintenance action takes before the clock owes the next.
 ///
-/// The same reasoning as [`PROVISIONING`]: AWS takes as long as the node takes, the
-/// emulator chooses a span, and it is deliberately NOT zero, so a caller reading
-/// straight after the call still observes the action `PENDING` and then
-/// `IN_PROGRESS`. The due instants are stored on the record and materialised by
-/// whichever later call reads it — nothing sleeps.
-pub const MAINTENANCE_STEP: Duration = Duration::from_millis(500);
+/// The due instants are stored on the record and materialised by whichever later call
+/// reads it ([`Maintenance::settle`]) — nothing sleeps — so what this span decides is
+/// not how the record moves but WHEN, and that is why it is the shortest span of this
+/// service rather than one of the seconds-long ones the records around it carry.
+///
+/// Every other span here holds a status open because the clock materialises a STATE
+/// CHANGE at its due instant that other calls then observe: the cluster of a domain
+/// coming up ([`DOMAIN_WORK`]), a configuration landing on its options, a package
+/// becoming associable, an endpoint's subnets applying. A maintenance action changes
+/// nothing — it restarts a process on one node and leaves the domain exactly as it
+/// found it, and no gate of this service reads the record — so the only thing a longer
+/// span would decide is how many polls a client waiting for the action's outcome has
+/// to issue before it can read one. It is therefore bounded by the NEXT READ such a
+/// client makes, which is the shortest span that still orders the two steps: the
+/// record is written `PENDING`, and the clock owes it `IN_PROGRESS` and then its
+/// terminal status within a millisecond of the call.
+///
+/// Measured against a client that polls the way an AWS-targeting client polls work
+/// AWS takes minutes over — one read right after the call that starts the action, and
+/// the next one an interval later: with this span at half a second that first read
+/// still answers `PENDING`, and the interval the client then waits out is longer than
+/// the deadline it allows the whole lifecycle, so it never reads an outcome at all; at
+/// a millisecond the outcome is there on that first read. What the span costs such a
+/// client is therefore a whole poll interval, whatever fraction of a second it is set
+/// to, which is why it is set below the gap between two of its calls.
+pub const MAINTENANCE_STEP: Duration = Duration::from_millis(1);
 
 /// How many maintenance actions a domain's history keeps — the emulator's own bound
 /// on the store, like [`CHANGE_HISTORY`], so a caller starting actions forever cannot
@@ -1668,7 +1693,8 @@ pub struct Maintenance {
     pub action: String,
     /// The `NodeId` of the data node this action runs on.
     pub node_id: String,
-    /// One of `MaintenanceStatus`'s values; see [`MAINTENANCE_STATUS_PENDING`].
+    /// The `MaintenanceStatus` this action is in; see
+    /// [`MAINTENANCE_STATUS_PENDING`].
     pub status: String,
     /// `CreatedAt`: the instant of the call that started the action.
     pub created_at: SystemTime,

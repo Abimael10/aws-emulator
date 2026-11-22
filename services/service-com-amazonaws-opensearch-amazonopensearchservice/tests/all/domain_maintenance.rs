@@ -20,8 +20,9 @@
 //! * an accepted action is a RECORD: the id the call hands out addresses it, it
 //!   reports the action and node the request named, and the clock — not a reader —
 //!   walks it from `PENDING` through `IN_PROGRESS` to the terminal status the service
-//!   reports a finished action with, over every `MaintenanceType` value the model
-//!   publishes;
+//!   reports a finished action with, each move dated at the instant it fell due, over
+//!   every `MaintenanceType` value the model publishes and over every state the clock
+//!   can owe such a record;
 //! * the listing reports those same records, each once and newest first, narrowed by
 //!   `Action` and by `Status` — over every published value of each — and paged by
 //!   every page size from one record per page up to more than the domain holds;
@@ -36,12 +37,13 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_IN_PROGRESS, MAINTENANCE_STATUS_PENDING,
-    MAINTENANCE_STATUS_SUCCESS, NODE_TYPE_DATA, NODE_TYPE_MASTER, NODE_TYPE_ULTRAWARM,
+    Maintenance, MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_IN_PROGRESS,
+    MAINTENANCE_STATUS_PENDING, MAINTENANCE_STATUS_SUCCESS, NODE_TYPE_DATA, NODE_TYPE_MASTER,
+    NODE_TYPE_ULTRAWARM,
 };
 
 use super::domain_lifecycle::{
-    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
 
 /// The `MaintenanceType` values the model publishes (`smithy_query(query="shape",
@@ -103,11 +105,12 @@ pub(crate) async fn list(emulator: &Emulator, name: &str, query: &str) -> Answer
 }
 
 /// `CreateDomain` with `cluster` as its `ClusterConfig`, asserting it was accepted,
-/// and then waiting out the provisioning span.
+/// and then waiting for the domain to report itself settled.
 ///
 /// Every case below reads or acts on a NODE of the domain, and a domain with work in
-/// flight publishes no node census — so each row waits for the create to land before
-/// the call under test, rather than asserting on a domain that is still coming up.
+/// flight publishes no node census — so each row waits for the CONDITION a client
+/// waits for ([`super::domain_lifecycle::settled_domain`]) before the call under test,
+/// rather than asserting on a domain that is still coming up.
 pub(crate) async fn create(emulator: &Emulator, name: &str, cluster: Value) {
     let answer = emulator
         .create(json!({ "DomainName": name, "ClusterConfig": cluster }))
@@ -117,7 +120,7 @@ pub(crate) async fn create(emulator: &Emulator, name: &str, cluster: Value) {
         "case CreateDomain({name:?}): expected 200, got {} with {:?}",
         answer.status, answer.body
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    super::domain_lifecycle::settled_domain(emulator, name).await;
 }
 
 /// The nodes of `name`, as `DescribeDomainNodes` publishes them: (NodeId, NodeType)
@@ -337,11 +340,25 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
         started.push((maintenance_id, (*action).to_string(), node_id));
     }
 
-    // Straight after the call the action is still waiting: the span it takes is not
-    // zero, so a caller observes the transient status.
+    // The clock, not the reader, walks the action: a client that polls reads it reach
+    // the terminal status this service reports a finished action with, and every
+    // status the walk went through is one this service reports.
     for (maintenance_id, action, node_id) in &started {
-        let answer = status(&emulator, "maintained-domain", maintenance_id).await;
         let case = format!("GetDomainMaintenanceStatus({action})");
+        let seen = polled_to_terminal(&emulator, "maintained-domain", maintenance_id, &case).await;
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some(MAINTENANCE_STATUS_SUCCESS),
+            "case {case}: expected the terminal status this service reports a finished action \
+             with, the reads saw {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|status| REPORTED_STATUSES.contains(&status.as_str())),
+            "case {case}: every status read is one this service reports, the reads saw {seen:?}"
+        );
+
+        let answer = status(&emulator, "maintained-domain", maintenance_id).await;
         assert_eq!(
             answer.status, 200,
             "case {case}: expected 200, got {} with {:?}",
@@ -354,16 +371,25 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
                 answer.body["NodeId"].as_str(),
             ),
             (
-                Some(MAINTENANCE_STATUS_PENDING),
+                Some(MAINTENANCE_STATUS_SUCCESS),
                 Some(action.as_str()),
                 Some(node_id.as_str()),
             ),
-            "case {case}: expected the action and node the request named, still pending, got {:?}",
+            "case {case}: expected the action and node the request named, finished, got {:?}",
             answer.body
         );
+        // The walk is dated: the instant the status last moved is the instant the step
+        // fell due, so it is at or after the instant the action was created.
+        let created = answer.body["CreatedAt"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case}: expected a CreatedAt, got {:?}", answer.body));
+        let updated = answer.body["UpdatedAt"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case}: expected an UpdatedAt, got {:?}", answer.body));
         assert!(
-            answer.body["CreatedAt"].is_number() && answer.body["UpdatedAt"].is_number(),
-            "case {case}: expected CreatedAt/UpdatedAt timestamps, got {:?}",
+            updated >= created,
+            "case {case}: expected the status to be dated at or after the instant the action \
+             was created, got {updated} after {created} in {:?}",
             answer.body
         );
 
@@ -376,37 +402,37 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
         );
     }
 
-    // The clock, not the reader, walks the action: `PENDING` then `IN_PROGRESS` then
-    // the terminal status, each step dated.
+    // Nor does any other call move it: an action the clock has finished has no step
+    // owed to it any more, so every member a later read reports is the one the walk
+    // left behind — the instant the status last moved included — however many other
+    // calls this service has served in between.
     let (maintenance_id, action, _) = &started[0];
-    let created = status(&emulator, "maintained-domain", maintenance_id)
-        .await
-        .body["CreatedAt"]
-        .clone();
-    let mut seen: Vec<String> = vec![MAINTENANCE_STATUS_PENDING.to_string()];
-    for _ in 0..2 {
-        tokio::time::sleep(SETTLE_WAIT).await;
-        let answer = status(&emulator, "maintained-domain", maintenance_id).await;
-        let case = format!("GetDomainMaintenanceStatus({action}, settled)");
-        let reported = string_member(&answer.body, "Status", &case);
-        if seen.last() != Some(&reported) {
-            seen.push(reported);
-        }
-        assert_eq!(
-            answer.body["CreatedAt"], created,
-            "case {case}: the instant the action was created does not move, got {:?} after {:?}",
-            answer.body["CreatedAt"], created
-        );
-    }
+    let settled = status(&emulator, "maintained-domain", maintenance_id).await;
+    let _ = list(&emulator, "maintained-domain", "").await;
+    let _ = census(&emulator, "maintained-domain").await;
+    let other_node = node_of(&emulator, "maintained-domain", NODE_TYPE_DATA).await;
+    let _ = start(
+        &emulator,
+        "maintained-domain",
+        MAINTENANCE_TYPES[0],
+        Some(other_node.as_str()),
+    )
+    .await;
+    let later = status(&emulator, "maintained-domain", maintenance_id).await;
     assert_eq!(
-        seen.last().map(String::as_str),
-        Some(MAINTENANCE_STATUS_SUCCESS),
-        "the action finishes once its spans have passed, got {seen:?}"
+        later.body,
+        settled.body,
+        "case GetDomainMaintenanceStatus({action}, after further calls): the record of a \
+         finished action does not move, got {:?} after {:?}",
+        later.body,
+        settled.body
     );
-    assert!(
-        seen.iter()
-            .all(|status| REPORTED_STATUSES.contains(&status.as_str())),
-        "every status is one this service reports, got {seen:?}"
+    assert_eq!(
+        later.body["Status"].as_str(),
+        Some(MAINTENANCE_STATUS_SUCCESS),
+        "case GetDomainMaintenanceStatus({action}, after further calls): expected the terminal \
+         status this service reports a finished action with, got {:?}",
+        later.body
     );
 
     // An id this domain holds no action for, and an id another domain's action
@@ -465,7 +491,13 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
     }
 
     // An unfiltered listing reports every action, each once; the newest first, so
-    // the ids are the started ones reversed.
+    // the ids are the started ones reversed. The cases below are about the LISTING
+    // rather than about the walk, so each action is first polled to the status the
+    // clock leaves it in — a record read mid-step would make the comparisons below
+    // depend on which step it was in.
+    for (maintenance_id, action) in &started {
+        polled_to_terminal(&emulator, "listed-domain", maintenance_id, action).await;
+    }
     let answer = list(&emulator, "listed-domain", "").await;
     assert_eq!(
         answer.status, 200,
@@ -528,11 +560,21 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
             "case action={action}: every row carries the action asked for, got {rows:?}"
         );
     }
+    // `Status` narrows the listing the same way. Every action here has been walked to
+    // the terminal status the service reports a finished one with, so no status still
+    // UNDER WAY selects any of them; the status a record is in while the clock still
+    // owes it a step is asserted to select it in
+    // [`the_clock_owes_each_step_and_a_read_reports_the_status_it_is_due`].
     for (query, expected, case) in [
         (
             format!("?status={MAINTENANCE_STATUS_PENDING}"),
-            started.len(),
-            "every action is still pending",
+            0,
+            "no action still waiting to begin",
+        ),
+        (
+            format!("?status={MAINTENANCE_STATUS_IN_PROGRESS}"),
+            0,
+            "no action still running",
         ),
         (
             format!("?status={MODELLED_FINISHED_STATUS}"),
@@ -541,8 +583,8 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
         ),
         (
             format!("?action={}&status={MAINTENANCE_STATUS_PENDING}", MAINTENANCE_TYPES[0]),
-            2,
-            "both filters at once",
+            0,
+            "both filters at once, on a status nothing carries",
         ),
     ] {
         let answer = list(&emulator, "listed-domain", &query).await;
@@ -555,6 +597,22 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
             "case {case}: expected {expected} rows for {query}, got {rows}"
         );
     }
+    // The status the records DO carry is not a value the enum publishes, so naming it
+    // is a malformed request rather than a filter.
+    let answer = list(
+        &emulator,
+        "listed-domain",
+        &format!("?status={MAINTENANCE_STATUS_SUCCESS}"),
+    )
+    .await;
+    assert_eq!(
+        (answer.status, error_code(&answer).as_str()),
+        (400, "ValidationException"),
+        "case status={MAINTENANCE_STATUS_SUCCESS}: a status outside the modelled enum is \
+         refused at the boundary, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
 
     // Every page size walks the listing exactly once, in the one order, plus the
     // uncapped default; a token this operation did not hand out is refused.
@@ -625,6 +683,55 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
         );
     }
 
+    // A status a record IS in selects it: an action the clock has not finished yet is
+    // listed under the status it is waiting in, and the filter narrows to that one.
+    // The record is planted, because the span a STARTED action waits in each step is
+    // bounded by the next read a polling client makes — see
+    // [`the_clock_owes_each_step_and_a_read_reports_the_status_it_is_due`], which is
+    // where each step's own reporting is asserted.
+    let waiting = "planted-waiting-action";
+    let created_at = std::time::SystemTime::now();
+    let ahead = std::time::Duration::from_secs(600);
+    plant(
+        &emulator,
+        "listed-domain",
+        Maintenance {
+            maintenance_id: waiting.to_string(),
+            action: MAINTENANCE_TYPES[0].to_string(),
+            node_id: nodes[0].clone(),
+            status: MAINTENANCE_STATUS_PENDING.to_string(),
+            created_at,
+            updated_at: created_at,
+            starts_at: Some(created_at + ahead),
+            completes_at: Some(created_at + ahead * 2),
+        },
+    );
+    let answer = list(
+        &emulator,
+        "listed-domain",
+        &format!("?status={MAINTENANCE_STATUS_PENDING}"),
+    )
+    .await;
+    let ids: Vec<&str> = answer.body["DomainMaintenances"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "case status={MAINTENANCE_STATUS_PENDING}, one action waiting: expected a list, \
+                 got {:?}",
+                answer.body
+            )
+        })
+        .iter()
+        .filter_map(|row| row["MaintenanceId"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![waiting],
+        "case status={MAINTENANCE_STATUS_PENDING}, one action waiting: expected the filter to \
+         select it and leave the finished ones out, got {:?}",
+        answer.body
+    );
+
     // A domain with no action listed holds an empty list rather than a refusal, and
     // a name no domain is stored under is the generic envelope.
     create(&emulator, "quiet-domain", every_role(MAINTAINABLE_DATA_NODES)).await;
@@ -647,6 +754,25 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
         answer.status,
         answer.body
     );
+}
+
+/// Put `record` into `domain`'s maintenance history, reached exactly as a handler
+/// reaches the store ([`Emulator::store`]).
+///
+/// The way this suite reaches a state no implemented operation parks a record in long
+/// enough to read: the span a STARTED action spends waiting for each step the clock
+/// owes it is bounded by the next read a polling client makes
+/// (`crate::state::MAINTENANCE_STEP`), so a case that wants to read an action mid-walk
+/// plants one whose due instants it chose rather than racing the host.
+fn plant(emulator: &Emulator, domain: &str, record: Maintenance) {
+    let store = emulator.store();
+    let mut guard = store.lock();
+    guard
+        .domains
+        .get_mut(domain)
+        .unwrap_or_else(|| panic!("expected the store to hold domain {domain}"))
+        .maintenances
+        .push_back(record);
 }
 
 /// The statuses a maintenance action of this service is ever reported with: the
@@ -697,16 +823,17 @@ async fn polled_to_terminal(
     seen.into_inner()
 }
 
-/// RULE: an accepted action becomes TERMINAL on the reads a polling client makes and
-/// nothing else.
+/// RULE: an accepted action is TERMINAL on the reads a polling client makes — the
+/// first of them included — and nothing else.
 ///
-/// What this adds over [`an_accepted_action_is_read_back_and_walked_by_the_clock`],
-/// which walks the same statuses off a domain of ONE shape: the client here issues
-/// nothing but the status read between the start and the terminal status, the read and
-/// the listing are asserted to agree on that terminal status, and the rule is asserted
-/// over the cluster shapes a maintainable domain comes in. The two cases are therefore
-/// about one rule each — the clock walking the record, and a polling client observing
-/// it — and should move together if either changes.
+/// What this adds over
+/// [`an_accepted_action_is_read_back_and_walked_by_the_clock`], which walks the same
+/// statuses off a domain of ONE shape: the client here issues nothing but the status read
+/// between the start and the terminal status, the read and the listing are asserted to
+/// agree on that terminal status, and the rule is asserted over the cluster shapes a
+/// maintainable domain comes in. The two cases are therefore about one rule each — the
+/// record a call leaves behind, and a polling client observing it — and should move
+/// together if either changes.
 #[tokio::test]
 async fn an_accepted_action_becomes_terminal_on_a_polling_clients_reads_alone() {
     // One row per cluster shape a maintainable domain comes in — the role on its own at
@@ -851,6 +978,154 @@ async fn an_accepted_action_becomes_terminal_on_a_polling_clients_reads_alone() 
                 Some(MAINTENANCE_STATUS_SUCCESS),
                 "case ListDomainMaintenances({case}): expected the listing to carry the same \
                  terminal status the read reports, got {row:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the CLOCK owes a maintenance action each step of its run, so the status a
+/// read reports is the one the record's own due instants put it in at that moment,
+/// each move dated at the instant it fell due rather than at the read that observed
+/// it — and `ListDomainMaintenances` narrows its listing by exactly those statuses.
+///
+/// The rows are the states the clock can owe a record: both steps still to come, the
+/// start fallen due with the completion still to come, and both fallen due. They are
+/// planted through the store seam, the way a suite reaches a state no implemented
+/// operation parks a record in ([`plant`]): the span a STARTED action spends waiting
+/// for each step
+/// is bounded by the next read a polling client makes
+/// (`crate::state::MAINTENANCE_STEP`), because a maintenance action defers no state
+/// change to those instants — so no case can read a started action mid-step without
+/// depending on how fast the host runs.
+/// [`an_accepted_action_is_read_back_and_walked_by_the_clock`] covers the started
+/// action; this covers what each step of the walk reports.
+#[tokio::test]
+async fn the_clock_owes_each_step_and_a_read_reports_the_status_it_is_due() {
+    let emulator = Emulator::new();
+    let domain = "clock-walked-maintenance";
+    create(&emulator, domain, every_role(MAINTAINABLE_DATA_NODES)).await;
+    let node_id = node_of(&emulator, domain, NODE_TYPE_DATA).await;
+
+    // Far enough either side of the planted creation instant that no row depends on
+    // how long the case takes to run, and whole seconds, so the instants the answers
+    // carry can be compared to the ones planted.
+    let step = std::time::Duration::from_secs(600);
+    let created_at = std::time::SystemTime::now() - step * 4;
+
+    // One row per state the clock can owe the record: how many steps after the
+    // creation instant each of the two falls due, the status a read must then report,
+    // and how far after the creation instant that status must be dated. The creation
+    // instant is four steps back, so a due instant beyond that is still to come.
+    let rows: [(&str, u32, u32, &str, u32); 3] = [
+        (
+            "both steps still to come",
+            5,
+            6,
+            MAINTENANCE_STATUS_PENDING,
+            0,
+        ),
+        (
+            "the start fell due, the completion still to come",
+            1,
+            5,
+            MAINTENANCE_STATUS_IN_PROGRESS,
+            1,
+        ),
+        ("both steps fell due", 1, 2, MAINTENANCE_STATUS_SUCCESS, 2),
+    ];
+
+    let mut planted: Vec<(String, &str, &str, u32)> = Vec::new();
+    for (index, (case, starts_in, completes_in, expected_status, dated_after)) in
+        rows.iter().enumerate()
+    {
+        let maintenance_id = format!("planted-action-{index}");
+        plant(
+            &emulator,
+            domain,
+            Maintenance {
+                maintenance_id: maintenance_id.clone(),
+                action: MAINTENANCE_TYPES[index % MAINTENANCE_TYPES.len()].to_string(),
+                node_id: node_id.clone(),
+                status: MAINTENANCE_STATUS_PENDING.to_string(),
+                created_at,
+                updated_at: created_at,
+                starts_at: Some(created_at + step * *starts_in),
+                completes_at: Some(created_at + step * *completes_in),
+            },
+        );
+        planted.push((maintenance_id, case, expected_status, *dated_after));
+    }
+
+    for (maintenance_id, case, expected_status, dated_after) in &planted {
+        let read = status(&emulator, domain, maintenance_id).await;
+        assert_eq!(
+            (read.status, read.body["Status"].as_str()),
+            (200, Some(*expected_status)),
+            "case {case}: expected the status the clock has made due, got {} with {:?}",
+            read.status,
+            read.body
+        );
+        // Each move is dated at the instant it fell DUE, not at the read that
+        // materialised it, so the instant a caller reads does not move with the moment
+        // it happened to look.
+        let created = read.body["CreatedAt"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case}: expected a CreatedAt, got {:?}", read.body));
+        let updated = read.body["UpdatedAt"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case}: expected an UpdatedAt, got {:?}", read.body));
+        let expected_gap = f64::from(*dated_after) * step.as_secs_f64();
+        assert!(
+            (updated - created - expected_gap).abs() < 1.0,
+            "case {case}: expected the status to be dated {expected_gap} s after the action was \
+             created, got {} s in {:?}",
+            updated - created,
+            read.body
+        );
+
+        // A second read reports the same record: the reader moved nothing, and what
+        // the clock had already made due was made due once.
+        let again = status(&emulator, domain, maintenance_id).await;
+        assert_eq!(
+            again.body, read.body,
+            "case {case}: a read must not move the record: {:?} then {:?}",
+            read.body, again.body
+        );
+
+        // The listing narrows by that status: it selects this action, and the rows it
+        // answers are the projection the status read reports.
+        let listed = list(&emulator, domain, &format!("?status={expected_status}")).await;
+        if *expected_status == MAINTENANCE_STATUS_SUCCESS {
+            // The terminal status is not a value `MaintenanceStatus` publishes, so a
+            // caller cannot name it: the request is refused at the boundary instead.
+            assert_eq!(
+                (listed.status, error_code(&listed).as_str()),
+                (400, "ValidationException"),
+                "case {case}: a status outside the modelled enum is refused, got {} with {:?}",
+                listed.status,
+                listed.body
+            );
+            continue;
+        }
+        let rows = listed.body["DomainMaintenances"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: expected a list, got {:?}", listed.body))
+            .clone();
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row["MaintenanceId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![maintenance_id.as_str()],
+            "case {case}: expected the status filter to select the action in that status, got \
+             {rows:?}"
+        );
+        for member in ["Action", "NodeId", "Status", "CreatedAt", "UpdatedAt"] {
+            assert_eq!(
+                rows[0][member], read.body[member],
+                "case {case}: the listing's {member} is the one the read reports ({:?}), got {:?}",
+                read.body[member], rows[0][member]
             );
         }
     }

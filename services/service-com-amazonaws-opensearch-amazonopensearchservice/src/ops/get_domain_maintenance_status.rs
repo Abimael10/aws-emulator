@@ -9,7 +9,9 @@
 //! A REPORTING operation. The one write it makes is materialising the status moves
 //! the clock already owed the action — owed at this instant whether or not anybody
 //! called — so an action reaches `IN_PROGRESS` and then its terminal status by the
-//! clock rather than by being read.
+//! clock rather than by being read, and within the span
+//! [`crate::state::MAINTENANCE_STEP`] bounds, so a client polling for the outcome does
+//! not have to outwait it.
 //!
 //! `StatusMessage` is "the status message of the maintenance action": this service's
 //! own wording for one is not published, and the status itself is reported in
