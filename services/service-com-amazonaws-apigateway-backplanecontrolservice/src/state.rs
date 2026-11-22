@@ -449,14 +449,21 @@ impl RestApiEntry {
             .collect()
     }
 
-    /// The method of this API that names `authorizer_id` in its `authorizerId`, or `None`
-    /// when none does.
+    /// The method of this API that USES the authorizer `authorizer_id`, or `None` when
+    /// none does.
     ///
-    /// A method names its authorizer in `Method$authorizerId`, so a method carrying that
-    /// identifier is a reference to the authorizer; one walk, so every operation that has
-    /// to know whether an authorizer is referenced reads the same records.
+    /// A method names the authorizer it is authorized by in `Method$authorizerId` — "the
+    /// identifier of an Authorizer to use on this method. The `authorizationType` must be
+    /// `CUSTOM`" — so that identifier is a reference to the authorizer only while the
+    /// method's own `authorizationType` is one an `Authorizer` authorizes, which is what
+    /// [`crate::ops::put_method::authorizer_in_use`] reads: a method authorized by `NONE`
+    /// or `AWS_IAM` asks no authorizer at all, so it depends on none. One walk, so every
+    /// operation that has to know whether an authorizer is still used reads the same
+    /// records through the same reading.
     pub fn method_referencing_authorizer(&self, authorizer_id: &str) -> Option<MethodReference> {
-        self.referencing_method(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
+        self.referencing_method(|method| {
+            crate::ops::put_method::authorizer_in_use(method) == Some(authorizer_id)
+        })
     }
 
     /// The method of this API that names `request_validator_id` in its

@@ -32,7 +32,10 @@ use crate::rest_api_lifecycle::{
 const CONFLICT: &str = "ConflictException";
 
 /// `DeleteAuthorizer` for `authorizer` of `api`.
-async fn delete_authorizer(gateway: &Gateway, api: &str, authorizer: &str) -> Answer {
+///
+/// `pub(crate)` because the sibling `authorizer_detached_from_a_method` suite deletes an
+/// authorizer through the same call, so both suites address it the one way.
+pub(crate) async fn delete_authorizer(gateway: &Gateway, api: &str, authorizer: &str) -> Answer {
     gateway
         .call(
             "DELETE",

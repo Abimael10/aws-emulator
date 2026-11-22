@@ -292,6 +292,29 @@ pub fn invalid_request_parameter(key: &str) -> String {
 pub const MISSING_METHOD_AUTHORIZER: &str = "Invalid authorizer ID specified. Setting the \
      authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
 
+/// The `Authorizer` `method` USES, or `None` when it uses none.
+///
+/// `Method$authorizerId` is "the identifier of an Authorizer to use on this method. The
+/// `authorizationType` must be `CUSTOM`", so the identifier names an authorizer the method
+/// uses only while its own `authorizationType` is one an `Authorizer` authorizes
+/// ([`AUTHORIZATION_BY_AUTHORIZER`]): a method authorized by `NONE` or `AWS_IAM` is decided
+/// without asking any authorizer — which is how the data plane decides it
+/// ([`crate::service::invoke`]) and how an export renders it
+/// ([`super::get_export`]) — so the identifier such a method still carries names no
+/// authorizer in use. A member set to the empty string names no authorizer either, the same
+/// unnamed authorizer an absent member is ([`validate_method`]).
+///
+/// `pub` because it is the one reading of that pairing: whether an authorizer is USED by a
+/// method is what decides a request to a deployed stage, and it is also what decides whether
+/// a stored authorizer is still depended on
+/// ([`crate::state::RestApiEntry::method_referencing_authorizer`]).
+pub fn authorizer_in_use(method: &MethodEntry) -> Option<&str> {
+    if !AUTHORIZATION_BY_AUTHORIZER.contains(&method.authorization_type.as_str()) {
+        return None;
+    }
+    method.authorizer_id.as_deref().filter(|id| !id.is_empty())
+}
+
 /// Refuse a `Method` record that breaks one of the rules its own members publish: a
 /// `requestParameters` key that is no method request parameter mapping expression, and an
 /// `authorizerId` that names no `Authorizer` of the api the method belongs to.
