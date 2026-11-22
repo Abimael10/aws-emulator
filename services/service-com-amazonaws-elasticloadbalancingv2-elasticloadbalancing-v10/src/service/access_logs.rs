@@ -449,6 +449,69 @@ impl DeliveredRecord {
     }
 }
 
+/// The canned ACL every object the delivery writes names: the delivery hands what it writes
+/// to the bucket's OWNER, which is what lets an account collect the logs of a load balancer
+/// into a bucket of its own, and which is the ACL the published log-delivery bucket policy
+/// conditions its grant on. One constant, so the ACL a write names and the ACL the grant is
+/// judged under ([`delivery_condition_context`]) cannot drift.
+pub(super) const DELIVERY_CANNED_ACL: &str = "bucket-owner-full-control";
+
+/// The condition key an object write's canned ACL answers.
+const ACL_CONDITION_KEY: &str = "s3:x-amz-acl";
+
+/// The condition keys naming WHOSE load balancer the write is for: the account that holds it
+/// and the load balancer itself.
+const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
+
+/// The condition key naming the transport the write is made over, and the value every
+/// delivery carries for it: the delivery reaches the object store over TLS.
+const SECURE_TRANSPORT_CONDITION_KEY: &str = "aws:SecureTransport";
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
+/// The condition keys the delivery's own write carries a value for, so a grant clause written
+/// over one of them is DECIDED rather than left undecided.
+pub(super) const DELIVERY_CONDITION_KEYS: &[&str] = &[
+    ACL_CONDITION_KEY,
+    SOURCE_ACCOUNT_CONDITION_KEY,
+    SOURCE_ARN_CONDITION_KEY,
+    SECURE_TRANSPORT_CONDITION_KEY,
+];
+
+/// The condition context one write of the delivery carries: the canned ACL it names, the
+/// account and the load balancer the logs are for, and the transport it is made over.
+///
+/// `pub(super)` because the destination judging beside this module
+/// ([`super::access_log_destination`]) decides the bucket's grant about exactly this write.
+pub(super) fn delivery_condition_context(
+    destination: &Destination,
+    load_balancer_arn: &str,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            ACL_CONDITION_KEY.to_string(),
+            DELIVERY_CANNED_ACL.to_string(),
+        ),
+        (
+            SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
+            destination.account_id.clone(),
+        ),
+        (
+            SOURCE_ARN_CONDITION_KEY.to_string(),
+            load_balancer_arn.to_string(),
+        ),
+        (
+            SECURE_TRANSPORT_CONDITION_KEY.to_string(),
+            SECURE_TRANSPORT_VALUE.to_string(),
+        ),
+    ]
+}
+
+/// The canned ACL as the object store's own API names it, from the one spelling above.
+fn delivery_acl() -> ::aws_sdk_s3::types::ObjectCannedAcl {
+    ::aws_sdk_s3::types::ObjectCannedAcl::from(DELIVERY_CANNED_ACL)
+}
+
 /// Deliver the record of one answered request into the bucket `destination` names.
 ///
 /// Nothing about the answer changes: a failure is traced and the client's own answer stands,
@@ -483,6 +546,7 @@ pub(super) async fn deliver(
         .put_object()
         .bucket(&file.bucket)
         .key(&file.key)
+        .acl(delivery_acl())
         .content_type(GZIP_MEDIA_TYPE)
         .body(::aws_sdk_s3::primitives::ByteStream::from(body))
         .send()
@@ -530,6 +594,7 @@ pub(super) async fn deliver_test_file(ctx: &OperationContext<'_>, destination: &
         .put_object()
         .bucket(&destination.bucket)
         .key(&key)
+        .acl(delivery_acl())
         .content_type(TEXT_MEDIA_TYPE)
         .body(::aws_sdk_s3::primitives::ByteStream::from_static(
             TEST_FILE_CONTENT,

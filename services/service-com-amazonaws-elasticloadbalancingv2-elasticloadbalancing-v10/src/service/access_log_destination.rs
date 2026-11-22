@@ -88,6 +88,9 @@ pub(crate) struct PendingDestination {
     prefix_key: String,
     /// The partition of the load balancer's own ARN, so every ARN this judges stays in it.
     partition: String,
+    /// The load balancer the logs are for, which is what the delivery's write names as its
+    /// source ([`super::access_logs::delivery_condition_context`]).
+    load_balancer_arn: String,
     /// Where the delivery would write: the bucket, the prefix, the Region and the account —
     /// the same reading of a destination the delivery itself uses.
     destination: super::access_logs::Destination,
@@ -153,6 +156,7 @@ pub(crate) fn pending_destinations(
                 prefix_key,
                 family: family.to_string(),
                 partition: parsed.partition.to_string(),
+                load_balancer_arn: record.arn.clone(),
             })
         })
         .collect()
@@ -269,6 +273,12 @@ impl PendingDestination {
     /// ([`super::access_logs::test_file_key`]), so the grant is judged at the shallowest path
     /// the delivery actually puts an object at, and a grant scoped to ANOTHER prefix of the
     /// same bucket does not admit this destination.
+    ///
+    /// The request also carries the CONDITION CONTEXT that write is made under
+    /// ([`super::access_logs::delivery_condition_context`]) — the canned ACL the delivery
+    /// names, the account and the load balancer the logs are for, and the transport it writes
+    /// over — because a clause the request carries no value for leaves its statement undecided,
+    /// and the log-delivery policy AWS publishes conditions its grant on exactly those facts.
     fn policy_admits_delivery(&self, policy: &str) -> bool {
         use ::service_common::iam_authorization::{resource_decision, Decision, Request};
 
@@ -279,7 +289,13 @@ impl PendingDestination {
             super::access_logs::delivery_prefix(&self.destination)
         );
         let principals = self.delivery_principals(policy);
-        let request = Request::new(DELIVERY_WRITE_ACTION, &resource, &principals);
+        let context = super::access_logs::delivery_condition_context(
+            &self.destination,
+            &self.load_balancer_arn,
+        );
+        let request = Request::new(DELIVERY_WRITE_ACTION, &resource, &principals)
+            .with_context(&context)
+            .with_published_keys(super::access_logs::DELIVERY_CONDITION_KEYS);
         resource_decision(policy, &request) == Decision::Allowed
     }
 
