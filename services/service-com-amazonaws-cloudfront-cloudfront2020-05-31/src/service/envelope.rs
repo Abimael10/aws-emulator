@@ -144,6 +144,23 @@ const UNKNOWN_ACTION: u16 = 404;
 /// sends, so the code the service sends is what this answers.
 const MALFORMED_XML: &str = "MalformedXML";
 
+/// The wire code and status of the refusal the AUTHORIZATION layer answers an unauthorized
+/// request with, which is the shape this model declares for it on every operation that
+/// declares one (`com.amazonaws.cloudfront#AccessDenied`, HTTP 403).
+const ACCESS_DENIED: &str = "AccessDenied";
+const FORBIDDEN: u16 = 403;
+
+/// The envelope an unauthorized request is refused in: `403 AccessDenied` under the sentence
+/// IAM states the refusal with ([`super::authorization`]).
+///
+/// Rendered here rather than returned by a handler because the decision is taken in FRONT of
+/// the operation, where no handler has run — and rendered through this module's one error
+/// renderer, so it carries the same `<Type>`, namespace and `RequestId` every other failure
+/// of this service carries.
+pub fn access_denied(message: &str) -> RtResponse {
+    error_response(FORBIDDEN, ACCESS_DENIED, message)
+}
+
 /// The query parameter every CloudFront list operation binds its page size to
 /// (`@httpQuery("MaxItems")` over an `integer`, from the model's list operations).
 const MAX_ITEMS_PARAM: &str = "MaxItems";
@@ -398,7 +415,10 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
 }
 
 /// The query component of a request URI (everything after the first `?`).
-fn request_query(uri: &str) -> &str {
+///
+/// Shared with [`super::authorization`], which reads the resource a request addresses in a
+/// query parameter through the same split rather than a second one.
+pub(super) fn request_query(uri: &str) -> &str {
     uri.split_once('?').map_or("", |(_, query)| query)
 }
 
@@ -409,7 +429,7 @@ fn query_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
 }
 
 /// The raw value a query component gives `name`, or `None` when it names it no value.
-fn query_value<'q>(query: &'q str, name: &str) -> Option<&'q str> {
+pub(super) fn query_value<'q>(query: &'q str, name: &str) -> Option<&'q str> {
     query_pairs(query).find_map(|(key, value)| (key == name).then_some(value))
 }
 
@@ -932,26 +952,40 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for CloudFrontDefinitio
     }
 }
 
-/// The modelled operation the request names, read from the model-derived routing table
-/// (never from the service's own override, which routes straight back here).
-fn modelled_operation<'s>(
+/// The modelled operation the request names together with the NAME the model names it by
+/// (which is the key the routing table holds it under, and the action IAM publishes it as),
+/// read from the model-derived routing table (never from the service's own override, which
+/// routes straight back here).
+fn modelled_route<'s, 'r>(
     svc: &'s dyn Service,
-    req: &RtRequest,
-) -> Option<&'s dyn ErasedOperation> {
+    req: &'r RtRequest,
+) -> Option<(&'r str, &'s dyn ErasedOperation)> {
     let key = svc.definition().protocol().routing_key(req).ok()?;
-    svc.definition().routing_table().get(key)
+    let operation = svc.definition().routing_table().get(key)?;
+    Some((key, operation))
 }
 
-/// The seam every request this service serves runs through: it dispatches the modelled
-/// operation unchanged, then finishes the response's error envelope (see the module
-/// docs).
+/// The seam every request this service serves runs through: it takes IAM's decision about
+/// the request, then dispatches the modelled operation unchanged, then finishes the
+/// response's error envelope (see the module docs).
 ///
-/// Stateless and engine-free: the operation it runs is looked up on the service the
-/// router hands it, so this holds nothing per request and nothing per engine.
-#[derive(Debug, Default)]
-pub struct ErrorEnvelope;
+/// It holds the ONE shared engine, because the decision reads the caller's identity and the
+/// policies in force on it out of the account's STS and IAM stores
+/// ([`super::authorization`]); the operation it runs is still looked up on the service the
+/// router hands it, so there is no second instance of any operation.
+pub struct ErrorEnvelope<Eng> {
+    engine: ::std::sync::Arc<Eng>,
+}
 
-impl ErasedOperation for ErrorEnvelope {
+impl<Eng> ErrorEnvelope<Eng> {
+    /// Build the seam from the shared engine the generated entry threads into every
+    /// operation.
+    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for ErrorEnvelope<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -970,9 +1004,18 @@ impl ErasedOperation for ErrorEnvelope {
             // exactly as the router would have run it. A request that names no modelled
             // operation never reaches here: the service claims only the ones its routing
             // table resolves.
-            let Some(op) = modelled_operation(svc, req) else {
+            let Some((operation, op)) = modelled_route(svc, req) else {
                 return with_request_id(svc.definition().routing_error_response(req));
             };
+            // IAM's decision, taken in front of the operation: the action is the one the
+            // request named under this service's prefix, and the resource is the one the
+            // REQUEST addresses. A refused request never reaches the operation, so it reads
+            // nothing, writes nothing and reports nothing about the resource it named.
+            if let Some(refused) =
+                super::authorization::refusal(&*self.engine, ctx, operation, req)
+            {
+                return refused;
+            }
             let resp = op.run(svc, req, ctx).await;
             let resp = restated(req, &resp).unwrap_or(resp);
             with_request_id(resp)

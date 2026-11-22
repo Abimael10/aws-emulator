@@ -50,6 +50,17 @@
 //! modelled one. That module's docs carry the rules; routing stays with the generated
 //! table, which the seam reads rather than replaces.
 //!
+//! ## This service's other edited seam: IAM authorization
+//!
+//! That same seam is where this service's calls are AUTHORIZED. AWS decides authorization
+//! at the IAM layer, in front of the service, so it is a property of SERVING a call rather
+//! than of any one operation — which is why it is not written per handler: every request
+//! the routing table resolves passes through [`envelope::ErrorEnvelope`], which asks
+//! [`authorization`] whether the caller's identity-based policies allow the action the
+//! request named on the resource it addressed, and answers `403 AccessDenied` when they do
+//! not. A refused request never reaches the operation. [`authorization`]'s docs carry the
+//! rule, the callers it does not bound, and how the resource a request addresses is read.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -167,10 +178,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The edge data plane, as an operation, so the router hands it an
     /// [`OperationContext`] — the in-process transport an origin fetch goes over.
     edge: EdgeDataPlane<Eng>,
-    /// Finishes the error envelope of every response this service answers, and restates
-    /// a boundary refusal in this service's modelled vocabulary. Held here because
-    /// [`Service::override_operation`] hands back a borrow of it.
-    envelope: envelope::ErrorEnvelope,
+    /// Takes IAM's decision about every request this service serves, finishes the error
+    /// envelope of every response it answers, and restates a boundary refusal in this
+    /// service's modelled vocabulary. Held here because [`Service::override_operation`]
+    /// hands back a borrow of it.
+    envelope: envelope::ErrorEnvelope<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -183,7 +195,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             edge: EdgeDataPlane {
                 engine: Arc::clone(&engine),
             },
-            envelope: envelope::ErrorEnvelope,
+            envelope: envelope::ErrorEnvelope::new(Arc::clone(&engine)),
         }
     }
 }

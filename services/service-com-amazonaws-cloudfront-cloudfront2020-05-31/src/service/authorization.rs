@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether IAM lets a request to this service perform the action it asks for — the
-//! authorization step an operation runs BEFORE it reads or writes anything.
+//! authorization step taken in front of EVERY operation, before it reads or writes
+//! anything.
 //!
-//! AWS decides authorization at the IAM layer, ahead of the service looking at the
-//! resource, so a caller whose identity-based policies do not grant the action on the ARN
-//! the request addressed is told it is not authorized rather than told anything about that
-//! resource, and the call performs nothing. The ORDER is part of the rule: a caller that
-//! holds no grant and names a resource the account does not hold reads the authorization
-//! refusal, not "no such resource" — otherwise a refused call reports whether a resource
-//! exists to a caller that may not look.
+//! AWS decides authorization at the IAM layer, ahead of the service looking at what a
+//! handler would do, so a caller whose identity-based policies do not grant the action on
+//! the ARN the request addressed is told it is not authorized rather than told anything
+//! about that resource, and the call performs nothing. The ORDER is part of the rule: a
+//! caller that holds no grant and names a resource the account does not hold reads the
+//! authorization refusal, not "no such resource" — otherwise a refused call reports whether
+//! a resource exists to a caller that may not look.
+//!
+//! The decision is taken for EVERY operation of this service, in ONE place
+//! ([`refusal`], called by [`super::envelope::ErrorEnvelope`], the seam every request the
+//! model's routing table resolves passes through), because authorization is a property of
+//! the REQUEST rather than of any one operation's error set: there is no operation a caller
+//! may perform without a grant, so there is no operation left unjudged and no second copy of
+//! the rule to drift.
 //!
 //! Three pieces, each held in exactly one place:
 //!
@@ -34,15 +42,42 @@
 //! keep theirs there: hoisting them into `service-common` would make every service that
 //! depends on that crate link the IAM and STS service crates.
 //!
-//! The ACTION is this service's namespace and the operation's own name
-//! ([`action_of`]), and the RESOURCE is the ARN the request addressed — the distribution
-//! or the distribution tenant whose invalidations the call is about
-//! ([`crate::state::distribution_arn`] / [`crate::state::distribution_tenant_arn`]) — so a
-//! policy scoped to one distribution's ARN permits that distribution's invalidations and no
-//! other's.
+//! ## The action and the resource
+//!
+//! The ACTION is this service's namespace and the operation's own name ([`action_of`]),
+//! which is how IAM publishes the actions of a service — so one statement scoped to
+//! `cloudfront:*` covers every operation of it and nothing outside it.
+//!
+//! The RESOURCE is the one the REQUEST addresses ([`judged_resource`]). CloudFront is a
+//! REST API whose routes carry the addressed resource as a path label, so the resource is
+//! read off the request line: the kind is the route's own resource segment and the
+//! identifier is the label beside it, and the ARN is the one THIS service mints for a
+//! resource of that kind ([`ARN_OF_KIND`], each entry the crate's own minting function). An
+//! identifier that is already an ARN of this service is the resource itself. The tagging
+//! routes carry theirs in the `Resource` query parameter instead
+//! ([`TAGGING_RESOURCE_PARAMETER`]), and that ARN is read the same way. Taking the resource
+//! from the request rather than from a stored record is what keeps the decision independent
+//! of whether that resource exists, which is also what keeps a refused call from telling an
+//! unauthorized caller whether it does — so a policy scoped to one distribution's ARN
+//! permits that distribution's calls and no other's.
+//!
+//! Every other request is judged against [`ANY_RESOURCE`], the resource IAM writes for a
+//! request that addresses no resource of its own: a collection route (`GET
+//! /2020-05-31/distribution`), a create, and an account-level call all address the whole
+//! service rather than one resource of it. For those the GRANT question is also asked in
+//! the weaker form `iam_authorization` states for a gate that does not know a resource ARN
+//! — whether any readable `Allow` covers the action at all — because a request judged
+//! against the wildcard may still be ABOUT a resource a statement is scoped to (one named
+//! in the request document rather than on the route, or one of a kind whose ARN this gate
+//! does not mint), and refusing it on the resource element would deny calls AWS permits.
+//! The DENY question is always decided against what the request addressed, so a `Deny`
+//! scoped to an ARN still refuses a call that names it.
 //!
 //! A CloudFront distribution carries no resource-based policy of its own, so the decision
-//! here is the identity-based one alone.
+//! here is the identity-based one alone. (The resource policy this service's own
+//! `PutResourcePolicy` writes grants principals OUTSIDE this account access to a VPC
+//! origin; every request this gate judges is signed by a credential of this account, whose
+//! grants are its identity's.)
 //!
 //! ## The callers this gate does not bound
 //!
@@ -58,6 +93,10 @@
 //!   An explicit `Deny` in a document that CAN be read still refuses, and a permissions
 //!   boundary the store DOES hold still caps the grant.
 //! * **An engine carrying no STS or IAM store**, where no session and no role can exist.
+//! * **The EDGE data plane.** A viewer request to a distribution's own domain carries no
+//!   AWS credential and names no modelled operation, so it is not an API call of this
+//!   account at all; it is served outside this gate (`crate::service::edge`), and what
+//!   admits or refuses it is the distribution's own configuration.
 //!
 //! An expired session credential speaks for nobody: it carries no documents and no
 //! principal spelling, so every action it asks for is refused. (A session the
@@ -65,11 +104,10 @@
 
 use std::time::SystemTime;
 
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
-
-use crate::ops::types::AccessDenied;
 
 /// This service's IAM action prefix: an action is `cloudfront:<OperationName>` ("Actions
 /// defined by Amazon CloudFront", IAM Service Authorization Reference), which is this
@@ -77,9 +115,57 @@ use crate::ops::types::AccessDenied;
 /// ARN this service mints carries ([`crate::state::distribution_arn`]).
 pub const ACTION_PREFIX: &str = "cloudfront";
 
+/// The resource IAM writes for a request that addresses no resource of its own.
+pub const ANY_RESOURCE: &str = "*";
+
 /// What a refusal names as the principal of a request whose session credential has already
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
 const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
+
+/// The one prefix every route of this API carries: its version, which is the API version
+/// this service's own resource paths are built under
+/// ([`crate::state::distribution_path`]).
+const ROUTE_PREFIX: &str = "/2020-05-31/";
+
+/// The resource-kind segment whose routes interpose a literal segment between the kind and
+/// the identity's own id (`/origin-access-identity/cloudfront/{Id}`, from this service's
+/// own `origin_access_identity_path`), so the identifier is one segment further along.
+const ORIGIN_ACCESS_IDENTITY_KIND: &str = "origin-access-identity";
+
+/// The query parameter the tagging routes address their resource by: `TagResource`,
+/// `UntagResource` and `ListTagsForResource` all bind `Resource` — "an ARN of a CloudFront
+/// resource" — to `@httpQuery("Resource")` over the one `/2020-05-31/tagging` path, so the
+/// resource those calls are about is never on the route.
+const TAGGING_RESOURCE_PARAMETER: &str = "Resource";
+
+/// How an ARN of one resource kind is minted from an identifier of that kind: the crate's
+/// own minting function for that kind.
+type MintArn = fn(&str) -> String;
+
+/// The resource kinds a route addresses by the resource's OWN identifier, each with the
+/// function THIS crate mints an ARN of that kind with — so the ARN a statement is matched
+/// against is the very one the service hands a client back, and no ARN form is restated
+/// here.
+///
+/// The segment is the route's own (`OPERATIONS.md`, rendered from the model): the
+/// distribution routes `/distribution/{Id}` and the monitoring-subscription routes
+/// `/distributions/{DistributionId}` both address a distribution, `/distribution-tenant`,
+/// `/streaming-distribution`, `/anycast-ip-list` and `/vpc-origin` each address their own
+/// kind, and `/function/{Name}` addresses a function — whose ARN carries that very name.
+/// Every other route either addresses no single resource or names it in the request
+/// document, and is judged against [`ANY_RESOURCE`] (see the module docs).
+const ARN_OF_KIND: &[(&str, MintArn)] = &[
+    ("distribution", crate::state::distribution_arn),
+    ("distributions", crate::state::distribution_arn),
+    ("distribution-tenant", crate::state::distribution_tenant_arn),
+    (
+        "streaming-distribution",
+        crate::state::streaming_distribution_arn,
+    ),
+    ("anycast-ip-list", crate::state::anycast_ip_list_arn),
+    ("vpc-origin", crate::state::vpc_origin_arn),
+    ("function", crate::state::function_arn),
+];
 
 /// The IAM action `operation` performs: this service's namespace and the operation's own
 /// name ([`smithy_server_runtime::Operation::NAME`]), which is how IAM publishes the
@@ -89,14 +175,97 @@ pub fn action_of(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
+/// One refused request: the sentence IAM states the refusal with, and nothing else — the
+/// status and the error code are the envelope's ([`super::envelope::access_denied`]).
+#[derive(Debug, Clone)]
+pub struct Denial {
+    /// What the caller is told: who was refused, which action, on which resource when the
+    /// request addressed one, and which of IAM's rules refused it.
+    pub message: String,
+}
+
+/// The wire answer to this request when IAM refuses it, or `None` when IAM permits it.
+///
+/// The ONE call site of this gate: the seam every request the model's routing table
+/// resolves runs through ([`super::envelope::ErrorEnvelope`]) asks this before it dispatches
+/// anything, with `operation` the name the model names the request's operation by.
+pub fn refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let resource = judged_resource(req);
+    authorize(engine, ctx, operation, &resource)
+        .err()
+        .map(|denial| super::envelope::access_denied(&denial.message))
+}
+
+/// The resource this request is judged against: the ARN of the resource it ADDRESSES, else
+/// [`ANY_RESOURCE`] (see the module docs for what each covers).
+#[must_use]
+pub fn judged_resource(req: &RtRequest) -> String {
+    addressed_resource(req.uri()).unwrap_or_else(|| ANY_RESOURCE.to_string())
+}
+
+/// The ARN of this service the request URI `uri` addresses, or `None` for a request that
+/// addresses no one resource of it.
+fn addressed_resource(uri: &str) -> Option<String> {
+    routed_resource(::service_common::request_path(uri)).or_else(|| tagged_resource(uri))
+}
+
+/// The ARN the ROUTE `path` addresses: the kind its resource segment names and the
+/// identifier beside it.
+fn routed_resource(path: &str) -> Option<String> {
+    let mut segments = path
+        .strip_prefix(ROUTE_PREFIX)?
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    let kind = segments.next()?;
+    if kind == ORIGIN_ACCESS_IDENTITY_KIND {
+        // The routes of that kind spell the literal `cloudfront` before the id.
+        segments.next()?;
+    }
+    let identifier = ::service_common::percent_decode_path_label(segments.next()?);
+    arn_of(kind, &identifier)
+}
+
+/// The ARN the `Resource` query parameter of a tagging route carries, read the way the
+/// request boundary reads a query value.
+fn tagged_resource(uri: &str) -> Option<String> {
+    let carried = super::envelope::query_value(
+        super::envelope::request_query(uri),
+        TAGGING_RESOURCE_PARAMETER,
+    )?;
+    arn_of_this_service(&::smithy_server_runtime::percent_decode(carried))
+}
+
+/// The ARN `identifier` names for a resource of `kind`: the identifier itself when it is
+/// already an ARN of this service, else the ARN this service mints for an identifier of
+/// that kind — and `None` for a kind whose ARN this gate does not mint.
+fn arn_of(kind: &str, identifier: &str) -> Option<String> {
+    if let Some(arn) = arn_of_this_service(identifier) {
+        return Some(arn);
+    }
+    let mint = ARN_OF_KIND
+        .iter()
+        .find_map(|(named, mint)| (*named == kind).then_some(mint))?;
+    Some(mint(identifier))
+}
+
+/// `value` when it is an ARN of THIS service naming a resource, read through the crate's one
+/// reading of such an ARN ([`crate::state::cloudfront_arn_resource`]).
+fn arn_of_this_service(value: &str) -> Option<String> {
+    crate::state::cloudfront_arn_resource(value).map(|_| value.to_string())
+}
+
 /// Authorize this request, where `operation` is the operation's own name
-/// ([`smithy_server_runtime::Operation::NAME`]) and `resource` the ARN the request NAMES.
+/// ([`smithy_server_runtime::Operation::NAME`]) and `resource` the resource it ADDRESSES
+/// ([`judged_resource`]).
 ///
 /// `Ok(())` for a request IAM permits (and for every caller this gate does not bound, see
-/// the module docs); the modelled refusal otherwise, which each operation returns as its
-/// own `AccessDenied`. Call it BEFORE the store is read or written, and with the ARN built
-/// from what the request carried rather than one resolved from a stored record, so the
-/// decision does not depend on whether that resource exists.
+/// the module docs); the refusal otherwise. Taken BEFORE the operation runs, so a refused
+/// request reads and writes nothing.
 ///
 /// Resolving the caller goes through STS's own `resolve_caller`, which first materialises
 /// the session expiries the clock has already made due; that write is owed at the same
@@ -107,7 +276,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resource: &str,
-) -> Result<(), AccessDenied> {
+) -> Result<(), Denial> {
     let action = action_of(operation);
     let caller = caller(engine, ctx);
     // The principal spellings travel with the request because that is what a statement's
@@ -115,7 +284,8 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     // such element, and a distribution publishes no resource-based policy (see the module
     // docs), so the decision below rests on the action and the resource.
     let request = iam::Request::new(&action, resource, &caller.principals);
-    let identity_said = iam::identity_decision(&caller.documents, &request);
+    let documents = iam::prepare_documents(&caller.documents);
+    let identity_said = iam::identity_decision_prepared(&documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
@@ -128,7 +298,9 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             iam::IDENTITY_POLICY_EXPLICIT_DENY,
         ));
     }
-    let granted = iam::is_allowed(identity_said, Decision::NotStated) || caller.is_unbounded();
+    let granted = iam::is_allowed(identity_said, Decision::NotStated)
+        || may_allow(&documents, &action, resource)
+        || caller.is_unbounded();
     if !granted {
         return Err(not_authorized(
             &caller.arn,
@@ -141,17 +313,33 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     // can grant" (IAM, permissions boundaries): a grant the boundary does not also allow
     // is not a permission the principal has. The account's own credential carries none.
     if let Some(boundary) = &caller.boundary {
-        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+        let boundary = iam::prepare_documents(::std::slice::from_ref(boundary));
+        let reason = match iam::identity_decision_prepared(&boundary, &request) {
             Decision::Allowed => return Ok(()),
             // An explicit deny is a fact about the boundary document, so the refusal names
             // it; a boundary that merely states nothing withheld the grant the
             // identity-based policies gave.
             Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+            Decision::NotStated => {
+                if may_allow(&boundary, &action, resource) {
+                    return Ok(());
+                }
+                iam::no_permissions_boundary_allows(&action)
+            }
         };
         return Err(not_authorized(&caller.arn, &action, resource, &reason));
     }
     Ok(())
+}
+
+/// Whether `documents` could allow `action` at all, asked only for a request judged against
+/// [`ANY_RESOURCE`] — one that addresses no resource on its route, and so may still be about
+/// a resource a statement is scoped to (see the module docs).
+///
+/// A request that DOES address a resource is decided against that resource alone, where the
+/// resource element is what AWS matches it on.
+fn may_allow(documents: &[iam::PreparedDocument], action: &str, resource: &str) -> bool {
+    resource == ANY_RESOURCE && iam::identity_may_allow_action(documents, action)
 }
 
 /// The refusal IAM states an authorization failure with: who was refused, which action, on
@@ -159,12 +347,16 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]), so this
 /// service's refusal reads as every other service's does. Every value in it comes from the
 /// request and from the stored policies.
-fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> AccessDenied {
-    AccessDenied {
-        message: Some(iam::not_authorized_by_identity_policy(
-            principal, action, resource, reason,
-        )),
-    }
+///
+/// A request that addresses no resource of its own is judged against [`ANY_RESOURCE`], and
+/// the sentence states no resource clause for it: there is nothing to name.
+fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> Denial {
+    let message = if resource == ANY_RESOURCE {
+        format!("User: {principal} is not authorized to perform: {action} {reason}")
+    } else {
+        iam::not_authorized_by_identity_policy(principal, action, resource, reason)
+    };
+    Denial { message }
 }
 
 /// The principal a request speaks for, and everything the decision is made from.
@@ -324,6 +516,7 @@ mod tests {
             "CreateInvalidation",
             "GetInvalidation",
             "ListInvalidations",
+            "GetDistributionConfig",
             "CreateInvalidationForDistributionTenant",
         ] {
             let action = action_of(operation);
@@ -353,23 +546,164 @@ mod tests {
     /// addressed and which of IAM's rules refused — every part taken from the request and
     /// the stored policies, in IAM's own wording (spelled out here as the LITERAL AWS
     /// states rather than through the shared builder, so a change to that wording fails
-    /// this).
+    /// this) — and it names no resource for a request that addresses none.
     #[test]
     fn the_refusal_names_the_principal_the_action_and_the_resource() {
         let principal = "arn:aws:sts::000000000000:assumed-role/invalidator/session-1";
-        let resource = crate::state::distribution_arn("E1EXAMPLE");
-        let action = action_of("CreateInvalidation");
-        let reason = iam::no_identity_policy_allows(&action);
-        let refusal = not_authorized(principal, &action, &resource, &reason);
-        let message = refusal.message.unwrap_or_default();
-        assert_eq!(
-            message,
-            format!(
-                "User: {principal} is not authorized to perform: cloudfront:CreateInvalidation \
-                 on resource: {resource} because no identity-based policy allows the \
-                 cloudfront:CreateInvalidation action"
+        let distribution = crate::state::distribution_arn("E1EXAMPLE");
+        // (case, the operation, the resource it addressed, the clause the sentence carries)
+        let rows: &[(&str, &str, &str, String)] = &[
+            (
+                "a refused invalidation",
+                "CreateInvalidation",
+                &distribution,
+                format!(" on resource: {distribution}"),
             ),
-            "case \"a refused invalidation\": expected IAM's wording, got {message:?}"
-        );
+            (
+                "a refused read of a distribution's configuration",
+                "GetDistributionConfig",
+                &distribution,
+                format!(" on resource: {distribution}"),
+            ),
+            (
+                "a refused call that addresses no resource of its own",
+                "ListDistributions",
+                ANY_RESOURCE,
+                String::new(),
+            ),
+        ];
+        for (case, operation, resource, clause) in rows {
+            let action = action_of(operation);
+            for reason in [
+                iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
+                iam::no_identity_policy_allows(&action),
+            ] {
+                let refused = not_authorized(principal, &action, resource, &reason);
+                assert_eq!(
+                    refused.message,
+                    format!(
+                        "User: {principal} is not authorized to perform: {action}{clause} \
+                         {reason}"
+                    ),
+                    "case {case:?}: expected IAM's wording, got {:?}",
+                    refused.message
+                );
+            }
+        }
+    }
+
+    /// RULE: the resource a request is judged against is the ARN of the resource its own
+    /// route (or, for the tagging routes, its `Resource` parameter) addresses, and the
+    /// any-resource wildcard for a request that addresses none.
+    #[test]
+    fn the_judged_resource_is_the_one_the_request_addresses() {
+        let distribution = crate::state::distribution_arn("E1EXAMPLE");
+        let tenant = crate::state::distribution_tenant_arn("dt_1EXAMPLE");
+        let streaming = crate::state::streaming_distribution_arn("E2EXAMPLE");
+        let anycast = crate::state::anycast_ip_list_arn("aip_3EXAMPLE");
+        let vpc_origin = crate::state::vpc_origin_arn("vo_4EXAMPLE");
+        let function = crate::state::function_arn("shaper");
+        let key_value_store = crate::state::key_value_store_arn("kvs-5");
+        // (case, the request URI, the resource it is judged against)
+        let rows: Vec<(&str, String, String)> = vec![
+            (
+                "a distribution read",
+                "/2020-05-31/distribution/E1EXAMPLE".to_string(),
+                distribution.clone(),
+            ),
+            (
+                "the configuration half of that read",
+                "/2020-05-31/distribution/E1EXAMPLE/config".to_string(),
+                distribution.clone(),
+            ),
+            (
+                "an invalidation of that distribution",
+                "/2020-05-31/distribution/E1EXAMPLE/invalidation/I9EXAMPLE".to_string(),
+                distribution.clone(),
+            ),
+            (
+                "the monitoring subscription of that distribution",
+                "/2020-05-31/distributions/E1EXAMPLE/monitoring-subscription".to_string(),
+                distribution.clone(),
+            ),
+            (
+                "a distribution tenant's invalidations",
+                "/2020-05-31/distribution-tenant/dt_1EXAMPLE/invalidation".to_string(),
+                tenant.clone(),
+            ),
+            (
+                "a streaming distribution",
+                "/2020-05-31/streaming-distribution/E2EXAMPLE/config".to_string(),
+                streaming.clone(),
+            ),
+            (
+                "an Anycast static IP list",
+                "/2020-05-31/anycast-ip-list/aip_3EXAMPLE".to_string(),
+                anycast.clone(),
+            ),
+            (
+                "a VPC origin",
+                "/2020-05-31/vpc-origin/vo_4EXAMPLE".to_string(),
+                vpc_origin.clone(),
+            ),
+            (
+                "a function, whose ARN carries its name",
+                "/2020-05-31/function/shaper/publish".to_string(),
+                function.clone(),
+            ),
+            (
+                "a label that is already an ARN of this service",
+                format!(
+                    "/2020-05-31/key-value-store/{}",
+                    key_value_store.replace(':', "%3A").replace('/', "%2F")
+                ),
+                key_value_store.clone(),
+            ),
+            (
+                "a tagging call, which names its resource in a parameter",
+                format!(
+                    "/2020-05-31/tagging?Operation=Tag&Resource={}",
+                    distribution.replace(':', "%3A").replace('/', "%2F")
+                ),
+                distribution.clone(),
+            ),
+            (
+                "the listing of a kind, which addresses no one resource",
+                "/2020-05-31/distribution?MaxItems=2".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+            (
+                "a create, which addresses no resource yet",
+                "/2020-05-31/cache-policy".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+            (
+                "a kind whose ARN this gate does not mint",
+                "/2020-05-31/cache-policy/C7EXAMPLE/config".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+            (
+                "an origin access identity, under the literal its routes interpose",
+                "/2020-05-31/origin-access-identity/cloudfront/E8EXAMPLE".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+            (
+                "an account-level call",
+                "/2020-05-31/verify-dns-configuration".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+            (
+                "a path outside this API's version prefix",
+                "/".to_string(),
+                ANY_RESOURCE.to_string(),
+            ),
+        ];
+        for (case, uri, expected) in rows {
+            let actual = addressed_resource(&uri).unwrap_or_else(|| ANY_RESOURCE.to_string());
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the judged resource {expected:?}, got {actual:?}"
+            );
+        }
     }
 }

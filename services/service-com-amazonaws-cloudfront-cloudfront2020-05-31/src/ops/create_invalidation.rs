@@ -178,18 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
-        // IAM decides the call BEFORE this service looks at the distribution, so a caller
-        // whose identity-based policies do not allow this action on that distribution's ARN
-        // is refused whether or not the account holds it
-        // ([`crate::service::authorization`]). Taken before this service's store is
-        // locked, because the decision reads the account's STS and IAM stores.
-        crate::service::authorization::authorize(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &crate::state::distribution_arn(&input.distribution_id),
-        )
-        .map_err(CreateInvalidationErrorModeled::AccessDenied)?;
+        // IAM's decision about this call is taken in FRONT of this operation, by the one
+        // authorization step every request of this service passes through
+        // ([`crate::service::authorization`]) — so a caller whose identity-based policies do
+        // not allow this action on this distribution's ARN never reaches this handler.
         let now = SystemTime::now();
         let mut store = state.lock();
         store.settle(now);

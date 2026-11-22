@@ -146,21 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
-        // IAM decides the call BEFORE this service looks at the distribution
-        // ([`crate::service::authorization`]), and before this service's store is locked,
-        // because the decision reads the account's STS and IAM stores.
-        crate::service::authorization::authorize(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &crate::state::distribution_arn(&input.distribution_id),
-        )
-        .map_err(ListInvalidationsErrorModeled::AccessDenied)?;
+        // IAM's decision about this call is taken in FRONT of this operation, by the one
+        // authorization step every request of this service passes through
+        // ([`crate::service::authorization`]), so a caller whose identity-based policies do
+        // not allow this action on this distribution's ARN never reaches this handler.
 
         // "MaxItems: the maximum number of invalidation batches that you want in the
         // response body" - the member BOUNDS the page rather than demanding one, so a
