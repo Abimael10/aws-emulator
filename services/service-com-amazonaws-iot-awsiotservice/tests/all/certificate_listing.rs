@@ -234,6 +234,9 @@ impl Emulator {
                 not_before: now,
                 not_after: now,
                 certificate_mode: mode.to_string(),
+                // A recorded certificate is in no transfer: a transfer is a state
+                // `TransferCertificate` puts a certificate in.
+                transfer: None,
             },
         );
         certificate_id

@@ -3303,9 +3303,21 @@ pub use certificates::{
     mint_keys_and_certificate_valid_until, missing_certificate_message,
     CertificateDeletionRefusal, CertificateStatusUpdateRefusal, MintedKeysAndCertificate,
     RegisteredCertificate, CERTIFICATE_MODE_DEFAULT, CERTIFICATE_STATUS_ACTIVE,
-    CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
+    CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_PENDING_TRANSFER,
+    CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
     FIRST_CERTIFICATE_CUSTOMER_VERSION, INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES,
     PROVISIONING_CLAIM_VALIDITY,
+};
+
+// The TRANSFER a device certificate is in — the record the source account holds while one
+// is pending, and the writes that start a transfer and take it back — lives in
+// `state/certificate_transfers.rs`, beside the certificate record whose state it is. Its
+// names are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod certificate_transfers;
+pub use certificate_transfers::{
+    active_certificate_transfer_message, attached_policies_transfer_message,
+    transfer_in_progress_message, transfer_not_in_progress_message, CertificateTransfer,
+    CertificateTransferCancellationRefusal, CertificateTransferRefusal,
 };
 
 // What a registered CA CERTIFICATE is — the record one holds, and what the account's own

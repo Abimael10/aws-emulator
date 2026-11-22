@@ -60,6 +60,13 @@ mod ca_certificate_registry;
 #[path = "device_certificate_issuance/transfer_state_projection.rs"]
 mod transfer_state_projection;
 
+/// `TransferCertificate`, `CancelCertificateTransfer` and `ListOutgoingCertificates`: the
+/// transfer of a certificate this suite's issuance minted to another account, which is what
+/// fills the transfer state the suite above reads while it is empty. Declared the same way,
+/// and for the same reason, as the two suites above.
+#[path = "device_certificate_issuance/certificate_transfer.rs"]
+mod certificate_transfer;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
