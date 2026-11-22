@@ -37,7 +37,8 @@
 //!   "cannot contain any qualifier", so a label that carries one is the modelled
 //!   `ValidationException` (HTTP 400), and a label that names no template of this knowledge
 //!   base — a bare id, another knowledge base's template, an ARN of another account — is
-//!   HTTP 404;
+//!   HTTP 404 from every operation of the plane but the READ, which refuses a template it
+//!   cannot resolve with the modelled `UnauthorizedException` (HTTP 401);
 //! * one message template holds at most the store's version ceiling, past which a publish
 //!   is the modelled `ServiceQuotaExceededException` (HTTP 402).
 
@@ -56,6 +57,12 @@ const MESSAGE_VERSION_NOT_FOUND: &str = "Message template version does not exist
 /// The sentences the other two not-found resources of this family are refused with.
 const MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+
+/// What a READ of a message template this knowledge base does not hold is refused with:
+/// the modelled `UnauthorizedException` (`@httpError(401)`, one `message` member) carrying
+/// this service's fixed sentence for the condition. Written out here rather than imported
+/// from the implementation.
+const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
 
 /// The two managed version qualifiers the read's own documentation names
 /// (`smithy_query(query="doc",shape="GetMessageTemplate")`: the qualifier is "either an
@@ -1221,7 +1228,23 @@ struct PlaneOperation {
     body: bool,
     /// Whether the operation's own documentation admits a version qualifier on the label.
     admits_qualifier: bool,
+    /// What this operation answers for a label that names no message template of the
+    /// knowledge base, as (status, `x-amzn-errortype`, `message`): the READ is authorized
+    /// against the template whose content it would report, so it refuses one it cannot
+    /// resolve; every other operation of the plane reports the template as the resource
+    /// that is missing.
+    template_not_held: (u16, &'static str, &'static str),
 }
+
+/// The refusal every operation of the plane but the read answers a template the knowledge
+/// base does not hold with, and the one the read answers.
+const TEMPLATE_NOT_FOUND: (u16, &str, &str) = (
+    404,
+    "ResourceNotFoundException",
+    MESSAGE_TEMPLATE_NOT_FOUND,
+);
+const TEMPLATE_UNAUTHORIZED: (u16, &str, &str) =
+    (401, "UnauthorizedException", MESSAGE_UNAUTHORIZED);
 
 /// The operations the version plane is reached through.
 const PLANE_OPERATIONS: [PlaneOperation; 6] = [
@@ -1231,6 +1254,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "/activate",
         body: true,
         admits_qualifier: false,
+        template_not_held: TEMPLATE_NOT_FOUND,
     },
     PlaneOperation {
         label: "DeactivateMessageTemplate",
@@ -1238,6 +1262,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "/deactivate",
         body: true,
         admits_qualifier: false,
+        template_not_held: TEMPLATE_NOT_FOUND,
     },
     PlaneOperation {
         label: "CreateMessageTemplateVersion",
@@ -1245,6 +1270,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "/versions",
         body: true,
         admits_qualifier: false,
+        template_not_held: TEMPLATE_NOT_FOUND,
     },
     PlaneOperation {
         label: "ListMessageTemplateVersions",
@@ -1252,6 +1278,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "/versions",
         body: false,
         admits_qualifier: false,
+        template_not_held: TEMPLATE_NOT_FOUND,
     },
     PlaneOperation {
         label: "UpdateMessageTemplate",
@@ -1259,6 +1286,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "",
         body: true,
         admits_qualifier: false,
+        template_not_held: TEMPLATE_NOT_FOUND,
     },
     PlaneOperation {
         label: "GetMessageTemplate",
@@ -1266,6 +1294,7 @@ const PLANE_OPERATIONS: [PlaneOperation; 6] = [
         suffix: "",
         body: false,
         admits_qualifier: true,
+        template_not_held: TEMPLATE_UNAUTHORIZED,
     },
 ];
 
@@ -1289,9 +1318,11 @@ async fn send_plane_operation(
 }
 
 /// The rule: every operation of this plane resolves the knowledge base and then the
-/// template inside it, so a label that names no resource of this account is refused with
-/// HTTP 404 naming the resource that is missing — and the operations whose documentation
-/// says their label "cannot contain any qualifier" refuse one that carries any.
+/// template inside it, so a label that names no resource of this account is refused —
+/// with HTTP 404 naming the resource that is missing, except on the READ, which is
+/// authorized against the template whose content it would report and so refuses a
+/// template it cannot resolve with HTTP 401 — and the operations whose documentation says
+/// their label "cannot contain any qualifier" refuse one that carries any.
 #[tokio::test]
 async fn every_version_operation_resolves_its_label_the_same_way() {
     let emulator = Emulator::new();
@@ -1368,15 +1399,21 @@ async fn every_version_operation_resolves_its_label_the_same_way() {
         ] {
             let reply =
                 send_plane_operation(&emulator, operation, &knowledge_base_id, &template_label).await;
+            let (status, error_type, message) = operation.template_not_held;
             assert_eq!(
-                reply.status, 404,
-                "case {}/{case:?}: expected HTTP 404, got HTTP {} with body {}",
+                reply.status, status,
+                "case {}/{case:?}: expected HTTP {status}, got HTTP {} with body {}",
                 operation.label, reply.status, reply.body
             );
             assert_eq!(
+                reply.error_type, error_type,
+                "case {}/{case:?}: expected error type {error_type}, got {:?}",
+                operation.label, reply.error_type
+            );
+            assert_eq!(
                 reply.string("/message"),
-                MESSAGE_TEMPLATE_NOT_FOUND,
-                "case {}/{case:?}: expected the message {MESSAGE_TEMPLATE_NOT_FOUND:?}, got {:?}",
+                message,
+                "case {}/{case:?}: expected the message {message:?}, got {:?}",
                 operation.label,
                 reply.string("/message")
             );

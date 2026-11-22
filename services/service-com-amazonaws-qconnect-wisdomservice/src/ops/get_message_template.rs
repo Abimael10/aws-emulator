@@ -10,6 +10,26 @@
 //! none addresses `$LATEST` — the working copy — as the operation's own documentation
 //! states.
 //!
+//! ## The template is the resource this read is authorized against
+//!
+//! Reading a message template is asking for the CONTENT of one named resource, and the
+//! service decides whether the caller may have that content before it reports any of it:
+//! a label pair that names no message template this knowledge base holds — one that was
+//! never created, one a delete has forgotten, another knowledge base's template, or an ARN
+//! of another account or partition, which resolves to nothing — names nothing any
+//! permission of this account covers, so the read is refused with the modelled
+//! `UnauthorizedException` (HTTP 401) and the service's fixed sentence for that condition
+//! ([`crate::state::MESSAGE_UNAUTHORIZED`]), reporting nothing about what the account
+//! holds. That is what the recorded wire answer for a read of a template that had just
+//! been deleted shows, and it is the safe direction: content the service withholds stays
+//! withheld.
+//!
+//! The knowledge base in the path is resolved first and reported missing as the resource
+//! it is ([`crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`]), and a VERSION of a template
+//! this account DOES hold is likewise reported missing rather than refused: the template
+//! resolved, so the request is answered on what that template published — which is what
+//! the recorded refusal of an activation naming a version no template published shows.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -95,6 +115,20 @@ fn not_found(message: &str, resource_name: &str) -> GetMessageTemplateError {
 fn validation(message: String) -> GetMessageTemplateError {
     GetMessageTemplateErrorModeled::ValidationException(ValidationException {
         message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `UnauthorizedException` (HTTP 401) this read refuses a label that names
+/// no message template of the knowledge base with, worded from the service's one fixed
+/// sentence for the condition.
+///
+/// It carries NOTHING from the request: the refusal says only that the caller may not
+/// perform the action, so neither the label nor anything about what this account holds
+/// reaches a caller that may not read it.
+fn unauthorized() -> GetMessageTemplateError {
+    GetMessageTemplateErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::MESSAGE_UNAUTHORIZED.to_string()),
     })
     .into()
 }
@@ -201,13 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
 
         // A label pair that crosses one knowledge base with another's template names
-        // nothing either.
+        // nothing either — and a label that names no template of this knowledge base names
+        // no resource this caller may be authorized for, so the read is refused rather than
+        // answered with anything about what the account holds (see the module docs).
         let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
         else {
-            return Err(not_found(
-                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
-                &input.message_template_id,
-            ));
+            return Err(unauthorized());
         };
 
         // Which version the qualifier addresses. `$LATEST` is the working copy, which is

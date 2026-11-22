@@ -637,6 +637,30 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .find(|template| template.name == name)
     }
 
+    /// Forget ONE message template of a knowledge base, with every version it published
+    /// — what `DeleteMessageTemplate` calls, whose documentation states that deleting a
+    /// template with no version qualifier deletes "the message template and all available
+    /// versions".
+    ///
+    /// Answers whether that knowledge base held a template under the id at all, so the
+    /// caller can report the resource as missing without resolving it twice; a template of
+    /// ANOTHER knowledge base is not this one's to forget.
+    pub fn remove_message_template(
+        &mut self,
+        knowledge_base_id: &str,
+        message_template_id: &str,
+    ) -> bool {
+        if self
+            .message_template(knowledge_base_id, message_template_id)
+            .is_none()
+        {
+            return false;
+        }
+        self.message_templates.remove(message_template_id);
+        self.forget_message_template_versions_of(message_template_id);
+        true
+    }
+
     /// Apply `metadata` to the message template this knowledge base holds under
     /// `message_template_id` AND to every version that template has published, answering
     /// whether the template was there at all.
@@ -678,7 +702,8 @@ impl ComAmazonawsQconnectWisdomserviceState {
         true
     }
 
-    /// Forget every message template of one knowledge base, answering with the ids it    /// dropped — what `remove_knowledge_base` calls so a knowledge base that is gone takes
+    /// Forget every message template of one knowledge base, answering with the ids it
+    /// dropped — what `remove_knowledge_base` calls so a knowledge base that is gone takes
     /// its templates with it, releasing the names they held.
     ///
     /// A template takes its published versions with it

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMessageTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMessageTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMessageTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the message template the route names, or the ONE version its label's qualifier
+//! names, out of the record `CreateMessageTemplate` wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +82,24 @@ use super::types::*;
 // `DeleteMessageTemplateError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-qconnect-wisdomservice.json");
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> DeleteMessageTemplateError {
+    DeleteMessageTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> DeleteMessageTemplateError {
+    DeleteMessageTemplateErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DeleteMessageTemplateError` alias below. An operation that models no errors
@@ -154,18 +166,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMessageTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMessageTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMessageTemplate"))
+        // Nothing here is built from request metadata: the labels the route carries are the
+        // whole input, and the modelled label patterns are already refused BEFORE this
+        // handler runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("DeleteMessageTemplate")
+        })?;
+        let mut store = state.lock();
+
+        // A message template is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // The label names the template and, optionally, ONE version of it: "You can provide
+        // the message template identifier as <message-template-id>:<versionNumber> to
+        // delete a specific version of the message template. If it is not supplied, the
+        // message template and all available versions will be deleted."
+        let (message_template_id, qualifier) =
+            crate::state::resolve_qualified_id(&input.message_template_id);
+        let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
+        let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+        let message_template_id = message_template.message_template_id.clone();
+
+        // Which version the qualifier addresses, read the same way every other
+        // message-template operation reads one: the working copy — what a label carrying no
+        // qualifier addresses — IS the resource, so deleting it takes the template and
+        // every version with it, while a qualifier that names a PUBLISHED version deletes
+        // that one version and leaves the rest. A qualifier naming neither is refused.
+        match crate::state::addressed_version(qualifier) {
+            Some(crate::state::AddressedVersion::Latest) => {
+                store.remove_message_template(&knowledge_base_id, &message_template_id);
+            }
+            Some(crate::state::AddressedVersion::Published) => {
+                let version_number = if qualifier == crate::state::VERSION_QUALIFIER_ACTIVE {
+                    store
+                        .active_message_template_version(&message_template_id)
+                        .map(|version| version.version_number)
+                } else {
+                    qualifier.parse::<i64>().ok()
+                };
+                // A version this template never published — or the activated one while none
+                // is activated — names nothing, so the request is refused and the store is
+                // left exactly as it was.
+                let deleted = version_number.is_some_and(|version_number| {
+                    store.remove_message_template_version(&message_template_id, version_number)
+                });
+                if !deleted {
+                    return Err(not_found(
+                        crate::state::MESSAGE_MESSAGE_TEMPLATE_VERSION_NOT_FOUND,
+                        &input.message_template_id,
+                    ));
+                }
+            }
+            None => {
+                return Err(validation(crate::state::message_invalid_version_qualifier(
+                    qualifier,
+                )))
+            }
+        }
+
+        Ok(DeleteMessageTemplateOutput {})
     }
 }

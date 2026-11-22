@@ -330,6 +330,24 @@ impl ComAmazonawsQconnectWisdomserviceState {
         MessageTemplateDeactivation::Deactivated
     }
 
+    /// Forget ONE published version of a message template, answering whether the template
+    /// published a version under that number — what `DeleteMessageTemplate` calls for a
+    /// label that carries a version qualifier, which its documentation says deletes "a
+    /// specific version of the message template" and leaves the working copy and the other
+    /// versions as they were.
+    pub fn remove_message_template_version(
+        &mut self,
+        message_template_id: &str,
+        version_number: i64,
+    ) -> bool {
+        let Some(versions) = self.message_template_versions.get_mut(message_template_id) else {
+            return false;
+        };
+        let held = versions.len();
+        versions.retain(|version| version.version_number != version_number);
+        held != versions.len()
+    }
+
     /// Forget every published version of one message template — what the delete of the
     /// template, and of the knowledge base that holds it, calls so a template that is gone
     /// takes its versions with it.

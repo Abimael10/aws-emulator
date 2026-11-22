@@ -38,9 +38,11 @@
 //!   modelled idempotency conflict;
 //! * a label this knowledge base holds no template under — a bare id, an ARN of this
 //!   account, of another account or of another partition, or another knowledge base's
-//!   template — is `ResourceNotFoundException` (HTTP 404), as is a create under a
-//!   knowledge base this account does not hold, and as is every version qualifier that
-//!   names a published version while none has been published;
+//!   template — is refused by the READ with the modelled `UnauthorizedException` (HTTP
+//!   401), which is the answer a read of a template the account does not hold earns,
+//!   while a create under a knowledge base this account does not hold is
+//!   `ResourceNotFoundException` (HTTP 404), as is every version qualifier that names a
+//!   published version while none has been published;
 //! * deleting a knowledge base forgets the message templates held inside it;
 //! * the tags a create persisted on a template are what `ListTagsForResource` reports for
 //!   its ARN;
@@ -131,6 +133,14 @@ const QUALIFIER_ACTIVE: &str = "$ACTIVE_VERSION";
 /// used in `ResourceNotFoundException`'s own `resourceName` member.
 const MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+
+/// The fixed sentence, status and error code a READ of a message template this knowledge
+/// base does not hold is refused with — the modelled `UnauthorizedException`
+/// (`@httpError(401)`), whose only member is `message`. Written out here rather than
+/// imported from the implementation.
+pub(crate) const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
+pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
+pub(crate) const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
 
 /// The sentence a create under a name a live template of the same knowledge base already
 /// holds is refused with, and the one a replayed `clientToken` carrying a different
@@ -1191,11 +1201,13 @@ async fn a_replayed_client_token_answers_with_what_it_created() {
     }
 }
 
-/// The rule: a label this knowledge base holds no template under is the modelled
-/// `ResourceNotFoundException` (HTTP 404), whatever form it takes — and so is a create or a
-/// read under a knowledge base this account does not hold.
+/// The rule: a READ whose label pair names no message template of this knowledge base is
+/// refused with the modelled `UnauthorizedException` (HTTP 401) and the service's fixed
+/// sentence for the condition, whatever form the label takes — while a CREATE under a
+/// knowledge base this account does not hold reports that knowledge base as the resource
+/// that is missing.
 #[tokio::test]
-async fn a_label_that_names_no_template_of_this_knowledge_base_is_not_found() {
+async fn a_label_that_names_no_template_of_this_knowledge_base_is_refused() {
     let emulator = Emulator::new();
     let knowledge_base_id = emulator.create_knowledge_base_named("missing-one").await;
     let other_base_id = emulator.create_knowledge_base_named("missing-two").await;
@@ -1263,26 +1275,25 @@ async fn a_label_that_names_no_template_of_this_knowledge_base_is_not_found() {
     for (case, template_label, parent) in rows {
         let reply = emulator.get_message_template(&parent, &template_label).await;
         assert_eq!(
-            reply.status, 404,
-            "case {case:?}: expected HTTP 404, got HTTP {} with body {}",
+            reply.status, UNAUTHORIZED_STATUS,
+            "case {case:?}: expected HTTP {UNAUTHORIZED_STATUS}, got HTTP {} with body {}",
             reply.status, reply.body
         );
         assert_eq!(
-            reply.error_type, "ResourceNotFoundException",
-            "case {case:?}: expected error type ResourceNotFoundException, got {:?}",
+            reply.error_type, UNAUTHORIZED_CODE,
+            "case {case:?}: expected error type {UNAUTHORIZED_CODE}, got {:?}",
             reply.error_type
         );
         assert_eq!(
             reply.string("/message"),
-            MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
-            "case {case:?}: expected the message {MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND:?}, got {:?}",
+            MESSAGE_UNAUTHORIZED,
+            "case {case:?}: expected the message {MESSAGE_UNAUTHORIZED:?}, got {:?}",
             reply.string("/message")
         );
-        assert_eq!(
-            reply.string("/resourceName"),
-            template_label,
-            "case {case:?}: the refusal must carry the label the request used, got {:?}",
-            reply.string("/resourceName")
+        assert!(
+            !reply.body.to_string().contains(template_label.as_str()),
+            "case {case:?}: the refusal must report nothing the request carried, got {}",
+            reply.body
         );
     }
 
