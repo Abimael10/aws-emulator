@@ -86,6 +86,18 @@ fn the_published_union_member_catalog_matches_the_model() {
     );
 }
 
+/// What AUTHORIZES the same call against the TARGET KMS key: the KMS operation a
+/// re-encryption performs on the key the request names, and the refusal the key's own
+/// authorities answer it with.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is — and this is the module whose payload writer, dispatcher and reader it drives
+/// its calls through. The `#[path]` is relative to this file's own directory, and is needed
+/// because `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "object_encryption_update/key_authorization.rs"]
+mod key_authorization;
+
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
