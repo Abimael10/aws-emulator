@@ -625,6 +625,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // * the VPC has to have both DNS attributes on, which is what makes a private hosted
         //   zone resolve inside it at all.
         //
+        // BOTH are asked BELOW, after the dry-run probe: each reads a resource the request
+        // NAMED — the endpoint service's own published name, the VPC's own attributes —
+        // against what the request asked for, rather than reading the request, so they are
+        // part of carrying the create out.
+        //
         // The model publishes no DEFAULT for the member (`smithy_query(query="doc",
         // shape="CreateVpcEndpointRequest",member="PrivateDnsEnabled")` states the rule above
         // and no default), and the service's own default is ON for a service that publishes a
@@ -638,21 +643,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && input
                 .private_dns_enabled
                 .unwrap_or(service_private_dns_name.is_some());
-        let private_dns_domain = match (private_dns_enabled, service_private_dns_name.as_deref()) {
-            (false, _) => None,
-            // A service that publishes no such name has nothing to turn on, through the one
-            // wording this crate refuses that with.
-            (true, None) => return Err(state::private_dns_unsupported_service(service_name)),
-            (true, Some(domain)) => Some(domain),
-        };
-        if private_dns_domain.is_some() {
-            let attributes = store
-                .vpc_attributes_of(&input.vpc_id)
-                .ok_or_else(|| state::invalid_vpc_id_not_found(&input.vpc_id))?;
-            if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
-                return Err(state::private_dns_unsupported_vpc(&input.vpc_id));
-            }
-        }
+        // The domain the zone would answer, where the service publishes one at all; a service
+        // that publishes none has nothing to turn on, which is the refusal below.
+        let private_dns_domain = service_private_dns_name
+            .as_deref()
+            .filter(|_| private_dns_enabled);
+        let private_dns_has_no_domain = private_dns_enabled && service_private_dns_name.is_none();
 
         // "The IDs of the subnets in which to create endpoint network interfaces"
         // (`SubnetIds`): each subnet is what an interface's Availability Zone and address
@@ -962,6 +958,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing has been written yet, and nothing is.
         if input.dry_run.unwrap_or(false) {
             return Err(state::dry_run_operation());
+        }
+
+        // "The private hosted zone contains a record set for the default public DNS name for
+        // the service for the Region" (`PrivateDnsEnabled`): that record set is the whole
+        // content of the zone, so a service publishing no such name has no zone to associate
+        // — through the one wording this crate refuses that with. Asked AFTER the probe
+        // above, with the VPC's attributes below: it reads the named service's own published
+        // name against what the request asked for.
+        if private_dns_has_no_domain {
+            return Err(state::private_dns_unsupported_service(service_name));
+        }
+        // "To use a private hosted zone, you must set the following VPC attributes to true:
+        // enableDnsHostnames and enableDnsSupport" (`PrivateDnsEnabled`): the zone this
+        // endpoint would associate resolves nothing inside a VPC that resolves no private
+        // names at all, so the association is refused rather than recorded as one no name
+        // would answer.
+        //
+        // Asked AFTER the dry-run probe above, for the reason the policy-support refusal
+        // below is: this reads the VPC's attributes against what the request asked for —
+        // two resources against each other — rather than reading the request, so it is part
+        // of carrying the create out. A recorded `DryRun` probe over a VPC whose attributes
+        // are off is answered `DryRunOperation`, and the real call is answered this.
+        if private_dns_domain.is_some() {
+            let attributes = store
+                .vpc_attributes_of(&input.vpc_id)
+                .ok_or_else(|| state::invalid_vpc_id_not_found(&input.vpc_id))?;
+            if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
+                return Err(state::private_dns_unsupported_vpc(&input.vpc_id));
+            }
         }
 
         // "Indicates whether the service supports endpoint policies"

@@ -12,7 +12,8 @@
 //! other service crate.
 //!
 //! The reading of what the ARN NAMES is [`crate::iam_role`]; this module is only how the
-//! question is put on the wire. Services with their own copy of this builder — `iam_client`
+//! question is put on the wire, and the one question several services put through it
+//! ([`instance_profile_is_held`]). Services with their own copy of this builder — `iam_client`
 //! in `service-com-amazonaws-firehose-firehose-20150804` and in
 //! `service-com-amazonaws-cloudformation-cloudformation`, and the inline blocks in
 //! `service-com-amazonaws-scheduler-awschronosservice`,
@@ -59,3 +60,48 @@ pub fn iam_client_through(
         .build();
     ::aws_sdk_iam::Client::from_conf(config)
 }
+
+/// Whether this account's IAM records hold an INSTANCE PROFILE under `name`: `Some(true)` for
+/// one IAM reports, `Some(false)` when IAM says the account holds none, and `None` when the
+/// ask did not reach IAM at all.
+///
+/// The question several services have to put before they act on a caller-supplied instance
+/// profile — an EC2 launch names the profile its instances run as, an EMR cluster names one as
+/// its `JobFlowRole`, an Image Builder infrastructure configuration names one its build host
+/// assumes — asked through [`iam_client`] so the hop stays the one construction above.
+///
+/// The three answers are kept apart because only the middle one is a fact about the request:
+/// a refusal must rest on IAM having ANSWERED that the profile is not there. `None` is this
+/// emulator failing to ask — an emulator with no IAM mounted looks exactly like that from
+/// here, the transport being in-process — so a caller of this answers it by refusing nothing,
+/// and the failure is traced rather than guessed at.
+pub async fn instance_profile_is_held(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Option<bool> {
+    let answer = iam_client(ctx, region)
+        .get_instance_profile()
+        .instance_profile_name(name)
+        .send()
+        .await;
+    match answer {
+        Ok(_) => Some(true),
+        Err(error)
+            if error.as_service_error().is_some_and(
+                ::aws_sdk_iam::operation::get_instance_profile::GetInstanceProfileError::is_no_such_entity_exception,
+            ) =>
+        {
+            Some(false)
+        }
+        Err(error) => {
+            ::tracing::warn!(
+                %name,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the instance profile a request named could not be resolved against IAM"
+            );
+            None
+        }
+    }
+}
+

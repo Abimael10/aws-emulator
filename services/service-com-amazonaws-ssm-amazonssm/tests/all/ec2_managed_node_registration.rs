@@ -24,7 +24,7 @@
 //! registration call (an AWS-managed policy attachment, an inline statement naming the
 //! action, an inline wildcard over the service), how it is withheld (no policy at all, an
 //! explicit deny beside a wildcard grant, a role another service may act as, no instance
-//! profile, a profile IAM holds no record of), and the platform of the AMI the instance was
+//! profile, a profile IAM no longer holds a record of), and the platform of the AMI the instance was
 //! launched from.
 //!
 //! Nothing here waits a fixed time: every span is a stored due instant, so a case LOOKS
@@ -229,6 +229,10 @@ const DENIES_REGISTRATION: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\
 /// The service principal an instance profile's role has to admit for Amazon EC2 to act as
 /// it on an instance's behalf.
 pub(crate) const EC2_PRINCIPAL: &str = "ec2.amazonaws.com";
+
+/// The instance profile one row launches with and IAM then stops holding, so that row's
+/// instance references a profile the account no longer has.
+const GONE_PROFILE: &str = "gone-after-the-launch";
 
 /// Build one instance profile the way a client builds one — `CreateRole`, the grant, then
 /// `CreateInstanceProfile` and `AddRoleToInstanceProfile` — and read it back through IAM's
@@ -457,6 +461,14 @@ fn profiles() -> Vec<Profile> {
             trusts: "lambda.amazonaws.com",
             grant: Grant::AwsManaged,
         },
+        // The profile the row below launches with and IAM then stops holding: its role WOULD
+        // let the agent register, so the only reason that instance does not is that there is
+        // no profile behind its reference by the time the registration falls due.
+        Profile {
+            name: GONE_PROFILE,
+            trusts: "ec2.amazonaws.com",
+            grant: Grant::AwsManaged,
+        },
     ]
 }
 
@@ -487,8 +499,8 @@ fn registration_rows() -> Vec<Case> {
             platform_type: "",
         },
         Case {
-            case: "an instance profile IAM holds no record of",
-            profile: Some("never-created"),
+            case: "an instance profile IAM no longer holds a record of",
+            profile: Some(GONE_PROFILE),
             windows: false,
             registers: false,
             platform_type: "",
@@ -541,6 +553,24 @@ async fn an_instance_registers_only_when_its_profile_lets_the_agent_register() {
         let image = if row.windows { &windows } else { &linux };
         let instance_id = launch(&router, row.case, REGION, image, row.profile).await;
         launched.push((*row, instance_id));
+    }
+    // The profile one row's instance runs as is TAKEN AWAY once that instance is launched:
+    // Amazon EC2 holds a launch to a profile the account really has, so the way an instance
+    // comes to reference a profile IAM holds nothing for is the profile going afterwards.
+    for (action, parameters) in [
+        (
+            "RemoveRoleFromInstanceProfile",
+            vec![
+                ("InstanceProfileName", GONE_PROFILE),
+                ("RoleName", GONE_PROFILE),
+            ],
+        ),
+        (
+            "DeleteInstanceProfile",
+            vec![("InstanceProfileName", GONE_PROFILE)],
+        ),
+    ] {
+        iam_ok(&router, GONE_PROFILE, action, &parameters).await;
     }
 
     // The rows that register: the node is reported once the clock makes the registration

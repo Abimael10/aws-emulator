@@ -490,6 +490,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 launch_overlaid_with_template(input, &data)?
             }
         };
+        // Whether this launch is a PROBE: `DryRun` "checks whether you have the required
+        // permissions for the action, WITHOUT ACTUALLY MAKING THE REQUEST, and provides an
+        // error response. If you have the required permissions, the error response is
+        // DryRunOperation" (`RunInstancesRequest$DryRun`). So a probe is answered once the
+        // request's own values have been read and the resources it NAMES resolved — which is
+        // where the arm below sits — and before the resources it named are read AGAINST EACH
+        // OTHER, which is part of carrying the launch out. The recorded contract draws that
+        // line exactly: a probe whose network interfaces and instance-level members cannot
+        // be given together is answered that parameter combination, while one naming a
+        // security group of another VPC than the subnet it lands in is answered the verdict.
+        let probe = input.dry_run == Some(true);
         // The combination rule above, asked of the launch as RESOLVED: the facts a launch
         // expresses are the facts of the merged parameters, so a launch whose interfaces come
         // from its template and whose subnet, security groups or primary private address come
@@ -540,7 +551,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|addresses| !addresses.is_empty())
             || input.ipv6_address_count.is_some_and(|count| count > 0)
-            || interface_requests.iter().any(|interface| interface.ipv6)
+            || input
+                .network_interfaces
+                .iter()
+                .flatten()
+                .any(interface_asks_for_ipv6)
         {
             return Err(Scaffolded::not_implemented(
                 "RunInstances with IPv6 addresses",
@@ -693,8 +708,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a profile cannot be spelled one way here and another there — BEFORE the store
         // is touched. A reference this service cannot act on refuses the whole launch
         // rather than being accepted and dropped.
+        //
+        // And the profile a launch names has to EXIST: the instance would run as it, so a
+        // name the account's IAM records hold no profile under names no profile the instance
+        // could ever run as, and the launch is refused for that member
+        // ([`crate::state::unheld_iam_instance_profile`]) — a `DryRun` probe included,
+        // because this reads the launch's own member rather than the launch this handler
+        // would have assembled. That is the recorded answer to a launch, probe or not, that
+        // names a role's name where an instance profile's belongs.
         let iam_instance_profile = match input.iam_instance_profile.as_ref() {
-            Some(specification) => Some(resolve_iam_instance_profile(&*self.engine, specification)?),
+            Some(specification) => {
+                let resolved = resolve_iam_instance_profile(&*self.engine, specification)?;
+                if let Some(refusal) = crate::state::unheld_iam_instance_profile(
+                    ctx,
+                    &request_region(ctx.parts()),
+                    specification,
+                )
+                .await
+                {
+                    return Err(refusal);
+                }
+                Some(resolved)
+            }
             None => None,
         };
 
@@ -803,7 +838,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `DryRun` probe asks nothing of KMS: it is answered below without creating
         // anything, and a data key is requested for volumes that are really being created.
         let mut volume_key_refusal = None;
-        if input.dry_run != Some(true) {
+        if !probe {
             for key_id in crate::state::launch_volume_encryption_keys(
                 root_block_device.as_ref(),
                 input.block_device_mappings.as_deref().unwrap_or_default(),
@@ -1374,11 +1409,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // DryRun sits AFTER every parameter has been validated and every read-only
-        // check made, and BEFORE the first write: the flag asks whether the request
-        // WOULD have worked, so one that would have been refused is refused with that
-        // reason instead, and one that would have succeeded leaves state untouched.
-        if input.dry_run == Some(true) {
+        // The probe's own answer, now that the request's values have been read and every
+        // resource it NAMES resolved — the image, the instance profile, the key pair, the
+        // placement group, the Dedicated Host, the Capacity Reservation: "if you have the
+        // required permissions, the error response is DryRunOperation" (`DryRun`). A launch
+        // that would have been refused for one of its own members is refused with that
+        // reason instead; one that got this far is answered the verdict, and the refusals
+        // that come out of ASSEMBLING the launch — reading its groups against the subnet it
+        // would sit in, and the interface plan skipped above — belong to the real call.
+        if probe {
             return Err(Scaffolded::dry_run_operation());
         }
 
@@ -2127,9 +2166,6 @@ struct InterfaceRequest {
     /// not known until the account's records are read ([`take_launch_interfaces`]).
     associate_public_ip_address: Option<bool>,
     addresses: crate::state::RequestedPrivateIps,
-    /// Whether the entry asked for an IPv6 address at all — a range this slice does not
-    /// model, answered where the launch's own IPv6 members are.
-    ipv6: bool,
     ena_srd_specification: Option<AttachmentEnaSrdSpecification>,
     ena_queue_count: Option<i32>,
 }
@@ -2146,44 +2182,33 @@ struct PlannedInterface {
     cidr_block: String,
 }
 
-/// Read a launch's `NetworkInterfaces` into what each entry asks for, refusing what the
-/// entries themselves rule out. Empty in, empty out: a launch that names no interface gets
-/// the single primary one the store creates for it.
+/// Whether one `NetworkInterfaces` entry asks for an IPv6 address — on either of the two
+/// members that ask for one (`Ipv6Addresses`, `Ipv6AddressCount`).
+fn interface_asks_for_ipv6(interface: &InstanceNetworkInterfaceSpecification) -> bool {
+    interface
+        .ipv6_addresses
+        .as_ref()
+        .is_some_and(|addresses| !addresses.is_empty())
+        || interface.ipv6_address_count.is_some_and(|count| count > 0)
+}
+
+/// Refuse a launch whose `NetworkInterfaces` name state this slice holds nothing of.
 ///
-/// `max_count` is the launch's own, because two members of an entry can serve exactly ONE
-/// instance: a private address it names, and an existing interface it attaches. `instance_type`
-/// is the launch's, because how many interfaces an instance may hold is a fact of its type.
-fn read_interface_specifications(
+/// Each of these members CONTRADICTS what the interface would otherwise report — a delegated
+/// prefix comes out of the subnet's prefixes, a primary IPv6 address out of its IPv6 range, a
+/// carrier IP address out of a Wavelength zone's carrier network, and a connection tracking
+/// configuration is a setting of its own — so a launch that asks for one is refused as
+/// unwritten rather than answered with an interface that silently lacks it.
+///
+/// Asked of every launch that names its interfaces, before anything is made of the entries:
+/// the answer is a statement about the REQUEST — this emulator cannot perform the work it
+/// asks for — rather than one about the launch the handler would have assembled from it.
+fn refuse_unwritten_interface_members(
     interfaces: &[InstanceNetworkInterfaceSpecification],
-    max_count: i32,
-    instance_type: &str,
-) -> Result<Vec<InterfaceRequest>, RunInstancesError> {
+) -> Result<(), RunInstancesError> {
     use crate::scaffolded::Scaffolded;
 
-    if interfaces.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The list a caller may send carries no modelled length, so it is bounded HERE, before any
-    // work proportional to its length — reading each entry, and the scan for a device index
-    // another entry already took — is done. The ceiling is the number of interfaces the
-    // instance type can hold, read off the one derivation of a type's facts.
-    let held_at_most = crate::state::network_interface_limit(instance_type)
-        .and_then(|limit| usize::try_from(limit).ok())
-        .unwrap_or(MAX_LAUNCH_INTERFACES);
-    if interfaces.len() > held_at_most {
-        return Err(crate::state::attachment_limit_exceeded(format!(
-            "Interface count {} exceeds the limit for {instance_type}",
-            interfaces.len()
-        )));
-    }
-    let mut requests: Vec<InterfaceRequest> = Vec::with_capacity(interfaces.len());
     for interface in interfaces {
-        // Members naming state this slice holds nothing of. Each CONTRADICTS what the
-        // interface would otherwise report — a delegated prefix comes out of the subnet's
-        // prefixes, an IPv6 GUA address out of its IPv6 range, a carrier IP address out of a
-        // Wavelength zone's carrier network, and a connection tracking configuration is a
-        // setting of its own — so a launch that asks for one is refused as unwritten rather
-        // than answered with an interface that silently lacks it.
         if interface
             .ipv4_prefixes
             .as_ref()
@@ -2214,7 +2239,45 @@ fn read_interface_specifications(
                 "RunInstances with a connection tracking specification on a network interface",
             ));
         }
+    }
+    Ok(())
+}
 
+/// Read a launch's `NetworkInterfaces` into what each entry asks for, refusing what the
+/// entries themselves rule out. Empty in, empty out: a launch that names no interface gets
+/// the single primary one the store creates for it.
+///
+/// `max_count` is the launch's own, because two members of an entry can serve exactly ONE
+/// instance: a private address it names, and an existing interface it attaches. `instance_type`
+/// is the launch's, because how many interfaces an instance may hold is a fact of its type.
+fn read_interface_specifications(
+    interfaces: &[InstanceNetworkInterfaceSpecification],
+    max_count: i32,
+    instance_type: &str,
+) -> Result<Vec<InterfaceRequest>, RunInstancesError> {
+    use crate::scaffolded::Scaffolded;
+
+    if interfaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The members of an entry this slice holds no state for, read before anything else is
+    // made of the entries ([`refuse_unwritten_interface_members`]).
+    refuse_unwritten_interface_members(interfaces)?;
+    // The list a caller may send carries no modelled length, so it is bounded HERE, before any
+    // work proportional to its length — reading each entry, and the scan for a device index
+    // another entry already took — is done. The ceiling is the number of interfaces the
+    // instance type can hold, read off the one derivation of a type's facts.
+    let held_at_most = crate::state::network_interface_limit(instance_type)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(MAX_LAUNCH_INTERFACES);
+    if interfaces.len() > held_at_most {
+        return Err(crate::state::attachment_limit_exceeded(format!(
+            "Interface count {} exceeds the limit for {instance_type}",
+            interfaces.len()
+        )));
+    }
+    let mut requests: Vec<InterfaceRequest> = Vec::with_capacity(interfaces.len());
+    for interface in interfaces {
         // "The position of the network interface in the attachment order. A primary network
         // interface has a device index of 0" (`DeviceIndex`), which is the position an entry
         // that names none takes. A position cannot be below zero, and two interfaces cannot
@@ -2361,11 +2424,6 @@ fn read_interface_specifications(
             delete_on_termination,
             associate_public_ip_address,
             addresses,
-            ipv6: interface
-                .ipv6_addresses
-                .as_ref()
-                .is_some_and(|addresses| !addresses.is_empty())
-                || interface.ipv6_address_count.is_some_and(|count| count > 0),
             // "Specifies the ENA Express settings for the network interface that's attached
             // to the instance" (`EnaSrdSpecification`): the request's shape and the one the
             // attachment reports carry the same settings, so what the launch asked for

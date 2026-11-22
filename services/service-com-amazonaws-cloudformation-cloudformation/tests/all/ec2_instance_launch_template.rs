@@ -34,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // `stack_lifecycle` re-exports the readers below but not that one.
 use crate::harness::failed_resource_reason;
 use crate::stack_lifecycle::{
-    create_stack, ec2, ec2_tag_value, is_service_assigned_id, resource_event_reason,
+    create_stack, ec2, ec2_tag_value, iam, is_service_assigned_id, resource_event_reason,
     router_with_engine, settled_stack, xml_blocks, xml_text, xml_texts, REGION,
 };
 
@@ -52,9 +52,10 @@ const TEMPLATE: &str = "TheTemplate";
 const LAUNCH_TEMPLATE_ID_TAG: &str = "aws:ec2launchtemplate:id";
 const LAUNCH_TEMPLATE_VERSION_TAG: &str = "aws:ec2launchtemplate:version";
 
-/// The instance profile the launch template names — a name IAM holds no record of is reported
-/// as the specification spelled it, so what this asserts is that the template's profile
-/// reached the instance at all.
+/// The instance profile the launch template names. A launch GIVES its instances that
+/// profile, so Amazon EC2 holds the launch to one the account's IAM records really carry —
+/// the profile is created through IAM's own wire below ([`hold_instance_profile`]), and what
+/// the rows assert is that the template's profile reached the instance.
 const PROFILE_NAME: &str = "the-estate-instance-profile";
 
 /// The instance types the two versions of the table's launch template carry, and the one a row
@@ -164,6 +165,22 @@ async fn ec2_ok(
     body
 }
 
+/// Make IAM hold the instance profile the templates below name, through the service that OWNS
+/// instance profiles: a launch names the profile its instances run as, and Amazon EC2 refuses
+/// a launch naming one the account holds none of.
+async fn hold_instance_profile(router: &MultiServiceRouter) {
+    let (status, body) = iam(
+        router,
+        "CreateInstanceProfile",
+        &[("InstanceProfileName", PROFILE_NAME)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "IAM must hold the instance profile the templates name, got {status} with body {body}"
+    );
+}
+
 /// Two AMIs of the Region, read out of Amazon EC2 itself — a template cannot invent an image
 /// id, and the two versions carry different ones so a row says WHICH version the launch read.
 async fn two_images(router: &MultiServiceRouter) -> (String, String) {
@@ -180,6 +197,7 @@ async fn two_images(router: &MultiServiceRouter) -> (String, String) {
 /// profile both versions carry.
 async fn launch_template(router: &MultiServiceRouter) -> Template {
     let case = "the estate";
+    hold_instance_profile(router).await;
     let (first_image, second_image) = two_images(router).await;
     let created = ec2_ok(
         router,
@@ -402,6 +420,7 @@ async fn an_instance_declared_from_a_launch_template_is_launched_from_that_versi
 async fn a_stack_that_declares_both_launches_the_instance_from_its_own_template() {
     let case = "a launch template and an instance in one stack";
     let (router, _engine) = router_with_engine();
+    hold_instance_profile(&router).await;
     let (image_id, _other) = two_images(&router).await;
     let body = json!({
         "AWSTemplateFormatVersion": "2010-09-09",

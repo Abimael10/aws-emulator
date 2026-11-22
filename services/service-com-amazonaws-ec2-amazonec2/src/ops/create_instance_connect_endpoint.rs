@@ -250,8 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "One or more security groups to associate with the endpoint. If you don't specify
         // a security group, the default security group for your VPC will be associated with
         // the endpoint" (`CreateInstanceConnectEndpointRequest$SecurityGroupIds`). A group
-        // is associated with the endpoint's network, so one of another VPC is refused; the
-        // modelled `@length` of at most 16 has already been enforced at the boundary.
+        // the account holds none of is a reference to nothing, so it is refused here, with
+        // the rest of the request's own reading; WHETHER the groups it does hold may be
+        // applied in this endpoint's subnet reads two resources against each other and is
+        // asked below, after the dry-run probe. The modelled `@length` of at most 16 has
+        // already been enforced at the boundary.
         let requested_groups = deduplicate_ids(input.security_group_ids.as_deref().unwrap_or(&[]));
         let security_group_ids = if requested_groups.is_empty() {
             let default_group = store
@@ -267,15 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !security_group_id_is_well_formed(group_id) {
                     return Err(Scaffolded::invalid_id(group_id));
                 }
-                let Some(group) = store.security_groups.get(group_id) else {
+                if !store.security_groups.contains_key(group_id) {
                     return Err(invalid_group_not_found(group_id));
-                };
-                if group.vpc_id.as_deref() != Some(vpc_id.as_str()) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "The security group '{group_id}' and the subnet '{subnet_id}' \
-                         belong to different networks",
-                        subnet_id = input.subnet_id,
-                    )));
                 }
             }
             requested_groups
@@ -347,12 +343,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
-        // the flag asks whether the request WOULD have worked, so one that would have been
-        // refused is refused with that reason instead, and one that would have succeeded
-        // leaves state untouched.
+        // DryRun sits AFTER the request's own members have been read and the resources it
+        // NAMES resolved, and BEFORE the create is put together: the flag asks whether the
+        // request WOULD have worked, so one that would have been refused for its own members
+        // is refused with that reason instead, and one that would have succeeded leaves
+        // state untouched.
         if input.dry_run == Some(true) {
             return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "One or more security groups to associate with the endpoint" — a security group
+        // belongs to ONE VPC, while the endpoint's network interfaces sit in the subnet's
+        // VPC, so a group of another VPC could never be applied to this endpoint. Asked
+        // AFTER the probe above: it reads the group and the subnet the request named
+        // AGAINST EACH OTHER, which is part of carrying the create out rather than of
+        // reading the request, so a recorded `DryRun` probe naming a group of another VPC is
+        // answered `DryRunOperation` and the real call is answered this.
+        //
+        // `ModifyInstanceConnectEndpoint` and `ModifyVpcEndpoint` still ask their own
+        // version of this question AHEAD of their probe: no recording of those two is known
+        // either way, and this crate's suites pin where they ask it today, so moving them
+        // waits for a recording that settles it.
+        for group_id in &security_group_ids {
+            let belongs_to_this_vpc = store
+                .security_groups
+                .get(group_id)
+                .is_some_and(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()));
+            if !belongs_to_this_vpc {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The security group '{group_id}' and the subnet '{subnet_id}' \
+                     belong to different networks",
+                    subnet_id = input.subnet_id,
+                )));
+            }
         }
 
         let endpoint_id = store.next_id(INSTANCE_CONNECT_ENDPOINT_ID_PREFIX.trim_end_matches('-'));

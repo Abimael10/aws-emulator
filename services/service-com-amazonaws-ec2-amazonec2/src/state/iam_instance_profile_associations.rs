@@ -649,3 +649,56 @@ pub fn resolve_iam_instance_profile<E, Eng: Send + Sync + 'static>(
         }
     }
 }
+
+/// Refuse a request whose `IamInstanceProfile` names a profile BY NAME that this account's
+/// IAM records hold none of: HTTP 400 `InvalidParameterValue`, with the sentence EC2's
+/// parameter layer words for an `iamInstanceProfile.name` it cannot use
+/// ([`unusable_iam_instance_profile_name`]) — the value the request sent, the parameter it
+/// sent it as, and what is wrong with it. `None` leaves the request alone.
+///
+/// A launch is GIVEN the profile it names, so a name nothing holds names no profile its
+/// instances could ever run as, and EC2 refuses the request for that member rather than
+/// accepting it: that is the recorded answer to a launch naming a role's name where an
+/// instance profile's belongs.
+///
+/// Two references are NOT judged here:
+///
+/// * the ARN spelling, which may name a profile of another account or another partition —
+///   records this emulator holds none of, so a reference cannot be judged against them;
+/// * any reference at all when the ask does not REACH IAM, which is what an emulator with no
+///   IAM mounted looks like from here: nothing is then known about the profile, and a refusal
+///   has to be grounded in what IAM answered rather than assumed — the same line
+///   `state::volume_key_refusal` draws for a volume's encryption key when there is no KMS to
+///   ask.
+///
+/// IAM is reached the way any emulated service reaches another: the ONE in-process ask about
+/// an instance profile this tree has ([`::service_common::iam_client::instance_profile_is_held`]),
+/// built from the framework's operation callback, which dispatches to the IAM service mounted
+/// in this same emulator. The profiles are IAM's resources, so the answer comes from the
+/// component that owns them.
+pub async fn unheld_iam_instance_profile<E>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    specification: &IamInstanceProfileSpecification,
+) -> Option<Scaffolded<E>> {
+    let named_by_arn = specification
+        .arn
+        .as_deref()
+        .is_some_and(|arn| !arn.is_empty());
+    let name = specification
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty() && !named_by_arn)?;
+    // IAM says this account holds no such instance profile: the refusal is grounded in what
+    // IAM answered. Every other answer — the profile is there, or the ask did not reach IAM
+    // at all — refuses nothing.
+    if ::service_common::iam_client::instance_profile_is_held(ctx, region, name).await
+        == Some(false)
+    {
+        return Some(invalid_parameter_value(unusable_iam_instance_profile_name(
+            name,
+        )));
+    }
+    None
+}
+

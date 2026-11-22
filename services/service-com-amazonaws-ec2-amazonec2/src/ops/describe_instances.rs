@@ -221,58 +221,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EC2 refuses a request carrying both an unknown filter name and a page size it will
         // not page with by naming the FILTER.
 
-        // Matching cost is filters x values x stored instances and the model bounds
-        // none of them, so the two request-controlled factors are capped here,
-        // before any work proportional to them is done.
-        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
-        if supplied_filters > MAX_FILTERS {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "The request carries {supplied_filters} filters, above the maximum \
-                 of {MAX_FILTERS}"
-            )));
-        }
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request" (`DescribeInstancesRequest$DryRun`): a probe is answered once
+        // the request's own values have been read and the instances it NAMES resolved, and
+        // before the describe is PERFORMED. RESOLVING THE FILTERS IS PART OF PERFORMING IT —
+        // a filter selects out of the account's instances — so the filters a probe carries
+        // are neither compiled nor judged, which is what the recorded probe carrying a
+        // filter name EC2 does not document is answered under.
+        let probe = input.dry_run == Some(true);
 
         // A filter name EC2 does not document is refused, never silently ignored:
         // ignoring it would answer a wider set than the caller asked for. The refusal is
         // the one every describe of this service words — `InvalidParameterValue` with
         // "The filter '<name>' is invalid" — with the name taken from the request.
         let mut filters: Vec<CompiledFilter> = Vec::new();
-        for filter in input.filters.iter().flatten() {
-            // An entry that names NO filter is still an entry the operation cannot use, and
-            // EC2 reports it by the name it has for an absent one
-            // ([`crate::state::UNNAMED_FILTER`]) rather than by an empty name, so the
-            // caller can see which entry was refused.
-            let name = filter
-                .name
-                .clone()
-                .unwrap_or_else(|| crate::state::UNNAMED_FILTER.to_string());
-            if !filter_name_supported(&name) {
+        if !probe {
+            // Matching cost is filters x values x stored instances and the model bounds
+            // none of them, so the two request-controlled factors are capped here,
+            // before any work proportional to them is done.
+            let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+            if supplied_filters > MAX_FILTERS {
                 return Err(Scaffolded::invalid_parameter_value(format!(
-                    "The filter '{name}' is invalid"
+                    "The request carries {supplied_filters} filters, above the maximum \
+                     of {MAX_FILTERS}"
                 )));
             }
-            let values = filter.values.clone().unwrap_or_default();
-            if values.len() > MAX_FILTER_VALUES {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "The filter '{name}' carries {} values, above the maximum of \
-                     {MAX_FILTER_VALUES}",
-                    values.len()
-                )));
+            for filter in input.filters.iter().flatten() {
+                // An entry that names NO filter is still an entry the operation cannot use,
+                // and EC2 reports it by the name it has for an absent one
+                // ([`crate::state::UNNAMED_FILTER`]) rather than by an empty name, so the
+                // caller can see which entry was refused.
+                let name = filter
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| crate::state::UNNAMED_FILTER.to_string());
+                if !filter_name_supported(&name) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "The filter '{name}' is invalid"
+                    )));
+                }
+                let values = filter.values.clone().unwrap_or_default();
+                if values.len() > MAX_FILTER_VALUES {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "The filter '{name}' carries {} values, above the maximum of \
+                         {MAX_FILTER_VALUES}",
+                        values.len()
+                    )));
+                }
+                // A capped NUMBER of comparisons is not capped WORK: the matcher's cost
+                // is the product of the pattern's length and the value's, so the value's
+                // size is bounded here too, before any matching runs under the lock.
+                if let Some(oversize) = values
+                    .iter()
+                    .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+                {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "A value of the filter '{name}' carries {} bytes, above the \
+                         maximum of {MAX_FILTER_VALUE_BYTES}",
+                        oversize.len()
+                    )));
+                }
+                filters.push(CompiledFilter::new(name, values));
             }
-            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost
-            // is the product of the pattern's length and the value's, so the value's
-            // size is bounded here too, before any matching runs under the lock.
-            if let Some(oversize) = values
-                .iter()
-                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
-            {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "A value of the filter '{name}' carries {} bytes, above the \
-                     maximum of {MAX_FILTER_VALUE_BYTES}",
-                    oversize.len()
-                )));
-            }
-            filters.push(CompiledFilter::new(name, values));
         }
 
         if input.max_results.is_some_and(|max_results| max_results < MIN_MAX_RESULTS) {
@@ -306,10 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             require_decoded_instance_record(&store, &region, instance_id)?;
         }
 
-        // DryRun sits AFTER every parameter has been validated and every named
-        // instance resolved: the flag asks whether the request WOULD have succeeded,
-        // so one that would have been refused is refused with that reason instead.
-        if input.dry_run == Some(true) {
+        // The probe's own answer, now that the request's values have been read and every
+        // instance it named resolved: "if you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`). Nothing of the account is reported.
+        if probe {
             return Err(Scaffolded::dry_run_operation());
         }
 
