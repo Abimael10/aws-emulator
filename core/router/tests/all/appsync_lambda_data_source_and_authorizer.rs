@@ -663,6 +663,27 @@ pub(crate) async fn post_published_uri(
     body: &Value,
     fields: &[(&str, String)],
 ) -> (u16, Value) {
+    let served = post_published_served(case, graphql_uri, body, fields).await;
+    (served.status, served.document)
+}
+
+/// What a call on a published endpoint was ANSWERED: the status, the response HEAD — which is
+/// where the endpoint writes what a client correlates the answer by — and the document served.
+pub(crate) struct ServedResponse {
+    pub(crate) status: u16,
+    pub(crate) head: String,
+    pub(crate) document: Value,
+}
+
+/// [`post_published_uri`] answering the whole exchange rather than its status and document, for
+/// a suite that grades a RESPONSE FIELD as well: the socket client stays this one, so there is
+/// still one reading of how a client reaches a published GraphQL endpoint.
+pub(crate) async fn post_published_served(
+    case: &str,
+    graphql_uri: &str,
+    body: &Value,
+    fields: &[(&str, String)],
+) -> ServedResponse {
     let (authority, path) = published_parts(case, graphql_uri);
     let port: u16 = authority
         .rsplit_once(':')
@@ -704,7 +725,11 @@ pub(crate) async fn post_published_uri(
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a status line, got {head:?}"));
     let document = serde_json::from_str(payload).unwrap_or(Value::Null);
-    (status, document)
+    ServedResponse {
+        status,
+        head: head.to_string(),
+        document,
+    }
 }
 
 /// The authority and the path of a published URL — what a client dials and what it asks for.
