@@ -93,7 +93,7 @@ async fn provisioned(
 /// emulator's own: an `https` URL on one of [`OWN_HOSTS`] with the port its listener
 /// answers on, and never a name under AWS's own zone — which resolves to AWS
 /// production or to nothing on the machine the emulator runs on.
-fn own_address(label: &str, endpoint: &str) -> (String, u16) {
+pub(crate) fn own_address(label: &str, endpoint: &str) -> (String, u16) {
     let authority = endpoint.strip_prefix("https://").unwrap_or_else(|| {
         panic!("case {label:?}: the endpoint must be an https URL, got {endpoint:?}")
     });
