@@ -2235,23 +2235,70 @@ pub fn document_text(value: &Document) -> String {
     }
 }
 
-/// `value` as compact JSON text, with the levels this walk may still descend.
+/// `value` as compact JSON text, with the levels this walk may still descend — the text
+/// a CLIENT reads ([`document_text`]).
+fn document_json(value: &Document, budget: usize) -> String {
+    render_document(value, budget, json_number)
+}
+
+/// `value` as the CANONICAL text one value renders as and no other does, with the levels
+/// this walk may still descend — the text a request's identity is taken over
+/// ([`request_fingerprint`]).
+///
+/// It is compact JSON text with one difference: a number carries the JSON TYPE it was
+/// read as beside its digits ([`canonical_number`]), because the digits alone do not tell
+/// an integer from the float that equals it, while this crate's own notion of one value —
+/// `Document` equality, which is what a write compares a supplied value with the stored
+/// one by ([`same_value`]) — does.
+fn document_canonical(value: &Document, budget: usize) -> String {
+    render_document(value, budget, canonical_number)
+}
+
+/// A number as the JSON text that renders its value.
+fn json_number(number: &Number) -> String {
+    match number {
+        Number::PosInt(n) => n.to_string(),
+        Number::NegInt(n) => n.to_string(),
+        // Written by this crate's JSON writer, so a float keeps the decimal point that
+        // tells it from an integer (`1.0`, not the `1` its plain decimal text would be);
+        // JSON has no literal for a non-finite float, which is what `null` is here.
+        Number::Float(n) => ::serde_json::Number::from_f64(*n)
+            .map_or_else(|| "null".to_string(), |number| number.to_string()),
+    }
+}
+
+/// A number as the text [`document_canonical`] renders it: the JSON type it was read as,
+/// then its exact value.
+///
+/// The type is part of the text because the digits are not enough: the plain decimal text
+/// of an integer and of the float that equals it is the same text, so without the type two
+/// documents this crate holds as different values would render alike and a request
+/// carrying one would pass for a request carrying the other.
+fn canonical_number(number: &Number) -> String {
+    match number {
+        Number::PosInt(n) => format!("u{n}"),
+        Number::NegInt(n) => format!("i{n}"),
+        // `{:?}` writes the shortest text that reads back as this float, so the value is
+        // rendered exactly; `+ 0.0` first, so the negative zero — a float that EQUALS the
+        // zero it is written against — renders as that zero does.
+        Number::Float(n) => format!("f{:?}", n + 0.0),
+    }
+}
+
+/// `value` as compact JSON text with `number` rendering each number, with the levels this
+/// walk may still descend.
 ///
 /// Bounded by `budget` so the recursion cannot exhaust the stack on a caller-supplied
 /// document; a create or update already refused anything deeper than
 /// [`MAX_DETAILS_DEPTH`], so the exhausted arm is unreachable for a stored document.
-fn document_json(value: &Document, budget: usize) -> String {
+fn render_document(value: &Document, budget: usize, number: fn(&Number) -> String) -> String {
     let Some(next) = budget.checked_sub(1) else {
         return "null".to_string();
     };
     match value {
         Document::Null => "null".to_string(),
         Document::Bool(flag) => flag.to_string(),
-        Document::Number(number) => match number {
-            Number::PosInt(n) => n.to_string(),
-            Number::NegInt(n) => n.to_string(),
-            Number::Float(n) => n.to_string(),
-        },
+        Document::Number(value) => number(value),
         Document::String(text) => {
             // `serde_json` is this crate's JSON writer; a string is the one scalar that
             // needs escaping.
@@ -2260,7 +2307,7 @@ fn document_json(value: &Document, budget: usize) -> String {
         Document::Array(items) => {
             let rendered: Vec<String> = items
                 .iter()
-                .map(|item| document_json(item, next))
+                .map(|item| render_document(item, next, number))
                 .collect();
             format!("[{}]", rendered.join(","))
         }
@@ -2272,7 +2319,7 @@ fn document_json(value: &Document, budget: usize) -> String {
                     format!(
                         "{}:{}",
                         ::serde_json::Value::String(name.clone()),
-                        document_json(member, next)
+                        render_document(member, next, number)
                     )
                 })
                 .collect();
@@ -2431,7 +2478,13 @@ pub fn same_value<T: FingerprintValue>(stored: &T, supplied: &T) -> bool {
 /// each as the document the request supplied for it ([`fingerprint_value`]) or `None`
 /// when the request omitted it. An omitted member is left out of the digest, so omitting
 /// a member and supplying one never fingerprint alike, and the rendering is canonical
-/// ([`document_json`] sorts an object's members), so two spellings of one request agree.
+/// ([`document_canonical`] sorts an object's members), so two spellings of one request
+/// agree.
+///
+/// What the rendering is canonical FOR is the identity: one value renders as one text, and
+/// two values this crate holds as different values ([`same_value`]) render as different
+/// texts — which is why it is [`document_canonical`] and not the JSON text a client reads,
+/// where a number's digits alone would let an integer stand for the float that equals it.
 ///
 /// A member the operation CANONICALISES on the way into the store is passed as the value
 /// it stores rather than as the text it was written with — an identifier as the record it
@@ -2449,7 +2502,7 @@ pub fn request_fingerprint(members: Vec<(&str, Option<Document>)>) -> String {
         .collect();
     // One level deeper than a stored document may nest, so the wrapper object below
     // cannot cost the deepest member of a document the handlers already accepted.
-    let canonical = document_json(&Document::Object(supplied), MAX_DETAILS_DEPTH + 1);
+    let canonical = document_canonical(&Document::Object(supplied), MAX_DETAILS_DEPTH + 1);
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 

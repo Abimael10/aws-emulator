@@ -20,8 +20,9 @@
 //! operation is replayed (`CreateBenefitApplication`, `UpdateBenefitApplication`,
 //! `AmendBenefitApplication`, `CancelBenefitApplication`, `RecallBenefitApplication`),
 //! which member of the request differs, and HOW it differs — a changed scalar, a changed
-//! document, a member added, a member dropped, a list grown, a list reordered, and an
-//! identifier naming a resource that does not exist.
+//! document, a document value of a different JSON TYPE (an integer and the float that
+//! equals it included), a member added, a member dropped, a list grown, a list reordered,
+//! and an identifier naming a resource that does not exist.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::IDEMPOTENT_PARAMETER_MISMATCH;
@@ -528,6 +529,278 @@ async fn every_token_carrying_write_refuses_a_spent_token_for_a_different_reques
         assert_eq!(
             after_replay, after_first,
             "case {case:?}: the replay must change nothing, expected {after_first:?}, got {after_replay:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A document value's JSON type is part of the request
+// ---------------------------------------------------------------------------
+
+/// A JSON number parsed from the text a request carries, for a form `json!` has no
+/// literal of its own for (`1e1`).
+fn number(text: &str) -> Value {
+    let value: Value = serde_json::from_str(text)
+        .unwrap_or_else(|error| panic!("{text:?} must parse as JSON: {error}"));
+    assert!(
+        value.is_number(),
+        "{text:?} must parse as a JSON number, got {value:?}"
+    );
+    value
+}
+
+/// Every number a document holds, as `f64`.
+///
+/// What a round-trip read is compared by: the wire carries a number's VALUE, and a JSON
+/// writer is free to write one value with or without a decimal point, so the text the
+/// reader reports is not what the assertion is about.
+fn numbers(document: &Value) -> Vec<f64> {
+    match document {
+        Value::Number(value) => value.as_f64().into_iter().collect(),
+        Value::Array(items) => items.iter().flat_map(numbers).collect(),
+        Value::Object(members) => members.values().flat_map(numbers).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One placement of the number under test: its name, and the document it builds around
+/// that number.
+type Placement = (&'static str, fn(&Value) -> Value);
+
+/// Where in a `BenefitApplicationDetails` document the number under test sits, since the
+/// rule is about the document's VALUES and holds wherever one of them is a number.
+///
+/// `RequestedAmount` is a field the seeded `BenefitRequestSchema`s declare as a JSON
+/// `number` (`state::SEEDED_BENEFITS`), and every form below is a number, so both
+/// requests of a row satisfy the requested benefit's schema and the only difference
+/// between them is the number itself.
+const PLACEMENTS: [Placement; 3] = [
+    ("a top-level member", |value| {
+        json!({ "RequestedAmount": value })
+    }),
+    ("a member of a nested object", |value| {
+        json!({ "Breakdown": { "RequestedAmount": value } })
+    }),
+    ("an element of an array", |value| {
+        json!({ "Installments": [value] })
+    }),
+];
+
+/// The pairs of numbers two requests differ by, each with whether they are the SAME value:
+/// `false` is a different request, which a spent token is refused for, and `true` is the
+/// same request, which it replays.
+///
+/// A number's JSON type is part of its value here, as it is in the value the service
+/// stores and compares a later write against: an integer and the float that equals it are
+/// different values, while one float written two ways — including the negative zero, which
+/// EQUALS zero — is one value.
+fn number_pairs() -> Vec<(&'static str, Value, Value, bool)> {
+    vec![
+        (
+            "an integer and the float that equals it",
+            json!(1),
+            json!(1.0),
+            false,
+        ),
+        (
+            "a negative integer and the float that equals it",
+            json!(-1),
+            json!(-1.0),
+            false,
+        ),
+        ("zero and the float zero", json!(0), json!(0.0), false),
+        (
+            "an integer and that value written with an exponent",
+            json!(10),
+            number("1e1"),
+            false,
+        ),
+        ("two different integers", json!(1), json!(2), false),
+        ("two different floats", json!(1.5), json!(2.5), false),
+        ("the same integer twice", json!(1), json!(1), true),
+        ("the same float twice", json!(1.0), json!(1.0), true),
+        (
+            "the float zero and the negative zero that equals it",
+            json!(0.0),
+            number("-0.0"),
+            true,
+        ),
+        (
+            "one float written plainly and with an exponent",
+            json!(1000.0),
+            number("1e3"),
+            true,
+        ),
+    ]
+}
+
+/// A create tells a document's number from a number of another JSON type that has the
+/// same digits: the second request is a DIFFERENT request, refused and creating nothing,
+/// while the same document under a fresh token is created and stored.
+#[tokio::test]
+async fn a_create_tells_a_number_from_another_number_of_the_same_digits() {
+    let harness = Harness::new();
+    let benefit_id = text("seed", &harness.active_benefit().await, "Id");
+
+    for (placement_index, (placement, build)) in PLACEMENTS.iter().enumerate() {
+        for (row, (difference, first_number, second_number, same_request)) in
+            number_pairs().iter().enumerate()
+        {
+            let case = format!("{difference}, at {placement}");
+            let token = format!("number-{placement_index}-{row}");
+            let request = |details: &Value, token: &str| {
+                json!({
+                    "Catalog": CATALOG,
+                    "ClientToken": token,
+                    "BenefitIdentifier": benefit_id,
+                    "Name": "numeric-identity",
+                    "BenefitApplicationDetails": details,
+                })
+            };
+            let second_details = build(second_number);
+
+            let first = harness
+                .create(&case, &request(&build(first_number), &token))
+                .await;
+            let before_ids = stored_ids(&harness, &case).await;
+            let (status, out) = harness
+                .call("CreateBenefitApplication", &request(&second_details, &token))
+                .await;
+
+            if *same_request {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the same request must replay the first answer, got {status} {out:?}"
+                );
+                assert_eq!(
+                    out, first,
+                    "case {case:?}: expected the first answer {first:?}, got {out:?}"
+                );
+            } else {
+                assert_mismatch(&case, status, &out);
+            }
+            assert_eq!(
+                stored_ids(&harness, &case).await,
+                before_ids,
+                "case {case:?}: a replayed or refused create must create nothing"
+            );
+
+            if *same_request {
+                continue;
+            }
+
+            // Under a FRESH token the refused request is one this service serves: it mints
+            // its own application and stores the document it carried, which is what the
+            // hollow replay dropped.
+            let fresh = harness
+                .create(
+                    &case,
+                    &request(
+                        &second_details,
+                        &format!("fresh-number-{placement_index}-{row}"),
+                    ),
+                )
+                .await;
+            assert_ne!(
+                fresh["Id"], first["Id"],
+                "case {case:?}: a fresh token must mint a new application, got {fresh:?}"
+            );
+            let stored = harness.get(&case, &text(&case, &fresh, "Id")).await;
+            assert_eq!(
+                numbers(&stored["BenefitApplicationDetails"]),
+                numbers(&second_details),
+                "case {case:?}: expected the document {second_details:?} to be stored, got {:?}",
+                stored["BenefitApplicationDetails"]
+            );
+        }
+    }
+}
+
+/// The update path tells the same two documents apart: a spent token carrying the float
+/// where the first carried the integer is a different request, refused with nothing
+/// written — and the same document under a fresh token is a change the update applies,
+/// which is what moves the revision.
+#[tokio::test]
+async fn an_update_tells_a_number_from_another_number_of_the_same_digits() {
+    let harness = Harness::new();
+    let benefit_id = text("seed", &harness.active_benefit().await, "Id");
+
+    for (index, (placement, build)) in PLACEMENTS.iter().enumerate() {
+        let case = format!("an update whose number sits at {placement}");
+        let created = harness
+            .create(
+                &case,
+                &json!({
+                    "Catalog": CATALOG,
+                    "ClientToken": format!("update-seed-{index}"),
+                    "BenefitIdentifier": benefit_id,
+                    "Name": "numeric-identity",
+                }),
+            )
+            .await;
+        let id = text(&case, &created, "Id");
+        let revision = text(&case, &harness.get(&case, &id).await, "Revision");
+        let token = format!("update-spent-{index}");
+        let request = |details: &Value, revision: &str, token: &str| {
+            json!({
+                "Catalog": CATALOG,
+                "ClientToken": token,
+                "Identifier": id,
+                "Revision": revision,
+                "BenefitApplicationDetails": details,
+            })
+        };
+
+        let first_body = request(&build(&json!(1)), &revision, &token);
+        let first = harness
+            .ok(&case, "UpdateBenefitApplication", &first_body)
+            .await;
+        let after_first = harness.get(&case, &id).await;
+        let applied_revision = text(&case, &after_first, "Revision");
+        assert_ne!(
+            applied_revision, revision,
+            "case {case:?}: the first update must move the revision, got {after_first:?}"
+        );
+
+        let (status, out) = harness
+            .call(
+                "UpdateBenefitApplication",
+                &request(&build(&json!(1.0)), &revision, &token),
+            )
+            .await;
+        assert_mismatch(&case, status, &out);
+        let after_refusal = harness.get(&case, &id).await;
+        assert_eq!(
+            after_refusal, after_first,
+            "case {case:?}: a refused update must write nothing, expected {after_first:?}, got {after_refusal:?}"
+        );
+
+        // The identical request still replays what the first call reported.
+        let replay = harness
+            .ok(&case, "UpdateBenefitApplication", &first_body)
+            .await;
+        assert_eq!(
+            replay, first,
+            "case {case:?}: the identical request must replay the first answer {first:?}, got {replay:?}"
+        );
+
+        // The float document IS a change to the stored integer one, so under a fresh token
+        // the update applies it and the revision moves.
+        let applied = harness
+            .ok(
+                &case,
+                "UpdateBenefitApplication",
+                &request(
+                    &build(&json!(1.0)),
+                    &applied_revision,
+                    &format!("update-fresh-{index}"),
+                ),
+            )
+            .await;
+        assert_ne!(
+            applied["Revision"],
+            json!(applied_revision),
+            "case {case:?}: the float document must be applied and move the revision, got {applied:?}"
         );
     }
 }
