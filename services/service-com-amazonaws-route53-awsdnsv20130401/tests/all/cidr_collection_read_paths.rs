@@ -15,7 +15,11 @@
 //!    Each row is also read off the collection it names at the moment of the read, so a
 //!    listing taken after the account's holdings have MOVED reconciles by ARN to exactly
 //!    the collections the account holds then: a moved version counter under the same ARN,
-//!    no row for a collection that was deleted, a row for one created afterwards.
+//!    no row for a collection that was deleted, a row for one created afterwards. Because
+//!    that reconciliation is an INVARIANT rather than a property of any one account, the
+//!    last test of this file holds it over DRAWN accounts as well: how many collections
+//!    the account holds, each name and each version counter are drawn from a seeded
+//!    generator.
 //! 2. An existing collection ENUMERATES its blocks: `ListCidrBlocks` answers HTTP 200 with
 //!    a `CidrBlocks` container carrying one row per block the request selects, and no row
 //!    where it selects none — a location a change has emptied, a location the collection
@@ -43,6 +47,8 @@
 //! sibling CIDR-collection suites use, so what is asserted is the HTTP/restXml behaviour a
 //! Route 53 client sees.
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
@@ -1071,4 +1077,102 @@ async fn no_response_of_the_service_renders_an_arn_in_another_layout() {
          reported by nothing, got {rendered:?}; body {}",
         listed.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1 as an INVARIANT over drawn holdings
+// ---------------------------------------------------------------------------
+
+/// The seed the collection names, holding counts and version counters below are
+/// drawn from.
+///
+/// Fixed, and named in every case label, so a drawn account that fails is
+/// reproduced by re-running this suite rather than guessed at. Nothing of the
+/// draw leaves the process.
+const HOLDINGS_SEED: u64 = 0x5d2c_91ab_4e73_60f1;
+
+/// How many accounts are drawn: a bounded count, so this test stays as quick as
+/// the tables beside it.
+const ACCOUNTS_DRAWN: usize = 6;
+
+/// The most collections a drawn account holds. Small on purpose: the invariant is
+/// about each row being read off its own collection, which a handful of
+/// collections already exercises, and one page of the listing carries far more.
+const MOST_COLLECTIONS_HELD: usize = 4;
+
+/// The most changes a drawn collection's version counter has been moved by.
+const MOST_CHANGES_APPLIED: usize = 2;
+
+/// Draw a `Name` of the form `CollectionName` admits — `len 1..64, pattern
+/// ^[0-9A-Za-z_\-]+$` (smithy_query(query="shape",shape="CollectionName")).
+///
+/// `index` keeps the names of ONE account apart, because `Name` is "a unique
+/// identifier for the account that can be used to reference the collection from
+/// other API calls" (`CreateCidrCollection$Name`); the drawn half spans the
+/// length and the character classes the shape admits. The length stays inside
+/// what the shared create helper can reach, which derives the caller reference
+/// from the name (`create-<name>`) and `CidrNonce` is `len 1..64`.
+fn drawn_collection_name(rng: &mut StdRng, index: usize) -> String {
+    const CHARACTERS: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    let length = rng.random_range(1..=24usize);
+    let drawn: String = (0..length)
+        .map(|_| char::from(CHARACTERS[rng.random_range(0..CHARACTERS.len())]))
+        .collect();
+    format!("{index}_{drawn}")
+}
+
+#[tokio::test]
+async fn every_drawn_set_of_holdings_reconciles_to_the_listing_by_arn() {
+    // Rule 1 where it is an INVARIANT rather than a table: whatever collections
+    // an account holds, the listing reports each of them exactly once, keyed by
+    // the ARN of a Route 53 resource over that collection's own id — the region
+    // and the account fields empty — with the `Name` it was created under and the
+    // `Version` its counter stands at, and reports nothing else. Every account
+    // below is drawn (how many collections it holds, each name's length and
+    // characters, how many changes have moved each counter), so a row that is
+    // right for one shape of account only cannot pass.
+    let mut rng = StdRng::seed_from_u64(HOLDINGS_SEED);
+    for draw in 0..ACCOUNTS_DRAWN {
+        let router = router();
+        let collections = rng.random_range(1..=MOST_COLLECTIONS_HELD);
+        let mut held: Vec<ListedCollection> = Vec::new();
+        for index in 0..collections {
+            let name = drawn_collection_name(&mut rng, index);
+            let id = create_collection(&router, &name).await;
+            let changes = rng.random_range(0..=MOST_CHANGES_APPLIED);
+            for step in 0..changes {
+                let applied = change_collection(
+                    &router,
+                    &id,
+                    None,
+                    &change("east", PUT, &[&format!("198.51.100.{step}/32")]),
+                )
+                .await;
+                assert_eq!(
+                    applied.status, 200,
+                    "draw {draw} (seed {HOLDINGS_SEED:#x}), collection {name:?}: expected 200 \
+                     from ChangeCidrCollection, got {} with body {}",
+                    applied.status, applied.body
+                );
+            }
+            held.push(ListedCollection {
+                arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+                id,
+                name,
+                // "A sequential counter that Route 53 sets to 1 when you create a
+                // CIDR collection and increments by 1 each time you update
+                // settings for the CIDR collection."
+                version: (1 + changes).to_string(),
+            });
+        }
+        assert_listing_reconciles(
+            &router,
+            &format!(
+                "the {collections} drawn collection(s) of draw {draw} (seed {HOLDINGS_SEED:#x})"
+            ),
+            &held,
+        )
+        .await;
+    }
 }

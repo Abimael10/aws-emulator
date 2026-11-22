@@ -26,7 +26,11 @@
 //! every SELECTION the listing's own filters narrow it to, and over zones whose
 //! feature state differs, where a zone's held status reported as an empty
 //! container, filled from another zone's state, or reported for a zone that has
-//! none, would otherwise pass unnoticed.
+//! none, would otherwise pass unnoticed. Pairing a listed zone with its own
+//! statuses is an INVARIANT rather than a property of any one account, so the
+//! last test holds it over DRAWN accounts too: how many zones the account holds,
+//! each zone's name and which zones hold the feature on are drawn from a seeded
+//! generator.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness the sibling hosted-zone suites use, so what is asserted is the
@@ -35,6 +39,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
@@ -1592,5 +1598,121 @@ async fn the_zone_listing_reports_each_zones_own_fallback_posture() {
             row.configure.then_some(ACCELERATED_RECOVERY_ENABLED),
             row.read_fallback(),
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The listing's container as an INVARIANT over drawn accounts
+// ---------------------------------------------------------------------------
+
+/// The seed the drawn zones below — how many, their names and which hold the
+/// feature on — are drawn from.
+///
+/// Fixed, and named in every case label, so a drawn account that fails is
+/// reproduced by re-running this suite rather than guessed at. Nothing of the
+/// draw leaves the process.
+const DRAWN_ZONE_SEED: u64 = 0x3ab7_5e19_c204_8d6f;
+
+/// How many accounts are drawn: a bounded count, so this test stays as quick as
+/// the tables beside it.
+const ACCOUNTS_DRAWN: usize = 6;
+
+/// The most zones a drawn account holds. Small on purpose: the invariant is about
+/// each container being read off the zone it is serialised inside, which a
+/// handful of zones already exercises.
+const MOST_ZONES_HELD: usize = 4;
+
+/// Draw a zone name of one to three drawn labels under a fixed parent, each label
+/// of the letters and digits a DNS label admits.
+///
+/// `index` keeps the names of ONE account apart, so each listed zone pairs with
+/// exactly one drawn zone; the drawn half spans the label count and the label
+/// lengths a zone name is built from.
+fn drawn_zone_name(rng: &mut StdRng, index: usize) -> String {
+    const CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let labels: Vec<String> = (0..rng.random_range(1..=3usize))
+        .map(|_| {
+            (0..rng.random_range(1..=12usize))
+                .map(|_| char::from(CHARACTERS[rng.random_range(0..CHARACTERS.len())]))
+                .collect()
+        })
+        .collect();
+    format!("z{index}-{}.example.com", labels.join("."))
+}
+
+#[tokio::test]
+async fn the_listing_pairs_every_drawn_zone_with_its_own_fallback_posture() {
+    // The same rule as the tables above, as an INVARIANT over drawn accounts:
+    // whatever zones an account holds, the account-wide listing projects each of
+    // them with a `Features` container that is a STRUCTURE carrying THAT zone's
+    // own public-DNS fallback status — the off status for a zone nothing has
+    // turned the feature on for — so neither an empty container nor another
+    // zone's posture can pass. How many zones the account holds, each name's
+    // label count and label lengths, and which zones hold the feature on, are all
+    // drawn.
+    let mut rng = StdRng::seed_from_u64(DRAWN_ZONE_SEED);
+    for draw in 0..ACCOUNTS_DRAWN {
+        let (router, engine) = router_with_store();
+        let zones = rng.random_range(1..=MOST_ZONES_HELD);
+        let case = format!("the {zones} drawn zone(s) of draw {draw} (seed {DRAWN_ZONE_SEED:#x})");
+        let mut expected: Vec<Held> = Vec::new();
+        for index in 0..zones {
+            let name = drawn_zone_name(&mut rng, index);
+            let created = create_zone(&router, &name, &format!("drawn-{draw}-{index}"), "").await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?}: expected 201 from CreateHostedZone for {name:?}, got {} with \
+                 body {}",
+                created.status, created.body
+            );
+            // Whether the feature is on for this zone is drawn too, so the status
+            // the listing reports has to be read off the zone rather than
+            // answered as one constant for every row.
+            let fallback_on = rng.random_bool(0.5);
+            if fallback_on {
+                turn_fallback_on(&engine, &bare_zone_id(&created));
+            }
+            expected.push(Held {
+                name: canonical_name(&name),
+                fallback: Some(if fallback_on {
+                    PUBLIC_DNS_FALLBACK_ENABLED
+                } else {
+                    PUBLIC_DNS_FALLBACK_DISABLED
+                }),
+                // Nothing configures accelerated recovery on a drawn zone, so no
+                // zone of these accounts has a status for it.
+                accelerated: None,
+            });
+        }
+
+        let listed = call(&router, "GET", "/2013-04-01/hostedzone", "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200 from ListHostedZones, got {} with body {}",
+            listed.status, listed.body
+        );
+        let reported = zone_features(&case, &listed.body);
+        assert_eq!(
+            reported.len(),
+            expected.len(),
+            "case {case:?}: the listing must project the {} zone(s) the account holds, got {} \
+             of them; body {}",
+            expected.len(),
+            reported.len(),
+            listed.body
+        );
+        for (name, block) in &reported {
+            let held = expected
+                .iter()
+                .find(|held| &held.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the listing reported a zone {name:?} nothing created; \
+                         body {}",
+                        listed.body
+                    )
+                });
+            assert_zone_features(&case, held, block.as_deref());
+        }
     }
 }
