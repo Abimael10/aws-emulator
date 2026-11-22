@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrincipalThings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrincipalThings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrincipalThings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the things the principal the request names is attached to, read out of the ONE
+//! relation this service keeps of those attachments
+//! ([`crate::state::thing_principals`]) — the other direction of the listing
+//! `ListThingPrincipals` walks, over the same rows `AttachThingPrincipal` records. A PURE
+//! read, so a later caller sees exactly what this one did.
+//!
+//! The principal is resolved against this account's state the way every other reader and
+//! writer of a principal resolves one ([`crate::state::ComAmazonawsIotAwsiotserviceState::resolve_thing_principal`]):
+//! a value that is no principal ADDRESS at all is the modelled `InvalidRequestException`
+//! (400), and a well-formed address this account holds no principal under the modelled
+//! `ResourceNotFoundException` (404) — never an empty page standing in for "no such
+//! principal". The answer is `@paginated` on `nextToken`/`maxResults`, so one page carries
+//! at most as many thing names as the request asked for and `nextToken` is present exactly
+//! while the listing is truncated.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +158,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrincipalThings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPrincipalThingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrincipalThings"))
+        // `ctx` carries request metadata only; this operation needs none of it: every thing
+        // name this listing reports was recorded when the thing was registered.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPrincipalThingsErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `maxResults` is modelled `range 1..250` and documents no default
+        // (`smithy_query(query="operation",operation="ListPrincipalThings")`), so a request
+        // naming none gets the largest page the model admits. The clamp is defensive rather
+        // than load-bearing: a value outside the range is refused before this handler runs.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+            }) as usize;
+
+        let store = state.lock();
+
+        // The principal is the resource the listing is OF, so it is resolved against this
+        // account's state before any row is read: a value that is no principal ADDRESS at
+        // all is the modelled `InvalidRequestException` (400), and a well-formed address
+        // naming no principal this account holds the modelled `ResourceNotFoundException`
+        // (404) — the same two classes the attach and the detach of the relation answer,
+        // never an empty page standing in for "no such principal".
+        let resolved = match store.resolve_thing_principal(&input.principal) {
+            Ok(resolved) => resolved,
+            Err(crate::state::ThingPrincipalLookup::InvalidType) => {
+                return Err(ListPrincipalThingsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::invalid_principal_type_message(
+                            &input.principal,
+                        )),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::ThingPrincipalLookup::Missing) => {
+                return Err(ListPrincipalThingsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::listing_missing_principal_message(
+                            &input.principal,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The continuation token belongs to THIS principal's listing, so one issued for
+        // another principal is refused rather than resuming a position computed over a
+        // different row set.
+        let scope = listing_scope(&resolved.key);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        // One page of the relation read from the principal's end, through the paging every
+        // other listing of it uses: the marker names a POSITION in the listing's total
+        // order, so a page resumes where the last one ended.
+        let (page, next_token) = crate::state::page_of(
+            store.things_attached_to_principal(&resolved.key),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListPrincipalThingsOutput {
+            // `ThingNameList` carries no length constraint, so a principal attached to no
+            // thing answers with an EMPTY list rather than an absent member: "nothing is
+            // attached" is an answer, not a missing one.
+            things: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The LISTING a continuation token belongs to: the principal whose things it walks, keyed
+/// by the resource the principal names ([`crate::state::ThingPrincipal::key`]), so a token
+/// issued for one principal cannot resume another's listing and two ARNs of the same
+/// certificate name the same listing.
+fn listing_scope(principal_key: &str) -> String {
+    format!("things/{principal_key}")
+}
+
+/// The thing name a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400, "The
+/// request is not valid") when the token is not one this listing issued for THIS principal.
+///
+/// The decoding is the one every paginated listing of this service shares
+/// ([`crate::state::decode_page_marker`]) and every step of it is fallible on purpose: the
+/// token is caller-supplied, so nothing read out of it may panic the handler.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListPrincipalThingsError> {
+    crate::state::decode_page_marker(token, scope).ok_or_else(|| {
+        ListPrincipalThingsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    })
 }

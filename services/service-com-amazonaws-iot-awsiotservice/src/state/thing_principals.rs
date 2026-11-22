@@ -271,6 +271,21 @@ pub fn listing_missing_thing_message(thing_name: &str) -> String {
     )
 }
 
+/// How `ListPrincipalThings` states that the value it was asked for the things of names no
+/// principal this account holds.
+///
+/// The listing words the miss after the CALL that failed, the way the two writes of the
+/// relation and the listing from the thing's end do
+/// ([`ThingPrincipalRefusal::message`], [`listing_missing_thing_message`]): fixed text
+/// naming the action and the reason, with the principal the request carried as its only
+/// variable part, no account qualification and no trailing period.
+pub fn listing_missing_principal_message(principal: &str) -> String {
+    format!(
+        "Failed to list things for principal {principal} because the principal does not \
+         exist in your account"
+    )
+}
+
 /// Why a value bound where this service takes a thing principal names no principal of this
 /// account: the question the RELATION asks of the value, before any operation words it
 /// ([`ThingPrincipalRefusal`]).

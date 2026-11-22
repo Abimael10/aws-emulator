@@ -3279,9 +3279,9 @@ pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
 pub mod thing_principals;
 pub use thing_principals::{
     attached_principals_thing_deletion_message, invalid_principal_type_message,
-    listing_missing_thing_message, ResolvedThingPrincipal, ThingPrincipal,
-    ThingPrincipalAttachment, ThingPrincipalLookup, ThingPrincipalRefusal, ThingPrincipalWrite,
-    DEFAULT_THING_PRINCIPAL_TYPE, MAX_PRINCIPALS_PER_THING,
+    listing_missing_principal_message, listing_missing_thing_message, ResolvedThingPrincipal,
+    ThingPrincipal, ThingPrincipalAttachment, ThingPrincipalLookup, ThingPrincipalRefusal,
+    ThingPrincipalWrite, DEFAULT_THING_PRINCIPAL_TYPE, MAX_PRINCIPALS_PER_THING,
 };
 
 // What an UPDATE of a thing GROUP record changes — the properties the request carries,
