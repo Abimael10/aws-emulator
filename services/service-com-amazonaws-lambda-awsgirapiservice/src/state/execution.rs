@@ -167,6 +167,11 @@ mod aws_cloudfront;
 /// the input and output documents a JSON protocol carries.
 mod aws_sns;
 
+/// The Amazon SES half of it, for the same reason: the email service's own model declares
+/// `awsQuery` too, and it is what a handler that exists to mail — a scheduled report, a
+/// confirmation, an alert — hands its message to.
+mod aws_ses;
+
 /// The SECURITY TOKEN half of it, for the same reason: that service's model declares
 /// `awsQuery` too, and it is what a handler that chains roles assumes one through.
 mod aws_sts;

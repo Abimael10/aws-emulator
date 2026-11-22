@@ -171,6 +171,10 @@ pub enum Protocol {
     /// to a path and an XML document, built by the CloudFront client this crate holds
     /// ([`super::aws_cloudfront`]).
     CloudFrontRest,
+    /// Amazon SES's `awsQuery`: the same binding, for the EMAIL service a handler that exists
+    /// to mail hands its message to, built by the client this crate holds for it
+    /// ([`super::aws_ses`]).
+    SesQuery,
     /// Amazon SNS's `awsQuery`: the operation travels as an `Action` parameter of a
     /// form-encoded body with the input flattened into the parameters beside it, and the
     /// answer is an XML document — so the request is built, signed and parsed by the Amazon
@@ -213,6 +217,7 @@ impl Api {
             Protocol::RestJson(_)
             | Protocol::S3Rest
             | Protocol::CloudFrontRest
+            | Protocol::SesQuery
             | Protocol::SnsQuery
             | Protocol::StsQuery
             | Protocol::IamQuery
@@ -615,6 +620,28 @@ pub const APIS: &[Api] = &[
             query_compatible: false,
         },
         answer_model: Some(&SFN),
+    },
+    // `services/service-com-amazonaws-ses-simpleemailservice/smithy-model/
+    // com-amazonaws-ses-simpleemailservice.json`: awsQuery, sigv4Name `ses`, endpointPrefix
+    // `email`, sdkId `SES`. Its operations carry their input as the parameters of a
+    // form-encoded `Action` and answer an XML document rather than a JSON one, so the request
+    // is built by [`super::aws_ses`].
+    //
+    // MAILING is why a very large share of functions exist at all: a scheduled report, a
+    // sign-up confirmation or an alert is composed by a handler and handed to this service,
+    // which is the surface the AWS SDKs have published for it since 2010 and the one almost
+    // every existing handler mails through. A handler that cannot reach it cannot send at all,
+    // so no message id is ever issued and nothing downstream of a send happens.
+    Api {
+        sdk_token: "ses",
+        signing_name: "ses",
+        endpoint_prefix: "email",
+        model: Some(SES_MODEL),
+        protocol: Protocol::SesQuery,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_ses`]); none of them carries bytes.
+        answer_model: None,
     },
     // `services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/
     // com-amazonaws-sesv2-simpleemailservice-v2.json`: restJson1, sigv4Name `ses`,
@@ -1288,6 +1315,10 @@ pub(super) const APIGATEWAY_MODEL: &str = include_str!(
 pub(super) const APIGATEWAYMANAGEMENTAPI_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi/\
      smithy-model/com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi.json"
+);
+pub(super) const SES_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-ses-simpleemailservice/smithy-model/\
+     com-amazonaws-ses-simpleemailservice.json"
 );
 pub(super) const SESV2_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/\
@@ -2246,6 +2277,17 @@ impl AwsAccess {
                 )
                 .await
             }
+            Protocol::SesQuery => {
+                super::aws_ses::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                    self.trace_header.as_deref(),
+                )
+                .await
+            }
             Protocol::SnsQuery => {
                 super::aws_sns::call(
                     &self.callback,
@@ -2600,6 +2642,7 @@ async fn sent(
         // ([`AwsAccess::dispatched`]): no request to them is built here.
         Protocol::S3Rest
         | Protocol::CloudFrontRest
+        | Protocol::SesQuery
         | Protocol::SnsQuery
         | Protocol::StsQuery
         | Protocol::IamQuery
@@ -2983,6 +3026,13 @@ mod tests {
                 super::Protocol::CloudFrontRest => assert_eq!(
                     api.signing_name, "cloudfront",
                     "case {:?}: expected CloudFront's own signing name on its protocol entry",
+                    api.sdk_token
+                ),
+                // Amazon SES's `awsQuery`, the same way, in `super::super::aws_ses`.
+                super::Protocol::SesQuery => assert_eq!(
+                    api.signing_name, "ses",
+                    "case {:?}: expected the email service's own signing name on its protocol \
+                     entry",
                     api.sdk_token
                 ),
                 // Amazon SNS's `awsQuery`, the same way, in `super::super::aws_sns`.

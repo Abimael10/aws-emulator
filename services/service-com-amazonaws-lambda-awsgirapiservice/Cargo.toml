@@ -185,6 +185,13 @@ aws-sdk-cloudfront = { version = "1", default-features = false }
 # what it just handled, or SUBSCRIBES a queue to the topic it publishes to, is the shape that
 # needs it. Only the generated client is needed: the emulator supplies the transport.
 aws-sdk-sns = { version = "1", default-features = false }
+# The EMAIL service's model declares `awsQuery` too, so a handler's `boto3.client("ses")` call
+# is built, signed and parsed by this client (`state::execution::aws_ses`), over the same
+# in-process callback. A function that exists to MAIL — a scheduled report, a sign-up
+# confirmation, an alert — is the shape that needs it, which is the overwhelming majority of
+# handlers that send at all. Only the generated client is needed: the emulator supplies the
+# transport.
+aws-sdk-ses = { version = "1", default-features = false }
 # The security token service's model declares `awsQuery` too, so a handler's
 # `boto3.client("sts")` call is built, signed and parsed by this client
 # (`state::execution::aws_sts`), over the same in-process callback. A function that ASSUMES
@@ -420,6 +427,10 @@ service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # identity, configuration set and message a handler's calls produce are read back through
 # that service's own API, mounted beside lambda on ONE engine.
 service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
+# The same for Amazon SES (the 2010-12-01 API), the email service a handler's `ses` client
+# reaches: the identity a handler verifies and the message it sends are read back through that
+# service's own awsQuery API, mounted beside lambda on ONE engine.
+service-com-amazonaws-ses-simpleemailservice = { workspace = true }
 # The same for AWS IoT: the thing a handler's own `CreateThing`/`UpdateThing` registers is
 # read back through that service's own registry, with it mounted beside lambda on ONE engine.
 service-com-amazonaws-iot-awsiotservice = { workspace = true }
