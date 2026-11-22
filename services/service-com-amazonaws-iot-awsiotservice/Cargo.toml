@@ -127,8 +127,19 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a new
 # integration-test suite is a new file and nothing lists it.
 automod = { workspace = true }
-# `tokio::time` drives the tests' wait past a stream's activation transition.
-tokio = { workspace = true, features = ["time"] }# The rules-engine tests observe a rule's action where a client observes it, so the
+# `tokio::time` drives the tests' wait past a stream's activation transition; `net` and
+# `io-util` open the socket a device's own MQTT connection to the published data endpoint is
+# spoken over (`tests/all/data_endpoint_mqtt_transport.rs`).
+tokio = { workspace = true, features = ["time", "net", "io-util"] }
+# A device dials the published data endpoint with TLS as well as in the clear — the two
+# halves of that one address: `rustls` / `tokio-rustls` run the CLIENT side of the handshake
+# the core terminates, in process. TEST-ONLY.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
+# Amazon SQS, mounted beside IoT on one engine, so an `sqs` rule action's send is observed
+# where a client observes it: as a body that queue's own `ReceiveMessage` serves.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# The rules-engine tests observe a rule's action where a client observes it, so the
 # services a `kinesis` action reaches are mounted beside IoT on one engine: the data plane
 # a message is published through, the stream the record is written to, and the IAM store
 # the action's role lives in.
