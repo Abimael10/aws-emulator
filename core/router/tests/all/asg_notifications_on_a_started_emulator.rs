@@ -24,7 +24,9 @@
 //! This module carries NO test of its own: it is one LEG of
 //! [`crate::cfn_deployed_pipeline_on_a_started_emulator`], which calls it on the emulator
 //! that suite has already started. Starting the binary costs what starting the emulator
-//! costs, so the legs share one start rather than paying it twice.
+//! costs, so the legs share one start rather than paying it twice — and for that reason this
+//! leg ends by running the EVENT-BUS half of the same drain
+//! ([`crate::asg_lifecycle_events_on_a_started_emulator`]) on the emulator it was handed.
 
 use std::time::{Duration, Instant};
 
@@ -472,4 +474,11 @@ pub(crate) fn an_asg_notification_reaches_its_subscribed_queue(emulator: &Starte
              {activities:?}"
         );
     }
+
+    // The EVENT-BUS half of the same drain, on this same started emulator: the lifecycle steps a
+    // group takes are announced to the topics its notification configurations named AND onto the
+    // account's default event bus, so the leg that pins the bus half runs here rather than paying
+    // for a second start ([`crate::asg_lifecycle_events_on_a_started_emulator`]).
+    crate::asg_lifecycle_events_on_a_started_emulator::
+        asg_lifecycle_steps_reach_the_rules_naming_them(emulator);
 }
