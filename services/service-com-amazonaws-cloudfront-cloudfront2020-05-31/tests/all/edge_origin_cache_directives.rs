@@ -44,7 +44,11 @@ const ERROR: u16 = 502;
 /// which is unique per viewer request, is part of it — so the body says whether this answer came
 /// out of the edge cache or out of the origin. It imports nothing: the answer is the handler's own
 /// work.
-const HANDLER_SOURCE: &str = r#"
+///
+/// `pub(crate)` so the sibling suite that drives the same rule off a behaviour whose spans come
+/// from a CACHE POLICY ([`crate::edge_error_caching_under_a_cache_policy`]) stages the same origin
+/// rather than a copy of it.
+pub(crate) const HANDLER_SOURCE: &str = r#"
 def lambda_handler(event, context):
     headers = event.get("headers") or {}
     directives = {
@@ -121,7 +125,14 @@ fn config_xml(caller_reference: &str, origin: &str, min_ttl: u64) -> String {
 
 /// One VIEWER request through the edge: no credential, addressed to `domain`, which is what
 /// resolves the distribution. Answers the status and the body.
-async fn view(topology: &Topology, case: &str, domain: &str, path: &str) -> (u16, String) {
+///
+/// `pub(crate)` for the same sibling suite, whose rows read an answer the same way.
+pub(crate) async fn view(
+    topology: &Topology,
+    case: &str,
+    domain: &str,
+    path: &str,
+) -> (u16, String) {
     let request = ::http::Request::builder()
         .method("GET")
         .uri(path)
