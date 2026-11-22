@@ -157,11 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A cancellation asks for the job to BE cancelled, so a job whose run already
+        // stands in the status the cancellation drives it to is already in the asked-for
+        // state: the request is accepted and answered with the same empty success the
+        // first one gave, leaving the job exactly as it stood. That makes a retry — the
+        // second cancel an SDK or a teardown path sends — succeed rather than turn an
+        // accepted cancellation into a client error.
+        //
         // "Call GetExportJob with that ID until JobStatus is COMPLETED, FAILED, or
-        // CANCELLED": those are the statuses a run never leaves, so a job already in one
-        // has no run left to stop and the request is refused with the one input error
-        // this operation models — leaving that job exactly as it stood.
-        if job.status.is_terminal() {
+        // CANCELLED": the OTHER statuses a run never leaves are ones a cancellation
+        // cannot reach, so a job whose run ended in one of those has no run left to stop
+        // and the request is refused with the one input error this operation models.
+        if job.status.is_terminal() && job.status != crate::state::ExportJobStatus::Cancelled {
             let status = job.status;
             return Err(CancelExportJobErrorModeled::BadRequestException(
                 BadRequestException {
@@ -173,7 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A job still CREATED or PROCESSING is stopped here: its run reaches the
         // terminal `CANCELLED` status, never completes and writes no export file, which
-        // is what every later read of the job reports.
+        // is what every later read of the job reports. A job already CANCELLED is left
+        // exactly as it stood, so repeating the request changes nothing.
         job.cancel();
 
         // "An HTTP 200 response if the request succeeds": the response carries no

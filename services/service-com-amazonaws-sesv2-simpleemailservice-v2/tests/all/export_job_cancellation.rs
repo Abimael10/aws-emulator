@@ -15,10 +15,14 @@
 //!   export file and hands out no download URL;
 //! * `CANCELLED` is terminal: once a run is stopped, no transition the clock would
 //!   otherwise have owed it moves it on;
+//! * a cancellation of a job already in the status it drives the job to is accepted:
+//!   the request asks for a state the job is already in, so it answers the same empty
+//!   200 the first one did, however often it is repeated, and leaves the job as it
+//!   stood;
 //! * "Call GetExportJob with that ID until JobStatus is COMPLETED, FAILED, or
-//!   CANCELLED" — a job already in a status its run never leaves has nothing left to
-//!   stop, so the cancellation is refused with the modelled `BadRequestException` and
-//!   that job is left exactly as it stood;
+//!   CANCELLED" — a job whose run ended in one of the OTHER statuses it never leaves
+//!   has nothing a cancellation could do to it, so that cancellation is refused with the
+//!   modelled `BadRequestException` and the job is left exactly as it stood;
 //! * a `JobId` the account holds no export job for is the modelled `NotFoundException`;
 //! * reading a job never cancels it, and never moves its run on.
 //!
@@ -383,8 +387,8 @@ impl Ses {
     }
 }
 
-/// How this surface words the refusal of a cancellation of a run that has ended, with
-/// the status the job is in as its one variable part.
+/// How this surface words the refusal of a cancellation of a run that ended in a status
+/// a cancellation cannot reach, with the status the job is in as its one variable part.
 fn not_cancellable(status: &str) -> String {
     format!("Cannot cancel an export job that has a <{status}> status.")
 }
@@ -521,59 +525,118 @@ async fn a_cancelled_run_is_never_moved_on_by_the_clock() {
 }
 
 #[tokio::test]
-async fn cancelling_a_run_that_has_already_ended_is_refused() {
-    // The two statuses a run of this emulator never leaves: the one a finished run
-    // reaches, and the one a cancellation puts it in.
+async fn cancelling_a_run_that_ended_in_another_terminal_status_is_refused() {
+    // The status a finished run reaches: a cancellation cannot reach it, so a job that
+    // stands in it has nothing a cancellation could do to it.
     for row in JOB_ROWS {
         let ses = Ses::new();
 
-        let completed_case = format!("{}, already COMPLETED", row.case);
+        let case = format!("{}, already COMPLETED", row.case);
         let completed = ses.create(row).await;
-        ses.establish(&completed_case, &completed, Run::Completed)
-            .await;
+        ses.establish(&case, &completed, Run::Completed).await;
 
-        let cancelled_case = format!("{}, already CANCELLED", row.case);
-        let cancelled = ses.create(row).await;
-        ses.establish(&cancelled_case, &cancelled, Run::Processing)
-            .await;
-        let stopped = ses.cancel(&cancelled).await;
+        let reply = ses.cancel(&completed).await;
         assert_eq!(
-            stopped.status, 200,
-            "case {cancelled_case:?}: expected 200 from the first cancellation, got {} {:?}",
-            stopped.status, stopped.body
+            reply.status, 400,
+            "case {case:?}: expected 400 for a run that completed, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected the modelled input error, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            not_cancellable("COMPLETED"),
+            "case {case:?}: expected the refusal to name the status, got {:?}",
+            reply.message()
         );
 
-        for (case, job_id, status) in [
-            (&completed_case, &completed, "COMPLETED"),
-            (&cancelled_case, &cancelled, "CANCELLED"),
-        ] {
-            let reply = ses.cancel(job_id).await;
-            assert_eq!(
-                reply.status, 400,
-                "case {case:?}: expected 400 for a run that has ended, got {} {:?}",
-                reply.status, reply.body
-            );
-            assert_eq!(
-                reply.error_code(),
-                "BadRequestException",
-                "case {case:?}: expected the modelled input error, got {:?}",
-                reply.body
-            );
-            assert_eq!(
-                reply.message(),
-                not_cancellable(status),
-                "case {case:?}: expected the refusal to name the status, got {:?}",
-                reply.message()
-            );
+        // The refused request left the job exactly as it stood.
+        let read = ses.get(&completed).await;
+        assert_eq!(
+            read.text("JobStatus"),
+            "COMPLETED",
+            "case {case:?}: a refused cancellation changes nothing, got {:?}",
+            read.body
+        );
+        assert!(
+            ses.has_a_file(&completed),
+            "case {case:?}: a refused cancellation leaves the finished run's export file"
+        );
+    }
+}
 
-            // The refused request left the job exactly as it stood.
-            let read = ses.get(job_id).await;
-            assert_eq!(
-                read.text("JobStatus"),
-                status,
-                "case {case:?}: a refused cancellation changes nothing, got {:?}",
-                read.body
-            );
+#[tokio::test]
+async fn repeating_a_cancellation_is_accepted_and_changes_nothing() {
+    // Every job shape, each run state a first cancellation can act on, and several
+    // repeats: the second and later requests ask for a state the job is already in.
+    for row in JOB_ROWS {
+        for run in [Run::Created, Run::Processing] {
+            for repeats in [1_usize, 2, 5] {
+                let case = format!("{} from {}, {repeats} repeat(s)", row.case, run.status());
+                let ses = Ses::new();
+                let job_id = ses.create(row).await;
+                ses.establish(&case, &job_id, run).await;
+
+                let first = ses.cancel(&job_id).await;
+                assert_eq!(
+                    first.status, 200,
+                    "case {case:?}: expected 200 from the first cancellation, got {} {:?}",
+                    first.status, first.body
+                );
+
+                for round in 0..repeats {
+                    let again = ses.cancel(&job_id).await;
+                    assert_eq!(
+                        again.status, 200,
+                        "case {case:?}: repeat {round} must be accepted, got {} {:?}",
+                        again.status, again.body
+                    );
+                    // `CancelExportJobResponse` is empty, so an accepted cancellation
+                    // carries no member either time.
+                    assert_eq!(
+                        again.body, first.body,
+                        "case {case:?}: repeat {round} must answer what the first did, got {:?}",
+                        again.body
+                    );
+                    assert_eq!(
+                        again.error_code(),
+                        "",
+                        "case {case:?}: repeat {round} must name no error, got {:?}",
+                        again.body
+                    );
+                }
+
+                // The repeats left the stopped run exactly where the first cancellation
+                // put it: still CANCELLED, still with no completion instant and no file.
+                let read = ses.get(&job_id).await;
+                assert_eq!(
+                    read.text("JobStatus"),
+                    "CANCELLED",
+                    "case {case:?}: a repeated cancellation changes nothing, got {:?}",
+                    read.body
+                );
+                assert_eq!(
+                    read.body.get("CompletedTimestamp"),
+                    None,
+                    "case {case:?}: a stopped run never completed, got {:?}",
+                    read.body
+                );
+                assert!(
+                    !ses.has_a_file(&job_id),
+                    "case {case:?}: a stopped run must write no export file"
+                );
+                let cancelled = ses.list(json!({"JobStatus": "CANCELLED"})).await;
+                assert_eq!(
+                    cancelled.ids(),
+                    vec![job_id.clone()],
+                    "case {case:?}: expected the one cancelled job in the listing, got {:?}",
+                    cancelled.body
+                );
+            }
         }
     }
 }

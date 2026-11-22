@@ -129,14 +129,15 @@ pub fn export_job_not_found(job_id: &str) -> String {
 }
 
 /// How this service words `BadRequestException` for a request to cancel an export job
-/// whose run has already ended.
+/// whose run ended in a status a cancellation cannot reach.
 ///
-/// A cancellation stops a run that is still going; a run that has already reached a
-/// status it never leaves ([`ExportJobStatus::is_terminal`]) has nothing left to stop.
-/// The model documents no sentence for `BadRequestException`, so the fixed text is the
-/// one a recording of this surface answers this refusal with — the angle brackets around
-/// the status included — and its one variable part is the `JobStatus` the job is
-/// actually in, read from the stored job rather than from any one run.
+/// A cancellation stops a run that is still going, and a job already `CANCELLED` is
+/// already in the asked-for state, so only a run that ended in one of the OTHER statuses
+/// it never leaves ([`ExportJobStatus::is_terminal`]) has nothing a cancellation could
+/// do to it. The model documents no sentence for `BadRequestException`, so the fixed
+/// text is the one a recording of this surface answers this refusal with — the angle
+/// brackets around the status included — and its one variable part is the `JobStatus`
+/// the job is actually in, read from the stored job rather than from any one run.
 pub fn export_job_not_cancellable(status: ExportJobStatus) -> String {
     format!(
         "Cannot cancel an export job that has a <{}> status.",
@@ -258,9 +259,9 @@ impl ExportJobRecord {
     /// `CANCELLED` and never completes, so it writes no export file.
     ///
     /// A job whose run has already ended ([`ExportJobStatus::is_terminal`]) is left
-    /// exactly as it stood: there is nothing left to stop. `CancelExportJob` refuses
-    /// such a request before it gets here, so that guard is the same rule stated once
-    /// for every other caller rather than a second, differing one.
+    /// exactly as it stood: there is nothing left to stop. So stopping a job that is
+    /// already `CANCELLED` changes nothing at all, which is what makes a repeated
+    /// cancellation of one job indistinguishable from the first.
     pub fn cancel(&mut self) {
         if self.status.is_terminal() {
             return;
