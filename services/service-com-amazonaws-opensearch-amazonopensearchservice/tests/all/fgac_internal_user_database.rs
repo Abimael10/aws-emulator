@@ -31,6 +31,18 @@ use serde_json::{json, Value};
 use super::domain_lifecycle::{Answer, Emulator};
 use super::domain_rest_data_plane::{endpoint_of, error_type};
 
+/// The same configuration read from the OTHER end: not which users the database holds or
+/// what a role is worth, but whether the address the control plane PUBLISHED answers the
+/// configured master user's Basic credential once the domain reports itself up — and whether
+/// what it answers is computed from that domain's own record, over a set of engine releases
+/// and master credentials.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "fgac_internal_user_database/master_endpoint_on_each_engine_version.rs"]
+mod master_endpoint_on_each_engine_version;
+
 /// The master user every domain below is created with, and its password — the credentials
 /// `MasterUserOptions$MasterUserName`/`MasterUserPassword` name.
 ///
