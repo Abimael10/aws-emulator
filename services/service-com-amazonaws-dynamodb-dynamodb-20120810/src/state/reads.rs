@@ -13,7 +13,10 @@
 //! What such a read reports of the item and whether the key held one at all are two
 //! different facts: whether there is an item at the key decides whether anything is
 //! reported, and the projection decides only the CONTENTS of what is reported — the map
-//! with nothing in it, when it names no location of the item it was applied to.
+//! with nothing in it, when it names no location of the item it was applied to. The one
+//! exception is the shape a TRANSACTIONAL read reports its item through: `ItemResponse`
+//! carries that one optional member and nothing else, so the OBJECT is what states whether
+//! the element produced anything ([`item_response_item`]).
 //!
 //! A file of its own beside the item store rather than inside it, for the reason the
 //! other read modules are: this is about what one REQUEST reports, not about what the

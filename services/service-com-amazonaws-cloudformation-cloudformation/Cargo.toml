@@ -121,8 +121,9 @@ emulator-core-build-support = { workspace = true }
 # (`tests/all/main.rs`), so a new suite is a new file and nothing lists it.
 automod = { workspace = true }
 # URL-form-encodes the request bodies this crate's integration tests send (the encoder
-# behind the `url` crate), so no test suite hand-rolls a percent-encoder.
-form_urlencoded = "1"
+# behind the `url` crate), so no test suite hand-rolls a percent-encoder. The floor is the
+# release `url`'s own fix for RUSTSEC-2026-0592 requires, so both resolve together.
+form_urlencoded = "1.2.3"
 # The suites here deploy templates declaring resources of types `state::provisioning`
 # creates in the service that OWNS them, so those services are mounted beside
 # CloudFormation on the one engine the test router builds — the same shape

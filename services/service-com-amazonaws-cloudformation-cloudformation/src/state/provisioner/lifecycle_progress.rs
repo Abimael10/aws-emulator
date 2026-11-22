@@ -732,6 +732,12 @@ impl Provisioner {
             Self::RekognitionDataset => {
                 rekognition_dataset_removal(ctx, region, physical_resource_id).await
             }
+            // `DeleteCluster` answers with the cluster `DELETING` and Amazon EKS goes on
+            // serving reads of it in that status until the control plane is torn down, so the
+            // cluster is still there when the delete answers and the deletion is finished
+            // once that service no longer holds it
+            // ([`compute_and_developer_tools::eks_cluster_removal`]).
+            Self::EksCluster => eks_cluster_removal(ctx, region, physical_resource_id).await,
             _ => Ok(Removal::Gone),
         }
     }

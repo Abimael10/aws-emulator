@@ -211,6 +211,11 @@ pub(crate) const EKS_CLUSTER_ACTIVE: &str = "ACTIVE";
 /// The `Cluster$status` a created cluster starts in, which that create answers with.
 pub(crate) const EKS_CLUSTER_CREATING: &str = "CREATING";
 
+/// The `Cluster$status` a cluster whose delete Amazon EKS has ACCEPTED is reported in while
+/// the control plane is torn down: "the cluster stays in the DELETING status until the
+/// deletion completes" — the status [`eks_cluster_removal`] reads a still-pending removal in.
+pub(crate) const EKS_CLUSTER_DELETING: &str = "DELETING";
+
 /// The `AWS::EKS::Cluster` properties `CreateCluster` takes under its own member name, as
 /// (property, member) pairs — each a SCALAR of the declaration.
 ///
@@ -607,6 +612,33 @@ pub(crate) async fn delete_eks_cluster(
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether Amazon EKS has finished removing the cluster a stack deleted.
+///
+/// `DeleteCluster` does not take the cluster away while the caller waits: "Deletes an Amazon
+/// EKS cluster control plane" answers with the cluster in [`EKS_CLUSTER_DELETING`], and that
+/// service goes on serving `DescribeCluster` for it in that status until the tear-down
+/// finishes — so the resource is still there when the delete answers and the deletion is
+/// finished once Amazon EKS no longer holds the cluster. Which is what keeps a stack from
+/// reporting its cluster deleted — and from going on to delete the subnets and the role the
+/// control plane is still placed in and running as — while that cluster is still being torn
+/// down.
+pub(crate) async fn eks_cluster_removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    match read_eks_cluster(ctx, region, physical_resource_id).await? {
+        None => Ok(Removal::Gone),
+        Some(cluster) => Ok(Removal::Pending(
+            cluster
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or(EKS_CLUSTER_DELETING)
+                .to_string(),
+        )),
     }
 }
 
