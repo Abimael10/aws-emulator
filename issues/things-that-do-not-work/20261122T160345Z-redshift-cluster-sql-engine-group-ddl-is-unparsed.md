@@ -1,0 +1,43 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: redshift.redshift-get-cluster-credentials-outside-the-requested-dbgroup-is-denied-at-the-sql-layer
+Issue-Key: redshift.redshift-get-cluster-credentials-outside-the-requested-dbgroup-is-denied-at-the-sql-layer|_run_sql#21|AssertionError|assert described["Status"] == "FINISHED", (
+Issue-Commit: 4caa4cc5e4e99526db0f9a1110584524dc75eb12
+
+# redshift cluster SQL engine: group DDL is unparsed — CREATE GROUP is refused with a SQLite 'near "GROUP": syntax error', so no database group can exist for GetClusterCredentials' DbGroups (1 cause)
+
+> _Note: this issue was identified against the code base at commit `4caa4cc5e4e99526db0f9a1110584524dc75eb12`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ExecuteStatement
+
+## Description
+Replay of simparity-behavioral-aws-v1 against the emulated Redshift cluster SQL engine (redshift-data ExecuteStatement reaching a provisioned cluster) produced one net-new failure. This bundle carries ONE cause; it must be closed before submitting. The suite marked this check neither ALREADY FILED nor OWNED. Related but NOT covering it: open issues 20261029T193810Z-redshift-cluster-sql-engine-multi-statement-sql-refused.md (multi-statement Sql, SQLite error text, pg_user/stv_blocklist, COPY/ENCODE/INTERVAL), 20261114T083409Z-redshift-cluster-sql-engine-3-net-new-causes.md, 20261116T000944Z-redshift-cluster-sql-engine-2-net-new-causes.md, 20261122T064140Z-redshift-cluster-native-sql-endpoint-5-net-new.md and 20261122T064140Z-redshift-data-api-sql-engine-2-net-new.md — none of them names the group-DDL statement family (CREATE/DROP/ALTER GROUP, GRANT ... TO GROUP).
+
+=== Cause 1 of 1: CREATE GROUP <name> is a parser error, so Redshift database groups cannot be created at all ===
+AWS: recorded behavior only for the SQL text (no Smithy shape describes the SQL surface), corroborated by the model's own dependence on groups: Smithy com.amazonaws.redshift#GetClusterCredentialsMessage.DbGroups is documented as "A list of the names of existing database groups that the user named in DbUser will join for the current session" with the documented name constraints (1–64 characters, lowercase letters/digits/underscore/plus/dot/at/hyphen, first character a letter), and com.amazonaws.redshiftdata#ExecuteStatementInput.Sql is a @required StatementString the model does not restrict by statement kind. A Redshift database accepts the role/group DDL family: CREATE GROUP <group>, DROP GROUP <group>, ALTER GROUP <group> ADD USER "<user>", and GRANT USAGE ON SCHEMA <schema> TO GROUP <group> / GRANT SELECT ON <schema>.<table> TO GROUP <group>; each statement reaches DescribeStatement Status FINISHED and the group then exists as a grantable principal, so a DbGroups-scoped credential inherits exactly the privileges granted to that group and a user outside it is refused SQLSTATE 42501 with the PostgreSQL wording 'permission denied for schema <schema>' (fixed text; <schema> is the schema from the statement).
+Emulator: the submit is accepted but the statement goes terminal with Status='FAILED' and Error='near "GROUP": syntax error in CREATE GROUP <group> at offset 7' — the embedded engine's (SQLite's) parser wording, with the offset of the unrecognised keyword in the submitted text. The GROUP keyword is never tokenised in this position, so no database group can ever be created, and the statements that depend on one (GRANT ... TO GROUP, ALTER GROUP ... ADD USER, DROP GROUP) are unreachable behind it. Note the shape of the message is itself wrong twice over: real Redshift would not refuse this statement at all, and where it does refuse a statement it uses 'ERROR: syntax error at or near "<token>"' with SQLSTATE 42601, never SQLite's 'near "<token>": syntax error in <whole statement> at offset <n>'.
+Why: database groups are Redshift's standard authorization unit and the one GetClusterCredentials itself is built on — DbGroups names groups that must already exist. A client that provisions its schema's groups over the Data API (every bootstrap/migration script that grants schema and table privileges to a group) is told its DDL failed with a syntax error real Redshift never returns, so no group-scoped privilege model can be established and DbGroups scoping can never be observed or enforced.
+Fix: the cluster SQL engine's statement parser behind ExecuteStatement, plus the principal/privilege state it writes — tokenise and execute the group DDL family (CREATE GROUP / DROP GROUP / ALTER GROUP ADD|DROP USER) and the GRANT/REVOKE ... TO GROUP forms, record groups and their memberships as grantable principals, and have GetClusterCredentials' DbGroups and the SQL layer's privilege checks read that state. Diagnostics raised by the embedded engine must also be re-worded into Redshift's own text before being stored in the statement record's Error.
+Traces: redshift.redshift-get-cluster-credentials-outside-the-requested-dbgroup-is-denied-at-the-sql-layer.
+
+## Evidence
+Suite: simparity-behavioral-aws-v1 — total 50/70 (71.4%); redshift 19/32 (59%), 13 failed (12 of them OWNED by existing issues and skipped).
+
+Cause 1 — check_redshift_redshift_get_cluster_credentials_outside_the_requested_dbgroup_is_denied_at_the_sql_layer.py:388 (run) via :231 (_run_sql)
+  sequence: CreateCluster a single-node cluster in a private subnet group, wait 'available', then over redshift-data as the master user: ExecuteStatement(Sql="CREATE GROUP <group>")
+  expected: DescribeStatement Status 'FINISHED'; the group then exists so the follow-on CREATE SCHEMA / CREATE TABLE / INSERT / GRANT USAGE ON SCHEMA <schema> TO GROUP <group> / GRANT SELECT ON <schema>.<table> TO GROUP <group> all FINISH, a GetClusterCredentials(DbGroups=[<group>]) user reads the seeded row over the Postgres wire, and a user outside the group is refused SQLSTATE 42501 'ERROR:  permission denied for schema <schema>'
+  actual:   AssertionError: DATAPLANE_UNIMPLEMENTED: SQL 'CREATE GROUP sim2real_behav_dbg_group' did not FINISH: status='FAILED' error='near "GROUP": syntax error in CREATE GROUP sim2real_behav_dbg_group at offset 7'
+
+Fixed vs per-run parts of the observed message: 'near "' + token + '": syntax error in ' + statement + ' at offset ' + n is the emulator's (SQLite's) template; the group name sim2real_behav_dbg_group, the cluster id and the offset 7 are this run's values. The requirement is that the statement PARSES and FINISHES; where a statement genuinely is malformed, Redshift's text is 'ERROR: syntax error at or near "<token>"' (SQLSTATE 42601), with <token> taken from the submitted SQL.
+
+Model corroboration (services/service-com-amazonaws-redshift-redshiftserviceversion20121201/smithy-model/com-amazonaws-redshift-redshiftserviceversion20121201.json): GetClusterCredentialsMessage.DbGroups — 'A list of the names of existing database groups that the user named in DbUser will join for the current session, in addition to any group memberships for an existing user. If not specified, a new user is added only to PUBLIC.' plus the documented group-name constraints.
+
+## Steps to Reproduce
+1. Clone the repo and boot the emulator. CreateCluster a single-node Redshift cluster (DBName devdb, master user adminuser) with a cluster subnet group, and wait for ClusterStatus 'available'.
+2. Point a botocore redshift-data client at the emulator with ClusterIdentifier=<cluster> and DbUser=adminuser.
+3. execute_statement(Sql="CREATE GROUP dbg_group") and poll describe_statement -> expect Status 'FINISHED'; observe Status 'FAILED' with Error 'near "GROUP": syntax error in CREATE GROUP dbg_group at offset 7'.
+4. Then exercise the statements that depend on the group and are blocked behind it: CREATE SCHEMA s; CREATE TABLE s.t (id INT, v VARCHAR(16)); INSERT INTO s.t VALUES (1,'seed'); GRANT USAGE ON SCHEMA s TO GROUP dbg_group; GRANT SELECT ON s.t TO GROUP dbg_group; ALTER GROUP dbg_group ADD USER "<user>"; DROP GROUP dbg_group -> each must FINISH.
+5. Confirm the scoping the group exists for: get_cluster_credentials(ClusterIdentifier=<cluster>, DbUser=inuser, DbName=devdb, AutoCreate=True, DbGroups=['dbg_group']) can SELECT from s.t over the cluster's Postgres-wire endpoint, while a credential minted without DbGroups is refused SQLSTATE 42501 'ERROR:  permission denied for schema s', and adding the membership with ALTER GROUP restores the read.
+6. Re-replay every check id in trace_ids to confirm the fix.
