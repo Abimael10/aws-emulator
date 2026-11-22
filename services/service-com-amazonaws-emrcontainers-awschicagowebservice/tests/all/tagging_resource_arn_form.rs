@@ -9,14 +9,15 @@
 //! AWS SDK client.
 //!
 //! The rule under test: the three `/tags/{resourceArn}` operations validate the resource
-//! REFERENCE they are given, so a `resourceArn` that does not resolve to a resource this
-//! endpoint holds — outside the `RsiArn` length or pattern the model declares, naming
-//! another partition, account or region, naming a resource path none of this service's
-//! resource ARNs take, or naming a resource that is not stored — is refused as invalid
-//! input: HTTP 400, the modelled `ValidationException`, and ONE fixed sentence with nothing
-//! of the request in it. It is never worded as the identifier-bearing refusal an operation
-//! that names its resource by id answers with ([`crate::not_found_message`] holds that
-//! class), and a reference that does resolve is served.
+//! REFERENCE they are given, and the layer in front of them refuses one it cannot act on —
+//! outside the `RsiArn` length or pattern the model declares, naming another partition,
+//! account or region, naming a resource path none of this service's resource ARNs take, or
+//! naming a resource that is not stored — as a bad request about the value it was handed:
+//! HTTP 400, that layer's own error code, and ONE fixed sentence with nothing of the request
+//! in it. It is never worded as the identifier-bearing refusal an operation that names its
+//! resource by id answers with ([`crate::not_found_message`] holds that class), never
+//! carried under one of the shapes the three operations model, and a reference that does
+//! resolve is served.
 //!
 //! The tables span what the rule generalises over: which of the three operations is called,
 //! which part of the reference puts it outside the set (the whole envelope, the partition,
@@ -36,20 +37,22 @@ use crate::resource_tag_removal::{
 };
 use crate::virtual_cluster_job_run_loop::{text, Answer, Emr, REGION};
 
-/// The class an invalid request is refused in: the `ValidationException` all three tagging
-/// operations model (smithy_query: operations `TagResource`, `UntagResource`,
-/// `ListTagsForResource`).
-const INVALID_REQUEST: &str = "ValidationException";
+/// The class the resource-tagging layer in front of this service refuses a resource
+/// reference it cannot act on in: a bad request about the value it was handed, under that
+/// layer's own code rather than one of the shapes the three operations model (smithy_query:
+/// operations `TagResource`, `UntagResource`, `ListTagsForResource` declare only
+/// `InternalServerException`, `ResourceNotFoundException` and `ValidationException`).
+pub(crate) const UNUSABLE_RESOURCE_ARN_CODE: &str = "BadRequestException";
 
 /// AWS's sentence for a `resourceArn` that is not the ARN of an EMR on EKS resource,
 /// written here as the service must emit it: FIXED text, so the expectation is the sentence
 /// itself and not a format string.
-const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
+pub(crate) const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
 
 /// `RsiArn` is `len 60..500` (smithy_query: operation `TagResource`, member `resourceArn`),
 /// so these are the published bounds a value is held to before any lookup.
-const ARN_MIN_CHARS: usize = 60;
-const ARN_MAX_CHARS: usize = 500;
+pub(crate) const ARN_MIN_CHARS: usize = 60;
+pub(crate) const ARN_MAX_CHARS: usize = 500;
 
 /// The shortest envelope `RsiArn`'s pattern admits:
 /// `arn:aws:emr-containers:{region}:{12 digits}:/virtualclusters/` with a one-character
@@ -60,11 +63,11 @@ const SHORTEST_ENVELOPE: &str = "arn:aws:emr-containers:a:123456789012:/virtualc
 
 /// A twelve-digit account id that is not this endpoint's, the form `RsiArn`'s pattern
 /// admits.
-const OTHER_ACCOUNT: &str = "111122223333";
+pub(crate) const OTHER_ACCOUNT: &str = "111122223333";
 
 /// An ARN-shaped value of exactly `characters` characters: the pattern's shortest envelope
 /// with a cluster-id segment sized to the bound under test.
-fn shaped_arn_of_length(characters: usize) -> String {
+pub(crate) fn shaped_arn_of_length(characters: usize) -> String {
     format!(
         "{SHORTEST_ENVELOPE}{}",
         "a".repeat(characters - SHORTEST_ENVELOPE.len())
@@ -80,7 +83,7 @@ fn minted_prefix() -> String {
 
 /// An ARN this endpoint really mints, of exactly `characters` characters, for a cluster id
 /// nothing holds: a row AT a published bound rather than near it.
-fn minted_arn_of_length(characters: usize) -> String {
+pub(crate) fn minted_arn_of_length(characters: usize) -> String {
     state::virtual_cluster_arn(REGION, &"a".repeat(characters - minted_prefix().len()))
 }
 
@@ -99,7 +102,7 @@ fn row(case: &str, resource_arn: String) -> ArnCase {
 }
 
 /// What each of the three `/tags/{resourceArn}` operations answered for one value.
-async fn answers(emr: &Emr, resource_arn: &str) -> Vec<(&'static str, Answer)> {
+pub(crate) async fn answers(emr: &Emr, resource_arn: &str) -> Vec<(&'static str, Answer)> {
     let path = format!("/tags/{}", encoded(resource_arn));
     vec![
         ("ListTagsForResource", emr.send("GET", &path, None).await),
@@ -115,12 +118,12 @@ async fn answers(emr: &Emr, resource_arn: &str) -> Vec<(&'static str, Answer)> {
     ]
 }
 
-/// Hold one value to the rule at all three operations: HTTP 400, the modelled
-/// `ValidationException`, the one fixed sentence, and no part of the request inside it.
+/// Hold one value to the rule at all three operations: HTTP 400, the tagging layer's own
+/// code, the one fixed sentence, and no part of the request inside it.
 async fn assert_invalid_arn(emr: &Emr, row: &ArnCase) {
     for (operation, answer) in answers(emr, &row.resource_arn).await {
         let case = format!("{operation}, {}", row.case);
-        answer.refused(&case, 400, INVALID_REQUEST);
+        answer.refused(&case, 400, UNUSABLE_RESOURCE_ARN_CODE);
         let message = text(&answer.body, "/message", &case);
         assert_eq!(
             message, INVALID_RESOURCE_ARN,

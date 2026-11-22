@@ -164,6 +164,21 @@ impl TaggingRefusal {
         }
     }
 
+    /// The refusal of `class` in the SENTENCE the front door that answered it states.
+    ///
+    /// The code, the status and the shape are the layer's — they are what a client branches
+    /// on, and two services answering the layer must not differ in them — while a family of
+    /// services fronted by one layer may word a class in its own fixed text. The sentence is
+    /// still FIXED: it is a `&'static str` of the caller's, so nothing of the request can be
+    /// interpolated into it here either.
+    #[must_use]
+    pub fn worded(class: &'static TaggingRefusalClass, message: &'static str) -> Self {
+        Self {
+            class,
+            message: message.to_string(),
+        }
+    }
+
     /// The refusal of an ARN naming no resource of the serving service.
     #[must_use]
     pub fn not_found() -> Self {

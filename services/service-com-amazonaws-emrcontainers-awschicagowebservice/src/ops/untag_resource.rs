@@ -8,11 +8,13 @@
 //! endpoint mints names a virtual cluster or a resource under one — and the keys are
 //! removed from the ONE tag set that resource's own record holds, so the next read of the
 //! resource (through `DescribeVirtualCluster` or `DescribeJobRun`) reports what is left. A
-//! `resourceArn` that does not resolve to a resource this endpoint holds — outside the
-//! modelled `RsiArn` constraint, naming another partition, account or region, naming a
-//! resource path the model does not declare, or naming a resource that is not stored — is
-//! refused with the modelled `ValidationException` carrying
-//! [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`].
+//! `resourceArn` that does not resolve to a resource this endpoint holds — naming another
+//! partition, account or region, naming a resource path the model does not declare, or
+//! naming a resource that is not stored — is refused by the layer this shared route is
+//! answered by, under ITS code and with
+//! [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`] ([`crate::state::TaggingError`]), the
+//! same class a value the modelled `RsiArn` constraint itself rejects is refused in at the
+//! boundary ([`crate::state::resource_arn_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -90,32 +92,32 @@ pub enum UntagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// (`crate::ops::untag_resource::UntagResourceError`). The modeled enum travels through the
+/// scaffold wrapper, and beside it the one refusal of this shared route that no shape of
+/// this model declares ([`crate::state::TaggingError`]).
+pub type UntagResourceError = crate::state::TaggingError<UntagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(modeled).into()
     }
 }
 
-/// This operation's ONE refusal of a `resourceArn` that does not resolve to a resource this
-/// endpoint holds — an ARN it does not mint, or one it does whose resource is not stored.
+/// This operation's ONE refusal of a `resourceArn` that satisfies the modelled `RsiArn`
+/// constraint and still resolves to no resource this endpoint holds — an ARN it does not
+/// mint, or one it does whose resource is not stored.
 ///
-/// The modelled `ValidationException` carrying the class's own fixed sentence
-/// ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]), so the two places this handler refuses
-/// a reference, and the boundary's own refusal of one outside the `RsiArn` constraint
-/// ([`crate::state::resource_arn_refusal`]), cannot drift into different wordings.
-fn invalid_resource_arn() -> UntagResourceError {
-    UntagResourceErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
-    })
-    .into()
+/// A reference the constraint admits is the tagging layer's to refuse: it carries the one
+/// fixed sentence that layer words this refusal with, under the layer's OWN code
+/// ([`crate::state::TaggingError`]) rather than one of the two 400 shapes this operation
+/// models, so a caller branching on either of those does not catch a reference this
+/// endpoint cannot act on. The value the constraint itself rejects is the boundary's
+/// ([`crate::state::resource_arn_refusal`]) and is refused in the same class there.
+fn unusable_resource_arn() -> UntagResourceError {
+    UntagResourceError::unusable_resource_arn()
 }
 
 /// The `UntagResource` operation.
@@ -154,12 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UntagResourceError::Modeled(UntagResourceErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the virtual cluster store is unavailable".to_string()),
-                },
-            ))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| -> Self::Error {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the virtual cluster store is unavailable".to_string()),
+            })
+            .into()
         })?;
         let region = crate::state::request_region(ctx);
 
@@ -172,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of this service ever has.
         let Some(resource) = crate::state::endpoint_tagged_resource(&region, &input.resource_arn)
         else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         let mut state = store.lock();
@@ -183,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved in the region this request is signed for: an ARN that names a resource
         // of another region is not this endpoint's to untag.
         let Some(tags) = state.resource_tags_mut(&region, &resource, &input.resource_arn) else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         // Remove exactly the keys the request names and keep every other tag. A key the

@@ -41,8 +41,8 @@ pub(crate) const REGION: &str = "us-west-2";
 /// What one call answered.
 ///
 /// `pub(crate)` because this suite's HTTP harness is the one the other suites in this
-/// test binary drive the service through too (`tests/all.rs` compiles them all into one
-/// crate), so there is a single request path under test rather than one copy per suite.
+/// test binary drive the service through too (`tests/all/main.rs` compiles them all into
+/// one crate), so there is a single request path under test rather than one copy per suite.
 pub(crate) struct Answer {
     pub(crate) status: u16,
     /// The error shape restJson1 names in `x-amzn-errortype`.

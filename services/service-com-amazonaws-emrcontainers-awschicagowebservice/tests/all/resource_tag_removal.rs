@@ -414,12 +414,16 @@ struct ArnCase {
     code: &'static str,
 }
 
+/// The code the resource-tagging layer in front of this service refuses a reference it
+/// cannot act on under ([`crate::tagging_resource_arn_form`] pins that class).
+const UNUSABLE_RESOURCE_ARN_CODE: &str = "BadRequestException";
+
 /// RULE: a `resourceArn` that does not resolve to a resource this endpoint holds — outside
 /// the modelled `RsiArn` constraint, naming another partition, account or region, naming a
 /// resource path none of the forms this service's resource ARNs declare, or naming a
-/// resource that is not stored — is an invalid resource reference: HTTP 400 with the
-/// modelled `ValidationException`, writing nothing
-/// ([`crate::tagging_resource_arn_form`] pins its wording).
+/// resource that is not stored — is refused by the layer in front of these three operations
+/// as a bad request about the value it was handed: HTTP 400 under that layer's code, writing
+/// nothing ([`crate::tagging_resource_arn_form`] pins its wording).
 #[tokio::test]
 async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
     let emr = Emr::new();
@@ -436,34 +440,34 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
         ArnCase {
             case: "a virtual cluster ARN naming no cluster",
             resource_arn: state::virtual_cluster_arn(REGION, unknown),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a job run ARN naming no run under a real cluster",
             resource_arn: state::job_run_arn(REGION, &cluster, unknown),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a real job run id under a cluster that does not exist",
             resource_arn: state::job_run_arn(REGION, unknown, &run),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a managed endpoint ARN, a resource form nothing stores yet",
             resource_arn: state::managed_endpoint_arn(REGION, &cluster, unknown),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "the cluster's own id in another region",
             resource_arn: state::virtual_cluster_arn("eu-west-1", &cluster),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "the cluster's own id in another account",
             resource_arn: format!(
                 "arn:aws:emr-containers:{REGION}:111122223333:/virtualclusters/{cluster}"
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "the cluster's own id in another partition",
@@ -471,7 +475,7 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
                 "arn:aws-us-gov:emr-containers:{REGION}:{}:/virtualclusters/{cluster}",
                 engine::emulator_account_id()
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a sub-resource type this service does not model",
@@ -479,7 +483,7 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
                 "arn:aws:emr-containers:{REGION}:{}:/virtualclusters/{cluster}/widgets/w1",
                 engine::emulator_account_id()
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a job run path with no job run id",
@@ -487,12 +491,12 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
                 "arn:aws:emr-containers:{REGION}:{}:/virtualclusters/{cluster}/jobruns",
                 engine::emulator_account_id()
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a job run path carrying an extra segment",
             resource_arn: format!("{}/extra", state::job_run_arn(REGION, &cluster, &run)),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a cluster id segment carrying a character no resource ARN admits",
@@ -500,7 +504,7 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
                 "arn:aws:emr-containers:{REGION}:{}:/virtualclusters/{cluster}_1",
                 engine::emulator_account_id()
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
         ArnCase {
             case: "a cluster id segment that is empty",
@@ -508,7 +512,7 @@ async fn an_untag_call_on_an_arn_that_names_no_resource_is_refused() {
                 "arn:aws:emr-containers:{REGION}:{}:/virtualclusters//jobruns/{run}",
                 engine::emulator_account_id()
             ),
-            code: "ValidationException",
+            code: UNUSABLE_RESOURCE_ARN_CODE,
         },
     ];
 

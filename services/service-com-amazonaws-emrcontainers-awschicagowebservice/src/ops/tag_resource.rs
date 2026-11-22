@@ -10,11 +10,14 @@
 //! the resource does not carry is added, a key it already carries takes the new value, and
 //! every key the request does not name is left as it was, so the next read of the resource
 //! (through `DescribeVirtualCluster` or `DescribeJobRun`) reports the merged set. A
-//! `resourceArn` that does not resolve to a resource this endpoint holds — outside the
-//! modelled `RsiArn` constraint, naming another partition, account or region, naming a
-//! resource path the model does not declare, or naming a resource that is not stored — is
-//! refused with the modelled `ValidationException` carrying
-//! [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]; and a merge that would leave the resource
+//! `resourceArn` that does not resolve to a resource this endpoint holds — naming another
+//! partition, account or region, naming a resource path the model does not declare, or
+//! naming a resource that is not stored — is refused by the layer this shared route is
+//! answered by, under ITS code and with
+//! [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`] ([`crate::state::TaggingError`]),
+//! while a value the modelled `RsiArn` constraint itself rejects keeps the
+//! `ValidationException` the boundary answers ([`crate::state::resource_arn_refusal`]); and
+//! a merge that would leave the resource
 //! holding more than [`crate::state::MAX_RESOURCE_TAGS`] tags with `ValidationException`,
 //! writing nothing.
 //!
@@ -102,32 +105,32 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`). The modeled enum travels through the
+/// scaffold wrapper, and beside it the one refusal of this shared route that no shape of
+/// this model declares ([`crate::state::TaggingError`]).
+pub type TagResourceError = crate::state::TaggingError<TagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(modeled).into()
     }
 }
 
-/// This operation's ONE refusal of a `resourceArn` that does not resolve to a resource this
-/// endpoint holds — an ARN it does not mint, or one it does whose resource is not stored.
+/// This operation's ONE refusal of a `resourceArn` that satisfies the modelled `RsiArn`
+/// constraint and still resolves to no resource this endpoint holds — an ARN it does not
+/// mint, or one it does whose resource is not stored.
 ///
-/// The modelled `ValidationException` carrying the class's own fixed sentence
-/// ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]), so the two places this handler refuses
-/// a reference, and the boundary's own refusal of one outside the `RsiArn` constraint
-/// ([`crate::state::resource_arn_refusal`]), cannot drift into different wordings.
-fn invalid_resource_arn() -> TagResourceError {
-    TagResourceErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
-    })
-    .into()
+/// A reference the constraint admits is the tagging layer's to refuse: it carries the one
+/// fixed sentence that layer words this refusal with, under the layer's OWN code
+/// ([`crate::state::TaggingError`]) rather than one of the two 400 shapes this operation
+/// models, so a caller branching on either of those does not catch a reference this
+/// endpoint cannot act on. The value the constraint itself rejects is the boundary's
+/// ([`crate::state::resource_arn_refusal`]) and keeps its own class.
+fn unusable_resource_arn() -> TagResourceError {
+    TagResourceError::unusable_resource_arn()
 }
 
 /// The `TagResource` operation.
@@ -185,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `/virtualclusters/.+` path no resource of this service ever has.
         let Some(resource) = crate::state::endpoint_tagged_resource(&region, &input.resource_arn)
         else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         let mut state = store.lock();
@@ -196,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved in the region this request is signed for: an ARN that names a resource
         // of another region is not this endpoint's to tag.
         let Some(tags) = state.resource_tags_mut(&region, &resource, &input.resource_arn) else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         // How big the merged set would be: the keys the resource already holds that this

@@ -10,10 +10,12 @@
 //! the same one `DescribeVirtualCluster`, `DescribeJobRun` and `DescribeManagedEndpoint`
 //! report. A resource carrying no tags answers an empty `tags` map, which is a different
 //! answer from a resource that is not there. A `resourceArn` that does not resolve to a
-//! resource this endpoint holds — outside the modelled `RsiArn` constraint, naming another
-//! partition, account or region, naming a resource path the model does not declare, or
-//! naming a resource that is not stored — is refused with the modelled
-//! `ValidationException` carrying [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`].
+//! resource this endpoint holds — naming another partition, account or region, naming a
+//! resource path the model does not declare, or naming a resource that is not stored — is
+//! refused by the layer this shared route is answered by, under ITS code and with
+//! [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`] ([`crate::state::TaggingError`]), the
+//! same class a value the modelled `RsiArn` constraint itself rejects is refused in at the
+//! boundary ([`crate::state::resource_arn_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -96,7 +98,7 @@ pub enum ListTagsForResourceErrorModeled {
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+pub type ListTagsForResourceError = crate::state::TaggingError<ListTagsForResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -104,22 +106,22 @@ pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForRes
 /// this operation is implemented.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::scaffolded::Scaffolded::Modeled(modeled).into()
     }
 }
 
-/// This operation's ONE refusal of a `resourceArn` that does not resolve to a resource this
-/// endpoint holds — an ARN it does not mint, or one it does whose resource is not stored.
+/// This operation's ONE refusal of a `resourceArn` that satisfies the modelled `RsiArn`
+/// constraint and still resolves to no resource this endpoint holds — an ARN it does not
+/// mint, or one it does whose resource is not stored.
 ///
-/// The modelled `ValidationException` carrying the class's own fixed sentence
-/// ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]), so the two places this handler refuses
-/// a reference, and the boundary's own refusal of one outside the `RsiArn` constraint
-/// ([`crate::state::resource_arn_refusal`]), cannot drift into different wordings.
-fn invalid_resource_arn() -> ListTagsForResourceError {
-    ListTagsForResourceErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
-    })
-    .into()
+/// A reference the constraint admits is the tagging layer's to refuse: it carries the one
+/// fixed sentence that layer words this refusal with, under the layer's OWN code
+/// ([`crate::state::TaggingError`]) rather than one of the two 400 shapes this operation
+/// models, so a caller branching on either of those does not catch a reference this
+/// endpoint cannot act on. The value the constraint itself rejects is the boundary's
+/// ([`crate::state::resource_arn_refusal`]) and is refused in the same class there.
+fn unusable_resource_arn() -> ListTagsForResourceError {
+    ListTagsForResourceError::unusable_resource_arn()
 }
 
 /// The `ListTagsForResource` operation.
@@ -177,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of this service ever has.
         let Some(resource) = crate::state::endpoint_tagged_resource(&region, &input.resource_arn)
         else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         let mut state = store.lock();
@@ -187,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle();
 
         let Some(tags) = state.resource_tags(&region, &resource, &input.resource_arn) else {
-            return Err(invalid_resource_arn());
+            return Err(unusable_resource_arn());
         };
 
         // Always a map, empty for a resource that holds no tags: an absent `tags` would

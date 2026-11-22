@@ -56,6 +56,9 @@ base64 = "0.22"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares every `tests/all/<name>.rs` as a suite of the one integration-test target, so a
+# new suite is a new file and nothing else.
+automod = { workspace = true }
 # Reads the certificate `CreateManagedEndpoint` generated for a managed endpoint back as
 # X.509 — its subject, its subject alternative names and its validity window — so the
 # suite asserts the member carries a real certificate rather than text that looks like

@@ -41,6 +41,11 @@ const REGION_PAIRS: [(&str, &str); 4] = [
     ("ca-central-1", "eu-central-1"),
 ];
 
+/// The code the resource-tagging layer in front of this service refuses a resource
+/// reference it cannot act on under — an ARN of another region among them
+/// ([`crate::tagging_resource_arn_form`] pins that class).
+const UNUSABLE_RESOURCE_ARN_CODE: &str = "BadRequestException";
+
 /// `POST /virtualclusters` — `CreateVirtualCluster`.
 async fn create_cluster(emr: &Emr, region: &str, body: Value) -> Answer {
     emr.send_in(region, "POST", "/virtualclusters", Some(body))
@@ -225,9 +230,10 @@ struct ReadCase {
 /// RULE, reading: a resource is described only at the endpoint of the region that created
 /// it, the ARN it reports names that region, and offering its id to another region's
 /// endpoint is the modelled `ResourceNotFoundException` (HTTP 400) — the answer for a
-/// resource that is not there. A read that names the resource by its ARN is refused there
-/// as an invalid resource reference instead, because an ARN of another region is not one
-/// that endpoint mints at all ([`crate::tagging_resource_arn_form`] pins that class).
+/// resource that is not there. A read that names the resource by its ARN is refused there by
+/// the layer in front of the tagging route instead, under that layer's own code, because an
+/// ARN of another region is not one that endpoint mints at all
+/// ([`crate::tagging_resource_arn_form`] pins that class).
 ///
 /// The rows span every resource class that has a reader, including `ListTagsForResource`,
 /// which resolves an ARN rather than an id.
@@ -283,7 +289,7 @@ async fn a_resource_is_read_only_at_the_endpoint_of_the_region_that_created_it()
                 path: format!("/tags/{}", encoded(&fixture.cluster_arn(home))),
                 pointer: "/tags",
                 carries_arn: false,
-                code: "ValidationException",
+                code: UNUSABLE_RESOURCE_ARN_CODE,
             },
         ];
 
@@ -491,17 +497,18 @@ async fn a_cross_region_mutate_is_refused_and_leaves_the_resource_as_it_was() {
                 method: "POST",
                 path: format!("/tags/{}", encoded(&arn)),
                 body: Some(json!({"tags": {"team": "stolen"}})),
-                // An ARN of another region is not one this endpoint mints, which is an
-                // invalid resource reference rather than a resource that is missing here
+                // An ARN of another region is not one this endpoint mints, which the layer
+                // in front of the tagging route refuses under its own code, as a bad request
+                // about the reference rather than a resource that is missing here
                 // ([`crate::tagging_resource_arn_form`] pins that class).
-                code: "ValidationException",
+                code: UNUSABLE_RESOURCE_ARN_CODE,
             },
             MutateCase {
                 label: "UntagResource",
                 method: "DELETE",
                 path: format!("/tags/{}?tagKeys=team", encoded(&arn)),
                 body: None,
-                code: "ValidationException",
+                code: UNUSABLE_RESOURCE_ARN_CODE,
             },
         ];
 

@@ -55,9 +55,11 @@ const SECURITY_CONFIGURATION: &str = "Security Configuration";
 /// reports it (smithy_query: digest — the shape is `ResourceNotFoundException`, HTTP 400).
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The client error a call refused as INVALID is carried by, which the rule under test is
-/// NOT: it is the class the tagging operations below answer an unresolvable reference in.
-const INVALID_REQUEST: &str = "ValidationException";
+/// The code the resource-tagging layer in front of this service refuses a reference it
+/// cannot act on under, which the rule under test is NOT: it is the class the tagging
+/// operations below answer an unresolvable reference in
+/// ([`crate::tagging_resource_arn_form`] pins it).
+const UNUSABLE_RESOURCE_ARN_CODE: &str = "BadRequestException";
 
 /// The form under test, written once: the resource type, the identifier the request named
 /// the resource by, and nothing else.
@@ -399,9 +401,10 @@ async fn a_deleted_resource_is_reported_as_one_that_does_not_exist() {
 
 /// The rule's OTHER boundary, where the request names the resource by its own ARN rather
 /// than by an id: the three `/tags/{resourceArn}` operations validate the REFERENCE, so one
-/// that resolves to no resource of this endpoint is refused as an invalid reference — one
-/// fixed sentence naming nothing of the request ([`crate::tagging_resource_arn_form`] pins
-/// that class) — and never with the identifier-bearing wording this file holds.
+/// that resolves to no resource of this endpoint is refused by the layer in front of them —
+/// one fixed sentence naming nothing of the request, under that layer's own code
+/// ([`crate::tagging_resource_arn_form`] pins that class) — and never with the
+/// identifier-bearing wording this file holds.
 ///
 /// The rows span the three resource ARNs an `RsiArn` admits — a virtual cluster, a job run
 /// under one, a managed endpoint under one — across all three tagging operations.
@@ -446,7 +449,7 @@ async fn an_arn_naming_no_stored_resource_is_not_refused_in_this_wording() {
         ];
         for (case, method, path, body) in calls {
             let answer: Answer = emr.send(method, &path, body).await;
-            answer.refused(&case, 400, INVALID_REQUEST);
+            answer.refused(&case, 400, UNUSABLE_RESOURCE_ARN_CODE);
             let reported = text(&answer.body, "/message", &case);
             for identifier in [absent, arn.as_str()] {
                 assert_ne!(

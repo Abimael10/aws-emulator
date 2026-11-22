@@ -102,13 +102,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // wording.
         //
         // The one refusal this service words itself is an unusable `resourceArn`: the three
-        // tagging operations' `RsiArn` label is held to its modelled length and pattern
-        // here, before any handler runs, and this service reports a resource reference it
-        // cannot resolve as one fixed sentence in its modelled `ValidationException` — the
-        // same answer the handlers give a reference whose envelope is right but which names
-        // no resource they hold, so the boundary and the handlers cannot drift apart. Both
-        // the code and the message come from there: a client branches on the code, so a
-        // message without its matching code would be worse than leaving both alone.
+        // tagging operations share one route, answered by the resource-tagging layer in
+        // front of this service, and that layer refuses a resource reference it cannot act
+        // on with its OWN code and one fixed sentence. `RsiArn`'s modelled length and
+        // pattern are enforced here, before any handler runs, so a value the constraint
+        // rejects is answered the way the layer answers it — the same code and the same
+        // sentence the handlers give a reference the constraint admits that resolves to
+        // nothing ([`crate::state::TaggingError`]), so the two halves of one refusal class
+        // cannot drift apart. Both the code and the message come from there: a client
+        // branches on the code, so a message without its matching code would be worse than
+        // leaving both alone.
         crate::state::resource_arn_refusal(refusal)
     }
 

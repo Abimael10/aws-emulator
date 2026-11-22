@@ -70,6 +70,12 @@ pub use container_cluster_admission::*;
 mod spent_client_token;
 pub use spent_client_token::*;
 
+/// The error channel the three `/tags/{resourceArn}` operations answer through, and the
+/// class the tagging layer in front of them refuses a resource reference it cannot act on
+/// in.
+mod tagging_front_door;
+pub use tagging_front_door::*;
+
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
 /// `emr-containers`), e.g.
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}`.
@@ -1225,18 +1231,16 @@ pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 /// take ([`endpoint_tagged_resource`]), or it is one this endpoint does mint and the
 /// resource it names is not stored.
 ///
-/// The three `/tags/{resourceArn}` operations report that whole class as ONE refusal: the
-/// resource reference is what they validate, and a reference that resolves to nothing is an
-/// unusable reference rather than a resource the caller may wait for. That is why it is the
-/// class's own sentence of FIXED text, with nothing of the request interpolated into it, and
-/// not the identifier-bearing wording an operation that names its resource by ID answers
-/// with ([`ResourceKind::not_found_message`]).
+/// The three `/tags/{resourceArn}` operations word that whole class as ONE sentence under
+/// ONE code: the resource reference is what the tagging layer in front of them validates,
+/// and a reference it cannot act on is a bad request about the value it was handed rather
+/// than a resource the caller may wait for. That is why it is the class's own sentence of
+/// FIXED text, with nothing of the request interpolated into it, and not the
+/// identifier-bearing wording an operation that names its resource by ID answers with
+/// ([`ResourceKind::not_found_message`]) — and why the code it travels under is that
+/// layer's and not one of the shapes the three operations model
+/// ([`TaggingError::unusable_resource_arn`], [`resource_arn_refusal`]).
 pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
-
-/// The error class an unusable `resourceArn` is refused in: the modelled
-/// `ValidationException` all three tagging operations declare (smithy_query: operations
-/// `TagResource`, `UntagResource`, `ListTagsForResource`), at HTTP 400.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// How this service words a refusal the framework raised before any handler ran, for the
 /// one member it words itself: a tagging call's `resourceArn`.
@@ -1244,12 +1248,17 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `RsiArn`'s `@length` 60..500 and its `@pattern` are enforced at the boundary, so a
 /// `resourceArn` that is not even shaped like one of this service's resource ARNs never
 /// reaches a handler — and the framework's own envelope would report it as a generic
-/// constraint violation naming the member, the bound and the value. This service reports an
-/// unusable resource reference as [`INVALID_RESOURCE_ARN_MESSAGE`] instead, so the boundary
-/// refusal and the handlers' own ([`endpoint_tagged_resource`]) are the same sentence in the
-/// same error class however the reference failed.
+/// constraint violation naming the member, the bound and the value, under the modelled
+/// `ValidationException`. The tagging layer this route is answered by refuses an unusable
+/// resource reference itself, so this service answers that value the way the layer does:
+/// [`INVALID_RESOURCE_ARN_MESSAGE`] under [`UNUSABLE_RESOURCE_ARN_CODE`], the same sentence
+/// and the same code the handlers give a reference the constraint admits that resolves to
+/// nothing ([`TaggingError::unusable_resource_arn`]) — one class, however the reference
+/// failed, because a client branches on the code.
 ///
-/// `None` for every other refusal, which keeps the framework's wording.
+/// `None` for every other refusal, which keeps the framework's wording and its modelled
+/// class: a `tags` or `tagKeys` value outside its own constraint is the operation's to
+/// refuse, not the layer's.
 pub fn resource_arn_refusal(
     refusal: &::smithy_server_runtime::Refusal,
 ) -> Option<::smithy_server_runtime::Refused> {
@@ -1262,7 +1271,7 @@ pub fn resource_arn_refusal(
         .iter()
         .any(|violation| violation.path == RESOURCE_ARN_MEMBER)
         .then(|| ::smithy_server_runtime::Refused {
-            code: VALIDATION_EXCEPTION.to_string(),
+            code: UNUSABLE_RESOURCE_ARN_CODE.to_string(),
             message: INVALID_RESOURCE_ARN_MESSAGE.to_string(),
         })
 }
