@@ -50,10 +50,10 @@ use tokio::net::TcpStream;
 use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator, REGION};
 
 /// The interface the core binds a resource listener on by default, which is the
-/// interface every published bootstrap address resolves to on this machine: a broker
-/// host is published in the zone a resolver answers with that interface (RFC 6761
-/// reserves `localhost` and every name under it for it), so this is the address the
-/// dialling below opens its connection to.
+/// interface every published bootstrap address names on this machine: a broker host is
+/// published as an address of the interface the core bound the method's socket on, and
+/// every address of the loopback interface names that one interface, so this is the
+/// address the dialling below opens its connection to.
 pub(crate) const LOOPBACK: &str = "127.0.0.1";
 
 /// The client id every connection below identifies itself with.

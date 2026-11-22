@@ -85,10 +85,17 @@ pub const MAX_RECORDS_PER_PARTITION: usize = 4096;
 /// See [`MAX_RECORDS_PER_PARTITION`].
 pub const MAX_LOG_BYTES_PER_PARTITION: usize = 8 * 1024 * 1024;
 
-/// The most bytes one produced record's key and value may carry together: Apache
-/// Kafka's own `max.message.bytes` topic default (1048588), so a record this endpoint
-/// refuses is one a broker with the default configuration refuses too.
+/// The most bytes of record one produce may carry when nothing narrows it: the BROKER's
+/// own `message.max.bytes` ([`BROKER_CONFIG_DEFAULTS`]), which is Apache Kafka's
+/// documented default (1048588) and also the default of a topic's own
+/// `max.message.bytes` — so a batch this endpoint refuses is one a broker with the
+/// documented configuration refuses too.
 pub const MAX_RECORD_BYTES: usize = 1_048_588;
+
+/// The topic configuration key that says how large a record batch the topic takes:
+/// "The largest record batch size allowed by Kafka" ("Topic-Level Configs", Apache Kafka
+/// documentation: `max.message.bytes`).
+pub const MAX_MESSAGE_BYTES_CONFIG: &str = "max.message.bytes";
 
 /// Apache Kafka's documented topic-level configuration defaults, as
 /// `DescribeConfigs` reports them for a topic whose `Configs` does not set them
@@ -334,6 +341,29 @@ pub fn header_bytes(headers: &RecordHeaders) -> usize {
         .sum()
 }
 
+/// How large a record batch a topic running `configuration` takes: its own
+/// `max.message.bytes` ([`MAX_MESSAGE_BYTES_CONFIG`], "The largest record batch size
+/// allowed by Kafka").
+///
+/// The TOPIC's value stands as it is written: the broker's `message.max.bytes` is
+/// documented as the default that setting overrides ("This can be set per topic with the
+/// topic level max.message.bytes config"), so a topic that raises its own limit takes a
+/// batch the broker default alone would have refused, and one that narrows it refuses a
+/// batch the default would have taken. A configuration that states no number leaves the
+/// broker's own default standing ([`MAX_RECORD_BYTES`]).
+///
+/// The one ceiling over that is this endpoint's own: a batch is carried in a request
+/// frame, and no frame past [`MAX_FRAME_BYTES`] is read at all — a CHOSEN process-safety
+/// bound, not an Apache Kafka setting.
+#[must_use]
+pub fn max_message_bytes(configuration: &BTreeMap<String, String>) -> usize {
+    configuration
+        .get(MAX_MESSAGE_BYTES_CONFIG)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(MAX_RECORD_BYTES)
+        .min(MAX_FRAME_BYTES)
+}
+
 /// One ACCESS METHOD a cluster's brokers are reached over: the connection scheme a
 /// client picks, over the network it arrives on — the cluster's own brokers, their
 /// public (service-provided EIP) siblings, or their multi-VPC ones.
@@ -343,7 +373,8 @@ pub fn header_bytes(headers: &RecordHeaders) -> usize {
 /// [`super::PORT_SASL_IAM`] and their public and multi-VPC siblings), so each method is
 /// served here on a socket of its OWN and every node of the cluster is published on
 /// that socket's port: a bootstrap string's port says which method a client is
-/// reaching, and its host says which broker ([`addressing`]). What a method requires of
+/// reaching, and its host which broker — an address of the bound interface apiece
+/// ([`addressing::published_broker_host`]). What a method requires of
 /// a client is its scheme's: the plaintext one encrypts nothing, the TLS one encrypts
 /// and authenticates no client, and each SASL one requires the exchange its mechanism
 /// defines before anything else is served. The PORT a client dials is the core's, not
@@ -882,8 +913,8 @@ impl ComAmazonawsKafkaKafkaState {
     /// record carries.
     ///
     /// Refused for a topic the cluster does not hold, a partition the topic does not
-    /// have, and a record past [`MAX_RECORD_BYTES`] — the same conditions a broker
-    /// refuses a produce for.
+    /// have, and a batch past the topic's `max.message.bytes`
+    /// ([`max_message_bytes`]) — the same conditions a broker refuses a produce for.
     pub fn data_plane_produce(
         &mut self,
         cluster_arn: &str,
@@ -902,11 +933,23 @@ impl ComAmazonawsKafkaKafkaState {
         if partition < 0 || partition >= held.partition_count.clamp(1, MAX_PARTITIONS_PER_TOPIC) {
             return Err(PartitionRefusal::UnknownTopicOrPartition);
         }
+        // How large a batch this TOPIC takes, which is what the produce is measured
+        // against: the records of one produce travel as one record batch, so the bytes of
+        // the whole batch are compared with the limit — a single record past it carries the
+        // batch past it on its own. What is counted is the bytes the records THEMSELVES
+        // carry (key, value and headers), since that is what this endpoint holds; the
+        // batch's own framing adds tens of bytes on top of them, so a batch admitted here
+        // within a few dozen bytes of the limit is one Apache Kafka's own count could put
+        // just past it.
+        let limit = max_message_bytes(&configuration);
+        let mut batch = 0usize;
         for record in &records {
-            let size = record.key.as_ref().map_or(0, Vec::len)
-                + record.value.as_ref().map_or(0, Vec::len)
-                + header_bytes(&record.headers);
-            if size > MAX_RECORD_BYTES {
+            batch = batch.saturating_add(
+                record.key.as_ref().map_or(0, Vec::len)
+                    + record.value.as_ref().map_or(0, Vec::len)
+                    + header_bytes(&record.headers),
+            );
+            if batch > limit {
                 return Err(PartitionRefusal::MessageTooLarge);
             }
         }

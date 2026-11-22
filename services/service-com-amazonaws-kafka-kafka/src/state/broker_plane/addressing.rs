@@ -76,13 +76,11 @@ mod tests {
                 ::service_common::data_plane_addressing::is_host_shaped(&published),
                 "case {case:?}: a published broker host must be host-shaped, got {published:?}"
             );
-            for aws_zone in ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
-                assert!(
-                    !published.ends_with(aws_zone),
-                    "case {case:?}: a published broker host must name no zone of AWS's own \
-                     ({aws_zone}), got {published:?}"
-                );
-            }
+            assert!(
+                !::service_common::data_plane_addressing::addresses_an_aws_endpoint(&published),
+                "case {case:?}: a published broker host must name no zone of AWS's own, got \
+                 {published:?}"
+            );
         }
     }
 

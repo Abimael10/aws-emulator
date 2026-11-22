@@ -1099,10 +1099,11 @@ pub const MAX_RESULTS_LIMIT: i32 = 100;
 /// some other list cannot be mistaken for one of these.
 const CLUSTER_PAGE_TOKEN_PREFIX: &str = "kafka:clusters:";
 
-/// One broker node of a provisioned cluster: the DNS name clients reach it on,
+/// One broker node of a provisioned cluster: the DNS name Amazon MSK gives it,
 /// and the placement the service gave it when it joined the cluster.
-/// `GetBootstrapBrokers` renders every bootstrap string from these hosts, and
-/// `ListNodes` reports each node through [`Cluster::to_node_info`].
+/// `ListNodes` reports each node through [`Cluster::to_node_info`], and
+/// `GetBootstrapBrokers` publishes one address per node — the socket that node's
+/// access method is served on ([`broker_plane::ClusterEndpoint`]).
 #[derive(Debug, Clone)]
 pub struct BrokerNode {
     /// 1-based broker id, as it appears in the `b-<id>` DNS label.
@@ -2990,8 +2991,9 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// ARN, access method), and what `GetBootstrapBrokers` announces every broker node of
     /// that cluster at on it ([`broker_plane::ClusterEndpoint`]). One per access METHOD,
     /// shared by every broker node, because Amazon MSK publishes one port per method and
-    /// tells its nodes apart by their hosts. Opened on the first bootstrap read of a
-    /// cluster the registry HOLDS, bounded by
+    /// tells its nodes apart by their hosts — here an address of the bound interface
+    /// apiece, so every published pair leads back to this process. Opened on the first
+    /// bootstrap read of a cluster the registry HOLDS, bounded by
     /// [`broker_plane::MAX_CLUSTER_ENDPOINTS`] entries, and held for as long as that
     /// cluster is in the registry, so an announced address never moves under a client;
     /// dropped when the cluster is unregistered, which closes the port.

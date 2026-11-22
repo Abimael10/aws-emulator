@@ -136,11 +136,11 @@ async fn bootstrap_hosts(emulator: &Emulator, cluster_arn: &str, case: &str) -> 
         "case {case}: expected GetBootstrapBrokers to return 200, got {} {}",
         reply.status, reply.body
     );
-    let mut hosts = BTreeSet::new();
     let members = reply
         .body
         .as_object()
         .unwrap_or_else(|| panic!("case {case}: GetBootstrapBrokers returned {}", reply.body));
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
     for value in members.values() {
         let Some(text) = value.as_str() else { continue };
         for endpoint in text.split(',') {

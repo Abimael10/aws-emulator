@@ -13,6 +13,9 @@
 //! endpoint by swapping the port of one string for another method's builds an address this
 //! emulator really serves.
 //!
+//! Each of those hosts is an address of the interface this emulator answers on, since a
+//! client dials the pair it was handed verbatim.
+//!
 //! An `Ipv6` member is the same access method reached over another network layer — one
 //! broker endpoint whose record set gains AAAA entries — so it carries that method's own
 //! port and string rather than a port of its own.
@@ -224,6 +227,13 @@ async fn one_port_per_access_method_is_shared_by_every_broker_node() {
             for pair in pairs {
                 let (host, port) = split(pair, &probe);
                 ports.insert(port);
+                // A host a client is handed is a host it dials, so it names this
+                // emulator's own interface.
+                assert!(
+                    ::service_common::data_plane_addressing::names_the_loopback_interface(&host),
+                    "case {probe:?}: every published host must name this emulator's own \
+                     interface, got {pairs:?}"
+                );
                 assert!(
                     hosts.insert(host.clone()),
                     "case {probe:?}: a string must name each address it serves once, got \

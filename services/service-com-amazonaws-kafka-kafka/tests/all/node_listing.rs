@@ -78,20 +78,20 @@ fn instant_secs(case: &str, text: &str) -> i64 {
         .secs()
 }
 
-/// Every broker host a `GetBootstrapBrokers` answer names, with the per-path port
-/// stripped: the same endpoint set the node listing must report, since both
-/// readers render the same stored brokers.
+/// Every broker HOST a `GetBootstrapBrokers` answer names, with the per-method port
+/// stripped: the hosts a client would connect to, which must each be an address this
+/// emulator answers on.
 fn bootstrap_hosts(case: &str, reply: &Reply) -> BTreeSet<String> {
     assert_eq!(
         reply.status, 200,
         "case {case}: expected GetBootstrapBrokers to return 200, got {} {}",
         reply.status, reply.body
     );
-    let mut hosts = BTreeSet::new();
     let members = reply
         .body
         .as_object()
         .unwrap_or_else(|| panic!("case {case}: GetBootstrapBrokers returned {}", reply.body));
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
     for value in members.values() {
         let Some(text) = value.as_str() else { continue };
         for endpoint in text.split(',') {

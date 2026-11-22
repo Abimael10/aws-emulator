@@ -30,7 +30,14 @@ use crate::kafka_harness::{sleep_past_activation, ClusterRequest, Emulator};
 
 /// Every `host:port` pair of every bootstrap string the cluster `arn` publishes, member by
 /// member, in the order each string lists them.
-async fn published(emulator: &Emulator, arn: &str, case: &str) -> Vec<(String, Vec<String>)> {
+///
+/// `pub(crate)` because the suites that read a published pair share this one reading of the
+/// answer rather than each keeping a copy.
+pub(crate) async fn published(
+    emulator: &Emulator,
+    arn: &str,
+    case: &str,
+) -> Vec<(String, Vec<String>)> {
     let reply = emulator.bootstrap_brokers(arn).await;
     assert_eq!(
         reply.status, 200,
@@ -58,7 +65,9 @@ async fn published(emulator: &Emulator, arn: &str, case: &str) -> Vec<(String, V
 }
 
 /// The host and port one published pair spells, or a failure naming the pair that did not.
-fn split(pair: &str, case: &str) -> (String, u16) {
+///
+/// `pub(crate)` for the same reason as [`published`]: one reading of a pair, shared.
+pub(crate) fn split(pair: &str, case: &str) -> (String, u16) {
     let (host, port) = pair.rsplit_once(':').unwrap_or_else(|| {
         panic!("case {case:?}: {pair:?} is not a hostname:port pair")
     });
@@ -301,9 +310,8 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
             // an address the string publishes and on the port of the access method the
             // client dialled — so the client follows the answer to a broker it already
             // knows, over the method it is already using, rather than to an address nothing
-            // serves. The brokers of one access method share that port, so WHICH node
-            // answers a connection the operating system routed to it is not the client's
-            // choice, and the answer is the same for every pair of the string.
+            // serves. It is the SAME broker whichever pair of the string the client asked
+            // on: one group has one coordinator.
             let coordinator: ::kafka_protocol::messages::FindCoordinatorResponse = client
                 .call(
                     &probe,
