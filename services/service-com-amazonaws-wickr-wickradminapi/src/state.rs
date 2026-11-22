@@ -13,6 +13,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The bot accounts of a network: the record, the id minting and the view every
+/// operation that reports a bot answers from.
+mod bots;
+/// The password policy a security group imposes on the accounts created under it.
+mod password_policy;
+
+pub use bots::*;
+pub use password_policy::*;
+
 /// The first `networkId` a store mints.
 ///
 /// `NetworkId` is `^[0-9]{8}$` (exactly 8 digits), so ids run from 10000000 to
@@ -174,6 +183,14 @@ pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 /// of this account that is gone — the deletion `DeleteNetwork` initiated has
 /// happened. It names no id either.
 pub const NETWORK_GONE_MESSAGE: &str = "Network not found";
+
+/// The fixed text this API answers for a `groupId` naming no security group of
+/// the network the request named. It names no id either.
+pub const SECURITY_GROUP_GONE_MESSAGE: &str = "Security group not found";
+
+/// The fixed text this API answers for a `botId` naming no bot of the network the
+/// request named.
+pub const BOT_GONE_MESSAGE: &str = "Bot not found";
 
 /// How a `networkId` a request named resolves for the caller, which is what the
 /// admin API decides before it reports anything about the network behind it.
@@ -526,6 +543,9 @@ pub struct ComAmazonawsWickrWickradminapiState {
     pub users: BTreeMap<String, BTreeMap<String, UserRecord>>,
     /// Security groups by `networkId`, then by group id.
     pub security_groups: BTreeMap<String, BTreeMap<String, SecurityGroupRecord>>,
+    /// Bots by `networkId`, then by `botId`. A bot is an account of one network,
+    /// so it is keyed the way a user is and goes with the network.
+    bots: BTreeMap<String, BTreeMap<String, BotRecord>>,
     /// Network-level settings by `networkId`, for the networks something has been
     /// set on. A network with no entry here has every setting at the default a new
     /// network carries, which is why reporting its settings never has to create an
@@ -549,6 +569,8 @@ pub struct ComAmazonawsWickrWickradminapiState {
     minted_networks: u32,
     /// How many user ids this store has minted, with the same guarantee.
     minted_users: u64,
+    /// How many bot ids this store has minted, with the same guarantee.
+    minted_bots: u64,
     /// How many security group ids this store has minted for each `networkId`.
     /// Group ids are scoped to their network, so each network counts its own,
     /// and the count is monotonic so a deleted group's id is never reissued.
@@ -700,10 +722,7 @@ impl ComAmazonawsWickrWickradminapiState {
     ) -> crate::ops::types::SecurityGroup {
         crate::ops::types::SecurityGroup {
             active_members: clamp_to_i32(self.active_members_of(network_id, &record.group_id)),
-            // A bot is a member of a group only once a bot operation has created
-            // it under that group; this store holds no bot, so no bot is a member
-            // of any group in it.
-            bot_members: 0,
+            bot_members: clamp_to_i32(self.bot_members_of(network_id, &record.group_id)),
             // The GUID of the Active Directory group this one mirrors, which a
             // group has only when the network synchronizes with LDAP — nothing
             // here does, so no group mirrors one.
@@ -754,6 +773,7 @@ impl ComAmazonawsWickrWickradminapiState {
         // store knows nothing about.
         self.deleted_networks.insert(network_id.to_string());
         let removed_users = self.users.remove(network_id).unwrap_or_default();
+        self.bots.remove(network_id);
         self.security_groups.remove(network_id);
         self.minted_security_groups.remove(network_id);
         self.security_group_tokens.remove(network_id);
@@ -899,6 +919,22 @@ pub fn page_start(
 fn decode_page_token(token: &str) -> Option<usize> {
     let raw = ::hex::decode(token).ok()?;
     ::std::str::from_utf8(&raw).ok()?.parse::<usize>().ok()
+}
+
+/// Whether a stored value satisfies a filter a listing carries: an absent filter
+/// accepts anything, and a present one accepts only an equal stored value.
+///
+/// Shared by every listing that filters, so they cannot disagree about what a
+/// filter means.
+pub fn matches_filter(filter: Option<&str>, stored: Option<&str>) -> bool {
+    filter.is_none_or(|wanted| stored == Some(wanted))
+}
+
+/// `id` zero-padded to the 10 digits this service's numeric ids are at most
+/// (`UserId` and `BotId` are both len 1..10, `^[0-9]+$`), so comparing two keys as
+/// strings orders them by their numeric value.
+pub fn numeric_sort_key(id: &str) -> String {
+    format!("{id:0>10}")
 }
 
 /// One page of `items` starting at `start`, plus the token for the page after it

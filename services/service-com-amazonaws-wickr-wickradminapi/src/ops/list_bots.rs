@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the bots stored under the network the `networkId` label names, narrowed
+//! by whichever filters the request carries, in the order `sortFields` and
+//! `sortDirection` ask for, one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +178,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBotsErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        let start = crate::state::page_start(input.max_results, input.next_token.as_deref())
+            .map_err(|problem| refused(problem.field(), problem.reason()))?;
+
+        // `ListBotsRequest$sortFields` documents the accepted names as "'username',
+        // 'firstName', 'displayName', 'status', and 'groupId'" and that "multiple
+        // fields can be specified by separating them with '+'", so every name a
+        // request carries is resolved to the member it orders by and anything else is
+        // refused rather than silently ignored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBots"))
+        // A name already given orders the listing no further, so it is resolved once
+        // however many times the value repeats it. That also bounds the work one
+        // request can ask for: the keys the ordering below computes per bot are at
+        // most the fields this listing accepts, whatever the length of the value.
+        let requested_fields = input.sort_fields.as_deref().unwrap_or(DEFAULT_SORT_FIELD);
+        let mut named: Vec<&str> = Vec::new();
+        let mut keys: Vec<BotKey> = Vec::new();
+        for field in requested_fields.split(SORT_FIELD_SEPARATOR) {
+            let key = sort_key(field).ok_or_else(|| {
+                refused(
+                    "sortFields",
+                    format!(
+                        "sortFields must name one of {}, got {field}",
+                        SORTABLE_FIELDS.join(", ")
+                    ),
+                )
+            })?;
+            if named.contains(&field) {
+                continue;
+            }
+            named.push(field);
+            keys.push(key);
+        }
+
+        let store = state.lock();
+        // Bots exist only inside a network, so a `networkId` behind which there is no
+        // network — one this store never minted, or one whose network has been
+        // deleted — has no bots to report and is answered as the resource that
+        // "doesn't exist or has been deleted" rather than as an empty listing.
+        if !store.networks.contains_key(&input.network_id) {
+            return Err(
+                ListBotsErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
+                    message: Some(crate::state::NETWORK_GONE_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+        let mut records = store.bots_of(&input.network_id);
+        drop(store);
+
+        // Every filter the request carries narrows the stored set; a filter it omits
+        // narrows nothing.
+        records.retain(|bot| {
+            crate::state::matches_filter(input.username.as_deref(), Some(bot.username.as_str()))
+                && crate::state::matches_filter(
+                    input.display_name.as_deref(),
+                    bot.display_name.as_deref(),
+                )
+                && input.status.is_none_or(|status| status == bot.status)
+                && crate::state::matches_filter(
+                    input.group_id.as_deref(),
+                    Some(bot.group_id.as_str()),
+                )
+        });
+
+        // The bot id breaks a tie on any other key, so the order is total and two
+        // pages of the same listing cannot interleave. Each record's key is computed
+        // once, not once per comparison.
+        records.sort_by_cached_key(|bot| {
+            (
+                keys.iter().map(|key| key(bot)).collect::<Vec<_>>(),
+                crate::state::numeric_sort_key(&bot.bot_id),
+            )
+        });
+        // `sortDirection` "Default is 'DESC'" (`ListBotsRequest$sortDirection`), so a
+        // listing that names no direction is descending and only an explicit `ASC`
+        // asks for the ascending order the comparison above produces.
+        if input.sort_direction.as_deref() != Some(crate::state::SORT_DIRECTION_ASC) {
+            records.reverse();
+        }
+
+        let (page, next_token) = crate::state::page(&records, start, input.max_results);
+        Ok(ListBotsOutput {
+            bots: page.iter().map(crate::state::bot_view).collect(),
+            next_token,
+        })
     }
+}
+
+/// The default `sortFields` value: a listing nobody ordered comes back by the name
+/// a bot is known by, which is the first field `ListBotsRequest$sortFields`
+/// documents as accepted.
+const DEFAULT_SORT_FIELD: &str = "username";
+
+/// What `ListBotsRequest$sortFields` separates several field names with.
+const SORT_FIELD_SEPARATOR: char = '+';
+
+/// The names `sortFields` accepts, as `ListBotsRequest$sortFields` documents them,
+/// for the refusal message.
+const SORTABLE_FIELDS: &[&str] = &[
+    "username",
+    "firstName",
+    "displayName",
+    "status",
+    "groupId",
+];
+
+/// One sort key of a bot: a string, so one comparison orders every name
+/// `sortFields` accepts.
+type BotKey = fn(&crate::state::BotRecord) -> String;
+
+/// The key `field` orders by, or `None` when it names nothing a bot can be sorted
+/// by.
+fn sort_key(field: &str) -> Option<BotKey> {
+    match field {
+        "username" => Some(|bot| bot.username.clone()),
+        "displayName" => Some(|bot| bot.display_name.clone().unwrap_or_default()),
+        // `status` is an `intEnum`, so it is zero-padded to its widest value for the
+        // string comparison above to order it by its number.
+        "status" => Some(|bot| format!("{:010}", bot.status)),
+        "groupId" => Some(|bot| bot.group_id.clone()),
+        // A bot account carries no first name — `Bot` has no such member — so this
+        // accepted name leaves every bot equal and the tie-break on the bot id
+        // decides the order.
+        "firstName" => Some(|_| String::new()),
+        _ => None,
+    }
+}
+
+/// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
+fn refused(field: &str, reason: String) -> ListBotsError {
+    ListBotsErrorModeled::ValidationError(crate::state::field_validation_error(field, &reason))
+        .into()
 }

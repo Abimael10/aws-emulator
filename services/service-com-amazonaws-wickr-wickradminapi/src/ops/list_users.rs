@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_SORT_FIELD)
             .to_string();
         let key: fn(&crate::state::UserRecord) -> String = match sort_field.as_str() {
-            "userId" => |user| numeric_key(&user.user_id),
+            "userId" => |user| crate::state::numeric_sort_key(&user.user_id),
             "username" => |user| user.username.clone(),
             "firstName" => |user| user.first_name.clone().unwrap_or_default(),
             "lastName" => |user| user.last_name.clone().unwrap_or_default(),
@@ -234,9 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every filter the request carries narrows the stored set; a filter it omits
         // narrows nothing.
         records.retain(|user| {
-            matches_filter(input.username.as_deref(), Some(user.username.as_str()))
-                && matches_filter(input.first_name.as_deref(), user.first_name.as_deref())
-                && matches_filter(input.last_name.as_deref(), user.last_name.as_deref())
+            crate::state::matches_filter(input.username.as_deref(), Some(user.username.as_str()))
+                && crate::state::matches_filter(
+                    input.first_name.as_deref(),
+                    user.first_name.as_deref(),
+                )
+                && crate::state::matches_filter(input.last_name.as_deref(), user.last_name.as_deref())
                 && input.status.is_none_or(|status| status == user.status)
                 && input
                     .group_id
@@ -247,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `userId` breaks a tie on any other key, so the order is total and two pages
         // of the same listing cannot interleave. Each record's key is computed once,
         // not once per comparison.
-        records.sort_by_cached_key(|user| (key(user), numeric_key(&user.user_id)));
+        records.sort_by_cached_key(|user| (key(user), crate::state::numeric_sort_key(&user.user_id)));
         if input.sort_direction.as_deref() == Some(crate::state::SORT_DIRECTION_DESC) {
             records.reverse();
         }
@@ -269,18 +272,6 @@ const DEFAULT_SORT_FIELD: &str = "userId";
 
 /// The `User` members `sortFields` accepts, for the refusal message.
 const SORTABLE_FIELDS: &[&str] = &["userId", "username", "firstName", "lastName", "status"];
-
-/// Whether a stored value satisfies a filter: an absent filter accepts anything,
-/// and a present one accepts only an equal stored value.
-fn matches_filter(filter: Option<&str>, stored: Option<&str>) -> bool {
-    filter.is_none_or(|wanted| stored == Some(wanted))
-}
-
-/// `user_id` zero-padded to the 10 digits `UserId` allows, so comparing two keys as
-/// strings orders them by their numeric value.
-fn numeric_key(user_id: &str) -> String {
-    format!("{user_id:0>10}")
-}
 
 /// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
 fn refused(field: &str, reason: String) -> ListUsersError {

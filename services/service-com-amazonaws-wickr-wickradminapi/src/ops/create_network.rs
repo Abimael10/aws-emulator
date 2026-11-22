@@ -239,9 +239,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     is_default: true,
                     // The group comes into being with the network and nothing has
                     // changed it since, so that is the instant it was last modified
-                    // at; and it carries no setting value until something sets one.
+                    // at; and it carries no setting value until something sets one,
+                    // beyond the password policy every group imposes on the accounts
+                    // created under it.
                     modified_at: created_at,
-                    settings: Default::default(),
+                    settings: crate::ops::types::SecurityGroupSettings {
+                        password_requirements: Some(
+                            crate::state::default_password_requirements(),
+                        ),
+                        ..Default::default()
+                    },
                 },
             )]
             .into_iter()

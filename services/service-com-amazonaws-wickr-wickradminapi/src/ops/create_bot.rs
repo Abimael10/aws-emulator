@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one bot account in a network: it is assigned to the security group the
+//! request names, and the password it is created with has to meet THAT group's
+//! password policy — a minimum length plus a required count of uppercase letters,
+//! lowercase letters, numbers and symbols — which is checked before anything is
+//! stored, so a password the policy turns down leaves the network's bots untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +178,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // A bot exists only inside a network, so there is nothing to create one in
+        // when the `networkId` names no network of this account — one this store
+        // never minted, or one whose network has been deleted.
+        if !store.networks.contains_key(&input.network_id) {
+            return Err(gone(crate::state::NETWORK_GONE_MESSAGE));
+        }
+
+        // The security group the bot "will be assigned to" is what carries the
+        // password policy the bot's password has to meet, so it is resolved from the
+        // network's own groups before anything else is decided. A `groupId` naming
+        // none of them names no group to assign the bot to.
+        let requirements = {
+            let group = store
+                .security_groups
+                .get(&input.network_id)
+                .and_then(|groups| groups.get(&input.group_id))
+                .ok_or_else(|| gone(crate::state::SECURITY_GROUP_GONE_MESSAGE))?;
+            // A group whose stored settings state no policy is held to the one every
+            // group carries, so no group leaves the passwords of its accounts
+            // unchecked.
+            group
+                .settings
+                .password_requirements
+                .clone()
+                .unwrap_or_else(crate::state::default_password_requirements)
+        };
+
+        // The password the bot would hold is measured against THAT group's policy,
+        // and a password that does not meet it is refused before any bot is created:
+        // the refusal names the policy and states the group's own numbers, so nothing
+        // of the submitted password is reported back.
+        if !crate::state::password_meets_requirements(&input.challenge, &requirements) {
+            return Err(refused(
+                crate::state::PASSWORD_POLICY_FIELD,
+                crate::state::password_policy_reason(&requirements),
+            ));
+        }
+
+        // `username` "must be unique within the network". One username names one
+        // account of a network whether that account is a user or a bot — `uname` is
+        // derived from it, so two accounts holding it would share one identifier.
+        if store
+            .user_by_username(&input.network_id, &input.username)
+            .is_some()
+            || store
+                .bot_by_username(&input.network_id, &input.username)
+                .is_some()
+        {
+            return Err(refused(
+                "username",
+                format!(
+                    "username {} already exists in network {}",
+                    input.username, input.network_id
+                ),
+            ));
+        }
+
+        let bot_id = store.mint_bot_id().ok_or_else(|| {
+            CreateBotErrorModeled::InternalServerError(InternalServerError {
+                message: "the bot id space is exhausted".to_string(),
+            })
+        })?;
+
+        store.insert_bot(
+            &input.network_id,
+            crate::state::BotRecord {
+                uname: crate::state::derive_uname(&input.network_id, &input.username),
+                bot_id: bot_id.clone(),
+                username: input.username,
+                display_name: input.display_name,
+                group_id: input.group_id,
+                // A bot is created waiting for its first sign-in and is not
+                // suspended. `hasChallenge` records that it HAS a password; the
+                // password itself is not kept, since no operation reports it back and
+                // nothing in this slice signs a bot in with it.
+                status: crate::state::BOT_STATUS_PENDING,
+                suspended: false,
+                has_challenge: true,
+            },
+        );
+
+        // Answer from what was stored, so the response cannot drift from the record
+        // `GetBot` reads back.
+        let stored = store
+            .bot_of(&input.network_id, &bot_id)
+            .ok_or_else(store_unavailable)?;
+        Ok(CreateBotOutput {
+            message: Some(CREATED_MESSAGE.to_string()),
+            bot_id: stored.bot_id.clone(),
+            network_id: Some(input.network_id.clone()),
+            username: Some(stored.username.clone()),
+            display_name: stored.display_name.clone(),
+            group_id: Some(stored.group_id.clone()),
+        })
     }
+}
+
+/// The sentence this operation's success body states the create in.
+///
+/// FIXED text: it names neither the bot nor its id, so the confirmation every caller
+/// reads is one sentence and carries nothing a caller would have to parse out of it.
+/// What identifies the bot that was created is the response's own members.
+const CREATED_MESSAGE: &str = "Bot created successfully";
+
+/// The modelled `ResourceNotFoundError` (HTTP 404) for a resource the request named
+/// that "doesn't exist or has been deleted", stated in this API's fixed sentence for
+/// it — which names no id, so it says nothing about what else the store holds.
+fn gone(message: &str) -> CreateBotError {
+    CreateBotErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A `ValidationError` (HTTP 422) naming what was refused and why.
+fn refused(field: &str, reason: String) -> CreateBotError {
+    CreateBotErrorModeled::ValidationError(crate::state::field_validation_error(field, &reason))
+        .into()
+}
+
+/// The modelled server error for a store this service cannot reach — the one
+/// failure that is the emulator's own fault rather than the request's.
+fn store_unavailable() -> CreateBotError {
+    CreateBotErrorModeled::InternalServerError(InternalServerError {
+        message: "the Wickr network store is unavailable".to_string(),
+    })
+    .into()
 }
