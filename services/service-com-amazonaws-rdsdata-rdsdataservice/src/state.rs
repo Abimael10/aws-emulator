@@ -3824,10 +3824,17 @@ fn value_text(value: &SqlValue) -> Option<String> {
 /// number, a JSON document and a UUID
 /// (`smithy_query(query="shape", shape="SqlParameter")`, member `typeHint`;
 /// the value list is `TypeHint`). So the hint is what the request is CHECKED
-/// against: a string that is not the form its hint names is refused in the fixed
-/// sentence that names the TYPE it could not be read as
-/// ([`cannot_parse_parameter`]), rather than silently stored under a type it is
-/// not.
+/// against: a string that is not the form its hint names is refused rather than
+/// silently stored under a type it is not.
+///
+/// And it is refused in the sentence of the HINT'S OWN class, not in one sentence
+/// generalised over the six: what the caller reads is the wording of the layer that
+/// reads the type the hint named. The date, time-of-day, date-and-time and exact-number
+/// hints are read by a reader that names the type and the fault it found and carries
+/// nothing of the request ([`cannot_parse_parameter`]); a document carries the document
+/// type's own input-syntax error, which is what its PARSER said was wrong
+/// ([`invalid_json_input`]); and a UUID is refused by this API itself, in a sentence that
+/// quotes the offending string back ([`cannot_parse_uuid_parameter`]).
 ///
 /// And the hint is what the value is SENT AS, which is not always the string the
 /// request spelled it with: a value of the hint's own type has one form, and the
@@ -3861,8 +3868,8 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
         "TIMESTAMP" => is_timestamp(value)
             .then(|| value.to_string())
             .map_or_else(|| cannot_parse("Timestamp", timestamp_fault(value)), Ok),
-        // A decimal number and a UUID are read as a WHOLE — the string either is one or is
-        // not — so the fault their reader reports is that the string is not written in the
+        // A decimal number is read as a WHOLE — the string either is one or is not — so
+        // the fault its reader reports is that the string is not written in the
         // characters of a value of that type.
         "DECIMAL" => is_decimal(value)
             .then(|| value.to_string())
@@ -3872,11 +3879,14 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
         "JSON" => serde_json::from_str::<serde_json::Value>(value)
             .map(|parsed| as_stored_document(&parsed).to_string())
             .map_err(|error| invalid_json_input(&error)),
+        // A UUID is read as a whole too, but the refusal is this API's OWN: its sentence
+        // names the hint and quotes the string it could not read back
+        // ([`cannot_parse_uuid_parameter`]).
         "UUID" => uuid::Uuid::parse_str(value)
             .is_ok()
             .then(|| value.to_string())
-            .map_or_else(|| cannot_parse("UUID", INVALID_CHARACTERS), Ok),
-        // Each arm above names the TYPE its hint sends the string as, as the parse
+            .ok_or_else(|| cannot_parse_uuid_parameter(value)),
+        // The four arms above name the TYPE their hint sends the string as, as the parse
         // failure's own sentence writes that type ([`cannot_parse_parameter`]).
         // The model declares `TypeHint` as an enum of exactly those six, so a
         // seventh value is a request this service cannot act on rather than a
@@ -3891,8 +3901,9 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
     sent.map(SqlValue::Text).map_err(SqlError::Engine)
 }
 
-/// What the service tells a caller whose hinted string it cannot read as a value of the
-/// type the hint named: the parse failure of THAT TYPE, named as the sentence writes it.
+/// What the service tells a caller whose hinted string it cannot read as a DATE, a TIME,
+/// a TIMESTAMP or a DECIMAL: the parse failure of THAT TYPE, named as the sentence writes
+/// it.
 ///
 /// FIXED text for the class, carrying nothing of the request: the string that could not be
 /// read is not quoted back, so every string that fails the same way is refused in the
@@ -3900,11 +3911,31 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
 /// parameter reads, since the message is the only thing that distinguishes one refusal of a
 /// parameter from another — and no caller input is interpolated into it.
 ///
+/// The sentence of ONE class of hints, and the other two classes have their own: a
+/// document's is [`invalid_json_input`] and a UUID's is [`cannot_parse_uuid_parameter`].
+///
 /// A failure to READ the value the request sent, so it is reported as the data plane's
 /// own error and not as a fault of the call's shape: the request named a type the model
 /// has and sent a string the model carries.
 fn cannot_parse_parameter(type_name: &str, fault: &str) -> String {
     format!("Parse Error for {type_name}: {fault}")
+}
+
+/// And what it tells a caller whose `UUID` parameter is not a UUID: the hint it sent and
+/// the string that could not be read as one, in double quotes.
+///
+/// The sentence of the UUID hint's own class — fixed text plus the OFFENDING VALUE, which
+/// is the one thing the response carries it in, so a client can name the value it sent
+/// back to its user. Nothing of the request but that value is in it, and it carries
+/// neither the prefix nor the SQLSTATE an engine-raised diagnostic is rendered with,
+/// which is what tells this refusal — one this API makes on the parameter, before the
+/// statement runs — from an error the database raised on the value.
+///
+/// Reported in the same class as every other failure to read a hinted value: the request
+/// named a type the model has and sent a string the model carries, so it is the data
+/// plane's error and not a fault of the call's shape.
+fn cannot_parse_uuid_parameter(value: &str) -> String {
+    format!("Cannot parse UUID parameter: \"{value}\"")
 }
 
 /// The two faults a reader of one of these types reports, which is what the sentence above

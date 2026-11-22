@@ -1922,11 +1922,10 @@ async fn every_call_answers_inside_the_request_budget() {
 
 /// RULE: a `typeHint` on a `stringValue` names the type that string is SENT AS, so the
 /// string has to be a value of that type — the documented form is accepted and stored,
-/// and anything else is refused with the FIXED parse-error sentence of that type, which
-/// names the type and the fault its reader reports and carries NOTHING of the request (the
-/// string it could not read is not quoted back), in the class a failure to read the
-/// caller's data is — and a hint on any other `Field` member, where the member already
-/// names the type, is ignored.
+/// and anything else is refused, in the class a failure to read the caller's data is,
+/// with the sentence of THAT HINT's own class (which
+/// `tests/all/refusal_classes.rs` pins per hint) — and a hint on any other `Field`
+/// member, where the member already names the type, is ignored.
 ///
 /// The formats come from the model: `DATE` is `YYYY-MM-DD`, `TIME` is
 /// `HH:MM:SS[.FFF]`, `TIMESTAMP` is `YYYY-MM-DD HH:MM:SS[.FFF]`, and `DECIMAL`,
@@ -1989,7 +1988,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
             "UUID",
             "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60",
             "4bcd3f0e-7a25-4f8c-9c3a",
-            "Parse Error for UUID: input contains invalid characters".to_string(),
+            "Cannot parse UUID parameter: \"4bcd3f0e-7a25-4f8c-9c3a\"".to_string(),
         ),
     ];
     for (hint, accepted, refused, expected_message) in cases {
@@ -2082,8 +2081,9 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
 
     // The FAULT the sentence carries, over the strings each reader refuses: input left
     // over once a value of the type has been read is trailing input, and a string whose
-    // characters are not those of such a value at all is the other fault. None of these
-    // sentences carries the string the request sent.
+    // characters are not those of such a value at all is the other fault. None of the
+    // date-and-number sentences carries the string the request sent; the UUID hint's own
+    // class does quote it back.
     //
     // (the hint, the string, the sentence the refusal carries)
     let faults = [
@@ -2132,7 +2132,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
         (
             "UUID",
             "not-a-uuid",
-            "Parse Error for UUID: input contains invalid characters",
+            "Cannot parse UUID parameter: \"not-a-uuid\"",
         ),
     ];
     for (hint, value, expected_message) in faults {

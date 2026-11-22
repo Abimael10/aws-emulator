@@ -27,7 +27,10 @@
 //! * a result column of a type the `Field` union has no member for is refused by THAT
 //!   TYPE, in every form it can be read in, while the same cell cast to a type the union
 //!   carries is served
-//!   ([`a_result_of_a_type_no_field_member_carries_is_refused_by_its_type`]).
+//!   ([`a_result_of_a_type_no_field_member_carries_is_refused_by_its_type`]);
+//! * a `stringValue` its `typeHint` cannot read is refused with the sentence of THAT
+//!   HINT's own class, on both statement operations
+//!   ([`an_unreadable_hinted_value_is_refused_in_the_sentence_of_its_hint`]).
 //!
 //! These rules are about the data plane, so this suite drives the Data API alone: no
 //! control plane is mounted, and the cluster, secret and identity legs of the precondition
@@ -1237,5 +1240,185 @@ async fn a_result_of_a_type_no_field_member_carries_is_refused_by_its_type() {
         json!(unsupported_type_message("DOUBLE PRECISION")),
         "case \"a non-finite float\": the two unsupported-result sentences must stay apart, \
          got {body}"
+    );
+}
+
+/// RULE: a `stringValue` its `typeHint` cannot read as a value of the type that hint names
+/// is refused HTTP 400 `DatabaseErrorException` with the sentence of THAT HINT's OWN class
+/// — one sentence per hint and not one sentence generalised over the six — and the same
+/// sentence whichever statement operation carried the parameter.
+///
+/// The three classes, each its own wording:
+///
+/// * `UUID` is read by the API itself, and its sentence QUOTES the string it could not
+///   read back, in double quotes, carrying neither the `ERROR:` prefix nor the `SQLState:`
+///   part an error the database raised is rendered with — which is what tells this
+///   refusal, made on the parameter before the statement runs, from an engine-raised one;
+/// * `JSON` carries the document type's own input-syntax error, which is what its PARSER
+///   said was wrong with the string;
+/// * `DATE`, `TIME`, `TIMESTAMP` and `DECIMAL` carry the fixed parse-error sentence of the
+///   type, which names the type and the fault its reader reports and carries nothing of
+///   the request.
+///
+/// The hints and their accepted forms come from the model
+/// (`smithy_query(query="shape", shape="SqlParameter")`, member `typeHint`; `TypeHint`
+/// lists exactly those six values). The rows differ along the hint, and within the `UUID`
+/// hint along WHAT is wrong with the string — nothing of the form at all, too few groups,
+/// non-hexadecimal digits, a value with something after it, and no string at all — so what
+/// is pinned is the template and not one value.
+#[tokio::test]
+async fn an_unreadable_hinted_value_is_refused_in_the_sentence_of_its_hint() {
+    let api = DataApi::new();
+    api.run(json!({"sql": "CREATE TABLE hinted_refusals (value TEXT)"}))
+        .await;
+    // The hinted value reaches the character column through a CAST, because the hint names
+    // the type the string is SENT AS; what this test is about is which sentence refuses a
+    // string the hint cannot read, which is decided before any column is reached.
+    const INSERT_HINTED: &str =
+        "INSERT INTO hinted_refusals (value) VALUES (CAST(:value AS TEXT))";
+
+    // (the hint, the string it cannot read, the sentence the refusal carries, whether that
+    // sentence quotes the string back)
+    let rows: Vec<(&str, &str, String, bool)> = vec![
+        (
+            "UUID",
+            "nope-not-a-uuid",
+            "Cannot parse UUID parameter: \"nope-not-a-uuid\"".to_string(),
+            true,
+        ),
+        (
+            "UUID",
+            "4bcd3f0e-7a25-4f8c-9c3a",
+            "Cannot parse UUID parameter: \"4bcd3f0e-7a25-4f8c-9c3a\"".to_string(),
+            true,
+        ),
+        (
+            "UUID",
+            "zzzzzzzz-7a25-4f8c-9c3a-1b2c3d4e5f60",
+            "Cannot parse UUID parameter: \"zzzzzzzz-7a25-4f8c-9c3a-1b2c3d4e5f60\"".to_string(),
+            true,
+        ),
+        (
+            "UUID",
+            "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60 and more",
+            "Cannot parse UUID parameter: \"4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60 and more\""
+                .to_string(),
+            true,
+        ),
+        (
+            "UUID",
+            "",
+            "Cannot parse UUID parameter: \"\"".to_string(),
+            true,
+        ),
+        (
+            "JSON",
+            "{bad json}",
+            "invalid input syntax for type json: key must be a string at line 1 column 2"
+                .to_string(),
+            false,
+        ),
+        (
+            "DATE",
+            "nope-not-a-date",
+            "Parse Error for Date: input contains invalid characters".to_string(),
+            false,
+        ),
+        (
+            "TIME",
+            "nope-not-a-time",
+            "Parse Error for Time: input contains invalid characters".to_string(),
+            false,
+        ),
+        (
+            "TIMESTAMP",
+            "nope-not-a-timestamp",
+            "Parse Error for Timestamp: input contains invalid characters".to_string(),
+            false,
+        ),
+        (
+            "DECIMAL",
+            "nope-not-a-number",
+            "Parse Error for Decimal: input contains invalid characters".to_string(),
+            false,
+        ),
+    ];
+    for (hint, value, message, quotes_the_value) in rows {
+        let sent = json!({"name": "value", "value": {"stringValue": value}, "typeHint": hint});
+        for (path, members) in [
+            (
+                "ExecuteStatement",
+                json!({"sql": INSERT_HINTED, "parameters": [sent.clone()]}),
+            ),
+            (
+                "BatchExecuteStatement",
+                json!({"sql": INSERT_HINTED, "parameterSets": [[sent.clone()]]}),
+            ),
+        ] {
+            let (status, body) = if path == "ExecuteStatement" {
+                api.execute(members).await
+            } else {
+                api.batch(members).await
+            };
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "DatabaseErrorException", json!(message)),
+                "case {hint} refusing {value:?} on {path}: expected HTTP 400 \
+                 DatabaseErrorException and {message:?}, got {status} {body}"
+            );
+            let answered = body["message"].as_str().unwrap_or_default().to_string();
+            assert!(
+                !answered.starts_with("ERROR:") && !answered.contains("SQLState:"),
+                "case {hint} refusing {value:?} on {path}: the API refused the parameter, so \
+                 the sentence carries neither the prefix nor the SQLSTATE of an \
+                 engine-raised diagnostic, got {answered:?}"
+            );
+            assert_eq!(
+                answered.contains(value),
+                quotes_the_value,
+                "case {hint} refusing {value:?} on {path}: expected the string quoted back \
+                 to be {quotes_the_value}, got {answered:?}"
+            );
+        }
+    }
+
+    // None of those refusals ran its statement.
+    let stored = api
+        .run(json!({"sql": "SELECT value FROM hinted_refusals"}))
+        .await;
+    assert!(
+        list(&stored, "records").is_empty(),
+        "case \"after every refusal\": expected no row written, got {stored}"
+    );
+
+    // And a string the hint CAN read is served through the same path, on both operations:
+    // what the refusals above are about is the string, not the hint being present.
+    for (path, accepted) in [
+        ("ExecuteStatement", "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60"),
+        ("BatchExecuteStatement", "0e1d2c3b-4a59-4687-8765-43210fedcba9"),
+    ] {
+        let sent = json!({"name": "value", "value": {"stringValue": accepted}, "typeHint": "UUID"});
+        let (status, body) = if path == "ExecuteStatement" {
+            api.execute(json!({"sql": INSERT_HINTED, "parameters": [sent]}))
+                .await
+        } else {
+            api.batch(json!({"sql": INSERT_HINTED, "parameterSets": [[sent]]}))
+                .await
+        };
+        assert_eq!(
+            status, 200,
+            "case a readable UUID on {path}: expected the statement to run, got {status} {body}"
+        );
+    }
+    let stored = api
+        .run(json!({"sql": "SELECT value FROM hinted_refusals ORDER BY value"}))
+        .await;
+    assert_eq!(
+        stored["records"],
+        json!([
+            [{"stringValue": "0e1d2c3b-4a59-4687-8765-43210fedcba9"}],
+            [{"stringValue": "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60"}],
+        ]),
+        "case \"the readable UUIDs\": expected both rows stored as they were sent, got {stored}"
     );
 }
