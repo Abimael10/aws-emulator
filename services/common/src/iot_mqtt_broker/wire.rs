@@ -126,6 +126,11 @@ pub struct MqttEndpoint {
     /// The emulator this endpoint's HTTP half is served by — the same router, engine and
     /// state as the call that opened it.
     pub(crate) callback: EmbeddedEmulator,
+    /// The IoT COMMANDS plane this endpoint's reserved `$aws/commands/*` topics are
+    /// served from ([`super::commands`]), or `None` for an engine that vends no such
+    /// stores — in which case those topics carry nothing and every other topic is served
+    /// exactly as before.
+    pub(crate) commands: Option<super::commands::CommandsPlane>,
 }
 
 impl NativeHandler for MqttEndpoint {
@@ -134,6 +139,7 @@ impl NativeHandler for MqttEndpoint {
         let upgrader = self.upgrader.clone();
         let published = Arc::clone(&self.published);
         let callback = self.callback.clone();
+        let commands = self.commands.clone();
         Box::pin(async move {
             let Some(mut conn) = crate::in_band_tls::negotiated(conn, upgrader).await else {
                 return;
@@ -148,7 +154,7 @@ impl NativeHandler for MqttEndpoint {
             let stream: ListenerConn =
                 Box::new(crate::in_band_tls::Prefixed::new(first.to_vec(), conn));
             if first[0] == MQTT_CONNECT_FIRST_BYTE {
-                serve_mqtt(state, published, stream).await;
+                serve_mqtt(state, published, commands, stream).await;
             } else {
                 super::https_plane::serve(callback, stream).await;
             }
@@ -185,6 +191,7 @@ struct SessionOpened {
 async fn serve_mqtt(
     state: ::engine::ServiceState<MqttBrokerState>,
     published: Arc<OnceLock<String>>,
+    commands: Option<super::commands::CommandsPlane>,
     conn: ListenerConn,
 ) {
     let (mut reader, mut writer) = ::tokio::io::split(conn);
@@ -397,6 +404,7 @@ async fn serve_mqtt(
     let reason = serve_session(
         version,
         &state,
+        commands.as_ref(),
         &client_id,
         connection_id,
         &closing,
@@ -422,6 +430,7 @@ async fn serve_mqtt(
 async fn serve_session<R, W>(
     version: protocol::Version,
     state: &::engine::ServiceState<MqttBrokerState>,
+    commands: Option<&super::commands::CommandsPlane>,
     client_id: &str,
     connection_id: u64,
     closing: &Notify,
@@ -511,6 +520,16 @@ where
                 // (`$aws/rules/<ruleName>/<topic>`) is published to nobody at all — and
                 // both are then evaluated by the account's topic rules.
                 super::served_publication(state, &message).await;
+                // A publication on a topic the broker RESERVES for one of its own
+                // exchanges is served as well as carried: a device's report on a command
+                // execution's reserved response topic is applied to that execution and
+                // answered on the execution's own `accepted` / `rejected` topic
+                // ([`super::commands`]). Every other topic is carried and nothing more.
+                if let Some(answer) = commands
+                    .and_then(|commands| commands.apply_report(&message.topic, &message.payload))
+                {
+                    super::publish_to_subscribers(state, &answer);
+                }
                 if at_least_once
                     && !write_packet(writer, |buffer| {
                         protocol::render_puback(version, buffer, packet_id)
@@ -533,7 +552,7 @@ where
                 // The DISTINCT filters this SUBSCRIBE subscribed, each with the QoS it was
                 // granted: at most [`MAX_SUBSCRIPTIONS_PER_SESSION`] of them, however many
                 // entries the packet repeated, which is what bounds the retained-message
-                // matching below.
+                // matching below and the reserved-topic replay after it.
                 let mut subscribed: ::std::collections::BTreeMap<String, i32> =
                     ::std::collections::BTreeMap::new();
                 {
@@ -609,6 +628,30 @@ where
                     next_packet_id = next_packet_id.checked_add(1).unwrap_or(1);
                     if !write_publish(version, writer, &message, delivered_id, true).await {
                         return Some(CONNECTION_LOST);
+                    }
+                }
+                // A filter this packet subscribed over one of the broker's own reserved
+                // exchanges may already be owed messages: a command execution created for
+                // this device before it subscribed is delivered now, which is what makes
+                // the order of a device's own calls immaterial ([`super::commands`]).
+                // Published after the SUBACK, so the client is told its subscription
+                // exists before anything arrives on it.
+                //
+                // BOUNDED as a PRODUCT: it runs over the DISTINCT filters above (at most
+                // [`MAX_SUBSCRIPTIONS_PER_SESSION`], whatever the packet repeated) and one
+                // allowance of messages and of payload bytes is spent across all of them
+                // ([`super::commands::ReplayBudget`]); the fan-out yields between
+                // deliveries, so it stays cancellable.
+                if let Some(commands) = commands {
+                    let mut budget = super::commands::ReplayBudget::of_one_subscribe();
+                    for path in subscribed.keys() {
+                        if budget.is_spent() {
+                            break;
+                        }
+                        for message in commands.pending_requests(path, &mut budget) {
+                            super::publish_to_subscribers(state, &message);
+                            ::tokio::task::yield_now().await;
+                        }
                     }
                 }
             }

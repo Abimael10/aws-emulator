@@ -128,6 +128,10 @@ pub async fn ensure_broker_endpoint<Eng: Send + Sync + 'static>(
         upgrader: listeners.tls_upgrader().ok(),
         published: Arc::clone(&published),
         callback: callback.clone(),
+        // The shared stores the reserved `$aws/commands/*` exchange is served from, taken
+        // from the SAME engine as the broker's own store, so an execution a device drives
+        // over this socket is the execution the control plane reports on.
+        commands: super::commands::CommandsPlane::of(engine),
     });
     let served = crate::dialable_data_planes::served_in_process(Arc::clone(&handler), None);
     let listening = crate::dialable_data_planes::SharedHandler(Arc::clone(&handler));

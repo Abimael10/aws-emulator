@@ -31,6 +31,9 @@
 //!   not its own DISCONNECT.
 //! * [`endpoint`] — the socket the core opens for it and the `host:port` that socket is
 //!   published at, which is the address `DescribeEndpoint` answers with.
+//! * [`commands`] — the reserved `$aws/commands/*` topics of the IoT Commands data plane:
+//!   a started command execution's request is delivered to its device there, and the
+//!   device's own report back drives the execution the control plane reports on.
 //!
 //! LOCK ORDER: the store is taken LAST and never held across an await. A connection's own
 //! task takes it to read or write a session and releases it before it writes a byte;
@@ -38,6 +41,7 @@
 //! is dropped.
 
 pub mod basic_ingest;
+pub mod commands;
 pub mod endpoint;
 pub mod https_plane;
 pub mod lifecycle;

@@ -653,14 +653,17 @@ async fn a_stored_command_execution_is_read_back_from_the_shared_store() {
              got {:?}",
             reply.member("parameters")
         );
-        // Nothing records a DEVICE-reported result or reason (the device-side
-        // `UpdateCommandExecution` MQTT API is not served here), so neither member is
-        // reported, whether or not the caller asked for the result.
+        // These rows seed executions NO device has reported on — the reason and the result
+        // are device-reported (`statusReason`, `result`), written only by a report on the
+        // execution's reserved MQTT response topic — so neither member is reported here,
+        // whether or not the caller asked for the result. What a reported one answers with
+        // is driven end to end by `core/router/tests/all/
+        // iot_command_execution_over_reserved_mqtt_topics.rs`.
         assert_eq!(
             (reply.member("result"), reply.member("statusReason")),
             (&Value::Null, &Value::Null),
-            "case {label:?}: nothing persists a device-reported result or reason, \
-             got {:?}",
+            "case {label:?}: an execution no device has reported on carries no result and \
+             no reason, got {:?}",
             reply.body
         );
 

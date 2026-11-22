@@ -17,9 +17,12 @@
 //! It holds an ARN — a command's identity on the wire (`CommandArn`,
 //! `arn:<partition>:iot:<region>:<account>:command/<commandId>`) — and the facts a
 //! reader outside the control plane DECIDES on ([`CommandFacts`]): whether the
-//! command's payload is static, and whether it has been deprecated. The command's own
-//! record — payload bytes, parameters, description, tags — stays with its owner, so
-//! this is an index and not a second copy of the resource.
+//! command's payload is static, and whether it has been deprecated. It also holds the
+//! PAYLOAD a command hands its device ([`CommandPayload`]), because the call that
+//! delivers it — `StartCommandExecution`, which publishes the execution's request on the
+//! device's reserved MQTT topic — is outside the control plane too. The rest of the
+//! command's own record — parameters, description, tags — stays with its owner, so this
+//! is an index and not a second copy of the resource.
 //!
 //! WHO WRITES IT: the owner. `iot:CreateCommand` registers the ARN it mints here with
 //! the facts the create decided, `iot:UpdateCommand` records a deprecation it makes,
@@ -64,6 +67,51 @@ pub struct CommandFacts {
     pub deprecated: bool,
 }
 
+/// The PAYLOAD a command hands its device: the bytes a command execution of it is
+/// delivered with, and the content type that says how the device is to read them.
+///
+/// It lives in the shared index rather than in the owning control plane's own record
+/// because the call that DELIVERS it to the device is in another crate
+/// (`iot-jobs-data`: `StartCommandExecution`), and the bytes a device is handed must be
+/// the bytes the create supplied — not a second copy that could drift from it.
+///
+/// Only a command created with a literal `payload` (`CreateCommand$payload`, "the payload
+/// object for the static command") has one; a command whose payload is generated from a
+/// `payloadTemplate` has none here, because nothing has generated those bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandPayload {
+    /// `CommandPayload$content`: "the static payload file for the command", verbatim.
+    pub content: Vec<u8>,
+    /// `CommandPayload$contentType`: "the content type that specifies the format type of
+    /// the payload file", e.g. `application/json`. `None` for a payload created without
+    /// one, which says nothing about how the bytes are to be read.
+    pub content_type: Option<String>,
+}
+
+/// One command's entry in the index: the facts a reader DECIDES on, and the payload a
+/// device is handed.
+///
+/// The two are kept apart in the public API — [`CommandFacts`] stays a small `Copy`
+/// decision record, while a payload is bytes — so a reader that only has to judge a
+/// request never copies a payload to do it.
+#[derive(Debug, Clone, Default)]
+struct CommandEntry {
+    facts: CommandFacts,
+    payload: Option<CommandPayload>,
+}
+
+/// How the IoT commands surface words a command execution that cannot be found.
+///
+/// The sentence is fixed around the `executionId` the caller addressed, and it is the
+/// same one wherever the answer is given — the control plane's `GetCommandExecution`
+/// (404 `ResourceNotFoundException`) and a device's own report on an execution's reserved
+/// MQTT response topic ([`crate::iot_mqtt_broker::commands`]) — so one missing execution
+/// reads one way.
+#[must_use]
+pub fn command_execution_not_found_message(execution_id: &str) -> String {
+    format!("Command execution {execution_id} cannot be found.")
+}
+
 /// Why registering a command was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterRefusal {
@@ -94,7 +142,7 @@ impl std::fmt::Display for RegisterRefusal {
 /// reorder itself between two runs holding the same commands.
 #[derive(Debug, Default)]
 pub struct IotCommandRegistry {
-    commands: BTreeMap<String, CommandFacts>,
+    commands: BTreeMap<String, CommandEntry>,
 }
 
 impl IotCommandRegistry {
@@ -114,7 +162,40 @@ impl IotCommandRegistry {
     /// disagree.
     #[must_use]
     pub fn facts(&self, command_arn: &str) -> Option<CommandFacts> {
-        self.commands.get(command_arn).copied()
+        self.commands.get(command_arn).map(|entry| entry.facts)
+    }
+
+    /// The PAYLOAD the command `command_arn` names hands its device, or `None` when no
+    /// such command exists or its create supplied no literal payload — see
+    /// [`CommandPayload`].
+    #[must_use]
+    pub fn payload(&self, command_arn: &str) -> Option<CommandPayload> {
+        self.commands.get(command_arn)?.payload.clone()
+    }
+
+    /// The same payload, BORROWED — for a reader that has to decide something from the
+    /// content type (which topic the payload goes out on) before it copies the bytes, so
+    /// a payload that is not going anywhere costs nothing.
+    #[must_use]
+    pub fn payload_ref(&self, command_arn: &str) -> Option<&CommandPayload> {
+        self.commands.get(command_arn)?.payload.as_ref()
+    }
+
+    /// Record the payload the command `command_arn` names hands its device, reporting
+    /// whether such a command exists.
+    ///
+    /// It is set BESIDE [`Self::register`] rather than through it so that registering a
+    /// command stays the one small call every reader of the index already makes; a
+    /// command that does not exist records nothing, because a payload is a fact about a
+    /// command and not an entry of its own.
+    pub fn set_payload(&mut self, command_arn: &str, payload: Option<CommandPayload>) -> bool {
+        match self.commands.get_mut(command_arn) {
+            Some(entry) => {
+                entry.payload = payload;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record that the command `command_arn` names exists, with the facts its create
@@ -131,7 +212,13 @@ impl IotCommandRegistry {
         if self.commands.len() >= MAX_REGISTERED_COMMANDS {
             return Err(RegisterRefusal::QuotaExceeded);
         }
-        self.commands.insert(command_arn.to_string(), facts);
+        self.commands.insert(
+            command_arn.to_string(),
+            CommandEntry {
+                facts,
+                payload: None,
+            },
+        );
         Ok(())
     }
 
@@ -140,8 +227,8 @@ impl IotCommandRegistry {
     /// nothing: the control plane refuses that update itself.
     pub fn set_deprecated(&mut self, command_arn: &str, deprecated: bool) -> bool {
         match self.commands.get_mut(command_arn) {
-            Some(facts) => {
-                facts.deprecated = deprecated;
+            Some(entry) => {
+                entry.facts.deprecated = deprecated;
                 true
             }
             None => false,
@@ -169,6 +256,10 @@ impl IotCommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One row of the payload table: the case, the command's ARN, and the payload its
+    /// create recorded (`None` for a create that supplied none).
+    type PayloadRow = (&'static str, &'static str, Option<CommandPayload>);
 
     /// A static-payload command, as `CreateCommand` registers one created with a
     /// literal `payload`.
@@ -300,6 +391,84 @@ mod tests {
                 .facts("arn:aws:iot:us-east-1:111122223333:command/absent")
                 .is_none(),
             "and leaves it non-existent, got {registry:?}"
+        );
+    }
+
+    /// The payload a command hands its device is the one its create recorded, is kept
+    /// per command, and goes away with the command.
+    ///
+    /// The rows span what the rule generalises over: a payload with a content type, one
+    /// without, an EMPTY payload (a command whose create supplied no literal payload at
+    /// all), and a payload of bytes that are no text.
+    #[test]
+    fn the_payload_of_a_command_is_the_one_its_owner_recorded() {
+        let mut registry = IotCommandRegistry::default();
+
+        // (case, arn, the payload the create recorded)
+        let rows: [PayloadRow; 4] = [
+            (
+                "a JSON payload",
+                "arn:aws:iot:us-east-1:111122223333:command/reboot",
+                Some(CommandPayload {
+                    content: br#"{"action":"reboot"}"#.to_vec(),
+                    content_type: Some("application/json".to_string()),
+                }),
+            ),
+            (
+                "a payload with no content type",
+                "arn:aws:iot:us-east-1:111122223333:command/blink",
+                Some(CommandPayload {
+                    content: b"blink".to_vec(),
+                    content_type: None,
+                }),
+            ),
+            (
+                "a command created with no literal payload",
+                "arn:aws:iot:us-east-1:111122223333:command/set-temperature",
+                None,
+            ),
+            (
+                "a payload of bytes that are no text",
+                "arn:aws:iot:us-east-1:111122223333:command/firmware",
+                Some(CommandPayload {
+                    content: vec![0x00, 0x9f, 0x10, 0xff],
+                    content_type: Some("application/octet-stream".to_string()),
+                }),
+            ),
+        ];
+
+        for (case, arn, payload) in &rows {
+            assert!(
+                !registry.set_payload(arn, payload.clone()),
+                "case {case:?}: a command that does not exist records no payload"
+            );
+            registry
+                .register(arn, CommandFacts::default())
+                .unwrap_or_else(|refusal| panic!("case {case:?}: registering it: {refusal}"));
+            assert!(
+                registry.set_payload(arn, payload.clone()),
+                "case {case:?}: recording the payload of a registered command reports it exists"
+            );
+        }
+        for (case, arn, expected) in &rows {
+            let actual = registry.payload(arn);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        let (case, arn, _) = rows[0];
+        assert!(registry.remove(arn), "case {case:?}: removing it reports it existed");
+        assert!(
+            registry.payload(arn).is_none(),
+            "case {case:?}: a removed command hands no payload to anything, got {:?}",
+            registry.payload(arn)
+        );
+        assert_eq!(
+            registry.payload("arn:aws:iot:us-east-1:111122223333:command/absent"),
+            None,
+            "a command that never existed has no payload"
         );
     }
 

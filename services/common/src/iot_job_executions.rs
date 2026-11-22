@@ -424,6 +424,32 @@ pub fn now_epoch_seconds() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// The reason a DEVICE gave for the status it reported for a command execution, as the
+/// store holds it: "provide additional context about the status of a command execution
+/// using a reason code and description" (`iot`: `StatusReason`).
+///
+/// Both members are the device's own words, kept verbatim: `reason_code` is required of
+/// a reason at all (`StatusReason$reasonCode`) and the description is optional
+/// (`StatusReason$reasonDescription`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandStatusReason {
+    pub reason_code: String,
+    pub reason_description: Option<String>,
+}
+
+/// One value of the RESULT a device reported for a command execution, as the store holds
+/// it: "an attribute of type String", "of type Boolean" or "of type Binary" (`iot`:
+/// `CommandExecutionResult`, whose members are `S`, `B` and `BIN`).
+///
+/// Each member is reported exactly when the device sent it, so a result value carrying
+/// one attribute does not grow the other two.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandResultValue {
+    pub s: Option<String>,
+    pub b: Option<bool>,
+    pub bin: Option<Vec<u8>>,
+}
+
 /// One job execution of one job on one thing, as the services persist it.
 #[derive(Debug, Clone)]
 pub struct JobExecutionRecord {
@@ -481,6 +507,21 @@ pub struct JobExecutionRecord {
     /// `GetCommandExecution$executionTimeoutSeconds`). `None` for an execution started
     /// without a timeout and for every execution a JOB created.
     pub command_execution_timeout_seconds: Option<i64>,
+    /// What the DEVICE reported alongside the status of a command execution: the reason
+    /// code and description it gave (`iot`: `GetCommandExecution$statusReason`), and
+    /// `None` for an execution whose device has reported none.
+    ///
+    /// It is written by the device's own report on the execution's reserved MQTT response
+    /// topic ([`crate::iot_mqtt_broker::commands`]) and read by the command surface, so
+    /// the reason a reader reports is the reason the device sent.
+    pub command_status_reason: Option<CommandStatusReason>,
+    /// The RESULT the device reported for a command execution (`iot`:
+    /// `GetCommandExecution$result`, "the device can use the result field to share
+    /// additional details about the execution"), empty for an execution whose device has
+    /// reported none.
+    ///
+    /// Ordered, so one report yields one response whatever order its names arrived in.
+    pub command_result: BTreeMap<String, CommandResultValue>,
     /// `JobExecution$forceCanceled`: "Will be true if the job execution was canceled
     /// with the optional force parameter set to true." `None` until something cancels
     /// the execution, so an execution nobody cancelled reports nothing about a
@@ -527,6 +568,8 @@ impl JobExecutionRecord {
             job_document,
             command_arn: None,
             command_execution_timeout_seconds: None,
+            command_status_reason: None,
+            command_result: BTreeMap::new(),
             force_canceled: None,
             // Stamped by the store when it accepts the record; see the field.
             enqueue_sequence: 0,

@@ -261,25 +261,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) =
             crate::state::command_execution_index(&store, &thing_name, &input.execution_id)
                 .and_then(|index| store.record(&thing_name, index))
-                .and_then(|record| crate::state::to_command_execution(record, &region))
+                .and_then(|record| {
+                    crate::state::to_command_execution(
+                        record,
+                        &region,
+                        // `includeResult` asks for the DEVICE-reported result of the
+                        // execution, so it is reported when the caller asked for it and
+                        // left out when it did not. Everything else the reader answers
+                        // is the same either way.
+                        input.include_result.unwrap_or(false),
+                    )
+                })
         else {
             return Err(GetCommandExecutionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No command execution {} exists on target {}",
-                        input.execution_id, input.target_arn
+                    message: Some(crate::state::missing_command_execution_message(
+                        &input.execution_id,
                     )),
                 },
             )
             .into());
         };
 
-        // `includeResult` asks for the DEVICE-reported result of the execution. The
-        // device-side `UpdateCommandExecution` MQTT API is not served by this emulator,
-        // so no execution carries a result and the member is absent either way — see
-        // `crate::state::to_command_execution`, which reports what the record holds and
-        // invents nothing for what it does not.
-        let _ = input.include_result;
         Ok(record)
     }
 }

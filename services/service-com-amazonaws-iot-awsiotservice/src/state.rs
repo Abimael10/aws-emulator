@@ -3462,11 +3462,12 @@ pub use billing_groups::{
 pub mod not_found;
 pub use not_found::{
     missing_audit_task_message, missing_authorizer_message, missing_billing_group_message,
-    missing_command_message, missing_fleet_metric_message, missing_job_execution_job_message,
-    missing_job_execution_message, missing_job_message, missing_job_template_message,
-    missing_thing_group_message, missing_thing_message, missing_thing_type_message,
-    tagged_thing_group_not_found_message, unauthorized_topic_rule_message,
-    unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    missing_command_execution_message, missing_command_message, missing_fleet_metric_message,
+    missing_job_execution_job_message, missing_job_execution_message, missing_job_message,
+    missing_job_template_message, missing_thing_group_message, missing_thing_message,
+    missing_thing_type_message, tagged_thing_group_not_found_message,
+    unauthorized_topic_rule_message, unrecognized_index_name_message,
+    MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource
@@ -3982,11 +3983,11 @@ pub fn command_execution_parameters(
 ///   the same exclusion).
 /// * `statusReason` and `result` are DEVICE-reported ("Your devices can use this
 ///   parameter to provide additional context", "The device can use the result field to
-///   share additional details"), and the device-side `UpdateCommandExecution` MQTT API
-///   is not served by this emulator, so nothing persists either one and neither member
-///   is reported. `includeResult` therefore selects nothing: a caller that asks for the
-///   result gets the same answer as one that does not, rather than a result nothing
-///   produced.
+///   share additional details"), so they are reported exactly for an execution whose
+///   device has reported them on the execution's reserved MQTT response topic
+///   (`service_common::iot_mqtt_broker::commands`) and are absent for one that has not.
+///   The result is reported only when the request ASKED for it (`includeResult`), which
+///   is what that member selects; the reason is not behind it.
 /// * `executionTimeoutSeconds` is the duration the start gave the device, which the
 ///   record keeps for the life of the execution
 ///   ([`JobExecutionRecord::command_execution_timeout_seconds`]).
@@ -3995,6 +3996,7 @@ pub fn command_execution_parameters(
 pub fn to_command_execution(
     record: &JobExecutionRecord,
     region: &str,
+    include_result: bool,
 ) -> Option<GetCommandExecutionOutput> {
     let command_arn = record.command_arn.clone()?;
     let status = command_execution_status(&record.status)?;
@@ -4003,8 +4005,8 @@ pub fn to_command_execution(
         command_arn: Some(command_arn),
         target_arn: Some(thing_arn(region, &record.thing_name)),
         status: Some(status.to_string()),
-        status_reason: None,
-        result: None,
+        status_reason: command_execution_status_reason(record),
+        result: include_result.then(|| command_execution_result(record)).flatten(),
         parameters: command_execution_parameters(record),
         execution_timeout_seconds: record.command_execution_timeout_seconds,
         created_at: Some(::aws_smithy_types::DateTime::from_secs(record.queued_at)),
@@ -4131,6 +4133,50 @@ pub fn command_execution_started_at(record: &JobExecutionRecord) -> i64 {
 /// when it was next read.
 pub fn command_execution_completed_at(record: &JobExecutionRecord) -> Option<i64> {
     record.is_terminal().then_some(record.last_updated_at)
+}
+
+/// The device-reported REASON of one command execution as the modelled `StatusReason`,
+/// or `None` for an execution whose device reported none.
+///
+/// "Provide additional context about the status of a command execution using a reason
+/// code and description" — both members are the device's own words as its report on the
+/// execution's reserved MQTT response topic sent them, so nothing is invented for an
+/// execution nobody has reported on.
+pub fn command_execution_status_reason(
+    record: &JobExecutionRecord,
+) -> Option<crate::ops::types::StatusReason> {
+    let reported = record.command_status_reason.as_ref()?;
+    Some(crate::ops::types::StatusReason {
+        reason_code: reported.reason_code.clone(),
+        reason_description: reported.reason_description.clone(),
+    })
+}
+
+/// The device-reported RESULT of one command execution as the modelled
+/// `CommandExecutionResultMap`, or `None` for an execution whose device reported none.
+///
+/// Each value carries the attributes the device sent and no others (`S`, `B`, `BIN`, the
+/// members `CommandExecutionResult` declares). `None` — never an empty map — for a
+/// result nobody reported: `CommandExecutionResultMap` is modelled `len 1..`, so an empty
+/// map is not a value a response may carry.
+pub fn command_execution_result(
+    record: &JobExecutionRecord,
+) -> Option<HashMap<String, crate::ops::types::CommandExecutionResult>> {
+    let result: HashMap<String, crate::ops::types::CommandExecutionResult> = record
+        .command_result
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                crate::ops::types::CommandExecutionResult {
+                    s: value.s.clone(),
+                    b: value.b,
+                    bin: value.bin.clone(),
+                },
+            )
+        })
+        .collect();
+    (!result.is_empty()).then_some(result)
 }
 
 /// A stored command execution as the modelled `CommandExecutionSummary` this service

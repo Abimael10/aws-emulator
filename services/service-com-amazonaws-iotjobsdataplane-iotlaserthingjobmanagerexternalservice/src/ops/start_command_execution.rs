@@ -35,6 +35,12 @@
 //! status `QUEUED` and a job document built from `commandArn` + `parameters`, and
 //! returns its id.
 //!
+//! The device is then TOLD about the execution: a command execution is carried out over
+//! the device's reserved MQTT topics, so the command's payload is published on
+//! `$aws/commands/things/{thingName}/executions/{executionId}/request/{format}`
+//! (`service_common::iot_mqtt_broker::commands`), where the device acts on it and reports
+//! back on the execution's response topic.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -594,7 +600,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let execution_id = crate::state::mint_execution_id(&mut state);
         let mut record = JobExecutionRecord::queued(
             execution_id.clone(),
-            thing_name,
+            thing_name.clone(),
             Some(document),
             now,
         );
@@ -616,6 +622,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token.clone() {
             state.remember_client_token(token, execution_id.clone(), fingerprint);
+        }
+        // The execution exists, so the DEVICE is told about it: a command execution is
+        // carried out over the device's own reserved MQTT topics, and the request this
+        // start created is published on
+        // `$aws/commands/things/{thingName}/executions/{executionId}/request/{format}`
+        // for the device to act on
+        // (`service_common::iot_mqtt_broker::commands::deliver_request`). A device that is
+        // not subscribed yet is handed it when it subscribes, so the publication here is
+        // what reaches one that already is — and reaching nobody is a device that is not
+        // listening, never a failure of the start.
+        //
+        // The store guard is released first: the delivery reads the shared command index
+        // and the broker's own store, and no guard of this service is held while another
+        // store is taken.
+        drop(state);
+        if let (Some(broker), Some(commands)) = (
+            ::service_common::iot_mqtt_broker::broker_state(&*self.engine),
+            ::service_common::iot_mqtt_broker::commands::CommandsPlane::of(&*self.engine),
+        ) {
+            commands.deliver_request(&broker, &thing_name, &execution_id, &input.command_arn);
         }
 
         Ok(ResponseDocument::new(

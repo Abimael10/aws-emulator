@@ -105,7 +105,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::iot_commands::CommandFacts;
+use crate::state::iot_commands::{CommandFacts, CommandPayload as IndexedPayload};
+
+/// The PAYLOAD this create hands the command's devices, as the shared index records it.
+///
+/// `CreateCommand$payload` is "the payload object for the static command [...] that
+/// contains the instructions for the device to process", so the bytes a device is handed
+/// for an execution of this command are the ones supplied here — kept with the content
+/// type that says how the device is to read them ("to make sure that the device correctly
+/// interprets the payload, we recommend you to specify the payload content type").
+///
+/// `None` for a create that supplied no literal payload: a command whose payload is
+/// generated from a `payloadTemplate` has no bytes yet, and the index reports none rather
+/// than an empty payload a device would be handed instead.
+fn command_payload(input: &CreateCommandInput) -> Option<IndexedPayload> {
+    let payload = input.payload.as_ref()?;
+    Some(IndexedPayload {
+        content: payload.content.clone().unwrap_or_default(),
+        content_type: payload.content_type.clone(),
+    })
+}
 
 /// The facts about the command this request creates that readers OUTSIDE the control
 /// plane decide on, as the shared index records them.
@@ -298,10 +317,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let command = crate::state::RegisteredCommand::new(
             input.command_id.clone(),
-            command_arn,
+            command_arn.clone(),
             created_at,
             &input,
         );
+        // The payload a device is handed for an execution of this command, recorded on
+        // the entry the register above created: the call that DELIVERS it
+        // (`iot-jobs-data`: `StartCommandExecution`, which publishes it on the device's
+        // own reserved request topic) is in another crate, so it reads the bytes from the
+        // shared index rather than holding a copy of its own.
+        index.set_payload(&command_arn, command_payload(&input));
         // The response is built from the record that is about to be persisted, so what
         // this call reports and what the next `GetCommand` reads are one value, not two
         // that could drift.

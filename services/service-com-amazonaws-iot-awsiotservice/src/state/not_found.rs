@@ -10,7 +10,9 @@
 //!   with the ACCOUNT the call was made for: `<Family> <accountId>:<name> not found.`
 //!   ([`registry_not_found`]).
 //! * The JOBS and COMMANDS planes word it `<Family> <id> cannot be found.`
-//!   ([`plane_not_found`]).
+//!   ([`plane_not_found`]) — including a command EXECUTION, whose sentence is shared with
+//!   the device-facing half of the same plane
+//!   ([`missing_command_execution_message`]).
 //! * The AUTHORIZER family words it `Authorizer <name> not found`.
 //! * The BILLING GROUP family words it `Billing group <name> does not exist`
 //!   ([`missing_billing_group_message`]).
@@ -143,6 +145,18 @@ pub fn missing_job_template_message(job_template_id: &str) -> String {
 /// sentence.
 pub fn missing_command_message(command_id: &str) -> String {
     plane_not_found("Command", command_id)
+}
+
+/// How this service states that an `executionId` names no command execution of the device
+/// the request addressed.
+///
+/// The same clause as the rest of the COMMANDS plane ([`plane_not_found`]), stated through
+/// the SHARED sentence (`service_common::iot_commands::command_execution_not_found_message`)
+/// because the device-facing half of this plane answers a missing execution too — a
+/// device's report on an execution's reserved MQTT response topic — and one missing
+/// execution must not be worded two ways.
+pub fn missing_command_execution_message(execution_id: &str) -> String {
+    ::service_common::iot_commands::command_execution_not_found_message(execution_id)
 }
 
 /// How this service refuses a read of a job execution whose JOB does not exist.
