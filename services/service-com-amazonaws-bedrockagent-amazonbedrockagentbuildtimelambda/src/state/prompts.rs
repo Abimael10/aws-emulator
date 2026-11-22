@@ -20,6 +20,7 @@ use super::*;
 
 use crate::ops::types::{
     CreatePromptOutput, CreatePromptVersionOutput, GetPromptOutput, PromptVariant,
+    UpdatePromptOutput,
 };
 
 /// The most prompts this store holds; past it `CreatePrompt` answers the modelled
@@ -65,6 +66,26 @@ impl PromptRecord {
     /// just stored, never from the request being served.
     pub fn to_create_output(&self) -> CreatePromptOutput {
         CreatePromptOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            default_variant: self.default_variant.clone(),
+            variants: self.variants.clone(),
+            id: self.prompt_id.clone(),
+            arn: self.arn.clone(),
+            version: self.version.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+
+    /// This record as the `UpdatePrompt` response: every member comes from the record as
+    /// the update left it, never from the request being served. The version reported is
+    /// the record's own, which is the working draft — `UpdatePrompt$version` is documented
+    /// "When you update a prompt, the version updated is the DRAFT version" — and the ARN
+    /// is the prompt's own, unqualified, because the draft is what moved.
+    pub fn to_update_output(&self) -> UpdatePromptOutput {
+        UpdatePromptOutput {
             name: self.name.clone(),
             description: self.description.clone(),
             customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),

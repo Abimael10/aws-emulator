@@ -22,7 +22,16 @@ pub struct UpdatePromptInput {
     pub prompt_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#UpdatePromptResponse")]
+/// `UpdatePromptResponse`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="UpdatePromptResponse")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdatePromptOutput {
     pub name: String,
@@ -36,4 +45,43 @@ pub struct UpdatePromptOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_agent_schema_and_codec!(
+    UpdatePromptOutput,
+    UPDATE_PROMPT_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagent#UpdatePromptResponse",
+    "com.amazonaws.bedrockagent",
+    "UpdatePromptResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_CUSTOMER_ENCRYPTION_KEY_ARN,
+        customer_encryption_key_arn,
+        "customerEncryptionKeyArn",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_DEFAULT_VARIANT,
+        default_variant,
+        "defaultVariant",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_VARIANTS,
+        variants,
+        "variants",
+        4,
+        opt,
+        list_of_struct(PromptVariant)
+    ),
+    (M_ID, id, "id", 5, req, string),
+    (M_ARN, arn, "arn", 6, req, string),
+    (M_VERSION, version, "version", 7, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 8, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 9, req, date_time),
+);
 

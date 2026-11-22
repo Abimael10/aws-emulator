@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePrompt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePrompt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePrompt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a stored prompt's WORKING DRAFT in [`crate::state`]: the response is projected
+//! from the record the update left behind, so a following `GetPrompt` reports the same
+//! prompt. The numbered versions cut from the prompt are static snapshots and stand
+//! still, whichever form the identifier took.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +184,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePrompt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePromptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePromptErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `PromptIdentifier` admits a prompt ARN — optionally qualified with
+        // a version — or a bare prompt id, and nothing else. The boundary validator lets
+        // other values through, because the pattern's top-level alternation leaves its
+        // first branch anchored only at the start, so an identifier of neither form is
+        // refused here as the bad request it is rather than reported as a missing prompt.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePrompt"))
+        // A version a qualified identifier carries selects nothing here: this operation's
+        // own contract is that "the version updated is the DRAFT version", and a numbered
+        // version is a static snapshot, so the write always lands on the working draft of
+        // the prompt the identifier names.
+        let Some(selection) = crate::state::prompt_from_identifier(&input.prompt_identifier)
+        else {
+            return Err(UpdatePromptErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::prompt_identifier_pattern_message(
+                        &input.prompt_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+
+        // `defaultVariant` is documented "This value must match the name field in the
+        // relevant PromptVariant object", so a default variant naming none of the
+        // variants the request carries is a bad request rather than a prompt to store.
+        // It constrains the request alone, so it is answered before the prompt the
+        // request addressed is resolved.
+        if !crate::state::default_variant_names_a_variant(
+            input.default_variant.as_deref(),
+            input.variants.as_deref(),
+        ) {
+            return Err(UpdatePromptErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::default_variant_pattern_message(
+                        input.default_variant.as_deref().unwrap_or_default(),
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        let Some(record) = state.prompts.get_mut(selection.prompt_id) else {
+            return Err(UpdatePromptErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::prompt_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        // The update REPLACES the draft's mutable members: this operation's own contract
+        // is to "include both fields that you want to keep and fields that you want to
+        // replace", so a member the request leaves out is left out of the prompt too. The
+        // identity members (`id`, `arn`), `createdAt`, the version the record IS and the
+        // high-water mark of the versions cut from it are not the request's to set, and
+        // neither are the tags, which the tagging surface owns.
+        record.name = input.name;
+        record.description = input.description;
+        record.customer_encryption_key_arn = input.customer_encryption_key_arn;
+        record.default_variant = input.default_variant;
+        // Stored as the request left it: an absent `variants` and an empty one are
+        // different values of the member, and a read reports back whichever was written.
+        record.variants = input.variants;
+        // The resource changed at this instant, so this is its last-updated one.
+        record.updated_at = now;
+
+        Ok(record.to_update_output())
     }
 }
