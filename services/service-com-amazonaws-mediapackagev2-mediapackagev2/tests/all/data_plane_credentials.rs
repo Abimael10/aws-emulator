@@ -23,11 +23,27 @@
 //! emulator does not hold, one scoped to another service, and the same classes carried in a
 //! presigned URL's query instead of a header — not along the resource names, which are not
 //! what the rule generalises over.
+//!
+//! The other half of that rule is what a push carrying a signature the emulator CAN verify
+//! earns: a signature verifies over the request as it ARRIVED, so the success path is taken
+//! only while nothing the signature covers differs from what the plane was handed. Those
+//! rows differ along WHICH covered part of the request was altered after signing — the
+//! signature itself, the body, the object, the method, the ingest endpoint's host, or the
+//! secret the signature was made with — crossed with the write methods, with the untouched
+//! request as the positive control. Their signatures come from the workspace's own signer,
+//! the recipe the emulator's verifier re-signs with, so nothing here restates how SigV4 is
+//! computed.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+// The ceiling one channel's retained objects are bounded by, from the service crate's own
+// constant rather than written out here.
+use service_com_amazonaws_mediapackagev2_mediapackagev2::state::MAX_INGESTED_OBJECTS_PER_CHANNEL;
+// The header a push declares the payload hash its signature covers in, and the digest of the
+// bytes it pushes: the tree's one home for both.
+use service_common::signed_payload_hash::{payload_digest, CONTENT_SHA256_HEADER};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every credential scope in this suite names.
@@ -126,6 +142,10 @@ struct Emulator {
     /// The access key id the emulator minted: a credential scoped to it is one the emulator
     /// HOLDS, so what it then refuses is the signature rather than the key.
     access_key_id: String,
+    /// Its secret, which is what lets a row present a signature that VERIFIES — the positive
+    /// control the refusal rows are refusals of. It is put in a request's `Authorization` and
+    /// nowhere else.
+    secret_access_key: String,
 }
 
 impl Emulator {
@@ -136,14 +156,16 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(true);
-        let access_key_id = match router.vended_credentials().into_iter().next() {
-            Some(emulator_server::VendedCredentials::AwsAccessKey { access_key_id, .. }) => {
-                access_key_id
-            }
-            other => panic!(
-                "with authentication on the emulator must vend a SigV4 key pair, got {other:?}"
-            ),
-        };
+        let (access_key_id, secret_access_key) =
+            match router.vended_credentials().into_iter().next() {
+                Some(emulator_server::VendedCredentials::AwsAccessKey {
+                    access_key_id,
+                    secret_access_key,
+                }) => (access_key_id, secret_access_key),
+                other => panic!(
+                    "with authentication on the emulator must vend a SigV4 key pair, got {other:?}"
+                ),
+            };
         router.set_request_authentication(false);
         router.register_service(
             service_com_amazonaws_mediapackagev2_mediapackagev2::EmulatedService::new(engine),
@@ -151,6 +173,7 @@ impl Emulator {
         Self {
             router,
             access_key_id,
+            secret_access_key,
         }
     }
 
@@ -301,9 +324,10 @@ fn grant_policy(action: &str) -> String {
     .to_string()
 }
 
-/// Create the group, the channel and the origin endpoint, and report the published ingest
-/// URL and HLS manifest URL.
-async fn fixtures(emulator: &Emulator) -> (String, String) {
+/// Create the group and the channel every case here pushes to, and report what the create
+/// answered — the one place in this suite those two resources are made, so the two helpers
+/// that need them cannot drift.
+async fn given_channel(emulator: &Emulator) -> Answer {
     let group = emulator
         .call(
             "POST",
@@ -328,6 +352,13 @@ async fn fixtures(emulator: &Emulator) -> (String, String) {
         "the channel must be created, got {} with body {}",
         channel.status, channel.body
     );
+    channel
+}
+
+/// Create the group, the channel and the origin endpoint, and report the published ingest
+/// URL and HLS manifest URL.
+async fn fixtures(emulator: &Emulator) -> (String, String) {
+    let channel = given_channel(emulator).await;
     let ingest_url = channel
         .json
         .get("IngestEndpoints")
@@ -560,5 +591,382 @@ async fn an_egress_fetch_is_gated_by_the_policy_and_by_the_credential_it_present
              {} (uri {})",
             answer.status, answer.body, answer.uri
         );
+    }
+}
+
+// --- the push that carries a signature which CAN verify -----------------------------------
+
+/// The bytes a signed row pushes.
+const SEGMENT: &[u8] = b"one CMAF fragment";
+
+/// The bytes the altered-body row puts in place of them after signing, so the signature
+/// covers a payload that never arrived.
+const OTHER_SEGMENT: &[u8] = b"a different CMAF fragment";
+
+/// What differs between the request a presented signature COVERS and the request that
+/// arrived at the plane.
+///
+/// Every variant carries a real SigV4 signature, made with the keys this emulator published
+/// by the workspace's own signer; what differs is which covered part of the request was
+/// altered after it was signed, which is what a signature verifies over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedPush {
+    /// Nothing is altered: the signature covers the request as it arrives.
+    AsPresented,
+    /// One character of the `Signature` field is altered — a well-formed header carrying a
+    /// signature that is not this request's, which is what a mis-signing encoder sends.
+    AlteredSignature,
+    /// The body is replaced after signing, so the payload the signature covers is not the
+    /// one that arrived.
+    AlteredBody,
+    /// The push is sent to another object under the same channel than the one signed.
+    AlteredObject,
+    /// The push is sent with the other write method than the one signed.
+    AlteredMethod,
+    /// The push is sent to the other published ingest endpoint of the channel's redundant
+    /// pair, whose host the signature does not cover.
+    AlteredEndpointHost,
+    /// The signature is made with a secret the emulator does not hold, under the key id it
+    /// published — an encoder configured with the wrong secret.
+    AnotherSecret,
+}
+
+impl SignedPush {
+    /// Whether the signature presented verifies over the request that arrives, which is the
+    /// one case the success path may be taken for.
+    fn verifies(self) -> bool {
+        self == Self::AsPresented
+    }
+}
+
+/// Every difference a row presents, the untouched request first as the positive control.
+const SIGNED_PUSHES: &[SignedPush] = &[
+    SignedPush::AsPresented,
+    SignedPush::AlteredSignature,
+    SignedPush::AlteredBody,
+    SignedPush::AlteredObject,
+    SignedPush::AlteredMethod,
+    SignedPush::AlteredEndpointHost,
+    SignedPush::AnotherSecret,
+];
+
+/// Where one signed row pushes, and the values its "altered after signing" variants put in
+/// place of what was signed.
+struct PushTarget<'a> {
+    /// The published ingest endpoint's host.
+    host: &'a str,
+    /// The object under its published path that the row writes.
+    object: &'a str,
+    /// Another object under the same channel: where [`SignedPush::AlteredObject`] sends it,
+    /// and read by that row alone.
+    other_object: &'a str,
+    /// The other published ingest endpoint's host: where
+    /// [`SignedPush::AlteredEndpointHost`] sends it, and read by that row alone.
+    other_host: &'a str,
+}
+
+impl Emulator {
+    /// Push `payload` carrying a REAL SigV4 signature, made with the keys this emulator
+    /// published, and alter `difference` of the request AFTER it was signed.
+    ///
+    /// The signature comes from the workspace's own signer
+    /// (`service_common::in_process_sigv4`), the recipe the emulator's verifier re-signs
+    /// with, so nothing here restates how SigV4 is computed; the secret is put in the
+    /// request's `Authorization` and nowhere else.
+    async fn push_signed(
+        &self,
+        method: &str,
+        target: &PushTarget<'_>,
+        payload: &[u8],
+        difference: SignedPush,
+    ) -> Answer {
+        let secret = match difference {
+            SignedPush::AnotherSecret => altered_last_character(&self.secret_access_key),
+            _ => self.secret_access_key.clone(),
+        };
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(target.object)
+            .header("host", target.host)
+            // A contribution encoder declares the payload hash its signature covers; the
+            // digest and the header come from the tree's one home for that declaration.
+            .header(CONTENT_SHA256_HEADER, payload_digest(payload))
+            .body(payload.to_vec())
+            .expect("a well-formed test request");
+        ::service_common::in_process_sigv4::sign_in_process_request_as(
+            &mut request,
+            SIGNING_NAME,
+            REGION,
+            &self.access_key_id,
+            &secret,
+        )
+        .await
+        .expect("the test request must sign");
+        let (mut parts, mut body) = request.into_parts();
+        match difference {
+            SignedPush::AlteredSignature => {
+                let presented = parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .expect("the signer must write an Authorization header")
+                    .to_string();
+                let altered = altered_signature(&presented)
+                    .parse()
+                    .expect("an altered SigV4 header is a header value");
+                parts.headers.insert("authorization", altered);
+            }
+            SignedPush::AlteredBody => body = OTHER_SEGMENT.to_vec(),
+            SignedPush::AlteredObject => {
+                parts.uri = target
+                    .other_object
+                    .parse()
+                    .expect("another object's path is a request target");
+            }
+            SignedPush::AlteredMethod => parts.method = other_write_method(method),
+            SignedPush::AlteredEndpointHost => {
+                let host = target
+                    .other_host
+                    .parse()
+                    .expect("a published host is a header value");
+                parts.headers.insert("host", host);
+            }
+            SignedPush::AsPresented | SignedPush::AnotherSecret => {}
+        }
+        let uri = parts.uri.to_string();
+        let response = self
+            .router
+            .dispatch(http::Request::from_parts(parts, bytes::Bytes::from(body)))
+            .await;
+        let status = response.status().as_u16();
+        let body = String::from_utf8_lossy(&response.into_body()).to_string();
+        let json = serde_json::from_str(&body).unwrap_or(Value::Null);
+        Answer {
+            status,
+            body,
+            json,
+            uri,
+        }
+    }
+}
+
+/// `text` with its last character replaced by one it is not: the signature a row presents,
+/// or the secret a row signs with, altered in exactly one place and in nothing else.
+fn altered_last_character(text: &str) -> String {
+    let mut characters: Vec<char> = text.chars().collect();
+    match characters.last_mut() {
+        Some(last) if *last == '0' => *last = '1',
+        Some(last) => *last = '0',
+        None => panic!("a signature and a secret are both non-empty"),
+    }
+    characters.into_iter().collect()
+}
+
+/// The `Authorization` header with one character of its `Signature` altered: still a
+/// well-formed SigV4 header, and not the signature of this request.
+fn altered_signature(header: &str) -> String {
+    let (fields, signature) = header
+        .rsplit_once("Signature=")
+        .unwrap_or_else(|| panic!("a signed request carries a Signature field, got {header:?}"));
+    format!("{fields}Signature={}", altered_last_character(signature))
+}
+
+/// The other method the ingest plane serves, so the altered-method row still addresses a
+/// method this plane answers and differs from what was signed in nothing else.
+fn other_write_method(method: &str) -> http::Method {
+    match method {
+        "PUT" => http::Method::POST,
+        "POST" => http::Method::PUT,
+        other => panic!("the ingest plane serves PUT and POST, got {other:?}"),
+    }
+}
+
+/// The write methods the ingest plane serves: a contributing encoder writes a segment with
+/// either of them.
+const WRITE_METHODS: &[&str] = &["PUT", "POST"];
+
+/// The `(host, path)` of each published endpoint of the channel's redundant pair, created
+/// through the same [`given_channel`] the suite's other fixture uses.
+async fn ingest_pair(emulator: &Emulator) -> Vec<(String, String)> {
+    let channel = given_channel(emulator).await;
+    let endpoints = channel
+        .json
+        .get("IngestEndpoints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        endpoints.len() >= 2,
+        "a channel publishes a redundant pair of ingest endpoints, got {}",
+        channel.body
+    );
+    endpoints
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| {
+            let url = endpoint
+                .get("Url")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ingest endpoint {index} publishes no Url, got {}",
+                        channel.body
+                    )
+                });
+            split_url(url)
+        })
+        .collect()
+}
+
+/// A credentialed push takes the success path only while the signature it presents verifies
+/// over the request that ARRIVED: altering any part that signature covers — the signature
+/// itself, the body, the object, the method, the endpoint host, or the secret it was made
+/// with — is refused `403` in the signature class, with a body that is not the access-denied
+/// one a push presenting no credential gets.
+#[tokio::test]
+async fn an_ingest_push_is_served_only_while_its_signature_covers_the_request_that_arrived() {
+    let mut emulator = Emulator::new();
+    let pair = ingest_pair(&emulator).await;
+    emulator.enforce_signatures();
+    let (host, path) = (pair[0].0.as_str(), pair[0].1.as_str());
+    let other_host = pair[1].0.as_str();
+    assert_ne!(
+        host, other_host,
+        "the premise of the altered-host row: each endpoint of the redundant pair is \
+         published on a host of its own, got {host} twice"
+    );
+    let object = format!("{path}/0.mp4");
+    let other_object = format!("{path}/1.mp4");
+    let target = PushTarget {
+        host,
+        object: &object,
+        other_object: &other_object,
+        other_host,
+    };
+
+    // The answer a push presenting NO credential gets, which every refusal below has to be
+    // distinguishable from: the service's own access-denied body.
+    let unauthenticated = emulator
+        .send("PUT", &object, host, SEGMENT, Credential::Absent)
+        .await;
+    assert_eq!(
+        unauthenticated.status, 403,
+        "case {:?}: expected HTTP 403, got {} with body {}",
+        Credential::Absent,
+        unauthenticated.status,
+        unauthenticated.body
+    );
+
+    for difference in SIGNED_PUSHES {
+        for method in WRITE_METHODS {
+            let case = format!("{difference:?} / {method}");
+            let answer = emulator
+                .push_signed(method, &target, SEGMENT, *difference)
+                .await;
+            if difference.verifies() {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: a push whose signature verifies over the request that \
+                     arrived must be served, got {} with body {}",
+                    answer.status, answer.body
+                );
+                continue;
+            }
+            assert_eq!(
+                answer.status, 403,
+                "case {case:?}: a push whose signature does not verify over the request that \
+                 arrived must be refused HTTP 403, got {} with body {} (uri {})",
+                answer.status, answer.body, answer.uri
+            );
+            assert!(
+                answer.reported().to_lowercase().contains("signature"),
+                "case {case:?}: the refusal must name the signature it would not accept, got {}",
+                answer.body
+            );
+            assert_ne!(
+                answer.body, unauthenticated.body,
+                "case {case:?}: the signature refusal must not answer the same body as a push \
+                 that presented no credential at all, got {}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// A refusal retains nothing: a channel that answered every presentation it could not verify
+/// `403` still takes its full complement of objects afterwards
+/// (`state::MAX_INGESTED_OBJECTS_PER_CHANNEL`, the store's own bound), so no refused push
+/// consumed a slot of it, and the `507` past that bound is what the SERVED pushes earned.
+#[tokio::test]
+async fn a_push_the_plane_refuses_retains_nothing_of_the_channels_capacity() {
+    let mut emulator = Emulator::new();
+    let pair = ingest_pair(&emulator).await;
+    emulator.enforce_signatures();
+    let (host, path) = (pair[0].0.as_str(), pair[0].1.as_str());
+    let other_host = pair[1].0.as_str();
+
+    let refused_object = format!("{path}/refused.mp4");
+    let other_object = format!("{path}/refused-elsewhere.mp4");
+    let refused_target = PushTarget {
+        host,
+        object: &refused_object,
+        other_object: &other_object,
+        other_host,
+    };
+    for difference in SIGNED_PUSHES.iter().filter(|row| !row.verifies()) {
+        let answer = emulator
+            .push_signed("PUT", &refused_target, SEGMENT, *difference)
+            .await;
+        assert_eq!(
+            answer.status, 403,
+            "case {difference:?}: expected HTTP 403, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+    for credential in UNVERIFIABLE.iter().chain([Credential::Absent].iter()) {
+        let answer = emulator
+            .send("PUT", &refused_object, host, SEGMENT, *credential)
+            .await;
+        assert_eq!(
+            answer.status, 403,
+            "case {credential:?}: expected HTTP 403, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+
+    // The channel's whole complement is still there to be filled, and the push past it is
+    // the one the bound refuses.
+    for index in 0..=MAX_INGESTED_OBJECTS_PER_CHANNEL {
+        let object = format!("{path}/fill-{index}.mp4");
+        let target = PushTarget {
+            host,
+            // Every row here is the untouched one, which reads neither of these.
+            object: &object,
+            other_object: &object,
+            other_host,
+        };
+        let answer = emulator
+            .push_signed("PUT", &target, SEGMENT, SignedPush::AsPresented)
+            .await;
+        let expected = match index < MAX_INGESTED_OBJECTS_PER_CHANNEL {
+            true => 200,
+            false => 507,
+        };
+        assert_eq!(
+            answer.status, expected,
+            "case \"object {index} of a channel that refused every unverifiable push\": \
+             expected HTTP {expected}, got {} with body {}",
+            answer.status, answer.body
+        );
+        if expected == 507 {
+            // Which bound refused it: the per-CHANNEL object count, not the store-wide byte
+            // budget, which these few bytes are nowhere near.
+            assert!(
+                answer.string("message").contains("channel"),
+                "case \"object {index}\": the refusal must name the per-channel bound it \
+                 reached, got {}",
+                answer.body
+            );
+        }
     }
 }
