@@ -208,6 +208,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A document bounded in SIZE may still describe more than one provider may hold:
+        // the identity providers it describes and the signing keys it publishes are both
+        // quotas, so a document past either is refused LimitExceeded naming the quota that
+        // fired (`crate::state::saml_metadata_over_quota`) and nothing is created — rather
+        // than a provider created from the part of the document that fits.
+        if let Some(message) = crate::state::saml_metadata_over_quota(&metadata) {
+            return Err(CreateSAMLProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A provider that DEMANDS encrypted assertions can read nothing without a key to
+        // decrypt them with, and the private key the request uploads is the only thing it
+        // would hold that can — so the two members have to hold together, and a request
+        // that names the strict mode without one is refused and no provider is created
+        // (`crate::state::REQUIRED_ASSERTION_ENCRYPTION_MODE`). The same rule
+        // `UpdateSAMLProvider` applies to the state an update would leave.
+        if input.assertion_encryption_mode.as_deref()
+            == Some(crate::state::REQUIRED_ASSERTION_ENCRYPTION_MODE)
+            && input.add_private_key.is_none()
+        {
+            return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::ASSERTION_ENCRYPTION_REQUIRES_PRIVATE_KEY.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
         // "invalid … value … for an input parameter" — and "if any one of the tags is
         // invalid or if you exceed the allowed maximum number of tags, then the entire

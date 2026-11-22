@@ -33,6 +33,30 @@ pub const DEFAULT_SAML_PROVIDER_VALIDITY_DAYS: i64 = 36_500;
 /// are treated.
 pub const DEFAULT_ASSERTION_ENCRYPTION_MODE: &str = "Allowed";
 
+/// The encryption setting under which a SAML provider DEMANDS encrypted assertions: the
+/// strict member of `assertionEncryptionModeType`
+/// (`crate::ops::types::ASSERTION_ENCRYPTION_MODE_TYPE_VALUES`).
+///
+/// A provider under it can serve nothing without a key to DECRYPT an assertion with: "the
+/// private key must be a .pem file that uses AES-GCM or AES-CBC encryption algorithm to
+/// decrypt SAML assertions" (`CreateSAMLProvider$AddPrivateKey`), and that key is the only
+/// thing a provider holds that can. So a call that would leave a provider demanding
+/// encrypted assertions with no private key on file supplied "an invalid … value … for an
+/// input parameter" across its members, refused with
+/// [`ASSERTION_ENCRYPTION_REQUIRES_PRIVATE_KEY`] — the rule both the create and the update
+/// of a provider apply, because either can reach that state.
+pub const REQUIRED_ASSERTION_ENCRYPTION_MODE: &str = "Required";
+
+/// The message IAM refuses a call that would leave a SAML provider demanding encrypted
+/// assertions with no private key to decrypt them with.
+///
+/// Recorded behaviour, and entirely fixed text: the sentence names the MODE the call asked
+/// for and the key that is missing, and quotes nothing of the request back — what it
+/// reports is that the setting could not be put in force, which is why it opens with
+/// `Failed to set`.
+pub const ASSERTION_ENCRYPTION_REQUIRES_PRIVATE_KEY: &str =
+    "Failed to set assertion encryption mode to Required because no private key is present.";
+
 /// Whether a held identity provider is enabled for trusted identity propagation.
 ///
 /// Reported on every entry of `ListSAMLProviders` and `ListOpenIDConnectProviders`, so a

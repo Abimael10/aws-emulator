@@ -261,6 +261,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // ONE user holds a bounded number of MFA devices, so a caller cannot enrol without
+        // limit; past the per-user quota IAM refuses the enrolment and the device stays
+        // unassigned. Taken against the devices of every kind the user already holds
+        // (`crate::state::mfa_devices_held_by`) and decided BEFORE the codes below are
+        // authenticated, because no pair of codes could make room for the enrolment. The
+        // refusal names the quota that fired, which is what tells it apart from this
+        // operation's other `LimitExceeded` causes.
+        if store.mfa_devices_held_by(&user_key) >= crate::state::MAX_MFA_DEVICES_PER_USER {
+            return Err(EnableMFADeviceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(
+                        crate::state::MFA_DEVICES_PER_USER_QUOTA_EXCEEDED.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The codes are AUTHENTICATED against the device's own seed (see the module docs):
         // two codes in a row, so what the request proves is that its sender holds a device
         // whose clock runs with this one. Nothing is enabled when they do not.

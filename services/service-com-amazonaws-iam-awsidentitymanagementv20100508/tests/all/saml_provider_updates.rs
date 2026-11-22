@@ -274,14 +274,16 @@ fn update_cases() -> Vec<UpdateCase> {
             name: "ModeFlipped",
             initial_valid_until: Some("2031-07-04T12:00:00Z"),
             initial_mode: Some("Required"),
-            initial_key: false,
+            // The strict mode the create chose demands a key to decrypt an assertion
+            // with, so the fixture holds one.
+            initial_key: true,
             new_document: None,
             new_mode: Some("Allowed"),
             add_key: false,
             remove_held_key: false,
             expected_valid_until: Some("2031-07-04T12:00:00Z"),
             expected_mode: Some("Allowed"),
-            expected_keys: 0,
+            expected_keys: 1,
         },
         UpdateCase {
             name: "FirstKeyUploaded",
@@ -297,16 +299,18 @@ fn update_cases() -> Vec<UpdateCase> {
             expected_keys: 1,
         },
         UpdateCase {
+            // The last key removed, which a provider may be left without exactly because
+            // it does not DEMAND encrypted assertions.
             name: "HeldKeyRemoved",
             initial_valid_until: Some("2033-03-03T03:03:03Z"),
-            initial_mode: Some("Required"),
+            initial_mode: Some("Allowed"),
             initial_key: true,
             new_document: None,
             new_mode: None,
             add_key: false,
             remove_held_key: true,
             expected_valid_until: Some("2033-03-03T03:03:03Z"),
-            expected_mode: Some("Required"),
+            expected_mode: Some("Allowed"),
             expected_keys: 0,
         },
         UpdateCase {
@@ -534,7 +538,7 @@ async fn an_update_applies_the_members_it_supplies_and_leaves_the_rest_held() {
 async fn an_upload_past_the_private_key_bound_is_refused_and_stores_nothing() {
     let router = router();
     let case = "PrivateKeyBound";
-    let arn = create_provider(&router, case, None, Some("Required"), false).await;
+    let arn = create_provider(&router, case, None, Some("Allowed"), false).await;
 
     // Every slot the bound allows can be filled.
     for slot in 1..=MAX_PRIVATE_KEYS_PER_SAML_PROVIDER {

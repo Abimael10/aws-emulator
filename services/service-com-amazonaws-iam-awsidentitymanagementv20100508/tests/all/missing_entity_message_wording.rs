@@ -435,7 +435,16 @@ async fn an_mfa_device_call_reports_an_absent_user_before_the_device() {
 
         // The user IS held: now the refusal is about the DEVICE, in the sentence of its own
         // class — the serial naming no device of the account at all, and the device the
-        // account holds but this user does not.
+        // account holds but this user has not enrolled, which the two calls word
+        // differently: the read of a device names the device and the user, while
+        // `DeactivateMFADevice` addresses the ENROLMENT and words its absence with its own
+        // fixed sentence. Both are written out as the wire text they are.
+        let not_this_users = match which {
+            DeviceCall::Deactivate => "MFA Device invalid for user.".to_string(),
+            DeviceCall::Resync => {
+                format!("MFA Device {unassigned} cannot be found for user {held_user}.")
+            }
+        };
         for (serial_number, expected) in [
             (
                 absent_arn.as_str(),
@@ -445,10 +454,7 @@ async fn an_mfa_device_call_reports_an_absent_user_before_the_device() {
                 bare_serial,
                 format!("MFA Device with serial number {bare_serial} does not exist."),
             ),
-            (
-                unassigned.as_str(),
-                format!("MFA Device {unassigned} cannot be found for user {held_user}."),
-            ),
+            (unassigned.as_str(), not_this_users),
         ] {
             let row = format!("{which:?} held user serial {serial_number:?}");
             let (status, body) = which.send(&router, held_user, serial_number).await;

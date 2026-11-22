@@ -237,8 +237,10 @@ fn provider_cases() -> Vec<ProviderCase> {
             entity_id: "urn:example:federation:group",
             valid_until: None,
             expected_valid_until: None,
-            encryption_mode: Some("Required"),
-            private_key: false,
+            // The strict mode, so the row uploads the key that mode demands: a provider
+            // that requires encrypted assertions has to hold one to decrypt them with.
+            encryption_mode: Some(REQUIRED_ENCRYPTION_MODE),
+            private_key: true,
             tags: vec![("only", "one")],
         },
         ProviderCase {
@@ -298,6 +300,12 @@ pub(crate) fn expected_expiration(
 pub(crate) fn expected_encryption_mode(chosen: Option<&str>) -> &str {
     chosen.unwrap_or("Allowed")
 }
+
+/// The STRICT member of `assertionEncryptionModeType` (`smithy_query(query="shape",
+/// shape="assertionEncryptionModeType")`): the mode under which a provider demands
+/// encrypted assertions, and so the mode a request may name only together with the private
+/// key that could decrypt one.
+pub(crate) const REQUIRED_ENCRYPTION_MODE: &str = "Required";
 
 /// `privateKeyIdType` (which both `SAMLProviderUUID` and `SAMLPrivateKey$KeyId` target)
 /// is len 22..64 with pattern `^[A-Z0-9]+$` (`smithy_query(query="shape",

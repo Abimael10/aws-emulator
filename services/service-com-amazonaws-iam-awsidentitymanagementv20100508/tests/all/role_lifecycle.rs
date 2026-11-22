@@ -237,6 +237,25 @@ async fn create_persists_every_member_and_get_role_reads_it_back() {
     ];
 
     let router = router();
+    // The boundary a bounded row names has to BE a managed policy of the account: a
+    // `CreateRole` RESOLVES its `PermissionsBoundary` and refuses a value that names no
+    // policy, so the fixture creates that policy before the rows run.
+    let (status, policy) = call(
+        &router,
+        "CreatePolicy",
+        &[
+            ("PolicyName", "Boundary"),
+            (
+                "PolicyDocument",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture boundary policy must be created, got {status}: {policy}"
+    );
     for (index, case) in cases.iter().enumerate() {
         let role_name = format!("role-{index}");
         let owned = case.params(&role_name);

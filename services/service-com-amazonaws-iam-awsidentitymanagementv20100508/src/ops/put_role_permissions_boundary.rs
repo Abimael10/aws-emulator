@@ -191,21 +191,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `arn:<partition>:iam::<account>:policy/<path><name>`. Anything else is an
         // "invalid … value … supplied for an input parameter", read through the one
         // definition of that grammar in `crate::state`, as `AttachRolePolicy` does.
-        // The two layers IAM takes an ARN member's form in, exactly as this crate's
-        // `AttachRolePolicy` takes it (`crate::state::is_arn`): a value that is not an ARN
+        // The two layers IAM takes an ARN member's form in, read through the one reader
+        // every operation setting a boundary shares
+        // (`crate::state::permissions_boundary_form_defect`): a value that is not an ARN
         // at all is refused with the code IAM answers a wrong FORM with, and an ARN naming
         // another service or resource type is the "invalid … value … supplied for an input
         // parameter" this operation MODELS — one sentence for both
         // (`crate::state::arn_not_valid`).
-        if crate::state::parse_policy_arn(&input.permissions_boundary).is_none() {
-            if !crate::state::is_arn(&input.permissions_boundary) {
-                return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::arn_not_valid(&input.permissions_boundary),
-                ));
+        if let Some(defect) =
+            crate::state::permissions_boundary_form_defect(&input.permissions_boundary)
+        {
+            let message = defect.message(&input.permissions_boundary);
+            if defect == crate::state::PermissionsBoundaryDefect::NotAnArn {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
             }
             return Err(PutRolePermissionsBoundaryErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::arn_not_valid(&input.permissions_boundary)),
+                    message: Some(message),
                 },
             )
             .into());

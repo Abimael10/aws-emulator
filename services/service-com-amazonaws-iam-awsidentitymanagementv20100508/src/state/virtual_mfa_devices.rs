@@ -348,9 +348,25 @@ pub fn mfa_device_not_found_message(serial_number: &str) -> String {
 ///
 /// A different class from [`mfa_device_not_found_message`], and so a different sentence: the
 /// entity that does not exist is the pair, not the device.
+///
+/// This is the wording of the operations that READ or RESYNCHRONISE a device the user holds
+/// (`GetMFADevice`, `ResyncMFADevice`). `DeactivateMFADevice` words the same class its own
+/// way ([`MFA_DEVICE_INVALID_FOR_USER`]), and both sentences are part of the wire contract a
+/// client matching the message sees.
 pub fn mfa_device_not_found_for_user_message(serial_number: &str, user_name: &str) -> String {
     format!("MFA Device {serial_number} cannot be found for user {user_name}.")
 }
+
+/// How `DeactivateMFADevice` refuses a serial that names no ENROLMENT of the named user —
+/// a device the account holds unassigned, and a device another user holds alike.
+///
+/// Entirely fixed text: the sentence quotes neither the serial nor the user back, because
+/// what it reports is that the device the request named is not one this user has enrolled.
+/// What that call removes is an enrolment ("the specified MFA device … for which it was
+/// originally enabled"), so the entity it addresses is the pair — and IAM words the absence
+/// of that pair here differently from the operations that read the device
+/// ([`mfa_device_not_found_for_user_message`]).
+pub const MFA_DEVICE_INVALID_FOR_USER: &str = "MFA Device invalid for user.";
 
 /// How IAM refuses an enrolment of a device that is ALREADY enabled: the `MFA Device for user `
 /// … ` already exists.` sentence of IAM's entity-already-exists family, carrying the name of

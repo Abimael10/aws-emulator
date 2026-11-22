@@ -255,14 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The association removed is the one "for which it was originally enabled": a device
         // the named user does not hold is, for this request, the entity that does not exist
         // — so a device nobody holds and a device another user holds are both refused, and
-        // neither is touched.
+        // neither is touched. What this call addresses is the ENROLMENT rather than the
+        // device, so the absence of one is reported in this operation's own fixed sentence
+        // (`crate::state::MFA_DEVICE_INVALID_FOR_USER`), which quotes neither the serial nor
+        // the user back.
         if device.user_key.as_deref() != Some(user_key.as_str()) {
             return Err(DeactivateMFADeviceErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::mfa_device_not_found_for_user_message(
-                        &input.serial_number,
-                        &named_user,
-                    )),
+                    message: Some(crate::state::MFA_DEVICE_INVALID_FOR_USER.to_string()),
                 },
             )
             .into());

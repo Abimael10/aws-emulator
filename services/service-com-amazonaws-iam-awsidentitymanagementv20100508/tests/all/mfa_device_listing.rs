@@ -403,9 +403,10 @@ async fn a_deactivation_removes_the_association_and_unblocks_the_delete() {
     }
 }
 
-/// RULE: a serial the account holds no device under, and a device the named user does not
-/// hold, are both the entity that does not exist — each refused 404 `NoSuchEntity` with the
-/// sentence of its own class — and neither deactivates anything.
+/// RULE: a serial the account holds no device under, and a device the named user has not
+/// enrolled, are both the entity that does not exist — each refused 404 `NoSuchEntity` with
+/// the sentence of its own class, the device's absence naming the serial and the
+/// ENROLMENT's naming neither the serial nor the user — and neither deactivates anything.
 #[tokio::test]
 async fn a_device_that_is_not_the_named_users_is_refused_as_a_missing_entity() {
     let case = "deactivating";
@@ -415,6 +416,10 @@ async fn a_device_that_is_not_the_named_users_is_refused_as_a_missing_entity() {
     let serial_number = given_enabled_device(&router, case, USER, "held-phone").await;
     let (free_serial, _) = given_device(&router, "free-phone").await;
     let absent_serial = format!("{serial_number}-absent");
+    // The sentence `DeactivateMFADevice` words the absence of an ENROLMENT with, whichever
+    // device the request named: entirely fixed text, written out here rather than read from
+    // the implementation's constant, because what this suite pins is the text on the WIRE.
+    let invalid_for_user = "MFA Device invalid for user.".to_string();
 
     let rows: [(&str, Option<&str>, &str, String); 4] = [
         (
@@ -433,13 +438,13 @@ async fn a_device_that_is_not_the_named_users_is_refused_as_a_missing_entity() {
             "a device another user holds",
             Some(OTHER_USER),
             serial_number.as_str(),
-            format!("MFA Device {serial_number} cannot be found for user {OTHER_USER}."),
+            invalid_for_user.clone(),
         ),
         (
             "a device nobody holds",
             Some(USER),
             free_serial.as_str(),
-            format!("MFA Device {free_serial} cannot be found for user {USER}."),
+            invalid_for_user,
         ),
     ];
 

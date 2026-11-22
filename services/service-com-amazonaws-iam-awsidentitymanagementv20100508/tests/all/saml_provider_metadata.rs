@@ -34,12 +34,18 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::MAX_SIGNING
 use smithy_server_runtime::MultiServiceRouter;
 use x509_cert::der::Decode;
 
+/// The whole sentence IAM refuses a document publishing more than
+/// `MAX_SIGNING_KEYS_PER_SAML_METADATA` signing keys with: the quota's name AND its
+/// published value (ten), written out rather than built from the implementation's constants,
+/// because what this suite pins is the text on the WIRE.
+const KEYS_QUOTA_EXCEEDED: &str = "Cannot exceed quota for KeysPerSamlIdp: 10";
+
 use crate::open_id_connect_providers::{issuer_of, list_members};
 use crate::role_lifecycle::{borrowed, optional, param};
 use crate::saml_provider_listing::split_element;
 use crate::saml_providers::{
-    DEFAULT_VALIDITY_SECONDS, METADATA_NAMESPACE, expected_arn, expected_encryption_mode,
-    expected_expiration, reported_instant,
+    DEFAULT_VALIDITY_SECONDS, METADATA_NAMESPACE, REQUIRED_ENCRYPTION_MODE, expected_arn,
+    expected_encryption_mode, expected_expiration, reported_instant,
 };
 use crate::user_lifecycle::{call, element, elements, router};
 
@@ -50,7 +56,7 @@ use crate::user_lifecycle::{call, element, elements, router};
 /// One key a fixture metadata document publishes: the base64 of its certificate's DER, as
 /// the document carries it, beside the identifier of the key inside it.
 #[derive(Debug, Clone)]
-struct SigningKey {
+pub(crate) struct SigningKey {
     /// What the document's `X509Certificate` element carries.
     certificate: String,
     /// The identifier of the key the certificate carries: the hex SHA-1 of its
@@ -61,7 +67,7 @@ struct SigningKey {
 
 /// Generate a real key pair and a self-signed certificate for it, and report the two forms
 /// above.
-fn signing_key(common_name: &str) -> SigningKey {
+pub(crate) fn signing_key(common_name: &str) -> SigningKey {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
     let mut params =
         rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("parameters");
@@ -89,7 +95,7 @@ fn signing_key(common_name: &str) -> SigningKey {
 /// How a document spells the SAML 2.0 metadata namespace and nests its entity, so no rule
 /// below can be keyed to the text of one spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentForm {
+pub(crate) enum DocumentForm {
     /// Root `EntityDescriptor`, the namespace declared as the default.
     Entity,
     /// Root `EntityDescriptor`, the namespace bound to the conventional `md` prefix.
@@ -103,9 +109,9 @@ enum DocumentForm {
 /// contained key may be used for both encryption and signing", OASIS "Metadata for SAML
 /// V2.0" §2.4.1.1) and which key it publishes.
 #[derive(Debug, Clone)]
-struct PublishedKey {
-    purpose: Option<&'static str>,
-    key: SigningKey,
+pub(crate) struct PublishedKey {
+    pub(crate) purpose: Option<&'static str>,
+    pub(crate) key: SigningKey,
 }
 
 /// A SAML 2.0 metadata document naming `entity_id` as its issuer, stating `valid_until` as
@@ -115,7 +121,7 @@ struct PublishedKey {
 /// The padding keeps every document past `SAMLMetadataDocumentType`'s 1000-character
 /// minimum (`smithy_query(query="operation", operation="CreateSAMLProvider")`) even when it
 /// publishes no key at all; it sits in an element nothing reads.
-fn metadata_document(
+pub(crate) fn metadata_document(
     form: DocumentForm,
     entity_id: &str,
     valid_until: Option<&str>,
@@ -216,6 +222,17 @@ impl ProviderCase {
         ];
         if let Some(mode) = self.encryption_mode {
             params.push(param("AssertionEncryptionMode", mode));
+            if mode == REQUIRED_ENCRYPTION_MODE {
+                // A provider that DEMANDS encrypted assertions has to hold a key to
+                // decrypt one with — "the private key must be a .pem file that uses
+                // AES-GCM or AES-CBC encryption algorithm to decrypt SAML assertions"
+                // (`CreateSAMLProvider$AddPrivateKey`) — so a row choosing that mode
+                // uploads one, whose body only has to satisfy `privateKeyType`.
+                params.push(param(
+                    "AddPrivateKey",
+                    &format!("-----BEGIN PRIVATE KEY----- {} -----END PRIVATE KEY-----", self.name),
+                ));
+            }
         }
         params
     }
@@ -470,18 +487,20 @@ async fn get_saml_provider_reports_the_identifier_of_every_signing_key_the_docum
     }
 }
 
-/// A document is read for at most `MAX_SIGNING_KEYS_PER_SAML_METADATA` distinct signing
-/// keys, so one request cannot choose how much work reading its document is: a document
-/// publishing exactly that many has every one of them reported, and one publishing more has
-/// the first that many reported and the rest left unread.
+/// A metadata document publishes at most `MAX_SIGNING_KEYS_PER_SAML_METADATA` distinct
+/// signing keys: a document publishing up to that many has every one of them reported, and
+/// one publishing more is refused `LimitExceeded` (HTTP 409) with nothing created — so one
+/// request can neither choose how much work reading its document is nor leave a provider
+/// holding only the part of a document that fitted.
 #[tokio::test]
-async fn a_document_is_read_for_at_most_the_bounded_number_of_signing_keys() {
+async fn a_document_past_the_signing_key_quota_is_refused_and_creates_nothing() {
     let router = router();
 
     for published in [
         MAX_SIGNING_KEYS_PER_SAML_METADATA - 1,
         MAX_SIGNING_KEYS_PER_SAML_METADATA,
-        MAX_SIGNING_KEYS_PER_SAML_METADATA + 2,
+        MAX_SIGNING_KEYS_PER_SAML_METADATA + 1,
+        MAX_SIGNING_KEYS_PER_SAML_METADATA + 5,
     ] {
         let keys: Vec<PublishedKey> = (0..published)
             .map(|index| PublishedKey {
@@ -498,20 +517,52 @@ async fn a_document_is_read_for_at_most_the_bounded_number_of_signing_keys() {
             encryption_mode: None,
             keys: keys.clone(),
         };
+        let params = case.params();
+        let (status, body) = call(&router, "CreateSAMLProvider", &borrowed(&params)).await;
+        if published > MAX_SIGNING_KEYS_PER_SAML_METADATA {
+            assert_eq!(
+                status, 409,
+                "a document publishing {published} signing keys is past the quota of \
+                 {MAX_SIGNING_KEYS_PER_SAML_METADATA} and must be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                crate::user_lifecycle::error_code(&body),
+                "LimitExceeded",
+                "a document past the signing-key quota must be refused LimitExceeded, got {body}"
+            );
+            assert_eq!(
+                element(&body, "Message"),
+                KEYS_QUOTA_EXCEEDED,
+                "expected the quota sentence {KEYS_QUOTA_EXCEEDED:?}, got {:?}",
+                element(&body, "Message")
+            );
+            // Nothing was created: the account holds no provider under that name.
+            let read = vec![param("SAMLProviderArn", &expected_arn(case.name))];
+            let (status, read_body) = call(&router, "GetSAMLProvider", &borrowed(&read)).await;
+            assert_eq!(
+                status, 404,
+                "a document past the quota must create nothing, got {status}: {read_body}"
+            );
+            continue;
+        }
+
         // Each row holds the account's only provider, so the name can be the same one.
-        let arn = create_provider(&router, &case).await;
+        assert_eq!(
+            status, 200,
+            "a document publishing {published} signing keys is within the quota and must be \
+             served, got {status}: {body}"
+        );
+        let arn = element(&body, "SAMLProviderArn");
         let read = read_provider(&router, case.name, &arn).await;
         let (_, hashes) = reported_key_hashes(&read);
         let expected: Vec<String> = keys
             .iter()
-            .take(MAX_SIGNING_KEYS_PER_SAML_METADATA)
             .map(|published| published.key.key_hash.clone())
             .collect();
         assert_eq!(
             hashes, expected,
-            "a document publishing {published} signing keys must report the first {} of \
-             them, got {read}",
-            expected.len()
+            "a document publishing {published} signing keys must report every one of them, \
+             got {read}"
         );
         let delete = vec![param("SAMLProviderArn", &arn)];
         let (status, body) = call(&router, "DeleteSAMLProvider", &borrowed(&delete)).await;

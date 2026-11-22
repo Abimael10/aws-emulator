@@ -21,6 +21,47 @@ use crate::ops::types::MFADevice;
 /// [`MARKER_SCOPE_VIRTUAL_MFA_DEVICES`]).
 pub const MARKER_SCOPE_MFA_DEVICES: &str = "mfa-devices";
 
+/// How many MFA devices ONE IAM user may have enrolled at a time.
+///
+/// AWS's "IAM and STS quotas" page gives the quota "MFA devices in use per IAM user: 8",
+/// which is why `EnableMFADevice` models `LimitExceededException` ("it attempted to create
+/// resources beyond the current … account limits. The error message describes the limit
+/// exceeded"): the enrolment past it is refused and the device stays unassigned. The quota
+/// is over the devices of EVERY kind the user holds, because what it bounds is the devices
+/// "in use" by that user ([`ComAmazonawsIamAwsidentitymanagementv20100508State::mfa_devices_held_by`]).
+pub const MAX_MFA_DEVICES_PER_USER: usize = 8;
+
+/// The sentence IAM refuses an enrolment past [`MAX_MFA_DEVICES_PER_USER`] with.
+///
+/// Recorded behaviour, and a DIFFERENT template from the one IAM's other quota refusals
+/// carry (`Cannot exceed quota for <quota>: <value>`): this one says `quota limit for` and
+/// states the quota's NAME alone, with no value after it. Entirely fixed text — it names
+/// neither the user nor the device — and the quota name in it is what identifies WHICH of
+/// the operation's several `LimitExceeded` causes refused the call.
+pub const MFA_DEVICES_PER_USER_QUOTA_EXCEEDED: &str =
+    "Cannot exceed quota limit for MFADevicesPerUser";
+
+impl ComAmazonawsIamAwsidentitymanagementv20100508State {
+    /// How many MFA devices the IAM user held under `user_key` has enrolled, of every kind
+    /// the account holds — what the per-user quota ([`MAX_MFA_DEVICES_PER_USER`]) is taken
+    /// against, and the count `ListMFADevices` would report for that user.
+    ///
+    /// A READ: it only consults the store.
+    pub fn mfa_devices_held_by(&self, user_key: &str) -> usize {
+        let virtual_devices = self
+            .virtual_mfa_devices
+            .values()
+            .filter(|record| record.user_key.as_deref() == Some(user_key))
+            .count();
+        let security_keys = self
+            .fido_security_keys
+            .values()
+            .filter(|record| record.user_key == user_key)
+            .count();
+        virtual_devices.saturating_add(security_keys)
+    }
+}
+
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The MFA devices the IAM user held under `user_key` has, as `ListMFADevices` reports
     /// them — "a list of MFA devices" of every kind the account holds, each carrying the

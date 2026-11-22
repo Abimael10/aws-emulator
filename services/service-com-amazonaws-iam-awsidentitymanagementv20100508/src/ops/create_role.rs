@@ -119,6 +119,10 @@
 //!   message describes the limit exceeded.
 //! * `MalformedPolicyDocumentException` (HTTP 400) — The request was rejected because the
 //!   policy document was malformed. The error message describes the specific error.
+//! * `NoSuchEntityException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the SERVICE models it ("the request was rejected because it referenced a resource
+//!   entity that does not exist"), and recorded behaviour refuses a `PermissionsBoundary`
+//!   naming no managed policy of the account under this code.
 //! * `ServiceFailureException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception or failure.
 
@@ -136,7 +140,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iam-awsidentitymanageme
 // here — hence the `CreateRoleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iam#CreateRole")]
+//
+// ONE shape the SERVICE models is widened in through `extra_errors`:
+// `NoSuchEntityException`. This operation's error list does not carry it
+// (`smithy_query(query="operation", operation="CreateRole")`), yet a `PermissionsBoundary`
+// is a REFERENCE to a managed policy and recorded behaviour refuses one that names no
+// policy of the account as the entity that does not exist — the same code `CreateUser`,
+// which does declare the shape, answers for the same value. The alternative would be to
+// answer one refusal under two codes depending on which identity was being created.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iam#CreateRole",
+    extra_errors = ["NoSuchEntityException"]
+)]
 #[derive(Debug)]
 pub enum CreateRoleErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
@@ -144,6 +159,7 @@ pub enum CreateRoleErrorModeled {
     InvalidInputException(InvalidInputException),
     LimitExceededException(LimitExceededException),
     MalformedPolicyDocumentException(MalformedPolicyDocumentException),
+    NoSuchEntityException(NoSuchEntityException),
     ServiceFailureException(ServiceFailureException),
 }
 
@@ -325,6 +341,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A `PermissionsBoundary` is "the ARN of the managed policy that is used to set the
+        // permissions boundary for the role", so it is a REFERENCE the account RESOLVES
+        // rather than a string the role carries: the boundary "defines the maximum
+        // permissions that identity-based policies can grant to an entity", which is a
+        // question asked of that policy's document, so a value naming no policy of the
+        // account bounds nothing and the role is not created. The resolution and the
+        // refusal are the shared ones every operation setting a boundary applies
+        // (`crate::state::permissions_boundary_defect`), so a dangling boundary is refused
+        // in the same words whether a create carried it or a put set it.
+        if let Some(boundary) = input.permissions_boundary.as_deref() {
+            if let Some(defect) = crate::state::permissions_boundary_defect(&store, boundary) {
+                let message = defect.message(boundary);
+                return Err(match defect {
+                    crate::state::PermissionsBoundaryDefect::NotAnArn => {
+                        crate::scaffolded::Scaffolded::validation_error(message)
+                    }
+                    // A boundary that resolves to no policy of the account "referenced a
+                    // resource entity that does not exist": the code `CreateUser` answers
+                    // for the same value, widened into this operation's channel above
+                    // because its own error list does not carry the shape.
+                    crate::state::PermissionsBoundaryDefect::NoSuchPolicy => {
+                        CreateRoleErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                    crate::state::PermissionsBoundaryDefect::NotAPolicyArn => {
+                        CreateRoleErrorModeled::InvalidInputException(InvalidInputException {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                });
+            }
         }
 
         // IAM entity names are unique within the account and "are not distinguished

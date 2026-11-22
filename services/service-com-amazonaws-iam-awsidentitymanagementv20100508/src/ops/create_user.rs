@@ -229,6 +229,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         )?;
 
+        // A `PermissionsBoundary` is "the ARN of the managed policy that is used to set the
+        // permissions boundary for the user", so it is a REFERENCE the account RESOLVES
+        // rather than a string the user carries: the boundary "defines the maximum
+        // permissions that identity-based policies can grant to an entity", which is a
+        // question asked of that policy's document, so a value naming no policy of the
+        // account bounds nothing and the user is not created. The resolution and the
+        // refusal are the shared ones every operation setting a boundary applies
+        // (`crate::state::permissions_boundary_defect`), so a dangling boundary is refused
+        // in the same words whether a create carried it or a put set it.
+        if let Some(boundary) = input.permissions_boundary.as_deref() {
+            if let Some(defect) = crate::state::permissions_boundary_defect(&store, boundary) {
+                let message = defect.message(boundary);
+                return Err(match defect {
+                    crate::state::PermissionsBoundaryDefect::NotAnArn => {
+                        crate::scaffolded::Scaffolded::validation_error(message)
+                    }
+                    crate::state::PermissionsBoundaryDefect::NotAPolicyArn => {
+                        CreateUserErrorModeled::InvalidInputException(InvalidInputException {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                    crate::state::PermissionsBoundaryDefect::NoSuchPolicy => {
+                        CreateUserErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                });
+            }
+        }
+
         // IAM entity names are unique within the account and "are not
         // distinguished by case", so the case-folded name is the identity.
         let key = crate::state::name_key(&input.user_name);

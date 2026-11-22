@@ -225,6 +225,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // The quotas on what one document may describe are taken on a REPLACEMENT exactly
+        // as the create takes them, before anything is written: the identity providers it
+        // describes and the signing keys it publishes
+        // (`crate::state::saml_metadata_over_quota`). A document past either leaves the
+        // held provider exactly as it was.
+        if let Some(message) = replacement
+            .as_ref()
+            .and_then(crate::state::saml_metadata_over_quota)
+        {
+            return Err(UpdateSAMLProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A mutation: the operation "updates the metadata document, SAML encryption
         // settings, and private keys for an existing SAML provider", so the lock is held
         // for write across the existence checks and the update of the held provider.
@@ -249,10 +266,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one record `GetSAMLProvider` reports; for an ARN the account holds no provider
         // under, what IAM found no manifest for is the ARN the request named — the wording
         // every operation naming a provider by ARN uses for that absence.
-        let Some(held_keys) = store
+        let Some((held_keys, held_mode)) = store
             .saml_providers
             .get(&input.saml_provider_arn)
-            .map(|provider| provider.private_keys.clone())
+            .map(|provider| {
+                (
+                    provider.private_keys.clone(),
+                    provider.assertion_encryption_mode.clone(),
+                )
+            })
         else {
             return Err(UpdateSAMLProviderErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
@@ -306,6 +328,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Cannot exceed quota for PrivateKeysPerSAMLProvider: {}",
                         crate::state::MAX_PRIVATE_KEYS_PER_SAML_PROVIDER
                     )),
+                },
+            )
+            .into());
+        }
+
+        // A provider that DEMANDS encrypted assertions can read nothing without a key to
+        // decrypt them with, so the rule `CreateSAMLProvider` applies to the request is
+        // applied here to the state this update would LEAVE: the mode it chooses — or the
+        // one the provider already carries, for an update that chooses none — against the
+        // keys it would hold, the held ones less the removal and plus the upload. So
+        // demanding encrypted assertions with no key, and removing the last key from a
+        // provider that demands them, are the same refusal, and the provider is left
+        // exactly as it was.
+        let left_with_mode = input
+            .assertion_encryption_mode
+            .as_deref()
+            .unwrap_or(&held_mode);
+        let left_with_keys = keys
+            .len()
+            .saturating_add(usize::from(input.add_private_key.is_some()));
+        if left_with_mode == crate::state::REQUIRED_ASSERTION_ENCRYPTION_MODE
+            && left_with_keys == 0
+        {
+            return Err(UpdateSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::ASSERTION_ENCRYPTION_REQUIRES_PRIVATE_KEY.to_string(),
+                    ),
                 },
             )
             .into());

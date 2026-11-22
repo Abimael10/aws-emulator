@@ -146,8 +146,9 @@ fn deletion_cases() -> Vec<DeletionCase> {
             form: MetadataForm::EntityGroup,
             entity_id: "urn:example:federation:group",
             valid_until: None,
+            // The strict mode, so the row uploads the key that mode demands.
             encryption_mode: Some("Required"),
-            private_key: false,
+            private_key: true,
             tags: vec![("only", "one")],
         },
         DeletionCase {
