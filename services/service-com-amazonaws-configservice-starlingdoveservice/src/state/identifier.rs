@@ -4,10 +4,11 @@
 //!
 //! Every id Config hands back for a resource a caller created is opaque: the caller
 //! cannot derive it, and holding one tells it nothing about any other. The two forms
-//! those ids take here are a run of base-36 characters ([`opaque_id`]) and a run of
-//! hexadecimal characters, unbroken ([`uuid_id`]) or hyphenated ([`stack_id`]), and all
-//! are drawn from randomness, so an id carries neither the order its resource was
-//! created in nor a hint of the next one.
+//! those ids take here are a run of base-36 characters ([`opaque_id`]) and a uuid
+//! written the one way AWS publishes a uuid — canonical and hyphenated ([`uuid_id`],
+//! and [`stack_id`] for the uuid CloudFormation assigns a stack) — and all are drawn
+//! from randomness, so an id carries neither the order its resource was created in nor
+//! a hint of the next one.
 
 use rand::Rng;
 
@@ -27,17 +28,22 @@ pub fn opaque_id(digits: usize) -> String {
         .collect()
 }
 
-/// One random (version 4) uuid in its 32-character lowercase hexadecimal form, which
-/// is the form of the opaque ids AWS hands back as an unbroken run of hex digits.
+/// The widths of the five hyphen-separated groups a uuid's canonical form is written
+/// in: `8-4-4-4-12` lowercase hexadecimal digits, 36 characters in all.
+pub const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// One random (version 4) uuid in the canonical, hyphenated 36-character form
+/// ([`UUID_GROUPS`]) — the one spelling AWS publishes a uuid in, and so the form of
+/// every identifier this service hands back as a uuid.
 pub fn uuid_id() -> String {
-    ::uuid::Uuid::new_v4().simple().to_string()
+    ::uuid::Uuid::new_v4().as_hyphenated().to_string()
 }
 
-/// One random (version 4) uuid in its hyphenated 36-character form (8-4-4-4-12), which
-/// is the form AWS writes the identifiers it spells as uuids in — a CloudFormation
-/// stack's id, the last segment of a stack ARN, among them.
+/// One random uuid for a CloudFormation stack's own id — the last segment of a stack
+/// ARN — which CloudFormation writes in the same canonical hyphenated form as every
+/// other uuid ([`uuid_id`]).
 pub fn stack_id() -> String {
-    ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+    uuid_id()
 }
 
 #[cfg(test)]
@@ -96,40 +102,34 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_id_takes_the_hyphenated_uuid_form() {
-        // The widths of the five groups a hyphenated uuid is written in.
-        const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
-        for _ in 0..64 {
-            let id = stack_id();
-            let widths: Vec<usize> = id.split('-').map(|group| group.chars().count()).collect();
-            assert_eq!(
-                widths.as_slice(),
-                GROUPS.as_slice(),
-                "a stack id is written in the groups {GROUPS:?}, got {id:?}"
-            );
-            assert!(
-                id.chars()
-                    .all(|digit| digit == '-'
-                        || (digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase())),
-                "a stack id is lowercase hex and hyphens, got {id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_uuid_id_takes_the_thirty_two_character_hexadecimal_form() {
-        for _ in 0..64 {
-            let id = uuid_id();
-            assert_eq!(
-                id.chars().count(),
-                32,
-                "a uuid's hexadecimal form is 32 characters long, got {id:?}"
-            );
-            assert!(
-                id.chars()
-                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
-                "a uuid's hexadecimal form is lowercase hex, got {id:?}"
-            );
+    fn every_minted_uuid_takes_the_canonical_hyphenated_form() {
+        // Rows differ along which uuid-shaped id is drawn; both are written the one way
+        // a uuid is published, so both are checked against the same form.
+        for (case, mint) in [
+            ("uuid", uuid_id as fn() -> String),
+            ("a stack id", stack_id as fn() -> String),
+        ] {
+            for _ in 0..64 {
+                let id = mint();
+                let widths: Vec<usize> =
+                    id.split('-').map(|group| group.chars().count()).collect();
+                assert_eq!(
+                    widths.as_slice(),
+                    UUID_GROUPS.as_slice(),
+                    "case {case:?}: a uuid is written in the groups {UUID_GROUPS:?}, got {id:?}"
+                );
+                assert_eq!(
+                    id.chars().count(),
+                    UUID_GROUPS.iter().sum::<usize>() + UUID_GROUPS.len() - 1,
+                    "case {case:?}: a canonical uuid is 36 characters long, got {id:?}"
+                );
+                assert!(
+                    id.chars()
+                        .all(|digit| digit == '-'
+                            || (digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase())),
+                    "case {case:?}: a uuid is lowercase hex and hyphens, got {id:?}"
+                );
+            }
         }
     }
 }

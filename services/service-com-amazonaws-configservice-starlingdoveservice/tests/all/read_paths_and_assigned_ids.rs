@@ -17,6 +17,9 @@
 //! 4. Every identifier Config assigns is drawn from randomness in the form AWS
 //!    publishes for it, so it carries neither the creation order nor a hint of the next
 //!    id.
+//! 5. An identifier Config spells as a uuid is written in the canonical hyphenated
+//!    36-character form, and that exact text is what every read of the resource echoes
+//!    and what the ARN built around it carries.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — reusing the
@@ -57,6 +60,36 @@ const PAST_THE_EXECUTION_SPAN: Duration = Duration::from_millis(700);
 /// How many ids a row mints when it checks that an assigned id is drawn rather than
 /// counted.
 const IDS_PER_MINT: usize = 8;
+
+/// The widths of the five hyphen-separated groups a uuid's canonical form is written
+/// in, `8-4-4-4-12` hexadecimal digits — the one spelling AWS publishes a uuid in. The
+/// 36 characters they come to are also the modelled maximum of `StoredQuery$QueryId`
+/// (`smithy_query(query="shape", shape="QueryId")`: length 1..36, pattern `^\S+$`).
+const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// The length of a canonical uuid: its five groups and the four hyphens between them.
+const UUID_LENGTH: usize = 36;
+
+/// Refuse `id` unless it is one uuid in the canonical hyphenated form, naming `case`
+/// and the `member` it was read from.
+fn assert_canonical_uuid(case: &str, member: &str, id: &str) {
+    let widths: Vec<usize> = id.split('-').map(|group| group.chars().count()).collect();
+    assert_eq!(
+        widths.as_slice(),
+        UUID_GROUPS.as_slice(),
+        "case {case:?}: expected {member} in the uuid groups {UUID_GROUPS:?}, got {id:?}"
+    );
+    assert_eq!(
+        id.chars().count(),
+        UUID_LENGTH,
+        "case {case:?}: expected {member} to be {UUID_LENGTH} characters, got {id:?}"
+    );
+    assert!(
+        id.chars().all(|character| character == '-'
+            || (character.is_ascii_hexdigit() && !character.is_ascii_uppercase())),
+        "case {case:?}: expected {member} in lowercase hexadecimal and hyphens, got {id:?}"
+    );
+}
 
 /// The recorder states a read of the inventory is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,8 +557,9 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
         kind: &'static str,
         /// The prefix the published form gives the id, if any.
         prefix: &'static str,
-        /// How many characters the id carries after its prefix.
-        digits: usize,
+        /// The widths of the hyphen-separated groups the id carries after its prefix:
+        /// one group for a flat run of characters, five for a canonical uuid.
+        groups: &'static [usize],
         /// Whether those characters are hexadecimal; otherwise they are base-36.
         hexadecimal: bool,
         /// The modelled maximum length of the id.
@@ -543,7 +577,7 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
         Case {
             kind: "ResourceEvaluationId",
             prefix: "",
-            digits: 32,
+            groups: &UUID_GROUPS,
             hexadecimal: true,
             max_length: 128,
             needs_recorder: false,
@@ -551,7 +585,7 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
         Case {
             kind: "QueryId",
             prefix: "",
-            digits: 32,
+            groups: &UUID_GROUPS,
             hexadecimal: true,
             max_length: 36,
             needs_recorder: false,
@@ -559,7 +593,7 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
         Case {
             kind: "ConfigRuleId",
             prefix: "config-rule-",
-            digits: 6,
+            groups: &[6],
             hexadecimal: false,
             max_length: 64,
             needs_recorder: true,
@@ -567,7 +601,7 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
         Case {
             kind: "ConfigurationAggregatorId",
             prefix: "config-aggregator-",
-            digits: 8,
+            groups: &[8],
             hexadecimal: false,
             max_length: 256,
             needs_recorder: false,
@@ -595,18 +629,20 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
                 case.max_length
             );
             let body = &id[case.prefix.len()..];
+            let widths: Vec<usize> = body.split('-').map(|group| group.chars().count()).collect();
             assert_eq!(
-                body.chars().count(),
-                case.digits,
-                "case {kind:?}: expected {} characters after the prefix, got {id:?}",
-                case.digits
+                widths.as_slice(),
+                case.groups,
+                "case {kind:?}: expected the groups {:?} after the prefix, got {id:?}",
+                case.groups
             );
             let well_formed = body.chars().all(|character| {
-                if case.hexadecimal {
-                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
-                } else {
-                    character.is_ascii_lowercase() || character.is_ascii_digit()
-                }
+                character == '-'
+                    || if case.hexadecimal {
+                        character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                    } else {
+                        character.is_ascii_lowercase() || character.is_ascii_digit()
+                    }
             });
             assert!(
                 well_formed,
@@ -630,6 +666,200 @@ async fn an_assigned_identifier_is_drawn_rather_than_counted() {
             sorted, as_minted,
             "case {kind:?}: the ids were handed out in increasing order, so a caller can \
              guess the next one, got {ids:?}"
+        );
+    }
+}
+
+/// A `ClientToken` at the modelled minimum width (`ClientToken` is 64..256 characters,
+/// from `smithy_query(query="shape", shape="ClientToken")`), seeded so no two rows
+/// share one token.
+fn client_token(seed: &str) -> String {
+    format!("{seed:0<64}")
+}
+
+#[tokio::test]
+async fn a_minted_uuid_identifier_is_canonical_and_is_the_text_every_read_echoes() {
+    // Rows differ along the shape of the START request — the deployment context, the
+    // timeout, the client token and the resource type being evaluated — because the
+    // form of the id Config mints is a property of the service, not of the request.
+    let evaluations: [(&str, Value); 5] = [
+        (
+            "a bare resource definition",
+            json!({
+                "EvaluationMode": "PROACTIVE",
+                "ResourceDetails": {
+                    "ResourceId": "config-emulator-bucket",
+                    "ResourceType": S3_BUCKET,
+                    "ResourceConfiguration": "{\"BucketName\":\"config-emulator-bucket\"}",
+                },
+            }),
+        ),
+        (
+            "an evaluation grouped by a deployment context",
+            json!({
+                "EvaluationMode": "PROACTIVE",
+                "EvaluationContext": { "EvaluationContextIdentifier": "stack/uuid-form/0001" },
+                "ResourceDetails": {
+                    "ResourceId": "vol-0001",
+                    "ResourceType": EC2_VOLUME,
+                    "ResourceConfiguration": "{\"Size\":8}",
+                },
+            }),
+        ),
+        (
+            "an evaluation with an explicit timeout",
+            json!({
+                "EvaluationMode": "PROACTIVE",
+                "EvaluationTimeout": 60,
+                "ResourceDetails": {
+                    "ResourceId": "config-emulator-table",
+                    "ResourceType": DYNAMODB_TABLE,
+                    "ResourceConfiguration": "{\"TableName\":\"config-emulator-table\"}",
+                },
+            }),
+        ),
+        (
+            "an idempotent evaluation carrying a client token",
+            json!({
+                "EvaluationMode": "PROACTIVE",
+                "ClientToken": client_token("uuid-form-token"),
+                "ResourceDetails": {
+                    "ResourceId": "config-emulator-bucket",
+                    "ResourceType": S3_BUCKET,
+                    "ResourceConfiguration": "{}",
+                },
+            }),
+        ),
+        (
+            "an evaluation of a third-party resource type",
+            json!({
+                "EvaluationMode": "PROACTIVE",
+                "ResourceDetails": {
+                    "ResourceId": "extension-resource",
+                    "ResourceType": "MyOrg::MyService::MyResource",
+                    "ResourceConfiguration": "{}",
+                },
+            }),
+        ),
+    ];
+
+    for (case, request) in evaluations {
+        let emulator = Emulator::new();
+        let started = emulator.ok("StartResourceEvaluation", &request).await;
+        let id = started["ResourceEvaluationId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {started}"))
+            .to_string();
+        assert_canonical_uuid(case, "ResourceEvaluationId", &id);
+
+        // The evaluation is KEYED by that exact text: the reads that echo the id back
+        // report the same characters, hyphens included.
+        let summary = emulator
+            .ok(
+                "GetResourceEvaluationSummary",
+                &json!({ "ResourceEvaluationId": id }),
+            )
+            .await;
+        assert_eq!(
+            summary["ResourceEvaluationId"].as_str(),
+            Some(id.as_str()),
+            "case {case:?}: expected the summary to echo the minted id, got {summary}"
+        );
+        let listed = emulator.ok("ListResourceEvaluations", &json!({})).await;
+        let ids: Vec<&str> = listed["ResourceEvaluations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a listing, got {listed}"))
+            .iter()
+            .filter_map(|entry| entry["ResourceEvaluationId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![id.as_str()],
+            "case {case:?}: expected the listing to report the minted id, got {listed}"
+        );
+    }
+
+    // Rows differ along the stored query's description and the text of its expression,
+    // Unicode included, because none of that reaches the id Config assigns.
+    let queries: [(&str, &str, Option<&str>, &str); 4] = [
+        (
+            "a query with no description",
+            "uuid-form-plain",
+            None,
+            "SELECT resourceId WHERE resourceType = 'AWS::S3::Bucket'",
+        ),
+        (
+            "a query with a description",
+            "uuid-form-described",
+            Some("every bucket this account records"),
+            "SELECT resourceId, resourceType WHERE resourceType = 'AWS::S3::Bucket'",
+        ),
+        (
+            "a query whose expression carries non-ASCII text",
+            "uuid-form-unicode",
+            Some("ressources chiffrées"),
+            "SELECT resourceId WHERE resourceType = 'AWS::S3::Bucket' /* chiffré 🚀 */",
+        ),
+        (
+            "a query whose name is spelled with every character its pattern allows",
+            "UUID_form-0123456789",
+            None,
+            "SELECT resourceId, resourceType",
+        ),
+    ];
+
+    for (case, name, description, expression) in queries {
+        let emulator = Emulator::new();
+        let mut stored_query = json!({ "QueryName": name, "Expression": expression });
+        if let Some(description) = description {
+            stored_query["Description"] = json!(description);
+        }
+        let created = emulator
+            .ok("PutStoredQuery", &json!({ "StoredQuery": stored_query }))
+            .await;
+        let created_arn = created["QueryArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a QueryArn, got {created}"))
+            .to_string();
+
+        let read = emulator
+            .ok("GetStoredQuery", &json!({ "QueryName": name }))
+            .await;
+        let stored = &read["StoredQuery"];
+        let id = stored["QueryId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a QueryId, got {read}"))
+            .to_string();
+        assert_canonical_uuid(case, "StoredQuery.QueryId", &id);
+
+        // `QueryArn`'s pattern carries the id as its final `query-<id>` segment, so the
+        // ARN and the id must agree character for character.
+        let arn = stored["QueryArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a QueryArn, got {read}"));
+        assert_eq!(
+            arn, created_arn,
+            "case {case:?}: expected the read to report the ARN the create answered \
+             with, got {arn:?}"
+        );
+        assert!(
+            arn.ends_with(&format!(":stored-query/{name}/query-{id}")),
+            "case {case:?}: expected the ARN to carry the id as its query-<id> segment, \
+             got {arn:?} beside {id:?}"
+        );
+
+        // The listing reports the same identity as the read.
+        let listed = emulator.ok("ListStoredQueries", &json!({})).await;
+        let metadata: Vec<(&str, &str)> = listed["StoredQueryMetadata"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a listing, got {listed}"))
+            .iter()
+            .filter_map(|entry| Some((entry["QueryId"].as_str()?, entry["QueryArn"].as_str()?)))
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![(id.as_str(), arn)],
+            "case {case:?}: expected the listing to report the minted identity, got {listed}"
         );
     }
 }

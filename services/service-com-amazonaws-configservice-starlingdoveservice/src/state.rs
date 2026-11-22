@@ -2919,10 +2919,10 @@ pub fn stored_query_arn(region: &str, name: &str, id: &str) -> String {
     )
 }
 
-/// The `QueryId` Config assigns a stored query created in this emulator: an opaque
-/// 32-character hexadecimal token ([`uuid_id`]), which sits inside `QueryId`'s 1..36
-/// length, satisfies its `^\S+$` pattern and is admitted by the `query-<id>` segment
-/// of `QueryArn`'s own pattern (`[a-zA-Z\d-_/]+`).
+/// The `QueryId` Config assigns a stored query created in this emulator: a uuid in the
+/// canonical hyphenated form ([`uuid_id`]), which is exactly the 36 characters
+/// `QueryId`'s 1..36 length allows, satisfies its `^\S+$` pattern and is admitted by
+/// the `query-<id>` segment of `QueryArn`'s own pattern (`[a-zA-Z\d-_/]+`).
 ///
 /// DRAWN rather than derived from how many queries have been created: a caller holding
 /// one query's id learns nothing about another's.
@@ -3192,8 +3192,10 @@ pub fn connector_name(provider: &str, tenant_identifier: &str) -> String {
 
 /// The group lengths of the canonical, hyphenated form of a GUID — `8-4-4-4-12`
 /// hexadecimal digits — which is the form Microsoft Entra ID (Azure AD) publishes a
-/// directory (tenant) identifier and an application (client) identifier in.
-pub const AZURE_IDENTIFIER_GUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+/// directory (tenant) identifier and an application (client) identifier in. It is the
+/// same canonical form a uuid this service MINTS is written in ([`UUID_GROUPS`]), so
+/// the widths are named once.
+pub const AZURE_IDENTIFIER_GUID_GROUPS: [usize; 5] = UUID_GROUPS;
 
 /// Whether `value` has the form an Azure tenant or client identifier takes: a GUID in
 /// its canonical hyphenated form.
@@ -4228,10 +4230,10 @@ pub async fn publish_service_event_via(
 /// emulator.
 ///
 /// The model gives `ResourceEvaluationId` no pattern (only a 1..128 length), and the
-/// recorded ids are opaque and unordered, so the id takes the same opaque
-/// 32-character hexadecimal form a stored query's does ([`uuid_id`]): DRAWN rather
-/// than derived from how many evaluations have been started, so one evaluation's id
-/// tells a caller nothing about another's.
+/// recorded ids are opaque and unordered, so the id takes the same canonical
+/// hyphenated uuid form a stored query's does ([`uuid_id`]): DRAWN rather than derived
+/// from how many evaluations have been started, so one evaluation's id tells a caller
+/// nothing about another's.
 pub fn mint_resource_evaluation_id() -> String {
     uuid_id()
 }

@@ -545,13 +545,14 @@ fn a_resource_evaluation_id_is_distinct_for_every_evaluation() {
         ids.len()
     );
     for id in &ids {
+        let widths: Vec<usize> = id.split('-').map(|group| group.chars().count()).collect();
         assert!(
             (1..=128).contains(&id.len())
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "a ResourceEvaluationId is lowercase hexadecimal inside the modelled 1..128 \
-             length, got {id:?}"
+                && widths == UUID_GROUPS
+                && id.chars().all(|c| c == '-'
+                    || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase())),
+            "a ResourceEvaluationId is a canonical hyphenated uuid inside the modelled \
+             1..128 length, got {id:?}"
         );
     }
 }
