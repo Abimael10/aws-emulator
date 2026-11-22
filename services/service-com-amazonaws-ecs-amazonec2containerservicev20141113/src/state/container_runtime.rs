@@ -774,6 +774,10 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         let container_arn = launch.container_arn.clone();
         let run_state = ::engine::ServiceState::clone(&state);
         let callback = callback.clone();
+        // The shared engine the run ANNOUNCES its end through: the task a container's exit
+        // stops is a task that has moved, and the run is the only component that knows the
+        // instant it moved at ([`super::publish_data_plane_task_state_changes`]).
+        let run_engine = ::std::sync::Arc::clone(engine);
         // WHERE a server this container starts is reached, for a task that holds an interface
         // of its own on an engine that vends the records.
         let serving = launch
@@ -812,7 +816,16 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             },
         );
         let handle = runtime.spawn(async move {
-            run_container(run_state, callback, launch, filesystem, serving, http).await
+            run_container(
+                run_state,
+                run_engine,
+                callback,
+                launch,
+                filesystem,
+                serving,
+                http,
+            )
+            .await
         });
         // The handle is kept with the run, so a run whose task is gone is aborted rather
         // than merely forgotten.
@@ -825,15 +838,24 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
 }
 
 /// Start ONE container: initialise its log driver, then run its program to its end,
-/// delivering what it writes and recording what it exited with.
+/// delivering what it writes, recording what it exited with and ANNOUNCING the task
+/// transition that exit produced.
 ///
 /// A container this emulator holds no program for still has its driver initialised — the
 /// stream is created as the container starts, which is what makes the group the
 /// configuration names hold one stream per started container (see this module's header) —
 /// and then reports nothing of its own ([`ContainerOutcome::Abandoned`]): the image holds
 /// the program whose output would have filled that stream, so no event is put in it.
-async fn run_container(
+///
+/// The ANNOUNCEMENT is what makes the end of a run observable without another Amazon ECS
+/// call: a standalone task whose essential container has exited is stopped at the instant
+/// its program ended, and the `STOPPED` event that stop earns is owed to a client watching
+/// the task through EventBridge, which will call nothing again
+/// ([`super::publish_data_plane_task_state_changes`]). Made after the store's guard has been
+/// dropped, as every other writer's is.
+async fn run_container<Eng: Send + Sync + 'static>(
     state: ::engine::ServiceState<ComAmazonawsEcsAmazonec2containerservicev20141113State>,
+    engine: ::std::sync::Arc<Eng>,
     callback: ::smithy_server_runtime::EmbeddedEmulator,
     launch: ContainerLaunch,
     filesystem: ContainerFilesystem,
@@ -854,6 +876,7 @@ async fn run_container(
             ContainerOutcome::Abandoned,
             None,
         );
+        super::publish_data_plane_task_state_changes(&callback, &engine, &launch.region);
         return;
     };
     let output = Arc::new(ContainerOutput::new(&callback, launch.log_target));
@@ -869,6 +892,7 @@ async fn run_container(
             ContainerOutcome::Abandoned,
             Some(NO_DECLARED_PROGRAM_DETAIL.to_string()),
         );
+        super::publish_data_plane_task_state_changes(&callback, &engine, &launch.region);
         return;
     };
     let deadline = Instant::now() + CONTAINER_RUN_LIFETIME;
@@ -909,4 +933,8 @@ async fn run_container(
     state
         .lock()
         .record_container_outcome(&launch.container_arn, outcome, detail);
+    // The guard that statement took is dropped with it, so the announcement — and the pump it
+    // hands the publication to — holds no lock of this store. The Region is the task's own, the
+    // one this run's own calls are addressed in ([`ContainerLaunch::region`]).
+    super::publish_data_plane_task_state_changes(&callback, &engine, &launch.region);
 }

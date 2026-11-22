@@ -45,6 +45,13 @@
 //! EventBridge makes no further Amazon ECS call, so a transition published only by the next
 //! reader would never be published at all. The pump changes WHEN nothing: it materialises
 //! only what the stored due instant has already made due, exactly as a reading door does.
+//!
+//! The CONTAINER DATA PLANE is a writer too, and the one no due instant can stand in for:
+//! when a container's program ends is the program's own business, so the run that ends is
+//! what records the move it produced and starts the pump again
+//! ([`publish_data_plane_task_state_changes`]) — a standalone task whose essential container
+//! has exited is stopped at that instant, and the `STOPPED` event that stop earns is the one
+//! a client watching the task is waiting for.
 
 use std::time::UNIX_EPOCH;
 
@@ -574,10 +581,20 @@ pub fn publish_task_state_changes<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     region: &str,
 ) {
+    record_task_moves(engine);
+    drive_task_clock(ctx, engine, region);
+}
+
+/// Compare this store's task map against what was last published, so every move since then
+/// is queued as an event — the ONE comparison both announcements make
+/// ([`publish_task_state_changes`] for a door's write,
+/// [`publish_data_plane_task_state_changes`] for the end of a container's run).
+///
+/// Called with NO guard of this store held: it takes that lock itself.
+fn record_task_moves<Eng: Send + Sync + 'static>(engine: &::std::sync::Arc<Eng>) {
     if let Some(state) = service_state(&**engine) {
         state.lock().record_task_state_changes(SystemTime::now());
     }
-    drive_task_clock(ctx, engine, region);
 }
 
 /// Publish every task state change this store has to publish, and leave the queue empty.
@@ -698,12 +715,13 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     region: &str,
 ) {
-    let Some(state) = service_state(&**engine) else {
+    // An engine that carries no store of this service, and a thread with no async runtime to
+    // spawn a pump onto, leave this call nothing to do — the same two conditions
+    // [`spawn_task_clock_pump`] stands down on, answered here so the steps below keep running
+    // only where the pump they lead up to can.
+    if service_state(&**engine).is_none() || ::tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
-        return;
-    };
+    }
     // The execution resources of every launch that is waiting for them are retrieved BEFORE
     // the pump's claim is taken, so a door that has just placed a task has the values its
     // containers take read before the clock could start it, whether or not a pump was already
@@ -718,10 +736,53 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     // finds a pump already running still has the containers of the task it just wrote
     // started or signalled ([`super::settle_container_runtime`]).
     super::settle_container_runtime(ctx.callback(), engine, region);
+    spawn_task_clock_pump(ctx.callback(), engine, region);
+}
+
+/// Record the task state change the CONTAINER DATA PLANE has just produced, and drive the
+/// clock so the transitions it earns are materialised and published.
+///
+/// The end of a container's PROGRAM is a task transition no stored due instant can predict:
+/// the program itself decides when it ends, and a standalone task whose essential container
+/// has exited is stopped at that instant
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_container_outcome`]) — so
+/// the run that has just ended is the only component that knows the task moved, and it
+/// announces that move exactly as a door announces the moves its own write produced
+/// ([`publish_task_state_changes`]). Without it the stop a container's exit earns waits for
+/// the next caller to materialise it, and a client that watches the task through EventBridge
+/// makes none: the `STOPPED` event it is waiting for would never be published at all.
+///
+/// Called with NO guard of this store held, from the run's own in-process task: it takes that
+/// lock itself to compare the task map against what was last published, and hands the
+/// publication to the same single pump every door shares.
+pub fn publish_data_plane_task_state_changes<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    record_task_moves(engine);
+    spawn_task_clock_pump(callback, engine, region);
+}
+
+/// Start the ONE clock pump of this store, unless a pump is already driving it.
+///
+/// The half of [`drive_task_clock`] that needs no request context, so the container data
+/// plane reaches it too ([`publish_data_plane_task_state_changes`]).
+fn spawn_task_clock_pump<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
     let Some(generation) = state.lock().start_task_clock_pump() else {
         return;
     };
-    let callback = ctx.callback().clone();
+    let callback = callback.clone();
     let engine = ::std::sync::Arc::clone(engine);
     let region = region.to_string();
     let pumped = ::engine::ServiceState::clone(&state);
