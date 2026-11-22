@@ -28,6 +28,7 @@ use crate::service::graphql_api::execution::SelectedField;
 use super::event_data_plane::{
     authority_of, uuid_from, SubscribeRefusal, CONNECTIONS_PER_API, SUBSCRIPTIONS_PER_CONNECTION,
 };
+use super::gauge_sampling::GaugeSampling;
 
 /// The sockets one GraphQL API's endpoints are served on, and what is open on them.
 struct ApiSocket {
@@ -40,6 +41,10 @@ struct ApiSocket {
     /// The connections open on this API, keyed by the connection id this plane minted for
     /// each.
     connections: BTreeMap<String, ConnectionRecord>,
+    /// The claim this API's single gauge sampler is held under
+    /// ([`GraphqlDataPlane::claim_gauge_sampler`]), so an API whose records go takes its
+    /// sampler with it.
+    gauges: GaugeSampling,
 }
 
 /// One open real-time connection: the channel its frames are written over, and the
@@ -143,14 +148,17 @@ impl GraphqlDataPlane {
         realtime: Arc<ResourceListener>,
     ) -> (String, String) {
         let authorities = (authority_of(&graphql), authority_of(&realtime));
-        self.apis.insert(
+        if let Some(replaced) = self.apis.insert(
             api_id.to_string(),
             ApiSocket {
                 graphql,
                 realtime,
                 connections: BTreeMap::new(),
+                gauges: GaugeSampling::default(),
             },
-        );
+        ) {
+            replaced.gauges.abort();
+        }
         authorities
     }
 
@@ -158,7 +166,51 @@ impl GraphqlDataPlane {
     /// deleted does to its data plane. Dropping the handles severs every connection, and
     /// the task serving each one then ends.
     pub fn forget_api(&mut self, api_id: &str) {
-        self.apis.remove(api_id);
+        if let Some(forgotten) = self.apis.remove(api_id) {
+            forgotten.gauges.abort();
+        }
+    }
+
+    /// Claim the single GAUGE SAMPLER of `api_id`: the claim's GENERATION when the caller
+    /// may start one, `None` when one already runs or this API holds no socket.
+    ///
+    /// The two gauges this plane reports ([`Self::active_connections`],
+    /// [`Self::active_subscriptions`]) measure quantities that HAVE a value at every
+    /// instant, so they are OBSERVED on a cadence rather than only when they change: one
+    /// sampler per API, claimed by the first connection opened on it and stood down once the
+    /// API holds none ([`Self::gauge_sampling_wanted_or_release`]).
+    pub fn claim_gauge_sampler(&mut self, api_id: &str) -> Option<u64> {
+        self.apis.get_mut(api_id)?.gauges.claim()
+    }
+
+    /// Keep the running sampler's task handle under the claim `generation`, aborting a
+    /// handle no claim covers.
+    pub fn set_gauge_sampler(
+        &mut self,
+        api_id: &str,
+        generation: u64,
+        handle: ::tokio::task::JoinHandle<()>,
+    ) {
+        let Some(socket) = self.apis.get_mut(api_id) else {
+            handle.abort();
+            return;
+        };
+        socket.gauges.install(generation, handle);
+    }
+
+    /// Whether `api_id` still has gauges to sample — and, when it has not, RELEASE the claim
+    /// `generation` holds.
+    ///
+    /// An API has gauges to sample while it holds a CONNECTION: the quantities are of the
+    /// connections open on the API and the subscriptions they hold, so an API nothing is
+    /// connected to has nothing to observe and publishes no reading at all rather than a run
+    /// of zeros.
+    pub fn gauge_sampling_wanted_or_release(&mut self, api_id: &str, generation: u64) -> bool {
+        let Some(socket) = self.apis.get_mut(api_id) else {
+            return false;
+        };
+        let wanted = !socket.connections.is_empty();
+        socket.gauges.wanted_or_release(generation, wanted)
     }
 
     /// Mint the next connection id: a UUID, which is the shape AppSync's own real-time
@@ -309,6 +361,24 @@ impl GraphqlDataPlane {
                     })
             })
             .collect()
+    }
+
+    /// How many real-time connections are open on `api_id`.
+    pub fn active_connections(&self, api_id: &str) -> usize {
+        self.apis
+            .get(api_id)
+            .map_or(0, |socket| socket.connections.len())
+    }
+
+    /// How many subscriptions those connections hold in total.
+    pub fn active_subscriptions(&self, api_id: &str) -> usize {
+        self.apis.get(api_id).map_or(0, |socket| {
+            socket
+                .connections
+                .values()
+                .map(|connection| connection.subscriptions.len())
+                .sum()
+        })
     }
 }
 

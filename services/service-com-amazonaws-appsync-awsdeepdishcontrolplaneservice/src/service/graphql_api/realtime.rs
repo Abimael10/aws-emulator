@@ -331,6 +331,10 @@ async fn carry_frames<S>(
         %connection_id,
         "a GraphQL API real-time connection is open"
     );
+    // The API now holds a connection, so its two gauges have a quantity to report: this is
+    // the write that owes the cadence they are observed on, for as long as the API is
+    // connected to ([`super::gauges`]). Claimed once however many connections are opened.
+    super::gauges::drive_gauge_sampling(&context);
     let (mut outgoing, mut incoming) = socket.split();
     // A connection is CONNECTED once the client's `connection_init` has been acked, which
     // is what `ConnectSuccess` counts and what a `DisconnectSuccess` is then owed for.
@@ -399,7 +403,9 @@ async fn carry_frames<S>(
         .graphql_data_plane
         .close_connection(&context.api_id, &connection_id);
     if acked {
-        context.metrics.disconnect_success();
+        context
+            .metrics
+            .disconnect_success(context.connection_counts());
     }
     ::tracing::info!(
         api_id = %context.api_id,
@@ -577,7 +583,7 @@ async fn served_message(
             // counts no second connection.
             if !*acked {
                 *acked = true;
-                context.metrics.connect_success();
+                context.metrics.connect_success(context.connection_counts());
             }
             vec![json!({
                 MESSAGE_TYPE_MEMBER: CONNECTION_ACK,
@@ -816,7 +822,14 @@ async fn started(
         },
     );
     match recorded {
-        Ok(()) => json!({"id": subscription_id, MESSAGE_TYPE_MEMBER: START_ACK}).to_string(),
+        Ok(()) => {
+            // The subscription is open on the API: one `SubscribeSuccess`, and the
+            // subscription gauge now reads what the store holds with it ([`super::metrics`]).
+            context
+                .metrics
+                .subscribe_success(context.connection_counts());
+            json!({"id": subscription_id, MESSAGE_TYPE_MEMBER: START_ACK}).to_string()
+        }
         Err(refusal) => error_frame(
             subscription_id,
             BAD_REQUEST_ERROR_TYPE,
@@ -840,6 +853,11 @@ fn stopped(context: &PlaneContext, connection_id: &str, subscription_id: &str) -
             NO_SUCH_SUBSCRIPTION,
         );
     }
+    // The subscriber ended one of its subscriptions: one `UnsubscribeSuccess`, and the
+    // subscription gauge falls to what the store holds without it ([`super::metrics`]).
+    context
+        .metrics
+        .unsubscribe_success(context.connection_counts());
     complete_frame(subscription_id)
 }
 

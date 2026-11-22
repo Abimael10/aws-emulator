@@ -56,6 +56,7 @@ pub mod event_bridge;
 pub mod execution;
 pub mod field_auth;
 pub mod field_logs;
+pub mod gauges;
 pub mod http_endpoint;
 pub mod introspection;
 pub mod lambda;
@@ -108,6 +109,18 @@ impl ::std::fmt::Debug for PlaneContext {
             .field("api_id", &self.api_id)
             .field("metrics", &self.metrics)
             .finish()
+    }
+}
+
+impl PlaneContext {
+    /// The counts the two gauges this plane reports read at this moment: the real-time
+    /// connections open on the API and the subscriptions they hold, as the store holds them.
+    pub fn connection_counts(&self) -> metrics::ConnectionCounts {
+        let store = self.state.lock();
+        metrics::ConnectionCounts {
+            connections: store.graphql_data_plane.active_connections(&self.api_id),
+            subscriptions: store.graphql_data_plane.active_subscriptions(&self.api_id),
+        }
     }
 }
 

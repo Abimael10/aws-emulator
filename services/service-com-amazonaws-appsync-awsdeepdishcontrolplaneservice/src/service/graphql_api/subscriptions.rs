@@ -33,6 +33,11 @@
 //! whose queue is full is not reading its socket, and the frame is dropped for it rather than
 //! held — the same allowance an Event API's subscriber gets
 //! ([`crate::service::event_api::publish`]).
+//!
+//! What one mutation DELIVERED is then reported as the API's own `PublishDataMessageSuccess`
+//! series ([`super::metrics`]): the frames that were written, so a publication a
+//! subscription's arguments or its installed filter excluded counts for nothing and one that
+//! reached two subscribers counts twice.
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
@@ -52,7 +57,12 @@ const DATA_MEMBER: &str = "data";
 /// `fields` is the mutation's own root selection and `data` what executing it answered, so
 /// what is published is what the mutation RESOLVED TO — read under the field's response key,
 /// which is its alias where the selection carried one.
+///
+/// How many data messages it DELIVERED is published once for the whole mutation, a zero
+/// included: a mutation that reached no subscriber is as much a measurement as one that
+/// reached many.
 pub async fn published(context: &PlaneContext, fields: &[SelectedField], data: &Json) {
+    let mut delivered_messages: u32 = 0;
     for field in fields {
         let Some(resolved) = data.get(&field.key).filter(|value| !value.is_null()) else {
             continue;
@@ -66,24 +76,28 @@ pub async fn published(context: &PlaneContext, fields: &[SelectedField], data: &
                 .unwrap_or_default()
         };
         for subscription_field in subscribed {
-            delivered(context, &subscription_field, resolved).await;
+            delivered_messages =
+                delivered_messages.saturating_add(delivered(context, &subscription_field, resolved).await);
         }
     }
+    context.metrics.data_messages_published(delivered_messages);
 }
 
 /// Deliver `published` to every subscription of this API on `subscription_field` whose own
-/// arguments and installed filter accept it, projected onto each subscriber's own selection.
+/// arguments and installed filter accept it, projected onto each subscriber's own selection,
+/// and answer how many frames were WRITTEN.
 ///
 /// The queues are taken out of the store and written to with no lock held. The fan-out
 /// YIELDS between subscribers: how many there can be is bounded (the plane's connections per
 /// API times its subscriptions per connection), and yielding keeps the executor serving other
 /// connections while a wide fan-out is written.
-async fn delivered(context: &PlaneContext, subscription_field: &str, published: &Json) {
+async fn delivered(context: &PlaneContext, subscription_field: &str, published: &Json) -> u32 {
     let deliveries = context
         .state
         .lock()
         .graphql_data_plane
         .deliveries(&context.api_id, subscription_field);
+    let mut written: u32 = 0;
     for (subscription_id, frames, subscription) in deliveries {
         if !matches_arguments(&subscription, published) {
             continue;
@@ -99,15 +113,19 @@ async fn delivered(context: &PlaneContext, subscription_field: &str, published: 
             subscription_field,
             &projected(published, &subscription.selections),
         );
-        if frames.try_send(frame).is_err() {
-            ::tracing::warn!(
+        match frames.try_send(frame) {
+            // The queue is the subscriber's own connection task's, so a frame accepted by it
+            // is a frame written to that socket: that is the delivery this counts.
+            Ok(()) => written = written.saturating_add(1),
+            Err(_) => ::tracing::warn!(
                 api_id = %context.api_id,
                 %subscription_id,
                 "a subscriber is not reading its socket; a mutation was not delivered to it"
-            );
+            ),
         }
         ::tokio::task::yield_now().await;
     }
+    written
 }
 
 /// Whether `published` satisfies the arguments `subscription` was started with.

@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The `AWS/AppSync` metrics a GraphQL API's REAL-TIME plane publishes about its own work:
-//! the connects it admitted, the ones it refused, and the disconnects that followed.
+//! the connects it admitted, the ones it refused, the subscriptions started and ended on
+//! them, the data messages those subscriptions were delivered, and the disconnects that
+//! followed.
 //!
 //! A real-time connect leaves no response a later caller can read — nothing in the control
-//! plane reports that a subscriber attached, or that a handshake was turned away. The only
-//! way a client learns any of it is the series AppSync publishes about itself, so this
-//! module publishes one datapoint per thing that happened, as it happens.
+//! plane reports that a subscriber attached, that a handshake was turned away, that a
+//! subscription is open or that a mutation reached it. The only way a client learns any of
+//! it is the series AppSync publishes about itself, so this module publishes one datapoint
+//! per thing that happened, as it happens, and the two GAUGES
+//! ([`ACTIVE_CONNECTIONS_METRIC`], [`ACTIVE_SUBSCRIPTIONS_METRIC`]) with the counts the
+//! store holds AT that moment — every time one changes AND on the cadence the plane observes
+//! them at while a connection is open ([`super::gauges`]), which is what lets a reader see
+//! subscriptions fall back to zero, and STAY there, while a connection stays open.
 //!
-//! WHICH dimension set they land under is part of the contract: a connect is made to the
+//! WHICH dimension set they land under is part of the contract: all of this happens on the
 //! API, so every series here is reported under [`GRAPHQL_API_ID_DIMENSION`] alone — the
 //! dimension that names a GraphQL API, as opposed to the `EventAPIId` an Event API's own
 //! series carry ([`super::super::event_api::metrics`]).
@@ -24,6 +31,20 @@ use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as c
 
 use super::super::event_api::metrics::{self as appsync_metrics, CloudWatchState};
 
+/// What the two gauges read at one moment: the connections open on the API and the
+/// subscriptions they hold. The same reading either real-time plane reports, so there is one
+/// shape for it.
+pub use super::super::event_api::metrics::ConnectionCounts;
+
+/// The series both of this service's real-time planes report about their own lifecycle,
+/// named once ([`super::super::event_api::metrics`] documents each): AppSync publishes these
+/// under the dimension of whichever API they are of, so the NAMES are shared and only the
+/// dimension set differs.
+pub use super::super::event_api::metrics::{
+    ACTIVE_CONNECTIONS_METRIC, ACTIVE_SUBSCRIPTIONS_METRIC, CONNECT_SUCCESS_METRIC,
+    DISCONNECT_SUCCESS_METRIC, SUBSCRIBE_SUCCESS_METRIC, UNSUBSCRIBE_SUCCESS_METRIC,
+};
+
 /// The dimension that names the GraphQL API every one of these series is of.
 pub const GRAPHQL_API_ID_DIMENSION: &str = "GraphQLAPIId";
 
@@ -36,24 +57,25 @@ pub const GRAPHQL_API_ID_DIMENSION: &str = "GraphQLAPIId";
 /// tell a client that is being refused from one that is not connecting at all.
 pub const CONNECT_REQUESTS_METRIC: &str = "ConnectRequests";
 
-/// One real-time connection established on the API: a handshake this endpoint completed
-/// whose `connection_init` it then acknowledged.
-pub const CONNECT_SUCCESS_METRIC: &str = "ConnectSuccess";
-
 /// One connect this endpoint refused because of the CLIENT: material that authorizes no
 /// connection to the API, or a handshake addressed to something this endpoint does not
 /// serve.
 pub const CONNECT_CLIENT_ERROR_METRIC: &str = "ConnectClientError";
 
-/// One real-time connection closed.
-pub const DISCONNECT_SUCCESS_METRIC: &str = "DisconnectSuccess";
+/// One `data` message this endpoint DELIVERED to a subscriber: a mutation published to a
+/// subscription of this API that was written to that subscription's own socket.
+///
+/// It counts deliveries, not publications: a mutation a subscription's arguments or its
+/// installed filter excluded reached no subscriber, so nothing of it is counted here, and a
+/// mutation that reached two subscribers is counted twice.
+pub const PUBLISH_DATA_MESSAGE_SUCCESS_METRIC: &str = "PublishDataMessageSuccess";
 
 /// The publisher of the metrics one GraphQL API's real-time plane produces: the store the
 /// datapoints go to, and the API they are all of.
 ///
 /// It holds no counts of its own — every observation is a datapoint in the CloudWatch
 /// store, never a second copy kept here, so the total a client reads is the `Sum`
-/// CloudWatch computes over a period.
+/// CloudWatch computes over a period and either gauge is the reading taken at that moment.
 #[derive(Clone)]
 pub struct GraphqlApiMetrics {
     /// The store the datapoints are appended to, or `None` when the engine carries no
@@ -86,30 +108,86 @@ impl GraphqlApiMetrics {
 
     /// Publish that one attempt to establish a real-time connection was made.
     pub fn connect_requested(&self) {
-        self.publish(CONNECT_REQUESTS_METRIC);
+        self.publish(CONNECT_REQUESTS_METRIC, 1.0);
     }
 
-    /// Publish that one real-time connection was established on the API.
-    pub fn connect_success(&self) {
-        self.publish(CONNECT_SUCCESS_METRIC);
+    /// Publish that one real-time connection was established on the API, and the counts
+    /// that leaves.
+    pub fn connect_success(&self, counts: ConnectionCounts) {
+        self.publish(CONNECT_SUCCESS_METRIC, 1.0);
+        self.sampled(counts);
     }
 
     /// Publish that one connect was refused on the client's own account.
     pub fn connect_client_error(&self) {
-        self.publish(CONNECT_CLIENT_ERROR_METRIC);
+        self.publish(CONNECT_CLIENT_ERROR_METRIC, 1.0);
     }
 
-    /// Publish that one real-time connection closed.
-    pub fn disconnect_success(&self) {
-        self.publish(DISCONNECT_SUCCESS_METRIC);
+    /// Publish that one subscription was started on the API, and the counts that leaves.
+    pub fn subscribe_success(&self, counts: ConnectionCounts) {
+        self.publish(SUBSCRIBE_SUCCESS_METRIC, 1.0);
+        self.sampled(counts);
+    }
+
+    /// Publish that one subscription was ended by its subscriber, and the counts that
+    /// leaves.
+    pub fn unsubscribe_success(&self, counts: ConnectionCounts) {
+        self.publish(UNSUBSCRIBE_SUCCESS_METRIC, 1.0);
+        self.sampled(counts);
+    }
+
+    /// Publish that `delivered` data messages were written to subscribers of the API.
+    ///
+    /// A publication that reached no subscriber is a measurement too: the series carries a
+    /// zero for it, so a reader can tell an API whose mutations reach nobody from one that
+    /// is serving no mutation at all.
+    pub fn data_messages_published(&self, delivered: u32) {
+        self.publish(
+            PUBLISH_DATA_MESSAGE_SUCCESS_METRIC,
+            f64::from(delivered),
+        );
+    }
+
+    /// Publish that one real-time connection closed, and the counts that leaves.
+    pub fn disconnect_success(&self, counts: ConnectionCounts) {
+        self.publish(DISCONNECT_SUCCESS_METRIC, 1.0);
+        self.sampled(counts);
+    }
+
+    /// Publish ONE SAMPLE of the two gauges: the connections open on the API and the
+    /// subscriptions they hold, as the store holds them at this moment.
+    ///
+    /// What every change above reports through, and what [`super::gauges`] calls on its
+    /// cadence, so every period of a held-open connection carries a reading of what the
+    /// plane holds then rather than only the reading taken at the last change. Both counts
+    /// are bounded by the plane's own caps (`crate::state::event_data_plane`'s connections
+    /// per API and subscriptions per connection), so neither loses anything as a value.
+    pub fn sampled(&self, counts: ConnectionCounts) {
+        for (metric, value) in [
+            (ACTIVE_CONNECTIONS_METRIC, counts.connections),
+            (ACTIVE_SUBSCRIPTIONS_METRIC, counts.subscriptions),
+        ] {
+            self.publish(metric, f64::from(u32::try_from(value).unwrap_or(u32::MAX)));
+        }
     }
 
     /// Append ONE observation of `metric`, dimensioned on the API alone.
-    fn publish(&self, metric: &str) {
+    fn publish(&self, metric: &str, value: f64) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        appsync_metrics::append_observation(store, metric, api_dimensions(&self.api_id), 1.0);
+        if !appsync_metrics::append_observation(
+            store,
+            metric,
+            api_dimensions(&self.api_id),
+            value,
+        ) {
+            ::tracing::warn!(
+                api_id = %self.api_id,
+                %metric,
+                "the CloudWatch store is at capacity; an AppSync metric could not be published"
+            );
+        }
     }
 }
 

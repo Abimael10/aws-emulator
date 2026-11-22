@@ -16,6 +16,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// lock.
 pub mod event_data_plane;
 
+/// The claim ONE gauge sampler of one API is held under, shared by both real-time planes:
+/// each reports the same two gauges and observes them on a cadence, so the bookkeeping that
+/// keeps exactly one sampler per API is written once.
+pub mod gauge_sampling;
+
 /// The GraphQL API REAL-TIME plane's records: the socket each `GraphqlApi`'s `REALTIME`
 /// endpoint is served on, the connections open on it and the subscriptions those
 /// connections hold. A field of the store below for the same reason the Event API's plane

@@ -323,6 +323,7 @@ fn within(held: &Json, wanted: &Json) -> bool {
 /// ended, and the frame is written through the queue its connection's own task owns — the
 /// same path a delivery takes (`super::subscriptions`).
 pub async fn invalidated(context: &PlaneContext, calls: &[ExtensionCall]) {
+    let mut ended = false;
     for call in calls
         .iter()
         .filter(|call| call.name == INVALIDATE_SUBSCRIPTIONS)
@@ -355,6 +356,7 @@ pub async fn invalidated(context: &PlaneContext, calls: &[ExtensionCall]) {
                 .lock()
                 .graphql_data_plane
                 .end_subscription(&context.api_id, &subscription_id);
+            ended = true;
             if frames
                 .try_send(super::realtime::complete_frame(&subscription_id))
                 .is_err()
@@ -367,6 +369,13 @@ pub async fn invalidated(context: &PlaneContext, calls: &[ExtensionCall]) {
             }
             ::tokio::task::yield_now().await;
         }
+    }
+    // An invalidation that ended subscriptions changed what the subscription GAUGE reads, so
+    // the API reports the reading it now holds rather than waiting for the next sample
+    // ([`super::metrics`]). It is not an unsubscribe: no subscriber asked for it, so nothing
+    // of `UnsubscribeSuccess` is counted for one.
+    if ended {
+        context.metrics.sampled(context.connection_counts());
     }
 }
 

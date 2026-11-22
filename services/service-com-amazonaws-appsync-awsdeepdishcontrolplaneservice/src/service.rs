@@ -58,6 +58,12 @@ pub mod authorization;
 /// answers.
 pub mod event_api;
 
+/// How the two GAUGES a real-time plane reports — the connections open on an API and the
+/// subscriptions they hold — are observed on a cadence while that API is connected to.
+/// Shared by both planes, because a gauge of either is a quantity with a value at every
+/// instant rather than a count of events.
+pub mod gauge_sampling;
+
 /// The media type the SCHEMA an introspection read answers with is labelled: the one
 /// response of this service whose body is not the restJson1 envelope its own serializer
 /// labels.

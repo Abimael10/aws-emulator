@@ -35,6 +35,8 @@ use std::sync::Arc;
 use ::emulator_server::ResourceListener;
 use ::tokio::sync::mpsc::Sender;
 
+use super::gauge_sampling::GaugeSampling;
+
 /// The two sockets one Event API is served on, and what is open on them.
 struct ApiSockets {
     /// The socket the API's HTTP endpoint (`Api$dns`'s `HTTP` record) is served on.
@@ -45,15 +47,10 @@ struct ApiSockets {
     /// The realtime connections open on this API, keyed by the connection id this plane
     /// minted for each.
     connections: BTreeMap<String, ConnectionRecord>,
-    /// Whether a gauge sampler is running for this API
-    /// ([`EventDataPlane::claim_gauge_sampler`]).
-    gauge_sampling: bool,
-    /// Which claim the running sampler holds, so a sampler that has stood down cannot
-    /// release a claim a later one took.
-    gauge_generation: u64,
-    /// The running sampler's task, held so the task a connection started stays stoppable:
-    /// an API whose records go takes its sampler with it.
-    gauge_sampler: Option<::tokio::task::JoinHandle<()>>,
+    /// The claim this API's single gauge sampler is held under
+    /// ([`EventDataPlane::claim_gauge_sampler`]), so an API whose records go takes its
+    /// sampler with it.
+    gauges: GaugeSampling,
 }
 
 /// One open realtime connection: the channel its frames are written over, and the
@@ -147,9 +144,7 @@ pub fn authority_of(listener: &ResourceListener) -> String {
 /// nothing left to observe: it is stopped with the records rather than left to discover
 /// that on its next wake-up.
 fn abort_sampler(sockets: ApiSockets) {
-    if let Some(sampler) = sockets.gauge_sampler {
-        sampler.abort();
-    }
+    sockets.gauges.abort();
 }
 
 /// Why a subscribe was not recorded, which is what the realtime endpoint answers
@@ -184,9 +179,7 @@ impl EventDataPlane {
                 publish,
                 realtime,
                 connections: BTreeMap::new(),
-                gauge_sampling: false,
-                gauge_generation: 0,
-                gauge_sampler: None,
+                gauges: GaugeSampling::default(),
             },
         ) {
             abort_sampler(replaced);
@@ -220,13 +213,7 @@ impl EventDataPlane {
     /// sampler per API, claimed by the first connection opened on it and stood down once
     /// the API holds none ([`Self::gauge_sampling_wanted_or_release`]).
     pub fn claim_gauge_sampler(&mut self, api_id: &str) -> Option<u64> {
-        let sockets = self.apis.get_mut(api_id)?;
-        if sockets.gauge_sampling {
-            return None;
-        }
-        sockets.gauge_sampling = true;
-        sockets.gauge_generation = sockets.gauge_generation.wrapping_add(1);
-        Some(sockets.gauge_generation)
+        self.apis.get_mut(api_id)?.gauges.claim()
     }
 
     /// Keep the running sampler's task handle, aborting the one it replaces — and only
@@ -242,13 +229,7 @@ impl EventDataPlane {
             handle.abort();
             return;
         };
-        if !sockets.gauge_sampling || sockets.gauge_generation != generation {
-            handle.abort();
-            return;
-        }
-        if let Some(previous) = sockets.gauge_sampler.replace(handle) {
-            previous.abort();
-        }
+        sockets.gauges.install(generation, handle);
     }
 
     /// Whether `api_id` still has gauges to sample — and, when it has not, RELEASE the
@@ -267,10 +248,7 @@ impl EventDataPlane {
             return false;
         };
         let wanted = !sockets.connections.is_empty();
-        if !wanted && sockets.gauge_generation == generation {
-            sockets.gauge_sampling = false;
-        }
-        wanted
+        sockets.gauges.wanted_or_release(generation, wanted)
     }
 
     /// Mint the next connection id: a UUID, which is the shape AppSync's own realtime
