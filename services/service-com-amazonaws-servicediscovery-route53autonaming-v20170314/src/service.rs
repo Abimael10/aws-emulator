@@ -45,6 +45,7 @@
 mod data_endpoint;
 mod enum_value_sets;
 mod error_message_member;
+mod modelled_patterns;
 mod submitted_collections;
 mod submitted_map;
 

@@ -223,26 +223,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // One name index holds every namespace type, so a public DNS namespace cannot
-            // take a name any namespace already answers to. A name already owned by a
-            // COMPLETED create is a duplicate request, not a validation failure: the
-            // create that owns the name has already run, so the conflict is reported as
-            // `DuplicateRequest` (409) naming that operation — the same rule every
-            // namespace create follows. Deleting the namespace frees the name.
+            // take a name any namespace already answers to. That is a NAME conflict, which
+            // is the class `NamespaceAlreadyExists` is declared for: the refusal names the
+            // namespace that owns the name ([`crate::state::namespace_already_exists`], the
+            // one home for this refusal) — the same rule every namespace create follows.
+            // Deleting the namespace frees the name.
             if let Some(existing) = state
                 .namespace_ids_by_name
                 .get(&input.name)
                 .and_then(|id| state.namespaces.get(id))
             {
-                return Err(CreatePublicDnsNamespaceErrorModeled::DuplicateRequest(
-                    DuplicateRequest {
-                        message: Some(crate::state::duplicate_create_message(
-                            Self::NAME,
-                            existing.create_operation_id.as_deref(),
-                        )),
-                        duplicate_operation_id: existing.create_operation_id.clone(),
-                    },
-                )
-                .into());
+                return Err(
+                    CreatePublicDnsNamespaceErrorModeled::NamespaceAlreadyExists(
+                        crate::state::namespace_already_exists(existing),
+                    )
+                    .into(),
+                );
             }
 
             if state.namespaces.len() >= crate::state::MAX_NAMESPACES {

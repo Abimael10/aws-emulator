@@ -842,6 +842,10 @@ pub mod token_bucket;
 /// of — for a service whose pre-handler refusal states one clause per violation rather than
 /// only the first one the read reached.
 pub mod unstated_members;
+/// The ONE home for the modelled `@pattern`s the framework's boundary declares but cannot
+/// apply — the ones carrying look-around, which its engine treats as satisfied — applied,
+/// for every service whose model declares one.
+pub mod unapplied_patterns;
 pub mod validation;
 pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one

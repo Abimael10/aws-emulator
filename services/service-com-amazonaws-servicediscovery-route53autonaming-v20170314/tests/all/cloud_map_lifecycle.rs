@@ -362,11 +362,12 @@ async fn every_refusal_of_a_bad_value_carries_this_service_s_own_code() {
     }
 }
 
-/// A `Name` already owned by a create that has COMPLETED is a duplicate request, not a
-/// bad value: it is refused with `DuplicateRequest` naming that operation. Deleting
-/// the namespace frees the name and the identical call then succeeds.
+/// A `Name` another namespace already answers to is a NAME conflict, not a bad value and
+/// not a conflict between operations: it is refused with `NamespaceAlreadyExists` naming
+/// the namespace that owns the name. Deleting that namespace frees the name and the
+/// identical call then succeeds.
 #[tokio::test]
-async fn a_name_already_owned_by_a_completed_create_is_a_duplicate_request() {
+async fn a_name_another_namespace_owns_is_a_namespace_already_exists() {
     let router = emulator();
 
     // (operation, the name it creates, the extra members that operation requires)
@@ -394,21 +395,21 @@ async fn a_name_already_owned_by_a_completed_create_is_a_duplicate_request() {
             }
         }
 
-        let (first_operation, namespace_id) =
+        let (_first_operation, namespace_id) =
             created_namespace(&router, operation, body.clone()).await;
 
         let (status, answer) = call(&router, operation, body.clone()).await;
         let (code, _) = error_of(&answer);
         assert_eq!(
             (status, code.as_str()),
-            (400, "DuplicateRequest"),
-            "case {operation} on the taken name {name:?}: expected 400 DuplicateRequest, got \
-             {answer}"
+            (400, "NamespaceAlreadyExists"),
+            "case {operation} on the taken name {name:?}: expected 400 NamespaceAlreadyExists, \
+             got {answer}"
         );
         assert_eq!(
-            answer["DuplicateOperationId"],
-            json!(first_operation),
-            "case {operation}: the refusal names the create that owns the name, got {answer}"
+            answer["NamespaceId"],
+            json!(namespace_id),
+            "case {operation}: the refusal names the namespace that owns the name, got {answer}"
         );
 
         // A second namespace was NOT created: the name still resolves to the first.

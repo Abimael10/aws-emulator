@@ -4,8 +4,8 @@
 //! Implemented: mints a namespace record and files the `CREATE_NAMESPACE` operation
 //! whose id is this call's only output. The namespace id reaches the caller through
 //! that operation's `Targets` map, which is how Cloud Map's asynchronous create works.
-//! A `Name` already owned by a completed create is refused with `DuplicateRequest`
-//! naming that operation.
+//! A `Name` another namespace already answers to is refused with
+//! `NamespaceAlreadyExists` naming that namespace.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The modelled `@pattern` on `NamespaceNameHttp`, which the boundary validator
-        // cannot apply (its `(?!arn:)` lookahead does not compile), so it is applied
-        // here before anything is created.
-        if let Some(message) = crate::state::namespace_name_violation(
-            "name",
-            &input.name,
-            crate::state::NAMESPACE_NAME_HTTP_PATTERN,
-        ) {
-            return Err(CreateHttpNamespaceErrorModeled::InvalidInput(InvalidInput {
-                message: Some(message),
-            })
-            .into());
-        }
-
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
@@ -215,23 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // A name already owned by a COMPLETED create is a duplicate request, not a
-        // validation failure: the create that owns the name has already run, so the
-        // conflict is reported as `DuplicateRequest` (409) naming that operation.
-        // Deleting the namespace frees the name and the identical call then succeeds.
+        // A name already owned by a stored namespace is a NAME conflict, which is the class
+        // `NamespaceAlreadyExists` is declared for: the refusal names the namespace that
+        // owns it, so the caller can tell "someone else owns this name" from a retry of its
+        // own create ([`crate::state::namespace_already_exists`], the one home for this
+        // refusal). Deleting the namespace frees the name and the identical call then
+        // succeeds.
         if let Some(existing) = state
             .namespace_ids_by_name
             .get(&input.name)
             .and_then(|id| state.namespaces.get(id))
         {
-            return Err(CreateHttpNamespaceErrorModeled::DuplicateRequest(
-                DuplicateRequest {
-                    message: Some(crate::state::duplicate_create_message(
-                        Self::NAME,
-                        existing.create_operation_id.as_deref(),
-                    )),
-                    duplicate_operation_id: existing.create_operation_id.clone(),
-                },
+            return Err(CreateHttpNamespaceErrorModeled::NamespaceAlreadyExists(
+                crate::state::namespace_already_exists(existing),
             )
             .into());
         }

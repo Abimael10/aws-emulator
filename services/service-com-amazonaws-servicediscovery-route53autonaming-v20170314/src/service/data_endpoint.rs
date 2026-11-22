@@ -27,10 +27,13 @@
 //! exactly where [`super::EmulatedService::override_refusal`] takes them from
 //! ([`super::enum_value_sets::stated_message`], the one home for the words), and the
 //! violations are the framework's own (the shared collecting walk over the protocol's
-//! deserializer and `constraints::validate`), so this layer cannot word a constraint
-//! differently from the endpoint beside it. A request that breaks no modelled constraint
-//! is handed to the operation untouched, which keeps every modelled error, every success
-//! and the whole handler path where they are.
+//! deserializer and `constraints::validate`) together with the ones that walk declares and
+//! cannot apply, collected and ordered by the shared home for that rule
+//! ([`::service_common::unapplied_patterns`], which the service's own refusal layer
+//! [`super::modelled_patterns`] states too) — so this layer cannot word a constraint
+//! differently from the endpoint beside it, nor apply a different set of them. A request
+//! that breaks no modelled constraint is handed to the operation untouched, which keeps
+//! every modelled error, every success and the whole handler path where they are.
 //!
 //! # Why a wrapper
 //!
@@ -49,6 +52,7 @@ use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtRespons
 use ::serde_json::Value;
 use ::service_common::front_door::{body_violations, worded_rejection};
 use ::service_common::submitted_collections::AnsweredAs;
+use ::service_common::unapplied_patterns::{stated_together, unapplied_violations};
 use ::smithy_server_runtime::{
     BoxFuture, ErasedOperation, Operation, OperationContext, Refused, Service,
 };
@@ -189,8 +193,16 @@ impl<Op: Operation> AtTheDataEndpoint<Op> {
         // bindings of an RPC protocol inert), so the body half of the shared walk is the
         // whole request. A model refresh that bound a member to the URI would leave that
         // member's refusal to the service's own seam, which is why the walk is named here
-        // rather than assumed.
-        let violations = body_violations::<Op>(protocol, req);
+        // rather than assumed. Beside the constraints that walk applies are the ones it
+        // declares and cannot — a `@pattern` its engine will not compile — which are
+        // collected and ordered by the shared home for that rule, so this endpoint applies
+        // the same set of modelled constraints as the service's own
+        // ([`super::modelled_patterns`]).
+        let violations = stated_together(
+            <Op as Operation>::INPUT_SCHEMA,
+            body_violations::<Op>(protocol, req),
+            unapplied_violations::<Op>(protocol, req),
+        );
         if violations.is_empty() {
             return None;
         }

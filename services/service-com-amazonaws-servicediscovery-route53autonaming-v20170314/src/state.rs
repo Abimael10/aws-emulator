@@ -36,13 +36,12 @@ pub mod tagged_resource_arn;
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance,
-    InstanceSummary, Namespace, NamespaceProperties, NamespaceSummary, Operation, Service,
-    ServiceAttributes, ServiceSummary, Tag, SOA,
+    InstanceSummary, Namespace, NamespaceAlreadyExists, NamespaceProperties, NamespaceSummary,
+    Operation, Service, ServiceAttributes, ServiceSummary, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -240,108 +239,6 @@ pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
 /// `HealthStatus` of an instance a health checker reported unhealthy.
 pub const HEALTH_STATUS_UNHEALTHY: &str = "UNHEALTHY";
 
-/// The `@pattern` the model declares on `NamespaceNameHttp` (`CreateHttpNamespace$Name`).
-pub const NAMESPACE_NAME_HTTP_PATTERN: &str = "^(?!arn:)[!-~]{1,1024}$";
-
-/// The `@pattern` the model declares on `NamespaceNamePrivate`
-/// (`CreatePrivateDnsNamespace$Name`).
-pub const NAMESPACE_NAME_PRIVATE_PATTERN: &str = "^(?!arn:)[!-~]{1,253}$";
-
-/// The step budget one namespace-name match may spend.
-///
-/// `fancy-regex` is a BACKTRACKING engine, so a match has no linear-time guarantee in
-/// general and the work is bounded explicitly here rather than left to the pattern's
-/// shape. Two facts make this budget unreachable in practice, and both are properties
-/// of the inputs rather than of the engine: the patterns are MODEL CONSTANTS (never
-/// built from a request), and the matched value is a namespace `Name`, whose `@length`
-/// maximum (1024 characters at most) the boundary validator enforces before any handler
-/// runs. The budget is the backstop for a future model pattern that is not so tame: a
-/// match that exhausts it is answered, not retried, and never spins.
-const NAMESPACE_NAME_BACKTRACK_LIMIT: usize = 1_000_000;
-
-/// How long a rejected value may be when a validation clause echoes it, matching the
-/// framework's own ceiling so a handler-built clause reads like a boundary-built one.
-const MAX_ECHOED_VALUE: usize = 256;
-
-/// Why the modelled `@pattern` on a namespace `Name` rejects `name`, worded as the
-/// framework's own validation envelope — or `None` when the name satisfies it.
-///
-/// This check belongs in the handlers rather than at the boundary: the Cloud Map
-/// namespace-name patterns open with the negative lookahead `(?!arn:)`, the vendored
-/// boundary validator compiles a `@pattern` with the `regex` crate, which has no
-/// look-around, and it treats a pattern it cannot compile as matching
-/// (`pattern_matches` in `vendor/smithy-schema-server/src/constraints.rs`). So the
-/// constraint the model declares would otherwise never be applied to those members.
-///
-/// The check is the pattern: `pattern` is matched by a look-around-capable engine
-/// (`fancy-regex`, as `service-com-amazonaws-odb-odb` already does for the same
-/// reason), so the clause — which quotes the model's own source text — cannot state a
-/// constraint this function does not apply.
-pub fn namespace_name_violation(member: &str, name: &str, pattern: &'static str) -> Option<String> {
-    if namespace_name_matches(pattern, name) {
-        return None;
-    }
-    ::aws_smithy_schema_server::envelope(&[::smithy_server_runtime::Violation {
-        path: member.to_string(),
-        kind: ::smithy_server_runtime::ViolationKind::Pattern(pattern.to_string()),
-        value: Some(echoed(name)),
-        sensitive: false,
-    }])
-}
-
-/// The namespace-name patterns of this model, each compiled once.
-///
-/// Keyed by the pattern source so the compiled form can never drift from the text the
-/// clause quotes. Each is built with an explicit backtrack budget
-/// ([`NAMESPACE_NAME_BACKTRACK_LIMIT`]), which is what bounds the work one match may
-/// do on a backtracking engine. Compilation is fallible and its input is a COMPILE-TIME
-/// CONSTANT, never request text, but a pattern that fails to compile is still dropped
-/// rather than unwrapped: nothing here panics, on any input.
-static NAMESPACE_NAME_REGEXES: LazyLock<HashMap<&'static str, ::fancy_regex::Regex>> =
-    LazyLock::new(|| {
-        [NAMESPACE_NAME_HTTP_PATTERN, NAMESPACE_NAME_PRIVATE_PATTERN]
-            .into_iter()
-            .filter_map(|pattern| {
-                ::fancy_regex::RegexBuilder::new(pattern)
-                    .backtrack_limit(NAMESPACE_NAME_BACKTRACK_LIMIT)
-                    .build()
-                    .ok()
-                    .map(|compiled| (pattern, compiled))
-            })
-            .collect()
-    });
-
-/// Whether `name` satisfies the namespace-name `@pattern` `pattern`.
-///
-/// A pattern this crate holds no compiled form for, and a match that exhausts its
-/// backtrack budget, are both treated as matching — which is what the boundary
-/// validator does with a pattern it cannot compile: a value is never refused because of
-/// a model pattern nothing can evaluate.
-fn namespace_name_matches(pattern: &str, name: &str) -> bool {
-    NAMESPACE_NAME_REGEXES
-        .get(pattern)
-        .is_none_or(|compiled| compiled.is_match(name).unwrap_or(true))
-}
-
-/// A rejected value as a clause may echo it: itself when short, a
-/// character-boundary-safe prefix with an elision when not, so a caller-controlled
-/// value cannot amplify a request into an arbitrarily long response.
-///
-/// The vendored validator keeps the same helper for the clauses IT builds, but it is
-/// private and `vendor/` is read-only here, so a handler that builds a clause of its
-/// own — which is expected to pass an already-elided `Violation::value` — elides it
-/// through this copy, as the other services that do the same thing already do.
-fn echoed(value: &str) -> String {
-    if value.len() <= MAX_ECHOED_VALUE {
-        return value.to_string();
-    }
-    let mut end = MAX_ECHOED_VALUE;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}... [{} bytes]", &value[..end], value.len())
-}
-
 /// A `ResourceDescription` as it is PERSISTED.
 ///
 /// The model gives `Description` no default and length 0..1024, and a resource created
@@ -537,28 +434,43 @@ fn invalid_filter_conditions_message(clauses: &[String]) -> Option<String> {
     (!clauses.is_empty()).then(|| format!("{INVALID_FILTER_CONDITIONS}{}", clauses.concat()))
 }
 
-/// The message a namespace create is refused with when the `Name` is already owned by
-/// a create that has already completed.
-///
-/// The text names the create that owns the name and the id a caller can poll, which is
-/// the whole content of the refusal: the duplicate is a *request* conflict, not a bad
-/// value. `operation` is the operation whose name was duplicated, so the same wording
-/// serves every namespace create.
-pub fn duplicate_create_message(operation: &str, completed: Option<&str>) -> String {
-    match completed {
-        Some(operation_id) => {
-            format!("Another operation of type {operation} and id {operation_id} has completed")
-        }
-        // A namespace stored without the id of its create (a record seeded directly
-        // into the store) still conflicts; there is just no id to poll.
-        None => format!("Another operation of type {operation} has completed"),
-    }
-}
-
 /// The `ServiceAlreadyExists` message, which is a CONSTANT: the service reports the
 /// class of conflict and names neither the service nor the namespace the caller asked
 /// for, so no request value reaches the body.
 pub const SERVICE_ALREADY_EXISTS_MESSAGE: &str = "Service already exists.";
+
+/// The `NamespaceAlreadyExists` message: the namespace conflict of this service, worded
+/// as its service conflict is ([`SERVICE_ALREADY_EXISTS_MESSAGE`]).
+///
+/// A CONSTANT, for the same reason: the sentence reports the CLASS of conflict and names
+/// neither the name the caller asked for nor the namespace that already answers to it.
+/// The error shape is what identifies the winner, through the two members it declares for
+/// exactly that — `NamespaceAlreadyExists$NamespaceId` ("the ID of the existing
+/// namespace") and `$CreatorRequestId` ("the `CreatorRequestId` that was used to create
+/// the namespace") — so nothing of the loser's own request reaches the body.
+pub const NAMESPACE_ALREADY_EXISTS_MESSAGE: &str = "Namespace already exists.";
+
+/// The refusal a namespace create earns when the `Name` it asks for is already held by a
+/// stored namespace, whichever create stored it.
+///
+/// One name index holds every namespace type and a namespace is addressed by its name on
+/// the discovery plane, so a name is held by AT MOST one namespace: a create asking for a
+/// name another namespace answers to is a NAME conflict, which is the class
+/// `NamespaceAlreadyExists` is declared for ("the namespace that you're trying to create
+/// already exists", `@httpError 400`). The members identify the namespace that owns the
+/// name — its id, and the `CreatorRequestId` of the create that made it — which is what a
+/// caller needs to tell this refusal from a retry of its OWN create: the duplicate-request
+/// class (409) is a conflict between OPERATIONS on one resource, not between two callers
+/// asking for one name.
+///
+/// Built here once, so no namespace create words this conflict differently from another.
+pub fn namespace_already_exists(existing: &NamespaceRecord) -> NamespaceAlreadyExists {
+    NamespaceAlreadyExists {
+        message: Some(NAMESPACE_ALREADY_EXISTS_MESSAGE.to_string()),
+        namespace_id: Some(existing.id.clone()),
+        creator_request_id: existing.creator_request_id.clone(),
+    }
+}
 
 /// The `InvalidInput` message a service-settings update is refused with when the
 /// service belongs to an HTTP namespace.
@@ -594,8 +506,8 @@ pub struct NamespaceRecord {
     /// a TTL reports [`NO_NEGATIVE_CACHING_TTL`] on the `SOA` every namespace read
     /// carries; nothing else is invented for it.
     pub soa_ttl: Option<i64>,
-    /// The `OperationId` of the create that owns this name, which is what a later
-    /// create of the SAME name is refused with (`DuplicateRequest`).
+    /// The `OperationId` of the create that owns this name, which is what the operation
+    /// records of the namespace are read back through.
     pub create_operation_id: Option<String>,
     pub tags: Vec<(String, String)>,
 }

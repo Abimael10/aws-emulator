@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivateDnsNamespace
-//! Implemented: validates the `Name` against the pattern the model declares, creates the
+//! Implemented: creates the
 //! Route 53 private hosted zone the namespace is backed by — associated with the requested
 //! `Vpc` — mints a `DNS_PRIVATE` namespace record carrying THAT zone's id, and files the
 //! `CREATE_NAMESPACE` operation whose id is this call's only output — the namespace id
@@ -192,22 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The modelled `@pattern` on `NamespaceNamePrivate`, which the boundary
-        // validator cannot apply (its `(?!arn:)` lookahead does not compile), so it is
-        // applied here before anything is created.
-        if let Some(message) = crate::state::namespace_name_violation(
-            "name",
-            &input.name,
-            crate::state::NAMESPACE_NAME_PRIVATE_PATTERN,
-        ) {
-            return Err(CreatePrivateDnsNamespaceErrorModeled::InvalidInput(
-                InvalidInput {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let store = state;
@@ -235,23 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
-            // A name already owned by a COMPLETED create is a duplicate request, not a
-            // validation failure — the same rule every namespace create follows.
+            // A name already owned by a stored namespace is a NAME conflict, which is the
+            // class `NamespaceAlreadyExists` is declared for: the refusal names the
+            // namespace that owns it, so the caller can tell "someone else owns this name"
+            // from a retry of its own create ([`crate::state::namespace_already_exists`],
+            // the one home for this refusal). Deleting that namespace frees the name and
+            // the identical call then succeeds.
             if let Some(existing) = state
                 .namespace_ids_by_name
                 .get(&input.name)
                 .and_then(|id| state.namespaces.get(id))
             {
-                return Err(CreatePrivateDnsNamespaceErrorModeled::DuplicateRequest(
-                    DuplicateRequest {
-                        message: Some(crate::state::duplicate_create_message(
-                            Self::NAME,
-                            existing.create_operation_id.as_deref(),
-                        )),
-                        duplicate_operation_id: existing.create_operation_id.clone(),
-                    },
-                )
-                .into());
+                return Err(
+                    CreatePrivateDnsNamespaceErrorModeled::NamespaceAlreadyExists(
+                        crate::state::namespace_already_exists(existing),
+                    )
+                    .into(),
+                );
             }
 
             if state.namespaces.len() >= crate::state::MAX_NAMESPACES {

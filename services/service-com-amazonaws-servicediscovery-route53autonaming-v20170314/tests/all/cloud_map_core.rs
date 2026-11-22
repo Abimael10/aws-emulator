@@ -1414,7 +1414,7 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "CreateHttpNamespace",
             json!({ "Name": "errors-ns" }),
             400,
-            "DuplicateRequest",
+            "NamespaceAlreadyExists",
         ),
         (
             "a service name that is already taken in the namespace",
@@ -1484,17 +1484,27 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
         );
     }
 
-    // The conflict names the create that already owns the name, so a caller can poll it.
+    // The conflict names the namespace that already owns the name, so a caller can read it
+    // rather than guess which call took the name.
     let create_operation = ok(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await
         ["OperationId"]
         .as_str()
         .expect("an OperationId")
         .to_string();
+    let owning_namespace = ok(
+        &router,
+        "GetOperation",
+        json!({ "OperationId": create_operation }),
+    )
+    .await["Operation"]["Targets"]["NAMESPACE"]
+        .as_str()
+        .expect("the CREATE_NAMESPACE operation targets the namespace it created")
+        .to_string();
     let (_, conflict) = call(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await;
     assert_eq!(
-        conflict["DuplicateOperationId"],
-        json!(create_operation),
-        "DuplicateRequest names the create that already owns the name, got {conflict}"
+        conflict["NamespaceId"],
+        json!(owning_namespace),
+        "NamespaceAlreadyExists names the namespace that already owns the name, got {conflict}"
     );
     let (_, conflict) = call(
         &router,

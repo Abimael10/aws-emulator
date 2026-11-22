@@ -25,11 +25,6 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque pagination cursor a `NextToken` carries.
 hex = { workspace = true }
-# Applies the modelled `@pattern` on a namespace name: its negative lookahead needs an
-# engine with look-around, which the boundary validator's `regex` has not. Bounded
-# range (0.16.x), and every match runs under an explicit backtrack budget — see
-# `state::NAMESPACE_NAME_BACKTRACK_LIMIT`.
-fancy-regex = "0.16"
 # `state::route53_zone`: the in-process Amazon Route 53 client this service creates a DNS
 # namespace's hosted zone with and publishes its services' record sets through. Only the
 # generated client is needed: the emulator supplies the transport, so the SDK's own HTTPS
@@ -48,9 +43,10 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 
 # The constraint-refusal wording this service answers with, and the renaming of the
 # member an error body carries its text in: the shared collecting walk, the shared
-# per-operation layer that quotes the collection a request submitted, and the one home
-# for that rename. See `src/service/submitted_collections.rs` and
-# `src/service/error_message_member.rs`.
+# per-operation layer that quotes the collection a request submitted, the shared home for
+# the modelled `@pattern`s the boundary validator declares and cannot apply, and the one
+# home for that rename. See `src/service/submitted_collections.rs`,
+# `src/service/modelled_patterns.rs` and `src/service/error_message_member.rs`.
 service-common = { path = "../common" }
 
 [build-dependencies]

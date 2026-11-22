@@ -292,7 +292,14 @@ cron = "0.15"
 # MATCHES with, from the maintained engine this workspace already matches caller-supplied
 # patterns with (its linear-time matcher, so a pattern a caller wrote cannot cost the host
 # more than the input it is run over) rather than a matcher written here.
+# `unapplied_patterns`: the same engine the framework's boundary validator compiles a
+# `@pattern` with, asked whether it compiles one at all.
 regex = "1.13"
+# `unapplied_patterns`: applies a modelled `@pattern` the engine above cannot compile — one
+# carrying look-around, which that engine treats as satisfied. Bounded range (0.16.x), and
+# every match runs under an explicit backtrack budget (`PATTERN_BACKTRACK_LIMIT`), so a
+# backtracking engine cannot spin on a caller's value.
+fancy-regex = "0.16"
 # `record_identicon`: the PNG encoder the image a service serves for a record whose own image
 # bytes it does not hold is written with — the maintained codec this workspace already encodes
 # PNGs with, so the one renderer every such service shares writes a real image rather than

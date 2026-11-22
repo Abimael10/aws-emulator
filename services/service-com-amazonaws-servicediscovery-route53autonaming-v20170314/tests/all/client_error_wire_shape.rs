@@ -109,9 +109,11 @@ async fn register(router: &MultiServiceRouter, service_id: &str, count: usize) {
 
 /// Every client-class refusal this service serves answers HTTP 400, whatever status the
 /// model pins on its shape: the table spans the shapes carrying `@httpError` 404 (the
-/// four not-found classes), 409 (`ResourceInUse`, `DuplicateRequest`) and 400
-/// (`InvalidInput`, `ServiceAlreadyExists`), reached through ten different operations,
-/// plus a boundary refusal the framework answers before any handler runs.
+/// four not-found classes), 409 (`ResourceInUse`) and 400
+/// (`InvalidInput`, `ServiceAlreadyExists`, `NamespaceAlreadyExists`), reached through ten
+/// different operations, plus a boundary refusal the framework answers before any handler
+/// runs. The other 409 class, `DuplicateRequest`, is reached through a second delete of a
+/// namespace whose delete is still running, which `delete_namespace.rs` covers.
 #[tokio::test]
 async fn every_client_class_refusal_answers_four_hundred() {
     let router = emulator();
@@ -175,10 +177,10 @@ async fn every_client_class_refusal_answers_four_hundred() {
             Message::Any,
         ),
         (
-            "a namespace name already created (modelled 409)",
+            "a namespace name already created (modelled 400)",
             "CreateHttpNamespace",
             json!({ "Name": "errors-ns" }),
-            "DuplicateRequest",
+            "NamespaceAlreadyExists",
             Message::Any,
         ),
         (

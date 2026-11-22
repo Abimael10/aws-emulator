@@ -10,13 +10,21 @@
 //! error code its constraint refusals carry, the member an error body reports its text in
 //! ([`super::error_message_member`]), the order it states a map's entries in
 //! ([`super::submitted_map`]), and which operations pay for the collection pass.
+//!
+//! Every operation is served BEHIND one more layer of the same kind
+//! ([`super::modelled_patterns`]): the other half of a constraint refusal that walk cannot
+//! state — a modelled `@pattern` its engine cannot compile, and the order two clauses about
+//! one member are stated in.
 
 use std::sync::Arc;
 
-use service_common::submitted_collections::{StatedClause, StatedClauseTable};
+use service_common::submitted_collections::{
+    AnsweringAs, QuotingSubmittedCollections, StatedClause,
+};
 use smithy_server_runtime::{ErasedOperation, Operation, OperationRoutingTable};
 
 use super::data_endpoint::AtTheDataEndpoint;
+use super::modelled_patterns::ApplyingEveryModelledPattern;
 
 /// The error code a constraint refusal of this service carries, which is the one
 /// [`super::EmulatedService::override_refusal`] picks for the same class: the restated
@@ -43,11 +51,56 @@ fn stated_clause() -> StatedClause {
 macro_rules! serve {
     ($table:expr, $engine:expr, $served:ident, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
-            $table.$served(
+            $served(
+                $table,
                 crate::ops::$module::$operation::new(::std::sync::Arc::clone($engine)),
             );
         )+
     };
+}
+
+/// Serve one operation with a constraint clause about a collection member QUOTING the
+/// collection the request submitted — for an operation whose model declares a bounded
+/// collection member, which is the only kind that can produce such a clause.
+fn quoting<O: Operation + ErasedOperation + 'static>(
+    table: &mut OperationRoutingTable,
+    operation: O,
+) {
+    applying_every_modelled_pattern::<O>(
+        table,
+        Box::new(QuotingSubmittedCollections::new(operation, stated_clause())),
+    );
+}
+
+/// Serve one operation with its responses answered as this service answers them and no
+/// collection pass at all.
+fn answering<O: Operation + ErasedOperation + 'static>(
+    table: &mut OperationRoutingTable,
+    operation: O,
+) {
+    applying_every_modelled_pattern::<O>(
+        table,
+        Box::new(AnsweringAs::new(operation, stated_clause().answered_as)),
+    );
+}
+
+/// File one already-wrapped operation under its modelled name, behind the layer that applies
+/// the modelled `@pattern`s the boundary validator declares and cannot apply
+/// ([`super::modelled_patterns`]) — which every operation of this service is served through,
+/// because which of them declare such an expression is read off their own input schemas
+/// rather than listed here.
+fn applying_every_modelled_pattern<O: Operation>(
+    table: &mut OperationRoutingTable,
+    served: Box<dyn ErasedOperation>,
+) {
+    table.add_operation(
+        O::NAME,
+        Box::new(ApplyingEveryModelledPattern::<O>::new(
+            served,
+            INVALID_INPUT,
+            super::error_message_member::with_modelled_message_member,
+        )),
+    );
 }
 
 /// The same modelled operations the generated table holds, each wrapped so that the error
@@ -55,7 +108,9 @@ macro_rules! serve {
 /// shared engine, so a wrapped operation reads and writes the one store.
 ///
 /// EVERY operation of this model is listed, because the member an error body reports its
-/// text in is a property of this service's error bodies rather than of any one operation.
+/// text in is a property of this service's error bodies rather than of any one operation,
+/// and so is the layer that applies the modelled `@pattern`s the boundary validator declares
+/// and cannot ([`super::modelled_patterns`]), which every operation below is served behind.
 /// The collection pass is listed separately: `UpdateServiceAttributes` is the only
 /// operation whose model declares a bounded collection member whose clause the framework's
 /// walk cannot state — `ServiceAttributesMap` (`@length` 1..30), whose rejected value the
@@ -66,13 +121,14 @@ macro_rules! serve {
 /// The operations the model hosts on an endpoint of their OWN are listed last, served
 /// through the layer that words their constraint refusals the way the validation in front
 /// of that endpoint words one ([`super::data_endpoint`]) — the member an error body reports
-/// its text in is unchanged for them.
+/// its text in is unchanged for them, and that layer applies the same set of modelled
+/// constraints as this one, under the error code IT names.
 pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> OperationRoutingTable {
-    let mut table = StatedClauseTable::new(stated_clause());
+    let mut table = OperationRoutingTable::new();
     serve!(
-        table,
+        &mut table,
         engine,
         quoting,
         create_http_namespace::CreateHttpNamespace,
@@ -84,7 +140,7 @@ pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
         update_service_attributes::UpdateServiceAttributes,
     );
     serve!(
-        table,
+        &mut table,
         engine,
         answering,
         delete_namespace::DeleteNamespace,
@@ -109,7 +165,6 @@ pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
         update_public_dns_namespace::UpdatePublicDnsNamespace,
         update_service::UpdateService,
     );
-    let mut table = table.finish();
     // The operations the model hosts on an endpoint of their own, where the generic
     // request-validation layer words a constraint refusal instead of this service
     // ([`super::data_endpoint`], whose census test pins which operations those are).
