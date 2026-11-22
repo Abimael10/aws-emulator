@@ -175,6 +175,34 @@ pub async fn pod_identity_role_trust_refusal(
     }
 }
 
+/// Why the `podExecutionRoleArn` a Fargate profile names is not a role the Fargate
+/// plane can assume for the Pods that profile selects, or `None` when nothing about
+/// its trust policy says so.
+///
+/// The Pod execution role "allows Fargate infrastructure to register with your
+/// cluster as a node" (`CreateFargateProfileRequest$podExecutionRoleArn`), and the
+/// infrastructure that assumes it speaks as [`FARGATE_PODS_SERVICE_PRINCIPAL`], so
+/// a role whose trust policy does not let that principal assume it is a role no
+/// Pod of the profile could ever register under. The reading is the service's one
+/// reading ([`role_trust`]); only the sentence differs, and it is the fixed one
+/// Amazon EKS answers this class with
+/// ([`fargate_pod_execution_role_trust_refusal_message`]).
+///
+/// As for every other trust reading in this module, the refusal is grounded in a
+/// TRUST POLICY IAM HOLDS and in nothing else — which is what the sentence is
+/// about: a role IAM does not hold has no trust policy to have read, and neither
+/// has an IAM this emulator could not ask, so silence refuses nothing.
+pub async fn fargate_pod_execution_role_trust_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<String> {
+    match role_trust(ctx, region, role_arn, FARGATE_POD_EXECUTION_ROLE_PRINCIPALS).await {
+        RoleTrust::Withholds => Some(fargate_pod_execution_role_trust_refusal_message()),
+        RoleTrust::Admits | RoleTrust::NoSuchRole | RoleTrust::Unanswered => None,
+    }
+}
+
 /// Whether IAM reports that this account holds NO role of this ARN — the second
 /// question the operations that are handed a caller-supplied role ask about it.
 ///

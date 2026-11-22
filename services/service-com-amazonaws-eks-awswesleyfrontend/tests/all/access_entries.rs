@@ -25,7 +25,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{access_entry_cluster_request, REGION};
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, encode_label, read_until, Answer};
 
 /// An EKS-managed access policy ARN: no region, `aws` as the account. Two of the
 /// policies the Amazon EKS User Guide publishes ("Access policy permissions").
@@ -1145,6 +1145,18 @@ async fn deleting_a_cluster_deletes_its_access_entries() {
 
     let deleted = delete_cluster(&router, "ephemeral").await;
     assert_eq!(deleted.status, 200, "deleting the cluster: {deleted:?}");
+
+    // The entries go with the RECORD, which the accepted deletion leaves in place —
+    // reporting `DELETING` — until the clock removes it: they are gone once the
+    // cluster is, waited for by looking again ([`crate::wire::read_until`]).
+    let uri = format!("/clusters/{}", encode_label("ephemeral"));
+    read_until(
+        "deleting the cluster",
+        "the deleted cluster became absent",
+        || call(&router, REGION, "GET", &uri, ""),
+        |read| read.status == 404,
+    )
+    .await;
 
     for (case, answer) in [
         (

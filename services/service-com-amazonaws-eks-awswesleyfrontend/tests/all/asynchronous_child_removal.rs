@@ -182,9 +182,9 @@ async fn child_until_gone(
 // ---------------------------------------------------------------------------
 
 /// The table spans the two children whose delete this service accepts
-/// asynchronously, and with them the class each create answers a taken name with:
-/// `CreateNodegroup` models `ResourceInUseException` (409) and
-/// `CreateFargateProfile` models `InvalidRequestException` (400).
+/// asynchronously; a create under a name either of them still holds is the one
+/// conflict this service answers a taken name with — `ResourceInUseException`
+/// (409), whatever the name is taken by.
 #[tokio::test]
 async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_due() {
     let router = emulator();
@@ -210,8 +210,8 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
             case: "a Fargate profile",
             child: Child::FargateProfile,
             name: "fp-removal",
-            taken_status: 400,
-            taken_code: "InvalidRequestException",
+            taken_status: 409,
+            taken_code: "ResourceInUseException",
         },
     ];
 

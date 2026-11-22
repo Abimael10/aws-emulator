@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The wire plumbing (one shared engine behind the production router, label
 // encoding, the reduced `Answer`) is shared with every other suite in this
 // crate — see `tests/all/wire.rs`.
-use crate::wire::{call, emulator, encode_label, Answer, TAG_MUTATION_STATUS};
+use crate::wire::{call, emulator, encode_label, read_until, Answer, TAG_MUTATION_STATUS};
 
 pub(crate) const REGION: &str = "us-west-2";
 
@@ -78,6 +78,29 @@ pub(crate) async fn delete(router: &MultiServiceRouter, name: &str) -> Answer {
         "",
     )
     .await
+}
+
+/// `DescribeCluster` the cluster `name` until the name answers 404 — the instant
+/// the deletion `DeleteCluster` accepted has FINISHED and the cluster has left the
+/// store, after the window in which it reports `DELETING`.
+///
+/// The wait is for the CONDITION, under the same generous deadline
+/// [`describe_when_active`] uses, so a loaded host only makes it slower. It lives
+/// here, beside the cluster calls every suite drives, so the suites that have to
+/// wait out an accepted deletion all wait the one way.
+pub(crate) async fn describe_until_absent(router: &MultiServiceRouter, name: &str) -> Answer {
+    let deadline = std::time::Instant::now() + ACTIVATION_DEADLINE;
+    loop {
+        let described = describe(router, name).await;
+        if described.status == 404 {
+            return described;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cluster {name:?}: the accepted deletion never finished, got {described:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
@@ -888,6 +911,9 @@ async fn an_unowned_resource_arn_is_not_found_on_both_tag_operations() {
         .to_owned();
     let removed = delete(&router, "gone-soon").await;
     assert_eq!(removed.status, 200, "setup delete: got {removed:?}");
+    // An accepted deletion runs for a window in which the cluster — and so its ARN —
+    // is still there; the ARN names no resource once that deletion has finished.
+    describe_until_absent(&router, "gone-soon").await;
 
     let cases = vec![
         ("a cluster ARN for a name never created", format!("arn:aws:eks:{REGION}:000000000000:cluster/never")),
@@ -931,8 +957,9 @@ async fn an_unowned_resource_arn_is_not_found_on_both_tag_operations() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `DeleteCluster` removes the cluster and reports it `DELETING`; after that
-// no read finds it, and a second delete is a not-found. A cluster with
+// RULE: `DeleteCluster` accepts the deletion and reports the cluster `DELETING`;
+// the cluster stays readable and listed in that status until the deletion
+// finishes, and only then does the name answer not-found. A cluster with
 // `deletionProtection` is refused and kept.
 // ---------------------------------------------------------------------------
 
@@ -1001,24 +1028,62 @@ async fn delete_removes_the_cluster_and_deletion_protection_refuses() {
             removed.cluster()["name"]
         );
 
-        let described = describe(&router, &name).await;
+        // THE ACCEPTED DELETE IS NOT THE REMOVAL: the cluster stays readable in
+        // `DELETING`, under the ARN it always had, and is still listed until the
+        // deletion finishes — which is what a waiter polling a teardown reads.
+        let deleting = describe(&router, &name).await;
+        assert_eq!(
+            deleting.status, 200,
+            "case {case:?}: a cluster whose delete was accepted is still readable, got \
+             {deleting:?}"
+        );
+        assert_eq!(
+            deleting.cluster()["status"],
+            serde_json::json!("DELETING"),
+            "case {case:?}: an independent read reports DELETING, got {:?}",
+            deleting.cluster()["status"]
+        );
+        assert_eq!(
+            deleting.cluster()["arn"],
+            removed.cluster()["arn"],
+            "case {case:?}: the deleting cluster keeps its ARN, got {:?}",
+            deleting.cluster()["arn"]
+        );
+        assert_eq!(
+            names_of(&list(&router, "").await),
+            vec![name.clone()],
+            "case {case:?}: a cluster being deleted is still listed"
+        );
+        // A delete that arrives in that window is the conflict it is: the cluster is
+        // being deleted, not absent.
+        let again = delete(&router, &name).await;
+        assert_eq!(
+            again.status, 409,
+            "case {case:?}: a second delete inside the window is a conflict, got {again:?}"
+        );
+        assert_eq!(
+            again.error_type.as_deref(),
+            Some("ResourceInUseException"),
+            "case {case:?}: expected ResourceInUseException, got {again:?}"
+        );
+
+        // ONLY ONCE THE DELETION HAS FINISHED is the cluster absent: the read 404s,
+        // the listing drops it and a delete is a not-found. Waited for by looking
+        // again ([`describe_until_absent`]).
+        let described = describe_until_absent(&router, &name).await;
         assert_eq!(
             described.status, 404,
             "case {case:?}: a deleted cluster is not found, got {described:?}"
         );
-        // The accepted delete finished the work it carried, so the cluster is absent
-        // rather than being deleted: a second delete is a not-found. (A call that
-        // OVERLAPS one still in flight is the conflict `cluster_admission_rules`
-        // pins.)
-        let again = delete(&router, &name).await;
+        let after = delete(&router, &name).await;
         assert_eq!(
-            again.status, 404,
-            "case {case:?}: a second delete is not found, got {again:?}"
+            after.status, 404,
+            "case {case:?}: a delete once the deletion finished is not found, got {after:?}"
         );
         assert_eq!(
-            again.error_type.as_deref(),
+            after.error_type.as_deref(),
             Some("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {again:?}"
+            "case {case:?}: expected ResourceNotFoundException, got {after:?}"
         );
         assert!(
             names_of(&list(&router, "").await).is_empty(),
@@ -1198,9 +1263,18 @@ async fn the_cluster_quota_is_reported_as_resource_limit_exceeded() {
         );
     }
 
-    // Deleting one frees exactly one slot.
+    // Deleting one frees exactly one slot — once the deletion has FINISHED: a
+    // cluster being deleted is still a cluster of the Region, so the slot is taken
+    // until it leaves.
     let removed = delete(&router, "quota-0000").await;
     assert_eq!(removed.status, 200, "freeing a slot: got {removed:?}");
+    let still_full = create(&router, &minimal_request("during-the-deletion")).await;
+    assert_eq!(
+        still_full.status, 400,
+        "case \"a cluster being deleted still holds its slot\": expected 400, got \
+         {still_full:?}"
+    );
+    describe_until_absent(&router, "quota-0000").await;
     let accepted = create(&router, &minimal_request("after-a-delete")).await;
     assert_eq!(
         accepted.status, 200,
@@ -1503,12 +1577,15 @@ async fn the_same_name_in_two_regions_is_two_independent_clusters() {
             deleted.status, 200,
             "case {case:?}: deleting {name:?} in {left} must succeed, got {deleted:?}"
         );
-        let gone = call(
-            &router,
-            left,
-            "GET",
-            &format!("/clusters/{}", encode_label(name)),
-            "",
+        // Deleting in one region leaves the other region's cluster untouched: the
+        // deleted one is absent there once its deletion has finished, waited for by
+        // looking again ([`crate::wire::read_until`]).
+        let uri = format!("/clusters/{}", encode_label(name));
+        let gone = read_until(
+            &case,
+            &format!("{name:?} became absent in {left}"),
+            || call(&router, left, "GET", &uri, ""),
+            |read| read.status == 404,
         )
         .await;
         assert_eq!(

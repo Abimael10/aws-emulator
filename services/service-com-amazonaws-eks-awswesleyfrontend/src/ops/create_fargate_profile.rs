@@ -13,7 +13,8 @@
 //! judged against the CLUSTER it named — the Amazon EKS-managed-plane gate, the
 //! name the cluster already holds, the quota — because Amazon EKS validates the
 //! payload it was sent before it asks what kind of cluster the profile would hang
-//! off. The subnets go last of all: resolving them is a call out to EC2.
+//! off. Then the Pod execution role's trust policy is read in IAM, which owns it.
+//! The subnets go last of all: resolving them is a call out to EC2.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +124,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
 //!   the model's `errors` list for this operation omits it, but the SERVICE models it and it
 //!   is this API's 404 for a `clusterName` that resolves to no cluster.
+//! * `ResourceInUseException` (HTTP 409) — widened in through `extra_errors` (see below): the
+//!   model's `errors` list for this operation omits it, but the SERVICE models it and it is
+//!   this API's conflict for a `fargateProfileName` the cluster already holds.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -152,9 +156,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // (403); and `clusterName` is an `@httpLabel`, so a request can name a cluster that
 // does not exist, which is ABSENCE (404) — the one answer every cluster-scoped
 // operation of this service gives it — rather than a bad parameter.
+// `ResourceInUseException` is widened in for the same reason: the model's `errors`
+// list for this operation omits it, but the SERVICE models it — at `@httpError` 409,
+// as `DeleteCluster`'s own error list shows — and a create under a name the cluster
+// already holds is a CONFLICT with the profile that holds it rather than a malformed
+// request, which is the one answer every create of this service gives a taken name.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreateFargateProfile",
-    extra_errors = ["AccessDeniedException", "ResourceNotFoundException"]
+    extra_errors = [
+        "AccessDeniedException",
+        "ResourceInUseException",
+        "ResourceNotFoundException"
+    ]
 )]
 #[derive(Debug)]
 pub enum CreateFargateProfileErrorModeled {
@@ -162,6 +175,7 @@ pub enum CreateFargateProfileErrorModeled {
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
+    ResourceInUseException(ResourceInUseException),
     ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
@@ -274,6 +288,17 @@ fn selector_refusal(selectors: &[FargateProfileSelector]) -> Option<String> {
     None
 }
 
+/// The sentence Amazon EKS refuses a `fargateProfileName` the cluster already
+/// holds with.
+///
+/// Entirely fixed text with NO variable part: it names neither the profile nor the
+/// cluster, both of which the caller addressed in its own request — the register
+/// `CreateAddon`'s own conflict sentence is in, rather than the two-name form
+/// `CreateNodegroup` words its conflict with. Each create states its own sentence,
+/// so this one is never derived from a sibling create's.
+const FARGATE_PROFILE_NAME_IN_USE: &str =
+    "A Fargate Profile already exists with this name in this cluster.";
+
 /// What judging the request against the cluster it named decides.
 ///
 /// A plain enum rather than a `Result`: the refusal travels in a variant, so this
@@ -303,7 +328,6 @@ fn judge_against_cluster(
     input: &CreateFargateProfileInput,
 ) -> Verdict {
     let cluster_name = input.cluster_name.as_str();
-    let profile_name = input.fargate_profile_name.as_str();
     let Some(cluster) = state
         .clusters
         .get(&(region.to_string(), input.cluster_name.clone()))
@@ -328,10 +352,11 @@ fn judge_against_cluster(
     // profile. "Fargate profiles are immutable. However, you can create a new
     // updated profile to replace an existing profile and then delete the original"
     // (`CreateFargateProfile`): a second create under a name the cluster already
-    // holds is refused rather than replacing it. This operation models no conflict
-    // error, and what the request is wrong about is what the cluster already holds —
-    // "The request is invalid given the state of the cluster"
-    // (`InvalidRequestException`).
+    // holds is refused rather than replacing it. The name is taken by a profile that
+    // EXISTS, so the resource the request collides with is in use — the conflict
+    // every create of this service answers a taken name with
+    // ([`CreateFargateProfileErrorModeled::ResourceInUseException`], 409), in the
+    // sentence Amazon EKS states for this one ([`FARGATE_PROFILE_NAME_IN_USE`]).
     if let Some(existing) = state.fargate_profiles.get(&(
         region.to_string(),
         input.cluster_name.clone(),
@@ -351,13 +376,14 @@ fn judge_against_cluster(
                 return Verdict::Replay(existing.to_fargate_profile());
             }
         }
+        // `ResourceInUseException` models `clusterName`, `nodegroupName` and
+        // `addonName` but no `fargateProfileName`
+        // (`smithy_query query="shape" shape="ResourceInUseException"`), so the
+        // payload names the cluster the name is taken in and nothing else.
         return Verdict::Refuse(
-            CreateFargateProfileErrorModeled::InvalidRequestException(InvalidRequestException {
+            CreateFargateProfileErrorModeled::ResourceInUseException(ResourceInUseException {
                 cluster_name: Some(input.cluster_name.clone()),
-                message: Some(format!(
-                    "Fargate Profile already exists with name: {profile_name} and cluster \
-                     name: {cluster_name}"
-                )),
+                message: Some(FARGATE_PROFILE_NAME_IN_USE.to_string()),
                 ..Default::default()
             })
             .into(),
@@ -490,6 +516,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             Verdict::Create => {}
+        }
+
+        // THE POD EXECUTION ROLE AGAINST IAM, which owns it: the role "allows Fargate
+        // infrastructure to register with your cluster as a node"
+        // (`CreateFargateProfileRequest$podExecutionRoleArn`), so a role whose trust
+        // policy does not let the Fargate Pod plane assume it is a role the Pods this
+        // profile selects could never register under — the bad parameter it is, in the
+        // sentence Amazon EKS states for that trust policy
+        // ([`state::fargate_pod_execution_role_trust_refusal`]). It follows the gates
+        // above so a conflict or a connected cluster is answered without asking IAM at
+        // all, and it runs with no lock held: it is a call out to another service.
+        if let Some(why) =
+            state::fargate_pod_execution_role_trust_refusal(ctx, &region, &input.pod_execution_role_arn)
+                .await
+        {
+            return Err(invalid_parameter(cluster_name, profile_name, why));
         }
 
         // The Pods of this profile are launched into the subnets the request names, so

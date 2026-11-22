@@ -182,6 +182,50 @@ pub(crate) async fn create_container_cluster(emr: &Emr, name: &str, count: usize
     }
 }
 
+/// How long a suite waits for Amazon EKS to finish a cluster deletion it ACCEPTED: far
+/// above the span EKS owes that deletion, so the deadline is reached only when the
+/// removal is not coming at all rather than when the host is slow.
+const EKS_DELETION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Delete the container cluster `name` through Amazon EKS's own API, and wait until EKS
+/// reports it ABSENT.
+///
+/// `DeleteCluster` ACCEPTS a deletion rather than completing one: EKS keeps answering for
+/// the cluster in its `DELETING` status until the deletion finishes, so a row that is
+/// about a container cluster NO owner holds waits for that — by LOOKING AGAIN until EKS
+/// answers its own not-found, never by waiting out a span.
+///
+/// `pub(crate)` for the reason [`create_container_cluster`] is: the test binary carries
+/// ONE definition of "delete a container cluster".
+pub(crate) async fn delete_container_cluster(emr: &Emr, name: &str) {
+    eks(emr, REGION)
+        .delete_cluster()
+        .name(name)
+        .send()
+        .await
+        .expect("Amazon EKS must delete the container cluster it created");
+    let deadline = std::time::Instant::now() + EKS_DELETION_DEADLINE;
+    loop {
+        let described = eks(emr, REGION).describe_cluster().name(name).send().await;
+        if let Err(error) = &described {
+            let absent = error
+                .as_service_error()
+                .is_some_and(|service| service.is_resource_not_found_exception());
+            assert!(
+                absent,
+                "Amazon EKS must answer for the container cluster {name:?} it is deleting, \
+                 got {error:?}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Amazon EKS never finished deleting the container cluster {name:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Create one virtual cluster backed by the container cluster `container_cluster`, and
 /// return its id.
 ///
@@ -652,12 +696,7 @@ async fn the_placement_is_the_one_the_container_clusters_owner_reports() {
             container_cluster,
         )
         .await;
-        eks(&emr, REGION)
-            .delete_cluster()
-            .name(container_cluster)
-            .send()
-            .await
-            .expect("Amazon EKS must delete the container cluster it created");
+        delete_container_cluster(&emr, container_cluster).await;
         let case = format!("{label} ({container_cluster})");
         let created = create_endpoint(
             &emr,

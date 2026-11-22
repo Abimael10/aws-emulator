@@ -46,6 +46,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,7 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        let guard = store.lock();
+        let mut guard = store.lock();
+        // The removals the clock owes are materialised first: a resource whose owner
+        // left the store at a due instant is gone whether or not anybody called, so
+        // the tag plane never resolves an ARN a read of the resource would answer 404
+        // for.
+        guard.materialize_due_transitions(SystemTime::now());
         // The ARN itself names the region and the resource, so the resolution
         // addresses any resource this service minted that ARN for — in any region,
         // without the request's own credential scope

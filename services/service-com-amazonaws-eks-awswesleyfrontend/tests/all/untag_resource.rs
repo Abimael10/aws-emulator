@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use service_com_amazonaws_eks_awswesleyfrontend::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{create, delete, describe, minimal_request, REGION};
+use crate::cluster_lifecycle::{
+    create, delete, describe, describe_until_absent, minimal_request, REGION,
+};
 use crate::wire::{call, emulator, encode_label, error_code, Answer, TAG_MUTATION_STATUS};
 
 type Tags = BTreeMap<String, String>;
@@ -292,6 +294,10 @@ async fn untagging_classifies_a_resource_arn_as_the_other_tag_operations_do() {
     let deleted_arn = cluster_with_tags(&router, "untag-gone-soon", &tags(&[("env", "dev")])).await;
     let removed = delete(&router, "untag-gone-soon").await;
     assert_eq!(removed.status, 200, "setup delete: got {removed:?}");
+    // The accepted deletion runs for a window in which the cluster, and so its ARN,
+    // is still owned by it; the ARN is owned by nothing once that deletion has
+    // finished.
+    describe_until_absent(&router, "untag-gone-soon").await;
 
     // (case, the value sent as `resourceArn`, the status and error it earns)
     let cases: Vec<(&str, String, u16, &str)> = vec![

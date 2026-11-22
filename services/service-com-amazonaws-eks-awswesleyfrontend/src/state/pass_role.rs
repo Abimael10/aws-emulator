@@ -190,6 +190,37 @@ pub const POD_IDENTITY_SERVICE_PRINCIPAL: &str = "pods.eks.amazonaws.com";
 /// other role of this service asks it ([`CAPABILITY_ROLE_PRINCIPALS`]).
 pub const POD_IDENTITY_ROLE_PRINCIPALS: &[&str] = &[POD_IDENTITY_SERVICE_PRINCIPAL];
 
+/// The service principal that assumes the Pod execution role of a Fargate
+/// profile.
+///
+/// "The Pod execution role allows Fargate infrastructure to register with your
+/// cluster as a node, and it provides read access to Amazon ECR image
+/// repositories" (`CreateFargateProfileRequest$podExecutionRoleArn`): the
+/// infrastructure that registers as that node is the Fargate plane of Amazon EKS,
+/// which speaks for the Pods it runs rather than for the control plane, so it is
+/// its own service principal — the one AWS publishes for a Fargate Pod execution
+/// role's trust policy (Amazon EKS User Guide, "Fargate Pod execution role").
+pub const FARGATE_PODS_SERVICE_PRINCIPAL: &str = "eks-fargate-pods.amazonaws.com";
+
+/// The service principals a Pod execution role may let assume it — one, stated as
+/// a list so the question is asked the one way every other role of this service
+/// asks it ([`POD_IDENTITY_ROLE_PRINCIPALS`]).
+pub const FARGATE_POD_EXECUTION_ROLE_PRINCIPALS: &[&str] = &[FARGATE_PODS_SERVICE_PRINCIPAL];
+
+/// The refusal a `podExecutionRoleArn` whose trust policy does not let the
+/// Fargate Pod plane assume it earns.
+///
+/// Fixed text with no variable part beyond the principal the rule is about, which
+/// is named from [`FARGATE_PODS_SERVICE_PRINCIPAL`] rather than written out twice:
+/// the sentence states the misconfiguration and the principal to add, and echoes
+/// nothing of the request.
+pub fn fargate_pod_execution_role_trust_refusal_message() -> String {
+    format!(
+        "Misconfigured PodExecutionRole Trust Policy; Please add the \
+         {FARGATE_PODS_SERVICE_PRINCIPAL} Service Principal"
+    )
+}
+
 /// The refusal a pod-identity `roleArn` whose trust policy does not let the EKS
 /// Pod Identity principal assume it earns.
 ///

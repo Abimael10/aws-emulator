@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The wire plumbing (one shared engine behind the production router, label
 // encoding, the reduced `Answer`) is shared with every other suite in this
 // crate — see `tests/all/wire.rs`.
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, encode_label, read_until, Answer};
 
 pub(crate) const REGION: &str = "us-west-2";
 const OTHER_REGION: &str = "eu-west-1";
@@ -1213,6 +1213,17 @@ async fn delete_removes_the_association_and_the_cluster_takes_its_children() {
         "the cluster must delete, got {:?} {:?}",
         cluster_deleted.status, cluster_deleted.body
     );
+    // The accepted deletion runs for a window in which the cluster still holds its
+    // name, so the name is created again once the deletion has FINISHED — waited for
+    // by looking again ([`crate::wire::read_until`]).
+    let cluster_uri = format!("/clusters/{}", encode_label(CLUSTER));
+    read_until(
+        "re-creating the cluster",
+        "the deleted cluster became absent",
+        || call(&router, REGION, "GET", &cluster_uri, ""),
+        |read| read.status == 404,
+    )
+    .await;
     let recreated = create_cluster(&router, REGION, CLUSTER).await;
     assert_eq!(
         recreated.status, 200,

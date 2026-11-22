@@ -22,7 +22,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The harness every suite in this test binary shares, declared once in
 // `tests/all/wire.rs`: the router under test, one request, and the answer reduced
 // to what a client branches on.
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, encode_label, read_until, Answer};
 
 const REGION: &str = "us-west-2";
 
@@ -748,7 +748,28 @@ async fn deleting_a_cluster_removes_the_capabilities_it_held() {
             "case {case:?}: setup DeleteCluster, got {deleted:?}"
         );
 
-        let gone = list_capabilities(&router, case, "").await;
+        // The accepted deletion gave the capabilities up: the cluster is still there,
+        // reporting `DELETING`, and it holds none of them.
+        let emptied = list_capabilities(&router, case, "").await;
+        assert_eq!(
+            emptied.status, 200,
+            "case {case:?}: a cluster being deleted is still listable, got {emptied:?}"
+        );
+        assert_eq!(
+            listed_names(&emptied),
+            Vec::<String>::new(),
+            "case {case:?}: the accepted delete gave up the capabilities, got {emptied:?}"
+        );
+
+        // And once the deletion has finished there is no cluster to list at all —
+        // waited for by looking again ([`crate::wire::read_until`]).
+        let gone = read_until(
+            case,
+            "the deleted cluster became absent",
+            || list_capabilities(&router, case, ""),
+            |listed| listed.status == 404,
+        )
+        .await;
         assert_eq!(
             gone.status, 404,
             "case {case:?}: a cluster that was deleted has nothing to list, got {gone:?}"

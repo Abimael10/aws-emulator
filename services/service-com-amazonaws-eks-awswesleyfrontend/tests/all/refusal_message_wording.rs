@@ -39,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::addon_versions::{
     addons, describe_addon_configuration, describe_addon_versions, string_member, versions_of,
 };
-use crate::cluster_lifecycle::{create, delete, minimal_request, REGION};
+use crate::cluster_lifecycle::{create, delete, describe_until_absent, minimal_request, REGION};
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
 /// The three tag operations, each driven at one `resourceArn`.
@@ -95,6 +95,10 @@ async fn every_tag_operation_states_an_unresolved_resource_in_the_same_fixed_sen
         .to_owned();
     let removed = delete(&router, "wording-gone-soon").await;
     assert_eq!(removed.status, 200, "setup delete: got {removed:?}");
+    // The accepted deletion runs for a window in which the cluster, and so its ARN,
+    // is still there: this row is about an ARN owned by NOTHING, so it is read once
+    // that deletion has finished.
+    describe_until_absent(&router, "wording-gone-soon").await;
 
     let rows: Vec<(&str, String)> = vec![
         ("the ARN of a deleted cluster", gone_arn),

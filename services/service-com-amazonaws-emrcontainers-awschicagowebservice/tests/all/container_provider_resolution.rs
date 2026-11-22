@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
-use crate::managed_endpoint_connection::{create_container_cluster, eks};
+use crate::managed_endpoint_connection::{create_container_cluster, delete_container_cluster};
 use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr, REGION};
 
 /// A Region whose endpoint holds its own clusters: a container cluster created in [`REGION`]
@@ -260,12 +260,10 @@ async fn a_container_provider_deleted_by_its_owner_registers_nothing() {
     let answer = register(&emr, REGION, "transient-before", "tok-transient-before", container_cluster).await;
     let before = text(answer.ok(case), "/id", case);
 
-    eks(&emr, REGION)
-        .delete_cluster()
-        .name(container_cluster)
-        .send()
-        .await
-        .expect("Amazon EKS must delete the container cluster it created");
+    // `DeleteCluster` ACCEPTS the deletion: the owner keeps answering for the cluster in
+    // its `DELETING` status until the deletion finishes, so the row below — which is
+    // about a container cluster the owner holds NOTHING for — waits for that.
+    delete_container_cluster(&emr, container_cluster).await;
 
     let case = "once Amazon EKS has deleted the container cluster";
     let answer = register(&emr, REGION, "transient-after", "tok-transient-after", container_cluster).await;

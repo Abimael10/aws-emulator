@@ -23,7 +23,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{create, minimal_request, REGION};
+use crate::cluster_lifecycle::{create, describe_until_absent, minimal_request, REGION};
 use crate::wire::{call, emulator, encode_label, Answer};
 
 pub(crate) async fn associate_in(
@@ -281,8 +281,10 @@ async fn a_type_the_configuration_was_not_created_with_is_the_same_not_found() {
     }
 }
 
-/// A configuration lives on its cluster, so deleting the cluster takes it with it —
-/// and the describe that followed the resource is then the same not-found answer.
+/// A configuration lives on its cluster, so the cluster leaving the store takes it
+/// with it — and the describe that followed the resource is then the same not-found
+/// answer. The record stays for the window the accepted deletion runs for, so the
+/// configuration is gone once the cluster is.
 #[tokio::test]
 async fn a_configuration_is_not_found_once_its_cluster_is_deleted() {
     let router = emulator();
@@ -313,6 +315,7 @@ async fn a_configuration_is_not_found_once_its_cluster_is_deleted() {
             deleted.status, 200,
             "case {case:?}: deleting the cluster must succeed, got {deleted:?}"
         );
+        describe_until_absent(&router, case).await;
 
         let answer = describe_config_in(&router, REGION, case, "attached").await;
         assert_not_found(case, &answer, &[case, "attached"]);

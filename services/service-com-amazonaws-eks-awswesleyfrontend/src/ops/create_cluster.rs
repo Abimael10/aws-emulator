@@ -953,7 +953,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if guard.clusters.contains_key(&key) {
                 // A NAME is what identifies a cluster, so a second create of a
                 // name this Region already holds is a conflict — whatever
-                // `clientRequestToken` it carries. The token is
+                // `clientRequestToken` it carries, and including a name still held
+                // by a cluster whose deletion has been accepted but not yet
+                // finished, which is a cluster this Region holds until it is
+                // removed. The token is
                 // `@idempotencyToken` ("A unique, case-sensitive identifier that
                 // you provide to ensure the idempotency of the request"), which is
                 // what keeps a retried call from creating a SECOND cluster; it
@@ -1014,10 +1017,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What this cluster's control plane exports to CloudWatch Logs, read off the
             // record while the lock is held; the export itself runs below, with none.
             let log_export = state::ControlPlaneLogExport::of(&record, input.logging.as_ref());
-            // The name now holds a cluster again, so no deletion is in flight for it:
-            // an earlier delete of a cluster of this name concerned the record that is
-            // gone, and the next `DeleteCluster` is about THIS one.
-            guard.cluster_deletions.remove(&key);
             guard.arn_index.insert(arn, key.clone());
             guard.clusters.insert(key.clone(), record);
             (cluster, log_export)

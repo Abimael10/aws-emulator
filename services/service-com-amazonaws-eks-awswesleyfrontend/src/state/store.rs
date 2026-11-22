@@ -126,16 +126,17 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// collide.
     pub minted_updates: u64,
     /// The cluster deletions that are IN FLIGHT, by the deleted cluster's
-    /// `(region, name)` key, each with the instant it stops being treated as one.
+    /// `(region, name)` key, each with the instant the clock owes that cluster its
+    /// removal from the store.
     ///
-    /// A cluster whose delete has been accepted is being deleted while that call is
-    /// still releasing what the cluster owned: a `DeleteCluster` that arrives in
-    /// that window is refused as a resource in use rather than answered as a
-    /// cluster that was never there. The call that started it is what clears the
-    /// entry ([`Self::finish_cluster_deletion`]); the instant stored with it is the
-    /// failsafe [`CLUSTER_DELETION_DELAY`] bounds, so a call that never reports
-    /// back leaves nothing behind for ever and this map holds at most the
-    /// deletions of that window.
+    /// A cluster whose delete has been accepted stays in [`Self::clusters`]
+    /// reporting `DELETING` for that whole window — a reader that polls
+    /// `DescribeCluster` through a teardown sees the status the delete reported,
+    /// and a `DeleteCluster` that arrives in the window is refused as a resource in
+    /// use rather than answered as a cluster that was never there. The clock is
+    /// what ends it ([`Self::finish_due_cluster_deletions`]), so this map holds at
+    /// most the deletions of the last [`CLUSTER_DELETION_DELAY`] and the record it
+    /// names leaves the store at the same instant for every caller.
     pub cluster_deletions: BTreeMap<(String, String), SystemTime>,
     /// The Kubernetes API plane of each cluster, by that cluster's
     /// `(region, name)` key: the objects its API server holds, the address it is
@@ -204,10 +205,13 @@ impl ComAmazonawsEksAwswesleyfrontendState {
 
     /// Materialise every clock-owed status move across the store.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
-        // A cluster deletion nothing reported back for is no longer treated as in
-        // flight once its failsafe instant has passed: the name it held is free
-        // again, and that was true at that instant whether or not anybody called.
-        self.cluster_deletions.retain(|_, due| now < *due);
+        // A cluster whose accepted deletion the clock has finished is no longer a
+        // cluster of the account: it leaves the store with the ARN index entry and
+        // the Kubernetes API plane that named it. It goes first — the record is
+        // gone, so nothing below has to reason about one that is on its way out —
+        // and the removal was due at the stored instant whether or not anybody
+        // called.
+        self.finish_due_cluster_deletions(now);
         // An add-on whose removal the clock has finished is no longer an add-on of
         // its cluster. It goes first: the record is gone, so nothing below has to
         // reason about one that is on its way out, and the removal was due at that
@@ -1693,36 +1697,54 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         None
     }
 
-    /// Record that the deletion of the cluster `key` names is in flight until the
-    /// call that started it reports back, or until `failsafe` at the latest, which
-    /// is what makes a `DeleteCluster` arriving in the meantime find a deletion
-    /// rather than an absent cluster.
+    /// Record that the deletion of the cluster `key` names has been ACCEPTED and is
+    /// in flight until `due`, the instant the clock owes the cluster its removal
+    /// from the store.
     ///
-    /// Entries whose failsafe instant has already passed at `now` are dropped here
-    /// as well as in [`Self::materialize_due_transitions`] — the same test
-    /// [`Self::cluster_deletion_in_flight`] applies, so a deletion of ANOTHER
-    /// cluster that is still genuinely in flight is left alone — which bounds the
-    /// map at the deletions of the last [`CLUSTER_DELETION_DELAY`] however many
-    /// clusters are deleted.
-    pub fn start_cluster_deletion(
-        &mut self,
-        key: (String, String),
-        now: SystemTime,
-        failsafe: SystemTime,
-    ) {
-        self.cluster_deletions.retain(|_, at| now < *at);
-        self.cluster_deletions.insert(key, failsafe);
+    /// The cluster record STAYS, reporting `DELETING`, for that whole window: "the
+    /// cluster REMAINS describable for the deletion" is what every waiter that
+    /// polls `DescribeCluster` until it 404s reads, so the status the accepted
+    /// delete reported is observable to any later reader until the deletion
+    /// finishes ([`Self::finish_due_cluster_deletions`]). A `DeleteCluster` that
+    /// arrives in the window finds a cluster that is being deleted rather than one
+    /// that was never there.
+    ///
+    /// Entries whose instant has already passed at `now` are finished here as well
+    /// as in [`Self::materialize_due_transitions`], which bounds the map at the
+    /// deletions of the last [`CLUSTER_DELETION_DELAY`] however many clusters are
+    /// deleted.
+    pub fn start_cluster_deletion(&mut self, key: (String, String), now: SystemTime, due: SystemTime) {
+        self.finish_due_cluster_deletions(now);
+        self.cluster_deletions.insert(key, due);
     }
 
-    /// Record that the deletion of the cluster `key` names has FINISHED: everything
-    /// the cluster owned is released, so the cluster is now absent rather than
-    /// being deleted and the next `DeleteCluster` for that name is a not-found.
-    pub fn finish_cluster_deletion(&mut self, key: &(String, String)) {
-        self.cluster_deletions.remove(key);
+    /// Remove every cluster whose accepted deletion the clock has finished at
+    /// `now`, with the ARN index entry and the Kubernetes API plane that named it.
+    ///
+    /// This is the ONE place a deleted cluster leaves the store: the deletion was
+    /// owed its completion at the instant [`Self::start_cluster_deletion`] stored
+    /// whether or not anybody called, so two callers see the name become absent at
+    /// the same instant. Dropping the plane closes the port that cluster's
+    /// Kubernetes API was published at.
+    pub fn finish_due_cluster_deletions(&mut self, now: SystemTime) {
+        let finished: Vec<(String, String)> = self
+            .cluster_deletions
+            .iter()
+            .filter(|(_, due)| now >= **due)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            self.cluster_deletions.remove(&key);
+            if let Some(record) = self.clusters.remove(&key) {
+                self.arn_index.remove(&record.arn);
+            }
+            self.kubernetes_api.remove(&key);
+        }
     }
 
     /// Whether the deletion of the cluster `key` names is still in flight at
-    /// `now`.
+    /// `now` — the window in which the cluster reports `DELETING` and a second
+    /// `DeleteCluster` for it is a conflict rather than a not-found.
     pub fn cluster_deletion_in_flight(&self, key: &(String, String), now: SystemTime) -> bool {
         self.cluster_deletions
             .get(key)

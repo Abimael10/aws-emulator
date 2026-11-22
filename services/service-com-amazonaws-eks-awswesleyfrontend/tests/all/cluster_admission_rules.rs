@@ -37,7 +37,6 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     cluster_not_found_message, ComAmazonawsEksAwswesleyfrontendState, SupportStatus,
     ACCESS_ENTRY_TYPES, ACCESS_ENTRY_TYPE_STANDARD, CLUSTER_ACTIVATION_DELAY,
-    CLUSTER_DELETION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1134,21 +1133,28 @@ async fn a_cluster_is_deleted_only_once_nothing_is_attached_to_it() {
 }
 
 /// The losing side of two `DeleteCluster` calls that OVERLAP is told the cluster is
-/// IN USE — it is being deleted — while a call that arrives after the first one has
-/// finished its work is told the cluster is not there at all.
+/// IN USE — it is being deleted — while a call that arrives after the deletion has
+/// FINISHED is told the cluster is not there at all.
 ///
-/// The overlap cannot be produced in process: a handler that has nothing to await
-/// runs to completion before the next request is polled, so the in-flight window is
-/// staged on the store the handler reads — the same seam the suites that need a
-/// precondition no implemented call writes use — and the sequential case is driven
-/// end to end.
+/// An accepted deletion runs for a window of its own, so the overlap is driven end
+/// to end: the second call is sent while the first deletion is
+/// still in flight, and the not-found case is read once the name has become absent —
+/// waited for by LOOKING AGAIN rather than for a span ([`crate::wire::read_until`]).
 #[tokio::test]
 async fn a_delete_that_overlaps_an_accepted_deletion_is_a_conflict() {
-    let (router, engine) = emulator_with_engine();
+    let router = emulator();
     let cluster = "race-overlap";
     let created = create_cluster(&router, &minimal_request(cluster)).await;
     assert_eq!(created.status, 200, "setup: {created:?}");
-    tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    // The cluster's own clock-owed move is waited for by LOOKING AGAIN, never by
+    // waiting out its span ([`crate::wire::read_until`]).
+    read_until(
+        "the overlapping delete",
+        "the cluster reported ACTIVE",
+        || describe_cluster(&router, cluster),
+        |read| read.body["cluster"]["status"] == serde_json::json!("ACTIVE"),
+    )
+    .await;
 
     let first = delete_cluster(&router, cluster).await;
     assert_eq!(
@@ -1161,35 +1167,8 @@ async fn a_delete_that_overlaps_an_accepted_deletion_is_a_conflict() {
         "the accepted delete reports DELETING, got {first:?}"
     );
 
-    // That call has finished its work, so the cluster is ABSENT: a delete that
-    // arrives now is a not-found, which is what a caller re-sending the delete of a
-    // cluster it has already deleted is told.
-    let resent = delete_cluster(&router, cluster).await;
-    assert_eq!(
-        resent.status, 404,
-        "a delete of a cluster whose deletion has finished is a not-found, got {resent:?}"
-    );
-    assert_eq!(
-        error_code(&resent),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException, got {resent:?}"
-    );
-    assert_eq!(
-        message_of(&resent),
-        cluster_not_found_message(cluster),
-        "expected the missing-cluster sentence, got {:?}",
-        message_of(&resent)
-    );
-
-    // And while a deletion IS in flight — the window a second, overlapping call
-    // arrives in — the cluster is reported in use rather than absent.
-    let key = (REGION.to_string(), cluster.to_string());
-    {
-        let store = engine.state::<ComAmazonawsEksAwswesleyfrontendState>();
-        let mut guard = store.lock();
-        let now = SystemTime::now();
-        guard.start_cluster_deletion(key.clone(), now, now + CLUSTER_DELETION_DELAY);
-    }
+    // That deletion is in flight — the window a second, overlapping call arrives in —
+    // so the cluster is reported in use rather than absent.
     let loser = delete_cluster(&router, cluster).await;
     assert_eq!(
         loser.status, 409,
@@ -1207,20 +1186,30 @@ async fn a_delete_that_overlaps_an_accepted_deletion_is_a_conflict() {
         message_of(&loser)
     );
 
-    // Once that deletion reports back, the cluster is absent again.
-    {
-        let store = engine.state::<ComAmazonawsEksAwswesleyfrontendState>();
-        let mut guard = store.lock();
-        guard.finish_cluster_deletion(&key);
-    }
+    // Once the deletion has finished, the name holds nothing: a delete of it is a
+    // not-found, which is what a caller re-sending the delete of a cluster it has
+    // already deleted is told.
+    read_until(
+        "the deletion finished",
+        "the cluster became absent",
+        || describe_cluster(&router, cluster),
+        |read| read.status == 404,
+    )
+    .await;
     let after = delete_cluster(&router, cluster).await;
     assert_eq!(
         after.status, 404,
-        "expected HTTP 404 once the deletion reported back, got {after:?}"
+        "a delete of a cluster whose deletion has finished is a not-found, got {after:?}"
     );
     assert_eq!(
         error_code(&after),
         "ResourceNotFoundException",
         "expected ResourceNotFoundException, got {after:?}"
+    );
+    assert_eq!(
+        message_of(&after),
+        cluster_not_found_message(cluster),
+        "expected the missing-cluster sentence, got {:?}",
+        message_of(&after)
     );
 }

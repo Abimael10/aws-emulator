@@ -31,7 +31,9 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{create, delete, minimal_request as cluster_request, REGION};
+use crate::cluster_lifecycle::{
+    create, delete, describe_until_absent, minimal_request as cluster_request, REGION,
+};
 use crate::nodegroup_lifecycle::{create_cluster, create_nodegroup_in, minimal_request};
 use crate::wire::{call, emulator, encode_label, Answer, TAG_MUTATION_STATUS};
 
@@ -308,6 +310,10 @@ async fn a_well_formed_eks_arn_is_resolved_and_only_then_reported_missing() {
         .to_owned();
     let removed = delete(&router, "class-gone").await;
     assert_eq!(removed.status, 200, "setup delete: got {removed:?}");
+    // An accepted deletion runs for a window in which the cluster, and so its ARN,
+    // is still there: the row below is about an ARN the store owns NOTHING for, so it
+    // is read once that deletion has finished.
+    describe_until_absent(&router, "class-gone").await;
 
     // (case, ARN, whether the store OWNS the resource that ARN names) — every row is
     // a WELL-FORMED resource ARN of this service, so none of them is a bad request:

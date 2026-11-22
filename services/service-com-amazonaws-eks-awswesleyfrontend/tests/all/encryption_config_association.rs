@@ -186,6 +186,27 @@ async fn settle_update() {
     tokio::time::sleep(UPDATE_COMPLETION_DELAY + Duration::from_millis(250)).await;
 }
 
+/// Read the cluster `name` until it answers 404: the instant its accepted deletion
+/// has FINISHED and the name holds nothing.
+///
+/// The condition is waited for by LOOKING AGAIN rather than by waiting out a span,
+/// under a deadline generous enough that what is asserted is the state the calls
+/// reach and never how fast the host gets there.
+async fn settle_deletion(router: &MultiServiceRouter, name: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let read = describe(router, name).await;
+        if read.status == 404 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deletion of {name:?} never finished, last read {read:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// `true` when `id` has the shape of a version-4 UUID, which is what `Update$id` is
 /// documented to be ("a UUID that is used to track the update").
 fn is_uuid_v4(id: &str) -> bool {
@@ -502,6 +523,10 @@ async fn an_association_against_a_cluster_this_region_does_not_hold_is_not_found
         removed.status, 200,
         "the deletable fixture must be deleted, got {removed:?}"
     );
+    // An accepted deletion runs for a window in which the cluster is still there,
+    // reporting `DELETING`; the rows below are about a cluster this Region does NOT
+    // hold, so they are read once that deletion has finished.
+    settle_deletion(&router, "deleted-one").await;
 
     let valid = association_of(serde_json::json!([{
         "resources": ["secrets"],

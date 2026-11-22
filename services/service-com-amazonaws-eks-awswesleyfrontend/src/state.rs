@@ -369,17 +369,18 @@ pub const UPDATE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 /// instant is stored on the record; nothing sleeps for it.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// The longest a cluster deletion is treated as IN FLIGHT when the call that
-/// started it never reports back.
+/// How long an accepted cluster deletion runs for: the window in which the
+/// cluster reports `DELETING` and remains describable, after which the clock
+/// removes it from the store.
 ///
-/// A deletion is in flight while the call that accepted it is still releasing the
-/// resources the cluster owned — a window another `DeleteCluster` for the same
-/// cluster observes, which is why that other call is told the cluster is in use
-/// rather than absent. The handler clears the deletion when that work is done
-/// ([`ComAmazonawsEksAwswesleyfrontendState::finish_cluster_deletion`]), so this
-/// span bounds only the case where it never got the chance: it is a FAILSAFE, so
-/// no deletion is remembered for ever, and the store holds at most the deletions
-/// of this window. Nothing sleeps for it.
+/// "The cluster stays in the `DELETING` status until the deletion completes", so a
+/// delete is accepted and the cluster is torn down afterwards: every waiter polls
+/// `DescribeCluster` until the name answers 404, which requires the deleting
+/// cluster to be readable until then. A span CHOSEN rather than cited — AWS takes
+/// minutes — and the one every other owed transition of this service uses, so a
+/// caller acting straight after the delete still observes `DELETING` and the state
+/// answers that go with it ([`ComAmazonawsEksAwswesleyfrontendState::finish_due_cluster_deletions`]
+/// is what ends it). Nothing sleeps for it.
 pub const CLUSTER_DELETION_DELAY: Duration = Duration::from_secs(3);
 
 /// The `CapabilityStatus` members this slice uses. The model's enum

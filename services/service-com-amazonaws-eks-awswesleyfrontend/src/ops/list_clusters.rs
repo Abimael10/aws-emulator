@@ -79,6 +79,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{self, DEFAULT_LIST_PAGE_SIZE, LIST_INCLUDE_ALL};
+use std::time::SystemTime;
 
 /// The sentence an `include` token set this listing cannot project is refused with.
 ///
@@ -235,7 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_LIST_PAGE_SIZE))
             .unwrap_or(DEFAULT_LIST_PAGE_SIZE as usize);
 
-        let guard = store.lock();
+        let mut guard = store.lock();
+        // The removals the clock owes are materialised before anything is listed: a
+        // cluster whose accepted deletion has finished left the store at that instant
+        // whether or not anybody called, so a listing never names a cluster a read of
+        // the same name would answer 404 for.
+        guard.materialize_due_transitions(SystemTime::now());
         // Clusters are listed per REGION: a name identifies a cluster only within the
         // region its ARN names, so this walks only the region the request is signed
         // for, under the projection `include` asked for.

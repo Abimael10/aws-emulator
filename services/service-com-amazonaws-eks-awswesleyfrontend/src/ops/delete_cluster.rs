@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! IMPLEMENTED. Removes the cluster — and its ARN index entry — from the store and
-//! answers with the record it removed, reporting `DELETING`. A second `DeleteCluster`,
-//! or any later `DescribeCluster`, for that name is then a `ResourceNotFoundException`,
-//! and `ListClusters` no longer lists it. Its EKS Pod Identity associations, which
-//! are children of the cluster, are removed with it.
+//! IMPLEMENTED. Accepts the deletion of a cluster, reports `DELETING`, and leaves
+//! the record in the store in that status until the clock finishes the deletion
+//! ([`crate::state::CLUSTER_DELETION_DELAY`]): a `DescribeCluster` or
+//! `ListClusters` in that window reads the cluster as `DELETING` with the ARN it
+//! always had — which is what every waiter that polls a teardown until the name
+//! 404s needs — and only once the deletion has finished does the name answer
+//! `ResourceNotFoundException`. A second `DeleteCluster` inside the window is a
+//! `ResourceInUseException`: the cluster is being deleted, not absent.
+//!
+//! What the cluster OWNS is given up when the delete is accepted: its EKS Pod
+//! Identity associations, add-ons, capabilities, node groups and Fargate profiles,
+//! and the Kubernetes API plane that served it — which closes the port that cluster
+//! was published at. What lives ON the record (access entries, identity provider
+//! configurations, certificate authorities, updates) goes with the record when the
+//! clock removes it, so the cluster still reports the authority signing for it.
 //!
 //! The security group `CreateCluster` provisioned for the cluster in EC2 is released
 //! with it ([`crate::state::release_cluster_security_group`]): that group exists only
-//! for this cluster, so nothing holds it once the cluster is gone.
+//! for this cluster, so nothing holds it once the cluster is being deleted.
 //!
 //! A cluster created with `deletionProtection` is refused with
 //! `InvalidRequestException` and left in the store: "the cluster cannot be deleted
@@ -20,14 +30,14 @@
 //! managed node groups or Fargate profiles attached to the cluster, you must delete
 //! them first" ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::attached_compute_refusal`]).
 //!
-//! The deletion this call accepts is IN FLIGHT until it has released what the
-//! cluster owned, so a `DeleteCluster` that arrives while that work is still
-//! running — the losing side of two racing calls — is refused with
-//! `ResourceInUseException`: the cluster is being deleted, not absent. Once that
-//! work is done the name answers `ResourceNotFoundException` again.
+//! The deletion this call accepts is IN FLIGHT until the clock finishes it, so a
+//! `DeleteCluster` that arrives in that window — the losing side of two racing
+//! calls, or a caller re-sending its own delete — is refused with
+//! `ResourceInUseException`: the cluster is being deleted, not absent. Once the
+//! deletion has finished the name answers `ResourceNotFoundException` again.
 //!
 //! A capability exists only inside a cluster — its key and its ARN both name one — so the
-//! cluster leaving the store takes its capabilities with it. Without that, a later cluster
+//! accepted deletion takes the cluster's capabilities with it. Without that, a later cluster
 //! created with the same name in the same region would inherit the deleted cluster's
 //! capabilities.
 //!
@@ -176,33 +186,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one in the region the request is signed for.
         let key = (region, input.name.clone());
 
-        // The cluster leaves this service's state under ONE lock; the group it owned in
-        // EC2 is released after that lock is given up, because releasing it is a call
-        // out to another service.
+        // The cluster is marked as deleting and gives up what it owned under ONE
+        // lock; the group it owned in EC2 is released after that lock is given up,
+        // because releasing it is a call out to another service.
         let (cluster, owned_group, released_capacity) = {
             let mut guard = store.lock();
             let now = SystemTime::now();
             guard.materialize_due_transitions(now);
 
             let Some(existing) = guard.clusters.get(&key) else {
-                // A cluster whose deletion is still RUNNING is not absent: it is
-                // being deleted, and a call that arrives while that work is in
-                // flight — the losing side of two racing ones — is told the
-                // resource is in use. Once the call that started it has released
-                // what the cluster owned, the cluster is absent and this is a
-                // not-found again.
-                if guard.cluster_deletion_in_flight(&key, now) {
-                    return Err(DeleteClusterErrorModeled::ResourceInUseException(
-                        ResourceInUseException {
-                            cluster_name: Some(input.name.clone()),
-                            message: Some(crate::state::cluster_being_deleted(&input.name)),
-                            ..Default::default()
-                        },
-                    )
-                    .into());
-                }
+                // Nothing of that name is left: a cluster whose deletion the clock
+                // has finished is absent, and so is one that was never there.
                 return Err(not_found());
             };
+            // A cluster whose deletion has already been ACCEPTED is not absent and
+            // is not deletable again: it is being deleted, so a second call — the
+            // losing side of two racing ones, or a caller re-sending the delete —
+            // is told the resource is in use. Once the clock has finished that
+            // deletion the name answers not-found again.
+            if guard.cluster_deletion_in_flight(&key, now) {
+                return Err(DeleteClusterErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        cluster_name: Some(input.name.clone()),
+                        message: Some(crate::state::cluster_being_deleted(&input.name)),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
             if existing.deletion_protection {
                 return Err(DeleteClusterErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -230,13 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let Some(mut record) = guard.clusters.remove(&key) else {
-                return Err(not_found());
-            };
-            guard.arn_index.remove(&record.arn);
-            // The deletion this call accepted is in flight from here until it has
-            // released what the cluster owned, which is what a `DeleteCluster`
-            // arriving in the meantime finds.
+            // The deletion this call accepted is in flight from here until the
+            // clock removes the record, which is what a reader of the cluster and a
+            // `DeleteCluster` arriving in the meantime find.
             guard.start_cluster_deletion(
                 key.clone(),
                 now,
@@ -264,10 +271,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the objects its API server held are gone with the cluster that held
             // them.
             guard.kubernetes_api.remove(&key);
+
+            let Some(record) = guard.clusters.get_mut(&key) else {
+                return Err(not_found());
+            };
             record.status = STATUS_DELETING.to_string();
-            // The cluster is gone, so the `CREATING` -> `ACTIVE` move the clock owed it is
-            // no longer owed to anybody.
+            // The cluster is on its way out, so the `CREATING` -> `ACTIVE` move the
+            // clock owed it is no longer owed to anybody.
             record.active_at = None;
+            // What lives ON the record — the access entries, identity provider
+            // configurations, certificate authorities, update history and insights
+            // refresh — stays with it for the deletion window and goes when the
+            // record does: the cluster still reports the authority that signs for
+            // it, and a cluster later created under the same name inherits none of
+            // them because the record that held them is removed.
 
             // The security group the create provisioned for this cluster in EC2 goes
             // with it: that group exists only for this cluster, so nothing holds it once
@@ -279,11 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (record.to_deleted_cluster(), owned_group, released_capacity)
         };
 
-        // The cluster has already left this service's state, so the answer does not
-        // depend on what EC2 says about the group. Releasing it is the last of the
-        // work this deletion carries, which is why the deletion stops being in
-        // flight only after it: until then another `DeleteCluster` for this cluster
-        // finds a deletion running rather than nothing.
+        // The cluster is already reporting `DELETING`, so the answer does not depend
+        // on what EC2 says about the group. Releasing it is the last of the work this
+        // deletion carries; the RECORD is removed by the clock
+        // ([`crate::state::CLUSTER_DELETION_DELAY`]), so until then a reader of the
+        // cluster finds it being deleted rather than nothing.
         if let Some(group_id) = owned_group {
             crate::state::release_cluster_security_group(ctx, &key.0, &group_id).await;
         }
@@ -300,7 +317,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(plane) = crate::state::pod_identity_plane::auth_plane(&*self.engine) {
             crate::state::pod_identity_plane::forget_cluster(&plane, &key.1);
         }
-        store.lock().finish_cluster_deletion(&key);
 
         Ok(DeleteClusterOutput {
             cluster: Some(cluster),

@@ -56,6 +56,12 @@ fn pod_execution_role() -> String {
     )
 }
 
+/// The sentence `CreateFargateProfile` refuses a `fargateProfileName` the cluster
+/// already holds with: fixed text with NO variable part — it names neither the
+/// profile nor the cluster, both of which are the caller's own request members.
+pub(crate) const PROFILE_NAME_IN_USE: &str =
+    "A Fargate Profile already exists with this name in this cluster.";
+
 /// The `fargateProfile` document an answer carries.
 fn profile(answer: &Answer) -> &serde_json::Value {
     &answer.body["fargateProfile"]
@@ -622,16 +628,19 @@ async fn a_profile_name_is_unique_within_its_cluster() {
         "the first create must be served, got {created:?}"
     );
 
-    // The same name in the same cluster: refused, and the stored profile is untouched.
+    // The same name in the same cluster: refused as the conflict it is, and the
+    // stored profile is untouched. The sentence is this operation's own fixed text,
+    // which names neither the profile nor the cluster.
     let conflict = create_profile(&router, first, &minimal_request(name)).await;
     assert_eq!(
         (conflict.status, error_code(&conflict).as_str()),
-        (400, "InvalidRequestException"),
+        (409, "ResourceInUseException"),
         "a second create under a name the cluster holds is refused, got {conflict:?}"
     );
-    assert!(
-        conflict.message().contains(name) && conflict.message().contains(first),
-        "the refusal must name the profile and the cluster, got {:?}",
+    assert_eq!(
+        conflict.message(),
+        PROFILE_NAME_IN_USE,
+        "the refusal must state the taken-name sentence, got {:?}",
         conflict.message()
     );
 
@@ -694,7 +703,7 @@ async fn a_profile_name_is_unique_within_its_cluster() {
     let conflict = create_profile(&router, first, &other_token).await;
     assert_eq!(
         (conflict.status, error_code(&conflict).as_str()),
-        (400, "InvalidRequestException"),
+        (409, "ResourceInUseException"),
         "a different token under a name the cluster holds still conflicts, got {conflict:?}"
     );
 }
@@ -790,6 +799,17 @@ async fn profiles_are_bounded_per_cluster_and_go_with_the_cluster() {
         "setup: the cluster must delete once nothing is attached, got {deleted:?} ({})",
         deleted.message()
     );
+    // The accepted deletion runs for a window in which the cluster still holds its
+    // name, so the name is created again once the deletion has FINISHED — waited for
+    // by looking again ([`crate::wire::read_until`]).
+    let cluster_uri = format!("/clusters/{}", encode_label(cluster));
+    read_until(
+        "the cluster is created again",
+        "the deleted cluster became absent",
+        || call(&router, REGION, "GET", &cluster_uri, ""),
+        |read| read.status == 404,
+    )
+    .await;
     create_cluster_in(&router, REGION, cluster).await;
     let read = describe_profile(&router, cluster, "fp-0").await;
     assert_eq!(
