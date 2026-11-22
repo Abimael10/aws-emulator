@@ -63,6 +63,7 @@ const KEY: &str = "orders/one.txt";
 const MUST_REACH: &[&str] = &[
     "apigateway",
     "apigatewaymanagementapi",
+    "cloudwatch",
     "cognito-idp",
     "dynamodb",
     "events",
