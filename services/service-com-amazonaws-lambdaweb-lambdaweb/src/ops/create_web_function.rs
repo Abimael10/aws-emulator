@@ -10,7 +10,9 @@
 //! slice of this service's state alongside the function, so the endpoint readers of
 //! the same service report it. A configuration that breaks one of the rules the
 //! model cannot express (the `endpointName` naming rule, the `regions` rule) is
-//! refused as a `ValidationException` before anything is stored.
+//! refused as a `ValidationException` before anything is stored — as is a
+//! `revisionConfig.kmsKeyArn` naming a key KMS would not encrypt the initial revision
+//! under (see [`crate::state::revision_key`]).
 //!
 //! ## Shape of an operation
 //!
@@ -333,6 +335,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let package = resolved
             .as_ref()
             .and_then(crate::state::code_package::CodePackage::package);
+
+        // Whether the key the initial revision would be encrypted under is one KMS would
+        // still encrypt with — the same pre-flight `CreateWebFunctionRevision` runs, because
+        // this is the other entry point that takes a revision's `kmsKeyArn`. Asked with no
+        // store guard held, and BEFORE the endpoint's address is opened below, so a refused
+        // create neither stores a function nor binds a port.
+        let key_refusal = crate::state::revision_key::refusal(
+            ctx,
+            &region,
+            input
+                .revision_config
+                .as_ref()
+                .and_then(|config| config.kms_key_arn.as_deref()),
+        )
+        .await;
+        if let Some(message) = key_refusal {
+            return Err(
+                CreateWebFunctionErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // The ADDRESS the initial endpoint is published on, opened before anything is
         // stored: the endpoint reports it as its `domainName`, and this emulator answers

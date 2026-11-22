@@ -57,6 +57,10 @@ pub use policy_document::*;
 mod resource_policies;
 pub use resource_policies::*;
 
+/// The customer managed KMS key a revision would be encrypted under: when each create
+/// asks KMS about it, and the sentence a create is refused with when it cannot be used.
+pub mod revision_key;
+
 /// The tag slice: the tags a web function carries, and the rules the tag
 /// operations hold a key set to.
 mod tags;

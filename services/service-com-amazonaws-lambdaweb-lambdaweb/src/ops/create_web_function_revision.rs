@@ -5,6 +5,11 @@
 //! Persists an immutable revision under a stored web function, with the model's
 //! `serviceConfig` defaults applied, and reports it back out of the store.
 //!
+//! The customer managed KMS key the request names is resolved in KMS before anything is
+//! stored, because building the revision encrypts under that key: a key whose state admits
+//! no cryptographic use is refused here rather than accepted into a revision nothing could
+//! build — see [`crate::state::revision_key`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,6 +157,33 @@ impl From<CreateWebFunctionRevisionErrorModeled> for CreateWebFunctionRevisionEr
     }
 }
 
+/// Refuse a create addressed at a web function this store does not hold. `name` is the stored
+/// key the request's `functionName` resolved to; `identifier` is the value the request
+/// addressed the function by, which the refusal names verbatim.
+///
+/// Taken twice: once before the two reads out of the handler, so a request that is going to be
+/// refused neither fetches a deployment package nor asks KMS about a key, and once under the
+/// guard that does the writing, which is the one that decides.
+fn refuse_if_absent(
+    state: &crate::state::ComAmazonawsLambdawebLambdawebState,
+    name: &str,
+    identifier: &str,
+) -> Result<(), CreateWebFunctionRevisionError> {
+    if state.functions.contains_key(name) {
+        return Ok(());
+    }
+    Err(
+        CreateWebFunctionRevisionErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::function_not_found_message(identifier),
+                resource_id: None,
+                resource_type: None,
+            },
+        )
+        .into(),
+    )
+}
+
 /// The `CreateWebFunctionRevision` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -197,10 +229,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // What this revision's BUILD reads, established BEFORE the store guard is taken:
-        // the deployment package its code object names, fetched from the emulator's own
-        // Amazon S3. A package the build cannot read an archive in settles the revision
-        // `Failed` rather than `Active` — see `crate::state::code_package`.
+        // The refusal the STORE decides, taken under a guard of its own and BEFORE the two
+        // reads out of the handler below: a request that is going to be refused should
+        // neither fetch a deployment package nor ask KMS about a key. It is checked again
+        // under the guard that does the writing, which is the one that decides, because the
+        // store may have moved in between.
+        //
+        // The caller may name the function by name or by ARN; both resolve to the one stored
+        // record.
+        let name = crate::state::resolve_function_name(&input.function_name).to_string();
+        {
+            let mut state = state.lock();
+            state.materialise_due_transitions(::std::time::SystemTime::now());
+            refuse_if_absent(&state, &name, &input.function_name)?;
+        }
+
+        // What this revision's BUILD reads, established with no store guard held: the
+        // deployment package its code object names, fetched from the emulator's own Amazon S3.
+        // A package the build cannot read an archive in settles the revision `Failed` rather
+        // than `Active` — see `crate::state::code_package`.
         let region = crate::state::request_region(ctx.parts());
         let resolved = crate::state::code_package::resolve(
             ctx,
@@ -213,25 +260,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // serving it runs, so the package is read once here rather than per request.
         let package = resolved.package();
 
+        // Whether the key this revision would be encrypted under is one KMS would still
+        // encrypt with, asked of KMS itself with no store guard held, because it is a call
+        // out of the handler — see `crate::state::revision_key`.
+        let key_refusal =
+            crate::state::revision_key::refusal(ctx, &region, input.kms_key_arn.as_deref()).await;
+
         let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
         state.materialise_due_transitions(now);
 
-        // The caller may name the function by name or by ARN; both resolve to the
-        // one stored record.
-        let name = crate::state::resolve_function_name(&input.function_name).to_string();
-        let Some(function) = state.functions.get(&name) else {
-            return Err(
-                CreateWebFunctionRevisionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::function_not_found_message(&input.function_name),
-                        resource_id: None,
-                        resource_type: None,
-                    },
-                )
-                .into(),
-            );
-        };
+        refuse_if_absent(&state, &name, &input.function_name)?;
+        let function = state
+            .functions
+            .get(&name)
+            .expect("the function just refused on is in the store");
+
+        // The key the revision would be encrypted under, judged before the quota and before
+        // anything is written: a revision AWS would never have built is not stored, so the
+        // function's revision list is left exactly as the caller left it.
+        if let Some(message) = key_refusal {
+            return Err(CreateWebFunctionRevisionErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
 
         if function.revisions.len() >= crate::state::MAX_REVISIONS_PER_FUNCTION {
             return Err(
