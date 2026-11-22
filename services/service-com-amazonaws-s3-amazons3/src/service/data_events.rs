@@ -87,7 +87,11 @@ const OMITTED_MEMBERS: &[&str] = &["Body"];
 /// (`smithy_query(query="service_info")` -> `protocol_config.restXml.noErrorWrapping: true`)
 /// and carries its own `@xmlNamespace` — the same two values the generated per-operation shim
 /// passes, so a refusal raised ahead of a handler reads exactly as it did before.
-const RESTXML_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::RestXml {
+///
+/// Shared with the MANAGEMENT leg ([`super::management_events`]), which renders the
+/// pre-dispatch failure of a bucket-level call in the same envelope: one service, one
+/// protocol.
+pub(super) const RESTXML_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::RestXml {
     xml_namespace: Some(super::wire::S3_XML_NAMESPACE),
     no_error_wrapping: true,
 };
@@ -423,7 +427,7 @@ const RECORDED_BUCKET_MEMBER: &str = "bucketName";
 ///    makes a delivered record's message the one the client received. A refusal that words its
 ///    OWN sentence (an authorization denial naming the principal, the action and the resource)
 ///    keeps it.
-fn this_services_record(mut call: ServedApiCall) -> ServedApiCall {
+pub(super) fn this_services_record(mut call: ServedApiCall) -> ServedApiCall {
     if let Some(parameters) = call.request_parameters.as_object_mut() {
         if let Some(bucket) = parameters.remove(&recorded_member_name(BUCKET_MEMBER)) {
             parameters.insert(RECORDED_BUCKET_MEMBER.to_string(), bucket);
@@ -520,19 +524,29 @@ impl<Eng: Send + Sync + 'static> AuditedService for ObjectDataEvents<Eng> {
     }
 
     fn names_the_request(&self, resp: RtResponse) -> (RtResponse, String) {
-        // Every response of this service already names the request it answers, in the header
-        // S3 names it in ("`x-amz-request-id`: a value created by Amazon S3 that uniquely
-        // identifies the request") — see [`super::wire`]. So the id is READ and the response
-        // is handed back untouched: the shared reader reports the `x-amzn-requestid` almost
-        // every other service spells its ids in, and writing that header onto an S3 response
-        // would put a second id on the wire.
-        let stated = resp
-            .headers()
-            .get(super::wire::REQUEST_ID_HEADER)
-            .unwrap_or_default()
-            .to_string();
-        (resp, stated)
+        stated_request_id(resp)
     }
+}
+
+/// The id the CALLER was answered under, read off the response this service already stated
+/// it in.
+///
+/// Every response of this service names the request it answers, in the header S3 names it in
+/// ("`x-amz-request-id`: a value created by Amazon S3 that uniquely identifies the request")
+/// — see [`super::wire`]. So the id is READ and the response is handed back untouched: the
+/// shared reader reports the `x-amzn-requestid` almost every other service spells its ids in,
+/// and writing that header onto an S3 response would put a second id on the wire.
+///
+/// Both legs of this service's auditing join their records to the caller's own response this
+/// way ([`super::management_events`]), so a client holding a response finds the record of
+/// that very call whichever class it was recorded as.
+pub(super) fn stated_request_id(resp: RtResponse) -> (RtResponse, String) {
+    let stated = resp
+        .headers()
+        .get(super::wire::REQUEST_ID_HEADER)
+        .unwrap_or_default()
+        .to_string();
+    (resp, stated)
 }
 
 impl<Eng: Send + Sync + 'static> DataEventDelivery for ObjectDataEvents<Eng> {

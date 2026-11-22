@@ -79,6 +79,9 @@ pub mod chunked_upload;
 // The calls on the CONTENTS of an object, which CloudTrail delivers as DATA events into the
 // bucket of every trail whose event selectors admit them — see `service/data_events.rs`.
 pub mod data_events;
+// The calls that ADMINISTER a bucket, which CloudTrail records in the account's event history
+// where `LookupEvents` reports them — see `service/management_events.rs`.
+pub mod management_events;
 // The operations a DIRECTORY bucket does not serve, and the refusal a request addressing one
 // of them earns — see `service/directory_bucket.rs`.
 pub mod directory_bucket;
@@ -1302,7 +1305,14 @@ const METADATA_DIRECTIVE_HEADER: &str = "x-amz-metadata-directive";
 /// See [`METADATA_DIRECTIVE_HEADER`].
 const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 
-/// The operations served behind this service's FRONT DOOR, and why each is.
+/// The operations this service serves from a table of its OWN — the AUDITED ones, and the
+/// ones behind a FRONT DOOR — and why each is.
+///
+/// Every call that ADMINISTERS a bucket is a management event of the account, so every one of
+/// those operations is here behind the recorder that writes its record
+/// ([`management_events::audited_table`]): this is the one table `override_operation`
+/// resolves an operation out of before the generated one, which is what makes the record a
+/// property of serving the call rather than of the route it arrived on.
 ///
 /// A door re-reads the request it is handed, finds the modelled constraints it breaks, and
 /// words the refusal through the service's own renderer — which is the only way a refusal
@@ -1336,8 +1346,12 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 /// * The four listings of what a bucket holds — `ListObjects`, `ListObjectsV2`,
 ///   `ListObjectVersions` and `ListMultipartUploads` — each of which binds the
 ///   `encoding-type` whose refusal names the parameter and echoes its value
-///   ([`uri_value_wording`]). They are wrapped where they are COUNTED
-///   ([`request_metrics::serve_metered`]) so that one operation is not served twice.
+///   ([`uri_value_wording`]).
+///
+/// Those last three groups are bucket-level calls, so they are served where their RECORD is
+/// built ([`management_events::audited_table`]), each with its door — and the listings with
+/// the counting as well — INSIDE the recorder: one entry per operation, so an operation that
+/// is wrapped for its refusal, counted and recorded is still served once.
 ///
 /// The table also holds the one operation this service serves that the model does not
 /// declare at all — the BROWSER-FORM upload ([`post_object`]) — because this is where the
@@ -1345,64 +1359,39 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 ///
 /// And it is where the operations whose answers are COUNTED into the addressed bucket's
 /// `AWS/S3` request metrics are served from, each wrapped in
-/// [`request_metrics::Metered`]: this is the one table `override_operation` resolves an
-/// operation out of before the generated one, so a wrapped operation is reached by both
-/// address forms and by nothing else. An operation that is both wrapped here for its refusal
-/// and counted is served as ONE entry, the door inside the counting.
+/// [`request_metrics::Metered`], so a wrapped operation is reached by both address forms and
+/// by nothing else. An operation that is both wrapped here for its refusal and counted is
+/// served as ONE entry, the door inside the counting.
 fn front_door<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> smithy_server_runtime::OperationRoutingTable {
-    use ::service_common::front_door::{FrontDoor, FrontDoorTable};
+    use ::service_common::front_door::FrontDoor;
     use smithy_server_runtime::Operation;
 
-    let mut door = FrontDoorTable::worded(submitted_value_wording);
-    door.serve(crate::ops::update_object_encryption::UpdateObjectEncryption::new(
-        Arc::clone(engine),
-    ));
-    let mut table = door.finish();
+    // Every call that ADMINISTERS a bucket is a management event of this service, recorded in
+    // the account's event history where CloudTrail's `LookupEvents` reads it — so this table
+    // starts as the AUDIT table ([`management_events::audited_table`]), which holds every one
+    // of those operations behind the recorder, the three configuration calls served behind a
+    // door and the four listings served counted behind one among them. Everything below is
+    // added to it, so one table answers `override_operation` for every request this service
+    // resolves itself.
+    let mut table = management_events::audited_table(engine);
+    // The one object-plane call this service serves behind a door and records as neither
+    // class: the refusal of a KMS key ARN that is not one names WHY, a reason read off the
+    // submitted ARN ([`submitted_value_wording`]). It acts on one object's contents, so no
+    // management record may hold it (see [`management_events`] for which calls are in neither
+    // catalog).
+    table.add_operation(
+        crate::ops::update_object_encryption::UpdateObjectEncryption::<Eng>::NAME,
+        Box::new(FrontDoor::worded(
+            crate::ops::update_object_encryption::UpdateObjectEncryption::new(Arc::clone(engine)),
+            submitted_value_wording,
+        )),
+    );
     // What the account's CloudTrail delivers for the calls on an object's CONTENTS: one
     // recorder for every data-event row below and in [`request_metrics::serve_metered`], so
     // two of them cannot report one call differently ([`data_events`]).
     let data_events = Arc::new(data_events::ObjectDataEvents::new(Arc::clone(engine)));
-    table.add_operation(
-        crate::ops::put_bucket_metrics_configuration::PutBucketMetricsConfiguration::<Eng>::NAME,
-        Box::new(
-            FrontDoor::worded(
-                crate::ops::put_bucket_metrics_configuration::PutBucketMetricsConfiguration::new(
-                    Arc::clone(engine),
-                ),
-                submitted_value_wording,
-            )
-            .wording_uri(configuration_id_wording),
-        ),
-    );
-    table.add_operation(
-        crate::ops::delete_bucket_metrics_configuration::DeleteBucketMetricsConfiguration::<Eng>::NAME,
-        Box::new(
-            FrontDoor::worded(
-                crate::ops::delete_bucket_metrics_configuration::DeleteBucketMetricsConfiguration::new(
-                    Arc::clone(engine),
-                ),
-                submitted_value_wording,
-            )
-            .wording_uri(configuration_id_wording),
-        ),
-    );
-    table.add_operation(
-        crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration::<Eng>::NAME,
-        Box::new(readable_document::ReadableDocument::<
-            crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration<Eng>,
-            _,
-        >::new(
-            FrontDoor::worded(
-                crate::ops::put_bucket_inventory_configuration::PutBucketInventoryConfiguration::new(
-                    Arc::clone(engine),
-                ),
-                submitted_value_wording,
-            )
-            .wording_uri(inventory_configuration_id_wording),
-        )),
-    );
     // The two copies are the operations this service serves BOTH behind a door and with
     // their answers counted into the addressed bucket's request metrics: a copy writes the
     // destination object, so it is a `PUT` request of that object's bucket
@@ -2350,10 +2339,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // matches the subresource whatever bucket it was addressed to, and from the request's
         // PATH-STYLE address so the two address forms resolve alike.
         if self.addresses_session_of_general_purpose_bucket(req) {
+            // Served from this service's own table where that operation is one of its rows
+            // ([`front_door`]), exactly as a request the generated table resolves is: a
+            // listing resolved here is the same call, and the same management event.
             return self
-                .entry
-                .routing_table()
-                .get(LISTING_WITHOUT_SUBRESOURCE);
+                .door
+                .get(LISTING_WITHOUT_SUBRESOURCE)
+                .or_else(|| self.entry.routing_table().get(LISTING_WITHOUT_SUBRESOURCE));
         }
         // The listing of this account's DIRECTORY buckets, which shares its method and path
         // with the listing of its general purpose ones and is told from it by the endpoint
@@ -2361,7 +2353,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // before the model's routing table, which cannot tell two routes apart on a
         // discriminator the request does not carry.
         if self.addresses_directory_bucket_listing(req) {
-            return self.entry.routing_table().get(LIST_DIRECTORY_BUCKETS);
+            // Served from this service's own table for the reason above.
+            return self
+                .door
+                .get(LIST_DIRECTORY_BUCKETS)
+                .or_else(|| self.entry.routing_table().get(LIST_DIRECTORY_BUCKETS));
         }
         // The BROWSER-FORM upload of an object, which the model's routing table cannot name
         // at all: no operation is bound at `POST /{Bucket}`, so the request resolved to

@@ -302,6 +302,19 @@ impl Emulator {
     }
 }
 
+/// The delivered records of THIS service.
+///
+/// A trail that logs management events delivers the account's OTHER management calls into the
+/// same bucket as well — the reads this suite itself makes of that bucket through Amazon S3's
+/// API among them — and what the rules here are about is the calls this service served.
+fn this_services_records(delivered: &[(String, Value)]) -> Vec<Value> {
+    delivered
+        .iter()
+        .filter(|(_, record)| text(record, "eventSource") == EVENT_SOURCE)
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
 /// One trail of the account, delivering into `bucket` under `key_prefix` with `selectors` for
 /// its data events and management events logged only where `management` says so.
 fn trail(
@@ -651,8 +664,9 @@ async fn a_selector_delivers_nothing_for_a_call_made_before_it_existed() {
         .await;
     let delivered = emulator.delivered(bucket, &area).await;
     assert!(
-        delivered.is_empty(),
-        "case \"before the selector\": expected nothing delivered, got {delivered:?}"
+        this_services_records(&delivered).is_empty(),
+        "case \"before the selector\": expected nothing of this service delivered, got \
+         {delivered:?}"
     );
 
     // After: the same trail, now carrying the state-machine data selector.
@@ -671,9 +685,9 @@ async fn a_selector_delivers_nothing_for_a_call_made_before_it_existed() {
         )
         .await;
     let delivered = emulator.delivered(bucket, &area).await;
-    let answered: Vec<String> = delivered
+    let answered: Vec<String> = this_services_records(&delivered)
         .iter()
-        .map(|(_, record)| text(record, "requestID"))
+        .map(|record| text(record, "requestID"))
         .collect();
     assert_eq!(
         answered,

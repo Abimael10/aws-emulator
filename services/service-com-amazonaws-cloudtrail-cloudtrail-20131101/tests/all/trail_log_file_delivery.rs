@@ -43,8 +43,11 @@ const LOG_FILE_SUFFIX: &str = ".json.gz";
 /// The member a log file's document holds its records in.
 const RECORDS_MEMBER: &str = "Records";
 
-/// This service's `eventSource` on every record it writes.
-const EVENT_SOURCE: &str = "cloudtrail.amazonaws.com";
+/// The event sources a record delivered in this suite can carry: this service's own calls,
+/// and the calls on the object store that this suite makes to READ what was delivered —
+/// bucket-level calls, which are management events of the account like any other, so a
+/// logging trail delivers them too.
+const DELIVERED_EVENT_SOURCES: &[&str] = &["cloudtrail.amazonaws.com", "s3.amazonaws.com"];
 
 /// CloudTrail and the object store over one shared engine.
 struct Emulator {
@@ -255,15 +258,21 @@ fn assert_log_file_layout(case: &str, key: &str, key_prefix: Option<&str>) -> St
     (*stamp).to_string()
 }
 
-/// Every `eventName` the log files in `bucket` carry between them, with every record
-/// checked for the fields a consumer reads it by.
-async fn delivered_event_names(
+/// Every record the log files in `bucket` carry between them, each checked for the fields a
+/// consumer reads it by.
+///
+/// A trail delivers the management calls of EVERY service of the account, not CloudTrail's
+/// own alone — this suite's own reads of the bucket through Amazon S3's API are management
+/// calls of that account too — so what every record is held to is the Region the trail logs,
+/// the account it belongs to, one of the two sources this suite's calls can carry
+/// ([`DELIVERED_EVENT_SOURCES`]) and the identifiers a record is read by.
+async fn delivered_records(
     emulator: &Emulator,
     case: &str,
     bucket: &str,
     key_prefix: Option<&str>,
-) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+) -> Vec<Value> {
+    let mut records: Vec<Value> = Vec::new();
     for key in emulator.keys(bucket).await {
         assert_log_file_layout(case, &key, key_prefix);
         for record in emulator.records(bucket, &key).await {
@@ -275,9 +284,14 @@ async fn delivered_event_names(
                     .to_string()
             };
             assert_eq!(
-                (field("eventSource").as_str(), field("awsRegion").as_str()),
-                (EVENT_SOURCE, REGION),
-                "case {case:?}: expected a CloudTrail record of this Region, got {record}"
+                field("awsRegion"),
+                REGION,
+                "case {case:?}: expected a record of this Region, got {record}"
+            );
+            assert!(
+                DELIVERED_EVENT_SOURCES.contains(&field("eventSource").as_str()),
+                "case {case:?}: expected a record of one of {DELIVERED_EVENT_SOURCES:?}, got \
+                 {record}"
             );
             assert_eq!(
                 field("recipientAccountId"),
@@ -288,9 +302,30 @@ async fn delivered_event_names(
                 !field("eventID").is_empty() && !field("eventTime").is_empty(),
                 "case {case:?}: expected a record naming itself and its instant, got {record}"
             );
-            names.push(field("eventName"));
+            records.push(record);
         }
     }
+    records
+}
+
+/// Every `eventName` those records carry, sorted.
+async fn delivered_event_names(
+    emulator: &Emulator,
+    case: &str,
+    bucket: &str,
+    key_prefix: Option<&str>,
+) -> Vec<String> {
+    let mut names: Vec<String> = delivered_records(emulator, case, bucket, key_prefix)
+        .await
+        .iter()
+        .map(|record| {
+            record
+                .get("eventName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
     names.sort();
     names
 }
@@ -509,16 +544,40 @@ async fn nothing_is_delivered_unless_the_trail_logs_the_call() {
     emulator
         .served("GetTrailStatus", &json!({"Name": trail}))
         .await;
-    let names = delivered_event_names(
+    let records = delivered_records(
         &emulator,
         "a ReadOnly trail and a read call",
         bucket,
         None,
     )
     .await;
-    assert_eq!(
-        names,
-        vec!["GetTrailStatus".to_string()],
-        "case a ReadOnly trail and a read call: expected only the read delivered, got {names:?}"
+    let names: Vec<String> = records
+        .iter()
+        .map(|record| {
+            record
+                .get("eventName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        names.contains(&"GetTrailStatus".to_string()),
+        "case a ReadOnly trail and a read call: expected the read delivered, got {names:?}"
+    );
+    // And NOTHING outside the class the selectors name: every record the trail delivered is a
+    // read, the write above among none of them. (The reads of the bucket this suite makes to
+    // check the delivery are management calls of the account as well, and a trail logging the
+    // read-only class logs those too.)
+    for record in &records {
+        assert_eq!(
+            record.get("readOnly"),
+            Some(&json!(true)),
+            "case a ReadOnly trail and a read call: expected only reads delivered, got {record}"
+        );
+    }
+    assert!(
+        !names.contains(&"PutEventSelectors".to_string()),
+        "case a ReadOnly trail and a write call: expected the write undelivered, got {names:?}"
     );
 }

@@ -612,12 +612,12 @@ fn epoch_secs(at: SystemTime) -> f64 {
 /// in [`Metered`], under the modelled name the protocol resolves for it.
 ///
 /// WHICH operations those are, and which type each one's requests are: the object data plane
-/// — the reads, writes and deletes of a key, the multipart upload that writes one in parts —
-/// and the listings of what a bucket holds. The two copies, which this service already serves
-/// behind its front door for the refusal only a door can word, are wrapped where they are
-/// built ([`super::front_door`]) so that one operation is not served twice; the four
-/// listings, which need a door for the same reason, are wrapped HERE
-/// ([`meter_behind_door`]) for that same reason.
+/// — the reads, writes and deletes of a key, the multipart upload that writes one in parts.
+/// The two copies, which this service already serves behind its front door for the refusal
+/// only a door can word, are wrapped where they are built ([`super::front_door`]) so that one
+/// operation is not served twice; the four listings of a bucket's contents, which need a door
+/// for the same reason and are MANAGEMENT events besides, are wrapped where their record is
+/// built ([`super::management_events::audited_table`]).
 ///
 /// Not here, and why: `DeleteObjects` names the objects it deletes in its request DOCUMENT
 /// rather than in its address, so which filtered configurations its keys fall under is not a
@@ -686,39 +686,11 @@ pub fn serve_metered<Eng: Send + Sync + 'static>(
         crate::ops::abort_multipart_upload::AbortMultipartUpload::new(Arc::clone(engine)),
         RequestKind::Delete,
     );
-    // The four listings are served behind a door as well as counted: each binds the
-    // `encoding-type` whose refusal carries members of its own ([`super::refused_argument`]),
-    // and only a door routes a refusal the BOUNDARY makes through this service's own
-    // renderer. One entry per operation, so the door and the counting are the same served
-    // operation rather than two.
-    meter_behind_door(
-        table,
-        engine,
-        data_events,
-        crate::ops::list_objects_v2::ListObjectsV2::new(Arc::clone(engine)),
-        RequestKind::List,
-    );
-    meter_behind_door(
-        table,
-        engine,
-        data_events,
-        crate::ops::list_objects::ListObjects::new(Arc::clone(engine)),
-        RequestKind::List,
-    );
-    meter_behind_door(
-        table,
-        engine,
-        data_events,
-        crate::ops::list_object_versions::ListObjectVersions::new(Arc::clone(engine)),
-        RequestKind::List,
-    );
-    meter_behind_door(
-        table,
-        engine,
-        data_events,
-        crate::ops::list_multipart_uploads::ListMultipartUploads::new(Arc::clone(engine)),
-        RequestKind::List,
-    );
+    // The four listings of what a bucket holds are counted AND served behind a door AND
+    // recorded as management events of this service, so they are served where that record is
+    // built ([`super::management_events::audited_table`], which composes
+    // [`counted_behind_door`] inside its recorder): one entry per operation, so the counting,
+    // the door and the record are the same served operation rather than three.
 }
 
 /// Add one metered operation to `table` behind this service's FRONT DOOR, keyed by its own
@@ -758,7 +730,10 @@ pub(super) fn meter_behind_door<Eng, O>(
 /// `operation` behind this service's front door, with its answers counted — the pair
 /// [`meter_behind_door`] serves, as a FUNCTION so the two arms above can wrap values of two
 /// different types (a closure is monomorphic in its argument).
-fn counted_behind_door<Eng, O>(
+///
+/// Reached from the AUDIT table as well ([`super::management_events`]), which serves the
+/// listings of a bucket's contents through this same pair with the record built inside it.
+pub(super) fn counted_behind_door<Eng, O>(
     operation: O,
     engine: &Arc<Eng>,
     kind: RequestKind,

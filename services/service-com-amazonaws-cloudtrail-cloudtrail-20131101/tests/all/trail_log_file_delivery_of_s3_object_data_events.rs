@@ -697,6 +697,18 @@ async fn an_arn_scoped_selector_delivers_the_object_calls_it_admits_and_withhold
         .map(|events| events.iter().map(|event| text(event, "EventName")).collect())
         .unwrap_or_default();
     for call in &served {
+        if call.resource.is_none() {
+            // The complement of the same rule: a BUCKET-level call is no data event, and it
+            // IS a management event of the account — so event history holds it, which is what
+            // tells "no data event reaches a lookup" from "nothing is recorded at all".
+            assert!(
+                names.contains(&call.operation.to_string()),
+                "case {:?}: a bucket-level call is a management event, so a lookup reports it, \
+                 got {names:?}",
+                call.case
+            );
+            continue;
+        }
         assert!(
             !names.contains(&call.operation.to_string()),
             "case {:?}: a data event reaches no event history, got {names:?}",
