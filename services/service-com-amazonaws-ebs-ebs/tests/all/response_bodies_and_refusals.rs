@@ -13,7 +13,7 @@
 //!    was in when the request arrived, no further block is accepted into it, and every
 //!    later call reads `completed` back.
 //! 3. A `blockToken` is judged against the expression the SERVICE enforces, and the
-//!    refusal reports that expression.
+//!    refusal reports that expression in the service's own modelled `ValidationException`.
 //! 4. A checksum algorithm the service does not support is refused through its own
 //!    modelled `ValidationException`, carrying both `Message` and `Reason`.
 //! 5. A `ClientToken` conflict carries the service's fixed message and echoes nothing.
@@ -25,6 +25,9 @@
 //!    request boundary is judged by the operation that owns it, so a value outside the
 //!    member's modelled form is refused with the service's OWN modelled
 //!    `ValidationException` — carrying both the `Message` and the `Reason` a client reads.
+//! 9. The same shape answers EVERY member whose constraints an operation of this service
+//!    judges itself, whichever operation owns it and whichever constraint the value
+//!    breaks: one envelope for the whole class, never the framework's synthetic one.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -39,6 +42,13 @@ use crate::snapshot_block_loop::{
 /// refusal reports. Mirrors `crate::state::BLOCK_TOKEN_PATTERN`; a test that quoted a
 /// different expression would assert nothing about the refusal a caller reads.
 const BLOCK_TOKEN_PATTERN: &str = "^[A-Za-z0-9+/=_-]+$";
+
+/// The `ValidationExceptionReason` this service reports for a value outside the form its
+/// member's constraints allow — a rejected parameter value
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ValidationExceptionReason")`).
+/// Distinct from `INVALID_BLOCK_TOKEN`, which answers a WELL-FORMED token that names no
+/// block.
+const CONSTRAINT_REFUSAL_REASON: &str = "INVALID_PARAMETER_VALUE";
 
 /// The only checksum algorithm the modelled `ChecksumAlgorithm` enum declares
 /// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChecksumAlgorithm")`).
@@ -251,7 +261,9 @@ async fn completing_a_snapshot_seals_it_and_acknowledges_the_status_it_sealed() 
 
 /// RULE 3: a `blockToken` is judged against the expression the SERVICE enforces —
 /// `^[A-Za-z0-9+/=_-]+$`, the URL-safe base64 alphabet — and a value outside it is
-/// refused with the framework's constraint report naming the member and THAT expression.
+/// refused with the framework's constraint report naming the member and THAT expression,
+/// carried by this service's OWN modelled `ValidationException`: `Message` plus the
+/// `Reason` a client branches on, as every other refusal of this operation is.
 /// A value inside it is never a constraint violation: it goes on to be resolved, and
 /// fails (or succeeds) on whether it names the block.
 #[tokio::test]
@@ -303,7 +315,22 @@ async fn block_token_is_judged_against_the_pattern_the_service_enforces() {
             "case {case:?}: expected the ValidationException error code, got {:?}",
             reply.error_code()
         );
-        let message = member(&reply, "message");
+        // The report travels in the service's OWN modelled shape, so it arrives as
+        // `Message` beside the `Reason` a client branches on. The synthetic envelope the
+        // boundary would have used carries neither: its only member is a lowercase
+        // `message`.
+        assert_eq!(
+            member(&reply, "Reason"),
+            CONSTRAINT_REFUSAL_REASON,
+            "case {case:?}: the refusal must carry the ValidationExceptionReason a client branches on, got {}",
+            reply.json()
+        );
+        assert!(
+            member(&reply, "message").is_empty(),
+            "case {case:?}: the refusal must not travel in the synthetic envelope, got {}",
+            reply.json()
+        );
+        let message = member(&reply, "Message");
         assert!(
             message.starts_with("1 validation error detected: Value '"),
             "case {case:?}: the refusal must be the constraint report, got {message:?}"
@@ -315,16 +342,16 @@ async fn block_token_is_judged_against_the_pattern_the_service_enforces() {
     }
 
     // The recorded instance, asserted whole: an empty token names the member, echoes the
-    // value and quotes the expression the service enforces.
+    // value and quotes the expression the service enforces, inside the modelled error.
     let empty = get_block(&router, &snapshot_id, 0, "").await;
-    assert_eq!(
-        member(&empty, "message"),
-        format!(
+    assert_validation(
+        "empty",
+        &empty,
+        CONSTRAINT_REFUSAL_REASON,
+        &format!(
             "1 validation error detected: Value '' at 'blockToken' failed to satisfy \
              constraint: Member must satisfy regular expression pattern: {BLOCK_TOKEN_PATTERN}"
         ),
-        "case \"empty\": the whole constraint report must be the service's, got {}",
-        empty.json()
     );
 
     // Rows INSIDE the enforced expression: each gets past validation and is answered by
@@ -998,6 +1025,24 @@ fn min_value_requirement(min: i64) -> String {
     format!("Member must have value greater than or equal to {min}")
 }
 
+/// The requirement a number above a member's `@range` maximum failed.
+fn max_value_requirement(max: i64) -> String {
+    format!("Member must have value less than or equal to {max}")
+}
+
+/// The ceiling a constraint report puts on the rejected value it echoes: a caller controls
+/// that value's length, so a long one arrives as a 256-character prefix followed by its
+/// byte count. Asserted here because a row below rejects a value past the ceiling.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// The rejected value as a clause echoes it.
+fn echoed(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    format!("{}... [{} bytes]", &value[..MAX_ECHOED_VALUE], value.len())
+}
+
 /// `CompleteSnapshot` with the header members this operation judges itself set to
 /// whatever the row carries; an optional header the row leaves `None` is not sent at all.
 async fn complete_snapshot_with_headers(
@@ -1246,5 +1291,275 @@ async fn a_judged_complete_snapshot_header_is_refused_through_the_modelled_error
         "case \"the snapshot read back after it was sealed\": the stored snapshot must read \
          back completed, got {}",
         repeated.json()
+    );
+}
+
+/// The modelled `@range` of `com.amazonaws.ebs#PutSnapshotBlockRequest$Progress`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#PutSnapshotBlockRequest")`
+/// reports min 0, max 100).
+const PROGRESS_RANGE: (i64, i64) = (0, 100);
+
+/// The modelled `@length` maximum of `com.amazonaws.ebs#BlockToken`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#BlockToken")`: `@length` 0..256),
+/// which the operation enforces alongside the expression it reports.
+const BLOCK_TOKEN_MAX_LENGTH: usize = 256;
+
+/// Which input a row of the RULE 9 table puts outside its form, and the value it carries.
+///
+/// Every variant names a member its operation takes OFF the request boundary and judges in
+/// its own handler: `GetSnapshotBlock`'s `BlockToken`, `PutSnapshotBlock`'s `Checksum`,
+/// `Progress` and `ChecksumAlgorithm`, and `CompleteSnapshot`'s `Checksum`,
+/// `ChecksumAggregationMethod` and `ChangedBlocksCount` — the whole set this service's
+/// handlers judge for themselves.
+enum JudgedInput {
+    /// `GetSnapshotBlock`'s `blockToken` query member.
+    BlockToken(String),
+    /// `PutSnapshotBlock`'s `x-amz-Checksum` header.
+    PutChecksum(String),
+    /// `PutSnapshotBlock`'s `x-amz-Progress` header.
+    PutProgress(String),
+    /// `PutSnapshotBlock`'s `x-amz-Checksum-Algorithm` header.
+    PutChecksumAlgorithm(String),
+    /// `CompleteSnapshot`'s `x-amz-Checksum` header.
+    CompleteChecksum(String),
+    /// `CompleteSnapshot`'s `x-amz-Checksum-Aggregation-Method` header.
+    CompleteAggregationMethod(String),
+    /// `CompleteSnapshot`'s `x-amz-ChangedBlocksCount` header.
+    CompleteChangedBlocksCount(i32),
+}
+
+/// Send the request a row describes: the read rows against `readable` (a sealed snapshot
+/// whose block is there to be read) and the write and completion rows against `pending`
+/// (a snapshot still open), so no row can be answered by the snapshot's state instead of
+/// by the member it carries.
+async fn send_judged(
+    router: &MultiServiceRouter,
+    readable: &str,
+    pending: &str,
+    input: &JudgedInput,
+) -> Reply {
+    let data = block_bytes(13);
+    let data_checksum = checksum(&data);
+    match input {
+        JudgedInput::BlockToken(token) => get_block(router, readable, 0, token).await,
+        JudgedInput::PutChecksum(value) => {
+            put_block(router, pending, 0, data, BLOCK_SIZE, value).await
+        }
+        JudgedInput::PutProgress(value) => {
+            put_block_with_progress(router, pending, 0, data, BLOCK_SIZE, &data_checksum, value)
+                .await
+        }
+        JudgedInput::PutChecksumAlgorithm(value) => {
+            put_block_with_algorithm(router, pending, 0, data, BLOCK_SIZE, &data_checksum, value)
+                .await
+        }
+        JudgedInput::CompleteChecksum(value) => {
+            complete_snapshot_with_headers(router, pending, 0, Some(value), None).await
+        }
+        JudgedInput::CompleteAggregationMethod(value) => {
+            complete_snapshot_with_headers(router, pending, 0, None, Some(value)).await
+        }
+        JudgedInput::CompleteChangedBlocksCount(count) => {
+            complete_snapshot_with_headers(router, pending, *count, None, None).await
+        }
+    }
+}
+
+/// RULE 9: a value this service judges in a HANDLER — every member an operation takes off
+/// the request boundary and checks itself — is refused through the service's OWN modelled
+/// `ValidationException`, carrying the `Message` and the `Reason` a client reads, and never
+/// through the framework's synthetic envelope, whose only member is a lowercase `message`.
+/// One class, one envelope: a client that branches on `ValidationExceptionReason` gets an
+/// answer for every member, not for all but one of them.
+///
+/// Rows differ along what the rule generalises over: which operation owns the member, where
+/// the member travels (a query, a header), which constraint the value breaks (a pattern, a
+/// length maximum, a range bound, an enum set, a value the service does not support) and
+/// how far outside it is. The controls at the end send each operation the same request with
+/// every judged member inside its form, so each refusal is about the value and not about
+/// the member or the snapshot.
+#[tokio::test]
+async fn every_handler_judged_member_is_refused_through_the_modelled_error() {
+    let router = router();
+    let readable = write_snapshot(&router, "a handler-judged member", 1, &[(0, 5)]).await;
+    let real_token = listed_blocks(&list_blocks(&router, &readable, "").await)
+        .first()
+        .map(|(_, token)| token.clone())
+        .expect("the sealed snapshot lists its block");
+    let started = start_snapshot(&router, &serde_json::json!({ "VolumeSize": 1 })).await;
+    assert_eq!(
+        started.status, 201,
+        "the open fixture must start, got {} with body {}",
+        started.status,
+        String::from_utf8_lossy(&started.body)
+    );
+    let pending = member(&started, "SnapshotId");
+
+    let over_long_token = "A".repeat(BLOCK_TOKEN_MAX_LENGTH + 1);
+    let over_long_checksum = "A".repeat(CHECKSUM_MAX_LENGTH + 1);
+    let malformed_checksum = "not*a*checksum";
+    let unsupported_algorithm = "MD5";
+    let outside_the_set = "NOTLINEAR";
+
+    let rows: Vec<(&str, JudgedInput, String)> = vec![
+        (
+            "GetSnapshotBlock with an empty blockToken",
+            JudgedInput::BlockToken(String::new()),
+            constraint_report(&[clause(
+                "",
+                "blockToken",
+                &pattern_requirement(BLOCK_TOKEN_PATTERN),
+            )]),
+        ),
+        (
+            "GetSnapshotBlock with a blockToken outside the enforced alphabet",
+            JudgedInput::BlockToken("token!".to_string()),
+            constraint_report(&[clause(
+                "token!",
+                "blockToken",
+                &pattern_requirement(BLOCK_TOKEN_PATTERN),
+            )]),
+        ),
+        (
+            "GetSnapshotBlock with a blockToken one character past the modelled maximum",
+            JudgedInput::BlockToken(over_long_token.clone()),
+            constraint_report(&[clause(
+                &echoed(&over_long_token),
+                "blockToken",
+                &max_length_requirement(BLOCK_TOKEN_MAX_LENGTH),
+            )]),
+        ),
+        (
+            "PutSnapshotBlock with a Checksum outside the modelled pattern",
+            JudgedInput::PutChecksum(malformed_checksum.to_string()),
+            constraint_report(&[clause(
+                malformed_checksum,
+                "checksum",
+                &pattern_requirement(CHECKSUM_PATTERN),
+            )]),
+        ),
+        (
+            "PutSnapshotBlock with a Checksum one character past the modelled maximum",
+            JudgedInput::PutChecksum(over_long_checksum.clone()),
+            constraint_report(&[clause(
+                &over_long_checksum,
+                "checksum",
+                &max_length_requirement(CHECKSUM_MAX_LENGTH),
+            )]),
+        ),
+        (
+            "PutSnapshotBlock with a Progress one past the modelled maximum",
+            JudgedInput::PutProgress("101".to_string()),
+            constraint_report(&[clause(
+                "101",
+                "progress",
+                &max_value_requirement(PROGRESS_RANGE.1),
+            )]),
+        ),
+        (
+            "PutSnapshotBlock with a Progress one below the modelled minimum",
+            JudgedInput::PutProgress("-1".to_string()),
+            constraint_report(&[clause(
+                "-1",
+                "progress",
+                &min_value_requirement(PROGRESS_RANGE.0),
+            )]),
+        ),
+        (
+            "PutSnapshotBlock with a ChecksumAlgorithm the service does not support",
+            JudgedInput::PutChecksumAlgorithm(unsupported_algorithm.to_string()),
+            format!(
+                "Unsupported Checksum Algorithm '{unsupported_algorithm}', supported algorithms \
+                 are {SUPPORTED_ALGORITHM}"
+            ),
+        ),
+        (
+            "CompleteSnapshot with a Checksum outside the modelled pattern",
+            JudgedInput::CompleteChecksum(malformed_checksum.to_string()),
+            constraint_report(&[clause(
+                malformed_checksum,
+                "checksum",
+                &pattern_requirement(CHECKSUM_PATTERN),
+            )]),
+        ),
+        (
+            "CompleteSnapshot with a ChecksumAggregationMethod outside the set its enum declares",
+            JudgedInput::CompleteAggregationMethod(outside_the_set.to_string()),
+            constraint_report(&[clause(
+                outside_the_set,
+                "checksumAggregationMethod",
+                &enum_requirement(AGGREGATION_METHODS),
+            )]),
+        ),
+        (
+            "CompleteSnapshot with a ChangedBlocksCount one below the modelled minimum",
+            JudgedInput::CompleteChangedBlocksCount(-1),
+            constraint_report(&[clause(
+                "-1",
+                "changedBlocksCount",
+                &min_value_requirement(CHANGED_BLOCKS_COUNT_MIN),
+            )]),
+        ),
+    ];
+
+    for (case, input, message) in &rows {
+        let reply = send_judged(&router, &readable, &pending, input).await;
+        assert_validation(case, &reply, CONSTRAINT_REFUSAL_REASON, message);
+        assert!(
+            member(&reply, "message").is_empty(),
+            "case {case:?}: the refusal must be the service's modelled shape, not the synthetic \
+             envelope whose only member is a lowercase message, got {}",
+            reply.json()
+        );
+    }
+
+    // The controls. The read the refused tokens were aimed at is served, so a token
+    // INSIDE the enforced form is no constraint violation.
+    let fetched = get_block(&router, &readable, 0, &real_token).await;
+    assert_eq!(
+        fetched.status, 200,
+        "case \"the token the service issued\": GetSnapshotBlock must answer 200, got {} with \
+         body {}",
+        fetched.status,
+        String::from_utf8_lossy(&fetched.body)
+    );
+    // The write, with every judged member inside its form.
+    let data = block_bytes(13);
+    let data_checksum = checksum(&data);
+    let written = put_block_with_progress(
+        &router,
+        &pending,
+        0,
+        data,
+        BLOCK_SIZE,
+        &data_checksum,
+        "100",
+    )
+    .await;
+    assert_eq!(
+        written.status, 201,
+        "case \"every judged member of the write inside its form\": PutSnapshotBlock must answer \
+         201, got {} with body {}",
+        written.status,
+        String::from_utf8_lossy(&written.body)
+    );
+    // And the completion, which is also what proves the refused completions above sealed
+    // nothing: the snapshot was still open to take that write and is still open now.
+    let completed =
+        complete_snapshot_with_headers(&router, &pending, 1, Some(&data_checksum), Some("LINEAR"))
+            .await;
+    assert_eq!(
+        completed.status, 202,
+        "case \"every judged member of the completion inside its form\": CompleteSnapshot must \
+         answer 202, got {} with body {}",
+        completed.status,
+        String::from_utf8_lossy(&completed.body)
+    );
+    assert_eq!(
+        member(&completed, "Status"),
+        "pending",
+        "case \"every judged member of the completion inside its form\": the 202 must report the \
+         status the snapshot was in when the completion arrived, got {}",
+        completed.json()
     );
 }

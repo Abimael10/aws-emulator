@@ -199,10 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `skip_validation` on `GetSnapshotBlockInput`), because the expression the
         // service enforces is WIDER than the one the on-disk model declares: a
         // service-issued URL-safe-base64 token containing `_` or `-` is accepted. The
-        // refusal is the framework's own constraint report, worded from the expression
-        // actually enforced — see [`block_token_refusal`].
+        // report is the framework's own, worded from the expression actually enforced
+        // (see [`block_token_refusal`]), but it travels in the service's OWN modelled
+        // `ValidationException`, exactly as the sibling operations' `skip_validation`
+        // members do: that is the shape carrying both the `Message` and the `Reason` a
+        // client reads, and the boundary's synthetic envelope carries neither. A value
+        // outside the form a member's constraints allow is a rejected PARAMETER VALUE,
+        // which is the `ValidationExceptionReason` this service reports for it — distinct
+        // from `INVALID_BLOCK_TOKEN` below, which answers a well-formed token that names
+        // no block.
         if let Some(message) = block_token_refusal(&input.block_token) {
-            return Err(crate::scaffolded::Scaffolded::validation(message));
+            return Err(validation("INVALID_PARAMETER_VALUE", message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
@@ -305,7 +312,8 @@ static BLOCK_TOKEN_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 /// detected: Value '<v>' at 'blockToken' failed to satisfy constraint: <requirement>` —
 /// rendered by the same envelope the boundary uses, so the refusal a caller reads states
 /// the expression this operation really enforces and cannot drift from the boundary's
-/// wording for every other member.
+/// wording for every other member. Only that SENTENCE comes from the framework: the shape
+/// it travels in is this service's own modelled error, as at the call site.
 fn block_token_refusal(block_token: &str) -> Option<String> {
     let mut validator = ValidatingSerializer::new();
     // Infallible: the validator accumulates violations instead of failing.
