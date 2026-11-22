@@ -44,3 +44,34 @@ The job id, table/vault/queue names and the harness budget are per-run values; t
 5. Poll backup.DescribeBackupJob until a terminal state -> expect FAILED with a StatusMessage.
 6. sqs.ReceiveMessage in a loop -> AWS yields the aws.backup "Backup Job State Change" envelope with detail.state="FAILED" for that backupJobId; the emulator yields nothing and the check times out.
 7. Replay backup__events.backup-job-failed-event-matches-pattern.
+
+## Resolution
+
+The FAILED half of the contract is served, and is now pinned end to end. One gap in the
+emission path this report names was real and is fixed; the rest of the report's account of the
+emulator is not what the tree does, which is worth recording.
+
+- FIXED: the published `Backup Job State Change` detail omitted `messageCategory`, although the
+  job records that class at the same instant it records its `StatusMessage` and
+  `DescribeBackupJob` / `ListBackupJobs` report it as `MessageCategory`. A consumer branching on
+  a failed backup therefore could not read WHICH kind of failure it was off the bus
+  (`AccessDenied` for a role that may not create the recovery point, `RESOURCE_NOT_FOUND` for a
+  resource nobody holds) and had to call the control plane again.
+  `services/service-com-amazonaws-backup-cryocontrollerusermanager/src/state/events.rs`.
+- NOT what the tree does: "no envelope for the job ever arrives on the target queue". The
+  permission-less job reaches `FAILED` with a `StatusMessage`, that transition is published on
+  the default bus of the vault's Region, and the rule scoped to
+  `{"source":["aws.backup"],"detail-type":["Backup Job State Change"],"detail":{"state":["FAILED"]}}`
+  delivers it to its Amazon SQS target under a queue policy granting
+  `events.amazonaws.com sqs:SendMessage` with `Condition ArnEquals aws:SourceArn=<rule arn>` —
+  within about a second of the job settling, and never for a job that reached `COMPLETED`.
+  Pinned by `core/router/tests/all/backup_job_failure_events_reach_their_rule.rs` (five
+  role/resource shapes, both Regions, plus a consumer long-polling the queue across the
+  publication) and by `core/router/tests/all/backup_failed_job_event_on_a_started_emulator.rs`,
+  which runs the recorded flow against the emulator a client STARTS — the built binary, request
+  authentication on, SigV4-signed calls over TLS, addressed at the emulator's own authority as a
+  client configured with its endpoint url addresses it — and reads the envelope off the rule's
+  queue. That whole flow, table to delivery, takes about five seconds there.
+- The recorded check still reports `Error: Check timed out after 60.0s` on the same key. Nothing
+  in the emulator's answer path withholds the delivery, as the started-emulator suite shows, so
+  what the check spends its wall-clock budget on is not the publication or the dispatch.

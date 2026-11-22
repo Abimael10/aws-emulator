@@ -579,6 +579,17 @@ fn backup_job_change(job: &BackupJob) -> JobStateChange {
     if let Some(status_message) = job.status_message.as_ref() {
         detail.insert("statusMessage".to_string(), status_message.clone().into());
     }
+    // The CLASS the job's outcome falls in, which the moved record's own API reports beside
+    // its message (`MessageCategory` of `DescribeBackupJob`): a consumer branching on a
+    // failed backup reads WHICH KIND of failure it was off the envelope rather than by
+    // calling the control plane again, and the job records it exactly when it records the
+    // message.
+    if let Some(message_category) = job.message_category.as_ref() {
+        detail.insert(
+            "messageCategory".to_string(),
+            message_category.clone().into(),
+        );
+    }
     JobStateChange {
         detail_type: BACKUP_JOB_STATE_CHANGE,
         // A backup job belongs to the vault it backs up INTO, so that vault's Region is
