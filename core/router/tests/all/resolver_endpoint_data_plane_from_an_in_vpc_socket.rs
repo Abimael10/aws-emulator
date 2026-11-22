@@ -796,7 +796,7 @@ async fn an_in_vpc_socket_client_reads_the_resolver_endpoints_gated_answers() {
             Vec::new(),
         ),
         (
-            probe("a name under no zone of the VPC", ENDPOINT_IPS[0], "example.com", TYPE_A),
+            probe("a name under no zone of the VPC", ENDPOINT_IPS[0], "broker.example.com", TYPE_A),
             RCODE_SERVFAIL,
             Vec::new(),
         ),

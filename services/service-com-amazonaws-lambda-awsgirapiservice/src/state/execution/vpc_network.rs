@@ -32,11 +32,15 @@
 //! (`ec2.internal` in `us-east-1`, `<region>.compute.internal` elsewhere), whose
 //! Amazon-provided hostnames name an address in the VPC. So a query for such a hostname of an
 //! address in this VPC is answered with that address, a reverse query for such an address with
-//! that hostname, a name of the internal zone that names no address in the VPC with
-//! `NXDOMAIN`, and a name of another zone — one the resolver recurses for — with what that
-//! recursion can establish from this emulator: a name the public namespace fixes as absent
-//! (`::service_common::vpc_private_dns::established_not_to_exist`) does not exist, so it is
-//! `NXDOMAIN`, and every other such name is one nothing here can answer, so it is `SERVFAIL`.
+//! that hostname — while the VPC's Resolver configuration still has the AUTODEFINED rules for
+//! reverse lookups, which is that configuration's own fact, read out of the register the
+//! service owning it records ([`::service_common::vpc_private_dns`]) — a name of the internal
+//! zone that names no address in the VPC with `NXDOMAIN`, and a name of another zone — one the
+//! resolver recurses for — with what that recursion can establish from this emulator: a name a
+//! DNS STANDARD reserves for documentation is answered out of the one reading of those names
+//! this tree holds (`service_common::public_dns_standard`), a name the public namespace fixes as
+//! absent (`::service_common::vpc_private_dns::established_not_to_exist`) does not exist, so it
+//! is `NXDOMAIN`, and every other such name is one nothing here can answer, so it is `SERVFAIL`.
 //! The DNS messages themselves are read and written by the `simple-dns` crate, so what travels
 //! is a real DNS exchange rather than a shape of this module's own.
 //!
@@ -48,13 +52,18 @@
 //! name a matched `BLOCK` rule covers is answered that rule's `BlockResponse` way instead of
 //! out of the zone; an engine no such service is mounted on filters nothing.
 //!
+//! A query the resolver answers is also RECORDED where the account asked for it: the Resolver
+//! query logging configurations associated with the VPC are the records of the service that owns
+//! them, so the record of the query is handed to that service through the same register
+//! ([`::service_common::vpc_private_dns`]) rather than rendered or delivered here.
+//!
 //! The attachment is read out of the EC2 inventory ONCE, when the invocation's seam is built
 //! ([`attachment_of`]), which is the point the execution environment is given its place in the
 //! VPC; nothing here writes to that inventory. A function attached to no VPC has no attachment
 //! at all, and its datagrams reach only the in-process X-Ray daemon
 //! ([`super::xray_daemon`]) — the position every function was in before this module.
 
-use ::std::net::Ipv4Addr;
+use ::std::net::{IpAddr, Ipv4Addr};
 
 use ::ipnet::Ipv4Net;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
@@ -62,8 +71,9 @@ use ::service_common::vpc_dns_firewall::{
     FirewallDecision, VpcQueryFilters, OVERRIDE_DNS_TYPE_CNAME,
 };
 use ::service_common::vpc_private_dns::{
-    established_not_to_exist, InVpcQuerySource, PrivateZoneAnswer, PrivateZoneCode,
-    PrivateZoneRecord, QueryAdmission, VpcPrivateDnsPlane, PROTOCOL_UDP,
+    established_not_to_exist, InVpcQuerySource, LoggedAnswer, LoggedQuery, PrivateZoneAnswer,
+    PrivateZoneCode, PrivateZoneRecord, QueryAdmission, VpcPrivateDnsPlane, CLASS_INTERNET,
+    PROTOCOL_UDP, SOURCE_ID_INSTANCE,
 };
 use ::simple_dns::rdata::{RData, A, AAAA, CNAME, MX, NS, PTR, TXT};
 use ::simple_dns::{
@@ -169,6 +179,10 @@ pub struct VpcAttachment {
     /// hold — and `None` for an engine that vends no such register, which then has no Resolver
     /// endpoint and no private zone anywhere.
     plane: Option<VpcPrivateDnsPlane>,
+    /// The id of the elastic network interface the run's traffic leaves the VPC through, which
+    /// is the resource inside the VPC a query of this run came FROM — the one a record of that
+    /// query attributes it to ([`VpcAttachment::recorded`]).
+    source_interface_id: Option<String>,
 }
 
 /// The attachment of the function whose interfaces are `interface_ids`, read out of the
@@ -192,6 +206,10 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
     let mut interfaces: Vec<AttachedInterface> = Vec::with_capacity(interface_ids.len());
     let mut held_vpc: Option<String> = None;
     let mut groups: Vec<String> = Vec::new();
+    // The interface the function's traffic LEAVES from, which is the first one it holds
+    // ([`VpcAttachment::private_address`]): the resource inside the VPC a query of this run came
+    // from.
+    let mut source_interface_id: Option<String> = None;
     for interface_id in interface_ids {
         let Some(interface) = store.network_interfaces.get(interface_id.as_str()) else {
             continue;
@@ -208,6 +226,9 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
             .and_then(|cidr| cidr.parse::<Ipv4Net>().ok());
         if let (Some(address), Some(subnet)) = (address, subnet) {
             interfaces.push(AttachedInterface { address, subnet });
+            if source_interface_id.is_none() {
+                source_interface_id = Some(interface_id.clone());
+            }
             if held_vpc.is_none() {
                 held_vpc = interface.vpc_id.clone();
             }
@@ -262,6 +283,7 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
         groups,
         plane: VpcPrivateDnsPlane::of(engine),
         vpc_id,
+        source_interface_id,
     })
 }
 
@@ -342,61 +364,22 @@ impl VpcAttachment {
         // message however many questions it carries.
         let mut filtered = self.filtered(&asked.questions);
         let mut code = RESPONSE_NO_ERROR;
+        // What each question came to, in the order asked, which is what the query logging
+        // configurations of this VPC record for it below.
+        let mut answered: Vec<Answered> = Vec::with_capacity(asked.questions.len());
         for question in &asked.questions {
             reply.questions.push(question.clone());
-            // The firewall decides a query before the resolver reads anything for it, so a
-            // blocked name is answered the rule's way whatever the zone holds.
-            match filtered.next().flatten() {
-                Some(Filtered::NxDomain) => {
-                    code = RESPONSE_NAME_ERROR;
-                    continue;
-                }
-                Some(Filtered::NoData) => continue,
-                Some(Filtered::Record(record)) => {
-                    reply.answers.push(*record);
-                    continue;
-                }
-                None => {}
-            }
-            // The PRIVATE HOSTED ZONES associated with this VPC answer ahead of the VPC's own
-            // internal zone: a query asked inside a VPC is answered out of the private zones
-            // associated with it, authoritatively, and only a name NO such zone holds is left to
-            // the internal zone below. Which zones those are, and what they hold, are Route 53's
-            // and Route 53 Resolver's records, read out of the register that owns them
-            // ([`::service_common::vpc_private_dns`]).
-            if let Some(answered) = self.private_zone_answer(question) {
-                // A zone of the VPC holds the name, so its answer is authoritative.
+            let came_to = self.answered(question, filtered.next().flatten());
+            if came_to.authoritative {
                 reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
-                if answered.code == PrivateZoneCode::NxDomain {
-                    code = RESPONSE_NAME_ERROR;
-                }
-                for record in private_zone_records(&answered) {
-                    reply.answers.push(record);
-                }
-                continue;
             }
-            match self.answer_for(&question.qname, question.qtype) {
-                Answer::Found(record) => {
-                    // The zone is the VPC's own, so the answer is authoritative.
-                    reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
-                    reply.answers.push(*record);
-                }
-                Answer::Empty => {
-                    reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
-                }
-                Answer::Absent => {
-                    reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
-                    code = RESPONSE_NAME_ERROR;
-                }
-                Answer::Nonexistent => {
-                    // The name is under no zone of this resolver, so the answer is not its own
-                    // authority's: what establishes the name does not exist is the recursion.
-                    code = RESPONSE_NAME_ERROR;
-                }
-                Answer::Elsewhere => {
-                    code = RESPONSE_SERVER_FAILURE;
-                }
+            if came_to.code != RESPONSE_NO_ERROR {
+                code = came_to.code;
             }
+            for record in &came_to.records {
+                reply.answers.push(record.clone());
+            }
+            answered.push(came_to);
         }
         let mut bytes = reply.build_bytes_vec().ok()?;
         // The RESPONSE CODE is the low four bits of the second flag byte of the message
@@ -405,7 +388,115 @@ impl VpcAttachment {
         // over the header the crate itself just built.
         let flags = bytes.get_mut(3)?;
         *flags = (*flags & 0xF0) | (code & 0x0F);
+        // The queries this VPC's Resolver answered are recorded where the account asked for
+        // them, which is the owning service's own write ([`Self::recorded`]).
+        self.recorded(&asked.questions, &answered, code);
         Some(bytes)
+    }
+
+    /// What ONE question of a message came to, once the firewall has had its say about it.
+    ///
+    /// `filtered` is that say: `None` for a query it lets through — one no rule matches, and one
+    /// a matched `ALLOW` or `ALERT` rule permits — and otherwise the answer the matched `BLOCK`
+    /// rule's `BlockResponse` states, which is what the query comes to whatever any zone holds
+    /// for the name.
+    fn answered(&self, question: &Question<'_>, filtered: Option<Filtered>) -> Answered {
+        // The firewall decides a query before the resolver reads anything for it, so a blocked
+        // name is answered the rule's way whatever the zone holds. A block is the resolver's own
+        // answer rather than a zone's, so it is not authoritative.
+        match filtered {
+            Some(Filtered::NxDomain) => {
+                return Answered::of(Vec::new(), RESPONSE_NAME_ERROR, false)
+            }
+            Some(Filtered::NoData) => return Answered::of(Vec::new(), RESPONSE_NO_ERROR, false),
+            Some(Filtered::Record(record)) => {
+                return Answered::of(vec![*record], RESPONSE_NO_ERROR, false)
+            }
+            None => {}
+        }
+        // The PRIVATE HOSTED ZONES associated with this VPC answer ahead of the VPC's own
+        // internal zone: a query asked inside a VPC is answered out of the private zones
+        // associated with it, authoritatively, and only a name NO such zone holds is left to
+        // the zones below. Which zones those are, and what they hold, are Route 53's and Route 53
+        // Resolver's records, read out of the register that owns them
+        // ([`::service_common::vpc_private_dns`]).
+        if let Some(answered) = self.private_zone_answer(question) {
+            let code = if answered.code == PrivateZoneCode::NxDomain {
+                RESPONSE_NAME_ERROR
+            } else {
+                RESPONSE_NO_ERROR
+            };
+            // A zone of the VPC holds the name, so its answer is authoritative.
+            return Answered::of(private_zone_records(&answered), code, true);
+        }
+        // A name no zone of the account holds is one the resolver recurses for, and the only
+        // names it can be answered out here are those a DNS standard fixes the records of
+        // (`service_common::public_dns_standard`): a recursed answer is not this resolver's own,
+        // so it is not authoritative.
+        if let Some(records) = standard_public_records(question) {
+            return Answered::of(records, RESPONSE_NO_ERROR, false);
+        }
+        match self.answer_for(&question.qname, question.qtype) {
+            // The zone is the VPC's own, so the answer is authoritative.
+            Answer::Found(record) => Answered::of(vec![*record], RESPONSE_NO_ERROR, true),
+            Answer::Empty => Answered::of(Vec::new(), RESPONSE_NO_ERROR, true),
+            Answer::Absent => Answered::of(Vec::new(), RESPONSE_NAME_ERROR, true),
+            // The name is under no zone of this resolver, so the answer is not its own
+            // authority's: what establishes the name does not exist is the recursion.
+            Answer::Nonexistent => Answered::of(Vec::new(), RESPONSE_NAME_ERROR, false),
+            Answer::Elsewhere => Answered::of(Vec::new(), RESPONSE_SERVER_FAILURE, false),
+        }
+    }
+
+    /// Record every question of one message in the Resolver query logging configurations
+    /// associated with this VPC: the question, the response code the client was answered with,
+    /// and the records of the answer section.
+    ///
+    /// WHICH configurations those are, what they deliver into and in which form is the owning
+    /// service's own ([`::service_common::vpc_private_dns`]), so nothing of a query log is
+    /// rendered here: what this states is the QUERY, which is what only the component carrying
+    /// it knows — the name asked for, the class and type, what came back, and the address inside
+    /// the VPC it came from.
+    fn recorded(&self, questions: &[Question<'_>], answered: &[Answered], code: u8) {
+        let Some(plane) = self.plane.as_ref() else {
+            return;
+        };
+        let Some(source_ip) = self.private_address().map(|address| address.to_string()) else {
+            return;
+        };
+        // WHICH resource inside the VPC the query came from, as a record of it attributes one: a
+        // record states the source under its `instance` member, and the resource this run's
+        // queries leave the VPC through is the elastic network interface Lambda stood up for the
+        // function — the one the account's EC2 inventory holds the source address on, which is
+        // what a record of a query from a client that is no instance names there.
+        let source_ids: Vec<(&str, &str)> = self
+            .source_interface_id
+            .as_deref()
+            .map(|interface_id| (SOURCE_ID_INSTANCE, interface_id))
+            .into_iter()
+            .collect();
+        for (question, came_to) in questions.iter().zip(answered) {
+            let answers: Vec<LoggedAnswer> =
+                came_to.records.iter().filter_map(logged_answer).collect();
+            plane.log_query(
+                &InVpcQuerySource {
+                    vpc_id: &self.vpc_id,
+                    source_ip: &source_ip,
+                    security_group_ids: &self.groups,
+                },
+                &LoggedQuery {
+                    name: &question.qname.to_string(),
+                    record_type: type_keyword(question.qtype).unwrap_or_default(),
+                    class: CLASS_INTERNET,
+                    response_code: response_code_keyword(code),
+                    answers: &answers,
+                    // A datagram is a query carried over UDP, which is the transport a record of
+                    // it states.
+                    transport: PROTOCOL_UDP,
+                    source_ids: &source_ids,
+                },
+            );
+        }
     }
 
     /// What the DNS Firewall of this VPC answers each of `questions` with, in the order they
@@ -438,9 +529,11 @@ impl VpcAttachment {
             .into_iter()
     }
 
-    /// The IPv4 addresses the VPC's own DNS server answers for `name`, ASKED OF IT the way a
-    /// client asks: one `A` question, carried to [`Self::resolved`] as a real DNS message and
-    /// read back off the reply that server answered with.
+    /// The addresses the VPC's own DNS server answers for `name`, ASKED OF IT the way a client
+    /// asks: one question per address family, each carried to [`Self::resolved`] as a real DNS
+    /// message and read back off the reply that server answered with.
+    ///
+    /// The IPv4 addresses come first, as a resolver that prefers them answers.
     ///
     /// Empty for a name it holds no address under — a name of its own zone that names no
     /// address in the VPC, a name of another zone it would have to recurse for, a name the
@@ -449,7 +542,17 @@ impl VpcAttachment {
     /// ([`super::guest_resolver`]) is answered by the same server, and with the same records, as
     /// a handler that sends the query itself.
     #[must_use]
-    pub fn addresses_of(&self, name: &str) -> Vec<Ipv4Addr> {
+    pub fn addresses_of(&self, name: &str) -> Vec<IpAddr> {
+        let mut resolved: Vec<IpAddr> = Vec::new();
+        for kind in [TYPE::A, TYPE::AAAA] {
+            resolved.extend(self.answered_addresses(name, kind));
+        }
+        resolved
+    }
+
+    /// The addresses of ONE family the server answers for `name`: the records of the reply to a
+    /// question of that type.
+    fn answered_addresses(&self, name: &str, kind: TYPE) -> Vec<IpAddr> {
         let Ok(asked) = Name::new(name) else {
             return Vec::new();
         };
@@ -457,7 +560,7 @@ impl VpcAttachment {
         query.set_flags(PacketFlag::RECURSION_DESIRED);
         query.questions.push(Question::new(
             asked.into_owned(),
-            QTYPE::TYPE(TYPE::A),
+            QTYPE::TYPE(kind),
             QCLASS::CLASS(CLASS::IN),
             false,
         ));
@@ -477,7 +580,10 @@ impl VpcAttachment {
             .answers
             .iter()
             .filter_map(|record| match &record.rdata {
-                RData::A(A { address }) => Some(Ipv4Addr::from(*address)),
+                RData::A(A { address }) => Some(IpAddr::V4(Ipv4Addr::from(*address))),
+                RData::AAAA(AAAA { address }) => {
+                    Some(IpAddr::V6(::std::net::Ipv6Addr::from(*address)))
+                }
                 _other => None,
             })
             .collect()
@@ -638,6 +744,15 @@ impl VpcAttachment {
 
     /// What the resolver holds for a REVERSE question: `labels` is what was asked under the
     /// `in-addr.arpa` zone, in that zone's reversed order.
+    ///
+    /// The Amazon-provided hostname of an address of the VPC is answered by the AUTODEFINED rules
+    /// Resolver creates for reverse DNS lookups — "Resolver … create autodefined rules for
+    /// reverse DNS lookups" (`UpdateResolverConfigRequest$AutodefinedReverseFlag`) — so a VPC
+    /// whose Resolver configuration has them DISABLED has nothing to answer such a question
+    /// from, and the reverse name of a private address is answered as the name that does not
+    /// exist it is in the locally served reverse zones of private address space (RFC 6303 §4).
+    /// Whether they are enabled is that configuration's own fact, read out of the register the
+    /// service owning it records ([`::service_common::vpc_private_dns`]).
     fn reverse_answer(
         &self,
         asked: &Name<'_>,
@@ -648,6 +763,9 @@ impl VpcAttachment {
         let Some(address) = reversed_address(labels).filter(|address| self.holds(*address)) else {
             return Answer::Absent;
         };
+        if !self.answers_autodefined_reverse() {
+            return Answer::Absent;
+        }
         if kind != QTYPE::TYPE(TYPE::PTR) {
             return Answer::Empty;
         }
@@ -667,6 +785,119 @@ impl VpcAttachment {
             Err(_unnamed) => Answer::Absent,
         }
     }
+
+    /// Whether the autodefined rules for reverse DNS lookups are in force in this VPC, read off
+    /// the register at the instant the query is answered — so a configuration the account has
+    /// just changed is observed by the next query.
+    ///
+    /// `true` where no such register is on this engine: nothing then says the rules a VPC has by
+    /// default ("This is enabled by default", `ResolverConfig$AutodefinedReverse`) are off.
+    fn answers_autodefined_reverse(&self) -> bool {
+        self.plane
+            .as_ref()
+            .is_none_or(|plane| plane.answers_autodefined_reverse(&self.vpc_id))
+    }
+}
+
+/// What ONE question of a message came to: the records it is answered with, the response code
+/// the client reads for it, and whether that answer is an authority's own.
+struct Answered {
+    /// The answer section for this question, in the order a resolver puts the records.
+    records: Vec<ResourceRecord<'static>>,
+    /// The response code, as RFC 1035 §4.1.1 numbers one.
+    code: u8,
+    /// Whether the answer came out of a zone this resolver is the authority for — a private
+    /// hosted zone of the VPC, or the VPC's own internal zone — rather than from a firewall rule
+    /// or from recursion.
+    authoritative: bool,
+}
+
+impl Answered {
+    /// One answer, stated in the order [`Answered`]'s own fields are.
+    fn of(records: Vec<ResourceRecord<'static>>, code: u8, authoritative: bool) -> Self {
+        Self {
+            records,
+            code,
+            authoritative,
+        }
+    }
+}
+
+/// The response code `code` as a query log names one, by the mnemonics RFC 1035 §4.1.1 gives the
+/// numbers this resolver answers with.
+fn response_code_keyword(code: u8) -> &'static str {
+    match code {
+        RESPONSE_NAME_ERROR => "NXDOMAIN",
+        RESPONSE_SERVER_FAILURE => "SERVFAIL",
+        _no_error => "NOERROR",
+    }
+}
+
+/// The records a question for a name whose addresses a DNS STANDARD fixes is answered with, and
+/// `None` for a name no standard fixes — which is a name this resolver cannot have resolved.
+///
+/// Which names those are, and which addresses they stand for, is the one reading of them this
+/// tree holds (`service_common::public_dns_standard`); a type such a name carries no record of
+/// is an answer with no record, because the name itself exists.
+fn standard_public_records(question: &Question<'_>) -> Option<Vec<ResourceRecord<'static>>> {
+    let asked = question.qname.to_string();
+    if !::service_common::public_dns_standard::names_a_fixed_address(&asked) {
+        return None;
+    }
+    let owner = question.qname.clone().into_owned();
+    let record_type = type_keyword(question.qtype).unwrap_or_default();
+    Some(
+        ::service_common::public_dns_standard::fixed_addresses_of_type(&asked, record_type)
+            .into_iter()
+            .map(|address| {
+                let rdata = match address {
+                    IpAddr::V4(address) => RData::A(A {
+                        address: u32::from(address),
+                    }),
+                    IpAddr::V6(address) => RData::AAAA(AAAA {
+                        address: u128::from(address),
+                    }),
+                };
+                ResourceRecord::new(owner.clone(), CLASS::IN, ANSWER_TTL_SECONDS, rdata)
+            })
+            .collect(),
+    )
+}
+
+/// One record of an answer section as a query log states it, and `None` for a record type this
+/// resolver does not name — the inverse of [`private_zone_record`], over the same set of types.
+fn logged_answer(record: &ResourceRecord<'_>) -> Option<LoggedAnswer> {
+    let (record_type, rdata) = match &record.rdata {
+        RData::A(A { address }) => ("A", Ipv4Addr::from(*address).to_string()),
+        RData::AAAA(AAAA { address }) => ("AAAA", ::std::net::Ipv6Addr::from(*address).to_string()),
+        RData::CNAME(CNAME(name)) => ("CNAME", name.to_string()),
+        RData::NS(NS(name)) => ("NS", name.to_string()),
+        RData::PTR(PTR(name)) => ("PTR", name.to_string()),
+        RData::TXT(text) => (
+            "TXT",
+            // The character strings of the record, as the wire carried them: the crate reads a
+            // `TXT` record into the `name=value` attributes a text record states, so the value
+            // is rendered back from them rather than from the record set the answer came out of.
+            text.attributes()
+                .into_iter()
+                .map(|(name, value)| match value {
+                    Some(value) => format!("{name}={value}"),
+                    None => name,
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
+        ),
+        RData::MX(MX {
+            preference,
+            exchange,
+        }) => ("MX", format!("{preference} {exchange}")),
+        _other => return None,
+    };
+    Some(LoggedAnswer {
+        rdata,
+        record_type: record_type.to_string(),
+        class: CLASS_INTERNET.to_string(),
+    })
 }
 
 /// What one question came to in the DNS Firewall of the VPC.

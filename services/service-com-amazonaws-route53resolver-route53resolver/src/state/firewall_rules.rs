@@ -966,7 +966,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .any(|record| record.rule.priority == Some(request.priority))
         {
             return Err(FirewallRuleCreateRefusal::Validation(
-                firewall_rule_priority_in_use(request.firewall_rule_group_id),
+                firewall_rule_priority_in_use(request.firewall_rule_group_id, request.trace_root),
             ));
         }
 
@@ -1246,7 +1246,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .any(|(other, record)| other != index && record.rule.priority == Some(requested))
             {
                 return Err(FirewallRuleUpdateRefusal::Validation(
-                    firewall_rule_priority_in_use(request.firewall_rule_group_id),
+                    firewall_rule_priority_in_use(
+                        request.firewall_rule_group_id,
+                        request.trace_root,
+                    ),
                 ));
             }
         }

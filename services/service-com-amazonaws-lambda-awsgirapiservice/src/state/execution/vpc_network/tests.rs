@@ -243,17 +243,18 @@ fn a_message_asking_more_questions_than_the_resolver_answers_is_dropped() {
 
 /// RULE: the VPC's DNS server answers a query for an Amazon-provided hostname of an address in
 /// the VPC with that address, a reverse query for such an address with that hostname, a name
-/// of the VPC's internal zone that names no address in it with NXDOMAIN, and a name of any
-/// other zone with SERVFAIL.
+/// of the VPC's internal zone that names no address in it with NXDOMAIN, a public name whose
+/// addresses a DNS standard fixes out of that standard, and a name of any other zone with
+/// SERVFAIL.
 ///
 /// The rows differ along what is asked: the hostname of an address in each subnet, a hostname
-/// of an address outside the VPC, a hostname of no such form, a reverse question, and a name
-/// of another zone.
+/// of an address outside the VPC, a hostname of no such form, a reverse question, a name of
+/// another zone, and a public name a standard fixes.
 #[test]
 fn the_vpc_resolver_answers_the_names_of_its_own_zone() {
     let engine = ::engine::InMemoryEngine::new();
     let attachment = two_subnet_attachment(&engine);
-    let rows: [(&str, &str, TYPE, RCODE, Option<&str>); 7] = [
+    let rows: [(&str, &str, TYPE, RCODE, Option<&str>); 8] = [
         (
             "a hostname of an address in the first subnet",
             "ip-10-7-1-37.us-west-2.compute.internal",
@@ -298,10 +299,19 @@ fn the_vpc_resolver_answers_the_names_of_its_own_zone() {
         ),
         (
             "a name of another zone",
-            "example.com",
+            "broker.example.com",
             TYPE::A,
             RCODE::ServerFailure,
             None,
+        ),
+        (
+            // A name whose addresses a DNS standard fixes is answered out of that standard
+            // rather than recursed for (`service_common::public_dns_standard`).
+            "a public name a standard fixes the address of",
+            "example.com",
+            TYPE::A,
+            RCODE::NoError,
+            Some("192.0.2.1"),
         ),
     ];
     for (case, name, kind, code, answered) in rows {

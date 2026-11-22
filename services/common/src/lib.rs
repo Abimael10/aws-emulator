@@ -725,6 +725,10 @@ pub mod no_content_responses;
 /// The ONE way a service tells a continuation token it ISSUED from one a caller built,
 /// for every paginated read whose `NextToken` carries the position inside it.
 pub mod page_tokens;
+/// The PUBLIC names a DNS standard reserves for documentation, and the reserved addresses they
+/// are answered with — the one reading every resolver this emulator serves answers such a name
+/// from.
+pub mod public_dns_standard;
 /// The ONE reading of whether a resource-based policy document grants PUBLIC access — a
 /// grant to a principal nobody named — for every service that refuses such a document or
 /// reports a policy's reach.

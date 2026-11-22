@@ -5,13 +5,15 @@
 //!
 //! A query sent from inside a VPC is carried by whatever runs the client — the datagram a
 //! running function's socket hands over, the query a command run on a managed node makes — and
-//! two of the facts that decide it are this service's and Route 53's rather than that
+//! four of the facts that decide it are this service's and Route 53's rather than that
 //! component's: WHICH addresses of the VPC answer DNS and whether the security groups on the
-//! addressed interface admit the query, and WHAT the private hosted zones associated with the
-//! VPC hold for the name. Both are already one reading of those stores here
-//! ([`super::vpc_dns`]), so this module records that reading in the register the carrying
-//! components ask ([`::service_common::vpc_private_dns`]) instead of either side holding a copy
-//! of the endpoints, the groups or the zones.
+//! addressed interface admit the query, WHAT the private hosted zones associated with the
+//! VPC hold for the name, whether the VPC's Resolver configuration still has the AUTODEFINED
+//! rules for reverse DNS lookups, and WHERE a query that was answered is RECORDED. All four are
+//! already one reading of those stores here ([`super::vpc_dns`], [`super::query_log_delivery`]),
+//! so this module records that reading in the register the carrying components ask
+//! ([`::service_common::vpc_private_dns`]) instead of either side holding a copy of the
+//! endpoints, the groups, the zones or the configurations.
 //!
 //! The reading is taken PER QUESTION here, at the instant the query is carried, off the very
 //! stores this service's and Route 53's own operations write — so revoking a security-group rule
@@ -25,8 +27,8 @@ use ::std::net::Ipv4Addr;
 use ::std::sync::Arc;
 
 use ::service_common::vpc_private_dns::{
-    InVpcQuerySource, PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord, QueryAdmission,
-    VpcPrivateDns, VpcPrivateDnsPlane,
+    InVpcQuerySource, LoggedQuery, PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord,
+    QueryAdmission, VpcPrivateDns, VpcPrivateDnsPlane,
 };
 
 use super::vpc_dns::{ResponseCode, StoredVpcDns, DNS_PORT};
@@ -84,6 +86,18 @@ impl VpcPrivateDns for StoredVpcDns {
                 })
                 .collect(),
         })
+    }
+
+    fn answers_autodefined_reverse(&self, vpc_id: &str) -> bool {
+        // The VPC's own Resolver behaviour configuration, read at the instant the query is
+        // carried ([`StoredVpcDns::autodefined_reverse_answers`]).
+        self.autodefined_reverse_answers(vpc_id)
+    }
+
+    fn log_query(&self, source: &InVpcQuerySource<'_>, query: &LoggedQuery<'_>) {
+        // The configurations recording this VPC's queries, their destinations and the form of a
+        // record are this service's own ([`super::query_log_delivery`]).
+        self.record_query(source, query);
     }
 }
 

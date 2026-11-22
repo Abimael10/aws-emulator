@@ -38,7 +38,9 @@ service-com-amazonaws-outposts-outpostsolafservice = { workspace = true }
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 # The other inventories a query logging configuration's `DestinationArn` is
 # resolved against (`state::query_log_destinations`): a CloudWatch Logs log
-# group, a Kinesis data stream and a Kinesis Data Firehose delivery stream.
+# group, a Kinesis data stream and a Kinesis Data Firehose delivery stream. The
+# log group is also where a record of a query asked inside an associated VPC is
+# DELIVERED, into that service's own store (`state::query_log_delivery`).
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }

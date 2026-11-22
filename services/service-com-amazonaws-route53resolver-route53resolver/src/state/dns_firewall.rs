@@ -104,6 +104,26 @@ struct ViewRule {
     qtype: Option<u16>,
     /// What the rule does to a query it matches.
     decision: FirewallDecision,
+    /// How the rule is NAMED in a record of a query it matched: its `Action`, the rule group it
+    /// is in and the domain list it matches against ([`MatchedFirewallRule`]).
+    matched: MatchedFirewallRule,
+}
+
+/// What a query log states about the DNS Firewall rule a query MATCHED, as the members of a
+/// Resolver query log record name it: the action the rule took, the rule group the rule is in,
+/// and the domain list it matched the name against.
+///
+/// Held beside the decision rather than derived from it, because two rules with the same
+/// decision are still different rules — and because the actions that CHANGE no answer (`ALLOW`,
+/// `ALERT`) are the ones a record of the match is the only evidence of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedFirewallRule {
+    /// `FirewallRule$Action` of the rule that matched.
+    pub action: String,
+    /// The id of the rule group the rule belongs to.
+    pub rule_group_id: String,
+    /// The id of the domain list the rule matched the name against.
+    pub domain_list_id: String,
 }
 
 /// One instant's reading of the DNS Firewall filtering a VPC's queries.
@@ -123,12 +143,23 @@ impl FirewallView {
         qtype: Option<u16>,
         decision: FirewallDecision,
     ) -> Self {
+        // The ACTION of a rule that decides a query the `decision` way, so a view built here
+        // cannot report a match that contradicts the decision it was built with.
+        let action = match &decision {
+            FirewallDecision::Allow => FIREWALL_RULE_ACTION_ALLOW,
+            _blocked => FIREWALL_RULE_ACTION_BLOCK,
+        };
         Self {
             rules: vec![ViewRule {
                 order: (profiles::MIN_FIREWALL_PRIORITY, 1, 0),
                 domains: domains.iter().map(|domain| canonical_domain(domain)).collect(),
                 qtype,
                 decision,
+                matched: MatchedFirewallRule {
+                    action: action.to_string(),
+                    rule_group_id: "rslvr-frg-testrulegroup".to_string(),
+                    domain_list_id: "rslvr-fdl-testdomainlist".to_string(),
+                },
             }],
         }
     }
@@ -150,17 +181,31 @@ impl FirewallView {
     /// The first matching rule decides, in the order the rules were read into the view.
     #[must_use]
     pub fn decision(&self, name: &str, qtype: Option<u16>) -> Option<FirewallDecision> {
-        let asked = canonical_domain(name);
-        self.rules
-            .iter()
-            .find(|rule| {
-                rule.qtype.is_none_or(|only| qtype == Some(only))
-                    && rule
-                        .domains
-                        .iter()
-                        .any(|entry| entry_matches(entry, &asked))
-            })
+        self.matching(name, qtype)
             .map(|rule| rule.decision.clone())
+    }
+
+    /// How the rule that DECIDED a query for `name` of type `qtype` is named in a record of that
+    /// query, and `None` when no rule matched it — which is a query no record names a rule for.
+    ///
+    /// The same rule [`Self::decision`] answers from, so what a query was decided by and what a
+    /// record of it states cannot disagree.
+    #[must_use]
+    pub fn matched(&self, name: &str, qtype: Option<u16>) -> Option<MatchedFirewallRule> {
+        self.matching(name, qtype).map(|rule| rule.matched.clone())
+    }
+
+    /// The rule of the view that decides a query for `name` of type `qtype`: the FIRST that
+    /// matches, in the order the rules were read into the view.
+    fn matching(&self, name: &str, qtype: Option<u16>) -> Option<&ViewRule> {
+        let asked = canonical_domain(name);
+        self.rules.iter().find(|rule| {
+            rule.qtype.is_none_or(|only| qtype == Some(only))
+                && rule
+                    .domains
+                    .iter()
+                    .any(|entry| entry_matches(entry, &asked))
+        })
     }
 }
 
@@ -441,6 +486,11 @@ fn view_rule(
         domains,
         qtype,
         decision,
+        matched: MatchedFirewallRule {
+            action: rule.action.clone().unwrap_or_default(),
+            rule_group_id: rule.firewall_rule_group_id.clone().unwrap_or_default(),
+            domain_list_id: rule.firewall_domain_list_id.clone().unwrap_or_default(),
+        },
     })
 }
 
@@ -525,6 +575,71 @@ mod tests {
             domains: domains.iter().map(|domain| canonical_domain(domain)).collect(),
             qtype,
             decision,
+            // The rows below are about which rule decides; how a record of the query NAMES the
+            // rule that matched is pinned by its own row, so every rule here is named alike
+            // except for the order it sits in.
+            matched: MatchedFirewallRule {
+                action: FIREWALL_RULE_ACTION_BLOCK.to_string(),
+                rule_group_id: format!("rslvr-frg-{}", order.2),
+                domain_list_id: format!("rslvr-fdl-{}", order.2),
+            },
+        }
+    }
+
+    /// RULE: a record of a query names the rule that DECIDED it — its action, its rule group and
+    /// its domain list — which is the same rule the decision came from, including the actions
+    /// that change no answer.
+    #[test]
+    fn a_matched_rule_is_named_by_the_rule_that_decided_the_query() {
+        let view = FirewallView {
+            rules: vec![
+                ViewRule {
+                    order: (100, 1, 7),
+                    domains: vec![canonical_domain("alerted.example.com")],
+                    qtype: None,
+                    decision: FirewallDecision::Allow,
+                    matched: MatchedFirewallRule {
+                        action: FIREWALL_RULE_ACTION_ALERT.to_string(),
+                        rule_group_id: "rslvr-frg-7".to_string(),
+                        domain_list_id: "rslvr-fdl-7".to_string(),
+                    },
+                },
+                rule(
+                    (100, 2, 8),
+                    &["blocked.example.com"],
+                    None,
+                    FirewallDecision::BlockNxDomain,
+                ),
+            ],
+        };
+        // (case, the name asked for, the action a record of the query names)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a name a matched ALERT rule permits",
+                "alerted.example.com",
+                Some(FIREWALL_RULE_ACTION_ALERT),
+            ),
+            (
+                "a name a matched BLOCK rule covers",
+                "blocked.example.com",
+                Some(FIREWALL_RULE_ACTION_BLOCK),
+            ),
+            ("a name no rule covers", "other.example.com", None),
+        ];
+        for (case, name, expected) in rows {
+            let matched = view.matched(name, Some(TYPE_A));
+            assert_eq!(
+                matched.as_ref().map(|rule| rule.action.as_str()),
+                *expected,
+                "case {case:?}: expected the action {expected:?}, got {matched:?}"
+            );
+            if let Some(matched) = matched {
+                assert!(
+                    matched.rule_group_id.starts_with("rslvr-frg-")
+                        && matched.domain_list_id.starts_with("rslvr-fdl-"),
+                    "case {case:?}: expected the rule's own group and list, got {matched:?}"
+                );
+            }
         }
     }
 

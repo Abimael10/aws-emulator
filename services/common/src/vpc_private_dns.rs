@@ -16,6 +16,16 @@
 //! * WHAT the PRIVATE HOSTED ZONES associated with the VPC hold for the name asked for, which is
 //!   what such a query is answered out of ahead of anything the VPC's own internal zone holds.
 //!
+//! Two more belong to the service that owns the VPC's RESOLVER CONFIGURATION and its QUERY
+//! LOGGING, and to no component that carries a query either:
+//!
+//! * whether the AUTODEFINED rules for reverse DNS lookups are in force in the VPC, which is
+//!   what answers a reverse question about an address of it;
+//! * WHERE a query that was answered is RECORDED: the query logging configurations associated
+//!   with the VPC, what each delivers into and in which form are that service's own records, so
+//!   a component carrying a query hands over the query and what it came to, and renders and
+//!   delivers nothing itself.
+//!
 //! Beside them it carries the ONE reading of what a name NO zone reaching the VPC holds comes to
 //! ([`established_not_to_exist`]), because every resolver of such a query decides that the same
 //! way and none of them recurses anywhere.
@@ -143,6 +153,57 @@ pub struct PrivateZoneAnswer {
     pub records: Vec<PrivateZoneRecord>,
 }
 
+/// ONE record of the answer section a query was answered with, as a query LOG states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedAnswer {
+    /// The record's value, as the wire carried it.
+    pub rdata: String,
+    /// The record's type (`A`, `CNAME`, …).
+    pub record_type: String,
+    /// The record's class (`IN`).
+    pub class: String,
+}
+
+/// One query asked inside a VPC and ANSWERED, as the component that carried it states it to the
+/// service that records queries.
+///
+/// Everything here is a fact of the exchange that just happened — the question as the client
+/// asked it, the response code it was answered with, and the records it was answered with — so
+/// nothing of a query log's own form is decided by the carrier. The VPC the query was asked in
+/// and the address it came from travel beside it, in the same [`InVpcQuerySource`] every other
+/// reading of such a query is made against.
+#[derive(Debug, Clone)]
+pub struct LoggedQuery<'a> {
+    /// The name asked for, as the question carried it.
+    pub name: &'a str,
+    /// The type asked about (`A`, `PTR`, …), and the empty string for a type the carrier cannot
+    /// name.
+    pub record_type: &'a str,
+    /// The class asked about (`IN`).
+    pub class: &'a str,
+    /// The response code the client was answered with (`NOERROR`, `NXDOMAIN`, `SERVFAIL`).
+    pub response_code: &'a str,
+    /// The answer section, in the order the client read it.
+    pub answers: &'a [LoggedAnswer],
+    /// The transport the query was carried over ([`PROTOCOL_UDP`], [`PROTOCOL_TCP`]).
+    pub transport: &'a str,
+    /// The resources the query came FROM, each as `(kind, id)` — the kind being how a query log
+    /// names such a source ([`SOURCE_ID_INSTANCE`]). Empty where the carrier is no resource of
+    /// the account the query can be attributed to.
+    pub source_ids: &'a [(&'a str, &'a str)],
+}
+
+/// How a query log names an INTERNET-class question and record, which is the one class a query
+/// asked inside a VPC is asked in: what [`LoggedQuery::class`] and [`LoggedAnswer::class`] carry.
+pub const CLASS_INTERNET: &str = "IN";
+
+/// How a query log names the RESOURCE a query came from: its `instance` member, which carries
+/// the Amazon EC2 instance a query made on one came from — and, for a client that is no instance,
+/// the elastic network interface of the VPC the query left through, which is the resource the
+/// account's inventory holds the query's source address on and what a record of such a query
+/// names there.
+pub const SOURCE_ID_INSTANCE: &str = "instance";
+
 /// The service that owns the Resolver data plane of a VPC, as the components that carry an
 /// in-VPC query reach it.
 ///
@@ -168,6 +229,17 @@ pub trait VpcPrivateDns: Send + Sync + 'static {
         name: &str,
         record_type: &str,
     ) -> Option<PrivateZoneAnswer>;
+
+    /// Whether the AUTODEFINED rules for reverse DNS lookups are in force in `vpc_id`, which is
+    /// what answers a reverse question about an address of that VPC.
+    fn answers_autodefined_reverse(&self, vpc_id: &str) -> bool;
+
+    /// Record `query`, asked inside the VPC `source` names and already answered, wherever the
+    /// account asked for its queries to be recorded.
+    ///
+    /// Called with the client ALREADY answered, so it decides nothing about the answer: a
+    /// configuration that cannot be delivered into loses the record rather than failing a query.
+    fn log_query(&self, source: &InVpcQuerySource<'_>, query: &LoggedQuery<'_>);
 }
 
 /// One engine's registered plane.
@@ -253,6 +325,29 @@ impl VpcPrivateDnsPlane {
         let plane = self.0.lock().plane.clone()?;
         plane.zone_answer(vpc_id, name, record_type)
     }
+
+    /// [`VpcPrivateDns::answers_autodefined_reverse`] of the registered plane, and `true` where
+    /// none is registered — nothing then says the rules a VPC has by default are off.
+    ///
+    /// The plane is cloned out of the record first, for the reason [`Self::admission`]'s is.
+    #[must_use]
+    pub fn answers_autodefined_reverse(&self, vpc_id: &str) -> bool {
+        let Some(plane) = self.0.lock().plane.clone() else {
+            return true;
+        };
+        plane.answers_autodefined_reverse(vpc_id)
+    }
+
+    /// [`VpcPrivateDns::log_query`] of the registered plane; an engine with none registered
+    /// records no query, because no query logging configuration exists on it to record one in.
+    ///
+    /// The plane is cloned out of the record first, for the reason [`Self::admission`]'s is.
+    pub fn log_query(&self, source: &InVpcQuerySource<'_>, query: &LoggedQuery<'_>) {
+        let Some(plane) = self.0.lock().plane.clone() else {
+            return;
+        };
+        plane.log_query(source, query);
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +397,10 @@ mod tests {
         admitted_source: &'static str,
         /// The name its zone holds.
         name: &'static str,
+        /// The VPC it has the autodefined reverse rules turned OFF in.
+        reverse_disabled_in: &'static str,
+        /// Every query it was handed to record, as `(vpc, name, response code)`.
+        recorded: ::std::sync::Mutex<Vec<(String, String, String)>>,
     }
 
     impl VpcPrivateDns for OneEndpoint {
@@ -341,6 +440,18 @@ mod tests {
                 }],
             })
         }
+
+        fn answers_autodefined_reverse(&self, vpc_id: &str) -> bool {
+            vpc_id != self.reverse_disabled_in
+        }
+
+        fn log_query(&self, source: &InVpcQuerySource<'_>, query: &LoggedQuery<'_>) {
+            self.recorded.lock().expect("the record").push((
+                source.vpc_id.to_string(),
+                query.name.to_string(),
+                query.response_code.to_string(),
+            ));
+        }
     }
 
     /// The source the rows below ask as.
@@ -375,6 +486,8 @@ mod tests {
             address,
             admitted_source: "10.91.1.20",
             name: "app.example.internal.",
+            reverse_disabled_in: "vpc-2",
+            recorded: ::std::sync::Mutex::new(Vec::new()),
         }));
         // (case, the VPC the query is asked in, the client's address, the address it is sent to,
         // what the plane answers)
@@ -434,5 +547,75 @@ mod tests {
             QueryAdmission::NoServer,
             "case \"another engine\": expected no server, got one"
         );
+    }
+
+    /// RULE: the two facts of the VPC's own Resolver behaviour the register carries — whether the
+    /// autodefined reverse rules answer, and where an answered query is recorded — come from the
+    /// plane the owning service registered, and an engine with none registered has the rules a
+    /// VPC has by default and records nothing.
+    #[test]
+    fn the_registered_plane_states_the_reverse_rules_and_records_the_queries() {
+        let engine = ::engine::InMemoryEngine::new();
+        let plane = VpcPrivateDnsPlane::of(&engine).expect("the engine vends the record");
+        // Nothing registered: the default is the documented one, and no query is recorded.
+        assert!(
+            plane.answers_autodefined_reverse("vpc-2"),
+            "case \"nothing registered\": the autodefined reverse rules are on by default"
+        );
+        plane.log_query(&source("vpc-2", "10.91.1.20"), &query("app.example.internal."));
+        let registered = Arc::new(OneEndpoint {
+            vpc_id: "vpc-1",
+            address: "10.91.1.10".parse().expect("an address"),
+            admitted_source: "10.91.1.20",
+            name: "app.example.internal.",
+            reverse_disabled_in: "vpc-2",
+            recorded: ::std::sync::Mutex::new(Vec::new()),
+        });
+        plane.registering(registered.clone());
+        // (case, the VPC, whether the autodefined reverse rules answer in it)
+        let rows: &[(&str, &str, bool)] = &[
+            ("the VPC the rules are disabled in", "vpc-2", false),
+            ("a VPC they are not disabled in", "vpc-1", true),
+        ];
+        for (case, vpc_id, expected) in rows {
+            let answered = plane.answers_autodefined_reverse(vpc_id);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected {expected}, got {answered}"
+            );
+        }
+        plane.log_query(&source("vpc-1", "10.91.1.20"), &query("app.example.internal."));
+        plane.log_query(&source("vpc-1", "10.91.1.20"), &query("absent.example.internal."));
+        let recorded = registered.recorded.lock().expect("the record").clone();
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    "vpc-1".to_string(),
+                    "app.example.internal.".to_string(),
+                    "NOERROR".to_string()
+                ),
+                (
+                    "vpc-1".to_string(),
+                    "absent.example.internal.".to_string(),
+                    "NOERROR".to_string()
+                ),
+            ],
+            "case \"the queries handed over\": expected both, in the order asked, got {recorded:?}"
+        );
+    }
+
+    /// One answered query of the rows above: the name, asked of the one class and type a row
+    /// needs.
+    fn query(name: &str) -> LoggedQuery<'_> {
+        LoggedQuery {
+            name,
+            record_type: "A",
+            class: "IN",
+            response_code: "NOERROR",
+            answers: &[],
+            transport: PROTOCOL_UDP,
+            source_ids: &[],
+        }
     }
 }

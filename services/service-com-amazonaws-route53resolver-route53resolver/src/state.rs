@@ -54,6 +54,9 @@ mod domain_imports;
 mod firewall_associations;
 mod firewall_rules;
 mod query_log;
+/// What a Resolver query logging configuration associated with a VPC delivers for a query
+/// asked inside that VPC, and where.
+mod query_log_delivery;
 mod query_log_destinations;
 mod resolver_rules;
 mod tags;
@@ -2585,18 +2588,27 @@ pub fn association_priority_in_use(
 /// query type it evaluates, its action, its match source) scopes that
 /// uniqueness — so the refusal states the fault with the service's code for it
 /// ([`RSLVR_CODE_RULE_PRIORITY_IN_USE`]), names the rule group the clash is in,
-/// and asks for another number.
-pub fn firewall_rule_priority_in_use(firewall_rule_group_id: &str) -> ValidationException {
+/// asks for another number, and closes with the trace clause of the request
+/// ([`traced_message`]) — the same close the sibling priority clash of an
+/// ASSOCIATION carries ([`association_priority_in_use`]), because that clause
+/// belongs to the exception body and not to the fault it reports.
+pub fn firewall_rule_priority_in_use(
+    firewall_rule_group_id: &str,
+    trace_root: &str,
+) -> ValidationException {
     ValidationException {
-        message: Some(rslvr_message_sentences(
-            RSLVR_CODE_RULE_PRIORITY_IN_USE,
-            &[
-                &format!(
-                    "The DNS Firewall rule group already has a rule associated with the same \
-                     priority: \"{firewall_rule_group_id}\""
-                ),
-                "Provide another priority",
-            ],
+        message: Some(traced_message(
+            rslvr_message_sentences(
+                RSLVR_CODE_RULE_PRIORITY_IN_USE,
+                &[
+                    &format!(
+                        "The DNS Firewall rule group already has a rule associated with the same \
+                         priority: \"{firewall_rule_group_id}\""
+                    ),
+                    "Provide another priority",
+                ],
+            ),
+            trace_root,
         )),
     }
 }

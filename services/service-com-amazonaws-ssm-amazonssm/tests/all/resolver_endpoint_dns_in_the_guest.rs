@@ -572,7 +572,7 @@ async fn the_answer_is_what_the_zone_holds_for_the_name_asked_for() {
         },
         NameRow {
             case: "a name under no zone of the VPC",
-            name: "example.com".to_string(),
+            name: "broker.example.com".to_string(),
             record_type: "A",
             values: Vec::new(),
         },
@@ -609,7 +609,7 @@ async fn the_answer_is_what_the_zone_holds_for_the_name_asked_for() {
             format!("absent.{ZONE}"),
             "NXDOMAIN",
         ),
-        ("a name under no zone of the VPC", "example.com".to_string(), "SERVFAIL"),
+        ("a name under no zone of the VPC", "broker.example.com".to_string(), "SERVFAIL"),
     ];
     for (row, name, status) in statuses {
         let (written, _code) = output(

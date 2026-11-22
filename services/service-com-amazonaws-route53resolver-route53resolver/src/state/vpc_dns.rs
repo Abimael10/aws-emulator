@@ -38,13 +38,25 @@
 //! 53's own store: a query is answered out of the zone whose name is the longest suffix of
 //! the name asked for ("Route 53 … uses the most specific zone"), authoritatively, since the
 //! Resolver is the authority for a private zone. A name that zone holds nothing at is
-//! [`ResponseCode::NxDomain`], a name it holds other types at is answered with no records,
-//! and a name under NO zone of the VPC is one the Resolver recurses for — which leaves this
-//! process, and nothing here does that, so what it is answered with is the only part of the
-//! public namespace this emulator can read: a name that namespace establishes does not exist
-//! ([`::service_common::vpc_private_dns::established_not_to_exist`]) is
+//! [`ResponseCode::NxDomain`], a name it holds other types at is answered with no records, and
+//! a name no name of the zone stands at is still answered by a WILDCARD record set of the zone
+//! that encloses it, which is what such a record set is for ([`set_for`]).
+//!
+//! A name under NO zone of the VPC is one the Resolver recurses for — which leaves this process,
+//! and nothing here does that — so what it is answered with is the only part of the public
+//! namespace this emulator can read: a name a DNS STANDARD reserves for documentation is answered
+//! out of the one reading of those names this tree holds
+//! (`service_common::public_dns_standard`), a name the public namespace establishes does not
+//! exist ([`::service_common::vpc_private_dns::established_not_to_exist`]) is
 //! [`ResponseCode::NxDomain`], and every other one is a query this resolver could not answer
 //! ([`ResponseCode::ServFail`]).
+//!
+//! # What is recorded about a query
+//!
+//! A query this plane answered is RECORDED in each of the account's Resolver query logging
+//! configurations associated with the VPC ([`super::query_log_delivery`]) — the configurations,
+//! their destinations and the form of a record are this service's own, so the component carrying
+//! a query hands the query over and renders nothing itself.
 //!
 //! # A VIEW, not a live resolver
 //!
@@ -58,11 +70,15 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::Instant;
 
+use ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
 use ::service_com_amazonaws_route53_awsdnsv20130401::ops::types::shared_types::ResourceRecordSet;
 use ::service_com_amazonaws_route53_awsdnsv20130401::state as route53;
 
 use ::service_common::vpc_dns_firewall::FirewallDecision;
-use ::service_common::vpc_private_dns::established_not_to_exist;
+use ::service_common::vpc_private_dns::{
+    established_not_to_exist, InVpcQuerySource, LoggedAnswer, LoggedQuery, CLASS_INTERNET,
+    SOURCE_ID_INSTANCE,
+};
 
 use super::dns_firewall::{qtype_number, FirewallView};
 use super::{ec2, ENDPOINT_STATUS_OPERATIONAL, IP_STATUS_ATTACHED};
@@ -111,6 +127,24 @@ const MAX_VIEW_VALUES_PER_RECORD_SET: usize = 32;
 /// record is a CNAME, Resolver … follows the chain", and a chain this long is a loop rather
 /// than a delegation.
 const MAX_CNAME_HOPS: usize = 8;
+
+/// The owner label of a WILDCARD record set, as this store canonicalises one: a record set
+/// whose name's leftmost label is `*` answers every name under its parent that no closer name of
+/// the zone answers (RFC 1034 §4.3.3), and Route 53 writes that label as its octal escape code
+/// (`route53::canonical_dns_name`).
+const WILDCARD_LABEL: &str = "\\052.";
+
+/// The most octets a NAME a query asks about may carry: "the total length of a domain name (i.e.,
+/// label octets and label length octets) is restricted to 255 octets or less" (RFC 1035 §2.3.4).
+///
+/// A value past it is no domain name, so no zone of the account can hold it and nothing here
+/// resolves it ([`a_resolvable_name`]) — which is also what keeps the work of one query bounded
+/// by this limit rather than by the length of the string a client sent.
+const MAX_NAME_OCTETS: usize = 255;
+
+/// The most octets ONE label of such a name may carry: "labels must be 63 characters or less"
+/// (RFC 1035 §2.3.4). See [`MAX_NAME_OCTETS`].
+const MAX_LABEL_OCTETS: usize = 63;
 
 /// The `A` record type, which is the one a client asking for an address asks for.
 pub const TYPE_A: &str = "A";
@@ -207,6 +241,15 @@ pub struct VpcDnsView {
     /// The DNS Firewall filtering this VPC's queries, which decides a query BEFORE any zone
     /// is read for it ([`super::dns_firewall`]).
     firewall: FirewallView,
+    /// The security groups the client is a member of, by id — carried so a query answered out of
+    /// this view is RECORDED against the same client every other reading of it is made for.
+    groups: Vec<String>,
+    /// Where a query this view answers is recorded ([`super::query_log_delivery`]), and `None`
+    /// for a view built for a test of the answer paths alone.
+    recorder: Option<StoredVpcDns>,
+    /// The Amazon EC2 instance the client runs on, where the view was taken for one — which is
+    /// how a record of its queries names their source.
+    instance_id: Option<String>,
 }
 
 /// One address of the VPC that answers DNS.
@@ -271,8 +314,54 @@ impl VpcDnsView {
         match self.admitted(address, protocol) {
             None => Resolution::NoServer,
             Some(false) => Resolution::Dropped,
-            Some(true) => Resolution::Answered(self.resolved(name, record_type)),
+            Some(true) => {
+                let answer = self.resolved(name, record_type);
+                self.recorded(name, record_type, protocol, &answer);
+                Resolution::Answered(answer)
+            }
         }
+    }
+
+    /// Record a query this view ANSWERED in the query logging configurations of its VPC, which is
+    /// the owning slice's own write ([`super::query_log_delivery`]).
+    ///
+    /// A query that reached no resolver, and one no security group admitted, is not a query the
+    /// Resolver answered, so neither is recorded.
+    fn recorded(&self, name: &str, record_type: &str, protocol: &str, answer: &Answer) {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return;
+        };
+        let answers: Vec<LoggedAnswer> = answer
+            .records
+            .iter()
+            .map(|record| LoggedAnswer {
+                rdata: record.value.clone(),
+                record_type: record.record_type.clone(),
+                class: CLASS_INTERNET.to_string(),
+            })
+            .collect();
+        let source_ids: Vec<(&str, &str)> = self
+            .instance_id
+            .as_deref()
+            .map(|instance_id| (SOURCE_ID_INSTANCE, instance_id))
+            .into_iter()
+            .collect();
+        recorder.record_query(
+            &InVpcQuerySource {
+                vpc_id: &self.vpc_id,
+                source_ip: &self.source_ip,
+                security_group_ids: &self.groups,
+            },
+            &LoggedQuery {
+                name,
+                record_type,
+                class: CLASS_INTERNET,
+                response_code: answer.code.as_str(),
+                answers: &answers,
+                transport: protocol,
+                source_ids: &source_ids,
+            },
+        );
     }
 
     /// Whether an address of this VPC answers DNS at `server` and, if it does, whether a query
@@ -311,12 +400,24 @@ impl VpcDnsView {
     fn resolved(&self, name: &str, record_type: &str) -> Answer {
         let asked = route53::canonical_dns_name(name);
         let record_type = record_type.trim().to_ascii_uppercase();
+        // A value that is no DOMAIN NAME is a query nothing can answer: no rule of the firewall
+        // covers it, no zone holds a record set at it, and nothing recursed for it would be
+        // answered either ([`a_resolvable_name`]). Answered before anything walks it, so what one
+        // query costs is bounded by the name's own published limits.
+        if !a_resolvable_name(&asked) {
+            return Answer {
+                code: ResponseCode::ServFail,
+                authoritative: false,
+                records: Vec::new(),
+            };
+        }
         // The firewall decides a query before anything resolves the name: a blocked name is
         // answered the rule's way whether or not any zone of this VPC holds it.
         if let Some(blocked) = self.blocked(&asked, &record_type) {
             return blocked;
         }
         self.zone_answer(&asked, &record_type)
+            .or_else(|| standard_public_answer(&asked, &record_type))
             .unwrap_or_else(|| Answer {
                 code: if established_not_to_exist(&asked) {
                     ResponseCode::NxDomain
@@ -347,6 +448,13 @@ impl VpcDnsView {
 fn answer_from_zones(zones: &[ViewZone], asked: &str, record_type: &str) -> Option<Answer> {
     {
         let asked = route53::canonical_dns_name(asked);
+        // A value that is no DOMAIN NAME is one no zone of the account can hold a record set at,
+        // so nothing here resolves it — and the work of one query is bounded by the name's own
+        // published limits rather than by the length of the string a client sent
+        // ([`a_resolvable_name`]).
+        if !a_resolvable_name(&asked) {
+            return None;
+        }
         let record_type = record_type.trim().to_ascii_uppercase();
         let zone = zone_for(zones, &asked)?;
         let mut records: Vec<AnsweredRecord> = Vec::new();
@@ -358,7 +466,7 @@ fn answer_from_zones(zones: &[ViewZone], asked: &str, record_type: &str) -> Opti
         let mut owner = asked.clone();
         let mut reported_under = asked;
         for _hop in 0..MAX_CNAME_HOPS {
-            if let Some(set) = zone.records.get(&(owner.clone(), record_type.clone())) {
+            if let Some(set) = set_for(zone, &owner, &record_type) {
                 // An ALIAS to another NAME answers with what that name's own record set holds,
                 // not with the name: "one value from the referenced resource record set"
                 // (`RecordDataEntry`).
@@ -385,20 +493,14 @@ fn answer_from_zones(zones: &[ViewZone], asked: &str, record_type: &str) -> Opti
             }
             // "If … a CNAME record, Resolver returns the CNAME and then resolves the name it
             // points at" — which is why a query for an address is answered through an alias.
-            let Some(alias) = zone
-                .records
-                .get(&(owner.clone(), TYPE_CNAME.to_string()))
-                .filter(|_| record_type != TYPE_CNAME)
+            let Some(alias) =
+                set_for(zone, &owner, TYPE_CNAME).filter(|_| record_type != TYPE_CNAME)
             else {
-                let exists = zone
-                    .records
-                    .keys()
-                    .any(|(held_name, _)| held_name == &owner);
                 return Some(Answer {
                     // A name the zone holds some other type at exists: the answer is the one a
                     // resolver gives for a type that name carries none of, which is no record
                     // and no error.
-                    code: if exists || !records.is_empty() {
+                    code: if holds_name(zone, &owner) || !records.is_empty() {
                         ResponseCode::NoError
                     } else {
                         ResponseCode::NxDomain
@@ -427,6 +529,111 @@ fn answer_from_zones(zones: &[ViewZone], asked: &str, record_type: &str) -> Opti
             records,
         })
     }
+}
+
+/// Whether `asked` — a name already in this store's canonical form — is a name a query can be
+/// resolved for at all: one inside the LIMITS the domain-name format publishes
+/// ([`MAX_NAME_OCTETS`], [`MAX_LABEL_OCTETS`]).
+///
+/// A value past either limit is no domain name: no zone of the account could hold a record set at
+/// it, and nothing recursed for it would be answered either, so a query for one is answered the
+/// way a query this resolver has no answer for is. Answered here rather than resolved, which also
+/// bounds what ONE query costs: every lookup below walks the name's labels, and the name is a
+/// caller's string.
+fn a_resolvable_name(asked: &str) -> bool {
+    !asked.is_empty()
+        && asked.len() <= MAX_NAME_OCTETS
+        && asked
+            .split('.')
+            .all(|label| label.len() <= MAX_LABEL_OCTETS)
+}
+
+/// The record set of `zone` that answers a query for the canonical name `owner` of
+/// `record_type`: the set standing AT that name, and otherwise the closest WILDCARD set of the
+/// zone that covers it.
+///
+/// "You can create a wildcard record … `*` must replace the leftmost label in a domain name"
+/// (`ResourceRecordSet$Name`), and such a record set answers every name under its parent that no
+/// closer name of the zone answers — which is the closest-encloser rule for a wildcard (RFC 1034
+/// §4.3.3): a name the zone holds a record set at is answered by that set, never by a wildcard,
+/// and the wildcard that answers is the one with the LONGEST parent still enclosing the name.
+fn set_for<'a>(zone: &'a ViewZone, owner: &str, record_type: &str) -> Option<&'a ViewRecordSet> {
+    if let Some(set) = zone.records.get(&(owner.to_string(), record_type.to_string())) {
+        return Some(set);
+    }
+    // The parents of the name, closest first, each asked for the wildcard standing under it.
+    // A wildcard only covers names BELOW its own parent, so the name itself is not a parent of
+    // the search, and the zone's own apex is the last one tried.
+    enclosers(zone, owner).find_map(|parent| {
+        zone.records
+            .get(&(format!("{WILDCARD_LABEL}{parent}"), record_type.to_string()))
+    })
+}
+
+/// Whether the zone holds the canonical name `owner` at all — at any record type, or through a
+/// wildcard of the zone that covers it, which is a name that EXISTS as far as a query for
+/// another type of it is concerned.
+fn holds_name(zone: &ViewZone, owner: &str) -> bool {
+    if zone
+        .records
+        .keys()
+        .any(|(held_name, _type)| held_name == owner)
+    {
+        return true;
+    }
+    enclosers(zone, owner).any(|parent| {
+        let wildcard = format!("{WILDCARD_LABEL}{parent}");
+        zone.records
+            .keys()
+            .any(|(held_name, _type)| held_name == &wildcard)
+    })
+}
+
+/// The names a wildcard answering `owner` could stand under, closest first: every suffix of the
+/// name from its parent down to the zone's own name.
+fn enclosers<'a>(zone: &'a ViewZone, owner: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    let zone_name = zone.name.as_str();
+    ::std::iter::successors(parent_of(owner), |name| parent_of(name))
+        .take_while(move |name| name.len() >= zone_name.len())
+}
+
+/// The name one label up from the canonical name `name`, and `None` for the root.
+fn parent_of(name: &str) -> Option<&str> {
+    let (_label, parent) = name.split_once('.')?;
+    (!parent.is_empty()).then_some(parent)
+}
+
+/// The records a query for a name whose addresses a DNS STANDARD fixes is answered with, and
+/// `None` for a name no standard fixes — which is a name no zone of the account holds and this
+/// resolver cannot have recursed for.
+///
+/// Which names those are, and which addresses they stand for, is the one reading of them this
+/// tree holds (`service_common::public_dns_standard`). The answer is NOT authoritative: the
+/// Resolver is the authority for a private zone and recurses for everything else.
+fn standard_public_answer(asked: &str, record_type: &str) -> Option<Answer> {
+    if !::service_common::public_dns_standard::names_a_fixed_address(asked) {
+        return None;
+    }
+    Some(Answer {
+        code: ResponseCode::NoError,
+        authoritative: false,
+        records: ::service_common::public_dns_standard::fixed_addresses_of_type(
+            asked,
+            record_type,
+        )
+        .into_iter()
+        .map(|address| AnsweredRecord {
+            name: asked.to_string(),
+            ttl: DEFAULT_TTL,
+            record_type: if address.is_ipv4() {
+                TYPE_A.to_string()
+            } else {
+                TYPE_AAAA.to_string()
+            },
+            value: address.to_string(),
+        })
+        .collect(),
+    })
 }
 
 impl VpcDnsView {
@@ -526,14 +733,20 @@ pub fn view_from_instance<Eng: Send + Sync + 'static>(
 #[derive(Clone)]
 pub struct StoredVpcDns {
     /// This service's own store, which holds the Resolver endpoints.
-    resolver: ::engine::ServiceState<super::ComAmazonawsRoute53resolverRoute53resolverState>,
+    pub(crate) resolver:
+        ::engine::ServiceState<super::ComAmazonawsRoute53resolverRoute53resolverState>,
     /// Amazon EC2's store, or `None` for an engine that vends none — then there is no VPC, no
     /// subnet and no security group to read.
     ec2: Option<::engine::ServiceState<ec2::ComAmazonawsEc2Amazonec2State>>,
     /// Route 53's store, or `None` for an engine that vends none — then no hosted zone answers.
     route53: Option<::engine::ServiceState<route53::ComAmazonawsRoute53Awsdnsv20130401State>>,
     /// The DNS Firewall filtering a VPC's queries, read off this service's own stores.
-    firewall: Option<super::dns_firewall::StoredFirewall>,
+    pub(crate) firewall: Option<super::dns_firewall::StoredFirewall>,
+    /// CloudWatch Logs' store, or `None` for an engine that vends none — then a query logging
+    /// configuration delivering into a log group has no group to deliver into
+    /// ([`super::query_log_delivery`]).
+    pub(crate) logs:
+        Option<::engine::ServiceState<logs::ComAmazonawsCloudwatchlogsLogs20140328State>>,
 }
 
 /// Written by hand rather than derived: the state handles inside carry no `Debug`, and what is
@@ -558,17 +771,44 @@ impl StoredVpcDns {
             ec2: ec2::service_state(engine),
             route53: route53::service_state(engine),
             firewall: super::dns_firewall::StoredFirewall::of(engine),
+            logs: logs::service_state(engine),
         })
     }
 
+    /// Whether the AUTODEFINED rules for reverse DNS lookups are in force in `vpc_id`: the VPC's
+    /// own Resolver behaviour configuration, as of now.
+    ///
+    /// "Resolver … create autodefined rules for reverse DNS lookups"
+    /// (`UpdateResolverConfigRequest$AutodefinedReverseFlag`), and a configuration whose
+    /// `AutodefinedReverse` has SETTLED on disabled has none: the status it reports while the
+    /// move is still in flight is "being disabled but are not complete"
+    /// (`ResolverConfig$AutodefinedReverse`), so the rules are still answering until the move the
+    /// clock owes falls due. Every VPC the store holds no record for reports the documented
+    /// default, which is enabled.
+    ///
+    /// Call it with NO store guard held.
+    #[must_use]
+    pub fn autodefined_reverse_answers(&self, vpc_id: &str) -> bool {
+        let store = self.resolver.lock();
+        store
+            .resolver_config(vpc_id)
+            .autodefined_reverse_at(Instant::now())
+            != super::AUTODEFINED_REVERSE_DISABLED
+    }
+
     /// The DNS a client running inside the instance `instance_id` names can reach, and `None`
-    /// when no store of this plane holds such an instance in a VPC.    ///
+    /// when no store of this plane holds such an instance in a VPC.
+    ///
     /// Call it with NO store guard held: it takes each store in turn and releases it before the
     /// next.
     #[must_use]
     pub fn view_from_instance(&self, instance_id: &str) -> Option<VpcDnsView> {
         let client = self.client_of(instance_id)?;
-        Some(self.view_for(&client))
+        let mut view = self.view_for(&client);
+        // A query made on an instance is recorded as the INSTANCE's, which is how a query log
+        // names the source of one.
+        view.instance_id = Some(instance_id.to_string());
+        Some(view)
     }
 
     /// The DNS a client of `vpc_id` at `source_ip`, a member of `security_group_ids`, can reach.
@@ -641,6 +881,10 @@ impl StoredVpcDns {
                 .as_ref()
                 .map(|firewall| firewall.view_for_vpc(&client.vpc_id))
                 .unwrap_or_default(),
+            groups: client.groups.clone(),
+            // The same stores this view was read off are where a query it answers is recorded.
+            recorder: Some(self.clone()),
+            instance_id: None,
         }
     }
 
@@ -955,6 +1199,272 @@ mod tests {
             // The rows below are about the zones; a view whose VPC no rule group reaches
             // filters nothing, which is every row here.
             firewall: FirewallView::default(),
+            groups: Vec::new(),
+            // The rows below are about what is ANSWERED; a view built over no store records
+            // nothing, which is what a reading taken for a test alone does.
+            recorder: None,
+            instance_id: None,
+        }
+    }
+
+    /// The wildcard record set the rows below ask for, added to [`view`]'s own zone: a record set
+    /// standing at the name whose leftmost label is the asterisk, which is how Route 53 holds a
+    /// wildcard record set and how this store canonicalises its name.
+    fn view_with_a_wildcard() -> VpcDnsView {
+        let mut view = view();
+        let zone = view.zones.first_mut().expect("the view holds one zone");
+        zone.records.insert(
+            (
+                format!("{WILDCARD_LABEL}wild.example.internal."),
+                TYPE_A.to_string(),
+            ),
+            ViewRecordSet {
+                ttl: 120,
+                values: vec!["192.0.2.30".to_string()],
+                alias_to_name: false,
+            },
+        );
+        zone.records.insert(
+            (
+                "exact.wild.example.internal.".to_string(),
+                TYPE_A.to_string(),
+            ),
+            ViewRecordSet {
+                ttl: 120,
+                values: vec!["192.0.2.31".to_string()],
+                alias_to_name: false,
+            },
+        );
+        view
+    }
+
+    /// RULE: a WILDCARD record set of the zone answers every name under its parent that no closer
+    /// name of the zone answers, under the name that was ASKED for — and answers nothing for a
+    /// name outside its parent, or for a type it holds no record of.
+    ///
+    /// The rows span what the rule generalises over: a name one label under the wildcard's
+    /// parent, a name several labels under it, the parent itself, a name the zone holds a record
+    /// set of its own at (which the wildcard must not answer), a type the wildcard holds no
+    /// record of, and a name outside the wildcard's parent.
+    #[test]
+    fn a_wildcard_record_set_answers_the_names_under_its_parent() {
+        let view = view_with_a_wildcard();
+        let link_local = Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS).to_string();
+        // (case, the name asked for, the type, the response code, the values answered)
+        let rows: &[(&str, &str, &str, ResponseCode, &[&str])] = &[
+            (
+                "a name one label under the wildcard's parent",
+                "app.wild.example.internal",
+                TYPE_A,
+                ResponseCode::NoError,
+                &["192.0.2.30"],
+            ),
+            (
+                "a name several labels under it",
+                "db.inner.wild.example.internal",
+                TYPE_A,
+                ResponseCode::NoError,
+                &["192.0.2.30"],
+            ),
+            (
+                "the wildcard's parent itself, which a wildcard does not cover",
+                "wild.example.internal",
+                TYPE_A,
+                ResponseCode::NxDomain,
+                &[],
+            ),
+            (
+                "a name the zone holds its own record set at",
+                "exact.wild.example.internal",
+                TYPE_A,
+                ResponseCode::NoError,
+                &["192.0.2.31"],
+            ),
+            (
+                "a type the wildcard holds no record of",
+                "app.wild.example.internal",
+                TYPE_AAAA,
+                ResponseCode::NoError,
+                &[],
+            ),
+            (
+                "a name outside the wildcard's parent",
+                "elsewhere.example.internal",
+                TYPE_A,
+                ResponseCode::NxDomain,
+                &[],
+            ),
+        ];
+        for (case, name, record_type, code, values) in rows {
+            let answered = view.answer(&link_local, name, record_type, PROTOCOL_UDP);
+            let Resolution::Answered(answer) = answered else {
+                panic!("case {case:?}: expected an answer, got {answered:?}");
+            };
+            assert_eq!(
+                answer.code, *code,
+                "case {case:?}: expected {code:?}, got {answer:?}"
+            );
+            let rendered: Vec<&str> = answer
+                .records
+                .iter()
+                .map(|record| record.value.as_str())
+                .collect();
+            assert_eq!(
+                rendered, *values,
+                "case {case:?}: expected the values {values:?}, got {answer:?}"
+            );
+            // A wildcard's answer is reported under the name that was asked for, not under the
+            // wildcard's own name (RFC 1034 §4.3.3).
+            for record in &answer.records {
+                assert_eq!(
+                    record.name,
+                    route53::canonical_dns_name(name),
+                    "case {case:?}: expected the answer under the name asked for, got {record:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: a name whose addresses a DNS standard fixes is answered out of that standard, and
+    /// every other name under no zone of the VPC is one this resolver has no answer for.
+    ///
+    /// The rows span what the rule generalises over: each address family of such a name, a type
+    /// it holds no record of, a label under the same domain that no standard fixes, and an
+    /// ordinary public name.
+    #[test]
+    fn a_name_a_standard_fixes_is_answered_and_every_other_public_name_is_not() {
+        let view = view();
+        let link_local = Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS).to_string();
+        // (case, the name asked for, the type, the response code, the values answered)
+        let rows: &[(&str, &str, &str, ResponseCode, &[&str])] = &[
+            (
+                "the address of a reserved documentation domain",
+                "example.net",
+                TYPE_A,
+                ResponseCode::NoError,
+                &["192.0.2.1"],
+            ),
+            (
+                "its IPv6 address",
+                "example.net",
+                TYPE_AAAA,
+                ResponseCode::NoError,
+                &["2001:db8::1"],
+            ),
+            (
+                "the host label published beside one",
+                "www.example.org",
+                TYPE_A,
+                ResponseCode::NoError,
+                &["192.0.2.1"],
+            ),
+            (
+                "a type such a name holds no record of",
+                "example.com",
+                TYPE_CNAME,
+                ResponseCode::NoError,
+                &[],
+            ),
+            (
+                "a label under the same domain no standard fixes",
+                "broker.example.com",
+                TYPE_A,
+                ResponseCode::ServFail,
+                &[],
+            ),
+            (
+                "an ordinary public name",
+                "aws.amazon.com",
+                TYPE_A,
+                ResponseCode::ServFail,
+                &[],
+            ),
+        ];
+        for (case, name, record_type, code, values) in rows {
+            let answered = view.answer(&link_local, name, record_type, PROTOCOL_UDP);
+            let Resolution::Answered(answer) = answered else {
+                panic!("case {case:?}: expected an answer, got {answered:?}");
+            };
+            assert_eq!(
+                answer.code, *code,
+                "case {case:?}: expected {code:?}, got {answer:?}"
+            );
+            assert!(
+                !answer.authoritative,
+                "case {case:?}: a recursed answer is not this resolver's own, got {answer:?}"
+            );
+            let rendered: Vec<&str> = answer
+                .records
+                .iter()
+                .map(|record| record.value.as_str())
+                .collect();
+            assert_eq!(
+                rendered, *values,
+                "case {case:?}: expected the values {values:?}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: a value that is no DOMAIN NAME is a query this resolver has no answer for, whatever
+    /// zone of the VPC its suffix falls in — so neither the published length of a name nor the
+    /// length of one of its labels can be exceeded by what a client sends.
+    ///
+    /// The rows span each published bound ([`MAX_NAME_OCTETS`], [`MAX_LABEL_OCTETS`]): a name at
+    /// it, and one past it, under a zone of the VPC and under no zone at all.
+    #[test]
+    fn a_value_that_is_no_domain_name_is_answered_by_nothing() {
+        let view = view();
+        let link_local = Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS).to_string();
+        let zone = "example.internal";
+        // The longest label the format admits, and one octet past it.
+        let longest_label = "a".repeat(MAX_LABEL_OCTETS);
+        let overlong_label = "a".repeat(MAX_LABEL_OCTETS + 1);
+        // A name of labels of the longest admitted length, grown past the whole name's limit.
+        let overlong_name = {
+            let mut name = String::new();
+            while name.len() + longest_label.len() + zone.len() + 2 <= MAX_NAME_OCTETS {
+                name.push_str(&longest_label);
+                name.push('.');
+            }
+            format!("{name}{longest_label}.{zone}")
+        };
+        // (case, the name asked for, the response code it is answered with)
+        let rows: &[(&str, String, ResponseCode)] = &[
+            (
+                "a name under the zone at the longest admitted label length",
+                format!("{longest_label}.{zone}"),
+                ResponseCode::NxDomain,
+            ),
+            (
+                "the same name one octet past that label length",
+                format!("{overlong_label}.{zone}"),
+                ResponseCode::ServFail,
+            ),
+            (
+                "a name under the zone past the whole name's limit",
+                overlong_name.clone(),
+                ResponseCode::ServFail,
+            ),
+            (
+                "a name under no zone past the whole name's limit",
+                format!("{overlong_name}.example.com"),
+                ResponseCode::ServFail,
+            ),
+        ];
+        for (case, name, code) in rows {
+            let answered = view.answer(&link_local, name, TYPE_A, PROTOCOL_UDP);
+            let Resolution::Answered(answer) = answered else {
+                panic!("case {case:?}: expected an answer, got {answered:?}");
+            };
+            assert_eq!(
+                answer.code, *code,
+                "case {case:?}: expected {code:?} for a name of {} octets, got {answer:?}",
+                name.len()
+            );
+            assert!(
+                answer.records.is_empty(),
+                "case {case:?}: expected no record, got {answer:?}"
+            );
         }
     }
 
@@ -1040,7 +1550,7 @@ mod tests {
             (
                 "a name under a zone somebody owns, which the resolver recurses for",
                 &link_local,
-                "example.com",
+                "broker.example.com",
                 TYPE_A,
                 PROTOCOL_UDP,
                 Resolution::Answered(Answer {

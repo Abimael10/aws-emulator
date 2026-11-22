@@ -21,9 +21,11 @@
 //! itself, from zero through the integer the model's `Priority` admits at either
 //! extreme.
 //!
-//! The message is asserted in FULL: the service answers this refusal with the
-//! code, the fault sentence and the sentence that says what to send instead, so
-//! no part of it is cut before the comparison.
+//! The message is asserted in FULL but for one clause: the service answers this
+//! refusal with the code, the fault sentence and the sentence that says what to
+//! send instead, and closes with the trace id of the request it refused — a
+//! different value on every call — so what is pinned is the fixed text plus the
+//! FORM of that clause ([`assert_refusal_message`]).
 //!
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
@@ -36,16 +38,42 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{call, emulator, error_type, ok, string_member};
 
-/// The whole message the service answers for a rule whose `Priority` another
-/// rule of its group already holds, written out here rather than built from the
-/// emulator's own constants so the wording itself is what this suite pins: the
-/// service error code in square brackets, the fault sentence with the rule group
-/// double-quoted inside it, and the sentence that states what to send instead.
+/// The FIXED part of the message the service answers for a rule whose `Priority`
+/// another rule of its group already holds, written out here rather than built
+/// from the emulator's own constants so the wording itself is what this suite
+/// pins: the service error code in square brackets, the fault sentence with the
+/// rule group double-quoted inside it, and the sentence that states what to send
+/// instead. What follows it is the trace clause ([`assert_refusal_message`]).
 fn expected_message(firewall_rule_group_id: &str) -> String {
     format!(
         "[RSLVR-02203] The DNS Firewall rule group already has a rule associated with the same \
          priority: \"{firewall_rule_group_id}\". Provide another priority."
     )
+}
+
+/// What the trace clause the message closes with is written as: a single space,
+/// `Trace Id:`, and the trace id of the refused request in double quotes. The id
+/// itself is a per-run value, so the clause is pinned by its form.
+const TRACE_CLAUSE: &str = " Trace Id: \"";
+
+/// Assert `message` is the refusal the service answers for a clashing priority in
+/// `firewall_rule_group_id`: the fixed text above, closed by the trace clause of
+/// the request.
+fn assert_refusal_message(case: &str, message: &str, firewall_rule_group_id: &str) {
+    let fixed = expected_message(firewall_rule_group_id);
+    assert!(
+        message.starts_with(&fixed),
+        "case {case:?}: expected the message to open with {fixed:?}, got {message:?}"
+    );
+    let clause = &message[fixed.len()..];
+    let carries_an_id = clause.starts_with(TRACE_CLAUSE)
+        && clause.ends_with('"')
+        && clause.len() > TRACE_CLAUSE.len() + 1;
+    assert!(
+        carries_an_id,
+        "case {case:?}: expected the message to close with the trace clause of the request, \
+         got {clause:?} after the fault"
+    );
 }
 
 /// An Amazon Web Services-managed advanced threat category, as the model's
@@ -290,11 +318,7 @@ async fn a_priority_the_group_holds_is_refused_whatever_else_the_rule_states() {
             rule_body(&group, &asked_name, priority, &asked),
         )
         .await;
-        let expected = expected_message(&group);
-        assert_eq!(
-            message, expected,
-            "case {case:?}: expected message {expected:?}, got {message:?}"
-        );
+        assert_refusal_message(case, &message, &group);
 
         let held_rules = listed_rules(&router, &group).await;
         let names: Vec<String> = held_rules
@@ -439,7 +463,6 @@ async fn a_batch_entry_with_a_held_priority_reports_the_same_message() {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let expected = expected_message(&group);
     let reported: Vec<(String, String, String)> = errors
         .iter()
         .map(|error| {
@@ -453,24 +476,25 @@ async fn a_batch_entry_with_a_held_priority_reports_the_same_message() {
             )
         })
         .collect();
-    let want: Vec<(String, String, String)> = [
+    let want: Vec<(String, String)> = [
         "batch-priority-clash-stored",
         "batch-priority-clash-entry",
     ]
     .into_iter()
-    .map(|name| {
-        (
-            name.to_string(),
-            "ValidationException".to_string(),
-            expected.clone(),
-        )
-    })
+    .map(|name| (name.to_string(), "ValidationException".to_string()))
     .collect();
+    let named: Vec<(String, String)> = reported
+        .iter()
+        .map(|(name, code, _message)| (name.clone(), code.clone()))
+        .collect();
     assert_eq!(
-        reported, want,
-        "the batch must report each clashing entry with the code and the message the single \
-         create answers for it: expected {want:?}, got {reported:?}"
+        named, want,
+        "the batch must report each clashing entry with the code the single create answers for \
+         it: expected {want:?}, got {reported:?}"
     );
+    for (name, _code, message) in &reported {
+        assert_refusal_message(name, message, &group);
+    }
 
     let held: Vec<i64> = listed_rules(&router, &group)
         .await
