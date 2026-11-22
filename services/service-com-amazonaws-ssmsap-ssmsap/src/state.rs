@@ -636,6 +636,16 @@ pub enum PendingChange {
         status: String,
         /// The `ApplicationDiscoveryStatus` it takes then.
         discovery_status: String,
+        /// What the application EXPLAINS that outcome with when it falls due, and `None`
+        /// for an outcome that explains itself.
+        ///
+        /// `Application$StatusMessage` explains a status the application reached, so the
+        /// work that computed the refusal behind a non-success outcome is what states it:
+        /// the call stores the sentence here with the status it owes, and
+        /// [`StoredApplication::settle`] attaches it at the same instant it moves the
+        /// status — exactly as the operation record of that same work carries its own
+        /// explanation to its terminal status ([`StoredOperation::terminal_status_message`]).
+        status_message: Option<String>,
     },
 }
 
@@ -788,6 +798,14 @@ pub struct StoredApplication {
     pub status: String,
     /// An `ApplicationDiscoveryStatus` value; see the `DISCOVERY_STATUS_*` constants.
     pub discovery_status: String,
+    /// What this application EXPLAINS its current status with, and `None` for a status
+    /// that explains itself.
+    ///
+    /// `Application$StatusMessage` explains the status the application is in, so it is
+    /// written with that status: the work whose outcome moves the application computes
+    /// the sentence and stores it on the change it owes
+    /// ([`PendingChange::Status::status_message`]), and [`Self::settle`] attaches it at
+    /// the instant the status becomes the application's.
     pub status_message: Option<String>,
     /// The components the registration DESCRIBES for this application's SAP system
     /// ([`registered_components`]): one per `ComponentsInfo` entry, plus the SAP HANA
@@ -858,6 +876,7 @@ impl StoredApplication {
             PendingChange::Status {
                 status,
                 discovery_status,
+                status_message,
             } => {
                 // A discovery result of `SUCCESS` is what completes the discovery of this
                 // application, and therefore what makes the landscape its registration
@@ -868,6 +887,12 @@ impl StoredApplication {
                 }
                 self.status = status;
                 self.discovery_status = discovery_status;
+                // `StatusMessage` explains the status the application is IN, so it is
+                // written with that status and not beside it: the outcome the work
+                // computed carries its explanation here, and an outcome that explains
+                // itself leaves the application explaining nothing rather than keeping
+                // the sentence of a status it is no longer in.
+                self.status_message = status_message;
             }
             PendingChange::Settings(settings) => {
                 self.credentials = settings.credentials;
@@ -997,6 +1022,21 @@ impl StoredApplication {
                 discovery_status, ..
             }) => discovery_status.as_str(),
             _ => self.discovery_status.as_str(),
+        }
+    }
+
+    /// What the application is GOING to explain its status with: the explanation the
+    /// change the clock owes it carries, or the one it already reports when that change
+    /// carries none.
+    ///
+    /// The counterpart of [`Self::owed_discovery_status`], for the same reason: a control
+    /// call that supersedes an outstanding status change carries the outcome of the work
+    /// already running forward, so the sentence explaining that outcome is carried forward
+    /// with it rather than dropped.
+    pub fn owed_status_message(&self) -> Option<String> {
+        match self.pending.as_ref().map(|pending| &pending.change) {
+            Some(PendingChange::Status { status_message, .. }) => status_message.clone(),
+            _ => self.status_message.clone(),
         }
     }
 

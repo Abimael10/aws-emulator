@@ -211,6 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // discovery the clock owes this application succeeds, exactly as the one
                 // its registration started did.
                 discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
+                // The discovery this refresh re-runs succeeds and the application's own
+                // status is left where it is, so there is no non-success outcome for
+                // `StatusMessage` to explain.
+                status_message: None,
             },
         });
 

@@ -205,6 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Starting an application does not re-run discovery, so the discovery
                 // status it already reached is the one it keeps.
                 discovery_status: application.discovery_status.clone(),
+                // A start that completes leaves the application ACTIVATED, a status that
+                // explains itself: there is nothing for `StatusMessage` to state.
+                status_message: None,
             },
         });
 

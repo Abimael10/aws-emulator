@@ -371,7 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::APPLICATION_STATUS_REGISTERING.to_string(),
             discovery_status: crate::state::DISCOVERY_STATUS_REGISTERING.to_string(),
             // `StatusMessage` explains a failed status; a registration under way has
-            // nothing to explain.
+            // nothing to explain, and the refusal its discovery ran into reaches the
+            // application with the failed status it explains, below.
             status_message: None,
             described_components,
             // Discovery is part of the registration and is still running, so the service
@@ -431,6 +432,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     } else {
                         crate::state::DISCOVERY_STATUS_SUCCESS.to_string()
                     },
+                    // `StatusMessage` explains the status the application REACHES, so the
+                    // refusal the discovery ran into is attached to the failed status it
+                    // explains — the same sentence this registration's own operation
+                    // record reaches `ERROR` with below. A discovery that can be carried
+                    // out leaves nothing to explain.
+                    status_message: discovery_refusal.clone(),
                 },
             }),
         };

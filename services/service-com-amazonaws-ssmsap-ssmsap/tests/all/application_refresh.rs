@@ -541,6 +541,9 @@ fn owed_changes() -> Vec<Owed> {
             change: || PendingChange::Status {
                 status: APPLICATION_STATUS_ACTIVATED.to_string(),
                 discovery_status: DISCOVERY_STATUS_SUCCESS.to_string(),
+                // A registration whose discovery can be carried out settles on an
+                // outcome that explains itself.
+                status_message: None,
             },
         },
         Owed {
@@ -550,6 +553,7 @@ fn owed_changes() -> Vec<Owed> {
             change: || PendingChange::Status {
                 status: APPLICATION_STATUS_ACTIVATED.to_string(),
                 discovery_status: DISCOVERY_STATUS_SUCCESS.to_string(),
+                status_message: None,
             },
         },
         Owed {
@@ -559,6 +563,7 @@ fn owed_changes() -> Vec<Owed> {
             change: || PendingChange::Status {
                 status: APPLICATION_STATUS_STOPPED.to_string(),
                 discovery_status: DISCOVERY_STATUS_SUCCESS.to_string(),
+                status_message: None,
             },
         },
     ]

@@ -41,6 +41,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one suite module per `tests/all/<name>.rs`, so the single integration-test
+# target needs no hand-written list.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # The EC2 service, mounted beside this one in tests/all/ec2_instance_shutdown.rs: the
 # instance shutdown can only be driven end to end with the owner of the instances on the

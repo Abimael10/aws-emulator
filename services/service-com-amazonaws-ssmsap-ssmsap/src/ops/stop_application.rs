@@ -313,6 +313,12 @@ fn record_stop(
             // discovery was going to report, which this stop takes over the delivery of
             // rather than discarding.
             discovery_status: application.owed_discovery_status().to_string(),
+            // The explanation goes with the discovery result this stop takes over the
+            // delivery of: a registration whose discovery could not be carried out
+            // explains itself the same way whether the stop or the registration is what
+            // delivers that outcome. A stop of a discovered application carries nothing,
+            // because that outcome explains itself.
+            status_message: application.owed_status_message(),
         },
     });
 
