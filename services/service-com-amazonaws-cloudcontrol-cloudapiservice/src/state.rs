@@ -2385,7 +2385,8 @@ pub fn resource_limit_message(type_name: &str) -> String {
 ///
 /// Shared by the three mutating operations and `GetResourceRequestStatus`, so the event
 /// a create answers with and the event a later status call reports cannot disagree about
-/// one request.
+/// one request. A LISTING of requests reports the narrower summary
+/// [`request_summary`] projects from the same record.
 pub fn progress_event(record: &RequestRecord) -> crate::ops::types::ProgressEvent {
     crate::ops::types::ProgressEvent {
         type_name: Some(record.type_name.clone()),
@@ -2403,6 +2404,23 @@ pub fn progress_event(record: &RequestRecord) -> crate::ops::types::ProgressEven
         retry_after: record
             .retry_after
             .map(::aws_smithy_types::DateTime::from),
+    }
+}
+
+/// The summary one request record reports as in a LISTING of resource operation requests.
+///
+/// A listing of requests reports each request's identity, operation, status and timing —
+/// the type, the primary identifier, the request token, the operation, the operation
+/// status, when it was initiated and, while one is owed, what the status says and when to
+/// poll again. It reports no RESOURCE MODEL: the model of the resource a request left
+/// behind is surfaced by the per-request reads, `GetResourceRequestStatus` for the request
+/// and `GetResource` for the resource, so an enumeration of requests never carries that
+/// payload. Every other member is the one [`progress_event`] reports, so a listing and a
+/// status call still cannot disagree about a request.
+pub fn request_summary(record: &RequestRecord) -> crate::ops::types::ProgressEvent {
+    crate::ops::types::ProgressEvent {
+        resource_model: None,
+        ..progress_event(record)
     }
 }
 

@@ -227,7 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListResourceRequestsOutput {
             resource_request_status_summaries: Some(
                 page.iter()
-                    .map(|record| crate::state::progress_event(record))
+                    // The LIST-shaped summary of each request: everything the status call
+                    // reports about it except the resource model, which an enumeration of
+                    // requests does not carry ([`crate::state::request_summary`]).
+                    .map(|record| crate::state::request_summary(record))
                     .collect(),
             ),
             next_token,

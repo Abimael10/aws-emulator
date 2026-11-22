@@ -32,7 +32,9 @@
 
 use serde_json::{json, Value};
 
-use super::emulator::{code, element, progress, text, Emulator, STATUS_SUCCESS};
+use super::emulator::{
+    code, element, listing_shaped, progress, text, Emulator, RESOURCE_MODEL, STATUS_SUCCESS,
+};
 use super::sns_topic_read_through::{attribute, attributes};
 
 /// The `Operation` a create's request record reports, as the model's own enum declares it
@@ -260,8 +262,10 @@ async fn summary(emulator: &Emulator, case: &str, token: &str) -> Value {
 }
 
 /// Assert the two views report ONE record for `token`: the summary the listing reports is
-/// the very `ProgressEvent` the status call resolves the token to, and it names the
-/// operation, type and identifier expected of it.
+/// the `ProgressEvent` the status call resolves the token to, projected as a listing
+/// reports it — every member of that event except the resource model, which the status
+/// call surfaces and the listing does not — and it names the operation, type and identifier
+/// expected of it.
 ///
 /// The status call is made AFTER the listing, so a record the two views compose differently
 /// fails here whichever of them a client read first.
@@ -282,10 +286,14 @@ async fn assert_views_agree(
     );
     assert_eq!(
         listed,
-        progress(&body),
-        "case {case:?}: the listing and the status call must report the same ProgressEvent, \
-         got {listed:?} and {:?}",
+        listing_shaped(&progress(&body)),
+        "case {case:?}: the listing and the status call must report the same ProgressEvent \
+         apart from the resource model, got {listed:?} and {:?}",
         progress(&body)
+    );
+    assert!(
+        listed.get(RESOURCE_MODEL).is_none(),
+        "case {case:?}: the listing summary must carry no {RESOURCE_MODEL}, got {listed:?}"
     );
     for (view, event) in [("the listing", &listed), ("the status call", &progress(&body))] {
         assert_eq!(

@@ -945,6 +945,22 @@ pub(crate) fn progress(body: &Value) -> Value {
     body["ProgressEvent"].clone()
 }
 
+/// The member a LISTING of resource operation requests reports no summary with: the
+/// resource model, which the per-request reads surface and an enumeration of requests does
+/// not carry.
+pub(crate) const RESOURCE_MODEL: &str = "ResourceModel";
+
+/// `event` with its [`RESOURCE_MODEL`] dropped: the summary shape a request listing
+/// reports, so a case can hold the listing and the status call to ONE record without
+/// expecting the listing to carry the resource model.
+pub(crate) fn listing_shaped(event: &Value) -> Value {
+    let mut projected = event.clone();
+    if let Some(members) = projected.as_object_mut() {
+        members.remove(RESOURCE_MODEL);
+    }
+    projected
+}
+
 /// The `ResourceDescriptions` of a listing.
 pub(crate) fn descriptions(listed: &Value) -> Vec<Value> {
     listed["ResourceDescriptions"]

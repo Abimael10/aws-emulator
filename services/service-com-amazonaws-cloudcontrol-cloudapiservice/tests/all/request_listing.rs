@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use super::emulator::{code, message, progress, text, Emulator, STATUS_IN_PROGRESS, STATUS_SUCCESS};
+use super::emulator::{
+    code, listing_shaped, message, progress, text, Emulator, RESOURCE_MODEL, STATUS_IN_PROGRESS,
+    STATUS_SUCCESS,
+};
 
 /// The type most cases drive requests against.
 const STREAM: &str = "AWS::Kinesis::Stream";
@@ -153,14 +156,13 @@ async fn created(emulator: &Emulator, type_name: &str, desired_state: &Value) ->
 #[tokio::test]
 async fn a_listing_reports_every_request_newest_first_and_agrees_with_the_status_call() {
     let emulator = Emulator::new();
-    // One request of each operation type, over two resource types, each initiated a
-    // measurable instant after the one before it — so the order a listing reports cannot
-    // be insertion order of the store's own map by accident.
+    // One request of each operation type, over two resource types, each initiated after
+    // the one before it — so the order a listing reports cannot be insertion order of the
+    // store's own map by accident. That the instants are DISTINCT is asserted below off
+    // the `EventTime`s the service itself reports, rather than waited for.
     let mut accepted = Vec::new();
     accepted.push(created(&emulator, STREAM, &json!({ "StreamName": "alpha" })).await);
-    tokio::time::sleep(APART).await;
     accepted.push(created(&emulator, RULE, &json!({ "Name": "zulu" })).await);
-    tokio::time::sleep(APART).await;
     let updated = emulator
         .update(
             STREAM,
@@ -177,7 +179,6 @@ async fn a_listing_reports_every_request_newest_first_and_agrees_with_the_status
     let update_token = text(&progress(&updated.1), "RequestToken");
     emulator.settled(&update_token).await;
     accepted.push(update_token);
-    tokio::time::sleep(APART).await;
     let deleted = emulator.delete_and_settle(STREAM, "alpha").await;
     accepted.push(text(&deleted, "RequestToken"));
 
@@ -195,18 +196,21 @@ async fn a_listing_reports_every_request_newest_first_and_agrees_with_the_status
         "case every request: the last page must carry no NextToken, got {listed:?}"
     );
 
-    // Newest first means the reported `EventTime`s do not increase down the page.
+    // Newest first means the reported `EventTime`s DECREASE down the page: each of these
+    // requests was accepted by a call of its own, so each was initiated at its own
+    // instant, and the order above is the one the service reports rather than a tie.
     let times: Vec<f64> = summaries(&listed)
         .iter()
         .map(|summary| summary["EventTime"].as_f64().unwrap_or_default())
         .collect();
     assert!(
-        times.windows(2).all(|pair| pair[0] >= pair[1]),
-        "case ordering: expected non-increasing EventTimes, got {times:?}"
+        times.windows(2).all(|pair| pair[0] > pair[1]),
+        "case ordering: expected strictly decreasing EventTimes, got {times:?}"
     );
 
-    // And each summary is the very `ProgressEvent` the status call reports for that
-    // request: one listing and one status call cannot disagree about a request.
+    // And each summary is the `ProgressEvent` the status call reports for that request,
+    // as a listing reports it — every member of that event except the resource model: one
+    // listing and one status call cannot disagree about a request.
     for summary in summaries(&listed) {
         let token = text(&summary, "RequestToken");
         let (status, body) = emulator.status(&token).await;
@@ -216,11 +220,16 @@ async fn a_listing_reports_every_request_newest_first_and_agrees_with_the_status
              {status} with body {body:?}"
         );
         assert_eq!(
-            progress(&body),
+            listing_shaped(&progress(&body)),
             summary,
             "case request {token:?}: the listing and the status call must report the same \
-             ProgressEvent, got {:?} and {summary:?}",
+             ProgressEvent apart from the resource model, got {:?} and {summary:?}",
             progress(&body)
+        );
+        assert!(
+            summary.get(RESOURCE_MODEL).is_none(),
+            "case request {token:?}: the listing summary must carry no {RESOURCE_MODEL}, got \
+             {summary:?}"
         );
         assert_eq!(
             text(&summary, "OperationStatus"),
