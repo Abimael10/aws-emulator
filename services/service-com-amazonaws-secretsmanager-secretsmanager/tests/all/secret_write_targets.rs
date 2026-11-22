@@ -27,6 +27,7 @@
 //! the modification made and the report taken.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
@@ -213,6 +214,29 @@ async fn last_changed(router: &MultiServiceRouter, secret_id: &str, case: &str) 
         .get("LastChangedDate")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("case {case:?}: no LastChangedDate in {described}"))
+}
+
+/// The clock in the unit this service reports a date in: whole milliseconds since
+/// the epoch.
+fn epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the test clock is after the epoch")
+        .as_millis()
+}
+
+/// Wait until the clock has LEFT the millisecond `reported` names.
+///
+/// This service reports a date at millisecond resolution, so a write made inside
+/// the same millisecond as the stamp already on the secret records that very same
+/// instant and the advance is invisible. Polling the clock waits exactly as long
+/// as the host needs to reach the next millisecond — never a fixed span — so the
+/// case proves the same thing on a fast machine and a loaded one.
+async fn past_the_millisecond_of(reported: f64) {
+    let reported_millis = (reported * 1_000.0).round() as u128;
+    while epoch_millis() <= reported_millis {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A prepared call: the operation's name and the members its request carries.
@@ -604,6 +628,7 @@ async fn last_changed_date_advances_on_a_modification_and_never_on_a_report() {
             ok(&router, prepare, body, &case).await;
         }
         let before = last_changed(&router, name, &case).await;
+        past_the_millisecond_of(before).await;
         ok(&router, operation, request, &case).await;
         let after = last_changed(&router, name, &case).await;
         assert!(

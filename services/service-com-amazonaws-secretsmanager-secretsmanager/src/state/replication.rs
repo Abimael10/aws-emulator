@@ -356,6 +356,11 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
             promoted.secret_type = content.secret_type;
             promoted.owning_service = content.owning_service;
             promoted.tags = content.tags;
+            // The promoted secret takes the tag list it had been reading as its
+            // own, which includes whether that list HAS a value at all: a primary
+            // every tag of which was removed hands on an empty list that is still
+            // reported ([`Secret::tags_ever_attached`]).
+            promoted.tags_ever_attached = content.tags_ever_attached;
             promoted.rotation_enabled = content.rotation_enabled;
             promoted.rotation_lambda_arn = content.rotation_lambda_arn;
             promoted.rotation_rules = content.rotation_rules;

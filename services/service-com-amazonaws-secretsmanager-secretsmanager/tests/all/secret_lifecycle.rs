@@ -8,6 +8,11 @@
 //! and size, the form of the `SecretId`, how many versions have been put, the
 //! recovery window, the page size, the filter key. One recorded request is one
 //! row.
+//!
+//! One rule here is about how a response is RENDERED rather than about what it
+//! holds: every timestamp member of this model is a plain `timestamp` with no
+//! `@timestampFormat` override, so `awsJson1_1` carries it as an epoch-seconds
+//! number, and the service reports a date at millisecond resolution.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1798,4 +1803,173 @@ async fn a_secret_created_with_replica_regions_is_stored_with_them() {
         Some(REGION),
         "a replicated secret reports the Region it is in, got {described}"
     );
+}
+
+/// How many fractional digits the shortest decimal that identifies `reported`
+/// carries, which is the resolution of the instant the wire number names: a date
+/// that is a whole number of milliseconds needs at most three, and one carrying
+/// finer digits cannot be written in fewer.
+fn fractional_digits(reported: f64) -> usize {
+    format!("{reported}")
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.trim_end_matches('0').len())
+}
+
+/// Every date member of a response body, wherever it sits — a member of the body
+/// itself or of an entry of one of its lists — as the member's name and the
+/// epoch-seconds number it carries.
+fn date_members(parsed: &Value) -> Vec<(String, f64)> {
+    let mut found = Vec::new();
+    collect_date_members(parsed, &mut found);
+    found
+}
+
+/// Walk `parsed`, pushing every member whose name ends in `Date` and whose value
+/// is a number.
+fn collect_date_members(parsed: &Value, found: &mut Vec<(String, f64)>) {
+    match parsed {
+        Value::Object(members) => {
+            for (name, value) in members {
+                match value.as_f64() {
+                    Some(reported) if name.ends_with("Date") => {
+                        found.push((name.clone(), reported));
+                    }
+                    _ => collect_date_members(value, found),
+                }
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_date_members(entry, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Assert every date member of one response is reported at the service's date
+/// resolution, and that the members the case names are among them — so the rule
+/// is asserted on a member that is there rather than on an absent one.
+fn assert_date_resolution(parsed: &Value, operation: &str, case: &str, expected: &[&str]) {
+    let reported = date_members(parsed);
+    for (member, instant) in &reported {
+        let digits = fractional_digits(*instant);
+        assert!(
+            digits <= 3,
+            "case {case:?}: expected {operation} to report {member} at this service's date \
+             resolution — an epoch-seconds number of whole milliseconds, so at most three \
+             fractional digits — got {instant} with {digits}"
+        );
+    }
+    for member in expected {
+        assert!(
+            reported.iter().any(|(name, _)| name == member),
+            "case {case:?}: expected {operation} to report {member}, got {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_date_member_is_reported_at_the_services_date_resolution() {
+    // Every timestamp member of this model is a plain `timestamp` with no
+    // `@timestampFormat` override, so `awsJson1_1` carries it as the epoch-seconds
+    // NUMBER its default names — and the service reports a date at millisecond
+    // resolution, so the number names a whole number of milliseconds whatever the
+    // host clock's own resolution is. The rows run over the type and size of the
+    // stored value, how many versions have been put and the recovery window the
+    // deletion asks for; each row reads every operation of the lifecycle that
+    // reports a date at all.
+    for (index, value) in value_cases().iter().enumerate() {
+        for (window_case, window) in [
+            ("no window, so the documented default", None),
+            ("the published minimum window", Some(7)),
+            ("the published maximum window", Some(30)),
+        ] {
+            let router = emulator();
+            let case = format!("{} with {window_case}", value.label);
+            let case = case.as_str();
+            let name = format!("dated/{index}");
+            let mut request = json!({"Name": &name});
+            let Value::Object(members) = value.wire_members() else {
+                unreachable!("wire_members builds an object")
+            };
+            for (member, wire) in members {
+                request[member] = wire;
+            }
+            let created = ok(&router, "CreateSecret", request, case).await;
+            assert_date_resolution(&created, "CreateSecret", case, &[]);
+
+            // A second version, so the version listing reports more than one
+            // created instant.
+            ok(
+                &router,
+                "PutSecretValue",
+                json!({"SecretId": &name, "SecretString": "next"}),
+                case,
+            )
+            .await;
+
+            let fetched = ok(&router, "GetSecretValue", json!({"SecretId": &name}), case).await;
+            assert_date_resolution(&fetched, "GetSecretValue", case, &["CreatedDate"]);
+
+            let described = ok(&router, "DescribeSecret", json!({"SecretId": &name}), case).await;
+            assert_date_resolution(
+                &described,
+                "DescribeSecret",
+                case,
+                &["CreatedDate", "LastChangedDate"],
+            );
+
+            let listed = ok(&router, "ListSecrets", json!({}), case).await;
+            assert_date_resolution(
+                &listed,
+                "ListSecrets",
+                case,
+                &["CreatedDate", "LastChangedDate"],
+            );
+
+            let versions = ok(
+                &router,
+                "ListSecretVersionIds",
+                json!({"SecretId": &name, "IncludeDeprecated": true}),
+                case,
+            )
+            .await;
+            assert_date_resolution(&versions, "ListSecretVersionIds", case, &["CreatedDate"]);
+
+            let batch = ok(
+                &router,
+                "BatchGetSecretValue",
+                json!({"SecretIdList": [&name]}),
+                case,
+            )
+            .await;
+            assert_date_resolution(&batch, "BatchGetSecretValue", case, &["CreatedDate"]);
+
+            let mut delete = json!({"SecretId": &name});
+            if let Some(window) = window {
+                delete["RecoveryWindowInDays"] = json!(window);
+            }
+            let deleted = ok(&router, "DeleteSecret", delete, case).await;
+            assert_date_resolution(&deleted, "DeleteSecret", case, &["DeletionDate"]);
+
+            // The scheduled secret carries one more date member, and the
+            // listing reports it too.
+            let scheduled = ok(&router, "DescribeSecret", json!({"SecretId": &name}), case).await;
+            assert_date_resolution(
+                &scheduled,
+                "DescribeSecret",
+                case,
+                &["CreatedDate", "DeletedDate", "LastChangedDate"],
+            );
+            let scheduled_list = ok(
+                &router,
+                "ListSecrets",
+                json!({"IncludePlannedDeletion": true}),
+                case,
+            )
+            .await;
+            assert_date_resolution(&scheduled_list, "ListSecrets", case, &["DeletedDate"]);
+        }
+    }
 }

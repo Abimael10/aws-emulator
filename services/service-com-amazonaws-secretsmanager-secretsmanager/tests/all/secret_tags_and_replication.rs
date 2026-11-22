@@ -13,6 +13,9 @@
 //!   in `ReplicationStatus` with a `StatusType` status;
 //! * `PrimaryRegion` is part of the replication view, so it is reported exactly
 //!   while the secret has at least one replica;
+//! * a tag list that a removal EMPTIED is still a value the secret has, so it is
+//!   reported as the empty list, while a secret no tag was ever attached to
+//!   carries no `Tags` member at all;
 //! * a fresh replica is created `InProgress` and the clock moves it to `InSync`.
 //!
 //! Every test is a TABLE over the class its rule generalises: the number of
@@ -355,10 +358,13 @@ async fn tags_attached_to_a_secret_round_trip_through_describe_and_list() {
             .filter(|(key, _)| !tag_case.detach.contains(key))
             .collect();
         if expected.is_empty() {
+            // The member has a value from the first tag onwards, so a list
+            // emptied by a removal is reported EMPTY rather than dropped.
             assert_eq!(
                 after.get("Tags"),
-                None,
-                "case {case:?}: a secret left with no tags must report no Tags, got {after}"
+                Some(&json!([])),
+                "case {case:?}: a secret every tag of which was removed must report Tags as the \
+                 empty list, got {after}"
             );
         } else {
             assert_eq!(
@@ -1206,3 +1212,171 @@ async fn stop_replication_to_replica_answers_for_the_region_it_is_called_in() {
         "case {case:?}: the primary no longer replicates to the promoted Region, got {after}"
     );
 }
+
+/// One row of the emptied-tag-list table: how the secret came to carry tags, and
+/// the calls that take every one of them off again.
+struct EmptiedCase {
+    label: &'static str,
+    /// The tags the create attaches, which is the path a `CreateSecret` request
+    /// carries them on.
+    created_with: Vec<(&'static str, &'static str)>,
+    /// The tags each later `TagResource` attaches, one call per entry.
+    attached: Vec<Vec<(&'static str, &'static str)>>,
+    /// The keys each later `UntagResource` removes, one call per entry.
+    detached: Vec<Vec<&'static str>>,
+}
+
+/// The table: the rule generalises over how many tags a secret carried, which
+/// write attached them and in how many calls they were removed, so the rows
+/// differ along each of those and every one ends with an empty tag list.
+fn emptied_cases() -> Vec<EmptiedCase> {
+    vec![
+        EmptiedCase {
+            label: "one tag attached and removed",
+            created_with: vec![],
+            attached: vec![vec![("team", "payments")]],
+            detached: vec![vec!["team"]],
+        },
+        EmptiedCase {
+            label: "three tags removed in one call",
+            created_with: vec![],
+            attached: vec![vec![("env", "prod"), ("team", "core"), ("owner", "sre")]],
+            detached: vec![vec!["env", "team", "owner"]],
+        },
+        EmptiedCase {
+            label: "three tags removed one call at a time",
+            created_with: vec![],
+            attached: vec![vec![("env", "prod")], vec![("team", "core"), ("owner", "sre")]],
+            detached: vec![vec!["env"], vec!["team"], vec!["owner"]],
+        },
+        EmptiedCase {
+            label: "tags the create carried, then removed",
+            created_with: vec![("env", "staging"), ("owner", "sre")],
+            attached: vec![],
+            detached: vec![vec!["env", "owner"]],
+        },
+        EmptiedCase {
+            label: "a removal that also names keys the secret never carried",
+            created_with: vec![("only", "one")],
+            attached: vec![],
+            detached: vec![vec!["only", "absent", "never-attached"]],
+        },
+    ]
+}
+
+/// The `Tags` member of a request body, from a row's pairs.
+fn wire_tags(pairs: &[(&'static str, &'static str)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_tag_list_emptied_by_a_removal_is_reported_empty_rather_than_dropped() {
+    // "Secrets Manager only returns fields that have a value in the response"
+    // (`DescribeSecret`, this service's Smithy model): a tag write gives the
+    // secret's tag list a value, so from the first tag onwards the member is
+    // reported — as the EMPTY list once every tag has been removed again — while a
+    // secret no tag was ever attached to has no such member at all. Each row is
+    // crossed with the reporting operation that projects the list and with the
+    // secret's own state, so neither is the one case the rule is asserted on.
+    for (index, row) in emptied_cases().iter().enumerate() {
+        let router = emulator();
+        let case = row.label;
+        let name = format!("emptied/{index}");
+        let mut create_body = json!({"Name": &name, "SecretString": "s3cret"});
+        if !row.created_with.is_empty() {
+            create_body["Tags"] = wire_tags(&row.created_with);
+        }
+        ok(&router, "CreateSecret", create_body, case).await;
+        for attach in &row.attached {
+            ok(
+                &router,
+                "TagResource",
+                json!({"SecretId": &name, "Tags": wire_tags(attach)}),
+                case,
+            )
+            .await;
+        }
+
+        // While tags are attached the member carries them, so the rows reach the
+        // empty list from a reported list rather than from nothing.
+        let tagged = ok(&router, "DescribeSecret", json!({"SecretId": &name}), case).await;
+        assert!(
+            !tags_of(&tagged, case).is_empty(),
+            "case {case:?}: the row must attach at least one tag before removing it, got {tagged}"
+        );
+
+        for detach in &row.detached {
+            ok(
+                &router,
+                "UntagResource",
+                json!({"SecretId": &name, "TagKeys": detach}),
+                case,
+            )
+            .await;
+        }
+
+        // Both reporting operations project the same emptied list, and both report
+        // it as present and empty.
+        for (reporter, reported) in [
+            (
+                "DescribeSecret",
+                ok(&router, "DescribeSecret", json!({"SecretId": &name}), case).await,
+            ),
+            (
+                "ListSecrets",
+                // The listing's projection of one secret, as the deletion-window
+                // suite already reads it.
+                crate::secret_deletion_window::listed(&router, &name, case).await,
+            ),
+        ] {
+            assert_eq!(
+                reported.get("Tags"),
+                Some(&json!([])),
+                "case {case:?}: expected {reporter} to report Tags as the empty list once every \
+                 tag was removed, got {reported}"
+            );
+        }
+
+        // And it stays reported while the secret is scheduled for deletion, which
+        // changes the secret's state and not its tag list.
+        ok(&router, "DeleteSecret", json!({"SecretId": &name}), case).await;
+        let scheduled = ok(&router, "DescribeSecret", json!({"SecretId": &name}), case).await;
+        assert_eq!(
+            scheduled.get("Tags"),
+            Some(&json!([])),
+            "case {case:?}: expected the scheduled secret to keep reporting Tags as the empty \
+             list, got {scheduled}"
+        );
+
+        // The contrast: a secret of the same store no tag was ever attached to
+        // carries no Tags member at all, so the empty list reports a REMOVAL
+        // rather than being reported for every secret.
+        let untouched = format!("never-tagged/{index}");
+        create(&router, &untouched, case).await;
+        let bare = ok(
+            &router,
+            "DescribeSecret",
+            json!({"SecretId": &untouched}),
+            case,
+        )
+        .await;
+        assert_eq!(
+            bare.get("Tags"),
+            None,
+            "case {case:?}: a secret no tag was ever attached to must report no Tags, got {bare}"
+        );
+        let bare_entry = crate::secret_deletion_window::listed(&router, &untouched, case).await;
+        assert_eq!(
+            bare_entry.get("Tags"),
+            None,
+            "case {case:?}: ListSecrets must report no Tags for a never-tagged secret, got \
+             {bare_entry}"
+        );
+    }
+}
+

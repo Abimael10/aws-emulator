@@ -1558,10 +1558,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Render a stored instant as the wire timestamp type.
+/// Render a stored instant as the wire timestamp type, at the resolution this
+/// service's dates carry.
+///
+/// Every timestamp member of this model is a plain `timestamp` with no
+/// `@timestampFormat` override, so `awsJson1_1` carries it as an epoch-seconds
+/// NUMBER — and the service reports a date at MILLISECOND resolution, so the
+/// host clock's finer digits are dropped here rather than serialized. The one
+/// place a stored `SystemTime` becomes a wire `DateTime` for this service, so
+/// every operation's date members are shaped alike.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    // TOTAL for any instant a `SystemTime` can hold: an epoch offset too large
+    // for the wire type saturates instead of wrapping into a past date.
+    let millis = i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX);
+    ::aws_smithy_types::DateTime::from_millis(millis)
 }
 
 /// `at` truncated to midnight UTC, the resolution the service reports an access
@@ -1904,6 +1915,19 @@ pub struct Secret {
     /// `None` for one a caller created.
     pub owning_service: Option<String>,
     pub tags: Vec<StoredTag>,
+    /// Whether a tag has ever been attached to this secret, which is what tells a
+    /// tag list that is empty because every tag was REMOVED from one a secret
+    /// never carried.
+    ///
+    /// "Secrets Manager only returns fields that have a value in the response"
+    /// (`DescribeSecret`, this service's Smithy model): a tag write gives the
+    /// secret's tag list a value — the list it holds from then on, empty or not —
+    /// while a secret no tag was ever attached to has none, so [`tags_out`]
+    /// reports the list from the first tag onwards and omits the member only
+    /// before it.
+    ///
+    /// [`tags_out`]: Secret::tags_out
+    pub tags_ever_attached: bool,
     pub created_date: SystemTime,
     pub last_changed_date: SystemTime,
     pub last_accessed_date: Option<SystemTime>,
@@ -2066,6 +2090,7 @@ impl Secret {
             secret_type: None,
             owning_service: None,
             tags: Vec::new(),
+            tags_ever_attached: false,
             created_date: at,
             last_changed_date: at,
             last_accessed_date: None,
@@ -2427,9 +2452,14 @@ impl Secret {
         })
     }
 
-    /// The secret's tags for the wire, omitted while it carries none.
+    /// The secret's tags for the wire: the list it holds once a tag write has
+    /// given it one — the EMPTY list for a secret every tag of which was removed
+    /// again — and nothing at all while no tag was ever attached to it (see
+    /// [`tags_ever_attached`]).
+    ///
+    /// [`tags_ever_attached`]: Secret::tags_ever_attached
     pub fn tags_out(&self) -> Option<Vec<Tag>> {
-        (!self.tags.is_empty()).then(|| {
+        (self.tags_ever_attached || !self.tags.is_empty()).then(|| {
             self.tags
                 .iter()
                 .map(|tag| Tag {
@@ -2438,6 +2468,13 @@ impl Secret {
                 })
                 .collect()
         })
+    }
+
+    /// Give the secret `tags` as its whole tag list, as a create does with the
+    /// tags its request carried.
+    pub fn set_tags(&mut self, tags: Vec<StoredTag>) {
+        self.tags_ever_attached |= !tags.is_empty();
+        self.tags = tags;
     }
 
     /// Attach `tags` to the secret, appending the keys it does not carry yet and
@@ -2461,6 +2498,9 @@ impl Secret {
                 None => self.tags.push(stored),
             }
         }
+        // A tag write is what gives the list a value, whatever merging it into
+        // the stored list leaves behind.
+        self.tags_ever_attached |= !tags.is_empty();
         self.last_changed_date = at;
     }
 

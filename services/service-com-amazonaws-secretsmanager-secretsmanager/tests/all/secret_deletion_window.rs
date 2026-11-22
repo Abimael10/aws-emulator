@@ -140,7 +140,11 @@ async fn describe(router: &MultiServiceRouter, secret_id: &str, case: &str) -> V
 }
 
 /// The entry `ListSecrets` reports for one secret, scheduled deletions included.
-async fn listed(router: &MultiServiceRouter, name: &str, case: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite under `tests/all/` reads the listing's
+/// projection of one secret through this helper instead of writing a second copy
+/// of it.
+pub(crate) async fn listed(router: &MultiServiceRouter, name: &str, case: &str) -> Value {
     let page = ok(
         router,
         "ListSecrets",
