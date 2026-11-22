@@ -13,16 +13,16 @@
 //! rather than by whoever is starting the container.
 //!
 //! TWO kinds of host address this gallery, and both have to be read, because a client
-//! composes a reference on whichever of them it was given: an address this emulator answers
-//! on ([`registry_address::names_this_emulator`]), which is the authority every URI this
-//! registry PUBLISHES is built on ([`registry_address::announced_gallery_authority`]) and the
-//! endpoint a client pointed straight at this emulator reaches it by; and an authority that
-//! names a public registry of the gallery AWS serves
-//! ([`registry_address::names_the_public_gallery`]) — the fixed `public`.`ecr` labels over a
-//! zone, which covers the name AWS serves the gallery at ([`GALLERY_HOST`]) as a reference
-//! written BY HAND carries it. So the reference a client builds from the URI the API handed
-//! it resolves to the very repository that URI names, and so does one a container definition
-//! spells in AWS's own form.
+//! composes a reference on whichever of them it was given: an authority that names a public
+//! registry ([`registry_address::names_the_public_gallery`]) — the fixed `public`.`ecr` labels
+//! over a zone, which covers both the authority every URI this registry PUBLISHES is built on
+//! ([`registry_address::announced_gallery_authority`], those labels over a zone this emulator
+//! answers in) and the name AWS serves its own gallery at ([`GALLERY_HOST`]) as a reference
+//! written BY HAND carries it; and an address this emulator answers on
+//! ([`registry_address::names_this_emulator`]), which is the endpoint a client pointed
+//! straight at this emulator reaches it by. So the reference a client builds from the URI the
+//! API handed it resolves to the very repository that URI names, and so does one a container
+//! definition spells in AWS's own form.
 //!
 //! Only this registry's own alias is answered: an alias this registry was not assigned names
 //! some other public registry ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]
@@ -238,8 +238,14 @@ mod tests {
                 expected: Some(names("alias", "app", Some("1.2"), None)),
             },
             Row {
-                // The authority a `repositoryUri` this registry published carries: a client
-                // that appends a tag to the URI it was handed names this registry by it.
+                // The authority a `repositoryUri` this registry published carries: the fixed
+                // public-registry labels over a zone this emulator answers in, which a client
+                // appends a tag to.
+                image: "public.ecr.localhost:9297/alias/app:1.2",
+                expected: Some(names("alias", "app", Some("1.2"), None)),
+            },
+            Row {
+                // An endpoint a client pointed straight at this emulator reaches it by.
                 image: "127.0.0.1:9297/alias/app:1.2",
                 expected: Some(names("alias", "app", Some("1.2"), None)),
             },

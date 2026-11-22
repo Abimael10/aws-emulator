@@ -7,26 +7,29 @@
 //! `Registry$registryUri` ("The URI of a public registry. The URI contains a universal
 //! prefix and the registry alias") and `Repository$repositoryUri` ("The URI for the
 //! repository. You can use this URI for container image `push` and `pull` operations") are
-//! both the address a container client DIALS, so each is published on an endpoint THIS
-//! emulator answers at — the endpoint the CALLER reached it on when a registry client can
-//! use it, and the address the emulator is served at otherwise — scoped by the account's
-//! primary registry alias (`RegistryAlias$primaryRegistryAlias`, "displayed in both the
-//! repository URL and the image URI used in the docker pull commands"), with the repository's
-//! own name appended for a repository's URI. Nothing else belongs in either: the owning
-//! account is reported in `registryId`, and a public registry is global, so no Region appears
-//! either. The name AWS serves its gallery at resolves to AWS's public registry rather than
-//! to this emulator, and a name invented under that gallery's `public`.`ecr` prefix resolves
-//! nowhere at all, so a URI naming either sends a push or a pull out of the emulator
-//! entirely.
+//! each DIALLED by a container client and PARSED by a client that has to tell which registry
+//! holds the repository, so each carries the public-registry authority layout AWS publishes —
+//! the fixed `public`.`ecr` labels over a DNS zone — then the account's primary registry alias
+//! (`RegistryAlias$primaryRegistryAlias`, "displayed in both the repository URL and the image
+//! URI used in the docker pull commands") and, for a repository, its own name. Nothing else
+//! belongs in either: the owning account is reported in `registryId`, and a public registry is
+//! global, so no Region appears either.
+//!
+//! The ZONE those fixed labels sit over, and the port beside them, are the ones of the
+//! endpoint this emulator answers that caller at — never the zone AWS serves its own gallery
+//! in, nor any zone AWS publishes its endpoints in, since a name under either resolves to AWS
+//! rather than to this process and would send a push or a pull out of the emulator entirely.
+//! The loopback zone RFC 6761 reserves is such a zone: a resolver answers every name under it
+//! with the interface the core binds on, which is where this emulator really answers.
 //!
 //! The class the rule generalises over is the endpoint a call arrived on crossed with the
 //! repository name and the operation reporting the URI, so the rows span the endpoint forms
 //! a caller reaches this emulator by — the emulator's own socket, a loopback name with
 //! another port, a bracketed IPv6 literal, an endpoint carried only on the request URI, this
 //! service's own endpoint host (which AWS publishes, so no registry client can use it), the
-//! published endpoint dialled back, a `Host` that is no endpoint at all, and no `Host` at all
-//! — crossed with the repository-name forms the modelled `RepositoryName` pattern admits. No
-//! row is the recorded request.
+//! gallery AWS serves, the published authority dialled back, a `Host` that is no endpoint at
+//! all, and no `Host` at all — crossed with the repository-name forms the modelled
+//! `RepositoryName` pattern admits. No row is the recorded request.
 //!
 //! The composition AWS documents is preserved throughout: a repository's URI is the
 //! registry's URI followed by the repository's name, and the four operations that publish
@@ -57,6 +60,11 @@ const SERVED_URL_BASE: &str = "https://127.0.0.1:9297";
 /// The `host[:port]` half of [`SERVED_URL_BASE`].
 const SERVED_ENDPOINT: &str = "127.0.0.1:9297";
 
+/// The authority published to a call answered at the address this emulator is served at: the
+/// fixed labels over the zone that address names — an IP address names the interface the
+/// loopback zone resolves to — carrying its port.
+const SERVED_AUTHORITY: &str = "public.ecr.localhost:9297";
+
 /// The Region every call in this suite is signed for, and the one Region string a published
 /// URI is checked against: a public registry is global, so no Region may appear in one.
 const SIGNED_REGION: &str = "us-east-1";
@@ -68,12 +76,16 @@ struct Endpoint {
     case: &'static str,
     host: Option<&'static str>,
     uri_authority: Option<&'static str>,
+    /// The authority this registry publishes to such a call: the public-registry label layout
+    /// over the zone of the endpoint above, carrying its port. Spelled out per row rather
+    /// than derived, so the zone this emulator announces in is asserted and not recomputed
+    /// from the implementation's own reading.
     published: &'static str,
 }
 
 /// The endpoints the table drives, spanning the forms a caller reaches this emulator by.
 ///
-/// An endpoint a registry client can dial is published as it arrived, host and port together;
+/// The zone and the port of an endpoint a registry client can dial are the ones published;
 /// every other form falls back to the address this emulator is served at.
 fn endpoints() -> Vec<Endpoint> {
     vec![
@@ -81,49 +93,59 @@ fn endpoints() -> Vec<Endpoint> {
             case: "the emulator's own socket",
             host: Some(SERVED_ENDPOINT),
             uri_authority: None,
-            published: SERVED_ENDPOINT,
+            published: SERVED_AUTHORITY,
         },
         Endpoint {
             case: "a loopback name with another port",
             host: Some("localhost:39355"),
             uri_authority: None,
-            published: "localhost:39355",
+            published: "public.ecr.localhost:39355",
         },
         Endpoint {
             case: "a bracketed IPv6 loopback literal",
             host: Some("[::1]:38001"),
             uri_authority: None,
-            published: "[::1]:38001",
+            published: "public.ecr.localhost:38001",
         },
         Endpoint {
             case: "an endpoint carried only on the request URI",
             host: None,
             uri_authority: Some("127.0.0.1:8443"),
-            published: "127.0.0.1:8443",
+            published: "public.ecr.localhost:8443",
         },
         Endpoint {
             case: "this service's endpoint host, which AWS publishes",
             host: Some("api.ecr-public.us-east-1.amazonaws.com"),
             uri_authority: None,
-            published: SERVED_ENDPOINT,
+            published: SERVED_AUTHORITY,
         },
         Endpoint {
-            case: "the published endpoint dialled back",
-            host: Some(SERVED_ENDPOINT),
+            // AWS's own gallery resolves to the real public registry, so its zone is not one
+            // this emulator may announce in: the served address is published instead.
+            case: "the gallery AWS serves",
+            host: Some(GALLERY_HOST),
             uri_authority: None,
-            published: SERVED_ENDPOINT,
+            published: SERVED_AUTHORITY,
+        },
+        Endpoint {
+            // A client that dialled the published authority is handed that same value back,
+            // rather than a second host composed on top of it.
+            case: "the published authority dialled back",
+            host: Some(SERVED_AUTHORITY),
+            uri_authority: None,
+            published: SERVED_AUTHORITY,
         },
         Endpoint {
             case: "a Host that is no endpoint at all",
             host: Some("elsewhere.example.com/gallery"),
             uri_authority: None,
-            published: SERVED_ENDPOINT,
+            published: SERVED_AUTHORITY,
         },
         Endpoint {
             case: "no endpoint on the request at all",
             host: None,
             uri_authority: None,
-            published: SERVED_ENDPOINT,
+            published: SERVED_AUTHORITY,
         },
     ]
 }
@@ -240,6 +262,25 @@ fn dialled(case: &str, uri: &str) -> (String, String) {
     let (authority, path) = uri
         .split_once('/')
         .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no path"));
+    // What a client READS the authority for: the fixed labels that tell a public registry's
+    // URI apart from a private `<account>.dkr.ecr.<region>` one, over a zone of its own.
+    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
+    let prefix = format!("{public}.{ecr}.");
+    assert!(
+        authority.to_ascii_lowercase().starts_with(&prefix),
+        "case {case:?}: expected {uri:?} on a {prefix}<zone> authority, which is what names a \
+         public registry"
+    );
+    let zone = authority
+        .get(prefix.len()..)
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !zone.is_empty(),
+        "case {case:?}: expected a zone behind the universal prefix in {uri:?}"
+    );
     // What makes the authority publishable at all: this emulator answers on it, by the one
     // reading of that question this service states.
     assert!(
@@ -247,26 +288,29 @@ fn dialled(case: &str, uri: &str) -> (String, String) {
         "case {case:?}: expected {uri:?} on an address this emulator answers on"
     );
     // The addresses a published URI may never name: a host AWS serves and this emulator does
-    // not — the gallery's own name, any name invented under the gallery's universal prefix
-    // (nothing resolves one to this process), and an AWS endpoint host.
+    // not — the gallery's own name, and any zone AWS publishes its endpoints in.
     assert_ne!(
         authority, GALLERY_HOST,
         "case {case:?}: {uri:?} names the real gallery host, which this emulator does not \
          answer on"
     );
-    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
-    assert!(
-        !authority.starts_with(&format!("{public}.{ecr}.")),
-        "case {case:?}: {uri:?} names a host under the gallery's universal prefix, which \
-         nothing resolves to this emulator"
-    );
-    assert!(
-        !authority.ends_with(".amazonaws.com"),
-        "case {case:?}: {uri:?} names an AWS endpoint host, which this emulator does not \
-         answer on"
-    );
+    for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+        assert!(
+            !zone.ends_with(suffix) && zone != suffix.trim_start_matches('.'),
+            "case {case:?}: {uri:?} is served in a zone AWS publishes its own endpoints in, \
+             which this emulator does not answer in"
+        );
+    }
     (authority.to_string(), path.to_string())
 }
+
+/// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
+/// imported so that a published zone slipping into one of them fails this suite.
+///
+/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
+/// list of them, which this service's reading of the zone it may announce in is written on.
+const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 #[tokio::test]
 async fn every_published_repository_uri_names_an_endpoint_this_emulator_answers_on() {

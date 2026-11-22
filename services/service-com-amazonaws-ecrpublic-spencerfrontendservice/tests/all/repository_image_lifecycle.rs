@@ -33,28 +33,31 @@ pub(crate) const REGISTRY_ID: &str = "000000000000";
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
 pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 
-/// The `host[:port]` this emulator is SERVED at, which is the address every URI this
-/// registry publishes is built on: a repository's and the registry's own URI are the
-/// addresses a container client dials, so their authority is an endpoint this emulator
-/// answers at rather than a name AWS or nothing at all resolves. No call in this target
-/// arrives on a socket, so that address is the authority of the unserved base
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`).
+/// The `host[:port]` this emulator is SERVED at, whose ZONE and port every URI this registry
+/// publishes is built on: a repository's and the registry's own URI are the addresses a
+/// container client dials, so each carries the public-registry label layout over a zone this
+/// emulator answers in rather than a name AWS resolves. No call in this target arrives on a
+/// socket, so that address is the authority of the unserved base
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`), a name RFC 6761 reserves.
 pub(crate) fn announced_endpoint() -> &'static str {
     let base = smithy_server_runtime::UNSERVED_URL_BASE;
     base.split_once("://").map_or(base, |(_scheme, authority)| authority)
 }
 
 /// The two fixed labels every ECR Public registry authority AWS publishes leads with, as the
-/// service states them (`state::registry_address::GALLERY_HOST_LABELS`) — the spelling a
-/// reference written BY HAND carries, which this registry READS and never publishes.
+/// service states them (`state::registry_address::GALLERY_HOST_LABELS`) — the spelling every
+/// authority this registry publishes LEADS with, and the one a reference written BY HAND
+/// carries.
 pub(crate) const PUBLIC_REGISTRY_LABELS: [&str; 2] =
     service_com_amazonaws_ecrpublic_spencerfrontendservice::state::registry_address::GALLERY_HOST_LABELS;
 
-/// The AUTHORITY every URI this registry publishes leads with: the endpoint this emulator
-/// answers the reader at ([`announced_endpoint`]), which for this target is the unserved
-/// base's own name.
+/// The AUTHORITY every URI this registry publishes leads with: a public-registry host — the
+/// fixed labels above over the ZONE of the endpoint this emulator answers the reader at
+/// ([`announced_endpoint`]), which for this target is the unserved base's own name, and that
+/// endpoint's port when it names one (it names none here).
 pub(crate) fn published_authority() -> String {
-    announced_endpoint().to_string()
+    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
+    format!("{public}.{ecr}.{}", announced_endpoint())
 }
 
 /// The leading segments of every `repositoryUri`: the endpoint this registry is published

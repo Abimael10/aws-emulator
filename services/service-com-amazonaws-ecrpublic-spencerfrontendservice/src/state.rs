@@ -160,13 +160,14 @@ pub fn unsupported_in_region(
 
 /// The host AWS serves the public gallery at — the fixed labels every public-registry
 /// authority AWS publishes leads with ([`registry_address::GALLERY_HOST_LABELS`]) over AWS's
-/// own zone, which is what a container reference a client WRITES BY HAND names this gallery
-/// by and how such a reference is read as addressing this registry
-/// ([`gallery_pull::parse_gallery_reference`]).
+/// own zone ([`registry_address::AWS_GALLERY_ZONE`]), which is what a container reference a
+/// client WRITES BY HAND names this gallery by and how such a reference is read as addressing
+/// this registry ([`gallery_pull::parse_gallery_reference`]).
 ///
-/// It is not an authority this service PUBLISHES: this name resolves to the real public
-/// registry rather than to this process, so a URI this registry hands out carries the
-/// endpoint this emulator answers at instead ([`registry_address::announced_gallery_authority`]).
+/// It is not the authority this service PUBLISHES: this name resolves to the real public
+/// registry rather than to this process, so a URI this registry hands out carries the same
+/// label layout over the zone this emulator answers in instead
+/// ([`registry_address::announced_gallery_authority`]).
 pub const GALLERY_HOST: &str = "public.ecr.aws";
 
 /// The registry alias this emulator's single public registry is assigned.
