@@ -38,7 +38,10 @@
 //! * A refusal is thrown as an instance of the error class the service's own model names for
 //!   it, with the `$metadata` the answer carried — the shape a v3 client throws — so a
 //!   handler that catches one by its class or by its name reads the emulated service's own
-//!   answer.
+//!   answer. The MEMBERS that error shape declares stand on the thrown error beside its
+//!   message, because an error shape is a structure like any other: a handler reads
+//!   `error.CancellationReasons`, or whichever members its model gives that class, the way it
+//!   reads a command's own output.
 //! * The names a package exports are the ones the SDK's own package for that service
 //!   exports: the client, a command class per operation and an error class per error shape,
 //!   read from the service's model ([`exports`]). They are exported as NAMES
@@ -348,7 +351,7 @@ function serviceError(answered) {
         ? (document.Message === undefined ? '' : document.Message)
         : document.message;
     var Thrown = errorClass(named);
-    return new Thrown({
+    var error = new Thrown({
         message: message,
         $metadata: {
             httpStatusCode: answered.status,
@@ -356,6 +359,30 @@ function serviceError(answered) {
         },
         $fault: answered.status >= 500 ? 'server' : 'client'
     });
+    // The MEMBERS the refusal's own error shape declares stand on the error a v3 client throws:
+    // an error shape is a structure like any other, so a handler reads
+    // `error.CancellationReasons` — or whichever members its model gives that class — the way it
+    // reads a command's own output. WHICH members one carries, and the key the wire carries each
+    // of them in, is the called service's model's to say; the value is the service's own. A key
+    // that differs from the member's only in CASE is the same member, which is how an AWS JSON
+    // refusal spells its message.
+    var carried = answered.errorMembers;
+    if (carried !== null && typeof carried === 'object') {
+        var folded = Object.create(null);
+        var keys = Object.keys(document);
+        for (var key = 0; key < keys.length; key += 1) {
+            folded[keys[key].toLowerCase()] = document[keys[key]];
+        }
+        var members = Object.keys(carried);
+        for (var at = 0; at < members.length; at += 1) {
+            var wire = String(carried[members[at]]);
+            var held = document[wire] === undefined ? folded[wire.toLowerCase()] : document[wire];
+            if (held !== undefined) {
+                error[members[at]] = held;
+            }
+        }
+    }
+    return error;
 }
 
 // The input members a handler may hand the TEXT of its bytes, by service: a client of one

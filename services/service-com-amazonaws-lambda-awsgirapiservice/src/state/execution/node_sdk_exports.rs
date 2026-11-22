@@ -9,11 +9,12 @@
 //! { SQSClient, GetQueueUrlCommand, QueueDoesNotExist } from '@aws-sdk/client-sqs'` — and an
 //! ES module's named imports are resolved when the module is LINKED, so the package has to
 //! state the names before any of them is read. That list is what this module computes, along
-//! with the three other things a client reads out of the same file: which error shapes its
+//! with the other things a client reads out of the same file: which error shapes its
 //! exception classes are built from (`crate::state::execution::aws_sdk_guest`, the Python SDK,
-//! asks the same question), which members it generates a value for when the caller leaves
-//! them out (`crate::state::execution::idempotency_token`) and how a paginator of it pages one
-//! operation through (the same Python SDK's `client.get_paginator`).
+//! asks the same question), which members each of those shapes declares — what a client hands
+//! the caller beside a refusal's code and message — which members it generates a value for when
+//! the caller leaves them out (`crate::state::execution::idempotency_token`) and how a
+//! paginator of it pages one operation through (the same Python SDK's `client.get_paginator`).
 //!
 //! It states none of those itself: they are read out of the target service's own Smithy
 //! model — the same file that service's emulator crate is generated from, embedded by
@@ -39,6 +40,14 @@ pub struct ClientExports {
     /// The error shapes the service declares, each of which the package exports a class of
     /// the shape's own name for.
     pub errors: Vec<String>,
+    /// The members each ERROR shape declares, keyed by the shape's own name: the name an SDK
+    /// reports a value under — the model's own member name — against the key the wire carries
+    /// it in.
+    ///
+    /// An SDK hands a refusal's own members to the caller beside its code and message, so what
+    /// a client reads off one is the error shape's whole modelled content and not the sentence
+    /// alone. A shape declaring no member is not held at all.
+    pub error_members: BTreeMap<String, BTreeMap<String, String>>,
     /// The error shapes each OPERATION declares — its own, plus the ones the service declares
     /// for every operation of it — keyed by the operation's own name.
     ///
@@ -175,6 +184,7 @@ fn exports_of(model: &str) -> ClientExports {
     };
     let mut operations = BTreeSet::new();
     let mut errors = BTreeSet::new();
+    let mut error_members = BTreeMap::new();
     let mut idempotency_tokens = BTreeMap::new();
     let mut operation_errors = BTreeMap::new();
     let mut pagination = BTreeMap::new();
@@ -203,6 +213,10 @@ fn exports_of(model: &str) -> ClientExports {
             }
             Some("structure") if is_error(shape) => {
                 errors.insert(name.to_string());
+                let declared = declared_members(shape);
+                if !declared.is_empty() {
+                    error_members.insert(name.to_string(), declared);
+                }
             }
             _ => {}
         }
@@ -210,6 +224,7 @@ fn exports_of(model: &str) -> ClientExports {
     ClientExports {
         operations: operations.into_iter().collect(),
         errors: errors.into_iter().collect(),
+        error_members,
         operation_errors,
         idempotency_tokens,
         pagination,
@@ -352,6 +367,30 @@ fn idempotency_members(
                 .iter()
                 .filter(|(_name, member)| is_idempotency_token(member))
                 .map(|(name, _member)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The members the structure `shape` declares: the name an SDK reports each member's value
+/// under, which is the model's own member name, against the key the wire carries it in — the
+/// member's `jsonName` where its model states one, and the member's own name otherwise.
+fn declared_members(shape: &Value) -> BTreeMap<String, String> {
+    shape
+        .get("members")
+        .and_then(Value::as_object)
+        .map(|members| {
+            members
+                .iter()
+                .map(|(name, member)| {
+                    let carried = member
+                        .get("traits")
+                        .and_then(Value::as_object)
+                        .and_then(|traits| traits.get("smithy.api#jsonName"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(name.as_str());
+                    (name.clone(), carried.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -575,6 +614,56 @@ mod tests {
                  operation declares {declared:?}",
                 answered_with
             );
+        }
+    }
+
+    /// The MEMBERS an SDK hands a caller for a refusal are the error shape's own, read from the
+    /// service's model: the name the shape gives each member, against the key the wire carries it
+    /// in.
+    ///
+    /// The rows differ along what the shape declares: a member beside the message whose own shape
+    /// is a list, one whose shape is a map, a message member the model spells in either case, two
+    /// members with no message at all, a shape declaring none, a name the service's model declares
+    /// no error shape of, and a service this emulator holds no model for.
+    #[test]
+    fn the_members_a_refusal_carries_are_its_error_shapes_own() {
+        // Each row: the service token, an error shape, and the members its model declares
+        // (`smithy_query(query="shape", shape="<the error shape>")`), sorted.
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "dynamodb",
+                "TransactionCanceledException",
+                &["CancellationReasons", "Message"],
+            ),
+            ("dynamodb", "ConditionalCheckFailedException", &["Item", "message"]),
+            ("dynamodb", "ResourceNotFoundException", &["message"]),
+            ("sqs", "QueueDoesNotExist", &["message"]),
+            // Two members and no message member at all.
+            ("s3", "InvalidObjectState", &["AccessTier", "StorageClass"]),
+            // An error shape declaring nothing, which is held as nothing.
+            ("s3", "NoSuchKey", &[]),
+            // The AWS-common refusals: no service's model declares a shape for them, so an SDK
+            // has no modelled member of one to hand over.
+            ("dynamodb", "ValidationException", &[]),
+            ("not-a-service", "ResourceNotFoundException", &[]),
+        ];
+        for (token, shape, expected) in cases {
+            let held = client_exports(token);
+            let declared = held.error_members.get(*shape).cloned().unwrap_or_default();
+            let members: Vec<&str> = declared.keys().map(String::as_str).collect();
+            assert_eq!(
+                members, *expected,
+                "case {token:?}/{shape:?}: expected the members {expected:?}, got {declared:?}"
+            );
+            // Each one is read from the key the wire carries it in, which is the member's own
+            // name wherever its model states no `jsonName` for it — as none of these does.
+            for (member, carried) in &declared {
+                assert_eq!(
+                    carried, member,
+                    "case {token:?}/{shape:?}: expected {member:?} to be carried under its own \
+                     name, got {carried:?}"
+                );
+            }
         }
     }
 

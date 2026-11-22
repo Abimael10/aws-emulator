@@ -2133,6 +2133,7 @@ fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
             "errorType": answer.error_type,
             "queryErrorCode": answer.query_error_code,
             "requestId": answer.request_id,
+            "errorMembers": answer.error_members,
             "streams": answer.streams,
             "blobs": answer.blobs,
             "payloadBlobs": answer.payload_blobs,

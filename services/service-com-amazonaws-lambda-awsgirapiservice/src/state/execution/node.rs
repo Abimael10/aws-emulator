@@ -964,6 +964,7 @@ fn call_answer(answered: &Result<Answer, Refusal>) -> String {
         "body": answer.body,
         "errorType": answer.error_type,
         "requestId": answer.request_id,
+        "errorMembers": answer.error_members,
         "streams": answer.streams,
         "blobs": answer.blobs,
         "payloadBlobs": answer.payload_blobs,

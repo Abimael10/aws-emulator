@@ -381,6 +381,9 @@ impl Observed {
             // query error code beside the code it names.
             query_error_code: None,
             request_id: carried.request_id,
+            // An answer that is not a refusal names no error shape, so it carries none of one's
+            // members.
+            error_members: ::std::collections::BTreeMap::new(),
             streams: Vec::new(),
             blobs: Vec::new(),
             payload_blobs: Vec::new(),
@@ -427,6 +430,9 @@ impl Observed {
             error_type: Some(code.to_string()),
             query_error_code: None,
             request_id: carried.request_id,
+            // The refusal reaches this seam as its code and its sentence alone
+            // (`ProvideErrorMetadata`), so no other member of its shape is here to report.
+            error_members: ::std::collections::BTreeMap::new(),
             streams: Vec::new(),
             blobs: Vec::new(),
             payload_blobs: Vec::new(),

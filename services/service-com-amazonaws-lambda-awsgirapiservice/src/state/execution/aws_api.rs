@@ -2514,6 +2514,17 @@ pub struct Answer {
     pub query_error_code: Option<String>,
     /// The id it gave the request it answered.
     pub request_id: Option<String>,
+    /// The members the ERROR SHAPE of a refusal declares, which the SDK the guest calls hands
+    /// the caller beside the refusal's code and message: the name each value is reported under
+    /// against the key [`Self::body`] carries it in ([`super::sdk_model::ClientExports`]).
+    ///
+    /// An error shape is a structure like any other — `TransactionCanceledException` carries the
+    /// per-action cancellation reasons, `ConditionalCheckFailedException` the item that failed
+    /// the condition — and a client of the service reads those members off the refusal it was
+    /// handed, so WHICH members one carries is the called service's own model's to say. Empty
+    /// for every answer that is not a refusal, and for a refusal whose shape that model declares
+    /// nothing of.
+    pub error_members: ::std::collections::BTreeMap<String, String>,
     /// The output members of [`Self::body`] that carry BYTES rather than text, as the
     /// base64 the answer's document carries them as — an object's own payload, say, or the
     /// member a REST-bound answer binds to the whole body whose shape is a `@streaming` blob.
@@ -2753,16 +2764,65 @@ async fn sent(
         }
         _ => Vec::new(),
     };
+    // WHICH members a REFUSAL carries is the called service's own model's to say too: an error
+    // shape is a structure, and a client hands its members to the caller beside the code and the
+    // message. Read on a blocking thread for the same reason the answer's blob paths are.
+    let error_members = match (200..300).contains(&status) {
+        true => ::std::collections::BTreeMap::new(),
+        false => {
+            let token = api.sdk_token;
+            let named = error_type.clone();
+            let body = body.clone();
+            ::tokio::task::spawn_blocking(move || refused_members(token, named.as_deref(), &body))
+                .await
+                .unwrap_or_default()
+        }
+    };
     Ok(Answer {
         status,
         body,
         error_type,
         query_error_code,
         request_id,
+        error_members,
         streams,
         blobs,
         payload_blobs,
     })
+}
+
+/// The members the error shape a refusal named declares, as the SDK the guest calls reports
+/// them ([`Answer::error_members`]).
+///
+/// WHICH shape the refusal is, is read the way a client reads it: the shape the answer named in
+/// its own header, else the one its document names in `__type`. A refusal naming no shape the
+/// service `token`'s model declares members of carries none, which is the position every
+/// AWS-common refusal is in — no service's model declares one.
+fn refused_members(
+    token: &'static str,
+    error_type: Option<&str>,
+    body: &str,
+) -> ::std::collections::BTreeMap<String, String> {
+    let document = ::serde_json::from_str::<::serde_json::Value>(body).ok();
+    let named = document
+        .as_ref()
+        .and_then(|document| document.get("__type"))
+        .and_then(::serde_json::Value::as_str);
+    let Some(shape) = [error_type, named]
+        .into_iter()
+        .flatten()
+        .filter_map(|named| named.split('#').next_back())
+        .filter_map(|named| named.split(':').next())
+        .map(str::trim)
+        .find(|named| !named.is_empty())
+    else {
+        return ::std::collections::BTreeMap::new();
+    };
+    super::sdk_model::client_exports(token)
+        .error_members
+        .get(shape)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// SigV4-sign one in-process request, as the identity the invocation was given.

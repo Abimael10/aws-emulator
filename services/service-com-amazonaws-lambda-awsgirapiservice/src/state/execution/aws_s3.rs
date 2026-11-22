@@ -1127,6 +1127,9 @@ impl Observed {
             // answer of its carries a legacy query error code.
             query_error_code: None,
             request_id: carried.request_id,
+            // An answer that is not a refusal names no error shape, so it carries none of one's
+            // members.
+            error_members: ::std::collections::BTreeMap::new(),
             streams,
             // Amazon S3's own protocol carries an object's bytes as the body itself rather
             // than as a member of a JSON document, so the bytes of this answer are the ones
@@ -1169,6 +1172,9 @@ fn refused<E: ProvideErrorMetadata>(
         error_type: Some(code.to_string()),
         query_error_code: None,
         request_id: carried.request_id,
+        // The refusal reaches this seam as its code and its sentence alone
+        // (`ProvideErrorMetadata`), so no other member of its shape is here to report.
+        error_members: ::std::collections::BTreeMap::new(),
         streams: Vec::new(),
         blobs: Vec::new(),
         payload_blobs: Vec::new(),
@@ -1206,6 +1212,8 @@ fn refused_without_a_document<E: ProvideErrorMetadata>(
         error_type: Some(code),
         query_error_code: None,
         request_id: carried.request_id,
+        // The status itself is all this refusal named, so there is no shape to read members of.
+        error_members: ::std::collections::BTreeMap::new(),
         streams: Vec::new(),
         blobs: Vec::new(),
         payload_blobs: Vec::new(),

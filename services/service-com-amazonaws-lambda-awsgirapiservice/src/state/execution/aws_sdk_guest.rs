@@ -26,7 +26,10 @@
 //! * A refusal is raised as `botocore.exceptions.ClientError`, carrying the service's own
 //!   error code and message under the `response` member and rendering the sentence botocore
 //!   renders, so a handler that catches one and reports `response["Error"]["Code"]` reads
-//!   the emulated service's own answer. For a service whose model carries the
+//!   the emulated service's own answer. Beside them stand the MEMBERS the refusal's own error
+//!   shape declares — an error shape is a structure like any other, so a handler reads
+//!   `response["CancellationReasons"]`, or whichever members its model gives that class, the
+//!   way it reads an answered call's own members. For a service whose model carries the
 //!   `awsQueryCompatible` modifier, this SDK's model keys the class by the LEGACY query code
 //!   the answer carries for it, so that code is what the refusal reports.
 //! * `client.exceptions.<ShapeName>` is the modelled error class for that name, a subclass
@@ -959,6 +962,24 @@ def _error_message(document):
     return ""
 
 
+def _member_of(document, carried):
+    """The value `document` holds for the member the wire carries under `carried`.
+
+    Answers the value and whether the document carried the member at all, so a member it
+    carried as null is reported as the null the service answered rather than as absent. The key
+    is the member's own on the wire; a protocol that spells one in a different CASE — the
+    message of an AWS JSON refusal, which travels as `message` — carries the same member, so a
+    key differing from it only in case answers too.
+    """
+    if carried in document:
+        return document[carried], True
+    folded = str(carried).lower()
+    for held in document:
+        if isinstance(held, str) and held.lower() == folded:
+            return document[held], True
+    return None, False
+
+
 class _ClientExceptions:
     """`client.exceptions`: the modelled error class for each error code."""
 
@@ -1273,6 +1294,17 @@ class Client:
             "Error": {"Code": code, "Message": _error_message(document)},
             "ResponseMetadata": metadata,
         }
+        # The members the refusal's own error SHAPE declares stand at the TOP of the answer it
+        # is raised with, beside `Error` and `ResponseMetadata`: an error shape is a structure
+        # like any other, so a handler reads `error.response["CancellationReasons"]` — or any
+        # other member its model gives that class — the way it reads an answered call's own
+        # members. WHICH members one carries, and the key the wire carries each of them in, is
+        # the called service's model's to say ([`super::aws_api::Answer::error_members`]); the
+        # value is the service's own, exactly as it answered it.
+        for member, carried in (answered.get("errorMembers") or {}).items():
+            held, present = _member_of(document, carried)
+            if present:
+                response[member] = held
         raise self.exceptions.from_code(code, shape, operation_name)(response, operation_name)
 
     def _sent(self, parameters):
