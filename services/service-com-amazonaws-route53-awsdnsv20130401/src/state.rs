@@ -1013,6 +1013,37 @@ impl StoredZone {
         }
     }
 
+    /// The `HostedZone` the ACCOUNT-WIDE listing projects this zone as.
+    ///
+    /// The same zone as [`StoredZone::to_hosted_zone`], down to one member: the
+    /// listing reports every zone's public-DNS fallback POSTURE, so a client
+    /// enumerating the account reads each zone's posture off the listing instead
+    /// of having to tell "the feature is off for this zone" from "this row
+    /// reports no feature state at all" ([`StoredZone::listed_features`]). The
+    /// single-zone readers keep the projection they answer with, which carries
+    /// the features something configured on the zone.
+    pub fn to_listed_hosted_zone(&self) -> HostedZone {
+        HostedZone {
+            features: self.listed_features(),
+            ..self.to_hosted_zone()
+        }
+    }
+
+    /// The `Features` the account-wide listing reports for this zone: the
+    /// statuses every hosted-zone projection carries, plus the public-DNS
+    /// fallback posture the zone is in.
+    ///
+    /// Every zone HAS that posture, whether or not anything configured the
+    /// feature on it ([`StoredZone::public_dns_fallback_posture`]), so every
+    /// listed zone carries the container and no listed zone carries it empty.
+    pub fn listed_features(&self) -> Option<HostedZoneFeatures> {
+        let features = HostedZoneFeatures {
+            public_dns_fallback_status: Some(self.public_dns_fallback_posture().to_string()),
+            ..self.to_hosted_zone_features()
+        };
+        Self::features_with_a_status(features)
+    }
+
     /// The `Features` a hosted-zone projection reports for this zone, and NOTHING for a zone
     /// no feature of the container is configured on.
     ///
@@ -1023,7 +1054,14 @@ impl StoredZone {
     /// from the operation that projected it, so the create, the single read, the comment
     /// update and both account-wide listings all report the same zone the same way.
     pub fn reported_features(&self) -> Option<HostedZoneFeatures> {
-        let features = self.to_hosted_zone_features();
+        Self::features_with_a_status(self.to_hosted_zone_features())
+    }
+
+    /// The container itself when it carries a status, and NOTHING when it
+    /// carries none: the member is optional, so a zone with nothing to report in
+    /// it is answered without it rather than with an empty container, whichever
+    /// projection built the container.
+    fn features_with_a_status(features: HostedZoneFeatures) -> Option<HostedZoneFeatures> {
         let configured = features.accelerated_recovery_status.is_some()
             || features.failure_reasons.is_some()
             || features.public_dns_fallback_status.is_some();

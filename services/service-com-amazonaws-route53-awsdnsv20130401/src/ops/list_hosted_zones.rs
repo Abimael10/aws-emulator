@@ -248,9 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_marker = Some(zone.id.clone());
                 break;
             }
-            // The one hosted-zone projection every operation of this service
-            // shares ([`crate::state::StoredZone::to_hosted_zone`]).
-            hosted_zones.push(zone.to_hosted_zone());
+            // The hosted-zone projection the account-wide listing reports a zone
+            // as ([`crate::state::StoredZone::to_listed_hosted_zone`]): the
+            // zone, with the public-DNS fallback posture it is in inside its
+            // `Features` container.
+            hosted_zones.push(zone.to_listed_hosted_zone());
         }
 
         Ok(ListHostedZonesOutput {
