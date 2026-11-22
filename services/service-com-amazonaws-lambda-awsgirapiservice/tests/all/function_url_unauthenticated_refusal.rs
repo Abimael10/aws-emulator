@@ -57,7 +57,9 @@ const SIGNATURE_MISMATCH_BODY: &str = "{\"message\":\"The request signature we c
      signing method. Consult the service documentation for details.\"}";
 
 /// The body a caller signing as an identity this emulator holds no credential for reads.
-const UNKNOWN_CREDENTIAL_BODY: &str =
+/// Shared with the suites that drive such a caller for a reason of their own, so one wording of
+/// that refusal serves them all.
+pub(crate) const UNKNOWN_CREDENTIAL_BODY: &str =
     r#"{"message":"The security token included in the request is invalid."}"#;
 
 /// The class of a caller whose credential names no identity this emulator holds.
@@ -82,9 +84,11 @@ def lambda_handler(event, context):
     .to_string()
 }
 
-/// How a request is credentialled.
+/// How a request is credentialled. Shared with the suites that drive an unadmitted caller of
+/// a function URL for a reason of their own, so one reading of each credential serves them
+/// all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Credential {
+pub(crate) enum Credential {
     /// No `Authorization` header at all.
     None,
     /// A signature whose credential scope names another service.
@@ -100,7 +104,7 @@ enum Credential {
 /// A signature's own validity window is part of what the authentication layer judges, so the
 /// row that is about the SIGNATURE not matching is dated NOW: a stale date would be refused
 /// for its date instead, which is a different refusal.
-fn headers(credential: Credential) -> Vec<(String, String)> {
+pub(crate) fn headers(credential: Credential) -> Vec<(String, String)> {
     let named = |name: &str, value: String| (name.to_string(), value);
     match credential {
         Credential::None => Vec::new(),
@@ -167,7 +171,7 @@ fn signing_stamp() -> String {
 }
 
 /// The owned header pairs as the dispatcher takes them.
-fn borrowed(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(headers: &[(String, String)]) -> Vec<(&str, &str)> {
     headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))

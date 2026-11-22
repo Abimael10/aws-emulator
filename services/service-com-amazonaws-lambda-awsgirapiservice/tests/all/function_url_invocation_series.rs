@@ -261,22 +261,28 @@ async fn request(
 }
 
 /// The dimension set of the series reported per function.
-fn function_dimensions() -> Value {
-    json!([{ "Name": FUNCTION_DIMENSION, "Value": FUNCTION }])
+///
+/// Shared with the suites that read the same series for requests of their own, beside
+/// [`datapoints`], so every reader names a dimension the one way.
+pub(crate) fn function_dimensions(function: &str) -> Value {
+    json!([{ "Name": FUNCTION_DIMENSION, "Value": function }])
 }
 
 /// The dimension set of the series reported per invoked resource: the function itself, for a
 /// URL attached to the unqualified function.
-fn resource_dimensions() -> Value {
+pub(crate) fn resource_dimensions(function: &str) -> Value {
     json!([
-        { "Name": FUNCTION_DIMENSION, "Value": FUNCTION },
-        { "Name": RESOURCE_DIMENSION, "Value": FUNCTION },
+        { "Name": FUNCTION_DIMENSION, "Value": function },
+        { "Name": RESOURCE_DIMENSION, "Value": function },
     ])
 }
 
 /// The `Datapoints` `GetMetricStatistics` answers for the series `metric` and `dimensions`
 /// identify, selected by the unit the AWS Lambda metric reference gives that series.
-async fn datapoints(
+///
+/// Shared with the suites that read the same series for requests of their own, so every reader
+/// asks the same question of CloudWatch.
+pub(crate) async fn datapoints(
     router: &MultiServiceRouter,
     case: &str,
     metric: &str,
@@ -307,7 +313,7 @@ async fn datapoints(
 }
 
 /// The total of one statistic over every datapoint of a series.
-fn total(points: &[Value], statistic: &str) -> f64 {
+pub(crate) fn total(points: &[Value], statistic: &str) -> f64 {
     points
         .iter()
         .filter_map(|point| point[statistic].as_f64())
@@ -470,7 +476,7 @@ async fn every_function_url_request_is_metered_on_the_functions_own_series() {
             request(&router, &endpoint, case, index, made).await;
         }
 
-        for dimensions in [function_dimensions(), resource_dimensions()] {
+        for dimensions in [function_dimensions(FUNCTION), resource_dimensions(FUNCTION)] {
             let invocations =
                 datapoints(&router, case, INVOCATIONS_SERIES, COUNT_UNIT, &dimensions).await;
             let counted = total(&invocations, "Sum");
@@ -532,7 +538,7 @@ async fn every_function_url_request_is_metered_on_the_functions_own_series() {
             case,
             INVOCATIONS_SERIES,
             COUNT_UNIT,
-            &function_dimensions(),
+            &function_dimensions(FUNCTION),
         )
         .await;
         let counted_again = total(&again, "Sum");
@@ -583,7 +589,7 @@ async fn the_url_plane_and_invoke_meter_one_function_on_one_series() {
         invoked.summary()
     );
 
-    let dimensions = function_dimensions();
+    let dimensions = function_dimensions(FUNCTION);
     let invocations =
         datapoints(&router, case, INVOCATIONS_SERIES, COUNT_UNIT, &dimensions).await;
     let counted = total(&invocations, "Sum");
