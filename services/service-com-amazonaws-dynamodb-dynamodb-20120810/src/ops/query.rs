@@ -512,10 +512,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not its items — decided against the partition the key condition selects and the
         // attributes this query asks for. The partition attribute is the TABLE's, which is
         // the only one a query here can select on: a request naming an `IndexName` is
-        // refused as unserved above, so no index's own leading key reaches this point.
-        if let Some(denial) = crate::state::authorization::denial_keys(
+        // refused as unserved above, so no index's own leading key reaches this point. A
+        // query THROUGH an index acts on that index's own ARN, which is what the decision
+        // and the refusal name ([`crate::state::authorization::addressed_resource`]).
+        if let Some(denial) = crate::state::authorization::denial_indexed(
             &caller,
             table,
+            input.index_name.as_deref(),
             "dynamodb:Query",
             now,
             &crate::state::authorization::RequestKeys::selected(

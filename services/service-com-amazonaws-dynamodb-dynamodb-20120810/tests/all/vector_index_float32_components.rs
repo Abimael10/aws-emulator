@@ -1,21 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a vector index HOLDS for a coordinate, and what a search through it reports,
-//! driven end to end.
+//! What a vector index HOLDS for a coordinate, and what a search through it computes from
+//! it, driven end to end.
 //!
 //! RULE under test: "each element is a 32-bit IEEE-754 floating point number"
 //! (`SearchVectors$SearchVector`, the same shape a vector index's `VectorAttribute` names
 //! on an item), so what the index stores for a coordinate is the float that type can hold
 //! and not the decimal the request spelled: a number no 32-bit float represents exactly is
-//! held as the one it rounds to, and a search through the index reports THAT. The table's
-//! own item is untouched by this — the item store holds the decimal the write carried, and
-//! `GetItem` answers it — so the two differ exactly where the rounding does.
+//! held as the one it rounds to, and the similarity score a search through the index reports
+//! is computed from THAT. The table's own item is untouched by this — the item store holds
+//! the decimal the write carried, and `GetItem` answers it — so the two differ exactly where
+//! the rounding does.
+//!
+//! The score is what the index's held copy is observed through: a search answers "the
+//! similarity score for this item relative to the search vector" (`SearchResultItem$Score`)
+//! and the projected attributes of the item (`SearchResultItem$Item`), which never carry the
+//! vector itself (pinned in [`super::vector_search`]). Over `DOT_PRODUCT` against the
+//! all-ones search vector that score is the sum of the held coordinates, so a coordinate the
+//! type cannot represent and the coordinate it rounds to score IDENTICALLY while every
+//! neighbour of them scores apart — which is the rounding, observed.
 //!
 //! The rows span what the rule generalises over: a coordinate a 32-bit float holds exactly
 //! (a whole number, a power of two, a half), the first whole number it does NOT hold
 //! (2^24 + 1, which rounds down to 2^24) and its neighbours, a value with more decimal
 //! digits than that type carries, a negative value, and zero — each written as the decimal
-//! a client sends and read back from the search result.
+//! a client sends and read back through the score the search computed.
 
 use serde_json::{json, Value};
 
@@ -33,8 +42,13 @@ const INDEX: &str = "float32-index";
 /// machine is not a defect, and what the bound is for is that the wait ENDS.
 const READY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The second coordinate every row's vector carries, so the vector has the index's own
+/// `Dimensions` — and the value of both coordinates of the search vector, so the inner
+/// product the index computes is the sum of the held coordinates.
+const COMPANION: &str = "1";
+
 /// One row: the case, the decimal the item is written with, and the decimal the index is
-/// expected to report for it.
+/// expected to hold for it.
 struct Row {
     case: &'static str,
     written: &'static str,
@@ -89,6 +103,18 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+impl Row {
+    /// The score a `DOT_PRODUCT` search with the all-ones vector computes for this row: the
+    /// sum of the coordinates the INDEX holds, which is the held value plus the companion.
+    /// Read as the 32-bit float the index stores, so the figure is the one the index's own
+    /// copy produces and not the one the decimal text would.
+    fn score(&self) -> f64 {
+        let held: f32 = self.held.parse().expect("the held decimal is a float32");
+        let companion: f32 = COMPANION.parse().expect("the companion is a float32");
+        f64::from(held) + f64::from(companion)
+    }
+}
+
 /// The `pk` the row at `at` is stored under.
 fn key_of(at: usize) -> String {
     format!("row{at}")
@@ -118,19 +144,19 @@ async fn ready(router: &smithy_server_runtime::MultiServiceRouter) {
     }
 }
 
-/// The item the search answered for `pk`, or `Value::Null` where it answered none.
+/// The result the search answered for `pk`, or `Value::Null` where it answered none.
 fn result_for(answered: &Value, pk: &str) -> Value {
     answered["SearchResults"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|result| result["Item"]["pk"]["S"] == json!(pk))
-        .map(|result| result["Item"].clone())
+        .cloned()
         .unwrap_or(Value::Null)
 }
 
 #[tokio::test]
-async fn a_vector_index_reports_the_float32_each_coordinate_is_held_as() {
+async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
     let router = emulator();
     ok(
         &router,
@@ -160,7 +186,7 @@ async fn a_vector_index_reports_the_float32_each_coordinate_is_held_as() {
             "PutItem",
             json!({"TableName": TABLE, "Item": {
                 "pk": {"S": key_of(at)},
-                "emb": {"L": [{"N": row.written}, {"N": "1"}]},
+                "emb": {"L": [{"N": row.written}, {"N": COMPANION}]},
             }}),
         )
         .await;
@@ -172,20 +198,21 @@ async fn a_vector_index_reports_the_float32_each_coordinate_is_held_as() {
         json!({
             "TableName": TABLE,
             "IndexName": INDEX,
-            "SearchVector": [{"N": "1"}, {"N": "1"}],
+            "SearchVector": [{"N": COMPANION}, {"N": COMPANION}],
             "TopK": rows().len(),
         }),
     )
     .await;
 
     for (at, row) in rows().iter().enumerate() {
-        let item = result_for(&answered, &key_of(at));
-        let reported = item["emb"]["L"][0]["N"].clone();
+        let result = result_for(&answered, &key_of(at));
+        let reported = result["Score"].as_f64();
+        let expected = row.score();
         assert_eq!(
             reported,
-            json!(row.held),
-            "case {:?}: the index holds the coordinate written as {:?} as {:?}, got {reported} \
-             from {item} of {answered}",
+            Some(expected),
+            "case {:?}: the index holds the coordinate written as {:?} as {:?}, so the search \
+             scores it {expected}, got {reported:?} from {result} of {answered}",
             row.case,
             row.written,
             row.held
@@ -206,4 +233,21 @@ async fn a_vector_index_reports_the_float32_each_coordinate_is_held_as() {
             row.case
         );
     }
+
+    // The rounding itself, stated as the two rows it makes indistinguishable and the
+    // neighbours it does not: 2^24 + 1 is held as 2^24, so those two score alike, while
+    // 2^24 + 2 — which the type holds exactly — scores apart from both.
+    let score_of = |at: usize| result_for(&answered, &key_of(at))["Score"].as_f64();
+    assert_eq!(
+        score_of(4),
+        score_of(5),
+        "case \"the first whole number the type cannot represent\": it is held as the \
+         coordinate it rounds to, so the two score alike, got {answered}"
+    );
+    assert_ne!(
+        score_of(5),
+        score_of(6),
+        "case \"the neighbour the type holds exactly\": it is held as itself, so it scores \
+         apart from the rounded one, got {answered}"
+    );
 }

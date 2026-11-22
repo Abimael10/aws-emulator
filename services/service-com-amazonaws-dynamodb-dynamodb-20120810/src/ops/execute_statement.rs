@@ -309,14 +309,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A table the policies in force do not let this caller act on with this
             // statement's own action is not read or written at all. PartiQL has its own
             // four actions, which is what `statement.action()` names; the partition the
-            // statement addresses is what a conditioned statement is decided against.
+            // statement addresses and whether it scans its whole source are what a
+            // conditioned statement is decided against. A statement whose `FROM` target
+            // names an INDEX acts on that index's own ARN
+            // ([`crate::state::authorization::addressed_resource`]).
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            if let Some(denial) = crate::state::authorization::denial_addressing(
+            if let Some(denial) = crate::state::authorization::denial_indexed(
                 &caller,
                 table,
+                statement.index(),
                 statement.action(),
                 now,
-                &crate::state::authorization::AddressedKeys::of_statement(table, &statement),
+                &crate::state::authorization::RequestKeys::of_statement(table, &statement),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

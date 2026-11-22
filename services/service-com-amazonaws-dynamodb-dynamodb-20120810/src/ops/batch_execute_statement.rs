@@ -475,15 +475,14 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // A statement of a batch performs its own PartiQL action INSIDE this operation,
         // which is what a statement admitting that action only as part of a given operation
         // tests ([`crate::state::authorization::EnclosingOperation`]).
-        if let Some(denial) = crate::state::authorization::denial_keys(
+        if let Some(denial) = crate::state::authorization::denial_indexed(
             caller,
             table,
+            statement.index(),
             statement.action(),
             now,
-            &crate::state::authorization::RequestKeys::addressing(
-                crate::state::authorization::AddressedKeys::of_statement(table, &statement),
-            )
-            .within(crate::state::authorization::EnclosingOperation::BatchExecuteStatement),
+            &crate::state::authorization::RequestKeys::of_statement(table, &statement)
+                .within(crate::state::authorization::EnclosingOperation::BatchExecuteStatement),
         ) {
             return Err(SlotFailure::new(ACCESS_DENIED_CODE, denial).at(&name));
         }

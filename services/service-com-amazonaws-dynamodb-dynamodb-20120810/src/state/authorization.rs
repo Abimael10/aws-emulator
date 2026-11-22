@@ -113,6 +113,11 @@
 //!   statement that admits an action only as part of a transaction tests. A call that
 //!   performs an action of its OWN carries no value for the key, which it answers for, so a
 //!   grant conditioned on an enclosing operation does not reach it.
+//! * whether a PartiQL statement reads its whole source rather than addressing a partition
+//!   of it by key — the key only a statement answers for ([`RequestKeys::of_statement`]),
+//!   which is what a policy admitting keyed reads while forbidding scans tests. Every other
+//!   call carries no value for it and does not answer for it, so a clause over it leaves
+//!   such a call undecided rather than reading it as a scan.
 //! * the session tags the calling principal carries, which is where a policy written with
 //!   `${aws:PrincipalTag/<key>}` takes the text it stands for. They are known for a
 //!   session this emulator's STS registry minted and for nobody else, so only such a
@@ -129,6 +134,19 @@
 //! tree's one evaluation of policy documents rather than here. A fine-grained statement
 //! over the partitions a call addresses therefore decides that call: it applies to the
 //! partitions its condition selects and to no others.
+//!
+//! ## WHICH resource the request addresses
+//!
+//! A call that names a SECONDARY INDEX of the table acts on that index, whose IAM resource is
+//! its own ARN ([`addressed_resource`]: the table's ARN followed by `/index/<index-name>`),
+//! and a call that names none acts on the table's own ARN. So the documents in force on the
+//! caller and the scope its credential was minted with are read for the resource the request
+//! really addressed, and the refusal names it — a grant written about the table does not cover
+//! an index of it, and one written about an index does not cover the table.
+//!
+//! The TABLE's own document is read for the table's ARN whichever source the call names: a
+//! resource-based policy is attached to the table, so its statements name the table, and what
+//! it says covers the table together with the indexes that project it.
 
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
@@ -169,6 +187,20 @@ const SELECT_CONDITION_KEY: &str = "dynamodb:Select";
 /// [`EnclosingOperation`] — what a statement admitting an action only as one entry of a
 /// transaction, or only outside one, tests.
 const ENCLOSING_OPERATION_CONDITION_KEY: &str = "dynamodb:EnclosingOperation";
+
+/// The condition key whose value says whether a PartiQL statement reads its WHOLE source
+/// rather than addressing a partition of it by key — a boolean key, so its value is one of
+/// the two literals the `Bool` operator compares against.
+///
+/// It is a fact about the STATEMENT, so only a statement answers for it: a policy that
+/// admits keyed reads while forbidding scans is written over this key, and the statement's
+/// own `WHERE` clause is what decides the value ([`RequestKeys::of_statement`]).
+const FULL_TABLE_SCAN_CONDITION_KEY: &str = "dynamodb:FullTableScan";
+
+/// The text the boolean condition key above carries for a statement that scans its whole
+/// source, and the one it carries for a statement addressed by key.
+const FULL_TABLE_SCAN_TRUE: &str = "true";
+const FULL_TABLE_SCAN_FALSE: &str = "false";
 
 /// An operation that performs the actions ITS OWN ENTRIES ask for, as the condition key
 /// reporting it holds that operation's name.
@@ -551,6 +583,10 @@ pub struct RequestKeys {
     /// performs an action of its own. Every data-plane call answers for this key: it either
     /// is one entry of such an operation or it is not ([`EnclosingOperation`]).
     enclosing: Option<EnclosingOperation>,
+    /// Whether this call reads its whole source rather than addressing a partition of it by
+    /// key, or `None` for a call that is no PartiQL statement and so carries no value for
+    /// the key at all ([`FULL_TABLE_SCAN_CONDITION_KEY`]).
+    full_table_scan: Option<bool>,
 }
 
 impl RequestKeys {
@@ -564,6 +600,30 @@ impl RequestKeys {
             attributes: None,
             select: None,
             enclosing: None,
+            full_table_scan: None,
+        }
+    }
+
+    /// The keys ONE PartiQL statement answers for: the partition(s) it addresses, and
+    /// whether it reads its whole source rather than addressing one of them by key.
+    ///
+    /// The statement's `WHERE` clause is what decides the second: a clause that pins the
+    /// partition key of the source the statement reads — the index's own, where the `FROM`
+    /// target names one — addresses that partition, and a clause that pins none leaves the
+    /// plan reading every entry of the source, which is the scan the key reports. A write
+    /// statement addresses the item it changes, so it scans nothing.
+    ///
+    /// The attributes a statement names are NOT enumerated here (its clauses and its `SET`
+    /// actions name them), so a clause over them stays undecided rather than being read as
+    /// naming none, exactly as for [`Self::addressing`].
+    #[must_use]
+    pub fn of_statement(table: &Table, statement: &PartiqlStatement) -> Self {
+        Self {
+            addressed: AddressedKeys::of_statement(table, statement),
+            attributes: None,
+            select: None,
+            enclosing: None,
+            full_table_scan: Some(statement_scans_whole_source(table, statement)),
         }
     }
 
@@ -590,6 +650,7 @@ impl RequestKeys {
             attributes: Some(Vec::new()),
             select: None,
             enclosing: None,
+            full_table_scan: None,
         }
     }
 
@@ -607,6 +668,7 @@ impl RequestKeys {
                 None => ALL_ATTRIBUTES_SELECT,
             }),
             enclosing: None,
+            full_table_scan: None,
         }
     }
 
@@ -626,6 +688,7 @@ impl RequestKeys {
             attributes: named_attributes(paths),
             select: Some(select),
             enclosing: None,
+            full_table_scan: None,
         }
     }
 
@@ -652,6 +715,7 @@ impl RequestKeys {
             ),
             select: None,
             enclosing: None,
+            full_table_scan: None,
         }
     }
 }
@@ -732,6 +796,16 @@ fn condition_context(caller: &Caller, keys: &RequestKeys) -> Vec<(String, String
             enclosing.name().to_string(),
         ));
     }
+    if let Some(scan) = keys.full_table_scan {
+        context.push((
+            FULL_TABLE_SCAN_CONDITION_KEY.to_string(),
+            if scan {
+                FULL_TABLE_SCAN_TRUE.to_string()
+            } else {
+                FULL_TABLE_SCAN_FALSE.to_string()
+            },
+        ));
+    }
     context.extend(principal_context(caller));
     context
 }
@@ -797,6 +871,10 @@ fn principal_published_keys(caller: &Caller) -> Vec<&str> {
 /// what lets a clause over a tag key the principal does not carry be decided. A federated
 /// credential answers for each key its own exchange published, so those are published one
 /// by one ([`sts_store::federated_claim_keys`]).
+///
+/// A PartiQL statement answers for whether it scans its whole source as well, because its
+/// own `WHERE` clause settles that either way; no other call carries a value for that key,
+/// so none of them publishes it.
 fn published_condition_keys<'a>(caller: &'a Caller, keys: &RequestKeys) -> Vec<&'a str> {
     let mut published = vec![SELECT_CONDITION_KEY, ENCLOSING_OPERATION_CONDITION_KEY];
     if keys.attributes.is_some() {
@@ -804,6 +882,9 @@ fn published_condition_keys<'a>(caller: &'a Caller, keys: &RequestKeys) -> Vec<&
     }
     if keys.addressed.values.is_some() {
         published.push(LEADING_KEYS_CONDITION_KEY);
+    }
+    if keys.full_table_scan.is_some() {
+        published.push(FULL_TABLE_SCAN_CONDITION_KEY);
     }
     published.extend(principal_published_keys(caller));
     published
@@ -1010,7 +1091,43 @@ pub fn denial_keys(
     now: SystemTime,
     keys: &RequestKeys,
 ) -> Option<String> {
-    let refusal = |reason: &str| Some(not_authorized(&caller.arn, action, &table.arn, reason));
+    denial_indexed(caller, table, None, action, now, keys)
+}
+
+/// The IAM resource a request on `table` addresses: the ARN of the secondary `index` it
+/// names, or the table's own ARN when it names none.
+///
+/// An index is a resource of its own in this service's IAM namespace — `super::index_arn`
+/// mints the ARN every description of one reports — so a request that reads THROUGH an index
+/// acts on that ARN, and a grant written about the table does not cover it (nor the other way
+/// round). This is the one derivation of it, so the decision and the sentence a refusal is
+/// worded with name the same resource.
+#[must_use]
+pub fn addressed_resource(table: &Table, index: Option<&str>) -> String {
+    match index {
+        Some(index) => super::index_arn(&table.region, &table.name, index),
+        None => table.arn.clone(),
+    }
+}
+
+/// The `AccessDeniedException` message a data-plane request that reads THROUGH a secondary
+/// index earns when the policies in force do not permit it, or `None` when they do.
+///
+/// `index` is the index the request names, when it names one: the request then acts on that
+/// index's own ARN ([`addressed_resource`]), which is what the caller's documents and its
+/// credential's scope are read for and what the refusal names. The TABLE's own document is
+/// read for the table's ARN whichever source the request names (see the module docs).
+///
+/// Every other part of the decision is [`denial_keys`]'s, which is this with no index named.
+pub fn denial_indexed(
+    caller: &Caller,
+    table: &Table,
+    index: Option<&str>,
+    action: &str,
+    now: SystemTime,
+    keys: &RequestKeys,
+) -> Option<String> {
+    let resource = addressed_resource(table, index);
     // "PutResourcePolicy is an asynchronous operation" and "the policy application is
     // eventually consistent" (the `PutResourcePolicy` doc): what decides this request is
     // the revision in force at this instant, which inside the span of the newest write is
@@ -1035,10 +1152,18 @@ pub fn denial_keys(
             .with_context(&context)
             .with_published_keys(&published);
         if policy.decision(&denying) == Decision::Denied {
-            return refusal("with an explicit deny in a resource-based policy");
+            return Some(not_authorized(
+                &caller.arn,
+                action,
+                &resource,
+                "with an explicit deny in a resource-based policy",
+            ));
         }
     }
-    let granting = iam::Request::new(action, &table.arn, &caller.principals)
+    // The caller's own documents and the scope its credential was minted with are read for
+    // the resource the request ADDRESSED, which for an index-qualified call is that index's
+    // own ARN.
+    let granting = iam::Request::new(action, &resource, &caller.principals)
         .with_context(&context)
         .with_published_keys(&published);
 
@@ -1048,7 +1173,7 @@ pub fn denial_keys(
     // permission of its own ("the resource-based policy and the identity-based policy are
     // evaluated together, and access is granted if either allows it"). Read only where the
     // identity-based documents did not already grant the call.
-    identity_denial(caller, action, &table.arn, &granting, || {
+    identity_denial(caller, action, &resource, &granting, || {
         policy.is_some_and(|policy| {
             // Read by the same holding the deny above was: the document's principals name
             // the identities their unique ids belong to.

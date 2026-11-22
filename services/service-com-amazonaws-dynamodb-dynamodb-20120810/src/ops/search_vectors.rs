@@ -8,10 +8,13 @@
 //!
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
-//! index covers, carrying a vector of the index's dimensions), and each result item is the
-//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) — the
-//! attributes the index projects, the vector it finds them by included, so a search
-//! reports exactly what the index stores and nothing the table holds outside it.
+//! index covers, carrying a vector of the index's dimensions), and each result item is what
+//! the index REPORTS for it ([`crate::state::VectorIndex::reported_entry`]) — "only
+//! attributes projected into the vector index can be retrieved"
+//! (`SearchVectors$ProjectionExpression`), so a search reports the attributes the index
+//! projects and nothing the table holds outside them; the vector the item was found by is
+//! the index's own search key, answered as the score computed from it rather than as an
+//! attribute of the entry.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -27,8 +30,10 @@
 //!   `SearchConditionExpression` that reads an attribute outside the index's search
 //!   schema, reads a schema element any way other than by pinning it with `=`, or leaves
 //!   a `HASH` element unpinned, are refused as `ValidationException`s;
-//! * a table whose resource-based policy denies the caller `dynamodb:SearchVectors` is
-//!   answered `AccessDeniedException` instead of its items.
+//! * a caller the policies in force do not let read the vector index the request names — the
+//!   resource such a request acts on is that INDEX's own ARN
+//!   ([`crate::state::authorization::addressed_resource`]) — is answered
+//!   `AccessDeniedException` instead of its items.
 //!
 //! Every size one request can choose is bounded: the expression members by the shared
 //! expression ceilings ([`crate::state::tokenize_expression`]), the work by the number of
@@ -285,10 +290,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .active_table(&region, &table_name, now)
             .map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
-        // not its items.
-        if let Some(denial) =
-            crate::state::policy_denial(&caller, table, "dynamodb:SearchVectors", now)
-        {
+        // not its items. A search reads ONE vector index, so it acts on that index's own
+        // ARN ([`crate::state::authorization::addressed_resource`]): a grant written about
+        // the table does not cover it, and the refusal names the index the request asked
+        // for.
+        if let Some(denial) = crate::state::authorization::denial_indexed(
+            &caller,
+            table,
+            Some(&input.index_name),
+            "dynamodb:SearchVectors",
+            now,
+            &crate::state::authorization::RequestKeys::addressing(
+                crate::state::authorization::AddressedKeys::whole_table(),
+            ),
+        ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will not
@@ -447,7 +462,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
-            let entry = index.index_entry(item, &table.key_schema);
+            // What a search REPORTS is the attributes the index's `Projection` projects —
+            // "only attributes projected into the vector index can be retrieved"
+            // (`SearchVectors$ProjectionExpression`) — which is narrower than what the index
+            // holds for the item: the vector it was found by is the index's own search key,
+            // reported only where the projection projects that attribute
+            // ([`crate::state::VectorIndex::reported_entry`]).
+            let entry = index.reported_entry(item, &table.key_schema);
             let projected = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,

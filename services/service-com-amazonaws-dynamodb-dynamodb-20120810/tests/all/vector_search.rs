@@ -10,9 +10,11 @@
 //!    partitions by — against the search vector with the index's OWN distance function,
 //!    and reports the `TopK` of them most similar first: the `k` smallest scores for
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
-//! 2. a result carries the entry the index holds for its item — the attributes its
-//!    `Projection` stores, the vector it finds them by included — narrowed further by a
-//!    `ProjectionExpression`, which reports nothing for a name the index does not hold;
+//! 2. a result carries what the index REPORTS for its item — "only attributes projected
+//!    into the vector index can be retrieved" (`SearchVectors$ProjectionExpression`), so the
+//!    attributes its `Projection` projects and never the vector it finds them by, which is
+//!    the index's own search key — narrowed further by a `ProjectionExpression`, which
+//!    reports nothing for a name the search does not report;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
 //! 4. a request that addresses no searchable index is refused: a table that is not serving
@@ -348,27 +350,24 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // Rows differ along the index's `Projection` (the three `ProjectionType` values) and
     // along the `ProjectionExpression` the request narrows it with — absent, a written-out
     // name, several names, and a name reached through an `ExpressionAttributeNames` alias.
-    // The vector attribute `emb` is one of the attributes EVERY index holds — it is the
-    // attribute the index is built over — so a search that narrows nothing reports it
-    // beside the score computed from it, and one that names it in a projection gets it.
-    let cases: [(&str, Value, Value, &[&str]); 8] = [
+    // "Only attributes projected into the vector index can be retrieved"
+    // (`SearchVectors$ProjectionExpression`), and the vector attribute `emb` is the index's
+    // own search key rather than an attribute copied from the table into it — a search
+    // answers the score computed from it — so no row reports it, not even the `ALL` index's
+    // and not even one that names it in a projection.
+    let cases: [(&str, Value, Value, &[&str]); 9] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "note", "pk", "tenant"],
+            &["brand", "note", "pk", "tenant"],
         ),
-        (
-            "keys-index",
-            Value::Null,
-            Value::Null,
-            &["emb", "pk", "tenant"],
-        ),
+        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "pk", "tenant"],
+            &["brand", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -380,10 +379,11 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         ),
         // A projection that names an attribute the item does not hold reports nothing for
         // it, the way a projection over a table's items does — and so does one naming an
-        // attribute the index does not project, while the vector attribute itself is held
-        // by every index and is reported.
+        // attribute no search reports: the index's vector attribute, over an index that
+        // projects every attribute of the item as much as over one that projects none.
         ("all-index", json!("absent"), Value::Null, &[]),
-        ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
+        ("all-index", json!("emb"), Value::Null, &[]),
+        ("keys-index", json!("note, emb"), Value::Null, &[]),
     ];
     for (index, projection_expression, names, expected) in cases {
         let case = format!("{index} projecting {projection_expression}");

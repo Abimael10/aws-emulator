@@ -489,10 +489,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = store.active_table(&region, &name, now).map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
         // not its items: it is decided before anything is read. A scan addresses no
-        // partition of its own, and asks for the attributes its selection names.
-        if let Some(denial) = crate::state::authorization::denial_keys(
+        // partition of its own, and asks for the attributes its selection names. A scan
+        // THROUGH an index acts on that index's own ARN, which is what the decision and the
+        // refusal name ([`crate::state::authorization::addressed_resource`]).
+        if let Some(denial) = crate::state::authorization::denial_indexed(
             &caller,
             table,
+            input.index_name.as_deref(),
             "dynamodb:Scan",
             now,
             &crate::state::authorization::RequestKeys::selected(

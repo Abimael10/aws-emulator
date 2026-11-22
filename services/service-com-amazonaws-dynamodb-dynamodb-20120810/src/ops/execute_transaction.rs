@@ -561,18 +561,18 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         let table = store.active_table(region, &name, now).map_err(absent)?;
         // A table the policies in force do not let this caller act on with this
         // statement's own action is not read at all. PartiQL has its own four actions,
-        // and the partition the statement addresses is what a conditioned statement is
-        // decided against. A statement of a transaction performs that action INSIDE this
-        // operation, which is what a statement admitting it only as part of one tests.
-        if let Some(denial) = crate::state::authorization::denial_keys(
+        // and the partition the statement addresses — with whether it scans its whole
+        // source — is what a conditioned statement is decided against. A statement of a
+        // transaction performs that action INSIDE this operation, which is what a statement
+        // admitting it only as part of one tests.
+        if let Some(denial) = crate::state::authorization::denial_indexed(
             caller,
             table,
+            statement.index(),
             statement.action(),
             now,
-            &crate::state::authorization::RequestKeys::addressing(
-                crate::state::authorization::AddressedKeys::of_statement(table, statement),
-            )
-            .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
+            &crate::state::authorization::RequestKeys::of_statement(table, statement)
+                .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
         ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
@@ -738,15 +738,14 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             // A statement of a transaction performs its own PartiQL action INSIDE this
             // operation, which is what a statement admitting that action only as part of
             // one tests.
-            if let Some(denial) = crate::state::authorization::denial_keys(
+            if let Some(denial) = crate::state::authorization::denial_indexed(
                 caller,
                 table,
+                statement.index(),
                 statement.action(),
                 now,
-                &crate::state::authorization::RequestKeys::addressing(
-                    crate::state::authorization::AddressedKeys::of_statement(table, statement),
-                )
-                .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
+                &crate::state::authorization::RequestKeys::of_statement(table, statement)
+                    .within(crate::state::authorization::EnclosingOperation::ExecuteTransaction),
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

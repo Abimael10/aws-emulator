@@ -3959,6 +3959,47 @@ pub fn source_sort_key_name(table: &Table, index: Option<&str>) -> Option<String
     }
 }
 
+/// The name of the PARTITION key of the source a statement reads: the index's own, when its
+/// `FROM` clause names one, and otherwise the table's — the attribute an equality has to pin
+/// for the statement to address one partition instead of walking the whole source.
+///
+/// `None` only for an index whose key schema declares no `HASH` element, which is a source no
+/// equality can address a partition of.
+pub fn source_partition_key_name(table: &Table, index: Option<&str>) -> Option<String> {
+    match index.and_then(|index| index_shape(table, index)) {
+        Some((key_schema, _)) => key_schema
+            .iter()
+            .find(|element| element.key_type == "HASH")
+            .map(|element| element.attribute_name.clone()),
+        None => Some(table.partition_key_name().to_string()),
+    }
+}
+
+/// Whether this statement READS EVERY ENTRY of the source it names rather than addressing
+/// one partition of it: the question the condition key reporting a full scan answers.
+///
+/// It is what the `WHERE` clause pins that decides, exactly as it decides which low-level
+/// plan serves the statement: an equality on the partition key of the SOURCE — the index's
+/// own, where the `FROM` target names one — addresses that partition, and a clause that pins
+/// none (or no clause at all) leaves every entry to be read. A statement that stores an item
+/// addresses the item it names, so it reads no source at all.
+pub fn statement_scans_whole_source(table: &Table, statement: &PartiqlStatement) -> bool {
+    let scans = |filter: Option<&Predicate>, index: Option<&str>| {
+        let Some(partition) = source_partition_key_name(table, index) else {
+            return true;
+        };
+        !filter.is_some_and(|filter| pinned_equalities(filter).contains_key(&partition))
+    };
+    match statement {
+        PartiqlStatement::Insert(_) => false,
+        PartiqlStatement::Select(select) | PartiqlStatement::Exists(select) => {
+            scans(select.filter.as_ref(), select.index.as_deref())
+        }
+        PartiqlStatement::Update(update) => scans(Some(&update.filter), None),
+        PartiqlStatement::Delete(delete) => scans(Some(&delete.filter), None),
+    }
+}
+
 /// How a `WHERE` clause that states a condition on the source's RANGE key inside a
 /// disjunction is refused, in the fixed sentence DynamoDB states that rule with.
 pub const OVERLAPPING_RANGE_KEY_MESSAGE: &str =
