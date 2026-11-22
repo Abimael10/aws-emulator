@@ -12,27 +12,47 @@
 //! and the directive flag it asks for.
 //!
 //! The representation the `OutputType` the call names chooses is the same distinction
-//! one type is reported under (`super::schema_types`): the SDL the schema's types are
-//! written in, or the introspection JSON they render to. Both are computed from the
-//! stored definitions, so the two cannot disagree about one schema, and neither can
-//! disagree with what `GetType` answers for a type of it.
+//! one type is reported under (`super::schema_types`): the canonical SDL the schema's
+//! types are printed as (`super::canonical_sdl`), or the introspection JSON they render
+//! to. Both are PRINTED from the stored definitions rather than from the document that
+//! installed them, so one type system is reported the same way however its author wrote
+//! it, the two representations cannot disagree about one schema, and neither can disagree
+//! with what `GetType` answers for a type of it.
+//!
+//! Both representations report the schema's own types. The introspection JSON reports what
+//! a schema holds BESIDE them too, because an introspection document is the result of the
+//! introspection query over the whole schema: the types GraphQL's introspection system
+//! defines, the built-in scalars the schema references, and the directives it supports
+//! (`super::introspection_meta_schema`).
 //!
 //! An API whose types are empty holds no type system, so there is no schema to
 //! introspect: what such a call reads as the API's schema is an EMPTY document, and the
 //! refusal carries the parse of that document — which stops at its origin — whatever
 //! left the API without a type system.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use apollo_parser::cst::{self, CstNode};
 use apollo_parser::Parser;
 use serde_json::{json, Value};
 
+use super::canonical_sdl::{Printer, RootOperation};
+use super::introspection_meta_schema::{
+    built_in_scalar_description, meta_type, SCHEMA_DIRECTIVES_SDL, SCHEMA_META_TYPE,
+};
 use super::schema_types::{input_value_definition, input_value_json};
 use super::{
-    invalid_syntax_detail, GraphqlApiRecord, InputValueDefinition, TypeRecord, BUILT_IN_SCALARS,
-    DEFINITION_RECURSION_LIMIT, DEFINITION_TOKEN_LIMIT, DOCUMENT_ORIGIN, JSON_FORMAT, SCALAR_KIND,
+    invalid_syntax_detail, GraphqlApiRecord, InputValueDefinition, TypeDefinition, TypeRecord,
+    BUILT_IN_SCALARS, DEFINITION_RECURSION_LIMIT, DEFINITION_TOKEN_LIMIT, DOCUMENT_ORIGIN,
+    JSON_FORMAT, SCALAR_KIND,
 };
+
+/// The operation each root operation type is the root OF, as a `schema` definition writes
+/// it.
+const QUERY_OPERATION: &str = "query";
+const MUTATION_OPERATION: &str = "mutation";
+const SUBSCRIPTION_OPERATION: &str = "subscription";
 
 /// The name the query root operation type carries in a schema that binds none.
 ///
@@ -61,28 +81,26 @@ struct SchemaDeclarations {
     mutation: Option<String>,
     /// The type the document binds as its subscription root.
     subscription: Option<String>,
-    /// The `schema` definition's own SDL text, kept verbatim, when the document writes
-    /// one.
-    schema_definition: Option<String>,
     /// The directives the document defines, in document order.
     directives: Vec<DirectiveDeclaration>,
 }
 
-/// One directive a schema document defines: the SDL text defining it and what that text
-/// declares.
+/// One directive a schema document defines, as its definition declares it.
+///
+/// What the definition DECLARES is kept rather than the text that declared it, because both
+/// representations of a schema are written from the declaration: the introspection
+/// `__Directive` and the canonical SDL rendering ([`super::canonical_sdl`]).
 #[derive(Debug)]
-struct DirectiveDeclaration {
-    /// The document's own text for this definition, kept verbatim.
-    definition: String,
-    name: String,
-    description: Option<String>,
+pub(crate) struct DirectiveDeclaration {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
     /// Whether the definition marks the directive `repeatable`.
-    is_repeatable: bool,
+    pub(crate) is_repeatable: bool,
     /// The locations the definition names a directive may be applied at, as GraphQL's
     /// `__DirectiveLocation` spells them.
-    locations: Vec<String>,
+    pub(crate) locations: Vec<String>,
     /// The arguments the definition declares, which are `__InputValue`s like a field's.
-    arguments: Vec<InputValueDefinition>,
+    pub(crate) arguments: Vec<InputValueDefinition>,
 }
 
 /// Read `document` for everything a schema declares beside its types.
@@ -98,7 +116,6 @@ fn schema_declarations(document: &str) -> SchemaDeclarations {
     for node in tree.document().definitions() {
         match node {
             cst::Definition::SchemaDefinition(schema) => {
-                declarations.schema_definition = Some(node_text(schema.syntax()));
                 bind_root_types(&mut declarations, schema.root_operation_type_definitions());
             }
             // An extension of the schema binds root operation types the same way the
@@ -112,7 +129,6 @@ fn schema_declarations(document: &str) -> SchemaDeclarations {
                     continue;
                 };
                 declarations.directives.push(DirectiveDeclaration {
-                    definition: node_text(directive.syntax()),
                     name,
                     description: directive
                         .description()
@@ -324,47 +340,82 @@ impl GraphqlApiRecord {
         Some(self.schema_json(&declarations, include_directives))
     }
 
-    /// This API's schema as GraphQL SDL: the `schema` definition the created document
-    /// binds its root operation types with (where it writes one — GraphQL lets a schema
-    /// whose roots carry the default names omit it), the directives it defines, and every
-    /// type the API holds, each in the SDL it was defined with.
+    /// This API's schema as GraphQL SDL: the service's own CANONICAL printing of the type
+    /// system the API holds ([`super::canonical_sdl`]) — the `schema` definition that binds
+    /// the root operation types it holds, the directives the schema states where the call
+    /// asks for them, and every type it holds.
     ///
-    /// The types are written in the order they were created, which is the order the
-    /// document declares them in and the order a listing reports them in, so one API's
-    /// schema reads the same on every call.
+    /// Printed from the stored definitions rather than from the text that created them, so
+    /// one type system renders to the same document however its author wrote it: the layout,
+    /// the order of the definitions and the order of each definition's members are the
+    /// service's, and only the names, the types and the directives are the schema's.
     fn introspection_sdl(
         &self,
         declarations: &SchemaDeclarations,
         include_directives: bool,
     ) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        parts.extend(declarations.schema_definition.clone());
-        if include_directives {
-            parts.extend(
-                declarations
-                    .directives
-                    .iter()
-                    .map(|directive| directive.definition.clone()),
-            );
+        let bound = self.bound_root_types(declarations);
+        let roots: Vec<RootOperation<'_>> = bound
+            .iter()
+            .map(|(operation, type_name)| RootOperation {
+                operation,
+                type_name,
+            })
+            .collect();
+        let directives: Vec<&DirectiveDeclaration> = declarations.directives.iter().collect();
+        let types: Vec<&TypeDefinition> = self
+            .types_in_creation_order()
+            .map(|record| &record.parsed)
+            .collect();
+        Printer {
+            directives: include_directives,
         }
-        parts.extend(
-            self.types_in_creation_order()
-                .map(|record| record.definition.trim().to_string()),
-        );
-        let mut sdl = parts.join("\n\n");
-        sdl.push('\n');
-        sdl
+        .render_schema(&roots, &directives, &types)
+    }
+
+    /// The root operation types this schema binds that the type system HOLDS, each with the
+    /// operation it is the root of, in the order a `schema` definition writes them.
+    ///
+    /// Each is the type the document BINDS for that operation, or GraphQL's default name for
+    /// it where the document binds none — the same reading every reader of a root operation
+    /// type takes ([`Self::query_root_type`]) — and a root bound to a type the API does not
+    /// hold is no root at all, the same reading introspection reports one under
+    /// ([`Self::root_type_json`]), so a type system with no query type binds nothing.
+    fn bound_root_types(&self, declarations: &SchemaDeclarations) -> Vec<(&'static str, String)> {
+        [
+            (QUERY_OPERATION, &declarations.query, DEFAULT_QUERY_TYPE),
+            (
+                MUTATION_OPERATION,
+                &declarations.mutation,
+                DEFAULT_MUTATION_TYPE,
+            ),
+            (
+                SUBSCRIPTION_OPERATION,
+                &declarations.subscription,
+                DEFAULT_SUBSCRIPTION_TYPE,
+            ),
+        ]
+        .into_iter()
+        .map(|(operation, bound, default_name)| {
+            (
+                operation,
+                bound.clone().unwrap_or_else(|| default_name.to_string()),
+            )
+        })
+        .filter(|(_, type_name)| self.types.contains_key(type_name))
+        .collect()
     }
 
     /// This API's schema as GraphQL introspection JSON: the result of the introspection
     /// query over it, so the `__Schema` the introspection system defines sits under the
     /// `data` every GraphQL result carries its data under — its root operation types,
-    /// every type it holds and, when the call asks for them, the directives it defines.
+    /// every type it holds and, when the call asks for them, the directives it supports.
     ///
     /// Each type is rendered as GraphQL's introspection system defines a `__Type` —
     /// which is not the document a read of ONE type answers with (`super::type_json`) —
-    /// and the built-in scalars the schema references are reported beside them, because
-    /// an introspection document holds every type its schema's fields resolve to.
+    /// and the introspection system's OWN types and the built-in scalars the schema
+    /// references are reported beside them, because an introspection document holds every
+    /// type its schema has.
     fn introspection_json(
         &self,
         declarations: &SchemaDeclarations,
@@ -381,15 +432,11 @@ impl GraphqlApiRecord {
         declarations: &SchemaDeclarations,
         include_directives: bool,
     ) -> Value {
-        let mut types: Vec<Value> = self
-            .types_in_creation_order()
-            .map(|record| record.introspection(&self.types))
+        let types: Vec<Value> = self
+            .introspected_types(declarations)
+            .iter()
+            .filter_map(|name| self.introspected_type(name))
             .collect();
-        types.extend(
-            self.referenced_built_in_scalars()
-                .into_iter()
-                .map(|name| built_in_scalar_json(&name)),
-        );
         let mut schema = json!({
             "queryType": self.root_type_json(declarations.query.as_deref(), DEFAULT_QUERY_TYPE),
             "mutationType": self
@@ -399,16 +446,102 @@ impl GraphqlApiRecord {
             "types": types,
         });
         if include_directives {
-            let directives: Vec<Value> = declarations
-                .directives
-                .iter()
-                .map(|directive| self.directive_json(directive))
-                .collect();
+            let directives = Value::Array(self.reported_directives(declarations));
             if let Some(members) = schema.as_object_mut() {
-                members.insert("directives".to_string(), Value::Array(directives));
+                members.insert("directives".to_string(), directives);
             }
         }
         schema
+    }
+
+    /// Every type the introspection document reports, in the order the schema REACHES it.
+    ///
+    /// A GraphQL schema's types are the ones reachable from what it declares, so the
+    /// document reports each type the first time it is reached: from the root operation
+    /// types the schema binds, outwards over the types their fields, arguments, interfaces
+    /// and members resolve to — a type's own type first and then the types its arguments
+    /// take — then every type the API holds that nothing reaches, and finally the
+    /// introspection system's own `__Schema` and everything it names, which every schema
+    /// holds ([`super::introspection_meta_schema`]).
+    ///
+    /// Walked ITERATIVELY over an explicit stack, so reading a type system costs one step
+    /// per reference and no stack frame per level however deeply its types nest.
+    fn introspected_types(&self, declarations: &SchemaDeclarations) -> Vec<String> {
+        let mut roots: Vec<String> = self
+            .bound_root_types(declarations)
+            .into_iter()
+            .map(|(_, type_name)| type_name)
+            .collect();
+        roots.extend(
+            self.types_in_creation_order()
+                .map(|record| record.parsed.name.clone()),
+        );
+        roots.push(SCHEMA_META_TYPE.to_string());
+
+        let mut reported: Vec<String> = Vec::new();
+        let mut reached: BTreeSet<String> = BTreeSet::new();
+        for root in roots {
+            let mut pending: Vec<String> = vec![root];
+            while let Some(name) = pending.pop() {
+                if !reached.insert(name.clone()) {
+                    continue;
+                }
+                for referenced in self.referenced_by(&name).into_iter().rev() {
+                    pending.push(referenced);
+                }
+                reported.push(name);
+            }
+        }
+        reported
+    }
+
+    /// The types the definition of `name` references, in the order it reaches them, or none
+    /// at all for a name no definition of this schema declares — a built-in scalar, and a
+    /// reference to a type nothing defines, each of which names no further type.
+    fn referenced_by(&self, name: &str) -> Vec<String> {
+        self.definition_of(name)
+            .map(TypeDefinition::referenced_types)
+            .unwrap_or_default()
+    }
+
+    /// The definition this schema holds for `name`: the API's own stored type, or the
+    /// introspection system's definition of one of ITS types, which every schema holds.
+    fn definition_of(&self, name: &str) -> Option<&TypeDefinition> {
+        match self.types.get(name) {
+            Some(record) => Some(&record.parsed),
+            None => meta_type(name),
+        }
+    }
+
+    /// One type of the introspection document as a `__Type`, or `None` for a name this
+    /// schema holds no type for — a reference to a type nothing defines is no type of the
+    /// document.
+    fn introspected_type(&self, name: &str) -> Option<Value> {
+        if let Some(definition) = self.definition_of(name) {
+            return Some(definition.introspection(&self.types));
+        }
+        BUILT_IN_SCALARS
+            .contains(&name)
+            .then(|| built_in_scalar_json(name))
+    }
+
+    /// The directives the introspection document reports: the ones this schema's own
+    /// document DEFINES, and the ones every schema of this service holds without defining
+    /// them ([`super::introspection_meta_schema::SCHEMA_DIRECTIVES_SDL`]).
+    ///
+    /// Each name is reported once, and a schema that defines one of those names itself is
+    /// reported with its OWN definition of it: a schema holds one directive per name.
+    fn reported_directives(&self, declarations: &SchemaDeclarations) -> Vec<Value> {
+        let defined = &declarations.directives;
+        defined
+            .iter()
+            .chain(
+                directives_every_schema_holds()
+                    .iter()
+                    .filter(|held| !defined.iter().any(|own| own.name == held.name)),
+            )
+            .map(|directive| self.directive_json(directive))
+            .collect()
     }
 
     /// The types this API holds, in the order they were created.
@@ -430,12 +563,14 @@ impl GraphqlApiRecord {
         }
     }
 
-    /// One directive the schema defines as introspection's `__Directive`.
+    /// One directive the schema holds as introspection's `__Directive`: the members that
+    /// type declares — the directive's name, its description, the locations it may be
+    /// applied at and the arguments it takes
+    /// ([`super::introspection_meta_schema`]) — and nothing else.
     fn directive_json(&self, directive: &DirectiveDeclaration) -> Value {
         json!({
             "name": directive.name,
             "description": directive.description,
-            "isRepeatable": directive.is_repeatable,
             "locations": directive.locations,
             "args": directive
                 .arguments
@@ -444,23 +579,14 @@ impl GraphqlApiRecord {
                 .collect::<Vec<Value>>(),
         })
     }
+}
 
-    /// The scalars every schema holds without defining them that this API's types
-    /// reference, in name order and each reported once.
-    ///
-    /// A field whose type is one of them resolves to a type of the introspection
-    /// document, so the document names them beside the types the API defines.
-    fn referenced_built_in_scalars(&self) -> Vec<String> {
-        let mut referenced: BTreeMap<String, ()> = BTreeMap::new();
-        for record in self.types.values() {
-            for name in record.parsed.referenced_types() {
-                if BUILT_IN_SCALARS.contains(&name.as_str()) {
-                    referenced.insert(name, ());
-                }
-            }
-        }
-        referenced.into_keys().collect()
-    }
+/// The directives EVERY schema of this service holds without defining them, read once from
+/// the SDL that declares them ([`SCHEMA_DIRECTIVES_SDL`]) by the same reader a caller's own
+/// document is read with, so one reading declares both.
+fn directives_every_schema_holds() -> &'static Vec<DirectiveDeclaration> {
+    static HELD: OnceLock<Vec<DirectiveDeclaration>> = OnceLock::new();
+    HELD.get_or_init(|| schema_declarations(SCHEMA_DIRECTIVES_SDL).directives)
 }
 
 /// The mutation fields a subscription field's `@aws_subscribe` directive names, or an empty
@@ -490,13 +616,14 @@ const SUBSCRIBE_DIRECTIVE: &str = "aws_subscribe";
 const SUBSCRIBE_MUTATIONS_ARGUMENT: &str = "mutations";
 
 /// One built-in scalar as introspection's `__Type`: a scalar carries no member a type
-/// system defines, so every member but its kind and name is null — the same rendering a
-/// DEFINED scalar of the API gets.
+/// system defines, so every member but its kind, its name and the description GraphQL gives
+/// it ([`built_in_scalar_description`]) is null — the same rendering a DEFINED scalar of the
+/// API gets.
 fn built_in_scalar_json(name: &str) -> Value {
     json!({
         "kind": SCALAR_KIND,
         "name": name,
-        "description": Value::Null,
+        "description": built_in_scalar_description(name),
         "fields": Value::Null,
         "inputFields": Value::Null,
         "interfaces": Value::Null,

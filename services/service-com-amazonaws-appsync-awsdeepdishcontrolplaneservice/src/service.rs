@@ -58,6 +58,11 @@ pub mod authorization;
 /// answers.
 pub mod event_api;
 
+/// The media type the SCHEMA an introspection read answers with is labelled: the one
+/// response of this service whose body is not the restJson1 envelope its own serializer
+/// labels.
+pub mod schema_media_type;
+
 /// A GraphQL API's REAL-TIME plane: the socket each `GraphqlApi`'s `REALTIME` endpoint is
 /// served on — the address `GraphqlApi$uris` publishes for a subscriber to dial — which is
 /// a SOCKET rather than a route of this service for the same reason an Event API's
@@ -659,7 +664,6 @@ fn gated_table<Eng: Send + Sync + 'static>(
         get_function::GetFunction,
         get_graphql_api::GetGraphqlApi,
         get_graphql_api_environment_variables::GetGraphqlApiEnvironmentVariables,
-        get_introspection_schema::GetIntrospectionSchema,
         get_resolver::GetResolver,
         get_schema_creation_status::GetSchemaCreationStatus,
         get_source_api_association::GetSourceApiAssociation,
@@ -694,6 +698,20 @@ fn gated_table<Eng: Send + Sync + 'static>(
         update_resolver::UpdateResolver,
         update_source_api_association::UpdateSourceApiAssociation,
         update_type::UpdateType,
+    );
+    // The one operation whose answer is not this service's restJson1 envelope: the SCHEMA
+    // an introspection read answers with is the response's whole payload, labelled with the
+    // media type AppSync labels a schema with ([`schema_media_type`]). Served behind the
+    // same decision as every other operation — the layer wraps that gate rather than
+    // replacing it.
+    wrappers.insert(
+        <crate::ops::get_introspection_schema::GetIntrospectionSchema<Eng> as Operation>::NAME,
+        Box::new(schema_media_type::AnnouncedAsJson::new(
+            authorization::Gated::<
+                crate::ops::get_introspection_schema::GetIntrospectionSchema<Eng>,
+                Eng,
+            >::new(Arc::clone(engine)),
+        )) as Box<dyn ErasedOperation>,
     );
     wrappers
 }

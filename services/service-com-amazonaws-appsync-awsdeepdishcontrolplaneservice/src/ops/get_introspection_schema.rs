@@ -124,6 +124,12 @@ pub struct GetIntrospectionSchema<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// What a call that names no `includeDirectives` asks for.
+///
+/// RECORDED behaviour: the schema a read answers with carries the directives the schema
+/// states, so the flag is what a caller DECLINES them with rather than what it asks for
+/// them with.
+const DIRECTIVES_UNLESS_DECLINED: bool = true;
 impl<Eng> GetIntrospectionSchema<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -197,10 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Rendered from the type system the API holds, in the representation the request
         // asked for; an API that holds none has no valid GraphQL schema to report, which
-        // is what `GraphQLSchemaException` says. A request that names no
-        // `includeDirectives` asks for none.
+        // is what `GraphQLSchemaException` says.
+        //
+        // `includeDirectives` is "A flag that specifies whether the schema introspection
+        // should contain directives". RECORDED behaviour: the directives the schema states
+        // are part of the answer unless the call asks for none, so a request that names no
+        // flag is answered with them.
         let schema = api
-            .introspection_schema(&input.format, input.include_directives.unwrap_or(false))
+            .introspection_schema(
+                &input.format,
+                input.include_directives.unwrap_or(DIRECTIVES_UNLESS_DECLINED),
+            )
             .map_err(|message| {
                 GetIntrospectionSchemaErrorModeled::GraphQLSchemaException(GraphQLSchemaException {
                     message: Some(message),

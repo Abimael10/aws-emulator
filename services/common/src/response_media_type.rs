@@ -90,6 +90,15 @@
 //! announces under the protocol's own media type, told apart from their front door's
 //! answers by the error CODE those refusals carry ([`client_error_naming_one_of`]).
 //!
+//! The payload case is called the same way, by
+//! `service-com-amazonaws-codeartifact-codeartifactcontrolplaneservice` and
+//! `service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice`: a `restJson1` operation
+//! whose body is a blob `@httpPayload`, which the renderer stamps with Smithy's blob default
+//! while the recorded wire announces `application/json`. Each states that one pair
+//! (`application/octet-stream` → `application/json`) and takes [`ResponseMediaType::announce`]
+//! from here — CodeArtifact at its own protocol's `serialize_output`, AppSync in the layer in
+//! front of the one operation whose answer is such a payload.
+//!
 //! STILL TO MIGRATE onto this module: `service-com-amazonaws-amp-amazonprometheusservice`
 //! (`RESPONSE_CONTENT_TYPE` in its `src/state.rs`, with the rewrite in its
 //! `src/service.rs`) and

@@ -385,11 +385,23 @@ fn assert_json(case: &Case, answer: &SchemaAnswer) {
                 .collect()
         })
         .unwrap_or_default();
-    assert_eq!(
-        reported, case.directives,
-        "case {:?} JSON: expected the directives {:?} the schema defines, got {:?}",
-        case.label, case.directives, schema["directives"]
-    );
+    // The directives the DOCUMENT defines are reported, each once. A schema also holds the
+    // directives nothing has to define — GraphQL's own and the ones an AppSync schema is
+    // written with — which the suite that asserts the whole introspection document covers
+    // (`crate::introspection_schema_canonical_rendering`).
+    for directive in case.directives {
+        assert_eq!(
+            reported
+                .iter()
+                .filter(|named| *named == directive)
+                .count(),
+            1,
+            "case {:?} JSON: expected the directive {directive:?} the schema defines to be \
+             reported once, got {:?}",
+            case.label,
+            schema["directives"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -529,15 +541,19 @@ async fn directives_are_reported_only_when_the_call_asks_for_them() {
         started, 200,
         "case directive flag: expected StartSchemaCreation 200, got {started}"
     );
-    tokio::time::sleep(state::SCHEMA_CREATION_SPAN + PAST_THE_CREATION).await;
+    // A wait on the CONDITION rather than on a fixed time: the creation is a transition the
+    // clock owes, so the suite looks again until the service reports it performed
+    // (`crate::schema_creation::await_creation`).
+    await_creation(&router, &api.id, "directive flag").await;
 
     // The flag is read the same way whichever representation is asked for, and a request
-    // that names none asks for no directives.
+    // that names none is answered with the schema's directives: the flag is what DECLINES
+    // them (recorded behaviour).
     for format in OUTPUT_TYPES {
         for (flag, wanted) in [
             ("&includeDirectives=true", true),
             ("&includeDirectives=false", false),
-            ("", false),
+            ("", true),
         ] {
             let answer = get_schema(&router, &api.id, &format!("format={format}{flag}")).await;
             assert_eq!(
@@ -572,21 +588,21 @@ async fn directives_are_reported_only_when_the_call_asks_for_them() {
         }
     }
 
-    // The directive is reported as GraphQL introspection defines a `__Directive`: what
-    // the definition declares, nothing of the request.
+    // The directive is reported as the introspection system's `__Directive` defines one:
+    // the members that type declares — the name, the description, the locations and the
+    // arguments (`state::introspection_meta_schema`) — read off the definition the document
+    // writes and nothing of the request.
     let reported = schema_in(&router, &api.id, "JSON").await.json();
     let directive = reported["data"]["__schema"]["directives"][0].clone();
     assert_eq!(
         (
             directive["name"].as_str(),
-            directive["isRepeatable"].as_bool(),
             directive["locations"][0].as_str(),
             directive["args"][0]["name"].as_str(),
             directive["args"][0]["defaultValue"].as_str(),
         ),
         (
             Some("auth"),
-            Some(true),
             Some("FIELD_DEFINITION"),
             Some("level"),
             Some("\"owner\""),

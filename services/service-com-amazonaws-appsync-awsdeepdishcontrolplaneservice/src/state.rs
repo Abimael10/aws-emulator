@@ -36,6 +36,14 @@ pub use schema_types::*;
 /// answers with, whichever way that type got into its API.
 mod type_sdl;
 
+/// How a whole SCHEMA is written back as GraphQL SDL: the canonical document an
+/// introspection read answers with, printed from the type system the API holds.
+mod canonical_sdl;
+
+/// The types and directives GraphQL's INTROSPECTION SYSTEM adds to every schema, which an
+/// introspection document reports beside the schema's own.
+mod introspection_meta_schema;
+
 /// How one stored type is written back as JSON: the type's own introspection document,
 /// which is the other representation a read can ask for.
 mod type_json;

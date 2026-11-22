@@ -224,49 +224,51 @@ impl TypeRecord {
     fn introspection_json(&self, api_types: &BTreeMap<String, TypeRecord>) -> String {
         self.parsed.render_json(api_types)
     }
+}
 
-    /// This type as a GraphQL introspection `__Type`: the JSON representation of a
+impl TypeDefinition {
+    /// This definition as a GraphQL introspection `__Type`: the JSON representation of a
     /// GraphQL type, as the introspection system defines it.
     ///
-    /// Reached by the whole SCHEMA's introspection too (`super::introspection_schema`),
-    /// so one type reported on its own and the same type reported as part of the schema
-    /// cannot disagree.
+    /// One reader for every type a schema has, so a type an API holds, the same type
+    /// reported as part of its schema (`super::introspection_schema`) and a type the
+    /// introspection system itself defines cannot be reported differently.
     ///
-    /// Every member is taken from the stored definition, and every type REFERENCE is
-    /// resolved against the types the API holds plus the schema's built-in scalars
-    /// ([`BUILT_IN_SCALARS`]) — so an interface reports the object types that implement
-    /// it, and a reference to a type nothing has defined carries its name with no kind
-    /// rather than a kind the schema does not support.
+    /// Every member is taken from the definition, and every type REFERENCE is resolved
+    /// against the types the API holds plus the types every schema holds without defining
+    /// them — its built-in scalars ([`BUILT_IN_SCALARS`]) and the introspection system's
+    /// own ([`super::introspection_meta_schema`]) — so an interface reports the object
+    /// types that implement it, and a reference to a type nothing has defined carries its
+    /// name with no kind rather than a kind the schema does not support.
     pub(crate) fn introspection(&self, api_types: &BTreeMap<String, TypeRecord>) -> Value {
-        let parsed = &self.parsed;
-        let has_fields = parsed.kind == OBJECT_KIND || parsed.kind == INTERFACE_KIND;
+        let has_fields = self.kind == OBJECT_KIND || self.kind == INTERFACE_KIND;
         json!({
-            "kind": parsed.kind,
-            "name": parsed.name,
-            "description": parsed.description,
+            "kind": self.kind,
+            "name": self.name,
+            "description": self.description,
             "fields": has_fields.then(|| {
-                parsed
+                self
                     .fields
                     .iter()
                     .map(|field| field_json(field, api_types))
                     .collect::<Vec<Value>>()
             }),
-            "inputFields": (parsed.kind == INPUT_OBJECT_KIND).then(|| {
-                parsed
+            "inputFields": (self.kind == INPUT_OBJECT_KIND).then(|| {
+                self
                     .input_fields
                     .iter()
                     .map(|input| input_value_json(input, api_types))
                     .collect::<Vec<Value>>()
             }),
             "interfaces": has_fields.then(|| {
-                parsed
+                self
                     .interfaces
                     .iter()
                     .map(|name| named_type_json(name, api_types))
                     .collect::<Vec<Value>>()
             }),
-            "enumValues": (parsed.kind == ENUM_KIND).then(|| {
-                parsed
+            "enumValues": (self.kind == ENUM_KIND).then(|| {
+                self
                     .enum_values
                     .iter()
                     .map(enum_value_json)
@@ -280,10 +282,9 @@ impl TypeRecord {
     /// types that implement an interface. Every other kind has none, which
     /// introspection reports as null rather than as an empty list.
     fn possible_types(&self, api_types: &BTreeMap<String, TypeRecord>) -> Value {
-        match self.parsed.kind {
+        match self.kind {
             UNION_KIND => Value::Array(
-                self.parsed
-                    .members
+                self.members
                     .iter()
                     .map(|name| named_type_json(name, api_types))
                     .collect(),
@@ -293,7 +294,7 @@ impl TypeRecord {
                     .values()
                     .filter(|record| {
                         record.parsed.kind == OBJECT_KIND
-                            && record.parsed.interfaces.contains(&self.parsed.name)
+                            && record.parsed.interfaces.contains(&self.name)
                     })
                     .map(|record| named_type_json(&record.parsed.name, api_types))
                     .collect(),
@@ -966,15 +967,23 @@ fn named_type_json(name: &str, api_types: &BTreeMap<String, TypeRecord>) -> Valu
     })
 }
 
-/// The kind the type `name` has in this API: the kind of its stored definition, or
-/// [`SCALAR_KIND`] for a scalar every schema holds ([`BUILT_IN_SCALARS`]). `None` when
-/// nothing defines it, which is reported as a reference with no kind rather than as a
-/// guess.
+/// The kind the type `name` has in this API: the kind of its stored definition, the kind
+/// the introspection system's own definition of it declares
+/// ([`super::introspection_meta_schema`]), or [`SCALAR_KIND`] for a scalar every schema
+/// holds ([`BUILT_IN_SCALARS`]). `None` when nothing defines it, which is reported as a
+/// reference with no kind rather than as a guess.
+///
+/// The introspection system's types are types of EVERY schema, so a reference to one
+/// resolves whether or not the API defines anything — and GraphQL reserves their `__`
+/// prefix, so no type an API holds can carry one of those names.
 fn kind_of(name: &str, api_types: &BTreeMap<String, TypeRecord>) -> Option<&'static str> {
     if BUILT_IN_SCALARS.contains(&name) {
         return Some(SCALAR_KIND);
     }
-    api_types.get(name).map(|record| record.parsed.kind)
+    api_types
+        .get(name)
+        .map(|record| record.parsed.kind)
+        .or_else(|| super::introspection_meta_schema::meta_type_kind(name))
 }
 
 /// The AppSync service quota for types on ONE GraphQL API.
@@ -1223,7 +1232,7 @@ pub fn parse_schema_document(definition: &str) -> Result<Vec<DeclaredType>, Sche
         return Err(SchemaDocumentError::Unparseable { line, column });
     }
 
-    // Declaration order is the document's, which is the order introspection reports a
+    // Declaration order is the document's, which is the order a listing reports a
     // schema's types in, so it is kept beside the by-name index the checks below need.
     let mut order: Vec<String> = Vec::new();
     let mut declared: BTreeMap<String, DeclaredType> = BTreeMap::new();
@@ -1322,22 +1331,29 @@ impl TypeDefinition {
         self.directives.extend(extension.directives);
     }
 
-    /// Every type name this definition references: the interfaces it implements, the
-    /// types a union holds, and the type of each field, field argument and input field.
+    /// Every type name this definition references, in the order the definition REACHES
+    /// them: the type each field resolves to and then the types that field's arguments
+    /// take, field by field; the interfaces it implements; the types a union holds; and
+    /// the type of each input field.
+    ///
+    /// The ORDER is part of the answer, because it is the order an introspection document
+    /// reports a schema's types in (`super::introspection_schema`). A caller that only
+    /// asks WHICH types are referenced — the check that every reference of a created
+    /// document resolves — reads the same list.
     ///
     /// A list or non-null reference is a wrapper around a named one (`[Post!]!`), so
     /// what is reported is the NAME at its root — the only part that has to resolve to a
     /// declared type.
     pub(crate) fn referenced_types(&self) -> Vec<String> {
         let mut referenced: Vec<String> = Vec::new();
-        referenced.extend(self.interfaces.iter().cloned());
-        referenced.extend(self.members.iter().cloned());
         for field in &self.fields {
             referenced.extend(field.value_type.as_ref().map(TypeRef::root_name));
             for argument in &field.arguments {
                 referenced.extend(argument.value_type.as_ref().map(TypeRef::root_name));
             }
         }
+        referenced.extend(self.interfaces.iter().cloned());
+        referenced.extend(self.members.iter().cloned());
         for input_field in &self.input_fields {
             referenced.extend(input_field.value_type.as_ref().map(TypeRef::root_name));
         }

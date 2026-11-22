@@ -107,7 +107,11 @@ impl TypeDefinition {
 
 /// The SDL keyword that declares a type of `kind`, as GraphQL's SDL grammar spells each
 /// of the kinds a definition can declare.
-fn keyword(kind: &str) -> &'static str {
+///
+/// GraphQL's own grammar rather than this rendering's, so the whole SCHEMA's canonical
+/// rendering ([`super::canonical_sdl`]) declares a kind with the same keyword a single
+/// type's does.
+pub(crate) fn keyword(kind: &str) -> &'static str {
     match kind {
         INTERFACE_KIND => "interface",
         INPUT_OBJECT_KIND => "input",
@@ -186,7 +190,11 @@ fn input_value_text(input: &InputValueDefinition) -> String {
 /// Written from the name at the reference's root OUTWARDS over the wrappers it nests
 /// (`TypeRef::flattened`), so a reference costs one step per wrapper and no stack frame
 /// per wrapper however deeply the stored definition nested it.
-fn type_text(value_type: &TypeRef) -> String {
+///
+/// GraphQL's own grammar rather than this rendering's, so the whole SCHEMA's canonical
+/// rendering ([`super::canonical_sdl`]) writes a reference the same way a single type's
+/// does.
+pub(crate) fn type_text(value_type: &TypeRef) -> String {
     let (wrappers, name) = value_type.flattened();
     let mut text = name.to_string();
     for wrapper in wrappers.iter().rev() {
