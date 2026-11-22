@@ -6,10 +6,18 @@
 //!
 //! The target is the one `RegisterTargetWithMaintenanceWindow` persisted, in the one store in
 //! [`crate::state::maintenance_window_targets`], so what this removes is what a later
-//! `DescribeMaintenanceWindowTargets` then no longer reports. Both ids NAME a resource — "the
-//! ID of the maintenance window the target should be removed from" and "the ID of the target
-//! definition to remove" — so a window this endpoint holds none of, and a target that window
-//! holds none of, are each refused `DoesNotExistException` and nothing is removed.
+//! `DescribeMaintenanceWindowTargets` then no longer reports. The WINDOW id names a resource —
+//! "the ID of the maintenance window the target should be removed from" — so a window this
+//! endpoint holds none of is refused `DoesNotExistException` and nothing is removed.
+//!
+//! A REMOVAL, on the other hand, asks for a state rather than for a resource: the target the
+//! request names is gone once this call answers, so a `WindowTargetId` an existing window
+//! already holds none of is that same state, answered 200 with the request's own ids and
+//! nothing written. The removal happens once, and asking for it again is not a miss — which is
+//! what lets a teardown that retried after a timeout, and a controller that deregisters
+//! unconditionally, converge instead of taking a hard error for a state already reached.
+//! `DoesNotExistException` is reserved for the resource half: the window, and the target an
+//! operation that EDITS one names ([`crate::ops::update_maintenance_window_target`]).
 //!
 //! "The system checks if the target is being referenced by a task" is what `Safe` asks for,
 //! and `TargetInUseException` is what such a reference is reported with: a task of the same
@@ -193,24 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A target the window holds none of names nothing to remove, whatever the request
-        // asked of the safety check.
+        // A target this window holds none of is a target already removed from it, which is
+        // the state the request asks for: nothing is written, nothing is resurrected, and the
+        // ids the request named are echoed back, whatever it asked of the safety check — a
+        // target that is not there is referenced by no task either.
         if store
             .maintenance_window_target(&region, &input.window_id, &input.window_target_id)
             .is_none()
         {
-            return Err(
-                DeregisterTargetFromMaintenanceWindowErrorModeled::DoesNotExistException(
-                    DoesNotExistException {
-                        message: Some(
-                            crate::state::maintenance_window_targets::target_not_found_message(
-                                &input.window_target_id,
-                            ),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Ok(DeregisterTargetFromMaintenanceWindowOutput {
+                window_id: Some(input.window_id),
+                window_target_id: Some(input.window_target_id),
+            });
         }
 
         // "The system checks if the target is being referenced by a task. If the target is

@@ -332,26 +332,38 @@ async fn a_started_session_is_reported_until_it_is_terminated() {
 
         // Ending it: the id is reported back, and the session moves to the other set with
         // the instant it ended.
-        for attempt in ["the first end", "the same end again"] {
-            let (status, body) = call_in_region(
-                &router,
-                REGION,
-                "TerminateSession",
-                &json!({ "SessionId": session_id }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {:?}: {attempt} must be served, got {status} with {body}",
-                row.case
-            );
-            assert_eq!(
-                body["SessionId"].as_str(),
-                Some(session_id.as_str()),
-                "case {:?}: {attempt} reports the session it ended, got {body}",
-                row.case
-            );
-        }
+        let (status, body) = call_in_region(
+            &router,
+            REGION,
+            "TerminateSession",
+            &json!({ "SessionId": session_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the first end must be served, got {status} with {body}",
+            row.case
+        );
+        assert_eq!(
+            body["SessionId"].as_str(),
+            Some(session_id.as_str()),
+            "case {:?}: the first end reports the session it ended, got {body}",
+            row.case
+        );
+        // And ending it AGAIN is refused: the session is in no state to be ended twice.
+        let (status, refused) = call_in_region(
+            &router,
+            REGION,
+            "TerminateSession",
+            &json!({ "SessionId": session_id }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str(), error_message(&refused).as_str()),
+            (400, "ValidationException", "Session is not in a valid state"),
+            "case {:?}: the same end again must be refused, got {status} with {refused}",
+            row.case
+        );
         let ended = session_in(&router, REGION, "History", &session_id)
             .await
             .unwrap_or_else(|| {

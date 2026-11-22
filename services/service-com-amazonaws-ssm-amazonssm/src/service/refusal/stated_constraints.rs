@@ -14,8 +14,11 @@
 //! expression inside a `^`…`$` pair, and recovering what is published is the textual inverse
 //! of that wrapping — `service_common::validation::unanchored`, the tree's one reading of
 //! that pair. For the expressions this service publishes exactly as the model declares them
-//! ([`PUBLISHED_AS_DECLARED`]) the model's text is quoted verbatim: which of the two forms a
-//! shape is published with cannot be read off the text, because both are spelled `^…$` in
+//! ([`PUBLISHED_AS_DECLARED`]) the model's text is quoted verbatim, and for the ones it
+//! publishes with the anchor they OPEN with and without the one they close with
+//! ([`PUBLISHED_UNANCHORED_AT_THE_CLOSE`]) only that closing anchor is dropped
+//! (`service_common::validation::unanchored_at_the_close`). Which of the three forms a shape
+//! is published with cannot be read off the text, because all of them are spelled `^…$` in
 //! the model, so it is reference data about the SHAPE, keyed by the expression — what is
 //! published belongs to the shape, so one row holds for every member targeting it, in any
 //! operation, and inside a constraint set stated at a collection of them. The CHECK always
@@ -58,7 +61,7 @@ use ::aws_smithy_schema::{Schema, ShapeId, TraitMap};
 use ::aws_smithy_schema_server::constraints::{
     path, LengthTrait, PatternTrait, RangeTrait, Violation, ViolationKind,
 };
-use ::service_common::validation::{quoted_echo, unanchored};
+use ::service_common::validation::{quoted_echo, unanchored, unanchored_at_the_close};
 use ::service_common::validation_message::{
     element_constraint_set, element_set_requirement, requirement,
 };
@@ -122,6 +125,17 @@ const CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN: &str =
 /// match it was refused for rather than a run a rejected value contains.
 const CHOSEN_NAME_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
 
+/// `com.amazonaws.ssm#OpsAggregatorType`'s expression as the model declares it
+/// (`smithy_query(query="shape",shape="OpsAggregatorType")`), which this service publishes
+/// with the `^` it OPENS with and without the `$` it closes with.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.get-ops-summary-invalid-aggregator-rejected`): an `AggregatorType` outside it is
+/// refused with the clause `Member must satisfy regular expression pattern:
+/// ^(range|count|sum)` — the opening anchor is part of the expression the service publishes
+/// and only the closing one is the model's own wrapping.
+const OPS_AGGREGATOR_TYPE_PATTERN: &str = "^(range|count|sum)$";
+
 /// The expressions this service publishes exactly as the model declares them, the outer
 /// anchors included — every other expression is published without the whole-value pair the
 /// model wrote around it ([`quoted_pattern`]).
@@ -137,6 +151,15 @@ const PUBLISHED_AS_DECLARED: &[&str] = &[
     CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN,
     CHOSEN_NAME_PATTERN,
 ];
+
+/// The expressions this service publishes with the anchor they OPEN with and without the one
+/// they close with — the third form of the same reference data [`PUBLISHED_AS_DECLARED`]
+/// carries, keyed by the expression for the same reason.
+///
+/// Which of the three forms a shape is published with cannot be read off the text, because
+/// all of them are spelled `^…$` in the model: it is reference data about the SHAPE, so one
+/// row holds for every member targeting it, in any operation.
+const PUBLISHED_UNANCHORED_AT_THE_CLOSE: &[&str] = &[OPS_AGGREGATOR_TYPE_PATTERN];
 
 /// One constraint of a shape's stated set.
 ///
@@ -475,14 +498,20 @@ fn satisfies(regex: &str, value: &str) -> bool {
 }
 
 /// The expression a `@pattern` clause of this service quotes for `regex`: the model's text
-/// without the whole-value pair it wraps the published expression in, or that text verbatim
-/// for the expressions this service publishes as declared.
+/// without the whole-value pair it wraps the published expression in, that text verbatim for
+/// the expressions this service publishes as declared, and that text without its CLOSING
+/// anchor alone for the expressions it publishes that way
+/// ([`PUBLISHED_UNANCHORED_AT_THE_CLOSE`]).
 ///
-/// The DROP is the shared one (`service_common::validation::unanchored`), called rather than
-/// restated, so this service cannot read the pair differently from any other.
+/// Every DROP is a shared one (`service_common::validation`'s `unanchored` and
+/// `unanchored_at_the_close`), called rather than restated, so this service cannot read an
+/// anchor differently from any other.
 pub(super) fn quoted_pattern(regex: &str) -> String {
     if PUBLISHED_AS_DECLARED.contains(&regex) {
         return regex.to_string();
+    }
+    if PUBLISHED_UNANCHORED_AT_THE_CLOSE.contains(&regex) {
+        return unanchored_at_the_close(regex);
     }
     unanchored(regex)
 }

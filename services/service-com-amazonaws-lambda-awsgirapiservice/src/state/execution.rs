@@ -2057,6 +2057,27 @@ pub(super) const EXECUTION_ENV_VARIABLE: &str = "AWS_EXECUTION_ENV";
 /// What that variable's value begins with, as the sentence above states it.
 pub(super) const EXECUTION_ENV_PREFIX: &str = "AWS_Lambda_";
 
+/// The environment a run of this engine that is nobody's Lambda invocation is handed so the
+/// release it reports is the one its own caller declared.
+///
+/// An EMBEDDER — another service whose own API declares which runtime a script of its runs in
+/// — states that identifier the way a managed runtime's environment states it, because that
+/// variable is where this engine reads WHICH runtime a run is of: the release of the
+/// interpreter the run reports ([`python_release`]) and the library directory the runtime's
+/// own modules are reported under ([`bootstrap`]) both come from it. Handing a run no
+/// environment at all names no runtime, which is what leaves a run reporting the interpreter's
+/// own build instead of the release its caller asked for.
+///
+/// Only the runtime is named: nothing of a Lambda function's own configuration belongs to such
+/// a run, so an embedder's script sees this and whatever its own caller passed it.
+#[must_use]
+pub fn environment_naming_runtime(runtime: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        EXECUTION_ENV_VARIABLE.to_string(),
+        format!("{EXECUTION_ENV_PREFIX}{runtime}"),
+    )])
+}
+
 /// The variable a managed runtime reads the log STREAM of its execution environment as. It is
 /// the environment's own for as long as the environment stands, so the environments the pool
 /// keeps re-state it for every invocation they serve ([`warm_pool`]).

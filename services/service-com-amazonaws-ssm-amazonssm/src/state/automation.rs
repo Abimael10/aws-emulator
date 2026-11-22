@@ -2154,6 +2154,20 @@ pub const SIGNAL_NOT_VALID: &str =
 pub const SIGNAL_STEP_EXECUTION_NOT_FOUND_MESSAGE: &str =
     "The specified step name and execution ID don't exist. Verify the information and try again.";
 
+/// The refusal a `StopStep` signal is answered with when the step execution its payload
+/// names is in no step of the execution it was sent to: a FIXED sentence with no variable
+/// parts, which is how Systems Manager words this one — the id a caller sent is not repeated
+/// back to it.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.send-automation-signal-nonexistent-step-rejected`): a `StopStep` whose payload
+/// carries a `StepExecutionId` no step of the live execution holds is answered 400
+/// `AutomationStepNotFoundException` with exactly this sentence. It is the STOP's own
+/// wording, which is why it is not [`SIGNAL_STEP_EXECUTION_NOT_FOUND_MESSAGE`]: the two
+/// sentences keep "the step id you asked me to stop is not in this execution" and the generic
+/// step-not-found condition apart.
+pub const STOP_STEP_NOT_FOUND_MESSAGE: &str = "The step you are trying to stop doesn't exist.";
+
 /// The refusal a STOP of an execution that is running nothing to stop is answered with, as
 /// the modelled `InvalidAutomationStatusUpdateException` words it ("The specified update
 /// status operation isn't valid.") — a fixed sentence with no variable parts.

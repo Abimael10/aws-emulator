@@ -1015,8 +1015,8 @@ async fn a_value_violating_two_modelled_constraints_states_both_clauses() {
     // (`smithy_query(query="shape", shape="OpsAggregatorType")`), so a longer value that is
     // also outside the pattern violates BOTH, and the refusal states one clause per
     // violation under the envelope that counts them. The clause quotes the expression the
-    // service PUBLISHES for the shape — the model's text without the whole-value pair it
-    // wraps a published expression in (`crate::service::refusal`).
+    // service PUBLISHES for the shape, which for this one keeps the anchor it opens with and
+    // drops the one the model closes it with (`crate::service::refusal`).
     let value = "not-a-real-aggregator-type";
     let (status, parsed) = call(
         &router,
@@ -1044,10 +1044,98 @@ async fn a_value_violating_two_modelled_constraints_states_both_clauses() {
             "2 validation errors detected: Value '{value}' at '{path}' failed to satisfy \
              constraint: Member must have length less than or equal to 20; Value '{value}' at \
              '{path}' failed to satisfy constraint: Member must satisfy regular expression \
-             pattern: (range|count|sum)"
+             pattern: ^(range|count|sum)"
         ),
         "both violated constraints are stated, got {parsed}"
     );
+}
+
+/// RULE: a `@pattern` clause of this service names the expression the service PUBLISHES for
+/// the member's shape, which is reference data about the SHAPE rather than a reading of the
+/// anchors in the model's text — so one shape's expression is rendered the same way at every
+/// member path that carries it, and another shape's is rendered as that shape is published.
+///
+/// The rows span the three forms this service publishes, each over a shape the model declares
+/// a `@pattern` for: `OpsAggregatorType` with the anchor it opens with and without the one it
+/// closes with, `DocumentName` with neither anchor, and `InventoryItemTypeName` exactly as the
+/// model declares it. The first expression is asserted at two member paths — a top-level
+/// aggregator and one nested inside it — because what is published belongs to the shape.
+#[tokio::test]
+async fn a_pattern_clause_names_the_expression_the_service_publishes() {
+    let (router, _engine) = service();
+
+    // (case, the operation, the request, the clause the message must end with)
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "an aggregator type outside its expression",
+            OPERATION,
+            json!({ "Aggregators": [{
+                "AggregatorType": "RANGE",
+                "TypeName": TYPE_OPS_ITEM,
+                "AttributeName": "Status",
+            }] }),
+            clause(
+                "aggregators.1.member.aggregatorType",
+                "RANGE",
+                "^(range|count|sum)",
+            ),
+        ),
+        (
+            "the same shape nested inside another aggregator",
+            OPERATION,
+            json!({ "Aggregators": [{
+                "AggregatorType": "count",
+                "TypeName": TYPE_OPS_ITEM,
+                "AttributeName": "Status",
+                "Aggregators": [{
+                    "AggregatorType": "Count",
+                    "TypeName": TYPE_OPS_ITEM,
+                    "AttributeName": "Source",
+                }],
+            }] }),
+            clause(
+                "aggregators.1.member.aggregators.1.member.aggregatorType",
+                "Count",
+                "^(range|count|sum)",
+            ),
+        ),
+        (
+            "a document name outside its expression, published without either anchor",
+            "GetDocument",
+            json!({ "Name": "no" }),
+            clause("name", "no", r"[a-zA-Z0-9_\-.:/]{3,128}"),
+        ),
+        (
+            "an inventory type name, published exactly as the model declares it",
+            "ListInventoryEntries",
+            json!({ "InstanceId": "i-0123456789abcdef0", "TypeName": "Application" }),
+            clause("typeName", "Application", "^(AWS|Custom):.*$"),
+        ),
+    ];
+
+    for (case, operation, request, expected) in rows {
+        let (status, parsed) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a value outside its modelled expression is refused by the boundary, \
+             got {status} with {parsed}"
+        );
+        let message = error_message(&parsed);
+        assert!(
+            message.ends_with(&expected),
+            "case {case:?}: expected the clause {expected:?}, got {message:?}"
+        );
+    }
+}
+
+/// One constraint clause as a refusal of this service words it: the value, the member path it
+/// filled and the expression it had to satisfy.
+fn clause(member_path: &str, value: &str, expression: &str) -> String {
+    format!(
+        "Value '{value}' at '{member_path}' failed to satisfy constraint: Member must satisfy \
+         regular expression pattern: {expression}"
+    )
 }
 
 #[tokio::test]

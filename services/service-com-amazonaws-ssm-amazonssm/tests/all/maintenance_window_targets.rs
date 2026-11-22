@@ -24,9 +24,9 @@
 //!    `OwnerInformation` — which intersect, each filter's values union, and a key outside that
 //!    set is refused before anything is read. A page holds `MaxResults` targets and the
 //!    `NextToken` resumes at the target the page stopped at.
-//! 4. **A removal removes it.** A deregistered target is no longer reported and cannot be
-//!    deregistered twice, and deleting the WINDOW removes the targets registered with it,
-//!    because a target is only ever addressed through its window.
+//! 4. **A removal removes it.** A deregistered target is no longer reported, a second removal
+//!    of it is the no-op the state it asks for already is, and deleting the WINDOW removes the
+//!    targets registered with it, because a target is only ever addressed through its window.
 //! 5. **The store is bounded per window.** Past the ceiling one window's targets are held
 //!    under, a register is refused `ResourceLimitExceededException` and writes nothing, while
 //!    a removal frees a slot and another window is bounded on its own.
@@ -526,8 +526,9 @@ async fn a_page_resumes_at_the_target_it_stopped_at() {
     }
 }
 
-/// RULE 4: a removal removes it — a deregistered target is no longer reported and cannot be
-/// deregistered twice, and deleting the WINDOW takes the targets registered with it.
+/// RULE 4: a removal removes it — a deregistered target is no longer reported and a second
+/// removal of it is the no-op the state it asks for already is, while deleting the WINDOW
+/// takes the targets registered with it.
 #[tokio::test]
 async fn a_removal_removes_the_target() {
     let router = router();
@@ -572,26 +573,51 @@ async fn a_removal_removes_the_target() {
         "case {case:?}: expected the other target to be untouched, got {held:?}"
     );
 
-    // (case, the window the deregister names, the target it names)
-    let refused: Vec<(&str, &str, &str)> = vec![
-        ("the target that is already gone", window_id.as_str(), first.as_str()),
-        ("a target id nothing minted", window_id.as_str(), UNKNOWN_TARGET_ID),
-        ("a window this endpoint holds none of", UNKNOWN_WINDOW_ID, second.as_str()),
+    // A removal asks for a STATE: a target an existing window already holds none of is that
+    // state, so the call answers 200 with the ids it was asked about and removes nothing.
+    // (case, the target the deregister names)
+    let already_gone: Vec<(&str, &str)> = vec![
+        ("the target that is already gone", first.as_str()),
+        ("a target id nothing minted", UNKNOWN_TARGET_ID),
     ];
-    for (why, window, target) in refused {
+    for (why, target) in already_gone {
         let (status, response) = call_in_region(
             &router,
             REGION,
             "DeregisterTargetFromMaintenanceWindow",
-            &json!({ "WindowId": window, "WindowTargetId": target }),
+            &json!({ "WindowId": window_id, "WindowTargetId": target }),
         )
         .await;
         assert_eq!(
-            (status, error_code(&response).as_str()),
-            (400, "DoesNotExistException"),
-            "case {why:?}: expected the deregister to be refused, got {status} {response}"
+            (status, response["WindowTargetId"].as_str()),
+            (200, Some(target)),
+            "case {why:?}: expected the deregister to echo the ids it was asked about, got \
+             {status} {response}"
         );
     }
+    let still_held = targets_of(&router, case, REGION, &window_id).await;
+    assert_eq!(
+        still_held.len(),
+        1,
+        "case {case:?}: expected the repeated deregisters to have written nothing, got \
+         {still_held:?}"
+    );
+
+    // The WINDOW is the resource half, and an id this endpoint holds no window for is still
+    // refused.
+    let (status, response) = call_in_region(
+        &router,
+        REGION,
+        "DeregisterTargetFromMaintenanceWindow",
+        &json!({ "WindowId": UNKNOWN_WINDOW_ID, "WindowTargetId": second }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, "DoesNotExistException"),
+        "case \"a window this endpoint holds none of\": expected the deregister to be refused, \
+         got {status} {response}"
+    );
 
     // Deleting the window takes its remaining target with it: a target is only ever
     // addressed through its window.

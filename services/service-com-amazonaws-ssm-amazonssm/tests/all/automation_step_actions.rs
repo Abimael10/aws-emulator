@@ -18,12 +18,15 @@
 //!   what fails the step;
 //! * an `aws:executeScript` step RUNS its `Script` in the declared `Runtime`, calls its
 //!   `Handler` with the substituted `InputPayload`, and selects the handler's return value
-//!   through `$.Payload…` into its declared outputs;
+//!   through `$.Payload…` into its declared outputs — and the RELEASE the interpreter serving
+//!   it reports is the one that `Runtime` declares;
 //! * a step's outputs are what the next step's `{{ <step>.<output> }}` references resolve
 //!   to, and the document's own `outputs` project them as `"<step>.<output>"`;
 //! * `SendAutomationSignal` resolves the execution the signal names and applies the signal
 //!   to it, answering the modelled refusal for an execution it holds none of and for a step
-//!   the runbook does not declare — and leaving the execution untouched either way.
+//!   the runbook does not declare — and leaving the execution untouched either way. A
+//!   `StopStep` names the step execution it stops by the `StepExecutionId` its payload
+//!   carries, and an id in no step of that execution is refused the stop's own refusal.
 //!
 //! An automation is `Pending` until the service picks it up, so the cases move the clock to
 //! that instant through the service's own state ([`pick_up`]) rather than sleeping for it,
@@ -1248,6 +1251,246 @@ async fn a_signal_the_state_does_not_admit_is_refused_and_a_stop_step_stops_the_
             (400, "InvalidAutomationSignalException"),
             "case {signal:?} on an execution that has ended: expected the invalid-signal \
              refusal, got {status} with {refused}"
+        );
+    }
+}
+
+/// The `StepExecutionId` of one step of an execution, by step name.
+fn step_execution_id(execution: &Value, name: &str) -> String {
+    text(&step(execution, name), "StepExecutionId")
+}
+
+/// The sentence a `StopStep` whose payload names a step execution this execution holds none
+/// of is refused with (`automation::STOP_STEP_NOT_FOUND_MESSAGE`).
+const STOP_STEP_NOT_FOUND: &str = "The step you are trying to stop doesn't exist.";
+
+/// A `StepExecutionId` of the 8-4-4-4-12 hexadecimal form this service mints them in that no
+/// step of any execution was minted under.
+const UNKNOWN_STEP_EXECUTION_ID: &str = "99999999-8888-7777-6666-555555555555";
+
+/// RULE: a `StopStep` signal names the step execution it stops through its PAYLOAD — by the
+/// step execution's own id ("for the StopStep signal type, you must send the step execution ID
+/// as the payload", `SendAutomationSignalRequest$Payload`) — and an id that is in no step of
+/// the execution the signal was sent to is refused `AutomationStepNotFoundException` with the
+/// stop's own sentence, leaving the execution exactly as it was. A payload naming no step at
+/// all is still refused by the member the service asks for.
+///
+/// The rows differ along what the rule generalises over: which payload member names the step,
+/// whether the id is one of this execution's steps, one of ANOTHER execution's, or one nothing
+/// minted, and whether the payload names a step at all.
+#[tokio::test]
+async fn a_stop_step_resolves_the_step_execution_its_payload_names() {
+    let (router, engine) = service();
+    let (held, step_name) = waiting(&router, &engine, "the stopped execution", "Stopped", "aws:pause").await;
+    // A SECOND execution of its own, so the row that names one execution's step id while
+    // signalling the other shows the ids are resolved per execution.
+    let (other, _) = waiting(&router, &engine, "the other execution", "Other", "aws:pause").await;
+
+    let standing = step_execution_id(&read(&router, "the stopped execution", &held).await, &step_name);
+    let not_reached = step_execution_id(&read(&router, "the stopped execution", &held).await, "after");
+    let elsewhere = step_execution_id(&read(&router, "the other execution", &other).await, &step_name);
+    assert!(
+        [&standing, &not_reached, &elsewhere]
+            .iter()
+            .all(|id| id.len() == 36),
+        "every step of an execution carries its own minted id, got {standing:?}, \
+         {not_reached:?} and {elsewhere:?}"
+    );
+
+    // (case, the payload the stop carries, the code it is refused with, the message where the
+    // service words that refusal itself)
+    let refused: Vec<(&str, Value, &str, Option<&str>)> = vec![
+        (
+            "a step execution id nothing was minted under",
+            json!({"StepExecutionId": [UNKNOWN_STEP_EXECUTION_ID]}),
+            "AutomationStepNotFoundException",
+            Some(STOP_STEP_NOT_FOUND),
+        ),
+        (
+            "a step execution id of ANOTHER execution's step",
+            json!({"StepExecutionId": [&elsewhere]}),
+            "AutomationStepNotFoundException",
+            Some(STOP_STEP_NOT_FOUND),
+        ),
+        (
+            "an id that is no id this service mints at all",
+            json!({"StepExecutionId": ["not-a-step-execution-id"]}),
+            "AutomationStepNotFoundException",
+            Some(STOP_STEP_NOT_FOUND),
+        ),
+        (
+            "a payload naming neither member",
+            json!({"Comment": ["stop it"]}),
+            "InvalidAutomationSignalException",
+            Some("One StepName is required when signal type is StopStep."),
+        ),
+        (
+            // A step the walk has not reached is running nothing to stop, which is the
+            // execution's own state rather than a step that does not exist.
+            "the id of a step the walk has not reached",
+            json!({"StepExecutionId": [&not_reached]}),
+            "AutomationStepNotFoundException",
+            None,
+        ),
+    ];
+
+    for (case, payload, expected_code, expected_message) in refused {
+        let (status, body) = call(
+            &router,
+            "SendAutomationSignal",
+            &json!({
+                "AutomationExecutionId": &held,
+                "SignalType": "StopStep",
+                "Payload": payload,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, expected_code),
+            "case {case:?}: expected the {expected_code} refusal, got {status} with {body}"
+        );
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                error_message(&body),
+                expected_message,
+                "case {case:?}: expected the stop's own sentence, got {body}"
+            );
+        }
+        let execution = read(&router, case, &held).await;
+        assert_eq!(
+            (
+                text(&execution, "AutomationExecutionStatus"),
+                text(&step(&execution, &step_name), "StepStatus"),
+            ),
+            ("Waiting".to_string(), "Waiting".to_string()),
+            "case {case:?}: expected the refusal to leave the execution waiting, got {execution}"
+        );
+    }
+
+    // The id of the step the execution STANDS at stops that step, and the automation with it.
+    let (status, answered) = call(
+        &router,
+        "SendAutomationSignal",
+        &json!({
+            "AutomationExecutionId": &held,
+            "SignalType": "StopStep",
+            "Payload": {"StepExecutionId": [&standing]},
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, &answered),
+        (200, &json!({})),
+        "expected an empty 200 for a stop of the step the automation stands at, got {status} \
+         with {answered}"
+    );
+    let execution = read(&router, "the stopped execution", &held).await;
+    assert_eq!(
+        (
+            text(&execution, "AutomationExecutionStatus"),
+            text(&step(&execution, &step_name), "StepStatus"),
+        ),
+        ("Cancelled".to_string(), "Cancelled".to_string()),
+        "expected the stopped step to cancel the automation, got {execution}"
+    );
+
+    // The OTHER execution is untouched by any of it, and its own step id stops its own step.
+    let (status, answered) = call(
+        &router,
+        "SendAutomationSignal",
+        &json!({
+            "AutomationExecutionId": &other,
+            "SignalType": "StopStep",
+            "Payload": {"StepExecutionId": [&elsewhere]},
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, &answered),
+        (200, &json!({})),
+        "expected the other execution's own step id to stop its own step, got {status} with \
+         {answered}"
+    );
+    assert_eq!(
+        text(
+            &read(&router, "the other execution", &other).await,
+            "AutomationExecutionStatus"
+        ),
+        "Cancelled",
+        "expected the other execution to be the one its own stop cancelled"
+    );
+}
+
+/// The script every row of the runtime table runs: it reports the release of the interpreter
+/// it is running in, read the two ways a Python program reads one.
+const RELEASE_SCRIPT: &str = "import platform\nimport sys\n\n\ndef handler(events, context):\n    \
+     return {\n        \"version\": platform.python_version(),\n        \
+     \"line\": \"%d.%d\" % (sys.version_info[0], sys.version_info[1]),\n    }\n";
+
+/// RULE: an `aws:executeScript` step declares the runtime its script runs in ("the language
+/// runtime environment in which to run the provided script"), so the release the interpreter
+/// serving that step reports is the one the step declared — not the build this emulator
+/// happens to embed. The patch level is the release's own; what the step declares is the line.
+///
+/// The rows are published `python3.x` runtimes an `aws:executeScript` step may declare,
+/// including ones no recorded check cited, so the reported release follows the DECLARATION
+/// rather than any one value. Three of them, because each row stands a whole interpreter up.
+#[tokio::test]
+async fn an_execute_script_step_runs_in_the_release_its_runtime_declares() {
+    let (router, engine) = service();
+
+    for runtime in ["python3.9", "python3.11", "python3.12"] {
+        let line = runtime
+            .strip_prefix("python")
+            .expect("the row names a python runtime");
+        let name = document_name("Release", runtime);
+        runbook(
+            &router,
+            &name,
+            &one_step_runbook(
+                json!({
+                    "name": "release",
+                    "action": "aws:executeScript",
+                    "inputs": {
+                        "Runtime": runtime,
+                        "Handler": "handler",
+                        "Script": RELEASE_SCRIPT,
+                        "InputPayload": {},
+                    },
+                    "outputs": [
+                        {"Name": "version", "Selector": "$.Payload.version", "Type": "String"},
+                        {"Name": "line", "Selector": "$.Payload.line", "Type": "String"},
+                    ],
+                }),
+                vec!["release.version", "release.line"],
+                json!({}),
+            ),
+        )
+        .await;
+        let id = started(&router, runtime, &json!({"DocumentName": name})).await;
+        pick_up(&engine);
+        let execution = at_rest(&router, runtime, &id).await;
+        assert_eq!(
+            text(&execution, "AutomationExecutionStatus"),
+            "Success",
+            "case {runtime:?}: expected the script step to reach Success, got {execution}"
+        );
+        let reported = step(&execution, "release");
+        let version = reported["Outputs"]["version"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            version.starts_with(&format!("{line}.")),
+            "case {runtime:?}: expected the reported version to be a release of {line}, got \
+             {version:?}"
+        );
+        assert_eq!(
+            reported["Outputs"]["line"][0].as_str(),
+            Some(line),
+            "case {runtime:?}: expected the version fields to report the {line} line, got \
+             {reported}"
         );
     }
 }

@@ -325,19 +325,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         );
                     }
                 }
-                // A `StopStep` signal is about ONE step too, and the payload member it is
-                // named by is the same one: a stop that names no step is refused by that
-                // member, and stopping the step the automation stands at stops the
-                // automation with it.
+                // A `StopStep` signal is about ONE step too, and the payload member it names
+                // that step by is the step EXECUTION's own id: "for the StopStep signal type,
+                // you must send the step execution ID as the payload. For example:
+                // StepExecutionId="97fff367-fc5a-4299-aed8-0123456789ab"". A stop that names
+                // no step at all is refused by the member the service asks for, and stopping
+                // the step the automation stands at stops the automation with it.
                 SIGNAL_STOP_STEP => {
-                    let Some(step_name) = named(STEP_NAME_PAYLOAD) else {
-                        return Err(step_name_required());
+                    // The step the payload names, by the step execution's id where it carries
+                    // one and by the step's name otherwise — and a payload that names the step
+                    // neither way is refused by the member the service asks for.
+                    let named_step = match (
+                        named(STEP_EXECUTION_ID_PAYLOAD),
+                        named(STEP_NAME_PAYLOAD),
+                    ) {
+                        (Some(step_execution_id), _) => NamedStep::Execution(step_execution_id),
+                        (None, Some(step_name)) => NamedStep::Name(step_name),
+                        (None, None) => return Err(step_name_required()),
                     };
                     // "The signal isn't valid for the current Automation execution": an
                     // execution that has ended is running no step for a stop to reach.
                     if execution.ended() {
                         return Err(not_valid("the execution has ended"));
                     }
+                    // A step execution this execution holds none of is no step there is to
+                    // stop, which is its own refusal: the step the caller asked to stop is in
+                    // no step of this execution, as against the generic miss of a name and an
+                    // id below.
+                    let step_name = match named_step {
+                        NamedStep::Name(step_name) => step_name,
+                        NamedStep::Execution(step_execution_id) => {
+                            let held = execution
+                                .steps
+                                .iter()
+                                .find(|step| step.step_execution_id == step_execution_id)
+                                .map(|step| step.definition.name.clone());
+                            let Some(step_name) = held else {
+                                return Err(
+                                    SendAutomationSignalErrorModeled::AutomationStepNotFoundException(
+                                        AutomationStepNotFoundException {
+                                            message: Some(
+                                                crate::state::automation::STOP_STEP_NOT_FOUND_MESSAGE
+                                                    .to_string(),
+                                            ),
+                                        },
+                                    )
+                                    .into(),
+                                );
+                            };
+                            step_name
+                        }
+                    };
                     let Some(execution) =
                         store.automation_execution_mut(&region, &input.automation_execution_id)
                     else {
@@ -413,9 +451,26 @@ const SIGNAL_STOP_STEP: &str = "StopStep";
 
 /// The payload member naming the step a signal that is about one step is about: "you must
 /// send the name of the Automation step to start or resume as the payload. For example:
-/// StepName="step1"" (`SendAutomationSignalRequest$Payload`), which is the member a
-/// `StopStep` signal is held to as well.
+/// StepName="step1"" (`SendAutomationSignalRequest$Payload`), which is the member the
+/// service's own precondition for a `StopStep` asks for too.
 const STEP_NAME_PAYLOAD: &str = "StepName";
+
+/// The payload member a `StopStep` signal names the step EXECUTION it stops by: "for the
+/// StopStep signal type, you must send the step execution ID as the payload. For example:
+/// StepExecutionId="97fff367-fc5a-4299-aed8-0123456789ab"" (same member).
+const STEP_EXECUTION_ID_PAYLOAD: &str = "StepExecutionId";
+
+/// How a `StopStep` signal's payload NAMES the step it stops: by the step execution's own id,
+/// which is the member the model documents for this signal type, or by the step's name.
+///
+/// Read off the payload before the execution's own state is judged, so the refusal of a
+/// payload that names the step neither way is decided on the request alone.
+enum NamedStep {
+    /// A `StepExecutionId`, resolved against the step executions this execution holds.
+    Execution(String),
+    /// A `StepName`, which is the step's own name in the runbook.
+    Name(String),
+}
 
 /// The payload member carrying the comment an `Approve` or `Reject` signal may send: "the
 /// payload is an optional comment that you can send with the signal type. For example:

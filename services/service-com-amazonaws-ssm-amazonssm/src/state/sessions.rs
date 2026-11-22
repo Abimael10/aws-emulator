@@ -42,6 +42,17 @@ pub const SESSION_STATE_HISTORY: &str = "History";
 /// modelled enum).
 pub const ENDED_SESSION_STATUSES: &[&str] = &["Terminated", "Terminating", "Failed"];
 
+/// The refusal a session that is in no state for the change a request asks of it is answered
+/// with: a FIXED sentence with no variable parts, which is how Session Manager words this one
+/// — the id a caller sent is not repeated back to it.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.terminate-session-already-terminated-noop`): a second `TerminateSession` on a session
+/// already in the ended set is answered 400 `ValidationException` with exactly this sentence.
+/// `TerminateSession` models no error of its own for the condition, so it travels as this
+/// service's boundary refusal ([`crate::scaffolded`]'s validation channel).
+pub const SESSION_NOT_IN_A_VALID_STATE: &str = "Session is not in a valid state";
+
 /// The `AccessType` of a session a caller started directly: "`Standard` access type is the
 /// default for Session Manager sessions" (`Session$AccessType`).
 pub const ACCESS_TYPE_STANDARD: &str = "Standard";
@@ -160,13 +171,36 @@ impl SessionRecord {
     /// the Session Manager client and SSM Agent on the managed node" (`TerminateSession`).
     ///
     /// A session that has already ended keeps the instant it ended at: the end happened
-    /// once, and a second request to end it changes nothing.
+    /// once, and a second request to end it changes nothing. Such a request is not served at
+    /// all ([`Self::can_be_terminated`]), so this is the one end of a session there is.
     pub fn terminate(&mut self, at: SystemTime) {
-        if self.state() == SESSION_STATE_HISTORY {
+        if self.has_ended() {
             return;
         }
         self.status = SESSION_STATUS_TERMINATED.to_string();
         self.end_date = Some(at);
+    }
+
+    /// Whether this session has ENDED: its status is one of the set a `History` report holds
+    /// ([`ENDED_SESSION_STATUSES`]), which is the one reading every question about a session's
+    /// usefulness is answered from, so no two of them can drift apart.
+    fn has_ended(&self) -> bool {
+        self.state() == SESSION_STATE_HISTORY
+    }
+
+    /// Whether an END of this session is a state it can be put in: a session that has not
+    /// ended can be ended, and one that has is in no state to be ended again.
+    ///
+    /// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+    /// `ssm.terminate-session-already-terminated-noop`): a second `TerminateSession` on a
+    /// session already in the ended set is refused `ValidationException`
+    /// ([`SESSION_NOT_IN_A_VALID_STATE`]) and the history keeps exactly the one record of it.
+    /// It is the SET rather than the one status, because every status in it is a session this
+    /// service holds no live connection for ([`ENDED_SESSION_STATUSES`]) and so none of them
+    /// is one an end still applies to — the same reading [`Self::is_resumable`] takes, which
+    /// is why both read it from [`Self::has_ended`].
+    pub fn can_be_terminated(&self) -> bool {
+        !self.has_ended()
     }
 
     /// Whether a connection to this session can still be re-established: "connections can be
@@ -179,7 +213,7 @@ impl SessionRecord {
     /// doing — which is why a client reconnecting "during intermittent network issues" is
     /// served whatever the session was last reported as.
     pub fn is_resumable(&self) -> bool {
-        self.state() != SESSION_STATE_HISTORY
+        !self.has_ended()
     }
 
     /// Reconnect this session: "Reconnects a session to a managed node after it has been

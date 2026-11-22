@@ -12,10 +12,12 @@
 //! Lambda service crate's `state::execution::python`), on a thread of its own with no store
 //! guard held, with the AWS SDK modules that runtime supplies on the import path — so a
 //! script's own `boto3` call reaches this same emulator, signed as the role the automation
-//! runs as, and its effects are real effects. Nothing of the host is reachable from it: the
-//! engine registers no socket, subprocess, memory-map or host-library module, supplies its
-//! own in-memory operating-system modules, and holds every bound in host code the script
-//! cannot reach.
+//! runs as, and its effects are real effects. The step's declared `Runtime` is handed to that
+//! run, which is how the interpreter the script executes in reports the RELEASE the step asked
+//! for rather than the build this process happens to embed. Nothing of the host is reachable
+//! from it: the engine registers no socket, subprocess, memory-map or host-library module,
+//! supplies its own in-memory operating-system modules, and holds every bound in host code the
+//! script cannot reach.
 //!
 //! What the step reports is what that run came to: the declared outputs selected out of the
 //! handler's own return value ([`super::selectors`]), the exception it raised as the step's
@@ -27,7 +29,9 @@ use ::serde_json::{Map, Value};
 
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
-use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::AwsAccess;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    environment_naming_runtime, AwsAccess,
+};
 
 use super::{
     script_budget, selectors, text_input, ActionOutcome, ClaimedAction, SCRIPT_CLOCK_TICK,
@@ -53,10 +57,11 @@ pub const INPUT_PAYLOAD_INPUT: &str = "InputPayload";
 
 /// The `Runtime` values this emulator runs, by prefix.
 ///
-/// The published values are versioned (`python3.11`, `python3.10`, …) and the engine embedded
-/// here runs the LANGUAGE rather than one of its point releases, so every `python…` runtime
-/// resolves to it. A runtime outside this set — the PowerShell Core ones — has no engine
-/// here, and such a step reports a script that did not run.
+/// The published values are versioned (`python3.11`, `python3.10`, …) and ONE interpreter runs
+/// every one of them, so every `python…` runtime resolves to it — with the release the step
+/// declared installed on the run, so what the script reads of the version it is running on is
+/// the one the step named. A runtime outside this set — the PowerShell Core ones — has no
+/// engine here, and such a step reports a script that did not run.
 pub const PYTHON_RUNTIME_PREFIX: &str = "python";
 
 /// The member of the step's answer the handler's own return value is reported under, which is
@@ -127,6 +132,11 @@ pub async fn run(claimed: &ClaimedAction, access: Option<AwsAccess>) -> ActionOu
         let entry = format!("{SCRIPT_MODULE}.{handler}");
         let event = payload.to_string();
         let request_id = claimed.execution_id.clone();
+        // "The language runtime environment in which to run the provided script": the step
+        // declares WHICH release the script runs in, so the run is handed that identifier and
+        // the interpreter it runs in reports that release — a script pinned to one release to
+        // get its behaviour is answered by it and not by whatever this process was built from.
+        let environment = environment_naming_runtime(&runtime);
         let (sender, receiver) = ::tokio::sync::oneshot::channel();
         let spawned = ::std::thread::Builder::new()
             .name("ssm-automation-script".to_string())
@@ -139,8 +149,9 @@ pub async fn run(claimed: &ClaimedAction, access: Option<AwsAccess>) -> ActionOu
                         modules: &modules,
                         handler: &entry,
                         // An `aws:executeScript` step's script is given its values through
-                        // its `InputPayload`, so the run carries no environment of its own.
-                        environment: &::std::collections::BTreeMap::new(),
+                        // its `InputPayload`, so the only thing the run's environment carries
+                        // is which runtime the step declared.
+                        environment: &environment,
                         // The instruction set the environment the script runs in has, which
                         // the run reports as its own machine. A step names none, so it is
                         // the one the engine's own runtime reports when none is named.
