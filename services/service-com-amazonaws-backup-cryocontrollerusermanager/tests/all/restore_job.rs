@@ -313,7 +313,17 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 
 /// One DynamoDB operation (`awsJson1_0`, target prefix `DynamoDB_20120810`), the
 /// way a client makes it.
-async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+///
+/// `pub(crate)` for the sibling suite whose subject is the configuration a backup CAPTURES
+/// from the table it is taken of (`recovery_point_restore_metadata.rs`): that suite creates
+/// tables of several shapes and compares what Backup reports against what DynamoDB itself
+/// describes, so both suites reach DynamoDB through this one dispatch rather than two copies
+/// of it.
+pub(crate) async fn dynamodb(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("http://localhost/")

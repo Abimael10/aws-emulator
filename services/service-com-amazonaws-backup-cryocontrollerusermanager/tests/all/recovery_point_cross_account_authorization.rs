@@ -13,8 +13,8 @@
 //! report as absent.
 //!
 //! The table spans every implemented operation that addresses a recovery point
-//! by the ARN the request supplies (the delete and the read, which bind it into
-//! the URI, and the two jobs that take one in the body) crossed with several
+//! by the ARN the request supplies (the delete and the two reads, which bind it
+//! into the URI, and the two jobs that take one in the body) crossed with several
 //! foreign-account ARNs: different account ids, different regions, different
 //! point ids, and an ARN with no account field at all. Each row carries its own
 //! controls: the same call on the account's OWN stored point still answers, an
@@ -79,12 +79,12 @@ fn role() -> String {
 /// naming `arn` reaches it.
 ///
 /// From the model (`smithy_query(query="operation",
-/// operation="DeleteRecoveryPoint,DescribeRecoveryPoint,StartCopyJob,StartRestoreJob")`):
-/// the delete and the read bind `RecoveryPointArn` into
-/// `/backup-vaults/{BackupVaultName}/recovery-points/{RecoveryPointArn}`, while
-/// `StartCopyJob` (`PUT /copy-jobs`) and `StartRestoreJob` (`PUT /restore-jobs`)
-/// carry it in the body. Every other operation that takes one is still a 501
-/// stub.
+/// operation="DeleteRecoveryPoint,DescribeRecoveryPoint,GetRecoveryPointRestoreMetadata,StartCopyJob,StartRestoreJob")`):
+/// the delete and the two reads bind `RecoveryPointArn` into
+/// `/backup-vaults/{BackupVaultName}/recovery-points/{RecoveryPointArn}` (the
+/// metadata read under a further `/restore-metadata`), while `StartCopyJob`
+/// (`PUT /copy-jobs`) and `StartRestoreJob` (`PUT /restore-jobs`) carry it in the
+/// body. Every other operation that takes one is still a 501 stub.
 pub(crate) struct Addressed {
     pub(crate) operation: &'static str,
     method: &'static str,
@@ -92,9 +92,17 @@ pub(crate) struct Addressed {
     body: Option<fn(&str) -> String>,
 }
 
-/// The four of them, each addressing the recovery point `arn`.
+/// Each of them, addressing the recovery point `arn`.
 pub(crate) fn addressed_operations() -> Vec<Addressed> {
     vec![
+        Addressed {
+            operation: "GetRecoveryPointRestoreMetadata",
+            method: "GET",
+            path: |arn| {
+                format!("/backup-vaults/{VAULT}/recovery-points/{arn}/restore-metadata")
+            },
+            body: None,
+        },
         Addressed {
             operation: "DeleteRecoveryPoint",
             method: "DELETE",
@@ -249,13 +257,18 @@ async fn a_recovery_point_arn_of_another_account_is_denied() {
 #[tokio::test]
 async fn an_own_account_arn_that_names_nothing_is_still_not_found() {
     // What each operation answers for a `RecoveryPointArn` of this account that
-    // resolves to no stored point: the delete and the read report the resource
+    // resolves to no stored point: the delete and the reads report the resource
     // absent, while the two jobs take the point as an INPUT and refuse its value
     // (`smithy_query(query="operation", operation="StartRestoreJob")` — the
     // modelled errors each one declares).
     let expected: Vec<(&str, u16, &str)> = vec![
         ("DeleteRecoveryPoint", 400, "ResourceNotFoundException"),
         ("DescribeRecoveryPoint", 400, "ResourceNotFoundException"),
+        (
+            "GetRecoveryPointRestoreMetadata",
+            400,
+            "ResourceNotFoundException",
+        ),
         ("StartCopyJob", 400, "ResourceNotFoundException"),
         ("StartRestoreJob", 400, "InvalidParameterValueException"),
     ];

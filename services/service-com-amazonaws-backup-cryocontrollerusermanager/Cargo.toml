@@ -61,6 +61,11 @@ aws-sdk-mpa = { version = "1", default-features = false }
 # engine, so the ARN a vault publishes is one `kms:DescribeKey` resolves
 # (`state::vault_encryption_key`).
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The Application Auto Scaling store, for the auto scaling settings in force on a
+# protected resource's capacity: the restore metadata a backup captures describes
+# them, and the service that owns them is the only component that holds them
+# (`state::captured_restore_metadata`).
+service-com-amazonaws-applicationautoscaling-anyscalefrontendservice = { workspace = true }
 # The STS store, for the identity an access key id speaks for: the principal
 # `sts:GetCallerIdentity` answers for the credentials a request signed with, which is
 # the caller a call that starts a job is authorized as

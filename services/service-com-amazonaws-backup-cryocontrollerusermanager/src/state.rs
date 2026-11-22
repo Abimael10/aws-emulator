@@ -123,9 +123,15 @@ mod restore_execution;
 pub use restore_execution::*;
 
 /// What a restore's `Metadata` has to carry for the type of resource it restores, which a
-/// start that carries less is refused for. Re-exported for the reason given on `events`.
+/// start that carries less is refused for, and the pairs a stored recovery point reports as
+/// its own. Re-exported for the reason given on `events`.
 mod restore_metadata;
 pub use restore_metadata::*;
+
+/// The original configuration of a protected resource, read from the service that owns it
+/// when the backup is taken. Re-exported for the reason given on `events`.
+mod captured_restore_metadata;
+pub use captured_restore_metadata::*;
 
 /// The restore testing plans this service stores, the one read projection of
 /// one and the reading of a plan body every operation that stores one shares.
@@ -3050,6 +3056,14 @@ pub struct RecoveryPoint {
     /// protected resource up, or the `StartCopyJob` that copied it into this
     /// vault.
     pub created_by_job_id: String,
+    /// The original configuration of the protected resource, as the service that
+    /// owns it reported it WHEN THE BACKUP WAS TAKEN
+    /// ([`captured_restore_metadata`]), which is what the restore-metadata read
+    /// reports for this point ([`restore_metadata_of`]). Empty for a point whose
+    /// resource no arm of that capture could describe, and copied as it stands
+    /// onto a COPY of this point: a copy of a backup describes the same original
+    /// resource.
+    pub captured_restore_metadata: BTreeMap<String, String>,
 }
 
 impl RecoveryPoint {

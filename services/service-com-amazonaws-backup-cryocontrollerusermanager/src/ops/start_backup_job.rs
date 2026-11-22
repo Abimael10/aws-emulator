@@ -241,9 +241,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.resource_arn,
         )
         .await;
-        // Starting the job holds this store's lock; neither the question above nor
+        // WHAT THE RECOVERY POINT WILL DESCRIBE, read from the service that owns the
+        // resource before anything is stored: the restore metadata of a recovery point
+        // is the ORIGINAL CONFIGURATION of the resource the backup captured, so it is
+        // captured now and stored on the point
+        // (`crate::state::captured_restore_metadata`) rather than read back later from a
+        // resource that may since have changed. Asked only for a backup that will write
+        // a point at all: a job nothing will perform captures nothing.
+        let captured_restore_metadata = if withheld.is_none() {
+            crate::state::captured_restore_metadata(
+                &*self.engine,
+                ctx.callback(),
+                &region,
+                &input.resource_arn,
+            )
+            .await
+        } else {
+            ::std::collections::BTreeMap::new()
+        };
+        // Starting the job holds this store's lock; neither the questions above nor
         // the publication below does, so no lock is held across an await.
-        let output = self.started_job(input, &region, withheld)?;
+        let output = self.started_job(input, &region, withheld, captured_restore_metadata)?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this job is owed falls due on the clock, not on the next
         // call: the pump publishes it when it does, so a client watching the bus
@@ -262,6 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
     /// point, since a backup nothing performs produces none, and the clock settles
     /// it `FAILED` with that reason.
     ///
+    /// `captured_restore_metadata` is the original configuration of the protected
+    /// resource, as the service that owns it reported it to the capture above; it is
+    /// stored ON the recovery point, which is what the restore-metadata read of that
+    /// point reports.
+    ///
     /// Separate from `handle` so this store's lock lives for exactly this call: the
     /// publication `handle` makes afterwards awaits, and a guard must not be held
     /// across an await. `region` is the Region of the call, which every ARN this
@@ -271,6 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
         input: StartBackupJobInput,
         region: &str,
         withheld: Option<crate::state::BackupFailure>,
+        captured_restore_metadata: ::std::collections::BTreeMap<String, String>,
     ) -> Result<StartBackupJobOutput, StartBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
@@ -492,6 +516,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
                 _ => None,
             },
             created_by_job_id: job_id.clone(),
+            captured_restore_metadata,
         };
         let job = crate::state::BackupJob {
             job_id: job_id.clone(),

@@ -1,15 +1,49 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecoveryPointRestoreMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecoveryPointRestoreMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecoveryPointRestoreMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the restore metadata of the stored recovery point the
+//! (`BackupVaultName`, `RecoveryPointArn`) pair addresses: the pairs that point
+//! carries ([`crate::state::restore_metadata_of`]) beside the vault, the point
+//! and the resource type the store holds for it — so this read, the
+//! recovery-point read and the vault's listing all answer from the one stored
+//! point, and the metadata a client is handed is the metadata a restore from
+//! that point requires ([`crate::state::rejected_restore_metadata`] measures a
+//! start against the same catalog).
+//!
+//! The decision order is the one every call addressed to a recovery point by
+//! (vault, ARN) shares, so this read can disclose nothing the sibling read
+//! would not:
+//!
+//! * a `RecoveryPointArn` that is not an ARN is a bad parameter value, not an
+//!   absent resource ([`crate::state::rejected_arn`]);
+//! * the ACCOUNT the read scopes itself to is decided next
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::authorized_vault_account`]);
+//! * then the authorization decision on the point the request names
+//!   ([`crate::state::authorized_recovery_point`]), so an ARN of another account
+//!   is refused for lack of privileges rather than resolved;
+//! * the named vault is resolved by the step every vault-scoped read shares
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`]),
+//!   which decides access before existence;
+//! * the point itself is resolved by the step every call that names one shares
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::stored_recovery_point`]):
+//!   a pair that names no settled recovery point of that vault is the one
+//!   not-found refusal, and the only write this read performs is materialising
+//!   the `CREATING` -> `COMPLETED` transition the clock had already made due.
+//!
+//! Nothing is read from the protected resource's own service HERE: the
+//! configuration a recovery point describes is the one the backup captured when
+//! it was taken ([`crate::state::captured_restore_metadata`]), so a resource
+//! changed or deleted since leaves what this read reports alone.
+//!
+//! The pairs are reported as they stand. `RestoreMetadata` is `@sensitive` in the
+//! model, and what it carries is the service's own description of the backed-up
+//! resource — the names, capacities and settings a restore of that point is
+//! started with — so a client that cannot read them cannot restore. That is the
+//! opposite of `GetRestoreJobMetadata`, whose `Metadata` is the CALLER's own
+//! configuration of a restore and is reported masked
+//! ([`crate::state::METADATA_VALUE_MASK`]). No credential and nothing of the host
+//! is among them.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +195,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecoveryPointRestoreMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecoveryPointRestoreMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecoveryPointRestoreMetadata"))
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The model types `RecoveryPointArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // reporting a value that could never name a recovery point as merely
+        // absent. ONE check and one sentence for every such member in this
+        // service.
+        if let Some(refusal) =
+            crate::state::rejected_arn("RecoveryPointArn", &input.recovery_point_arn)
+        {
+            return Err(
+                GetRecoveryPointRestoreMetadataErrorModeled::InvalidParameterValueException(
+                    refusal,
+                )
+                .into(),
+            );
+        }
+
+        // The ACCOUNT this read scopes itself to, decided before anything else
+        // the request names is judged: a request that addresses another
+        // account's vault with `BackupVaultAccountId` asks to act in that
+        // account, which only that account could grant.
+        crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::authorized_vault_account(
+            input.backup_vault_account_id.as_deref(),
+        )?;
+
+        // Then the authorization decision on the recovery point this read
+        // reports, taken BEFORE anything is resolved: an ARN of another account
+        // is refused for lack of privileges, so no read can disclose whether
+        // another account holds the point it names.
+        crate::state::authorized_recovery_point(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.recovery_point_arn,
+        )?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRecoveryPointRestoreMetadataErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A vault-scoped read decides access before existence, so a vault this
+        // region of this account does not hold — or one addressed with another
+        // account's `BackupVaultAccountId` — is refused 403 rather than
+        // reported as missing.
+        store.visible_vault(
+            &region,
+            &input.backup_vault_name,
+            input.backup_vault_account_id.as_deref(),
+        )?;
+
+        // Resolved first, so a refused request writes nothing. This is the one
+        // write a read performs: a recovery point whose settle instant has
+        // passed completed at that instant, whether or not anybody looked.
+        store.settle_recovery_points_in(&region, &input.backup_vault_name, now);
+
+        let point = store
+            .stored_recovery_point(&region, &input.backup_vault_name, &input.recovery_point_arn)
+            .map_err(GetRecoveryPointRestoreMetadataErrorModeled::ResourceNotFoundException)?;
+
+        // The pairs the stored point carries, derived from it by the ONE step
+        // that states what a recovery point's restore metadata is — the keys the
+        // restore of its resource type reads, the configuration the backup
+        // captured from that resource's own service, and the backup request that
+        // captured it — so a client that hands these back carries every key that
+        // start requires.
+        let restore_metadata = crate::state::restore_metadata_of(point)
+            .into_iter()
+            .collect();
+
+        Ok(GetRecoveryPointRestoreMetadataOutput {
+            // The ARNs the STORED point carries, not the ones the request
+            // spelled: the vault that holds it, and the point's own ARN.
+            backup_vault_arn: Some(point.backup_vault_arn.clone()),
+            recovery_point_arn: Some(point.arn.clone()),
+            resource_type: point.resource_type.clone(),
+            // Always reported: every point carries restore metadata, since every
+            // point names the backup request that captured it.
+            restore_metadata: Some(restore_metadata),
+        })
     }
 }

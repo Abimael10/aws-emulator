@@ -452,6 +452,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             // copy carries none until something asks for one.
             index_status: None,
             created_by_job_id: copy_job_id.clone(),
+            // A copy of a backup describes the SAME original resource, so the copy
+            // carries the configuration the source point captured rather than
+            // describing nothing.
+            captured_restore_metadata: source_point.captured_restore_metadata.clone(),
         };
         let job = crate::state::CopyJobRecord {
             copy_job_id: copy_job_id.clone(),
