@@ -15,9 +15,11 @@ mod association_periods;
 mod refusals;
 mod billing_period_checks;
 mod pagination;
+mod period_history;
 mod tagging;
 mod charges;
 pub use association_periods::*;
+pub use period_history::*;
 pub use tagging::*;
 pub use pagination::*;
 pub use billing_period_checks::*;
@@ -1292,41 +1294,24 @@ impl PricingPlanRecord {
     /// one period does not reopen an association that has already ended.
     ///
     /// An association ended in the very period it started in was in force in no period
-    /// at all ([`PricingRuleAssociationRecord::covers`]), so its record is DROPPED
-    /// rather than kept as a span covering nothing — which is also what keeps a caller
-    /// cycling one rule inside one billing period from growing the record. The ended
+    /// at all ([`BillingPeriodHistoryRecord::covers`]), so its record is DROPPED rather
+    /// than kept as a span covering nothing — which is also what keeps a caller cycling
+    /// one rule inside one billing period from growing the record. The ended
     /// associations that a read of a closed period still has to report are kept, at most
     /// [`MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN`] of them with the oldest
     /// dropped first, so the kept history is bounded like every other store here and the
-    /// associations in force are never the ones evicted.
+    /// associations in force are never the ones evicted. Both of those are
+    /// [`prune_period_history`], the pruning every billing-period history here shares.
     pub fn end_rule_associations(&mut self, rule_arns: &[String], billing_period: &str) {
         for association in &mut self.pricing_rule_associations {
             if association.is_live() && rule_arns.contains(&association.arn) {
                 association.exclusive_end_billing_period = Some(billing_period.to_string());
             }
         }
-        self.pricing_rule_associations
-            .retain(PricingRuleAssociationRecord::covers_any_period);
-        let cap = MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN;
-        while self.ended_rule_association_count() > cap {
-            let Some(oldest) = self
-                .pricing_rule_associations
-                .iter()
-                .position(|association| !association.is_live())
-            else {
-                break;
-            };
-            self.pricing_rule_associations.remove(oldest);
-        }
-    }
-
-    /// How many of this plan's associations have ENDED — the history the cap
-    /// [`MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN`] bounds.
-    fn ended_rule_association_count(&self) -> usize {
-        self.pricing_rule_associations
-            .iter()
-            .filter(|association| !association.is_live())
-            .count()
+        prune_period_history(
+            &mut self.pricing_rule_associations,
+            MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN,
+        );
     }
 
     /// Do this record and `other` hold the SAME values for every member a write can
@@ -1442,34 +1427,20 @@ impl PricingRuleAssociationRecord {
             exclusive_end_billing_period: None,
         }
     }
+}
 
-    /// Does this association still stand — has nothing ended it?
-    pub fn is_live(&self) -> bool {
-        self.exclusive_end_billing_period.is_none()
+/// The half-open billing-period range an association is in force over, as every store
+/// here keeping a HISTORY of such ranges reads it: whether it still stands, whether it
+/// is in force in one period, and whether it is in force in any period at all are
+/// [`BillingPeriodHistoryRecord`]'s, so this record and a billing group membership
+/// cannot answer them differently.
+impl BillingPeriodHistoryRecord for PricingRuleAssociationRecord {
+    fn inclusive_start_billing_period(&self) -> &str {
+        &self.inclusive_start_billing_period
     }
 
-    /// Is this association in force in ANY billing period at all? One that still
-    /// stands always is; an ended one only when it ended in a LATER period than the one
-    /// it started in, since the span is half-open.
-    pub fn covers_any_period(&self) -> bool {
-        billing_period_precedes(
-            billing_period_key(&self.inclusive_start_billing_period),
-            self.exclusive_end_billing_period
-                .as_deref()
-                .and_then(billing_period_key),
-        )
-    }
-
-    /// Is this association in force in `billing_period`? Half-open, as
-    /// [`billing_period_range_covers`] reads it: every period from the one it started
-    /// in up to, but not including, the one it ended at — so an association that began
-    /// and ended in the SAME period is in force in no period at all.
-    pub fn covers(&self, billing_period: &str) -> bool {
-        billing_period_range_covers(
-            Some(&self.inclusive_start_billing_period),
-            self.exclusive_end_billing_period.as_deref(),
-            billing_period,
-        )
+    fn exclusive_end_billing_period(&self) -> Option<&str> {
+        self.exclusive_end_billing_period.as_deref()
     }
 }
 
@@ -2209,22 +2180,20 @@ pub struct AccountAssociationRecord {
     pub exclusive_end_billing_period: Option<String>,
 }
 
-impl AccountAssociationRecord {
-    /// Does this membership still stand — has nothing ended it?
-    pub fn is_live(&self) -> bool {
-        self.exclusive_end_billing_period.is_none()
+/// The half-open billing-period range a membership is in force over, read the way
+/// every store here keeping a HISTORY of such ranges reads it
+/// ([`BillingPeriodHistoryRecord`]): the account is a member from the period the
+/// membership began in up to, but not including, the period it ended in, so a
+/// membership that began and ended in the SAME period covers no period at all — which
+/// is what a listing for that period reports, and the reason such a record is not kept
+/// ([`prune_period_history`]).
+impl BillingPeriodHistoryRecord for AccountAssociationRecord {
+    fn inclusive_start_billing_period(&self) -> &str {
+        &self.inclusive_start_billing_period
     }
 
-    /// Was the account a member of this group in `billing_period`? Half-open, as
-    /// [`billing_period_range_covers`] reads it, so a membership that began and
-    /// ended in the SAME period covers no period at all — which is what a listing
-    /// for that period reports, and what the live membership says too.
-    pub fn covers(&self, billing_period: &str) -> bool {
-        billing_period_range_covers(
-            Some(&self.inclusive_start_billing_period),
-            self.exclusive_end_billing_period.as_deref(),
-            billing_period,
-        )
+    fn exclusive_end_billing_period(&self) -> Option<&str> {
+        self.exclusive_end_billing_period.as_deref()
     }
 }
 
@@ -2234,8 +2203,9 @@ impl AccountAssociationRecord {
 /// in. `None` when none of them covers it.
 ///
 /// One reverse scan per account, bounded by
-/// [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`], and the only place that decides which
-/// membership a period reports — so every period-scoped read answers the same way.
+/// [`MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`], and the only place that decides
+/// which membership a period reports — so every period-scoped read answers the same
+/// way.
 fn membership_in<'a>(
     memberships: &'a [AccountAssociationRecord],
     billing_period: &str,
@@ -2908,9 +2878,10 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   from the roster itself ([`organization_linked_accounts`]), which no cap of this
 ///   store evicts; nothing deletes a linked account, so this memory is capped at
 ///   [`MAX_UNASSOCIATED_ACCOUNTS`] and evicts oldest-first, forgetting the evicted
-///   account's billing group memberships with it; one account keeps at most
-///   [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] of them, oldest ENDED membership
-///   dropped first.
+///   account's billing group memberships with it; one account keeps the membership in
+///   force plus at most [`MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] ENDED ones,
+///   oldest ended membership dropped first, and keeps no membership that covers no
+///   billing period at all.
 /// * the idempotency index is capped at [`MAX_IDEMPOTENCY_TOKENS`], evicts
 ///   oldest-first, and additionally drops the entries that point at a deleted
 ///   group.
@@ -2965,9 +2936,11 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// one, since an account belongs to at most one billing group). The index that
     /// makes "not associated with another billing group" decidable, the MONITORED
     /// filter computable, and a read scoped to a billing period answerable from the
-    /// membership that was in force THEN (through [`membership_in`]). At most
-    /// [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] per account, oldest ended membership
-    /// dropped first; a delete ends the memberships the deleted group held.
+    /// membership that was in force THEN (through [`membership_in`]). Pruned the way
+    /// every billing-period history here is ([`prune_period_history`]): a membership
+    /// that covers no billing period at all is not kept, and at most
+    /// [`MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] ENDED memberships are, the oldest
+    /// ended one dropped first; a delete ends the memberships the deleted group held.
     ///
     /// A handler writes it only through [`Self::associate_account`] and
     /// [`Self::release_account`], and reads it through
@@ -3331,6 +3304,13 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// one: a membership of ANOTHER group is ended in this same period, and restating
     /// the membership the account already has changes nothing — the period it began in
     /// is the one it is still in force from.
+    ///
+    /// What is left is then pruned the way every billing-period history here is
+    /// ([`prune_period_history`]): a membership ended in the very period it began in
+    /// was a membership of no period at all, so it is not kept, and the kept history is
+    /// at most [`MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] ENDED memberships with
+    /// the oldest ended one dropped first — never the membership in force, and never
+    /// one an earlier period still reports while a membership covering nothing is held.
     pub fn associate_account(&mut self, account_id: &str, group_arn: &str) {
         let billing_period = current_billing_period();
         let memberships = self
@@ -3348,9 +3328,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             inclusive_start_billing_period: billing_period,
             exclusive_end_billing_period: None,
         });
-        while memberships.len() > MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT {
-            memberships.remove(0);
-        }
+        prune_period_history(memberships, MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT);
     }
 
     /// Release `account_id` from `group_arn`: the membership of that group it still
@@ -3358,16 +3336,22 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// belonging to no billing group — which is what `UNMONITORED` reports. A no-op
     /// on the memberships of an account that group does not hold now, so a release
     /// never rewrites what some other group's membership says.
+    ///
+    /// A membership released in the very period it began in was a membership of no
+    /// period at all, so its record is DROPPED rather than kept as a span covering
+    /// nothing, and the kept history stays bounded — both through the pruning every
+    /// billing-period history here shares ([`prune_period_history`]).
     pub fn release_account(&mut self, account_id: &str, group_arn: &str) {
         let billing_period = current_billing_period();
-        if let Some(live) = self
-            .account_associations
-            .get_mut(account_id)
-            .and_then(|memberships| memberships.iter_mut().rev().find(|held| held.is_live()))
-        {
-            if live.billing_group_arn == group_arn {
+        if let Some(memberships) = self.account_associations.get_mut(account_id) {
+            if let Some(live) = memberships
+                .iter_mut()
+                .rev()
+                .find(|held| held.is_live() && held.billing_group_arn == group_arn)
+            {
                 live.exclusive_end_billing_period = Some(billing_period);
             }
+            prune_period_history(memberships, MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT);
         }
         self.note_unassociated_account(account_id);
     }
@@ -4425,16 +4409,20 @@ pub const MAX_BILLING_TRANSFER_PREFERENCES: usize = 1000;
 /// account that is still associated with a group is never in this tail.
 pub const MAX_UNASSOCIATED_ACCOUNTS: usize = 1024;
 
-/// How many billing group memberships this service remembers per linked account:
-/// the one that stands now plus the ones that have ended.
+/// How many ENDED billing group memberships this service remembers per linked
+/// account, so that a read scoped to a closed billing period can still report the
+/// group that held the account then ([`prune_period_history`]). The membership in
+/// force is kept beside them and counts against nothing.
 ///
 /// A CHOSEN bound, not an AWS limit: a caller decides how often it associates and
-/// disassociates an account, and each cycle is one more ended membership to report a
-/// past billing period from. The oldest ENDED membership is dropped first, so a
-/// forgotten one reads back the way that period read before anybody recorded it, and
-/// the membership in force is never the one evicted. A billing period is a month, so
+/// disassociates an account, and each cycle that spans a new billing period is one more
+/// ended membership to report a past billing period from. The oldest ENDED membership is
+/// dropped first, so a forgotten one reads back the way that period read before anybody
+/// recorded it, and the membership in force is never the one evicted. A membership that
+/// ended in the period it began in covers no period at all and is not kept, so no cycle
+/// inside ONE billing period costs this bound anything. A billing period is a month, so
 /// this holds every membership a long history of them could be reported for.
-pub const MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT: usize = 100;
+pub const MAX_ENDED_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT: usize = 100;
 
 /// How many pricing plans this emulator stores for the account.
 ///

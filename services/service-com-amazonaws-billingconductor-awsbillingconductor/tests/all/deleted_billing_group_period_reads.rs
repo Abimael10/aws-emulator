@@ -34,6 +34,7 @@
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_billingconductor_awsbillingconductor::state::AccountAssociationRecord;
 use service_com_amazonaws_billingconductor_awsbillingconductor::{
     ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState, EmulatedService,
 };
@@ -239,21 +240,28 @@ impl Emulator {
         deleted.deletion_time_millis = at;
     }
 
-    /// Backdate one account's stored membership to the half-open period range
+    /// State that `account` was a member of `group` over the half-open period range
     /// `[start, end)`, as if the associating call had been made in `start` and the delete
     /// that ended it in `end` — the world no request can ask for, since a call happens
     /// now.
-    fn membership_ran(&self, account: &str, start: &str, end: &str) {
+    ///
+    /// The membership is WRITTEN rather than derived from whatever the calls above left,
+    /// because what they leave depends on the periods they were made in: a membership
+    /// begun and ended inside one billing period is in force in no period at all, so the
+    /// store keeps no record of it to backdate.
+    fn membership_ran(&self, account: &str, group: &str, start: &str, end: &str) {
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
         let memberships = state
             .account_associations
-            .get_mut(account)
-            .expect("setup membership_ran: the account was a member above");
-        for membership in memberships.iter_mut() {
-            membership.inclusive_start_billing_period = start.to_string();
-            membership.exclusive_end_billing_period = Some(end.to_string());
-        }
+            .entry(account.to_string())
+            .or_default();
+        memberships.clear();
+        memberships.push(AccountAssociationRecord {
+            billing_group_arn: group.to_string(),
+            inclusive_start_billing_period: start.to_string(),
+            exclusive_end_billing_period: Some(end.to_string()),
+        });
     }
 
     /// The `BillingGroups` `ListBillingGroups` reports for `period` under `filters`.
@@ -434,7 +442,7 @@ async fn a_deleted_group_is_reported_for_the_periods_it_billed_in_and_for_no_oth
         em.deleted_in(&group, &deleted);
         // The membership the group held ran exactly as long as the group did: a delete
         // ends it at the period the delete was made in.
-        em.membership_ran(&account, &created, &deleted);
+        em.membership_ran(&account, &group, &created, &deleted);
 
         for offset in read_offsets(row) {
             let period = shift_period(&now, offset);
@@ -571,7 +579,7 @@ async fn the_generation_a_period_reports_for_a_deleted_group_is_the_one_in_force
     .await;
     em.generation_started_in(&group, &changed);
     em.delete_group(case, &group).await;
-    em.membership_ran(&account, &created, &now);
+    em.membership_ran(&account, &group, &created, &now);
 
     // Rows differ along which generation's periods the read falls in: the first period of
     // the first generation, its last, the first of the second generation and its last.
