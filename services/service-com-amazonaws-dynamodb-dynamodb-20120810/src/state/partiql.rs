@@ -160,14 +160,15 @@ enum ParseDefect {
     /// unquoted word is read as the keyword it is and the grammar has no place for it
     /// there.
     UnexpectedKeyword,
-    /// The text STOPS inside a quoted run — a string literal or a quoted name the
-    /// statement never closes — so there is no token at the position to name and the
-    /// parser reports no phrase for it at all.
+    /// The text STOPS inside a run it never closes — a string literal, a quoted name or a
+    /// `/* … */` comment — so there is no token at the position to name and the parser
+    /// reports no phrase for it at all.
     Unterminated,
     /// A LEXEME the scanner cannot read at all: a numeric literal whose exponent marker
-    /// carries no exponent, a number run together with a word. The text never became
-    /// tokens, so there is no grammar position to name and the parser reports no phrase
-    /// — the same empty tail an unterminated run earns.
+    /// carries no exponent, a number run together with a word, a character the language
+    /// spells nothing with. The text never became tokens, so there is no grammar position
+    /// to name and the parser reports no phrase — the same empty tail an unterminated run
+    /// earns.
     Lexeme,
     /// The `}` that closes a tuple literal is not there.
     ExpectedRightCurly,
@@ -496,6 +497,61 @@ pub fn check_single_attribute_source_key(
     Ok(())
 }
 
+/// The clauses the query language states that this surface does not serve, as the keyword
+/// each is spelled with.
+///
+/// This surface serves "reads and singleton writes on data stored in DynamoDB, using
+/// PartiQL" (the `ExecuteStatement` doc), and the language's query form states clauses
+/// besides the ones a read of a table is made of: each of these follows a statement that is
+/// otherwise complete and asks for something no read or write here performs. A statement
+/// carrying one names a CLAUSE of the language rather than failing to parse, so it is
+/// refused as the clause it is ([`unsupported_clause`]) — the way text whose leading
+/// keywords name an operation is refused as that operation
+/// ([`NON_DML_STATEMENT_OPERATIONS`]) — and the keyword a refusal states is the language's
+/// own spelling of it, not the statement's.
+const UNSUPPORTED_CLAUSES: [&str; 2] = ["LIMIT", "OFFSET"];
+
+/// How a clause this surface does not serve is refused: the clause keyword, and where the
+/// statement spells the expression that clause carries.
+///
+/// The position is the expression's, which is what the clause is MADE of — a count, an
+/// offset — reported as every positioned sentence of this surface reports a token
+/// ([`Position`]): its line, its column and its own width.
+fn unsupported_clause(clause: &str, at: Position) -> RequestError {
+    RequestError::Validation(format!("Unsupported clause: {clause} at {}", at.stated()))
+}
+
+/// The key a refusal about the statement's OWN top-level value names: the document a
+/// statement carries is the root of what it writes, so a value standing directly in it
+/// stands under this key ([`unsupported_value_data_type`]).
+const ROOT_VALUE_KEY: &str = "root";
+
+/// How a statement spelling an unquoted word where only a VALUE may stand is refused: the
+/// token the statement wrote, the key of the document that holds it, and where the
+/// statement spells that token.
+///
+/// A value position takes a literal, a collection of literals or a `?` marker — a string
+/// is spelled `'in single quotes'` — so an unquoted word there denotes no value an item can
+/// hold, and the statement is told WHICH token it wrote and which document holds it:
+/// [`ROOT_VALUE_KEY`] for the statement's own value, and the attribute a nested document is
+/// held under once the parse steps inside one.
+fn unsupported_value_data_type(token: &str, key: &str, at: Position) -> RequestError {
+    RequestError::Validation(format!(
+        "Unsupported data type: {token} under key {key} at {}",
+        at.stated()
+    ))
+}
+
+/// How a statement that compares `MISSING` with an operator is refused.
+///
+/// `MISSING` is an attribute the item does not CARRY rather than a value one can hold, so
+/// the only operator that reads it is the type test (`attr IS MISSING`): an equality or an
+/// ordering against it compares a value with the absence of one, which no operator decides.
+/// The sentence is fixed and names neither the attribute nor the operator, and it is stated
+/// where an OPERAND of a comparison is read ([`StatementParser::operand`]) — the keyword
+/// standing where a stored value belongs is the keyword it is, like every other.
+const MISSING_COMPARISON_MESSAGE: &str = "MISSING must be compared using IS operator";
+
 /// How a statement that reads as a COMPLETE statement and is then followed by more
 /// tokens is refused.
 ///
@@ -809,6 +865,19 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
         let (token_line, token_column) = (line, start + 1 - line_start);
         match character {
             c if c.is_whitespace() => at += 1,
+            // The two comments the language states, each read as the TEXT it is and
+            // passed over: a `--` comment runs to the end of its line, a `/* … */` one to
+            // the delimiter that closes it, and neither becomes a token, so the statement
+            // around a comment is the statement that parses.
+            '-' if characters.get(at + 1) == Some(&'-') => {
+                at += 2;
+                while at < characters.len() && characters[at] != '\n' {
+                    at += 1;
+                }
+            }
+            '/' if characters.get(at + 1) == Some(&'*') => {
+                at = block_comment_end(&characters, at)?;
+            }
             '\'' | '"' => {
                 let (text, next) = quoted(&characters, at, character)?;
                 tokens.push(if character == '\'' {
@@ -819,6 +888,18 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
                 at = next;
             }
             c if c.is_ascii_digit() => {
+                let (lexeme, next) = number(&characters, at)?;
+                tokens.push(Token::Number(lexeme));
+                at = next;
+            }
+            // A number may open with its decimal point (`.5`), so a `.` with a digit
+            // behind it opens one LEXEME; everywhere else the same character is the step
+            // separator of a document path, which never steps into a digit.
+            '.' if characters
+                .get(at + 1)
+                .copied()
+                .is_some_and(|next| next.is_ascii_digit()) =>
+            {
                 let (lexeme, next) = number(&characters, at)?;
                 tokens.push(Token::Number(lexeme));
                 at = next;
@@ -917,7 +998,10 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
                 tokens.push(Token::Slash);
                 at += 1;
             }
-            _ => return Err(statement_parse_error(ParseDefect::UnexpectedTerm)),
+            // A character the language spells nothing with: the text never became
+            // tokens, so the defect is the LEXICAL one, which names no grammar position
+            // ([`ParseDefect::Lexeme`]).
+            _ => return Err(statement_parse_error(ParseDefect::Lexeme)),
         }
         // Every arm above reads ONE run of text and pushes at most one token for it, so
         // the position of whatever it pushed is the run it read.
@@ -941,6 +1025,22 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
         return Err(statement_parse_error(ParseDefect::NotDataManipulation));
     }
     Ok(Lexemes { tokens, positions })
+}
+
+/// Where the text carries on past the `/* … */` comment that opens at `at`.
+///
+/// A comment the text never closes is a run the scan STOPS inside, the way an unclosed
+/// quoted run is: there is no token at the position the scan stopped at, so the refusal
+/// names no phrase for it ([`ParseDefect::Unterminated`]).
+fn block_comment_end(characters: &[char], at: usize) -> Result<usize, RequestError> {
+    let mut index = at + 2;
+    while index + 1 < characters.len() {
+        if characters[index] == '*' && characters[index + 1] == '/' {
+            return Ok(index + 2);
+        }
+        index += 1;
+    }
+    Err(statement_parse_error(ParseDefect::Unterminated))
 }
 
 /// Read one quoted run starting at `at`, where `delimiter` is the quote character: a
@@ -972,8 +1072,9 @@ fn quoted(
 }
 
 /// Read one numeric lexeme starting at `at`: digits, an optional fraction and an
-/// optional exponent. The TEXT is returned; what number it denotes — and whether the
-/// store can hold it — is [`canonical_number_text`]'s business.
+/// optional exponent, where the digits before the point may be left out altogether
+/// (`.5`). The TEXT is returned; what number it denotes — and whether the store can hold
+/// it — is [`canonical_number_text`]'s business.
 ///
 /// A literal the scanner cannot finish reading is no lexeme at all: an exponent marker
 /// with no exponent after it (`1e`), or a number run together with a word (`1abc`),
@@ -1052,6 +1153,20 @@ impl StatementPath {
     /// equality has to.
     fn is_attribute(&self) -> bool {
         self.segments.len() == 1
+    }
+
+    /// The DOCUMENT a value assigned at this path stands in: the attribute at the end of
+    /// the path's named steps, which is the key a refusal about a token standing where
+    /// that value belongs reports ([`unsupported_value_data_type`]).
+    fn document(&self) -> &str {
+        self.segments
+            .iter()
+            .rev()
+            .find_map(|segment| match segment {
+                PathSegment::Name(name) => Some(name.as_str()),
+                PathSegment::Index(_) => None,
+            })
+            .unwrap_or(ROOT_VALUE_KEY)
     }
 
     /// The value this path addresses inside one item, or `None` when it addresses
@@ -1554,6 +1669,12 @@ pub fn parse_statement(
         return Err(statement_parse_error(ParseDefect::AfterSemicolon));
     }
     if !parser.at_end() {
+        // A clause of the language this surface does not serve stands exactly here — after
+        // a statement that is otherwise complete — and names a CLAUSE rather than failing
+        // to parse, so it is refused as that clause ([`unsupported_clause`]).
+        if let Some(refusal) = parser.unsupported_clause() {
+            return Err(refusal);
+        }
         return Err(unexpected_token_after_statement());
     }
     // A statement that READ as a whole statement and bound a name to its table is one
@@ -1799,6 +1920,23 @@ impl StatementParser<'_> {
         outcome
     }
 
+    /// The refusal a clause this surface does not serve earns, when the token the parser
+    /// stands on opens one ([`UNSUPPORTED_CLAUSES`]), and `None` for every other token.
+    ///
+    /// The keyword is CONSUMED, so the position the refusal reports is where the statement
+    /// spells the expression the clause carries — and, for a clause stating none at all,
+    /// the empty position just past the text ([`Self::position`]).
+    fn unsupported_clause(&mut self) -> Option<RequestError> {
+        let Some(Token::Word(word)) = self.peek() else {
+            return None;
+        };
+        let clause = UNSUPPORTED_CLAUSES
+            .iter()
+            .find(|clause| word.eq_ignore_ascii_case(clause))?;
+        self.at += 1;
+        Some(unsupported_clause(clause, self.position()))
+    }
+
     /// The statement, by the verb it opens with.
     fn statement(&mut self) -> Result<PartiqlStatement, RequestError> {
         if self.accept_word("select") {
@@ -2004,7 +2142,7 @@ impl StatementParser<'_> {
         }
         // A `SELECT` carries on with its own `WHERE` or `ORDER BY`; any other name here
         // binds the source ([`Self::read_table_alias`]).
-        let source = self.read_source(&["where", "order"])?;
+        let source = self.read_source()?;
         let (table, index) = (source.table, source.index);
         let filter = self.where_clause()?;
         let order_by = if self.accept_word("order") {
@@ -2037,7 +2175,7 @@ impl StatementParser<'_> {
     /// `INSERT INTO source VALUE tuple`.
     fn insert(&mut self) -> Result<InsertStatement, RequestError> {
         self.expect_clause_word("into")?;
-        let (components, at) = self.write_target(&["value", "values"])?;
+        let (components, at) = self.write_target()?;
         let table = Self::one_table_in_clause(&components, at)?;
         if !self.accept_word("value") && !self.accept_word("values") {
             // What follows an `INSERT`'s target is the VALUE it inserts, so the position
@@ -2080,7 +2218,7 @@ impl StatementParser<'_> {
     /// complete statement ([`ParseDefect::TrailingToken`], raised where the whole text is
     /// read).
     fn update(&mut self, source: StatedSource) -> Result<UpdateStatement, RequestError> {
-        let (components, _at) = self.write_target(&["set", "remove", "where", "returning"])?;
+        let (components, _at) = self.write_target()?;
         let [table] = components.as_slice() else {
             // The target an `UPDATE` names carries no clause around it, so a qualifier on
             // it asks for the update through an index.
@@ -2146,9 +2284,7 @@ impl StatementParser<'_> {
         // parse's own ("the parameters for the PartiQL statement" are counted against the
         // statement that runs).
         let used = self.used_parameters;
-        let mut opens = self
-            .write_target(&["set", "remove", "where", "returning"])
-            .is_ok();
+        let mut opens = self.write_target().is_ok();
         if opens && !(self.peek_word("set") || self.peek_word("remove")) {
             // A predicate before the actions is the other order this form may come in;
             // text whose predicate does not read at all states no action after it either,
@@ -2165,7 +2301,7 @@ impl StatementParser<'_> {
     /// `DELETE FROM source WHERE predicate [RETURNING values]`.
     fn delete(&mut self) -> Result<DeleteStatement, RequestError> {
         self.expect_clause_word("from")?;
-        let source = self.read_source(&["where", "returning"])?;
+        let source = self.read_source()?;
         let table = source.table;
         if source.index.is_some() {
             // A `DELETE` addresses an item THROUGH the source it names, and an index holds
@@ -2198,7 +2334,7 @@ impl StatementParser<'_> {
 
     /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
     /// `table.index`, either part quoted or bare.
-    fn read_source(&mut self, continues: &[&str]) -> Result<StatementSource, RequestError> {
+    fn read_source(&mut self) -> Result<StatementSource, RequestError> {
         let table = self.path_component()?;
         let index = if self.accept(&Token::Dot) {
             Some(self.path_component()?)
@@ -2213,7 +2349,7 @@ impl StatementParser<'_> {
             ));
         }
         let source = StatementSource { table, index };
-        self.read_table_alias(continues);
+        self.read_table_alias();
         Ok(source)
     }
 
@@ -2235,17 +2371,14 @@ impl StatementParser<'_> {
     /// is refused for the target rather than for the token after it, and the position that
     /// comes back is where the path OPENS ([`Position`]). WHICH refusal that is belongs to
     /// the verb ([`StatementParser::insert`], [`StatementParser::update`]).
-    fn write_target(
-        &mut self,
-        continues: &[&str],
-    ) -> Result<(Vec<String>, Position), RequestError> {
+    fn write_target(&mut self) -> Result<(Vec<String>, Position), RequestError> {
         let opens_at = self.position();
         let mut components = vec![self.path_component()?];
         while self.accept(&Token::Dot) {
             components.push(self.path_component()?);
         }
         if components.len() == 1 {
-            self.read_table_alias(continues);
+            self.read_table_alias();
         }
         Ok((components, opens_at))
     }
@@ -2271,14 +2404,16 @@ impl StatementParser<'_> {
     /// Read the ALIAS a statement binds to the table it has just named, when it states
     /// one, and remember that it did.
     ///
-    /// A binding is `AS name`, or the same name with the keyword left out; `continues`
-    /// names the keywords the statement itself carries on with at this position, so a
-    /// word that is none of them — and a `"quoted"` name, which is never a keyword —
-    /// binds the table rather than continuing the statement. The binding is part of the
-    /// grammar and is therefore READ rather than refused here: a statement that does not
-    /// parse past it earns its own parse defect, and one that parses whole is refused for
-    /// the binding ([`aliasing_unsupported`], applied once the statement is read).
-    fn read_table_alias(&mut self, continues: &[&str]) {
+    /// A binding is `AS name`, or the same name with the keyword left out. An alias is a
+    /// NAME, so a bare word that spells one of the dialect's keywords
+    /// ([`is_statement_keyword`]) binds nothing — it is the keyword it spells, whether
+    /// that is a clause this statement carries on with or a clause of the language this
+    /// surface does not serve ([`StatementParser::unsupported_clause`]) — while a
+    /// `"quoted"` name, which is never a keyword, binds the table. The binding is part of
+    /// the grammar and is therefore READ rather than refused here: a statement that does
+    /// not parse past it earns its own parse defect, and one that parses whole is refused
+    /// for the binding ([`aliasing_unsupported`], applied once the statement is read).
+    fn read_table_alias(&mut self) {
         if self.accept_word("as") {
             self.aliased = true;
             // The name the binding states, when it states one: text that is no name
@@ -2289,9 +2424,7 @@ impl StatementParser<'_> {
             return;
         }
         let binds = match self.peek() {
-            Some(Token::Word(word)) => !continues
-                .iter()
-                .any(|keyword| word.eq_ignore_ascii_case(keyword)),
+            Some(Token::Word(word)) => !is_statement_keyword(word),
             Some(Token::Quoted(_)) => true,
             _ => false,
         };
@@ -2329,8 +2462,14 @@ impl StatementParser<'_> {
 
     /// `SET path = expression`, where the expression is one operand, two joined by
     /// `+` or `-`, or one of the documented functions.
+    ///
+    /// The clause assigns the document the target path names, so a refusal about a token
+    /// standing where the assigned value belongs reports that document
+    /// ([`StatementPath::document`]) — the same key an `INSERT` writing the identical value
+    /// under the identical attribute reports.
     fn assignment(&mut self) -> Result<UpdateClause, RequestError> {
         let path = self.path()?;
+        let document = path.document().to_string();
         self.expect(&Token::Compare(CompareOp::Equal))?;
         // `set_add` and `set_delete` are the statement forms of the ADD and DELETE
         // update actions, so they are whole clauses rather than values.
@@ -2344,7 +2483,7 @@ impl StatementParser<'_> {
                     )));
                 }
                 self.expect_operand(function, 1)?;
-                let value = self.value()?;
+                let value = self.value_in(&document)?;
                 self.expect_call_close(function, 2)?;
                 return Ok(if is_add {
                     UpdateClause::Add(path, value)
@@ -2353,15 +2492,15 @@ impl StatementParser<'_> {
                 });
             }
         }
-        let left = self.set_operand()?;
+        let left = self.set_operand(&document)?;
         self.refuse_unsupported_update_operator()?;
         if self.accept(&Token::Plus) {
-            let right = self.set_operand()?;
+            let right = self.set_operand(&document)?;
             self.refuse_unsupported_update_operator()?;
             return Ok(UpdateClause::Set(path, SetExpression::Sum(left, right)));
         }
         if self.accept(&Token::Minus) {
-            let right = self.set_operand()?;
+            let right = self.set_operand(&document)?;
             self.refuse_unsupported_update_operator()?;
             return Ok(UpdateClause::Set(
                 path,
@@ -2384,14 +2523,15 @@ impl StatementParser<'_> {
         }
     }
 
-    /// One operand of a `SET`: `list_append`, a path, or a value.
-    fn set_operand(&mut self) -> Result<AssignmentOperand, RequestError> {
+    /// One operand of a `SET`: `list_append`, a path, or a value standing in the document
+    /// `key` names.
+    fn set_operand(&mut self, key: &str) -> Result<AssignmentOperand, RequestError> {
         if self.peek_word("list_append") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
             self.at += 2;
             let (left, right) = self.nested(|parser| {
-                let left = parser.set_operand()?;
+                let left = parser.set_operand(key)?;
                 parser.expect_operand("list_append", 1)?;
-                let right = parser.set_operand()?;
+                let right = parser.set_operand(key)?;
                 Ok((left, right))
             })?;
             self.expect_call_close("list_append", 2)?;
@@ -2400,7 +2540,7 @@ impl StatementParser<'_> {
         if self.starts_path() {
             return Ok(AssignmentOperand::Path(self.path()?));
         }
-        Ok(AssignmentOperand::Value(self.value()?))
+        Ok(AssignmentOperand::Value(self.value_in(key)?))
     }
 
     /// `WHERE predicate`, when the statement states one.
@@ -2451,7 +2591,61 @@ impl StatementParser<'_> {
         self.primary()
     }
 
+    /// One predicate: a term of the predicate grammar, and the BOOLEAN comparison a
+    /// statement may state it in ([`Self::compared_with_truth`]).
     fn primary(&mut self) -> Result<Predicate, RequestError> {
+        let held = self.predicate_term()?;
+        self.compared_with_truth(held)
+    }
+
+    /// The predicate `held`, as the comparison against a boolean literal the statement
+    /// carries on with states it — and `held` itself where it states none.
+    ///
+    /// A predicate IS a boolean value of this language, so a clause may state one by
+    /// comparing it with another boolean rather than on its own: `begins_with(a, 'x') =
+    /// TRUE` selects the items `begins_with(a, 'x')` selects, `= FALSE` the items it does
+    /// not, and `<>` states each the other way round. The predicate's own meaning is
+    /// untouched either way — the comparison only says WHICH outcome the clause selects —
+    /// so it is kept as the predicate it already is, negated where the comparison asks for
+    /// the outcome it does not state. Only the two equality operators compare booleans;
+    /// an ORDERING of them is no comparison the predicate grammar reads, and the operand
+    /// has to be the literal itself, so a comparison against anything else is left to the
+    /// grammar that reads it.
+    fn compared_with_truth(&mut self, held: Predicate) -> Result<Predicate, RequestError> {
+        let equality = match self.peek() {
+            Some(Token::Compare(CompareOp::Equal)) => true,
+            Some(Token::Compare(CompareOp::NotEqual)) => false,
+            _ => return Ok(held),
+        };
+        let Some(truth) = self.boolean_literal_at(self.at + 1) else {
+            return Ok(held);
+        };
+        self.at += 2;
+        Ok(if truth == equality {
+            held
+        } else {
+            Predicate::Not(Box::new(held))
+        })
+    }
+
+    /// The boolean the token `at` spells, and `None` for every other token — the two
+    /// keyword literals of the language, matched without regard to case the way every
+    /// keyword of this dialect is.
+    fn boolean_literal_at(&self, at: usize) -> Option<bool> {
+        let Some(Token::Word(word)) = self.tokens.get(at) else {
+            return None;
+        };
+        for (keyword, truth) in [("true", true), ("false", false)] {
+            if word.eq_ignore_ascii_case(keyword) {
+                return Some(truth);
+            }
+        }
+        None
+    }
+
+    /// One term of the predicate grammar: a parenthesised predicate, a call to one of the
+    /// boolean functions, a type test, a `BETWEEN`, a membership or a comparison.
+    fn predicate_term(&mut self) -> Result<Predicate, RequestError> {
         if self.accept(&Token::Open) {
             let inner = self.nested(Self::disjunction)?;
             self.expect(&Token::Close)?;
@@ -2677,7 +2871,17 @@ impl StatementParser<'_> {
     }
 
     /// One comparison operand: `size(path)`, a path, or a value.
+    ///
+    /// `MISSING` is read here and refused ([`MISSING_COMPARISON_MESSAGE`]): an operand
+    /// position belongs to a comparison — a relational operator, a `BETWEEN`, a
+    /// membership, a boolean call — and the absence of an attribute is read by the type
+    /// test alone, so the keyword standing here asks for a comparison no operator decides.
     fn operand(&mut self) -> Result<PredicateOperand, RequestError> {
+        if self.peek_word("missing") {
+            return Err(RequestError::Validation(
+                MISSING_COMPARISON_MESSAGE.to_string(),
+            ));
+        }
         if self.peek_word("size") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
             self.at += 2;
             let path = self.function_path("size")?;
@@ -2816,8 +3020,18 @@ impl StatementParser<'_> {
 
     /// One value the statement carries: a literal, a collection of literals, or a
     /// `?` marker standing for one `Parameters` entry.
+    ///
+    /// The value stands in the statement's own document, so a refusal about a token
+    /// standing where a value belongs names that document ([`ROOT_VALUE_KEY`]); a clause
+    /// that assigns a NAMED attribute states its own document instead
+    /// ([`Self::value_in`]).
     fn value(&mut self) -> Result<AttributeValue, RequestError> {
-        let value = self.raw_value()?;
+        self.value_in(ROOT_VALUE_KEY)
+    }
+
+    /// The same, for a value standing in the document `key` names.
+    fn value_in(&mut self, key: &str) -> Result<AttributeValue, RequestError> {
+        let value = self.raw_value(key)?;
         // A value a statement carries is held to the same rules a stored one is: the
         // documented nesting depth and this emulator's ceiling on a collection's
         // members.
@@ -2825,7 +3039,11 @@ impl StatementParser<'_> {
         Ok(value)
     }
 
-    fn raw_value(&mut self) -> Result<AttributeValue, RequestError> {
+    /// One value as the statement spells it, where `key` names the DOCUMENT the value
+    /// stands in — the statement's own ([`ROOT_VALUE_KEY`]), or the attribute a nested
+    /// document is held under — which is what a refusal about a token standing in a value
+    /// position reports ([`unsupported_value_data_type`]).
+    fn raw_value(&mut self, key: &str) -> Result<AttributeValue, RequestError> {
         match self.peek().cloned() {
             Some(Token::Text(text)) => {
                 self.at += 1;
@@ -2864,21 +3082,21 @@ impl StatementParser<'_> {
             Some(Token::OpenBracket) => {
                 self.at += 1;
                 let members = self.nested_to(MAX_ATTRIBUTE_DEPTH, |parser| {
-                    parser.value_list(&Token::CloseBracket)
+                    parser.value_list(&Token::CloseBracket, key)
                 })?;
                 Ok(AttributeValue::L(members))
             }
             Some(Token::OpenBag) => {
                 self.at += 1;
-                let members = self
-                    .nested_to(MAX_ATTRIBUTE_DEPTH, |parser| {
-                        parser.value_list(&Token::CloseBag)
-                    })?;
+                let members = self.nested_to(MAX_ATTRIBUTE_DEPTH, |parser| {
+                    parser.value_list(&Token::CloseBag, key)
+                })?;
                 set_of(members)
             }
             Some(Token::OpenBrace) => {
                 self.at += 1;
-                let entries = self.nested_to(MAX_ATTRIBUTE_DEPTH, Self::tuple_entries)?;
+                let entries =
+                    self.nested_to(MAX_ATTRIBUTE_DEPTH, |parser| parser.tuple_entries(key))?;
                 Ok(AttributeValue::M(entries))
             }
             Some(Token::Word(word)) => {
@@ -2894,20 +3112,37 @@ impl StatementParser<'_> {
                     self.at += 1;
                     return Ok(AttributeValue::Bool(false));
                 }
-                Err(unexpected_token(self.peek()))
+                // A bare word that spells one of the dialect's keywords is the KEYWORD it
+                // spells, and the grammar has no place for one here — `MISSING` included,
+                // since the comparison that reads the absence of an attribute is refused
+                // where an OPERAND is read ([`Self::operand`]) and not where a stored value
+                // belongs. Any other unquoted word is a token standing where a value
+                // belongs, which denotes no value an item can hold
+                // ([`unsupported_value_data_type`]).
+                if is_statement_keyword(&word) {
+                    return Err(unexpected_token(self.peek()));
+                }
+                Err(unsupported_value_data_type(&word, key, self.position()))
             }
             _ => Err(unexpected_token(self.peek())),
         }
     }
 
     /// The members of a list or bag literal, up to its closing delimiter.
-    fn value_list(&mut self, closing: &Token) -> Result<Vec<AttributeValue>, RequestError> {
+    ///
+    /// A member stands in the collection itself, so a refusal about one names the document
+    /// that holds the COLLECTION — the key passed through from the value around it.
+    fn value_list(
+        &mut self,
+        closing: &Token,
+        key: &str,
+    ) -> Result<Vec<AttributeValue>, RequestError> {
         let mut members = Vec::new();
         if self.accept(closing) {
             return Ok(members);
         }
         loop {
-            members.push(self.raw_value()?);
+            members.push(self.raw_value(key)?);
             if !self.accept(&Token::Comma) {
                 break;
             }
@@ -2931,8 +3166,14 @@ impl StatementParser<'_> {
         }))
     }
 
-    /// The `'name': value` entries of a tuple literal, up to its closing brace.
-    fn tuple_entries(&mut self) -> Result<Item, RequestError> {
+    /// The `'name': value` entries of a tuple literal, up to its closing brace, where
+    /// `key` names the document this tuple itself stands in.
+    ///
+    /// A member's value stands in THIS tuple, so a refusal about a token standing where
+    /// that value belongs names the key this tuple is held under; a member that is itself a
+    /// document is stepped into under its OWN name, which is the key the values inside it
+    /// stand under ([`unsupported_value_data_type`]).
+    fn tuple_entries(&mut self, key: &str) -> Result<Item, RequestError> {
         let mut entries = Item::new();
         if self.accept(&Token::CloseBrace) {
             return Ok(entries);
@@ -2953,7 +3194,15 @@ impl StatementParser<'_> {
                 _ => return Err(unexpected_token(self.peek())),
             };
             self.expect(&Token::Colon)?;
-            let value = self.raw_value()?;
+            let nested = matches!(
+                self.peek(),
+                Some(Token::OpenBrace | Token::OpenBracket | Token::OpenBag)
+            );
+            let value = if nested {
+                self.raw_value(&name)?
+            } else {
+                self.raw_value(key)?
+            };
             if entries.insert(name, value).is_some() {
                 return Err(statement_refused(
                     "a tuple names each of its attributes once",
