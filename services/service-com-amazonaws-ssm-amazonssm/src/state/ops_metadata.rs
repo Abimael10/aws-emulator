@@ -411,6 +411,24 @@ pub fn ops_metadata_arn(region: &str, application: &str) -> String {
     )
 }
 
+/// The resource an authorization decision about a call that addresses no ONE OpsMetadata
+/// object is taken against: every `opsmetadata` resource of `region`, the object path spelled
+/// with IAM's own wildcard —
+/// `arn:aws:ssm:<region>:<account>:opsmetadata/*`.
+///
+/// A create is decided about this rather than about an object's own ARN because the ARN only
+/// exists once the create has minted it ([`ops_metadata_arn`]), and a listing because it names
+/// no object either; so a statement covering the Region's OpsMetadata objects allows such a
+/// call while one scoped to a single object does not.
+#[must_use]
+pub fn ops_metadata_resources(region: &str) -> String {
+    ::engine::emulator_arn(
+        super::ARN_SERVICE,
+        region,
+        &format!("{ARN_OPS_METADATA_RESOURCE_PREFIX}*"),
+    )
+}
+
 /// Whether `arn` names the account this endpoint serves — the question asked before the
 /// store is looked at, so a caller is never told what another account holds.
 ///

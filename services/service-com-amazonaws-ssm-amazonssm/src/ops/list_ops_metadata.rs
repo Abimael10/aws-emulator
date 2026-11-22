@@ -22,6 +22,13 @@
 //! ([`crate::state::ops_metadata::list_ops_metadata_page_size`]); an object left over past
 //! the page is reported through `NextToken`, the ARN the next page resumes at.
 //!
+//! WHO MAY CALL IT is decided first, against the calling principal's identity-based IAM
+//! policies ([`crate::state::identity_authorization`]) and before the store is read: the
+//! action is this operation's own and the resource is every OpsMetadata object of the Region
+//! ([`crate::state::ops_metadata::ops_metadata_resources`]), since a listing names no single
+//! object — so a caller no readable document allows is refused `AccessDeniedException` and
+//! reads nothing of what the Region holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,6 +91,8 @@
 //! * `InternalServerError` (HTTP 500) — An error occurred on the server side.
 //! * `OpsMetadataInvalidArgumentException` (HTTP 400) — One of the arguments passed is
 //!   invalid.
+//! * `AccessDeniedException` (HTTP 400, widened in from the service's own errors) — The
+//!   requester doesn't have permissions to perform the requested operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -99,9 +108,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `ListOpsMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#ListOpsMetadata")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it ("the
+// requester doesn't have permissions to perform the requested operation") and this
+// operation's own `errors` list omits it, so the refusal a caller holding no grant gets is
+// that shape rather than some other status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#ListOpsMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListOpsMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     OpsMetadataInvalidArgumentException(OpsMetadataInvalidArgumentException),
 }
@@ -163,6 +180,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         use crate::state::{request_region, INVALID_NEXT_TOKEN};
 
+        // The caller's own identity-based policies decide this listing before the store is
+        // read. A listing names no single object, so the resource is every OpsMetadata object
+        // of the Region this request was signed for.
+        let region = request_region(ctx.parts());
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::ops_metadata::ops_metadata_resources(&region),
+        ) {
+            return Err(ListOpsMetadataErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         // `MaxResults`'s 1..50 range, the `Filters` list's length, each filter's key and the
         // length of the values it carries are MODELLED constraints the centralized walk has
         // already refused anything outside of. What is read here is which of this Region's
@@ -208,7 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Systems Manager calls this API operation when displaying all Application Manager
         // OpsMetadata objects or blobs": the objects held at the endpoint this request was
         // signed for, narrowed to the ones meeting EVERY filter it carries.
-        let region = request_region(ctx.parts());
         let store = state.lock();
         let matching: Vec<&OpsMetadataRecord> = store
             .ops_metadata_in_region(&region)

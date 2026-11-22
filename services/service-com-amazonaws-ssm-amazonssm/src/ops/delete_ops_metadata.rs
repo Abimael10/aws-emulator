@@ -12,6 +12,12 @@
 //! `OpsMetadataNotFoundException`
 //! ([`crate::state::ops_metadata::OPS_METADATA_NOT_FOUND`]).
 //!
+//! WHO MAY CALL IT is decided first, against the calling principal's identity-based IAM
+//! policies ([`crate::state::identity_authorization`]) and before the ARN is resolved: the
+//! action is this operation's own and the resource is the object the request NAMES, so a
+//! caller no readable document allows is refused `AccessDeniedException` and the object it
+//! named is left exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -64,6 +70,8 @@
 //! * `OpsMetadataInvalidArgumentException` (HTTP 400) — One of the arguments passed is
 //!   invalid.
 //! * `OpsMetadataNotFoundException` (HTTP 400) — The OpsMetadata object doesn't exist.
+//! * `AccessDeniedException` (HTTP 400, widened in from the service's own errors) — The
+//!   requester doesn't have permissions to perform the requested operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -79,9 +87,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `DeleteOpsMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#DeleteOpsMetadata")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it ("the
+// requester doesn't have permissions to perform the requested operation") and this
+// operation's own `errors` list omits it, so the refusal a caller holding no grant gets is
+// that shape rather than some other status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#DeleteOpsMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum DeleteOpsMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     OpsMetadataInvalidArgumentException(OpsMetadataInvalidArgumentException),
     OpsMetadataNotFoundException(OpsMetadataNotFoundException),
@@ -142,6 +158,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `OpsMetadataArn`'s presence, its 1..1011 length and its ARN pattern are MODELLED
         // constraints the centralized walk has already refused anything outside of.
+        // The caller's own identity-based policies decide this delete before the ARN is
+        // resolved, about the object the request NAMED, so a refused delete removes nothing
+        // and tells the caller nothing about what this Region holds.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.ops_metadata_arn,
+        ) {
+            return Err(DeleteOpsMetadataErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteOpsMetadataErrorModeled::InternalServerError(
                 InternalServerError {

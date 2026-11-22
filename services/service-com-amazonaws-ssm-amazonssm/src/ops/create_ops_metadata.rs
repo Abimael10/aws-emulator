@@ -16,6 +16,13 @@
 //! ([`crate::state::ops_metadata::MAX_OPS_METADATA`]): a create past that ceiling is refused
 //! with `OpsMetadataLimitExceededException` and writes nothing.
 //!
+//! WHO MAY CALL IT is decided first, against the calling principal's identity-based IAM
+//! policies ([`crate::state::identity_authorization`]) and before anything the request names
+//! is resolved: the action is this operation's own and the resource is every OpsMetadata
+//! object of the Region ([`crate::state::ops_metadata::ops_metadata_resources`]), since the
+//! object's own ARN does not exist until this call mints it. A caller no readable document
+//! allows is refused `AccessDeniedException` and nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -88,6 +95,8 @@
 //!   objects. Delete one or more OpsMetadata object and try again.
 //! * `OpsMetadataTooManyUpdatesException` (HTTP 400) — The system is processing too many
 //!   concurrent updates. Wait a few moments and try again.
+//! * `AccessDeniedException` (HTTP 400, widened in from the service's own errors) — The
+//!   requester doesn't have permissions to perform the requested operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -107,9 +116,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `CreateOpsMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#CreateOpsMetadata")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it ("the
+// requester doesn't have permissions to perform the requested operation") and this
+// operation's own `errors` list omits it, so the refusal a caller holding no grant gets is
+// that shape rather than some other status — the way every other gated operation of this
+// crate answers it (`crate::ops::put_compliance_items`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#CreateOpsMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateOpsMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     OpsMetadataAlreadyExistsException(OpsMetadataAlreadyExistsException),
     OpsMetadataInvalidArgumentException(OpsMetadataInvalidArgumentException),
@@ -183,6 +201,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let region = crate::state::request_region(ctx.parts());
+
+        // The caller's own identity-based policies decide this call before anything it names
+        // is resolved, so a caller holding no grant is refused whatever the store holds and
+        // the refused create writes nothing. The resource is every OpsMetadata object of the
+        // Region: a create has no object's ARN to be decided about, since the ARN is what it
+        // mints.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &metadata::ops_metadata_resources(&region),
+        ) {
+            return Err(
+                CreateOpsMetadataErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateOpsMetadataErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the OpsMetadata store is unavailable".to_string()),
@@ -204,7 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let arn = metadata::ops_metadata_arn(&region, application);
         let now = ::std::time::SystemTime::now();
         // Who is writing this object, resolved from the credential the request was signed

@@ -19,6 +19,12 @@
 //! `NextToken` a page hands back is the metadata key the next one resumes at, so a resume is
 //! a key rather than an offset into a map that may have changed.
 //!
+//! WHO MAY CALL IT is decided first, against the calling principal's identity-based IAM
+//! policies ([`crate::state::identity_authorization`]) and before the ARN is resolved: the
+//! action is this operation's own and the resource is the object the request NAMES, so a
+//! caller no readable document allows is refused `AccessDeniedException` and learns nothing
+//! about whether that object exists.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,6 +90,8 @@
 //! * `OpsMetadataInvalidArgumentException` (HTTP 400) — One of the arguments passed is
 //!   invalid.
 //! * `OpsMetadataNotFoundException` (HTTP 400) — The OpsMetadata object doesn't exist.
+//! * `AccessDeniedException` (HTTP 400, widened in from the service's own errors) — The
+//!   requester doesn't have permissions to perform the requested operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -99,9 +107,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetOpsMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetOpsMetadata")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it ("the
+// requester doesn't have permissions to perform the requested operation") and this
+// operation's own `errors` list omits it, so the refusal a caller holding no grant gets is
+// that shape rather than some other status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetOpsMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetOpsMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     OpsMetadataInvalidArgumentException(OpsMetadataInvalidArgumentException),
     OpsMetadataNotFoundException(OpsMetadataNotFoundException),
@@ -173,6 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         };
+
+        // The caller's own identity-based policies decide this read before the ARN is
+        // resolved, about the object the request NAMED, so a caller holding no grant cannot
+        // learn from the refusal whether that object exists.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.ops_metadata_arn,
+        ) {
+            return Err(GetOpsMetadataErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetOpsMetadataError::from(GetOpsMetadataErrorModeled::InternalServerError(

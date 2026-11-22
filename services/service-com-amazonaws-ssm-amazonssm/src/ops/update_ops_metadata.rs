@@ -23,6 +23,12 @@
 //! A served update records the principal that made it and the instant it ran, which is what
 //! a listing reports as the object's last write.
 //!
+//! WHO MAY CALL IT is decided first, against the calling principal's identity-based IAM
+//! policies ([`crate::state::identity_authorization`]) and before the ARN is resolved: the
+//! action is this operation's own and the resource is the object the request NAMES, so a
+//! caller no readable document allows is refused `AccessDeniedException` and the object keeps
+//! the entries the last served write persisted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -90,6 +96,8 @@
 //! * `OpsMetadataNotFoundException` (HTTP 400) — The OpsMetadata object doesn't exist.
 //! * `OpsMetadataTooManyUpdatesException` (HTTP 400) — The system is processing too many
 //!   concurrent updates. Wait a few moments and try again.
+//! * `AccessDeniedException` (HTTP 400, widened in from the service's own errors) — The
+//!   requester doesn't have permissions to perform the requested operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -113,9 +121,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `UpdateOpsMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#UpdateOpsMetadata")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it ("the
+// requester doesn't have permissions to perform the requested operation") and this
+// operation's own `errors` list omits it, so the refusal a caller holding no grant gets is
+// that shape rather than some other status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#UpdateOpsMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateOpsMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     OpsMetadataInvalidArgumentException(OpsMetadataInvalidArgumentException),
     OpsMetadataKeyLimitExceededException(OpsMetadataKeyLimitExceededException),
@@ -211,6 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(message) = metadata::metadata_key_refusal(&clauses) {
             return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The caller's own identity-based policies decide this write before the ARN is
+        // resolved, about the object the request NAMED, so a refused update writes nothing and
+        // tells the caller nothing about what this Region holds.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.ops_metadata_arn,
+        ) {
+            return Err(UpdateOpsMetadataErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
