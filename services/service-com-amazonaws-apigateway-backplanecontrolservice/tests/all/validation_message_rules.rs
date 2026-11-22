@@ -12,7 +12,9 @@
 //! request is answered HTTP 400 `ValidationException` — the CONSTRAINT layer's own error
 //! class, not the operation's modelled `BadRequestException` — whose message names the
 //! offending value, the member's path ROOTED AT THE OPERATION'S INPUT SHAPE
-//! (`<operation>Input` in lowerCamel), and the constraint it failed — with a `@pattern`
+//! (`<operation>Input` in lowerCamel) when the member travels in the BODY and the member
+//! NAME ALONE when it is read out of the request URI (a path label or a query-string
+//! parameter), and the constraint it failed — with a `@pattern`
 //! emitted without the whole-value anchors the public model adds, and an enum value set
 //! listed in the order the service declares the enum in. The ONE member this service
 //! checks itself ahead of that layer (`CreateAuthorizer$type`) carries the operation's own
@@ -20,10 +22,11 @@
 //! the exception the last table below pins.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
-//! seven different operations (so the root is shown to be derived per operation, not a
+//! twelve different operations (so the root is shown to be derived per operation, not a
 //! constant), four constraint classes (an enum value set, a `@pattern`, an absent
-//! required member, several violations at once), both HTTP bindings a violated member
-//! can have (a body member and a URI label), and a nested member at two different list
+//! required member, several violations at once), all three HTTP bindings a violated member
+//! can have (a body member, a URI label and a query-string parameter), five enums whose
+//! value set the service lists in its own order, and a nested member at two different list
 //! positions.
 
 use serde_json::{json, Value};
@@ -95,6 +98,43 @@ const GATEWAY_RESPONSE_TYPE_VALUES: [&str; 21] = [
 /// The `AuthorizerType` value set, in the order the model declares it. Source:
 /// `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`.
 const AUTHORIZER_TYPE_VALUES: [&str; 3] = ["TOKEN", "REQUEST", "COGNITO_USER_POOLS"];
+
+/// The `IntegrationType` value set as API Gateway lists it. Source: the recorded refusal
+/// of an out-of-enum `type` on `PutIntegration`. (The public model declares the same five
+/// values in a different order: `smithy_query(query="shape",
+/// shape="com.amazonaws.apigateway#IntegrationType")` gives
+/// `[HTTP, AWS, MOCK, HTTP_PROXY, AWS_PROXY]`.)
+const INTEGRATION_TYPE_VALUES: [&str; 5] = ["HTTP", "MOCK", "AWS_PROXY", "HTTP_PROXY", "AWS"];
+
+/// The `ContentHandlingStrategy` value set as API Gateway lists it. Source: the recorded
+/// refusal of an out-of-enum `contentHandling` on `PutIntegrationResponse`. (The public
+/// model declares the two values the other way round: `smithy_query(query="shape",
+/// shape="com.amazonaws.apigateway#ContentHandlingStrategy")`.)
+const CONTENT_HANDLING_VALUES: [&str; 2] = ["CONVERT_TO_TEXT", "CONVERT_TO_BINARY"];
+
+/// The `PutMode` value set as API Gateway lists it. Source: the recorded refusal of an
+/// out-of-enum `mode` on `PutRestApi`. (The public model declares `[merge, overwrite]`:
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#PutMode")`.)
+const PUT_MODE_VALUES: [&str; 2] = ["overwrite", "merge"];
+
+/// The `DocumentationPartType` value set as API Gateway lists it. Source: the recorded
+/// refusal of an out-of-enum `location.type` on `CreateDocumentationPart`. (The public
+/// model declares the same twelve values in another order: `smithy_query(query="shape",
+/// shape="com.amazonaws.apigateway#DocumentationPartType")`.)
+const DOCUMENTATION_PART_TYPE_VALUES: [&str; 12] = [
+    "RESPONSE_BODY",
+    "RESPONSE",
+    "METHOD",
+    "MODEL",
+    "AUTHORIZER",
+    "RESPONSE_HEADER",
+    "RESOURCE",
+    "PATH_PARAMETER",
+    "REQUEST_BODY",
+    "QUERY_PARAMETER",
+    "API",
+    "REQUEST_HEADER",
+];
 
 /// The sentence `CreateAuthorizer` answers a `type` outside that value set with, written
 /// out here rather than read from the crate so a change of wording is caught rather than
@@ -241,8 +281,9 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
             )),
         ),
         (
-            // The SAME pattern on a member bound to the URI, not the body: where the
-            // member travels does not change how the refusal is stated.
+            // The SAME pattern on a member bound to the URI, not the body: such a member
+            // is read out of the URI one value at a time rather than out of the document
+            // the input shape describes, so the clause names it alone.
             "PutIntegrationResponse, a status code label outside its pattern".to_string(),
             "PUT",
             "/restapis/abcde12345/resources/fghij67890/methods/GET/integration/responses/abc"
@@ -250,20 +291,87 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
             Some(json!({})),
             one(&clause(
                 "abc",
-                "putIntegrationResponseInput.statusCode",
+                "statusCode",
                 &regular_expression(STATUS_CODE_PATTERN),
             )),
         ),
         (
-            // An enum value set on a member bound to the URI.
+            // An enum value set on another member bound to the URI.
             "PutGatewayResponse, a response type outside its enum".to_string(),
             "PUT",
             "/restapis/abcde12345/gatewayresponses/NOT_A_RESPONSE_TYPE".to_string(),
             Some(json!({ "statusCode": "404" })),
             one(&clause(
                 "NOT_A_RESPONSE_TYPE",
-                "putGatewayResponseInput.responseType",
+                "responseType",
                 &enum_value_set(&GATEWAY_RESPONSE_TYPE_VALUES),
+            )),
+        ),
+        (
+            // A `@pattern` on a URI LABEL of another operation: named alone, as the query
+            // member above is — both are read out of the request URI.
+            "PutMethodResponse, a status code label outside its pattern".to_string(),
+            "PUT",
+            "/restapis/abcde12345/resources/fghij67890/methods/GET/responses/not-a-status"
+                .to_string(),
+            Some(json!({})),
+            one(&clause(
+                "not-a-status",
+                "statusCode",
+                &regular_expression(STATUS_CODE_PATTERN),
+            )),
+        ),
+        (
+            // An enum value set whose order is the SERVICE's and not the model's, on a
+            // body member of a third operation.
+            "PutIntegration, a type outside its enum".to_string(),
+            "PUT",
+            "/restapis/abcde12345/resources/fghij67890/methods/GET/integration".to_string(),
+            Some(json!({ "type": "NOT_A_REAL_TYPE" })),
+            one(&clause(
+                "NOT_A_REAL_TYPE",
+                "putIntegrationInput.type",
+                &enum_value_set(&INTEGRATION_TYPE_VALUES),
+            )),
+        ),
+        (
+            "PutIntegrationResponse, a content handling outside its enum".to_string(),
+            "PUT",
+            "/restapis/abcde12345/resources/fghij67890/methods/GET/integration/responses/200"
+                .to_string(),
+            Some(json!({ "contentHandling": "NOT_A_REAL_CONTENT_HANDLING" })),
+            one(&clause(
+                "NOT_A_REAL_CONTENT_HANDLING",
+                "putIntegrationResponseInput.contentHandling",
+                &enum_value_set(&CONTENT_HANDLING_VALUES),
+            )),
+        ),
+        (
+            // The same, on a NESTED body member.
+            "CreateDocumentationPart, a location type outside its enum".to_string(),
+            "POST",
+            "/restapis/abcde12345/documentation/parts".to_string(),
+            Some(json!({
+                "location": { "type": "NOT_A_REAL_LOCATION_TYPE" },
+                "properties": "{}",
+            })),
+            one(&clause(
+                "NOT_A_REAL_LOCATION_TYPE",
+                "createDocumentationPartInput.location.type",
+                &enum_value_set(&DOCUMENTATION_PART_TYPE_VALUES),
+            )),
+        ),
+        (
+            // The same, on a member read out of the QUERY STRING: the service's own value
+            // order and the member named alone.
+            "PutRestApi, a mode outside its enum".to_string(),
+            "PUT",
+            "/restapis/abcde12345?mode=sideways".to_string(),
+            Some(json!({ "openapi": "3.0.1" })),
+            one(&clause(
+                "sideways",
+                "mode",
+                &enum_value_set(&PUT_MODE_VALUES),
             )),
         ),
         (
@@ -372,7 +480,8 @@ async fn a_member_this_service_checks_itself_is_refused_as_the_operations_own_ba
 #[tokio::test]
 async fn every_violation_of_one_request_is_stated_with_the_same_rooted_path() {
     // Two members of one request break their constraints at once: the envelope counts
-    // them and every clause carries the operation's root. The ORDER the walk reports
+    // them and each clause names its member the way that member travels — the body member
+    // from the operation's root, the URI label alone. The ORDER the walk reports
     // them in belongs to the framework, so the clauses are looked for rather than
     // sequenced.
     let gateway = Gateway::new();
@@ -401,7 +510,7 @@ async fn every_violation_of_one_request_is_stated_with_the_same_rooted_path() {
     for expected in [
         clause(
             "NOT_A_RESPONSE_TYPE",
-            "putGatewayResponseInput.responseType",
+            "responseType",
             &enum_value_set(&GATEWAY_RESPONSE_TYPE_VALUES),
         ),
         clause(

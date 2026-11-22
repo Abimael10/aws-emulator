@@ -494,7 +494,7 @@ async fn deleting_a_gateway_response_the_api_never_customized_is_refused_with_on
 #[tokio::test]
 async fn a_body_no_importer_can_read_is_refused_with_the_importers_own_sentence() {
     const UNREADABLE_PARTS: &str = "Unable to build importer with provided input.";
-    const INVALID_DEFINITION: &str = "Invalid OAS input";
+    const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "import-sentences").await;

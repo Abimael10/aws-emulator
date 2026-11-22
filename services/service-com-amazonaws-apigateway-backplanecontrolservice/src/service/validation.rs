@@ -15,17 +15,19 @@
 //!    request handling ahead of that layer, which earn the operation's class AND the one
 //!    sentence it words that refusal with; see [`VALIDATION_EXCEPTION`],
 //!    [`BAD_REQUEST_EXCEPTION`] and [`SELF_VALIDATED_MEMBERS`].
-//! 1. **The member path is rooted at the operation's input shape.** AWS's own model
-//!    names an operation's input `<Operation>Input`, and the clause names the member by
-//!    its path from that root in lowerCamel — `updateDocumentationVersionInput.
-//!    patchOperations.1.member.op`, `putGatewayResponseInput.statusCode` — so a client
-//!    can map the clause back to the operation AND the field. The framework's path
-//!    starts at the first input member, which names no operation. [`input_root`] is
-//!    that root; it is derived per operation, which the recordings prove by showing a
-//!    DIFFERENT root for the same member path on `UpdateRestApi`, `UpdateApiKey` and
-//!    `UpdateDocumentationVersion`. A member bound to the QUERY STRING is the exception:
-//!    it is named by its own member name alone, with no root at all — see
-//!    [`binds_to_query`].
+//! 1. **The member path is rooted at the operation's input shape when the member travels
+//!    in the BODY.** AWS's own model names an operation's input `<Operation>Input`, and
+//!    the clause names such a member by its path from that root in lowerCamel —
+//!    `updateDocumentationVersionInput.patchOperations.1.member.op`,
+//!    `putGatewayResponseInput.statusCode` — so a client can map the clause back to the
+//!    operation AND the field. The framework's path starts at the first input member,
+//!    which names no operation. [`input_root`] is that root; it is derived per operation,
+//!    which the recordings prove by showing a DIFFERENT root for the same member path on
+//!    `UpdateRestApi`, `UpdateApiKey` and `UpdateDocumentationVersion`. A member that
+//!    travels in the REQUEST URI — a path label or a query-string parameter — is the
+//!    exception: it is named by its own member name alone, with no root at all, because it
+//!    was never read out of the document the input shape describes; see
+//!    [`binds_to_the_uri`].
 //! 2. **A `@pattern` is emitted without the whole-value anchors.** The public Smithy
 //!    model writes AWS's implicit whole-value match as an explicit `^…$` pair
 //!    (`smithy_query(query="shape", shape="com.amazonaws.apigateway#StatusCode")` gives
@@ -103,7 +105,7 @@ const SELF_VALIDATED_MEMBERS: [(&str, &str, &str); 1] = [(
 /// request, and is recorded as such: a value set is rendered in the service's declared
 /// order, which for every other enum of this service is the order the public model
 /// preserves.
-const DECLARED_VALUE_SETS: [&[&str]; 5] = [
+const DECLARED_VALUE_SETS: [&[&str]; 7] = [
     &["add", "remove", "move", "test", "replace", "copy"],
     &["overwrite", "merge"],
     &["HTTP", "MOCK", "AWS_PROXY", "HTTP_PROXY", "AWS"],
@@ -123,6 +125,33 @@ const DECLARED_VALUE_SETS: [&[&str]; 5] = [
     // `apigateway__cloudformation.deploy-cfn-apigateway-restapi-invalid-apikeysourcetype-\
     // rejected`).
     &["AUTHORIZER", "HEADER"],
+    // `IntegrationResponse$contentHandling`'s shape,
+    // `com.amazonaws.apigateway#ContentHandlingStrategy`, which the public model declares
+    // `[CONVERT_TO_BINARY, CONVERT_TO_TEXT]` (`smithy_query(query="shape",
+    // shape="com.amazonaws.apigateway#ContentHandlingStrategy")`); the recorded refusal of
+    // an out-of-enum `contentHandling` on `PutIntegrationResponse` lists it as below.
+    &["CONVERT_TO_TEXT", "CONVERT_TO_BINARY"],
+    // `DocumentationPartLocation$type`'s shape,
+    // `com.amazonaws.apigateway#DocumentationPartType`, which the public model declares
+    // `[API, AUTHORIZER, MODEL, RESOURCE, METHOD, PATH_PARAMETER, QUERY_PARAMETER,
+    // REQUEST_HEADER, REQUEST_BODY, RESPONSE, RESPONSE_HEADER, RESPONSE_BODY]`
+    // (`smithy_query(query="shape",
+    // shape="com.amazonaws.apigateway#DocumentationPartType")`); the recorded refusal of an
+    // out-of-enum `location.type` on `CreateDocumentationPart` lists it as below.
+    &[
+        "RESPONSE_BODY",
+        "RESPONSE",
+        "METHOD",
+        "MODEL",
+        "AUTHORIZER",
+        "RESPONSE_HEADER",
+        "RESOURCE",
+        "PATH_PARAMETER",
+        "REQUEST_BODY",
+        "QUERY_PARAMETER",
+        "API",
+        "REQUEST_HEADER",
+    ],
 ];
 
 /// This service's wording for the violations the framework found on `operation`'s
@@ -130,7 +159,7 @@ const DECLARED_VALUE_SETS: [&[&str]; 5] = [
 ///
 /// `input_schema` is the operation's own input schema, which is what says how each
 /// violated member TRAVELS — the one request-shaped fact a clause of this service depends
-/// on (see [`binds_to_query`]).
+/// on (see [`binds_to_the_uri`]).
 ///
 /// `carried_lists` are the lists the request itself carried, keyed by the member path the
 /// walk reports a list at (`service_common::validation::submitted_lists`): a clause stated
@@ -227,7 +256,7 @@ fn stated_over_elements(
 /// `collection` is the path as the CLAUSE states it — rooted at the operation's input shape
 /// ([`input_root`]) — while the request's lists are keyed by the path the framework's walk
 /// reports, so the root is taken off again before the lookup. A member bound to the query
-/// string carries no root at all ([`binds_to_query`]), so the path is tried as it stands
+/// string carries no root at all ([`binds_to_the_uri`]), so the path is tried as it stands
 /// too.
 fn quoted_list(
     collection: &str,
@@ -271,11 +300,11 @@ fn input_root(operation: &str) -> String {
 }
 
 /// One violation as this service states it: the path rooted at the input shape — unless
-/// the member travels in the QUERY STRING, which is named on its own — the constraint
+/// the member travels in the REQUEST URI, which is named on its own — the constraint
 /// rendered the way the service renders it, the value as the framework echoed it (already
 /// elided to the framework's cap).
 fn as_stated(root: &str, input_schema: &'static Schema, violation: &Violation) -> Violation {
-    let path = if binds_to_query(input_schema, &violation.path) {
+    let path = if binds_to_the_uri(input_schema, &violation.path) {
         violation.path.clone()
     } else {
         format!("{root}.{}", violation.path)
@@ -288,17 +317,26 @@ fn as_stated(root: &str, input_schema: &'static Schema, violation: &Violation) -
     }
 }
 
-/// Whether `violation_path` names a member `input_schema` carries in the QUERY STRING.
+/// Whether `violation_path` names a member `input_schema` carries in the REQUEST URI — a
+/// path label or a query-string parameter.
 ///
-/// Read off the member's own `@httpQuery` binding, so the MODEL decides: the clause for
-/// such a member names it alone, while a member that travels in the body or in the URI
-/// path is named from the operation's input shape — the recorded refusal of
-/// `PutRestApi`'s `mode`, a `@httpQuery` member, names `mode`, where the recorded refusals
-/// of `PutGatewayResponse`'s `statusCode` (a body member) and `PutIntegrationResponse`'s
-/// (a `@httpLabel`) are both rooted. A nested path is placed by its FIRST segment, the
-/// top-level member the whole subtree hangs off, exactly as the shared front-door
-/// placement does it.
-fn binds_to_query(input_schema: &Schema, violation_path: &str) -> bool {
+/// Read off the member's own `@httpLabel`/`@httpQuery` binding, so the MODEL decides: such
+/// a member is read out of the URI one value at a time rather than out of the document the
+/// input shape describes, and the clause names it alone — the recorded refusal of
+/// `PutRestApi`'s `mode`, a `@httpQuery` member, names `mode`, and the recorded refusal of
+/// `PutMethodResponse`'s `statusCode`, a `@httpLabel`, names `statusCode` — while a member
+/// that travels in the BODY is named from the operation's input shape, as the recorded
+/// refusals of `PutGatewayResponse`'s `statusCode`, `PutIntegration`'s `type`,
+/// `PutIntegrationResponse`'s `contentHandling` and `CreateDocumentationPart`'s
+/// `location.type` are. A nested path is placed by its FIRST segment, the top-level member
+/// the whole subtree hangs off, exactly as the shared front-door placement does it.
+///
+/// An earlier revision of this check read `@httpQuery` alone and rooted every label,
+/// asserting that a recorded refusal rooted `PutIntegrationResponse`'s `statusCode` (a
+/// `@httpLabel`). That assertion was unfounded: no recording of this service states that
+/// clause, the only two label clauses the recordings do state name the member alone, and
+/// every rooted clause they state is a BODY member — which is the rule above.
+fn binds_to_the_uri(input_schema: &Schema, violation_path: &str) -> bool {
     // `split` always yields at least one item, so this is the whole path when it has no
     // `.` in it.
     let member_name = violation_path.split('.').next().unwrap_or_default();
@@ -306,7 +344,7 @@ fn binds_to_query(input_schema: &Schema, violation_path: &str) -> bool {
         member
             .member_name()
             .is_some_and(|name| path::member(name) == member_name)
-            && member.http_query().is_some()
+            && (member.http_query().is_some() || member.http_label().is_some())
     })
 }
 
@@ -514,6 +552,8 @@ mod tests {
     const PUT_MODE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[1];
     const INTEGRATION_TYPE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[2];
     const API_KEY_SOURCE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[4];
+    const CONTENT_HANDLING_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[5];
+    const DOCUMENTATION_PART_TYPE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[6];
 
     /// A value set is listed in the service's declared order: the recorded order for
     /// `Op`, for `PutMode`, for `IntegrationType` and for `ApiKeySourceType`, the model's own
@@ -521,7 +561,7 @@ mod tests {
     #[test]
     fn an_enum_value_set_is_listed_in_the_services_declared_order() {
         // (case, the set as the model declares it, the set as the service lists it)
-        let rows: [(&str, &[&str], &[&str]); 9] = [
+        let rows: [(&str, &[&str], &[&str]); 13] = [
             (
                 "Op, in the model's declaration order",
                 &["add", "remove", "replace", "move", "copy", "test"],
@@ -571,6 +611,44 @@ mod tests {
                 "IntegrationType, already in the service's order",
                 INTEGRATION_TYPE_VALUE_SET,
                 INTEGRATION_TYPE_VALUE_SET,
+            ),
+            // Source: `smithy_query(query="shape",
+            // shape="com.amazonaws.apigateway#ContentHandlingStrategy")` declares
+            // `[CONVERT_TO_BINARY, CONVERT_TO_TEXT]`.
+            (
+                "ContentHandlingStrategy, in the model's declaration order",
+                &["CONVERT_TO_BINARY", "CONVERT_TO_TEXT"],
+                CONTENT_HANDLING_VALUE_SET,
+            ),
+            (
+                "ContentHandlingStrategy, already in the service's order",
+                CONTENT_HANDLING_VALUE_SET,
+                CONTENT_HANDLING_VALUE_SET,
+            ),
+            // Source: `smithy_query(query="shape",
+            // shape="com.amazonaws.apigateway#DocumentationPartType")`.
+            (
+                "DocumentationPartType, in the model's declaration order",
+                &[
+                    "API",
+                    "AUTHORIZER",
+                    "MODEL",
+                    "RESOURCE",
+                    "METHOD",
+                    "PATH_PARAMETER",
+                    "QUERY_PARAMETER",
+                    "REQUEST_HEADER",
+                    "REQUEST_BODY",
+                    "RESPONSE",
+                    "RESPONSE_HEADER",
+                    "RESPONSE_BODY",
+                ],
+                DOCUMENTATION_PART_TYPE_VALUE_SET,
+            ),
+            (
+                "DocumentationPartType, already in the service's order",
+                DOCUMENTATION_PART_TYPE_VALUE_SET,
+                DOCUMENTATION_PART_TYPE_VALUE_SET,
             ),
         ];
 
@@ -801,9 +879,9 @@ mod tests {
     }
 
     /// A violated member is named from the operation's input shape unless it travels in
-    /// the QUERY STRING, which is named alone.
+    /// the REQUEST URI, which is named alone.
     #[test]
-    fn a_query_bound_member_is_named_without_the_input_shape_root() {
+    fn a_uri_bound_member_is_named_without_the_input_shape_root() {
         // (case, operation, the violated member's path, the clause's member path) — the
         // rows span the three ways a member of this service travels: the query string, the
         // URI path and the body, plus a nested path under each.
@@ -811,13 +889,13 @@ mod tests {
             // `PutRestApiRequest$mode` is `@httpQuery("mode")`
             // (`smithy_query(query="operation", operation="PutRestApi")`).
             ("a query member", "PutRestApi", "mode", "mode"),
-            // `restApiId` is the `@httpLabel` of the same operation, so one request can
-            // show both spellings at once.
+            // `restApiId` is the `@httpLabel` of the same operation: it travels in the URI
+            // too, so it is named alone as well.
             (
                 "a URI label of the same operation",
                 "PutRestApi",
                 "restApiId",
-                "putRestApiInput.restApiId",
+                "restApiId",
             ),
             (
                 "a body member",

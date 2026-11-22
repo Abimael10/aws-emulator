@@ -59,7 +59,7 @@ const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
 /// cannot be read as that format.
 ///
 /// Source: `crate::ops::put_rest_api::INVALID_DEFINITION`.
-const INVALID_DEFINITION: &str = "Invalid OAS input";
+const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The `message` an answer carries, or a panic naming the case.
 fn message(answer: &Answer, case: &str) -> String {

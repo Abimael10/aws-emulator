@@ -65,6 +65,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `BadRequestException` message for a request addressing the API's ROOT resource.
+///
+/// The root resource is created with its API and anchors the resource tree, so it is not a
+/// resource a caller may remove. API Gateway states it with ENTIRELY FIXED TEXT naming the
+/// resource class: the resource id the request carried is not echoed, and neither is the
+/// call that would remove it with the API.
+pub const ROOT_RESOURCE_NOT_DELETABLE: &str = "Root resource cannot be deleted";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,14 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.rest_api_id)
             .ok_or_else(crate::state::state_unavailable)?;
         // The root resource is created with its API and is the tree's anchor — every
-        // other resource's path hangs off it — so it goes only when the API goes.
+        // other resource's path hangs off it — so it goes only when the API goes. API
+        // Gateway states it with this fixed sentence, which names the resource class and
+        // nothing of the request.
         if input.resource_id == api.root_resource_id {
             return Err(DeleteResourceErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(
-                        "The root resource cannot be deleted; delete the RestApi instead"
-                            .to_string(),
-                    ),
+                    message: Some(ROOT_RESOURCE_NOT_DELETABLE.to_string()),
                 },
             )
             .into());

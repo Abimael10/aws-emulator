@@ -153,6 +153,55 @@ pub const HTTP_METHODS: &[&str] = &[
     "ANY", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT",
 ];
 
+/// The same catalog in the order API Gateway LISTS it in when it refuses a verb outside
+/// it, which is the order the developer guide publishes the verbs in rather than the
+/// alphabetical order [`HTTP_METHODS`] is written in.
+///
+/// Two spellings of ONE catalog: [`valid_http_methods_are_listed`] holds them to the same
+/// members, so a verb added to one is a verb of the other.
+const HTTP_METHODS_AS_LISTED: &[&str] = &[
+    "GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS", "HEAD", "ANY",
+];
+
+/// The `BadRequestException` message for a verb outside the catalog ([`HTTP_METHODS`]).
+///
+/// API Gateway's own sentence for it: ENTIRELY FIXED text — it states the member in the
+/// record's spelling (`HttpMethod`, as the sentence for an EMPTY one does, see
+/// [`super::put_integration::EMPTY_INTEGRATION_HTTP_METHOD`]) and then lists the catalog,
+/// comma-separated with no spaces, in [`HTTP_METHODS_AS_LISTED`]'s order. The submitted
+/// verb is NOT part of it: the caller has to pick one of the options, which the sentence
+/// names in full, and the request already carries the verb it sent.
+///
+/// `pub` because every call that reads a verb onto this catalog states the same refusal —
+/// the method a `PutMethod` creates and the integration whose own `httpMethod` is one of
+/// the same verbs — so the two cannot disagree about the sentence.
+pub fn invalid_http_method() -> String {
+    format!(
+        "Invalid HttpMethod specified. Valid options are {}",
+        HTTP_METHODS_AS_LISTED.join(",")
+    )
+}
+
+/// The envelope API Gateway states a MAPPING EXPRESSION it could not read in.
+///
+/// A mapping expression names what a request or a response carries over — a method request
+/// parameter, a method or gateway response header, an integration response's source — and
+/// one that is not of the documented form is refused with this one structured sentence,
+/// which carries the service's own validation finding about the expression: the fixed
+/// `Validation Result` frame with no warnings and the one error, inside which the offending
+/// expression appears again. BUILT FROM THE REQUEST: the only variable part is the
+/// expression the caller has to change, which the sentence states twice as AWS words it.
+///
+/// `pub` because every member of this service that carries a mapping expression is refused
+/// by it, whichever operation wrote it, so there is one wording for the class rather than
+/// one per member.
+pub fn invalid_mapping_expression(expression: &str) -> String {
+    format!(
+        "Invalid mapping expression specified: Validation Result: warnings : [], errors : \
+         [Invalid mapping expression specified: {expression}]"
+    )
+}
+
 /// The key a method is stored under, and the one an operation addressing a method by its
 /// `httpMethod` resolves it with: the verb EXACTLY as the request spelled it.
 ///
@@ -228,19 +277,13 @@ pub fn is_method_request_parameter(key: &str) -> bool {
 /// `method.request.{location}.{name}` mapping expression; see
 /// [`is_method_request_parameter`].
 ///
-/// API Gateway's own wording for it, as a recorded refusal reports: the sentence names the
-/// member class it could not read, and then states the service's own validation finding
-/// about the key — the envelope this service's recorded refusals carry around a finding
-/// about one submitted value (`crate::state::INVALID_MODEL_SCHEMA` is the same shape).
-/// BUILT FROM THE REQUEST: the only variable part is the key the caller has to change.
+/// One mapping expression the service could not read, stated in the envelope it states
+/// every such finding in ([`invalid_mapping_expression`]).
 ///
 /// `pub` because `UpdateMethod` writes the same member under the same rule, so the two
 /// operations cannot disagree on how a key outside the documented form is stated.
 pub fn invalid_request_parameter(key: &str) -> String {
-    format!(
-        "Invalid mapping expression specified: Validation Result: warnings : [], errors : \
-         [Invalid mapping expression specified: {key}]"
-    )
+    invalid_mapping_expression(key)
 }
 
 /// The `BadRequestException` message for a method whose `authorizationType` is authorized
@@ -420,11 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let verb = method_key(&input.http_method);
         if !HTTP_METHODS.contains(&verb.as_str()) {
             return Err(PutMethodErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "Invalid HTTP method specified: {}; expected one of {}",
-                    input.http_method,
-                    HTTP_METHODS.join(", ")
-                )),
+                message: Some(invalid_http_method()),
             })
             .into());
         }
@@ -530,5 +569,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             method_integration: body.method_integration,
             authorization_scopes: body.authorization_scopes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two spellings of the verb catalog hold the same verbs: the set a request is
+    /// checked against ([`HTTP_METHODS`]) and the list the refusal names
+    /// ([`HTTP_METHODS_AS_LISTED`]) are one catalog, so neither can gain a verb the other
+    /// does not have.
+    #[test]
+    fn valid_http_methods_are_listed() {
+        let mut checked: Vec<&str> = HTTP_METHODS.to_vec();
+        checked.sort_unstable();
+        let mut listed: Vec<&str> = HTTP_METHODS_AS_LISTED.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            checked, listed,
+            "case the verb catalog: expected the listed verbs {listed:?} to be the checked \
+             ones {checked:?}"
+        );
     }
 }

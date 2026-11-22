@@ -135,13 +135,13 @@ pub fn is_field_name_char(character: char) -> bool {
 /// The `BadRequestException` message for a `responseParameters` key that is not a
 /// `method.response.header.{name}` mapping expression; see [`is_method_response_header`].
 ///
+/// One mapping expression the service could not read, stated in the envelope it states
+/// every such finding in (`super::put_method::invalid_mapping_expression`).
+///
 /// `pub` because `UpdateMethodResponse` writes the same member under the same rule, so the
 /// two operations cannot disagree on how a key outside the documented form is stated.
 pub fn invalid_response_parameter(key: &str) -> String {
-    format!(
-        "Invalid mapping expression specified: {key}; a method response parameter must \
-         match {METHOD_RESPONSE_HEADER_PREFIX}{{name}}, where name is a valid header name"
-    )
+    super::put_method::invalid_mapping_expression(key)
 }
 
 /// Refuse a request whose caller-sized members would grow the store past a bound.

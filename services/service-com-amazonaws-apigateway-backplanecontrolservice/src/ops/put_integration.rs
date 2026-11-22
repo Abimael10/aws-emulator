@@ -400,6 +400,15 @@ pub fn accepted_timeout(requested: i32) -> Result<i32, String> {
 pub const EMPTY_INTEGRATION_HTTP_METHOD: &str =
     "Enumeration value for HttpMethod must be non-empty";
 
+/// The refusal for a standard HTTP integration whose `uri` is no HTTP(S) endpoint.
+///
+/// An integration of the HTTP family "takes a fully formed HTTP(S) URL" for the backend it
+/// forwards to (`Integration$uri`), so a URI that names no such endpoint — another scheme,
+/// or no scheme at all — configures a hop that could never be made. API Gateway states it
+/// with ENTIRELY FIXED TEXT about the member: the submitted URI is NOT echoed, and neither
+/// is the integration type.
+pub const INVALID_HTTP_ENDPOINT: &str = "Invalid HTTP endpoint specified for URI";
+
 /// The refusal for a private integration that names no VPC link: a fixed sentence saying
 /// what `connectionId` must be set to on that connection type, which quotes nothing of
 /// the request back.
@@ -574,10 +583,12 @@ pub fn validate_integration(
         }
         Some(verb) => {
             if !HTTP_METHODS.contains(&verb) {
-                return Err(format!(
-                    "Invalid integration HTTP method specified: {verb}; expected one of {}",
-                    HTTP_METHODS.join(", ")
-                ));
+                // The integration's own method is one of the SAME verbs a method is put
+                // under, read onto the same catalog: a value outside it earns the
+                // catalog's own sentence ([`super::put_method::invalid_http_method`]),
+                // the way an EMPTY one earns the enumeration's
+                // ([`EMPTY_INTEGRATION_HTTP_METHOD`]).
+                return Err(super::put_method::invalid_http_method());
             }
             // Which verb a Lambda integration is INVOKED through is the backend's own
             // requirement ("For Lambda integrations, you must set the integration method
@@ -620,10 +631,7 @@ pub fn validate_integration(
                 && !private
                 && !(uri.starts_with("http://") || uri.starts_with("https://"))
             {
-                return Err(format!(
-                    "Invalid integration URI specified: an integration of type {integration_type} \
-                     takes a fully formed HTTP(S) URL, got {uri}"
-                ));
+                return Err(INVALID_HTTP_ENDPOINT.to_string());
             }
         }
         None if is_mock => {}

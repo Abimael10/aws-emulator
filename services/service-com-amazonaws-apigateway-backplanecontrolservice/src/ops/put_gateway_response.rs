@@ -132,16 +132,12 @@ pub fn is_gateway_response_parameter(key: &str) -> bool {
 /// The `BadRequestException` message for a `responseParameters` key that is not a gateway
 /// response parameter mapping expression; see [`is_gateway_response_parameter`].
 ///
-/// Stated the way this service states the sibling mapping-expression refusal
-/// (`super::put_method_response::invalid_response_parameter`), so a key outside the
-/// documented form is refused in one wording whichever member carried it. `pub` because
-/// `UpdateGatewayResponse` refuses the same key by the same rule.
+/// One mapping expression the service could not read, stated in the envelope it states
+/// every such finding in (`super::put_method::invalid_mapping_expression`), so a key
+/// outside the documented form is refused in one wording whichever member carried it.
+/// `pub` because `UpdateGatewayResponse` refuses the same key by the same rule.
 pub fn invalid_response_parameter(key: &str) -> String {
-    format!(
-        "Invalid mapping expression specified: {key}; a gateway response parameter must \
-         match {}{{name}} or {}{{name}}, where name is a valid header name",
-        GATEWAY_RESPONSE_HEADER_PREFIXES[0], GATEWAY_RESPONSE_HEADER_PREFIXES[1]
-    )
+    super::put_method::invalid_mapping_expression(key)
 }
 
 /// Refuse a request whose caller-sized members would grow the store past a bound, or

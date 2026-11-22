@@ -52,9 +52,11 @@
 //! ## This service's edited seam: how a broken constraint is stated
 //!
 //! API Gateway names the offending member of a refused request by its path from the
-//! OPERATION's input shape — `updateDocumentationVersionInput.patchOperations.1.member.op`,
+//! OPERATION's input shape when that member travels in the BODY —
+//! `updateDocumentationVersionInput.patchOperations.1.member.op`,
 //! `putGatewayResponseInput.statusCode` — so the sentence identifies the operation as
-//! well as the field. The framework refuses every modelled constraint before a handler
+//! well as the field, while a member read out of the request URI is named alone. The
+//! framework refuses every modelled constraint before a handler
 //! runs and words that refusal through [`Service::override_refusal`], which is handed
 //! the violations ALONE — no operation, no request — so it cannot name the input shape
 //! the path hangs off, and the root is per operation (the recordings show the same

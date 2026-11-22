@@ -225,6 +225,13 @@ pub fn is_integration_response_mapping_value(value: &str) -> bool {
 /// The `BadRequestException` message for a `responseParameters` value that is none of the
 /// forms the member publishes; see [`is_integration_response_mapping_value`].
 ///
+/// The VALUE side of a response parameter mapping keeps its own sentence, naming the forms
+/// it admits: no recording of this service states a refusal of it, so the structured
+/// validation-result envelope the recordings DO state for the mapping expression a request
+/// names as the parameter (`super::put_method::invalid_mapping_expression`, used for this
+/// member's KEYS through [`invalid_response_parameter`]) is not claimed for this class
+/// until one does.
+///
 /// `pub` because `UpdateIntegrationResponse` writes the same member under the same rule, so
 /// the two operations cannot disagree on how a value outside the documented forms is
 /// stated.

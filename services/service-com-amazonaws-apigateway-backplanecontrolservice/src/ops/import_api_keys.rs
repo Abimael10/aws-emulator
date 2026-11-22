@@ -196,6 +196,23 @@ const VALUE_REQUIRED: &str = "API Key value is required";
 /// of the API key file format.
 const NAME_REQUIRED: &str = "API Key name is required";
 
+/// The `BadRequestException` message for a body that is not CONTENT of the format the
+/// request asked the import to read it as.
+///
+/// `ImportApiKeysRequest$format` names the format the payload is written in, and a body the
+/// reader for that format cannot read at all — bytes that are not text, a document with no
+/// header line, a header line the reader cannot parse — carries no keys to import. API
+/// Gateway states it with a fixed sentence closing on the format FROM THE REQUEST, which is
+/// the only variable part: what the caller has to fix is the content it sent for that
+/// format.
+///
+/// A document the reader DOES read keeps its own refusal instead: a header line declaring
+/// none of a required column is [`missing_required_column`], and a row this service could
+/// not carry over is that row's warning ([`skipped_record`]).
+fn invalid_import_content(format: &str) -> String {
+    format!("Invalid API Key import content specified for format: {format}")
+}
+
 /// The `BadRequestException` message for a header line that declares none of a column the
 /// API key file format requires.
 ///
@@ -395,24 +412,19 @@ fn imported_key(
 ///
 /// `Err` carries the message for a payload that is not an API key file at all: the caller
 /// has to fix it from this text alone.
-fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
+fn parse_import(body: &[u8], format: &str) -> Result<ImportedKeys, String> {
     if body.len() > MAX_IMPORT_BYTES {
         return Err(format!(
             "body may be at most {MAX_IMPORT_BYTES} bytes, got {}",
             body.len()
         ));
     }
-    let document = ::std::str::from_utf8(body).map_err(|_| {
-        "body must be a UTF-8 encoded CSV document carrying the API keys to import".to_string()
-    })?;
+    let document = ::std::str::from_utf8(body).map_err(|_| invalid_import_content(format))?;
     // A spreadsheet export prefixes the document with a byte order mark; it belongs to
     // the encoding, not to the name of the first column.
     let document = document.trim_start_matches('\u{feff}');
     if document.trim().is_empty() {
-        return Err(format!(
-            "body must carry the CSV header line declaring at least the {COLUMN_KEY} and \
-             {COLUMN_NAME} columns"
-        ));
+        return Err(invalid_import_content(format));
     }
     let mut reader = ::csv::ReaderBuilder::new()
         .has_headers(true)
@@ -423,9 +435,7 @@ fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
         .from_reader(document.as_bytes());
     let header = reader
         .headers()
-        .map_err(|_| {
-            "body could not be read as a CSV document: its header line is malformed".to_string()
-        })?
+        .map_err(|_| invalid_import_content(format))?
         .clone();
     let indices = column_indices(&header);
     for required in [COLUMN_KEY, COLUMN_NAME] {
@@ -573,7 +583,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The payload is read and bounded BEFORE the store lock is taken, so a malformed
         // or over-sized import never reaches the records at all.
-        let ImportedKeys { keys, mut warnings } = parse_import(&input.body).map_err(bad_request)?;
+        let ImportedKeys { keys, mut warnings } =
+            parse_import(&input.body, &input.format).map_err(bad_request)?;
 
         let now = crate::state::now();
         let mut store = state.lock();

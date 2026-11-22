@@ -332,7 +332,7 @@ pub struct ImportedPath {
 /// The emulator's own resource guards keep their own wording instead, because they are this
 /// emulator's bounds rather than anything the service publishes, and a caller has to be able
 /// to tell the two apart.
-pub const INVALID_DEFINITION: &str = "Invalid OAS input";
+pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The refusal for a document that PARSED and declares no OAS/Swagger version.
 ///
