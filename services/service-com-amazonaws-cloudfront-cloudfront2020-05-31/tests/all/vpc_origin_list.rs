@@ -106,7 +106,10 @@ fn create_body(seed: &Seed) -> String {
 }
 
 /// `GET /2020-05-31/vpc-origin` with the query string `query` (empty for none).
-async fn list_vpc_origins(router: &MultiServiceRouter, query: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite listing VPC origins calls this ROUTE rather than growing a
+/// second copy of it.
+pub(crate) async fn list_vpc_origins(router: &MultiServiceRouter, query: &str) -> Answer {
     let uri = if query.is_empty() {
         format!("/{API_VERSION}/vpc-origin")
     } else {
