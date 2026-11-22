@@ -51,6 +51,28 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .count()
     }
 
+    /// The memberships the group `(aws_account_id, namespace, group_name)` holds, ordered
+    /// by member name — the order `ListGroupMemberships` pages through.
+    pub fn group_members_in(
+        &self,
+        aws_account_id: &str,
+        namespace: &str,
+        group_name: &str,
+    ) -> Vec<&GroupMemberRecord> {
+        let mut members: Vec<&GroupMemberRecord> = self
+            .group_members
+            .iter()
+            .filter(|((account, member_namespace, member_group, _), _)| {
+                account == aws_account_id
+                    && member_namespace == namespace
+                    && member_group == group_name
+            })
+            .map(|(_, record)| record)
+            .collect();
+        members.sort_by(|left, right| left.member_name.cmp(&right.member_name));
+        members
+    }
+
     /// Removes the memberships the groups of `(aws_account_id, namespace)` hold,
     /// answering how many went.
     ///

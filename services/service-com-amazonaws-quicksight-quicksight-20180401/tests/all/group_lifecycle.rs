@@ -24,7 +24,9 @@
 //!
 //! The membership cases at the end of this suite are about a group's MEMBERS — the
 //! users it holds — which are reached through the group they belong to, so they are
-//! driven here beside the group they hang on. The role-membership cases after them are
+//! driven here beside the group they hang on; the listing cases after them read those
+//! same members back as the group's membership list, a page at a time. The
+//! role-membership cases after them are
 //! the other way round: a ROLE's members are groups, so they too are driven beside the
 //! group they name.
 
@@ -1257,6 +1259,401 @@ async fn a_new_membership_past_the_allowance_is_refused_and_a_held_one_still_ans
         held_memberships(&harness),
         qs_state::MAX_GROUP_MEMBERS,
         "the store must hold exactly the allowance's worth of memberships"
+    );
+}
+
+// --- A group's membership list ------------------------------------------------------
+//
+// The rule under test: a group's membership list reports exactly the memberships that
+// group holds — each as the name of the user it names and that user's own ARN — ordered
+// by member name and handed out a page of at most `MaxResults` at a time, with a
+// `NextToken` that resumes after the page just reported; it is a report on stored state,
+// so two reads of one group answer the same thing and neither changes what the store
+// holds. A name no group of the namespace is held under, and a namespace the account
+// does not hold, are not found rather than reported as a group holding no members.
+// So the rows below vary what the rule generalises over (how many members the group
+// holds, the form of their names and the order they were added in, the group's own name,
+// the namespace, the account, and the page size) rather than re-running one recorded
+// call.
+
+/// The address of one group's membership list:
+/// `.../namespaces/{Namespace}/groups/{GroupName}/members`.
+/// Source: smithy_query(query="operation", operation="ListGroupMemberships").
+fn group_members_path(account: &str, namespace: &str, group_name: &str) -> String {
+    format!(
+        "/accounts/{account}/namespaces/{namespace}/groups/{}/members",
+        group_label(group_name)
+    )
+}
+
+/// `ListGroupMemberships`: `GET` on that list, with `query` carrying the pagination
+/// parameters the model binds to the query string (`max-results`, `next-token`).
+async fn list_group_members(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    group_name: &str,
+    query: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "GET",
+            &format!(
+                "{}{query}",
+                group_members_path(account, namespace, group_name)
+            ),
+            None,
+        )
+        .await
+}
+
+/// The members one `ListGroupMemberships` response reported, as `(MemberName, Arn)` pairs
+/// in the order it reported them.
+fn reported_group_members(case: &str, body: &Value) -> Vec<(String, String)> {
+    body["GroupMemberList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: the response holds no GroupMemberList: {body}"))
+        .iter()
+        .map(|member| {
+            (
+                member["MemberName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                member["Arn"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The members `(account, namespace, members)` are expected to be reported as: one pair
+/// per member, each carrying the ARN of the user it names, in member-name order.
+fn expected_group_members(
+    account: &str,
+    namespace: &str,
+    members: &[&str],
+) -> Vec<(String, String)> {
+    let mut expected: Vec<(String, String)> = members
+        .iter()
+        .map(|member| {
+            (
+                (*member).to_string(),
+                member_arn(account, namespace, member),
+            )
+        })
+        .collect();
+    expected.sort();
+    expected
+}
+
+#[tokio::test]
+async fn a_group_reports_exactly_the_members_it_holds() {
+    let harness = Harness::new();
+    // A user QuickSight manages itself needs an account with an identity store of its
+    // own, so both accounts are signed up for one.
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    sign_up_for_quicksight_identities(&harness, OTHER_ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    // Rows: a group holding no members, one, and several added out of name order; names
+    // whose form differs (digits, a space, non-ASCII letters); a custom namespace; and
+    // the same group name in another account.
+    let rows: [(&str, &str, &str, &str, &[&str]); 5] = [
+        ("no-members", ACCOUNT, DEFAULT_NAMESPACE, "Empty Group", &[]),
+        (
+            "one-member",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Readers",
+            &["reader-1"],
+        ),
+        (
+            "several-added-out-of-name-order",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Analysts",
+            &["zoe", "adam", "Mikael"],
+        ),
+        (
+            "custom-namespace-and-names-of-other-forms",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Groupe Ventes",
+            &["café au lait", "Ärger", "bob jones"],
+        ),
+        (
+            "same-group-name-in-another-account",
+            OTHER_ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Analysts",
+            &["other-analyst"],
+        ),
+    ];
+
+    for (case, account, namespace, group_name, members) in rows {
+        given_group(&harness, case, account, namespace, group_name).await;
+        for member in members {
+            given_user(&harness, case, account, namespace, member).await;
+            let (status, body) =
+                add_group_member(&harness, account, namespace, group_name, member).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: adding {member:?} expected 200, got {status} with {body}"
+            );
+        }
+    }
+
+    let held_before = held_memberships(&harness);
+
+    for (case, account, namespace, group_name, members) in rows {
+        // Two reads of one group report the same list: a read answers from the stored
+        // memberships and changes nothing.
+        for attempt in ["first-read", "second-read"] {
+            let (status, body) =
+                list_group_members(&harness, account, namespace, group_name, "").await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{attempt}: listing the members expected 200, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                reported_group_members(case, &body),
+                expected_group_members(account, namespace, members),
+                "case {case:?}/{attempt}: the group must report exactly the members added \
+                 to it, each with the ARN of the user it names, in member-name order: \
+                 {body}"
+            );
+            assert_eq!(
+                body["NextToken"],
+                Value::Null,
+                "case {case:?}/{attempt}: a list that fits one page hands out no \
+                 NextToken: {body}"
+            );
+            assert!(
+                body["RequestId"]
+                    .as_str()
+                    .is_some_and(|request_id| !request_id.is_empty()),
+                "case {case:?}/{attempt}: the response must report a RequestId: {body}"
+            );
+        }
+    }
+
+    assert_eq!(
+        held_memberships(&harness),
+        held_before,
+        "reading a group's members must not change what the store holds"
+    );
+}
+
+#[tokio::test]
+async fn group_membership_pages_walk_every_member_exactly_once() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+
+    let group = "Paged Group";
+    // Seven members in one group, so a page size smaller than the list leaves a
+    // remainder.
+    let members: Vec<String> = (0..7).map(|n| format!("page-member-{n:02}")).collect();
+    given_group(&harness, "paging", ACCOUNT, DEFAULT_NAMESPACE, group).await;
+    for member in &members {
+        given_user(&harness, "paging", ACCOUNT, DEFAULT_NAMESPACE, member).await;
+        let (status, body) =
+            add_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, group, member).await;
+        assert_eq!(
+            status, 200,
+            "the fixture membership of {member:?} expected 200, got {status} with {body}"
+        );
+    }
+
+    // Rows: the unpaginated request, both published bounds of `MaxResults` (1..100) and
+    // sizes in between. Each must walk the seven members exactly once, in name order.
+    // Source: smithy_query(query="operation", operation="ListGroupMemberships").
+    for max_results in [None, Some(1), Some(2), Some(3), Some(7), Some(100)] {
+        let case = format!("max-results={max_results:?}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let query = match (max_results, token.as_deref()) {
+                (None, None) => String::new(),
+                (Some(max), None) => format!("?max-results={max}"),
+                (None, Some(next)) => format!("?next-token={next}"),
+                (Some(max), Some(next)) => format!("?max-results={max}&next-token={next}"),
+            };
+            let (status, body) =
+                list_group_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, group, &query).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: listing expected 200, got {status} with {body}"
+            );
+            let page = reported_group_members(&case, &body);
+            if let Some(max) = max_results {
+                assert!(
+                    page.len() <= usize::try_from(max).unwrap_or_default(),
+                    "case {case}: a page held {} members, more than MaxResults: {body}",
+                    page.len()
+                );
+            }
+            for (member_name, arn) in &page {
+                assert_eq!(
+                    *arn,
+                    member_arn(ACCOUNT, DEFAULT_NAMESPACE, member_name),
+                    "case {case}: every page reports the ARN of the user the member names: \
+                     {body}"
+                );
+                seen.push(member_name.clone());
+            }
+            pages += 1;
+            assert!(
+                pages <= members.len() + 1,
+                "case {case}: pagination did not terminate after {pages} pages"
+            );
+            match body["NextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, members,
+            "case {case}: paging must yield every member exactly once, in name order"
+        );
+    }
+
+    // A token this service did not issue names no position, so it is refused rather than
+    // read as "from the beginning": an opaque-looking token, one with this service's
+    // prefix but a body that is not hex, and an empty one.
+    for token in ["not-a-token", "qs1-zzzz", "qs1-abc", ""] {
+        let (status, body) = list_group_members(
+            &harness,
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            group,
+            &format!("?next-token={token}"),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {token:?}: an unreadable NextToken expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidNextTokenException"),
+            "case {token:?}: expected InvalidNextTokenException, got {body}"
+        );
+    }
+
+    // `MaxResults` is bounded at 1..100, so a page size one past either bound is refused
+    // before the handler runs.
+    // Source: smithy_query(query="operation", operation="ListGroupMemberships").
+    for max_results in ["0", "101"] {
+        let (status, body) = list_group_members(
+            &harness,
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            group,
+            &format!("?max-results={max_results}"),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {max_results:?}: a page size outside the bounds expected 400, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ValidationException"),
+            "case {max_results:?}: expected ValidationException, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_membership_list_needs_the_group_and_the_namespace_it_is_held_in() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    // One group that does hold a member, so every row below is about the address the call
+    // named rather than about an empty store.
+    given_group(&harness, "fixture", ACCOUNT, DEFAULT_NAMESPACE, "Members").await;
+    given_user(&harness, "fixture", ACCOUNT, DEFAULT_NAMESPACE, "member-1").await;
+    let (status, body) =
+        add_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Members", "member-1").await;
+    assert_eq!(
+        status, 200,
+        "the fixture membership expected 200, got {status} with {body}"
+    );
+
+    let rows = [
+        (
+            "a name no group of the namespace is held under",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "No Such Group",
+            "GROUP",
+            group_miss_message(ACCOUNT, DEFAULT_NAMESPACE, "No Such Group"),
+        ),
+        (
+            "a group held in another namespace only",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Members",
+            "GROUP",
+            group_miss_message(ACCOUNT, CUSTOM_NAMESPACE, "Members"),
+        ),
+        (
+            "a group held in another account only",
+            OTHER_ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Members",
+            "GROUP",
+            group_miss_message(OTHER_ACCOUNT, DEFAULT_NAMESPACE, "Members"),
+        ),
+        (
+            "a namespace the account does not hold",
+            ACCOUNT,
+            "no-such-namespace",
+            "Members",
+            "NAMESPACE",
+            "Namespace no-such-namespace not found".to_string(),
+        ),
+    ];
+
+    for (case, account, namespace, group_name, resource_type, message) in rows {
+        let (status, body) = list_group_members(&harness, account, namespace, group_name, "").await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a membership list is reported only where the group is held, so \
+             this expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!(resource_type),
+            "case {case:?}: the refusal must name the resource that is missing: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(message),
+            "case {case:?}: the refusal must report the address the call named: {body}"
+        );
+    }
+
+    // And the group that does hold a member still reports it.
+    let (status, body) =
+        list_group_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Members", "").await;
+    assert_eq!(
+        status, 200,
+        "the group that holds a member must stay readable, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_group_members("after-the-misses", &body),
+        expected_group_members(ACCOUNT, DEFAULT_NAMESPACE, &["member-1"]),
+        "the held membership must survive the refusals: {body}"
     );
 }
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupMemberships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupMemberships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupMemberships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the members one group holds — the memberships `CreateGroupMembership`
+//! persisted under that group — a page at a time, ordered by member name, and writes
+//! nothing: a membership list is a report on stored state.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupMemberships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupMembershipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupMemberships"))
+        // A report on stored state: nothing here writes to the store, and every part of
+        // the address it reads comes from the request's path labels and query string.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupMembershipsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        // A group lives in a namespace of the account, so a namespace the account does
+        // not hold holds no group whose members could be reported.
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
+            return Err(ListGroupMembershipsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::namespace_not_found_message(&input.namespace)),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The group whose members are listed has to exist: a membership is held inside
+        // one, so a name no group of the namespace is held under is a group that is not
+        // found rather than a group holding no members.
+        if store
+            .group(&input.aws_account_id, &input.namespace, &input.group_name)
+            .is_none()
+        {
+            return Err(ListGroupMembershipsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::group_not_found_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.group_name,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not issue names no position, so it is refused rather
+        // than read as "from the beginning".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListGroupMembershipsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The NextToken value isn't valid.".to_string()),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let members =
+            store.group_members_in(&input.aws_account_id, &input.namespace, &input.group_name);
+        let (page, next_token) = crate::state::page_of(
+            &members,
+            |record| record.member_name.as_str(),
+            resume_after.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListGroupMembershipsOutput {
+            // Each member is reported as the stored membership has it: the name of the
+            // user it names and the ARN that user carries, since a group's members are
+            // users.
+            group_member_list: Some(
+                page.into_iter()
+                    .map(crate::state::GroupMemberRecord::to_group_member)
+                    .collect(),
+            ),
+            next_token,
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the call's
+            // HTTP status.
+            status: 200,
+        })
     }
 }
