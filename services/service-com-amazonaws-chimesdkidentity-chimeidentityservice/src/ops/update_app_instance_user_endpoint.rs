@@ -165,13 +165,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // An endpoint exists only under an `AppInstanceUser`, and that ARN is the
+        // caller's own choice rather than anything this service minted, so it is
+        // resolved FIRST and reported absent exactly as every other user-keyed
+        // operation of this service reports it.
+        if state.user(&input.app_instance_user_arn).is_none() {
+            return Err(match state.unresolved_arn(&input.app_instance_user_arn) {
+                // The AppInstance this user hung off has been deleted, taking the user
+                // and its endpoints with it, so the request is one this caller may no
+                // longer make: the modelled permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    UpdateAppInstanceUserEndpointErrorModeled::ForbiddenException(
+                        ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                        },
+                    )
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that names no user this
+                // service holds is refused with the modelled `BadRequestException`
+                // carrying the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    UpdateAppInstanceUserEndpointErrorModeled::BadRequestException(
+                        BadRequestException {
+                            code: Some("NotFound".to_string()),
+                            message: Some(format!(
+                                "AppInstanceUser {} does not exist",
+                                input.app_instance_user_arn
+                            )),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+
         let Some(endpoint) =
             state.endpoint_mut(&input.app_instance_user_arn, &input.endpoint_id)
         else {
             // An `EndpointId` is minted by the service and opaque to the caller, so an
-            // endpoint this user does not hold — deregistered, or never registered — is
-            // nothing this caller may write to, and the refusal is the modelled
-            // permanent one rather than a report on whether it ever existed.
+            // endpoint this live user does not hold — deregistered, or never
+            // registered — is nothing this caller may write to, and the refusal is the
+            // modelled permanent one rather than a report on whether it ever existed.
             return Err(
                 UpdateAppInstanceUserEndpointErrorModeled::ForbiddenException(
                     ForbiddenException {

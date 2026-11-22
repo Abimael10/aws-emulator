@@ -19,7 +19,9 @@
 //! * an update writes the name and the opt-in and nothing else, and re-stamps the
 //!   endpoint's last-updated instant;
 //! * a deregister removes the endpoint, and every endpoint-keyed call addressed to an
-//!   endpoint the user does not hold is refused `ForbiddenException`;
+//!   endpoint a LIVE user does not hold is refused `ForbiddenException`, while one
+//!   addressed to a user ARN this service holds no user for earns the same unknown-ARN
+//!   refusal the user-keyed operations give for that ARN;
 //! * `ListAppInstanceUserEndpoints` reports the endpoints of the ONE user it was asked
 //!   about, in a stable key order, paged at `MaxResults`;
 //! * a register past the store's endpoint bound is refused `ResourceLimitExceededException`
@@ -50,6 +52,13 @@ const ENDPOINT_TYPES: [&str; 3] = ["APNS", "APNS_SANDBOX", "GCM"];
 /// caller may not act on, as the modelled `ForbiddenException` ("The client is
 /// permanently forbidden from making the request") carries it.
 const FORBIDDEN_MESSAGE: &str = "You are not allowed to make this request.";
+
+/// The sentence this service refuses a request with that names an `AppInstanceUser` ARN
+/// it holds no user for, as the modelled `BadRequestException` carrying the `NotFound`
+/// error code reports it.
+fn absent_user_message(user_arn: &str) -> String {
+    format!("AppInstanceUser {user_arn} does not exist")
+}
 
 /// One row of the member table: the case's label and the optional members a register
 /// carries (`Name`, `VoipDeviceToken`, `AllowMessages`).
@@ -760,7 +769,7 @@ async fn an_update_writes_only_the_name_and_the_opt_in() {
 }
 
 /// RULE: a deregister removes the endpoint, and every endpoint-keyed call addressed to
-/// an endpoint its user does not hold — deregistered, never registered, or registered
+/// an endpoint a LIVE user does not hold — deregistered, never registered, or registered
 /// under another user — is refused with the modelled `ForbiddenException`.
 #[tokio::test]
 async fn an_endpoint_is_reachable_only_while_its_user_holds_it() {
@@ -889,10 +898,14 @@ async fn an_endpoint_is_reachable_only_while_its_user_holds_it() {
     );
     let (status, answer) = describe_endpoint(&emulator, &owner, &doomed).await;
     assert_eq!(
-        (status, answer["Code"].as_str()),
-        (403, Some("Forbidden")),
-        "case \"the owning user was deleted\": expected the endpoint to be gone, got \
-         {status} {answer:?}"
+        (status, answer["Code"].as_str(), answer["Message"].as_str()),
+        (
+            400,
+            Some("NotFound"),
+            Some(absent_user_message(&owner).as_str())
+        ),
+        "case \"the owning user was deleted\": expected the endpoint to be gone and the \
+         user ARN reported absent, got {status} {answer:?}"
     );
 
     let survivor = endpoint_id(
@@ -1177,4 +1190,212 @@ async fn a_register_past_the_endpoint_bound_is_refused() {
         "expected the neighbouring user's endpoint to register and describe, got \
          {status} {described:?}"
     );
+}
+
+/// RULE: an endpoint-keyed call resolves the `AppInstanceUser` its path names BEFORE the
+/// endpoint id, so a user ARN this service holds no live user for earns the same
+/// unknown-ARN refusal every other user-keyed operation gives for that ARN — 400
+/// `BadRequestException` carrying `NotFound` and the absent-user sentence, or the modelled
+/// `ForbiddenException` when the ARN hangs off a deleted `AppInstance` — and the permanent
+/// 403 refusal covers only a service-minted `EndpointId` a LIVE user does not hold.
+#[tokio::test]
+async fn an_endpoint_keyed_call_resolves_its_user_before_the_endpoint_id() {
+    let emulator = Emulator::new();
+    let instance = emulator.app_instance("ep-user", "tok-ep-user").await;
+    let live = emulator.user(&instance, "live", "tok-ep-user-live").await;
+    let doomed_user = emulator.user(&instance, "doomed", "tok-ep-user-doomed").await;
+    let resource_arn = resolvable_pinpoint_arn(71);
+    let held = endpoint_id(
+        &emulator,
+        &live,
+        register_body("tok-ep-user-held", "GCM", &resource_arn, "device-token-user"),
+    )
+    .await;
+
+    // A user deleted on its own, under an `AppInstance` that is still alive: an ARN this
+    // service held once and holds no live user for now.
+    let (status, answer) = emulator
+        .call(
+            "DELETE",
+            &format!("/app-instance-users/{}", uri_encode(&doomed_user)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 204,
+        "expected DeleteAppInstanceUser to answer 204, got {status} {answer:?}"
+    );
+
+    // Rows: (label, the user ARN addressed) — every form of `AppInstanceUserArn` this
+    // service holds no live user for, each a well-formed `ChimeArn` so all three
+    // endpoint-keyed operations see a valid input (`UpdateAppInstanceUserEndpoint` and
+    // `DeregisterAppInstanceUserEndpoint` target `ChimeArn`:
+    // `smithy_query(query="operation",operation="UpdateAppInstanceUserEndpoint")`).
+    let absent_users: Vec<(&str, String)> = vec![
+        ("a live user's ARN with a suffix", format!("{live}x")),
+        (
+            "an unknown user id under a live app instance",
+            format!("{instance}/user/nobody"),
+        ),
+        (
+            "a user under an app instance that never existed",
+            format!("{instance}x/user/{}", "ghost"),
+        ),
+        ("a user deleted on its own", doomed_user.clone()),
+        (
+            "an ARN in another partition",
+            "arn:aws-cn:chime:cn-north-1:123456789012:app-instance/00000000-0000-4000-8000-\
+             000000000001/user/elsewhere"
+                .to_string(),
+        ),
+    ];
+    // The endpoint id is immaterial to the answer: one a live user does hold, one nobody
+    // registered, and the shortest and longest ids the modelled `String64` admits.
+    let long_id = "e".repeat(64);
+    let endpoint_ids: Vec<(&str, &str)> = vec![
+        ("an id another user holds", held.as_str()),
+        ("an id nobody registered", "00000000-0000-4000-8000-000000000000"),
+        ("a one-character id", "e"),
+        ("an id at the modelled maximum", long_id.as_str()),
+    ];
+
+    for (index, (user_label, user_arn)) in absent_users.iter().enumerate() {
+        let expected = (
+            400u16,
+            Some("NotFound"),
+            Some(absent_user_message(user_arn)),
+        );
+        for (id_label, endpoint) in &endpoint_ids {
+            let case = format!("{user_label} / {id_label}");
+            let (status, answer) = describe_endpoint(&emulator, user_arn, endpoint).await;
+            assert_eq!(
+                (
+                    status,
+                    answer["Code"].as_str(),
+                    answer["Message"].as_str().map(str::to_string)
+                ),
+                expected,
+                "case {case:?}/Describe: expected the unknown-ARN refusal, got \
+                 {status} {answer:?}"
+            );
+            let (status, answer) =
+                update_endpoint(&emulator, user_arn, endpoint, json!({ "Name": "ghost" })).await;
+            assert_eq!(
+                (
+                    status,
+                    answer["Code"].as_str(),
+                    answer["Message"].as_str().map(str::to_string)
+                ),
+                expected,
+                "case {case:?}/Update: expected the unknown-ARN refusal, got \
+                 {status} {answer:?}"
+            );
+            let (status, answer) = deregister_endpoint(&emulator, user_arn, endpoint).await;
+            assert_eq!(
+                (
+                    status,
+                    answer["Code"].as_str(),
+                    answer["Message"].as_str().map(str::to_string)
+                ),
+                expected,
+                "case {case:?}/Deregister: expected the unknown-ARN refusal, got \
+                 {status} {answer:?}"
+            );
+        }
+
+        // The two sibling operations on the SAME route answer the same way for the same
+        // ARN, which is the consistency the rule is about.
+        let (status, answer) = list_endpoints(&emulator, user_arn, "").await;
+        assert_eq!(
+            (
+                status,
+                answer["Code"].as_str(),
+                answer["Message"].as_str().map(str::to_string)
+            ),
+            expected,
+            "case {user_label:?}/List: expected the unknown-ARN refusal, got \
+             {status} {answer:?}"
+        );
+        let (status, answer) = register(
+            &emulator,
+            user_arn,
+            register_body(
+                &format!("tok-ep-user-absent-{index}"),
+                "APNS",
+                &resource_arn,
+                "device-token-absent",
+            ),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                answer["Code"].as_str(),
+                answer["Message"].as_str().map(str::to_string)
+            ),
+            expected,
+            "case {user_label:?}/Register: expected the unknown-ARN refusal, got \
+             {status} {answer:?}"
+        );
+    }
+
+    // The control: under a LIVE user the endpoint-id miss keeps the modelled permanent
+    // refusal, and the endpoint the live user does hold is still served.
+    for (id_label, endpoint) in &endpoint_ids[1..] {
+        let (status, answer) = describe_endpoint(&emulator, &live, endpoint).await;
+        assert_eq!(
+            (status, answer["Code"].as_str(), answer["Message"].as_str()),
+            (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+            "case {id_label:?} under a live user: expected the modelled forbidden refusal, \
+             got {status} {answer:?}"
+        );
+    }
+    let (status, described) = describe_endpoint(&emulator, &live, &held).await;
+    assert_eq!(
+        (
+            status,
+            described["AppInstanceUserEndpoint"]["EndpointId"].as_str()
+        ),
+        (200, Some(held.as_str())),
+        "expected the live user's endpoint to stay readable, got {status} {described:?}"
+    );
+
+    // And a user ARN whose own `AppInstance` was deleted keeps the modelled permanent
+    // refusal: the unknown-ARN refusal is for an ARN no delete of this service accounts
+    // for.
+    let (status, answer) = emulator
+        .call(
+            "DELETE",
+            &format!("/app-instances/{}", uri_encode(&instance)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 204,
+        "expected DeleteAppInstance to answer 204, got {status} {answer:?}"
+    );
+    for (id_label, endpoint) in &endpoint_ids {
+        let (status, answer) = describe_endpoint(&emulator, &live, endpoint).await;
+        assert_eq!(
+            (status, answer["Code"].as_str(), answer["Message"].as_str()),
+            (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+            "case {id_label:?} under a deleted app instance: expected the modelled \
+             forbidden refusal, got {status} {answer:?}"
+        );
+        let (status, answer) =
+            update_endpoint(&emulator, &live, endpoint, json!({ "Name": "ghost" })).await;
+        assert_eq!(
+            (status, answer["Code"].as_str(), answer["Message"].as_str()),
+            (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+            "case {id_label:?} under a deleted app instance/Update: expected the modelled \
+             forbidden refusal, got {status} {answer:?}"
+        );
+        let (status, answer) = deregister_endpoint(&emulator, &live, endpoint).await;
+        assert_eq!(
+            (status, answer["Code"].as_str(), answer["Message"].as_str()),
+            (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+            "case {id_label:?} under a deleted app instance/Deregister: expected the \
+             modelled forbidden refusal, got {status} {answer:?}"
+        );
+    }
 }
