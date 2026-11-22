@@ -37,6 +37,12 @@
 //! launch lost AFTER a rollout reached its steady state is not that rollout's failure, since
 //! the breaker is what decides a service that fails to reach one.
 //!
+//! The last test drives the same rule from the other REASON a launch can fail: a rollout moved
+//! onto an image reference that names no release of an image this emulator holds — spelled
+//! through each registry that image is published under — is one whose every launch the
+//! registry refuses, so the breaker fails it and the rollback takes the service back to the
+//! release that completed, with the tasks it lost stopped as tasks that never started.
+//!
 //! Every launch is decided by the placement it was made into, as
 //! [`crate::image_pull_placement`] pins: the services below run in a subnet with no route
 //! off its VPC and the three endpoints Amazon ECR publishes, so the FIRST revision's image
@@ -684,6 +690,318 @@ async fn the_deployment_circuit_breaker_takes_a_failing_rollout_to_a_terminal_st
             }
         }
     }
+}
+
+/// A subnet of a VPC whose route table sends `0.0.0.0/0` to an attached internet gateway —
+/// the placement a task given a public address reaches a PUBLIC registry from, so what decides
+/// its launch is the registry's own answer about the image rather than the path to it.
+///
+/// Created through Amazon EC2's own API, like every other placement in this suite.
+async fn routed_placement(router: &MultiServiceRouter) -> String {
+    let case = "routed network";
+    let vpc = ec2_element(
+        &ec2(router, "CreateVpc", &[("CidrBlock", "10.99.0.0/16")], case).await,
+        "vpcId",
+        case,
+    );
+    let subnet = ec2_element(
+        &ec2(
+            router,
+            "CreateSubnet",
+            &[
+                ("VpcId", &vpc),
+                ("CidrBlock", "10.99.0.0/20"),
+                ("AvailabilityZone", &format!("{SIGNED_REGION}a")),
+            ],
+            case,
+        )
+        .await,
+        "subnetId",
+        case,
+    );
+    let gateway = ec2_element(
+        &ec2(router, "CreateInternetGateway", &[], case).await,
+        "internetGatewayId",
+        case,
+    );
+    ec2(
+        router,
+        "AttachInternetGateway",
+        &[("InternetGatewayId", &gateway), ("VpcId", &vpc)],
+        case,
+    )
+    .await;
+    let table = ec2_element(
+        &ec2(router, "CreateRouteTable", &[("VpcId", &vpc)], case).await,
+        "routeTableId",
+        case,
+    );
+    ec2(
+        router,
+        "AssociateRouteTable",
+        &[("RouteTableId", &table), ("SubnetId", &subnet)],
+        case,
+    )
+    .await;
+    ec2(
+        router,
+        "CreateRoute",
+        &[
+            ("RouteTableId", &table),
+            ("DestinationCidrBlock", "0.0.0.0/0"),
+            ("GatewayId", &gateway),
+        ],
+        case,
+    )
+    .await;
+    subnet
+}
+
+/// Register one Fargate `awsvpc` revision of `family` running `image`, and answer its ARN —
+/// [`register`] for a family of this row's own, so two rows never share a revision.
+async fn register_family(
+    router: &MultiServiceRouter,
+    family: &str,
+    image: &str,
+    case: &str,
+) -> String {
+    let body = ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "requiresCompatibilities": ["FARGATE"],
+            "executionRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecs-execution"),
+            "containerDefinitions": [container("app", image)],
+        }),
+        case,
+    )
+    .await;
+    string(&body["taskDefinition"], "taskDefinitionArn", case)
+}
+
+/// One row of the table below: a service whose rollout moves it onto an image reference that
+/// names no release of an image this emulator holds, spelled through one of the registries
+/// that image is published under.
+struct TagRow {
+    case: &'static str,
+    service: &'static str,
+    family: &'static str,
+    /// The reference the service is created on, which names a release that image publishes.
+    released: &'static str,
+    /// The reference the rollout moves it onto, which names a tag that publishes none.
+    unreleased: &'static str,
+}
+
+/// The rows, differing along the registry spelling of the SAME held image — the gallery's
+/// mirror of it, the repository that mirror carries it from, and that repository under the
+/// registry's own namespace and host — and along which of the held images they name.
+fn tag_rows() -> Vec<TagRow> {
+    vec![
+        TagRow {
+            case: "the gallery's mirror of a held image",
+            service: "galleryspelling",
+            family: "galleryapp",
+            released: "public.ecr.aws/docker/library/busybox:1.36",
+            unreleased: "public.ecr.aws/docker/library/busybox:no-such-release",
+        },
+        TagRow {
+            case: "the repository that mirror carries the image from",
+            service: "mirroredspelling",
+            family: "mirroredapp",
+            released: "busybox:1.36",
+            unreleased: "busybox:no-such-release",
+        },
+        TagRow {
+            case: "that repository under the registry's namespace and host",
+            service: "namespacedspelling",
+            family: "namespacedapp",
+            released: "registry-1.docker.io/library/nginx:1.27",
+            unreleased: "registry-1.docker.io/library/nginx:no-such-release",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_rollout_onto_an_image_tag_that_names_no_release_is_failed_and_rolled_back() {
+    let router = emulator_with_ec2();
+    create_cluster(&router, CLUSTER, "tags").await;
+    let subnet = routed_placement(&router).await;
+    let rows = tag_rows();
+
+    // Each service is created on the reference that names a RELEASE of its image, so each has
+    // a rollout that completed successfully — the one its rollback puts back.
+    let mut released = Vec::new();
+    let mut unreleased = Vec::new();
+    for row in &rows {
+        let release = register_family(&router, row.family, row.released, row.case).await;
+        unreleased.push(register_family(&router, row.family, row.unreleased, row.case).await);
+        ok(
+            &router,
+            "CreateService",
+            json!({
+                "cluster": CLUSTER,
+                "serviceName": row.service,
+                "taskDefinition": release,
+                "desiredCount": 1,
+                "launchType": "FARGATE",
+                "deploymentController": { "type": "ECS" },
+                "deploymentConfiguration": {
+                    "deploymentCircuitBreaker": { "enable": true, "rollback": true },
+                },
+                "networkConfiguration": {
+                    "awsvpcConfiguration": {
+                        "subnets": [subnet],
+                        "securityGroups": ["sg-0123456789abcdef0"],
+                        "assignPublicIp": "ENABLED",
+                    }
+                },
+            }),
+            row.case,
+        )
+        .await;
+        released.push(release);
+    }
+    for row in &rows {
+        poll_until(
+            &router,
+            row.service,
+            row.case,
+            "the rollout of the released image to complete with its task running",
+            |service| {
+                string(&primary(service, "released"), "rolloutState", "released") == COMPLETED
+                    && count(service, "runningCount", "released") == 1
+            },
+        )
+        .await;
+    }
+
+    // The rollout onto the tag that names NO release: every launch it makes is refused by the
+    // registry that holds the image, so the rollout loses every task it places.
+    let mut rollouts = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let body = ok(
+            &router,
+            "UpdateService",
+            json!({
+                "cluster": CLUSTER,
+                "service": row.service,
+                "taskDefinition": unreleased[index],
+            }),
+            row.case,
+        )
+        .await;
+        rollouts.push(string(&body["service"], "currentServiceDeployment", row.case));
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let put_back = released[index].clone();
+        let service = poll_until(
+            &router,
+            row.service,
+            case,
+            "the breaker to fail the rollout and take the service back to the release that \
+             completed",
+            move |service| {
+                let deployment = primary(service, "rolled back");
+                string(service, "taskDefinition", "rolled back") == put_back
+                    && string(&deployment, "rolloutState", "rolled back") == COMPLETED
+                    && count(service, "runningCount", "rolled back") == 1
+            },
+        )
+        .await;
+        let deployment = primary(&service, case);
+        assert_eq!(
+            string(&deployment, "taskDefinition", case),
+            released[index],
+            "case {case:?}: expected the PRIMARY deployment to run the release that completed, \
+             got {deployment}"
+        );
+        assert_eq!(
+            count(&deployment, "runningCount", case),
+            1,
+            "case {case:?}: expected the rolled-back deployment to hold the task the service \
+             wants, got {deployment}"
+        );
+        // The rollout the breaker failed, as a resource of its own: it ends rolled back, under
+        // the breaker that watched it.
+        let record = describe_deployment(&router, &rollouts[index], case).await;
+        assert_eq!(
+            string(&record, "status", case),
+            "ROLLBACK_SUCCESSFUL",
+            "case {case:?}: expected the failed rollout to end rolled back, got {record}"
+        );
+        assert_eq!(
+            string(&record, "statusReason", case),
+            ROLLED_BACK_REASON,
+            "case {case:?}: expected the status reason to report the rollback the breaker \
+             made, got {record}"
+        );
+        assert_eq!(
+            string(&record["deploymentCircuitBreaker"], "status", case),
+            "TRIGGERED",
+            "case {case:?}: expected the breaker to report that it fired, got {record}"
+        );
+        // The tasks that rollout placed are the launches it LOST: each is stopped with the
+        // stop code of a task Amazon ECS could not start, carrying the runtime's account of a
+        // reference that resolves to nothing.
+        let stopped = stopped_tasks(&router, case).await;
+        let failed: Vec<&Value> = stopped
+            .iter()
+            .filter(|task| {
+                string(task, "taskDefinitionArn", case) == unreleased[index]
+            })
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "case {case:?}: expected the rollout's tasks to be stopped, got {stopped:?}"
+        );
+        for task in failed {
+            assert_eq!(
+                string(task, "stopCode", case),
+                "TaskFailedToStart",
+                "case {case:?}: expected a task that never started, got {task}"
+            );
+            let reason = string(task, "stoppedReason", case);
+            assert!(
+                reason.contains("CannotPullContainerError") && reason.contains("not found"),
+                "case {case:?}: expected the runtime's account of a reference that resolves to \
+                 nothing, got {reason:?}"
+            );
+            assert!(
+                reason.contains(row.unreleased),
+                "case {case:?}: expected the reason to name {}, got {reason:?}",
+                row.unreleased
+            );
+        }
+    }
+}
+
+/// Every STOPPED task of the cluster, read back through `ListTasks` and `DescribeTasks`.
+async fn stopped_tasks(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    let listed = ok(
+        router,
+        "ListTasks",
+        json!({ "cluster": CLUSTER, "desiredStatus": "STOPPED" }),
+        case,
+    )
+    .await;
+    let arns: Vec<Value> = list(&listed, "taskArns", case);
+    if arns.is_empty() {
+        return Vec::new();
+    }
+    let described = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": CLUSTER, "tasks": arns }),
+        case,
+    )
+    .await;
+    list(&described, "tasks", case)
 }
 
 #[tokio::test]

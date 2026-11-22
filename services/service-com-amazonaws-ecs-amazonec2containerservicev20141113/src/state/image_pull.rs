@@ -53,13 +53,20 @@
 //!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]),
 //!      or a repository that gallery publishes ITSELF whose image this emulator holds, which
 //!      the releases it publishes decide
-//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images`]).
+//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images`]);
+//!    * the repository one of those held images is MIRRORED FROM, which a reference names
+//!      with or without that registry's own namespace and which a container runtime resolves
+//!      a reference naming no registry at all against ([`DOCKER_HUB_REGISTRY`]) — the same
+//!      image, so the same releases decide it
+//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images::official_image`]):
+//!      a tag that names a release of it is fetched, and a tag it publishes no release under
+//!      resolves to no image whichever of the two spellings the reference carries.
 //!
 //!    Either way the registry that holds the image is the one that answers, and the manifest
 //!    digest it resolved is what the container reports for the image it ran
 //!    (`Container$imageDigest`). A reference naming any OTHER registry — an alias that
 //!    gallery was not assigned, which names another public registry, another registry
-//!    altogether, or a bare name a container runtime resolves against Docker Hub — is no
+//!    altogether, or a repository of the mirrored registry no image is held of — is no
 //!    registry's here to answer, so nothing beyond the path above is decided for it and no
 //!    digest is known for it.
 //!
@@ -324,6 +331,35 @@ pub fn registry_host(image: &str) -> &str {
         }
         _ => DOCKER_HUB_REGISTRY,
     }
+}
+
+/// The hosts that address the registry the gallery's mirrored images are carried FROM:
+/// [`DOCKER_HUB_REGISTRY`] itself, the name a reference usually spells it by, and the index
+/// host — all one registry, which is also the registry a reference naming no host at all is
+/// resolved against.
+const MIRRORED_REGISTRY_HOSTS: [&str; 3] = ["docker.io", "index.docker.io", DOCKER_HUB_REGISTRY];
+
+/// The `(repository path, tag)` of `image` for a reference into that mirrored registry, and
+/// `None` for a reference naming any other registry or naming no release.
+///
+/// The path is what follows the host, which the registry reads as its own namespaces, so it
+/// is handed on exactly as written for that registry's catalogue to decide
+/// ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images::official_image`]).
+/// A reference that addresses a DIGEST names content rather than a release, so the releases a
+/// repository publishes state nothing about it and it is not answered here.
+fn mirrored_image_reference(image: &str) -> Option<(String, String)> {
+    let path = match image.split_once('/') {
+        Some((host, rest)) if MIRRORED_REGISTRY_HOSTS.contains(&host) => rest,
+        // A reference whose first segment is not one of those hosts is this registry's only
+        // when it names no host at all ([`registry_host`]).
+        _ if registry_host(image) == DOCKER_HUB_REGISTRY => image,
+        _ => return None,
+    };
+    if path.contains('@') {
+        return None;
+    }
+    let (repository_path, image_tag) = path.rsplit_once(':')?;
+    Some((repository_path.to_string(), image_tag.to_string()))
 }
 
 /// Attempt the image fetch of every task that has just been launched, and record what it
@@ -674,7 +710,18 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     // the registry the reference names, and an alias this gallery was not given names a
     // registry this emulator does not hold.
     let Some(reference) = gallery_pull::parse_gallery_reference(image) else {
-        return ImageFetch::Undecided;
+        // The repository one of the gallery's MIRRORED images is carried from is the same
+        // repository under another registry's spelling, so the releases this emulator holds
+        // of that image decide a reference through it too ([`mirrored_image_reference`]).
+        return match mirrored_image_reference(image)
+            .and_then(|(path, tag)| published_images::official_image(&path, &tag))
+        {
+            Some(published_images::PublishedImage::Published) => ImageFetch::Served(None),
+            Some(published_images::PublishedImage::NotPublished) => {
+                ImageFetch::Refused(image_not_found_message(image))
+            }
+            None => ImageFetch::Undecided,
+        };
     };
     if gallery_pull::serves_registry_alias(engine, &reference.registry_alias) {
         return match gallery_pull::serve_pull(engine, &reference) {

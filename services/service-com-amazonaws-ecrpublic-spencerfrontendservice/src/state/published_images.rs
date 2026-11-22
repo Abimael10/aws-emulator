@@ -35,6 +35,13 @@
 //! hash rather than a release the repository published, so the tags a repository publishes
 //! state nothing about it.
 //!
+//! The same entries answer the OTHER spelling of the very same repository. The `docker` alias
+//! is a MIRROR, so each of these images has a repository on the registry it is mirrored from,
+//! which a reference may name with or without that registry's `library` namespace
+//! ([`official_image`]); a mirror carries the releases of the repository it mirrors, so the
+//! releases held here decide a reference through either registry rather than only the one
+//! whose alias it spells.
+//!
 //! A READ: deciding a pull consults these entries and writes nothing, so a container start
 //! cannot change what a later caller reads back.
 
@@ -135,6 +142,12 @@ pub const PUBLISHED_REPOSITORIES: &[PublishedRepository] = &[
 /// the registry every entry above belongs to.
 const DOCKER_OFFICIAL_IMAGES_ALIAS: &str = "docker";
 
+/// The namespace a Docker Official Image's own repository carries on the registry the gallery
+/// mirrors it from: "Docker Official Images" live under `library`, which is why the gallery
+/// spells each of them `library/<name>` under its [`DOCKER_OFFICIAL_IMAGES_ALIAS`] and why a
+/// reference that names the bare `<name>` addresses the same repository.
+const OFFICIAL_IMAGES_NAMESPACE: &str = "library";
+
 /// What this catalogue says about one reference into a repository it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedImage {
@@ -166,6 +179,41 @@ pub fn published_image(reference: &GalleryReference) -> Option<PublishedImage> {
     let published = published_repository(&reference.registry_alias, &reference.repository_name)?;
     let tag = reference.image_tag.as_deref()?;
     Some(if published.image_tags.contains(&tag) {
+        PublishedImage::Published
+    } else {
+        PublishedImage::NotPublished
+    })
+}
+
+/// Whether the same catalogue publishes the image a reference into the registry the gallery
+/// MIRRORS those images from names: `repository_path` as that registry spells it (the bare
+/// `<name>` of a Docker Official Image, or its full [`OFFICIAL_IMAGES_NAMESPACE`] path) under
+/// the tag `image_tag`.
+///
+/// One repository, two spellings. The entries above are the gallery's mirror of the Docker
+/// Official Images, and a mirror carries the releases of the repository it mirrors, so the
+/// releases this emulator holds of such an image are the same whichever of the two registries
+/// a reference addresses it through — which is what keeps one tag from naming an image under
+/// one spelling and no image at all under the other.
+///
+/// `None` for every repository path that is no Docker Official Image this emulator holds, so a
+/// reference into another repository of that registry is left undecided exactly as a reference
+/// into an alias no image is held of is.
+#[must_use]
+pub fn official_image(repository_path: &str, image_tag: &str) -> Option<PublishedImage> {
+    let repository_name = match repository_path.split_once('/') {
+        // The official images live in ONE namespace of that registry; a path under any other
+        // namespace names somebody else's repository there.
+        Some((namespace, name)) if namespace == OFFICIAL_IMAGES_NAMESPACE => {
+            format!("{OFFICIAL_IMAGES_NAMESPACE}/{name}")
+        }
+        Some(_) => return None,
+        // A reference may name an official image without its namespace, which is the form a
+        // container runtime completes with that namespace.
+        None => format!("{OFFICIAL_IMAGES_NAMESPACE}/{repository_path}"),
+    };
+    let published = published_repository(DOCKER_OFFICIAL_IMAGES_ALIAS, &repository_name)?;
+    Some(if published.image_tags.contains(&image_tag) {
         PublishedImage::Published
     } else {
         PublishedImage::NotPublished
@@ -262,6 +310,75 @@ mod tests {
                 "case {}/{}: expected at least one published tag, got none",
                 published.registry_alias,
                 published.repository_name
+            );
+        }
+    }
+
+    /// RULE: the releases of a held image decide a reference into the repository the mirror
+    /// carries it FROM as well — with or without that registry's namespace — while a path
+    /// under another namespace, and a repository no image is held of, are left undecided.
+    ///
+    /// The rows differ along the spelling of the path, the repository named, and whether the
+    /// tag asked for is one the entry publishes; `library/httpd` is a repository the table
+    /// above does not reach through this spelling.
+    #[test]
+    fn a_held_images_releases_decide_its_mirrored_repositorys_spelling_too() {
+        // (case, repository path, tag, what the catalogue says)
+        let rows: &[(&str, &str, &str, Option<PublishedImage>)] = &[
+            (
+                "the bare name of a held repository, on a published release",
+                "busybox",
+                "1.36",
+                Some(PublishedImage::Published),
+            ),
+            (
+                "the namespaced path of a held repository, on a published release",
+                "library/busybox",
+                "1.36",
+                Some(PublishedImage::Published),
+            ),
+            (
+                "the moving channel of a held repository",
+                "library/httpd",
+                "latest",
+                Some(PublishedImage::Published),
+            ),
+            (
+                "a variant release of a held repository",
+                "nginx",
+                "1.27-alpine",
+                Some(PublishedImage::Published),
+            ),
+            (
+                "a tag the held repository publishes no release under",
+                "busybox",
+                "no-such-release",
+                Some(PublishedImage::NotPublished),
+            ),
+            (
+                "the same under the namespaced spelling",
+                "library/nginx",
+                "no-such-release",
+                Some(PublishedImage::NotPublished),
+            ),
+            (
+                "a repository of that registry no image is held of",
+                "library/python",
+                "3.12",
+                None,
+            ),
+            (
+                "a path under somebody else's namespace of that registry",
+                "someone/busybox",
+                "1.36",
+                None,
+            ),
+        ];
+        for (case, repository_path, image_tag, expected) in rows {
+            let answered = official_image(repository_path, image_tag);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected {expected:?}, got {answered:?}"
             );
         }
     }

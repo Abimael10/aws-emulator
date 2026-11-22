@@ -30,6 +30,11 @@
 //! * which route table applies: one a caller associated with the subnet, and the VPC's
 //!   MAIN table for a subnet associated with none.
 //!
+//! The last test is the other half of the same fetch: with the path open, what decides the
+//! launch is whether the registry that holds the image resolves the reference at all, which
+//! for an image this emulator holds is the releases that image publishes — under every
+//! registry spelling it is published under.
+//!
 //! Nothing here reaches into either state struct: every value asserted is read back
 //! through `DescribeTasks`, `ListTasks` and `DescribeServices`.
 
@@ -824,6 +829,118 @@ async fn scaling_a_service_up_into_an_isolated_placement_stops_its_task() {
                 0,
                 "case {case:?}: expected a service whose task failed to start to run none, \
                  got {service}"
+            );
+        }
+    }
+}
+
+/// The rule the other half of a fetch turns on: the registry that holds the image decides
+/// whether the reference names an image AT ALL, and an image this emulator holds is held under
+/// every registry spelling it is published under — the gallery's mirror of it and the
+/// repository that mirror carries it from, which a reference may name with or without that
+/// registry's own namespace and host. So a reference naming a release of such an image is
+/// fetched and the task runs, and one naming a tag that publishes no release resolves to
+/// nothing however it is spelled: the task never starts and the stop carries the runtime's
+/// account of a reference it could not resolve.
+///
+/// Every row is launched into the placement that REACHES the registry, so what decides it is
+/// the registry's answer rather than the path to it. The rows differ along the spelling of the
+/// reference, the image named, and whether the tag asked for is one that image publishes; a
+/// repository no image is held of is the control — no registry here answers for it, so such a
+/// task runs.
+#[tokio::test]
+async fn an_image_tag_that_names_no_release_of_a_held_image_stops_the_task() {
+    let router = emulator_with_ec2();
+    create_cluster(&router, CLUSTER, "releases").await;
+    let network = network(&router).await;
+
+    // (case, family, image reference, whether the reference names an image that is fetched)
+    let rows: [(&str, &str, &str, bool); 8] = [
+        (
+            "the gallery's mirror of a held image, on a release it publishes",
+            "mirrorrelease",
+            "public.ecr.aws/docker/library/busybox:1.36",
+            true,
+        ),
+        (
+            "the same mirror, on a tag it publishes no release under",
+            "mirrorunreleased",
+            "public.ecr.aws/docker/library/busybox:no-such-release",
+            false,
+        ),
+        (
+            "the repository that mirror carries the image from, on a release",
+            "hubrelease",
+            "busybox:1.36",
+            true,
+        ),
+        (
+            "that repository, on a tag it publishes no release under",
+            "hubunreleased",
+            "busybox:no-such-release",
+            false,
+        ),
+        (
+            "that repository under the registry's namespace, on a release",
+            "namespacedrelease",
+            "library/nginx:1.27",
+            true,
+        ),
+        (
+            "that repository under the registry's host, on no release",
+            "namespacedunreleased",
+            "registry-1.docker.io/library/nginx:no-such-release",
+            false,
+        ),
+        (
+            // No registry here holds the image of this repository, so nothing is decided
+            // about the reference and the path is all the fetch was decided by.
+            "a repository of that registry no image is held of",
+            "unheldrepository",
+            "python:3.12",
+            true,
+        ),
+        (
+            "a gallery alias no image is held of",
+            "unheldalias",
+            PUBLIC_IMAGE,
+            true,
+        ),
+    ];
+
+    for (case, family, image, _) in rows {
+        register(&router, family, image, case).await;
+    }
+    // Launched first and read afterwards: each settles on its own clock, so the table costs
+    // one start rather than one per row.
+    let mut launched = Vec::new();
+    for (case, family, image, fetchable) in rows {
+        let task_arn = run(&router, family, &network.routed_by_gateway, "ENABLED", case).await;
+        launched.push((case, image, task_arn, fetchable));
+    }
+
+    for (case, image, task_arn, fetchable) in launched {
+        let task = settled(&router, &task_arn, case).await;
+        if fetchable {
+            assert_eq!(
+                string(&task, "lastStatus", case),
+                RUNNING,
+                "case {case:?}: expected a task whose reference {image} names an image to \
+                 reach {RUNNING}, got {task}"
+            );
+            assert!(
+                task["stopCode"].is_null(),
+                "case {case:?}: expected no stopCode on a running task, got {task}"
+            );
+        } else {
+            assert_failed_to_start(&task, image, case);
+            // What the registry answered, in the runtime's words: the reference was retried
+            // and then reported as naming nothing.
+            let reason = string(&task, "stoppedReason", case);
+            assert!(
+                reason.contains("not found"),
+                "case {case:?}: expected the reason to report that {image} resolves to no \
+                 image, got {reason:?}"
             );
         }
     }
