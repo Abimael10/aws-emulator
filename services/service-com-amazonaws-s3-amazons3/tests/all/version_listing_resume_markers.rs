@@ -30,6 +30,14 @@
 //! each other and with what was stored, so an escape applied to the separator, a marker that
 //! does not resume, and an encoding applied to the version-id marker each fail here.
 //!
+//! Beside that, this suite pins what a resume POSITION is: a version marker names a version
+//! within one key's versions ("specifies the object version you want to start listing from",
+//! `ListObjectVersionsRequest$VersionIdMarker`) and only the key marker names that key
+//! ("specifies the key to start with when listing objects in a bucket", `$KeyMarker`), so a
+//! request that states a version marker and no key marker names no position at all and is
+//! refused rather than answered with an unanchored page — which is what a hand-rolled pager
+//! that drops the key half of the pair gets back.
+//!
 //! [`super::listing_resume_markers`] walks the same property for `ListObjects` and
 //! `ListMultipartUploads`, whose resume position is a key name plus an upload id — and owns
 //! the two helpers this walk shares with it, the `Rendering` of one listing and the predicate
@@ -230,6 +238,172 @@ fn assert_written_as_encoded(case: &str, element: &str, written: &str, stored: &
             false => "not ",
         }
     );
+}
+
+/// The code a request field carrying a value the listing cannot accept is refused with, and
+/// the status that code is rendered at.
+const INVALID_ARGUMENT: &str = "InvalidArgument";
+const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The sentence a version listing refuses a version marker that anchors to no key with, and
+/// the query parameter its `<ArgumentName>` names — the field the caller has to change.
+const UNANCHORED_VERSION_MARKER_MESSAGE: &str =
+    "A version-id marker cannot be specified without a key marker.";
+const VERSION_ID_MARKER_PARAMETER: &str = "version-id-marker";
+
+/// The keys the refusal walk's bucket holds; the first is written twice, so the bucket holds
+/// one key with two versions and one with a single version.
+const UNANCHORED_KEYS: &[&str] = &["alpha.bin", "beta~1"];
+
+/// One marker pair that DOES name a position: how the case is named, the query that states
+/// the pair, and the `(key, version id)` entries the listing it asks for must report.
+#[derive(Debug)]
+struct Served {
+    case: &'static str,
+    query: String,
+    reported: Vec<(String, String)>,
+}
+
+#[tokio::test]
+async fn a_version_marker_without_a_key_marker_names_no_position_and_is_refused() {
+    let router = router();
+    let name = "version-unanchored-marker";
+    let stored = stored_versions(&router, name, UNANCHORED_KEYS).await;
+    // Every stored version, key by key in ascending byte order, newest version of a key
+    // first — the order a listing reports them in, read back from what the writes minted.
+    let expected: Vec<(String, String)> = stored
+        .iter()
+        .flat_map(|(key, ids)| ids.iter().map(|id| (key.clone(), id.clone())))
+        .collect();
+    let (anchor_key, anchor_version) = expected
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("the bucket must hold a version to anchor a marker to"));
+
+    // The values a `version-id-marker` may carry, spanning what one can be: an id this very
+    // bucket minted, the id a version stored while versioning was off is named by, and a token
+    // no listing of this service ever issued. None of them names a position without a key.
+    let markers: &[(&str, &str)] = &[
+        ("a version id this bucket minted", anchor_version.as_str()),
+        ("the null version id", "null"),
+        ("a token no listing issued", "not-a-version-id"),
+    ];
+    // How a request can state no key to anchor to: leaving `key-marker` out, and stating it
+    // with no value — an empty marker names no key, so it anchors a version no better than an
+    // absent one, and the two requests are one answer.
+    let unanchored: &[(&str, &str)] = &[
+        ("no key-marker at all", ""),
+        ("key-marker stated empty", "&key-marker="),
+    ];
+
+    for (why_marker, marker) in markers {
+        for (why_key, key_marker) in unanchored {
+            let case = format!("{why_marker}, {why_key}");
+            let answer = list_object_versions(
+                &router,
+                name,
+                &format!("{key_marker}&version-id-marker={}", in_path(marker)),
+            )
+            .await;
+            assert_eq!(
+                answer.status,
+                INVALID_ARGUMENT_STATUS,
+                "case {case:?}: expected HTTP {INVALID_ARGUMENT_STATUS}, got {} with body {:?}",
+                answer.status,
+                text(&answer)
+            );
+            assert_eq!(
+                answer.error_code(),
+                INVALID_ARGUMENT,
+                "case {case:?}: expected the {INVALID_ARGUMENT:?} code, got {:?}",
+                answer.error_code()
+            );
+            assert_eq!(
+                answer.error_message(),
+                UNANCHORED_VERSION_MARKER_MESSAGE,
+                "case {case:?}: expected the published sentence \
+                 {UNANCHORED_VERSION_MARKER_MESSAGE:?}, got {:?}",
+                answer.error_message()
+            );
+            assert_eq!(
+                answer.element("ArgumentName").as_deref(),
+                Some(VERSION_ID_MARKER_PARAMETER),
+                "case {case:?}: the envelope must name the parameter it rejected, got {:?} in \
+                 {:?}",
+                answer.element("ArgumentName"),
+                text(&answer)
+            );
+            assert_eq!(
+                answer.element("ArgumentValue").as_deref(),
+                Some(*marker),
+                "case {case:?}: the envelope must echo the marker the request carried, got {:?} \
+                 in {:?}",
+                answer.element("ArgumentValue"),
+                text(&answer)
+            );
+        }
+    }
+
+    // And the pairs that DO name a position are served, so every refusal above was about the
+    // version marker having no key to anchor to rather than about the parameter being there.
+    let served = vec![
+        Served {
+            case: "neither marker",
+            query: String::new(),
+            reported: expected.clone(),
+        },
+        Served {
+            case: "a key marker alone",
+            query: format!("&key-marker={}", in_path(&anchor_key)),
+            // "If you specify key-marker without version-id-marker, the listing begins with
+            // the key immediately after key-marker": every version of a LATER key.
+            reported: expected
+                .iter()
+                .filter(|(key, _)| key > &anchor_key)
+                .cloned()
+                .collect(),
+        },
+        Served {
+            case: "both markers",
+            query: format!(
+                "&key-marker={}&version-id-marker={}",
+                in_path(&anchor_key),
+                in_path(&anchor_version)
+            ),
+            // With both, the listing begins with the version immediately after the one named.
+            reported: expected[1..].to_vec(),
+        },
+        Served {
+            case: "a version marker stated with no value",
+            query: "&version-id-marker=".to_string(),
+            // A marker stated empty states no position at all, so the listing is the one a
+            // request that left the parameter out is answered with.
+            reported: expected.clone(),
+        },
+    ];
+    for Served {
+        case,
+        query,
+        reported,
+    } in served
+    {
+        let answer = list_object_versions(&router, name, &query).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: a pair that names a position is served, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let listing = version_listing_of(&answer);
+        assert_eq!(
+            listing.entries(),
+            reported,
+            "case {case:?}: expected the versions after the position the request named, \
+             {reported:?}, got {:?}",
+            listing.entries()
+        );
+    }
 }
 
 #[tokio::test]

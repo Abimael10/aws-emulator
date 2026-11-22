@@ -310,6 +310,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The position this request asks to resume from has to be one a page can resume from.
+        // A version marker names a version WITHIN one key's versions and `key-marker` is the
+        // only parameter that names that key, so the pair is judged before anything about the
+        // bucket's contents is reported — see [`crate::state::unanchored_version_id_marker`],
+        // which is the one reading of that pair, and whose refusal carries the marker as the
+        // request spelled it in the envelope's `<ArgumentValue>`.
+        if let Some(unanchored) = crate::state::unanchored_version_id_marker(
+            input.key_marker.as_deref(),
+            input.version_id_marker.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::VERSION_ID_MARKER_ARGUMENT,
+                Some(unanchored),
+                crate::state::VERSION_ID_MARKER_WITHOUT_KEY_MARKER_MESSAGE,
+            ));
+        }
+
         // `MaxKeys` publishes no range of its own and a value that bounds no page is refused
         // above, so what reaches here is a non-negative bound or none at all.
         let max_keys = input.max_keys.unwrap_or(MAX_KEYS_PER_PAGE);

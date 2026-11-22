@@ -410,6 +410,49 @@ pub fn withholds_max_keys(value: &str) -> bool {
     value.is_empty() || max_keys_fault(value).is_some()
 }
 
+/// The query parameter a version listing binds the KEY a page resumes at from
+/// (`smithy_query(query="operation",operation="ListObjectVersions")` reports
+/// `KeyMarker: {httpQuery: "key-marker"}`).
+pub const KEY_MARKER_PARAMETER: &str = "key-marker";
+
+/// The request field a version marker that anchors to no key is reported against — the query
+/// parameter a version listing binds the VERSION a page resumes at from (`VersionIdMarker:
+/// {httpQuery: "version-id-marker"}`, the same source), which is how S3's `InvalidArgument`
+/// document names the argument it rejected.
+pub const VERSION_ID_MARKER_ARGUMENT: &str = "version-id-marker";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a version listing that states
+/// a version marker and no key marker.
+///
+/// Fixed text, naming the rule the pair broke; the marker as the request spelled it travels
+/// beside it as the envelope's `<ArgumentValue>`.
+pub const VERSION_ID_MARKER_WITHOUT_KEY_MARKER_MESSAGE: &str =
+    "A version-id marker cannot be specified without a key marker.";
+
+/// The `version-id-marker` a version listing cannot resume from, or `None` for a pair it can.
+///
+/// "Specifies the object version you want to start listing from"
+/// (`ListObjectVersionsRequest$VersionIdMarker`) — a version is a position WITHIN one key's
+/// versions, which only `key-marker` names ("specifies the key to start with"), so a version
+/// marker stated without a key marker anchors to nothing and the listing is refused rather
+/// than served from the start of the bucket.
+///
+/// A marker stated with NO value states no position at all, exactly as
+/// [`withholds_empty_listing_value`] reads the other listing parameters: an empty
+/// `version-id-marker` asks to resume from no version, so it is no fault, and an empty
+/// `key-marker` names no key, so it anchors a version marker no better than an absent one —
+/// which is what keeps a request that states a marker empty and one that leaves it out the
+/// same answer.
+pub fn unanchored_version_id_marker<'v>(
+    key_marker: Option<&str>,
+    version_id_marker: Option<&'v str>,
+) -> Option<&'v str> {
+    let version_id_marker = version_id_marker.filter(|marker| !marker.is_empty())?;
+    key_marker
+        .is_none_or(str::is_empty)
+        .then_some(version_id_marker)
+}
+
 /// The query parameter every listing binds the string it rolls keys up at from: `delimiter`
 /// (`smithy_query(query="operation",operation="ListObjects,ListObjectsV2,ListObjectVersions,ListMultipartUploads")`
 /// reports `Delimiter: {httpQuery: "delimiter"}` on each of them).
