@@ -28,6 +28,12 @@
 //! publishes; each surface spells those onto the shapes ITS model declares — the
 //! classic surface's `Pending`/`Success` for the v2 surface's `PENDING`/`SUCCESS`.
 //!
+//! Because the surfaces page ONE directory, the continuation token of an identity
+//! listing is minted HERE as well ([`page_token`]): it is authenticated under the
+//! registry's own key ([`SesIdentityDirectory::page_token_key`]), so a token either
+//! surface's listing issued names a position in that one directory and continues it on
+//! either surface, while a value no listing issued is refused by both.
+//!
 //! The registry is BOUNDED at [`MAX_REGISTERED_IDENTITIES`], the identity quota SES
 //! documents per account per Region, so a caller looping on a verify cannot grow it
 //! without end.
@@ -36,6 +42,19 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
+
+use super::page_tokens::PageTokenKey;
+
+/// The `NextToken` an identity listing hands back to resume at a cursor — the identity the
+/// NEXT page starts at — and the reading of one it is handed.
+///
+/// The workspace's one authenticated-cursor rendering
+/// ([`super::page_tokens::page_token`]), under this registry's key
+/// ([`SesIdentityDirectory::page_token_key`]): ONE form for the account's one identity
+/// directory, which is what lets a token minted by either surface's listing continue that
+/// directory on either surface, while a value no listing of it minted names no position at
+/// all.
+pub use super::page_tokens::{page_cursor, page_token};
 
 /// The identities one account may hold, and so the ceiling on this registry: SES
 /// documents a limit of 10,000 verified identities per account per Region, and a
@@ -219,6 +238,11 @@ impl SesIdentityRecord {
 pub struct SesIdentityDirectory {
     /// The records, by identity key.
     identities: BTreeMap<String, SesIdentityRecord>,
+    /// The secret this account's identity-listing tokens are authenticated under, drawn
+    /// from the system's randomness when the registry is created and never revealed. One
+    /// key for the account's one identity directory, which is what lets either surface
+    /// verify a token the other minted.
+    page_token_key: PageTokenKey,
     /// How many tokens this registry has minted, which is what makes the next one
     /// UNIQUE rather than merely unlikely to repeat: every token digests this
     /// counter, and the counter is never reused.
@@ -320,6 +344,15 @@ impl SesIdentityDirectory {
     /// Whether the account holds no identity at all.
     pub fn is_empty(&self) -> bool {
         self.identities.is_empty()
+    }
+
+    /// The key this account's identity-listing tokens are authenticated under
+    /// ([`page_token`]).
+    ///
+    /// Handed out by value — [`PageTokenKey`] is `Copy` — so a listing can take the key
+    /// off the registry and go on to read the records it is about to report.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
     }
 
     /// Bring one surface's own identity `table` and this registry back into agreement
@@ -915,5 +948,64 @@ mod tests {
             "case one past the ceiling: expected the ceiling held, got {}",
             registry.len()
         );
+    }
+
+    #[test]
+    fn a_page_token_names_a_position_only_under_the_registry_that_minted_it() {
+        let registry = SesIdentityDirectory::default();
+        let other = SesIdentityDirectory::default();
+        let key = registry.page_token_key();
+        // Cursors spanning the identity keys a listing cuts a page at: a domain, a
+        // subdomain, an address, and an address whose local part carries punctuation.
+        for cursor in [
+            "example.com",
+            "mail.example.co.uk",
+            "user@example.com",
+            "first.last+tag@example.net",
+        ] {
+            let token = page_token(&key, cursor);
+            assert_eq!(
+                page_cursor(&key, &token).as_deref(),
+                Some(cursor),
+                "case {cursor:?}: expected the cursor to round-trip, got {:?}",
+                page_cursor(&key, &token)
+            );
+            assert_eq!(
+                page_cursor(&other.page_token_key(), &token),
+                None,
+                "case {cursor:?}: a token of another registry must name no position, got {:?}",
+                page_cursor(&other.page_token_key(), &token)
+            );
+            // Every value a caller could send that this registry did not mint.
+            for (case, made_up) in [
+                ("the cursor sent bare", cursor.to_string()),
+                ("an empty token", String::new()),
+                ("not base64", "not a token!".to_string()),
+                (
+                    "a token with its last byte dropped",
+                    ::aws_smithy_types::base64::encode(
+                        &key.mint(cursor)[..key.mint(cursor).len() - 1],
+                    ),
+                ),
+                (
+                    "a made-up authenticator",
+                    ::aws_smithy_types::base64::encode(
+                        [
+                            vec![0_u8; crate::page_tokens::AUTHENTICATOR_BYTES],
+                            cursor.as_bytes().to_vec(),
+                        ]
+                        .concat()
+                        .as_slice(),
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    page_cursor(&key, &made_up),
+                    None,
+                    "case {cursor:?} / {case}: expected no position, got {:?}",
+                    page_cursor(&key, &made_up)
+                );
+            }
+        }
     }
 }

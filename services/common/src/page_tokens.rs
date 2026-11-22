@@ -100,6 +100,29 @@ impl Default for PageTokenKey {
     }
 }
 
+/// The `NextToken` a listing hands back to resume at `cursor`, rendered base64.
+///
+/// Opaque: the caller reads no position out of it and hands it back verbatim. Authenticated
+/// under the issuing store's key, so a value the caller assembled names no position at all
+/// ([`page_cursor`]), and base64 travels in a body, a query string and an XML element alike.
+///
+/// The ONE rendering of an authenticated cursor, so every collection whose listings share a
+/// store share a token FORM as well: a listing that mints here and reads with [`page_cursor`]
+/// accepts a token any other listing of that same collection minted.
+pub fn page_token(key: &PageTokenKey, cursor: &str) -> String {
+    ::aws_smithy_types::base64::encode(key.mint(cursor))
+}
+
+/// The cursor a token of a listing authenticated under `key` resumes at, or `None` for any
+/// value that key did not mint: one that is not base64, one whose authenticator does not
+/// match the cursor it travels with, and one minted under another store's key.
+///
+/// The caller refuses such a token rather than restarting its listing at some other position.
+pub fn page_cursor(key: &PageTokenKey, token: &str) -> Option<String> {
+    let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
+    key.cursor_of(&bytes)
+}
+
 /// Redacted: the key authenticates a store's page tokens, so it belongs in no log line
 /// and in no debug dump of the state that holds it.
 impl std::fmt::Debug for PageTokenKey {

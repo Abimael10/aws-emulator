@@ -329,30 +329,16 @@ pub trait AccountConfigurationSetRecord: Sized {
     fn adopt(record: &SesConfigurationSetRecord, created_at: SystemTime) -> Self;
 }
 
-/// The `NextToken` a configuration-set listing hands back to resume at `cursor` — the set
-/// the NEXT page starts at.
+/// The `NextToken` a configuration-set listing hands back to resume at a cursor — the set
+/// the NEXT page starts at — and the reading of one it is handed.
 ///
-/// Opaque: the caller reads no position out of it and hands it back verbatim. Authenticated
-/// under the registry's key, so a value the caller assembled names no position at all
-/// ([`page_cursor`]), and rendered as base64, which travels in both surfaces' bodies.
-///
-/// ONE form for the account's one configuration-set collection, which is what lets a token
-/// minted by either surface's listing continue that collection on either surface.
-pub fn page_token(key: &PageTokenKey, cursor: &str) -> String {
-    ::aws_smithy_types::base64::encode(key.mint(cursor))
-}
-
-/// The configuration set a token of the account's configuration-set listing resumes AT, or
-/// `None` for any value no listing of it minted: one that is not base64, one whose
-/// authenticator does not match the cursor it travels with, and one minted under another
-/// registry's key.
-///
-/// The caller refuses such a token rather than restarting the listing at some other
-/// position.
-pub fn page_cursor(key: &PageTokenKey, token: &str) -> Option<String> {
-    let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
-    key.cursor_of(&bytes)
-}
+/// The workspace's one authenticated-cursor rendering
+/// ([`super::page_tokens::page_token`]), under this registry's key
+/// ([`SesConfigurationSetDirectory::page_token_key`]): ONE form for the account's one
+/// configuration-set collection, which is what lets a token minted by either surface's
+/// listing continue that collection on either surface, while a value no listing of it minted
+/// names no position at all.
+pub use super::page_tokens::{page_cursor, page_token};
 
 #[cfg(test)]
 mod tests {

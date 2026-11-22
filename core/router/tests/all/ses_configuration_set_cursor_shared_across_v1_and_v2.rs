@@ -29,9 +29,10 @@
 //! That assembly and the two wire forms over it ([`router`], [`v1`], [`v2`], [`create`],
 //! [`page`], [`emulator_holding_sets`]) are `pub(crate)` because
 //! [`crate::ses_configuration_set_cursor_outlives_collection_changes`] asks the same
-//! listing the same way and must not grow a second copy of them: a suite that writes its
-//! own harness drifts from the one beside it, exactly as `crate::query_wire` exists to
-//! stop.
+//! listing the same way and must not grow a second copy of them — as does
+//! [`crate::ses_identity_cursor_shared_across_v1_and_v2`], which holds the same rule over
+//! the account's IDENTITY directory: a suite that writes its own harness drifts from the one
+//! beside it, exactly as `crate::query_wire` exists to stop.
 
 use std::sync::Arc;
 
@@ -129,7 +130,7 @@ impl Answer {
     /// The modelled error code the answer names, whichever protocol carried it: the
     /// classic surface's `<Code>` element, or the v2 surface's error-type header or
     /// `__type` member.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         if let Some(code) = opt_element(&self.text, "Code") {
             return code;
         }
@@ -147,7 +148,7 @@ impl Answer {
 
     /// The message the answer carries, in either envelope, with the five entities the XML
     /// serializer escapes decoded back.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         if let Some(message) = opt_element(&self.text, "Message") {
             return message
                 .replace("&lt;", "<")

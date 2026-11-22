@@ -134,12 +134,13 @@ fn forged_cursors(real: &str) -> Vec<(&'static str, String)> {
             ::aws_smithy_types::base64::encode("alpha.example.com"),
         ),
         (
-            "one of this listing's own cursors with its tag broken",
-            ::aws_smithy_types::base64::encode(
-                String::from_utf8(::aws_smithy_types::base64::decode(real).expect("base64"))
-                    .expect("utf-8")
-                    .replacen("sesv2", "sesv3", 1),
-            ),
+            "one of this listing's own cursors with its authenticator broken",
+            {
+                let mut bytes =
+                    ::aws_smithy_types::base64::decode(real).expect("an issued cursor is base64");
+                bytes[0] ^= 0x01;
+                ::aws_smithy_types::base64::encode(&bytes)
+            },
         ),
     ]
 }

@@ -2,8 +2,10 @@
 
 //! @op ListEmailIdentities
 //! Enumerates the persisted email identities, honouring `Filter`, `PageSize` and the
-//! opaque `NextToken` this operation hands back. This is the ONLY file to touch for
-//! this operation.
+//! opaque `NextToken` this operation hands back. The cursor belongs to the ACCOUNT's
+//! identity directory rather than to this API, so one this listing issues continues the
+//! classic SES identity listing and one that listing issues continues this one. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,14 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let filters = page_filters(input.filter)?;
 
-        // The token is this operation's own: it names the last identity the previous
-        // page returned, so the next page resumes strictly after it. A value this
-        // listing never issued is no position in it, and is refused in this listing's
-        // own words ([`invalid_next_token_message`]).
-        let resume_after = match input.next_token.as_deref() {
+        // The token names the identity the NEXT page starts at, and it belongs to the
+        // ACCOUNT's identity directory rather than to this operation: the APIs over the
+        // account's identities page one directory, so a token the classic surface's
+        // `ListIdentities` issued is a position in this listing too (and the other way
+        // round). A value no listing of that directory minted names no position in it,
+        // and is refused in this listing's own words
+        // ([`invalid_next_token_message`]).
+        let Some(token_key) = crate::state::identity_page_token_key(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListEmailIdentities without the account's identity registry",
+            ));
+        };
+        let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(token)
+                crate::state::identity_page_cursor(&token_key, token)
                     .ok_or_else(|| bad_request(invalid_next_token_message(token)))?,
             ),
         };
@@ -196,18 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already owed is part of what it reports.
         store.settle(::std::time::SystemTime::now());
 
-        // `identities` is ordered by storage key, so a page is a window over the
-        // matching records and the resume point is a position in that order — which
-        // keeps the token valid even if the identity it names has since been
-        // deleted.
+        // `identities` is ordered by storage key — the account's identity key, the same
+        // order the classic surface walks — so a page is a window over the matching
+        // records and the resume point is a position in that order, which keeps the
+        // token valid even if the identity it names has since been deleted.
         let matching: Vec<(&String, &EmailIdentityRecord)> = store
             .identities
             .iter()
             .filter(|(_, record)| matches_filters(record, &filters))
             .collect();
-        let start = match resume_after.as_deref() {
+        let start = match resume_from.as_deref() {
             None => 0,
-            Some(last) => matching.partition_point(|(key, _)| key.as_str() <= last),
+            // The cursor names where the next page STARTS, so a page boundary neither
+            // repeats nor skips an entry even when identities are created or deleted
+            // between calls, and a cursor over an identity the account no longer holds
+            // resumes at the first one at or after it.
+            Some(first) => matching.partition_point(|(key, _)| key.as_str() < first),
         };
         let remaining = &matching[start..];
         let page = match page_size {
@@ -224,10 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 verification_status: Some(record.verification_status.as_str().to_string()),
             })
             .collect();
-        // A token only when records remain behind this page.
-        let next_token = (page.len() < remaining.len())
-            .then(|| page.last().map(|(key, _)| crate::state::encode_page_token(key)))
-            .flatten();
+        // A token only when records remain behind this page, so a walk terminates; it
+        // names the first of them, which is where the next page begins.
+        let next_token = remaining
+            .get(page.len())
+            .map(|(key, _)| crate::state::identity_page_token(&token_key, key));
 
         Ok(ListEmailIdentitiesOutput {
             email_identities: Some(email_identities),

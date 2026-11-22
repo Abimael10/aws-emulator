@@ -4523,11 +4523,6 @@ pub fn easy_dkim_tokens(domain: &str) -> Vec<String> {
         .collect()
 }
 
-/// What a `NextToken` of this service's own making starts with, so a token from
-/// anywhere else — including one that happens to be valid base64 — is detectably
-/// not a position in this listing.
-const PAGE_TOKEN_TAG: &str = "sesv2:email-identities:";
-
 /// The tag `ListContactLists`'s own tokens carry.
 pub const CONTACT_LISTS_PAGE_TOKEN_TAG: &str = "sesv2:contact-lists:";
 
@@ -4584,17 +4579,6 @@ pub fn encode_tagged_page_token(tag: &str, last_returned: &str) -> String {
 pub fn decode_tagged_page_token(tag: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
     decoded.strip_prefix(tag).map(ToString::to_string)
-}
-
-/// Encode a `ListEmailIdentities` `NextToken` that resumes after `last_returned`.
-pub fn encode_page_token(last_returned: &str) -> String {
-    encode_tagged_page_token(PAGE_TOKEN_TAG, last_returned)
-}
-
-/// Decode a `NextToken` produced by [`encode_page_token`]. `None` when the caller
-/// made the token up.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    decode_tagged_page_token(PAGE_TOKEN_TAG, token)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -4681,6 +4665,25 @@ pub fn identity_registry<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<
             ::service_common::ses_identities::SesIdentityDirectory,
         >)
+}
+
+/// The `NextToken` the identity listing hands back to resume at the identity the NEXT
+/// page starts at, and the reading of one it is handed.
+///
+/// The registry's, not this surface's: the APIs over the account's identities page one
+/// directory, so one token form serves them all
+/// ([`::service_common::ses_identities::page_token`]).
+pub use ::service_common::ses_identities::{
+    page_cursor as identity_page_cursor, page_token as identity_page_token,
+};
+
+/// The key this account's identity-listing tokens are authenticated under
+/// ([`identity_page_token`]), or `None` when the engine holds no registry at all.
+///
+/// Taken by value — [`PageTokenKey`] is `Copy` — so a listing reads the key and then goes
+/// on to read the identities it is about to report without holding the registry's lock.
+pub fn identity_page_token_key<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<PageTokenKey> {
+    Some(identity_registry(engine)?.lock().page_token_key())
 }
 
 /// Bring this service's identity table and the account's identity registry back into

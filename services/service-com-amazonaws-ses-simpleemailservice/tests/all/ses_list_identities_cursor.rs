@@ -11,14 +11,22 @@
 //!
 //! What is asserted is that rule over a SET of cursors: the one the listing issued,
 //! and a table of values it did not — made up, empty, an identity name sent bare,
-//! hex too short to carry a tag, a tampered tag, a truncated or extended token, and a
-//! cursor this service issued for ANOTHER of its listings.
+//! hex of this surface's own privately tagged listings, a tampered authenticator, a
+//! truncated or extended token, and a cursor this service issued for ANOTHER of its
+//! listings.
+//!
+//! The cursor itself belongs to the ACCOUNT's identity directory, which both Amazon SES
+//! APIs page ([`service_com_amazonaws_ses_simpleemailservice::state::identity_page_token`]),
+//! so it is minted and read under the registry's key; the cross-surface hand-off that
+//! makes it one walk is `core/router/tests/all/ses_identity_cursor_shared_across_v1_and_v2`,
+//! which is the only crate that can mount both services.
 
-use crate::harness::{call, element, elements, field, xml_text, Field};
+use crate::harness::{call, element, elements, emulator_and_engine, field, xml_text, Field};
 use service_com_amazonaws_ses_simpleemailservice::state::{
-    encode_page_token, LISTING_CONFIGURATION_SETS, LISTING_IDENTITIES,
+    encode_page_token, identity_page_token, identity_page_token_key, LISTING_CONFIGURATION_SETS,
 };
 use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
 
 /// The identities the account holds for these cases, in the order the store keys
 /// them (lexicographic), so the expected pages are the expected pages.
@@ -30,9 +38,14 @@ fn stored_identities() -> Vec<String> {
     names
 }
 
-/// A router whose account holds [`stored_identities`].
-async fn emulator_holding() -> (MultiServiceRouter, Vec<String>) {
-    let router = crate::harness::emulator();
+/// A router whose account holds [`stored_identities`], and the engine behind it — whose
+/// account identity registry mints this listing's cursors.
+async fn emulator_holding_over_engine() -> (
+    MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+    Vec<String>,
+) {
+    let (router, engine) = emulator_and_engine();
     let expected = stored_identities();
     for domain in &expected {
         let (status, body) = call(&router, "VerifyDomainIdentity", &[field("Domain", domain)]).await;
@@ -41,6 +54,12 @@ async fn emulator_holding() -> (MultiServiceRouter, Vec<String>) {
             "VerifyDomainIdentity({domain:?}): expected 200, got {status} with {body}"
         );
     }
+    (router, engine, expected)
+}
+
+/// A router whose account holds [`stored_identities`].
+async fn emulator_holding() -> (MultiServiceRouter, Vec<String>) {
+    let (router, _, expected) = emulator_holding_over_engine().await;
     (router, expected)
 }
 
@@ -132,16 +151,19 @@ async fn the_issued_cursor_is_opaque_and_resumes_exactly_where_the_page_ended() 
 
 #[tokio::test]
 async fn a_next_token_this_listing_did_not_issue_is_refused() {
-    let (router, expected) = emulator_holding().await;
+    let (router, engine, expected) = emulator_holding_over_engine().await;
+    let token_key = identity_page_token_key(&*engine)
+        .expect("the account's identity registry is on the shared engine");
     let (_, issued) = list(&router, Some(5), None).await;
     let issued = issued.expect("a store larger than the page size yields a NextToken");
 
-    let real = encode_page_token(LISTING_IDENTITIES, &expected[3]);
+    let real = identity_page_token(&token_key, &expected[3]);
     let tampered = {
-        let mut bytes = ::hex::decode(&real).expect("an issued token is hex");
+        let mut bytes =
+            ::aws_smithy_types::base64::decode(&real).expect("an issued token is base64");
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
-        ::hex::encode(bytes)
+        ::aws_smithy_types::base64::encode(&bytes)
     };
     // Each row is a cursor shaped unlike anything this listing issues, or one issued
     // for a different listing or over a tampered position.
@@ -155,12 +177,19 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
         ("hex that carries no key", "0011223344556677".to_string()),
         ("hex too short to carry a tag", "00112233".to_string()),
         ("odd-length hex", "abc".to_string()),
-        ("a tag that does not match the key", tampered),
+        ("an authenticator that does not match the key", tampered),
         ("a token truncated by a byte", real[..real.len() - 2].to_string()),
         ("a token with a byte appended", format!("{real}ff")),
         (
             "a cursor of another listing of this service",
             encode_page_token(LISTING_CONFIGURATION_SETS, &expected[3]),
+        ),
+        // The private, per-API cursor form this listing used to mint, which names no
+        // position in the account's identity directory and so is a cursor no listing of
+        // it issued.
+        (
+            "a cursor privately tagged for this API's own identity listing",
+            encode_page_token("ListIdentities", &expected[3]),
         ),
         // A rejected value is quoted back into the error envelope, so one carrying
         // XML metacharacters must travel escaped rather than breaking the envelope.
@@ -216,7 +245,7 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
     // where the next page starts, so the listing resumes at the first identity at or
     // after it rather than refusing a caller whose page boundary was deleted between
     // calls.
-    let over_a_gap = encode_page_token(LISTING_IDENTITIES, &format!("{}a", expected[7]));
+    let over_a_gap = identity_page_token(&token_key, &format!("{}a", expected[7]));
     let (after_gap, _) = list(&router, None, Some(&over_a_gap)).await;
     assert_eq!(
         after_gap,

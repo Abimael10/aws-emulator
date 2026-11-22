@@ -31,7 +31,11 @@
 //!
 //! A listing this store serves a page at a time hands the caller an OPAQUE,
 //! self-verifying cursor ([`encode_page_token`]), so a token this service never
-//! issued is refused instead of being read as some arbitrary position.
+//! issued is refused instead of being read as some arbitrary position. A listing
+//! over a collection the account's other email APIs page too takes that cursor from
+//! the shared registry instead ([`identity_page_token`],
+//! [`configuration_set_page_token`], [`template_page_token`]), so one cursor names a
+//! position in the ACCOUNT's collection rather than in this API's view of it.
 //!
 //! The identity list here is this surface's VIEW of one account-wide set of email
 //! identities, which lives in the shared engine as
@@ -2023,10 +2027,6 @@ pub const LISTING_RECEIPT_RULE_SETS: &str = "ListReceiptRuleSets";
 /// listing.
 pub const LISTING_CONFIGURATION_SETS: &str = "ListConfigurationSets";
 
-/// The listing name stamped into a `ListIdentities` page token, for the same
-/// reason: a cursor cut from the identity list resumes only that listing.
-pub const LISTING_IDENTITIES: &str = "ListIdentities";
-
 /// The listing name stamped into a `ListCustomVerificationEmailTemplates` page
 /// token, for the same reason: a cursor cut from the custom verification email
 /// template list resumes only that listing.
@@ -3436,6 +3436,25 @@ pub fn identity_registry<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<
             ::service_common::ses_identities::SesIdentityDirectory,
         >)
+}
+
+/// The `NextToken` the identity listing hands back to resume at `cursor` — the identity the
+/// NEXT page starts at — and the reading of one it is handed.
+///
+/// The registry's, not this surface's: the APIs over the account's identities page one
+/// directory, so one token form serves them all
+/// ([`::service_common::ses_identities::page_token`]).
+pub use ::service_common::ses_identities::{
+    page_cursor as identity_page_cursor, page_token as identity_page_token,
+};
+
+/// The key this account's identity-listing tokens are authenticated under
+/// ([`identity_page_token`]), or `None` when the engine holds no registry at all.
+///
+/// Taken by value — [`PageTokenKey`] is `Copy` — so a listing reads the key and then goes
+/// on to read the identities it is about to report without holding the registry's lock.
+pub fn identity_page_token_key<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<PageTokenKey> {
+    Some(identity_registry(engine)?.lock().page_token_key())
 }
 
 /// Bring this service's identity list and the account's identity registry back into

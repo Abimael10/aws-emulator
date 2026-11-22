@@ -3,7 +3,9 @@
 //! @op ListIdentities
 //!
 //! Reports this account's identity list, filtered by `IdentityType`, in one
-//! stable order, a page at a time.
+//! stable order, a page at a time. The page cursor belongs to the ACCOUNT's identity
+//! directory rather than to this API, so one this listing issues continues the SES v2
+//! identity listing and one that listing issues continues this one.
 //!
 //! ## Shape of an operation
 //!
@@ -191,32 +193,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ListIdentities",
             ));
         };
-        let state = state.lock();
 
-        // A page token is OPAQUE and self-verifying: only a cursor this listing
-        // issued names a position in it, so a value the caller made up is refused
-        // instead of being read as some arbitrary position — a caller that hands
-        // back a stale or hand-built cursor is told so rather than silently
-        // restarting the walk at page one. The refusal quotes the rejected value in
-        // angle brackets, as this service words it, and the identity list is left
-        // untouched.
+        // A page token is OPAQUE and self-verifying: only a cursor a listing of the
+        // ACCOUNT's identities issued names a position in it, so a value the caller
+        // made up is refused instead of being read as some arbitrary position — a
+        // caller that hands back a stale or hand-built cursor is told so rather than
+        // silently restarting the walk at page one. The cursor is the account
+        // registry's rather than this surface's
+        // ([`crate::state::identity_page_token`]), because the APIs over the account's
+        // identities page ONE directory: a token this listing issued continues the v2
+        // listing and one the v2 listing issued continues this one. The refusal quotes
+        // the rejected value in angle brackets, as this service words it, and the
+        // identity list is left untouched.
+        let Some(token_key) = crate::state::identity_page_token_key(&*self.engine) else {
+            // No registry at all, so this surface has no account identity directory to
+            // page: see `verify_email_identity.rs` for why that answers the scaffold's
+            // 501 rather than a modelled client error.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListIdentities",
+            ));
+        };
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(crate::state::LISTING_IDENTITIES, token)
-                    .ok_or_else(|| {
-                        crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                            "Invalid NextToken <{token}>."
-                        ))
-                    })?,
+                crate::state::identity_page_cursor(&token_key, token).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                        "Invalid NextToken <{token}>."
+                    ))
+                })?,
             ),
         };
 
-        // The store is keyed by the identity string, so iteration is in one
-        // stable (lexicographic) order for every caller — which is what makes a
-        // `NextToken` resumable at all. The cursor names the identity the next page
-        // starts at, so a page boundary never repeats or skips an entry even when
-        // identities are added or removed between calls.
+        let state = state.lock();
+
+        // The store is keyed by the identity key, so iteration is in one stable
+        // (lexicographic) order for every caller — the same order the v2 surface walks
+        // — which is what makes a `NextToken` resumable at all, on either surface. The
+        // cursor names the identity the next page starts at, so a page boundary never
+        // repeats or skips an entry even when identities are added or removed between
+        // calls.
         let page = match resume_from.as_deref() {
             Some(resume_from) => (
                 std::ops::Bound::Included(resume_from),
@@ -231,10 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if identities.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(
-                    crate::state::LISTING_IDENTITIES,
-                    name,
-                ));
+                next_token = Some(crate::state::identity_page_token(&token_key, name));
                 break;
             }
             // The identity as it was RECORDED, which is the value every other reader
