@@ -254,14 +254,31 @@ async fn create_confirmed_user(router: &MultiServiceRouter, user_pool_id: &str, 
 }
 
 /// Sign `username` in with its password and return the `AuthenticationResult`.
+///
+/// A client that holds a secret is a confidential one, so the request proves it holds
+/// that secret: "add a `SECRET_HASH` parameter if your app client has a client secret"
+/// (`InitiateAuth.AuthParameters` in this service's model).
 async fn sign_in(router: &MultiServiceRouter, fixture: &Fixture, username: &str) -> Value {
+    let mut parameters = Map::new();
+    parameters.insert("USERNAME".to_string(), json!(username));
+    parameters.insert("PASSWORD".to_string(), json!(GOOD_PASSWORD));
+    if let Some(secret) = fixture.client_secret.as_deref() {
+        parameters.insert(
+            "SECRET_HASH".to_string(),
+            json!(super::confidential_client_sign_in::secret_hash(
+                secret,
+                username,
+                &fixture.client_id
+            )),
+        );
+    }
     let payload = ok(
         router,
         "InitiateAuth",
         &json!({
             "ClientId": fixture.client_id,
             "AuthFlow": "USER_PASSWORD_AUTH",
-            "AuthParameters": { "USERNAME": username, "PASSWORD": GOOD_PASSWORD },
+            "AuthParameters": Value::Object(parameters),
         }),
     )
     .await;

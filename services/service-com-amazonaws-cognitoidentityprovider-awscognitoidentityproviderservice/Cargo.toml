@@ -98,8 +98,9 @@ totp-lite = "2.0"
 csv = "1.3"
 # `url`: reads the scheme and the host of a redirect URL an app client registers
 # (`src/state/client_preconditions.rs`), the way every other reader of a URL in this
-# tree does, rather than scanning the authority by hand.
-url = "2"
+# tree does, rather than scanning the authority by hand. At 2.5.9 or newer, where
+# `Url::origin()` no longer recurses once per `blob:` prefix of a caller-supplied URL.
+url = "2.5.9"
 # `ipnet`: reads the CIDR notation a pool's threat-protection address exceptions are
 # "displayed and set in" and decides whether a request's address lies in one of those
 # blocks (`src/state/risk_exceptions.rs`).

@@ -565,27 +565,45 @@ async fn the_client_credentials_grant_refuses_an_undefined_scope_as_unauthorized
         );
     }
 
-    // Every scope the POOL defines is granted, whether or not the app client is
-    // configured with it, and a request naming none falls back to its configuration.
-    for (case, scopes, expected) in [
+    // Every scope the request names must be one the APP CLIENT was permitted, so the
+    // positive controls are asked for scopes within each client's own
+    // `AllowedOAuthScopes`: the first is permitted one scope, the second the scopes of
+    // two resource servers, and a request naming none falls back to the client's own.
+    let broad_client = create_client(
+        &router,
+        &user_pool_id,
+        "m2m-broad-scopes",
+        &[CLIENT_TOKEN_AUTH_FLOW],
+        Some(CLIENT_SECRET),
+        Some(&[
+            "urn:billing/invoice.read",
+            "https://api.example.test/write",
+        ]),
+        None,
+    )
+    .await;
+    for (case, client, scopes, expected) in [
         (
             "one scope of one resource server",
+            client_id.as_str(),
             Some(json!(["https://api.example.test/read"])),
             vec!["https://api.example.test/read"],
         ),
         (
             "scopes of two resource servers at once",
+            broad_client.as_str(),
             Some(json!(["urn:billing/invoice.read", "https://api.example.test/write"])),
             vec!["urn:billing/invoice.read", "https://api.example.test/write"],
         ),
         (
             "no scopes at all, which takes the app client's own",
+            client_id.as_str(),
             None,
             vec!["https://api.example.test/read"],
         ),
     ] {
         let mut body = Map::new();
-        body.insert("ClientId".to_string(), json!(client_id));
+        body.insert("ClientId".to_string(), json!(client));
         body.insert("Secret".to_string(), json!(CLIENT_SECRET));
         if let Some(scopes) = scopes {
             body.insert("Scopes".to_string(), scopes);

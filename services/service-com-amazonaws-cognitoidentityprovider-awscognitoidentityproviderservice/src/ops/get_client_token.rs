@@ -10,6 +10,10 @@
 //! app client's configured access-token validity, and the scopes the request asked for
 //! or, when it asked for none, the ones the stored app client is configured with.
 //!
+//! The app client's own `AllowedOAuthScopes` is the bound on what the token may
+//! authorize either way: a request naming a scope outside that grant is refused rather
+//! than served a token narrowed to the granted part ([`SCOPES_NOT_GRANTED`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -240,6 +244,19 @@ const INVALID_CLIENT_OR_SECRET: &str = "Invalid client or secret";
 /// refusal carries this one sentence.
 const INVALID_SCOPES_REQUESTED: &str = "Invalid scopes requested";
 
+/// The message a request whose `Scopes` name a scope the app client's own
+/// `AllowedOAuthScopes` does not grant is refused with.
+///
+/// `AllowedOAuthScopes` is "the OAuth, OpenID Connect (OIDC), and custom scopes that
+/// you want to permit your app client to authorize access with" (`CreateUserPoolClient`
+/// in this service's model), so that list is the whole of what an app client may be
+/// authorized for: a scope outside it is one this app client was never permitted,
+/// whichever resource server of the pool defines it. The request is refused rather than
+/// narrowed to the granted part, because a token authorizing less than was asked for is
+/// not the token the caller asked for. It names no value from the request, so every such
+/// refusal carries this one sentence.
+const SCOPES_NOT_GRANTED: &str = "Client is not allowed to request these scopes";
+
 /// Resolve the request against stored state: the app client, its secret, the
 /// machine-to-machine configuration it has to carry, and the scopes the token is
 /// authorized for.
@@ -290,6 +307,21 @@ fn resolve(state: &State, input: &GetClientTokenInput) -> Result<Grant, GetClien
     } else {
         if requested.iter().any(|scope| !pool.defines_scope(scope)) {
             return Err(not_authorized(INVALID_SCOPES_REQUESTED));
+        }
+        // A scope the POOL defines is still only authorizable by an app client that
+        // was PERMITTED it: "Amazon Cognito authorizes the scopes that are configured
+        // for the app client" is what a request naming none falls back to, and those
+        // configured scopes are equally the bound on what a request may name — "the
+        // ... scopes that you want to permit your app client to authorize access
+        // with" (`AllowedOAuthScopes`). So an app client permitted a subset of its
+        // pool's scopes, and one permitted none at all, is refused every scope outside
+        // that grant ([`SCOPES_NOT_GRANTED`]) rather than served a narrowed token.
+        let granted = client.allowed_oauth_scopes.as_deref().unwrap_or_default();
+        if requested
+            .iter()
+            .any(|scope| !granted.iter().any(|permitted| permitted == scope))
+        {
+            return Err(not_authorized(SCOPES_NOT_GRANTED));
         }
         requested.to_vec()
     };

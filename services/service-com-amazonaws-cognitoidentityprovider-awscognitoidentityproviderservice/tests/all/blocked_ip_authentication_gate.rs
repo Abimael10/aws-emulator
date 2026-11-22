@@ -23,6 +23,10 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
+// The `SECRET_HASH` a confidential app client requires of a request, read through the one
+// definition of that tag this test target holds.
+use super::confidential_client_sign_in::secret_hash;
+
 /// A request's SigV4 credential scope is what routes it to this service. The
 /// signature is never checked here: the suite turns request authentication off.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -121,16 +125,6 @@ fn error_message(payload: &Value) -> &str {
         .or_else(|| payload.get("Message"))
         .and_then(Value::as_str)
         .unwrap_or("<no message>")
-}
-
-/// The `SecretHash` a request for `username` to the app client `client_id`
-/// carries when that client's secret is `client_secret`: base64 of HMAC-SHA256,
-/// keyed with the secret, over the username followed by the client id
-/// (`smithy_query(query="doc",shape="SignUpRequest",member="SecretHash")`).
-fn secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, client_secret.as_bytes());
-    let tag = ring::hmac::sign(&key, format!("{username}{client_id}").as_bytes());
-    aws_smithy_types::base64::encode(tag.as_ref())
 }
 
 /// A pool created in the add-on mode `mode` names — or with no `UserPoolAddOns`
@@ -242,16 +236,30 @@ async fn block_ranges(
 }
 
 /// An `AdminInitiateAuth` request for [`USERNAME`] with the correct password,
-/// stating `ip_address` as the device's source address when one is given.
-fn admin_initiate_auth(user_pool_id: &str, client_id: &str, ip_address: Option<&str>) -> Value {
+/// stating `ip_address` as the device's source address when one is given, and
+/// carrying the `SECRET_HASH` of `client_secret` when the app client holds one
+/// ("add a `SECRET_HASH` parameter if your app client has a client secret",
+/// `AdminInitiateAuth.AuthParameters` in this service's model).
+fn admin_initiate_auth(
+    user_pool_id: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    ip_address: Option<&str>,
+) -> Value {
     let mut body = Map::new();
     body.insert("UserPoolId".to_string(), json!(user_pool_id));
     body.insert("ClientId".to_string(), json!(client_id));
     body.insert("AuthFlow".to_string(), json!("ADMIN_USER_PASSWORD_AUTH"));
-    body.insert(
-        "AuthParameters".to_string(),
-        json!({ "USERNAME": USERNAME, "PASSWORD": GOOD_PASSWORD }),
-    );
+    let mut parameters = Map::new();
+    parameters.insert("USERNAME".to_string(), json!(USERNAME));
+    parameters.insert("PASSWORD".to_string(), json!(GOOD_PASSWORD));
+    if let Some(secret) = client_secret {
+        parameters.insert(
+            "SECRET_HASH".to_string(),
+            json!(secret_hash(secret, USERNAME, client_id)),
+        );
+    }
+    body.insert("AuthParameters".to_string(), Value::Object(parameters));
     if let Some(ip_address) = ip_address {
         // Every member of `ContextDataType` but `EncodedData` is `@required`.
         body.insert(
@@ -419,7 +427,7 @@ async fn an_address_inside_a_blocked_range_is_refused_whatever_the_range_names()
         let (status, payload) = call(
             &router,
             "AdminInitiateAuth",
-            &admin_initiate_auth(&fixture.user_pool_id, &fixture.client_id, *address),
+            &admin_initiate_auth(&fixture.user_pool_id, &fixture.client_id, None, *address),
         )
         .await;
         assert_block(case, *blocked, status, &payload);
@@ -453,6 +461,7 @@ async fn only_a_pool_that_acts_on_its_threat_protection_blocks_the_request() {
             &admin_initiate_auth(
                 &fixture.user_pool_id,
                 &fixture.client_id,
+                None,
                 Some("203.0.113.77"),
             ),
         )
@@ -610,29 +619,35 @@ async fn the_ranges_that_apply_are_the_ones_stored_at_the_app_clients_own_level(
     .await;
 
     // The rows differ along which level configured the app client the request
-    // carries, and along which of the two ranges the stated address lies in.
-    for (case, client_id, address, blocked) in [
+    // carries, and along which of the two ranges the stated address lies in. The
+    // second app client holds a secret, so its rows carry that secret's
+    // `SECRET_HASH`.
+    for (case, client_id, client_secret, address, blocked) in [
         (
             "the app client's own range, on the client that configured one",
             &fixture.client_id,
+            None,
             "198.51.100.7",
             true,
         ),
         (
             "the pool's range, on the client that configured its own",
             &fixture.client_id,
+            None,
             "203.0.113.77",
             false,
         ),
         (
             "the pool's range, on a client that configured none",
             &fixture.propagating_client_id,
+            Some(fixture.propagating_client_secret.as_str()),
             "203.0.113.77",
             true,
         ),
         (
             "the other client's range, on a client that configured none",
             &fixture.propagating_client_id,
+            Some(fixture.propagating_client_secret.as_str()),
             "198.51.100.7",
             false,
         ),
@@ -640,7 +655,12 @@ async fn the_ranges_that_apply_are_the_ones_stored_at_the_app_clients_own_level(
         let (status, payload) = call(
             &router,
             "AdminInitiateAuth",
-            &admin_initiate_auth(&fixture.user_pool_id, client_id, Some(address)),
+            &admin_initiate_auth(
+                &fixture.user_pool_id,
+                client_id,
+                client_secret,
+                Some(address),
+            ),
         )
         .await;
         assert_block(case, blocked, status, &payload);
@@ -663,7 +683,12 @@ async fn the_block_is_decided_before_the_credential_the_request_carries() {
     // than with the refusal a bad credential owes, so nothing about the
     // credential was evaluated.
     let mut wrong_password =
-        admin_initiate_auth(&fixture.user_pool_id, &fixture.client_id, Some("203.0.113.77"));
+        admin_initiate_auth(
+            &fixture.user_pool_id,
+            &fixture.client_id,
+            None,
+            Some("203.0.113.77"),
+        );
     wrong_password["AuthParameters"]["PASSWORD"] = json!("not-the-password");
     let (status, payload) = call(&router, "AdminInitiateAuth", &wrong_password).await;
     assert_block(
@@ -708,6 +733,7 @@ async fn the_block_is_decided_before_the_credential_the_request_carries() {
         &admin_initiate_auth(
             &fixture.user_pool_id,
             &fixture.client_id,
+            None,
             Some("198.51.100.7"),
         ),
     )
@@ -775,7 +801,7 @@ async fn a_prevented_attempt_is_logged_with_the_pools_block_decision() {
         call(
             &router,
             "AdminInitiateAuth",
-            &admin_initiate_auth(&fixture.user_pool_id, &fixture.client_id, Some(address)),
+            &admin_initiate_auth(&fixture.user_pool_id, &fixture.client_id, None, Some(address)),
         )
         .await;
         let event = newest_auth_event(&router, &fixture.user_pool_id).await;

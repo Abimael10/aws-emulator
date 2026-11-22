@@ -10,6 +10,11 @@
 //! token this pool issued for a fresh id and access token. Every other
 //! `AuthFlow` answers 501 until it is implemented.
 //!
+//! An app client that holds a client secret is a CONFIDENTIAL client, so the sign-in first
+//! requires the `SECRET_HASH` parameter that secret produces over the username it names
+//! ([`SECRET_HASH`]), and refuses the sign-in when the parameter is absent or is not a tag
+//! the stored secret produces.
+//!
 //! On a user pool that carries a `DeviceConfiguration`, a completed sign-in also
 //! records the device it came from and answers with that device's
 //! `NewDeviceMetadata` when the pool did not recognise it.
@@ -495,6 +500,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                 &input.client_id,
                 &username,
                 &password,
+                auth_parameters.get(SECRET_HASH).map(String::as_str),
                 auth_parameters.get(DEVICE_KEY).map(String::as_str),
                 now,
                 true,
@@ -524,6 +530,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                     &input.client_id,
                     &username,
                     &password,
+                    auth_parameters.get(SECRET_HASH).map(String::as_str),
                     auth_parameters.get(DEVICE_KEY).map(String::as_str),
                     now,
                     false,
@@ -711,6 +718,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
 
     /// Decide this sign-in from the STORED state, before anything is written.
     ///
+    /// `presented_secret_hash` is the request's [`SECRET_HASH`] parameter, which a
+    /// confidential app client's caller proves it holds the client secret with.
+    ///
     /// `may_migrate` is whether a username the pool does not hold may still be migrated:
     /// the first pass of a pool that configures a migrate-user function asks for that
     /// migration, and the pass that follows it decides over the state the migration left.
@@ -725,6 +735,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
         client_id: &str,
         username: &str,
         password: &str,
+        presented_secret_hash: Option<&str>,
         presented_device_key: Option<&str>,
         now: ::std::time::SystemTime,
         may_migrate: bool,
@@ -750,6 +761,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
             return Err(invalid_parameter(
                 crate::state::ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE.to_string(),
             ));
+        }
+        // A CONFIDENTIAL app client authenticates a caller acting as it by the
+        // secret it holds ([`SECRET_HASH`]), over the username this sign-in names
+        // plus the app client. Asked before the pool is searched for that username
+        // and before the password is checked, so the sign-in of an app client whose
+        // secret the request does not hold moves no stored state.
+        if let Some(defect) = client.secret_hash_defect(username, presented_secret_hash) {
+            return Err(not_authorized(&defect.message(client_id)));
         }
         let hides_user_existence = client.hides_user_existence();
         let session_validity = client.auth_session_validity();
@@ -899,8 +918,22 @@ async fn refresh_sign_in(
         }
         guard
             .resolve_refresh_token(&input.user_pool_id, &input.client_id, &refresh_token, now)
-            .map_err(refresh_refused)?
-            .username
+            .map_err(refresh_refused)
+            .and_then(|refreshed| {
+                // A CONFIDENTIAL app client authenticates a caller acting as it by the
+                // secret it holds ([`SECRET_HASH`]), over the username plus the app
+                // client. This flow names no username of its own — the user is the one
+                // the presented refresh token was issued to — so the gate is asked as
+                // soon as that username is known, before any token is minted for it,
+                // exactly as on the client-side sign-in.
+                match client.secret_hash_defect(
+                    &refreshed.username,
+                    auth_parameters.get(SECRET_HASH).map(String::as_str),
+                ) {
+                    Some(defect) => Err(not_authorized(&defect.message(&input.client_id))),
+                    None => Ok(refreshed.username),
+                }
+            })?
     };
 
     let overrides = crate::state::lambda_triggers::fire_pre_token_generation(
@@ -974,6 +1007,19 @@ const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 /// remembered device" (`AdminInitiateAuth.AuthParameters` in this service's
 /// model).
 const DEVICE_KEY: &str = "DEVICE_KEY";
+
+/// The `AuthParameters` entry a CONFIDENTIAL app client's caller proves it holds
+/// the client secret with: "add a `SECRET_HASH` parameter if your app client has a
+/// client secret" (`AdminInitiateAuth.AuthParameters` in this service's model),
+/// which the doc states for the parameter map as a whole rather than for one
+/// `AuthFlow`.
+///
+/// The hash is the tag the app client's secret produces over the username plus the
+/// client id, judged through the one definition of that check
+/// ([`crate::state::UserPoolClient::secret_hash_defect`]), so this sign-in and the
+/// client-side one cannot disagree about which hash an app client accepts. An app
+/// client that holds no secret has nothing to prove.
+const SECRET_HASH: &str = "SECRET_HASH";
 
 /// What the stored state decided this sign-in is, read under the state lock
 /// before anything is written.

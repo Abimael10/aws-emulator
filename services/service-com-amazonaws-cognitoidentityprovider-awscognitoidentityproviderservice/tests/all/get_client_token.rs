@@ -21,7 +21,9 @@
 //! of several resource servers defines them, a resource server identifier that itself
 //! carries the `/` separator, and the access-token validity the lifetime is read off —
 //! with a row on each bound of the window the model documents for an access token's
-//! lifetime (five minutes to one day).
+//! lifetime (five minutes to one day). Every scope a row asks for is one its app client's
+//! `AllowedOAuthScopes` permits, which is the bound on what the grant may authorize
+//! (`client_token_scope_grant.rs` is where that bound is itself under test).
 //!
 //! A token issued to an app client is NOT the "access token that Amazon Cognito issued
 //! to the currently signed-in user" the self-service operations ask for, and those
@@ -359,7 +361,7 @@ async fn a_client_credentials_grant_issues_one_scoped_access_token_of_the_app_cl
             case: "one requested scope of the pool's only resource server",
             pool_name: "one-scope-pool",
             resource_servers: &[("https://inventory.example.test", &["items.read"])],
-            configured_scopes: &[],
+            configured_scopes: &["https://inventory.example.test/items.read"],
             access_token_validity: Some((15, "minutes")),
             requested_scopes: Some(&["https://inventory.example.test/items.read"]),
             expected_scopes: &["https://inventory.example.test/items.read"],
@@ -372,7 +374,11 @@ async fn a_client_credentials_grant_issues_one_scoped_access_token_of_the_app_cl
                 ("https://orders.example.test", &["place", "cancel"]),
                 ("urn:billing", &["invoice.read"]),
             ],
-            configured_scopes: &["https://orders.example.test/place"],
+            configured_scopes: &[
+                "https://orders.example.test/place",
+                "https://orders.example.test/cancel",
+                "urn:billing/invoice.read",
+            ],
             access_token_validity: Some((2, "hours")),
             requested_scopes: Some(&[
                 "urn:billing/invoice.read",
@@ -402,7 +408,7 @@ async fn a_client_credentials_grant_issues_one_scoped_access_token_of_the_app_cl
             case: "a resource server identifier that carries the scope separator itself",
             pool_name: "separator-pool",
             resource_servers: &[("https://api.example.test/v2", &["read"])],
-            configured_scopes: &[],
+            configured_scopes: &["https://api.example.test/v2/read"],
             // The upper bound of that window: one day, named in seconds, which
             // is also the member's modelled maximum.
             access_token_validity: Some((86_400, "seconds")),

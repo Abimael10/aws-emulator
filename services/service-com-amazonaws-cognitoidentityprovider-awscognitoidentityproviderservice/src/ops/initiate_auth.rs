@@ -10,6 +10,11 @@
 //! no `UserPoolId`. The two admin flows are refused as the model documents, and every
 //! remaining `AuthFlow` answers 501 until it is implemented.
 //!
+//! An app client that holds a client secret is a CONFIDENTIAL client, so each flow above
+//! first requires the `SECRET_HASH` parameter that secret produces over the username the
+//! flow signs in ([`SECRET_HASH`]), and refuses the sign-in when the parameter is absent
+//! or is not a tag the stored secret produces.
+//!
 //! On a user pool that carries a `DeviceConfiguration`, a completed password sign-in
 //! also records the device it came from and answers with that device's
 //! `NewDeviceMetadata` when the pool did not recognise it.
@@ -635,6 +640,19 @@ const CODE_DELIVERY_DESTINATION: &str = crate::state::CODE_DELIVERY_DESTINATION;
 /// remembered device" (`InitiateAuth.AuthParameters` in this service's model).
 const DEVICE_KEY: &str = "DEVICE_KEY";
 
+/// The `AuthParameters` entry a CONFIDENTIAL app client's caller proves it holds
+/// the client secret with: "add a `SECRET_HASH` parameter if your app client has a
+/// client secret" (`InitiateAuth.AuthParameters` in this service's model), which
+/// the doc states for the parameter map as a whole rather than for one `AuthFlow`.
+///
+/// This operation is `@optionalAuth`, so the app client's secret is the only thing
+/// that authenticates a caller acting as that app client: every flow below asks for
+/// it through [`crate::state::UserPoolClient::secret_hash_defect`], over the
+/// username the flow signs in, before the credential the flow presents is checked.
+/// An app client that holds no secret has nothing to prove and is judged by neither
+/// sentence.
+const SECRET_HASH: &str = "SECRET_HASH";
+
 /// `AuthFlow=USER_PASSWORD_AUTH`: "Client-side username-password authentication with
 /// the password sent directly in the request" (`InitiateAuth.AuthFlow`), whose
 /// `AuthParameters` are `USERNAME` and `PASSWORD`, both documented "required".
@@ -669,6 +687,7 @@ async fn password_sign_in(
             client_id,
             username,
             password,
+            auth_parameters.get(SECRET_HASH).map(String::as_str),
             auth_parameters.get(DEVICE_KEY).map(String::as_str),
             now,
             true,
@@ -699,6 +718,7 @@ async fn password_sign_in(
                 client_id,
                 username,
                 password,
+                auth_parameters.get(SECRET_HASH).map(String::as_str),
                 auth_parameters.get(DEVICE_KEY).map(String::as_str),
                 now,
                 false,
@@ -903,6 +923,9 @@ enum Decided {
 /// Decide the password sign-in of `username` through `client_id` from the STORED state,
 /// before anything is written.
 ///
+/// `presented_secret_hash` is the request's [`SECRET_HASH`] parameter, which a
+/// confidential app client's caller proves it holds the client secret with.
+///
 /// `may_migrate` is whether a username the pool does not hold may still be migrated: the
 /// first pass of a pool that configures a migrate-user function asks for that migration, and
 /// the pass that follows it decides over the state the migration left.
@@ -916,6 +939,7 @@ fn decide_password_sign_in(
     client_id: &str,
     username: &str,
     password: &str,
+    presented_secret_hash: Option<&str>,
     presented_device_key: Option<&str>,
     now: ::std::time::SystemTime,
     may_migrate: bool,
@@ -932,6 +956,14 @@ fn decide_password_sign_in(
         return Err(invalid_parameter(
             crate::state::auth_flow_not_enabled_message(USER_PASSWORD_AUTH),
         ));
+    }
+    // A CONFIDENTIAL app client authenticates its caller by the secret it holds
+    // ([`SECRET_HASH`]), and the hash authenticates the username this flow signs in
+    // plus the app client. Asked before the pool is searched for that username and
+    // before the password is checked, so a caller that does not hold the secret
+    // learns nothing about the user it named and no stored state moves for it.
+    if let Some(defect) = client.secret_hash_defect(username, presented_secret_hash) {
+        return Err(not_authorized(&defect.message(client_id)));
     }
     let hides_user_existence = client.hides_user_existence();
     let session_validity = client.auth_session_validity();
@@ -1045,6 +1077,17 @@ fn email_otp_sign_in(
             return Err(invalid_parameter(
                 crate::state::auth_flow_not_enabled_message(USER_AUTH),
             ));
+        }
+        // A CONFIDENTIAL app client authenticates its caller by the secret it
+        // holds ([`SECRET_HASH`]), over the username this flow signs in plus the
+        // app client. Asked before the pool is searched for that username and
+        // before any code is minted, so a caller that does not hold the secret
+        // starts no challenge and is delivered no one-time password.
+        if let Some(defect) = client.secret_hash_defect(
+            username,
+            auth_parameters.get(SECRET_HASH).map(String::as_str),
+        ) {
+            return Err(not_authorized(&defect.message(client_id)));
         }
         // `SignInPolicyType.AllowedFirstAuthFactors` is what the POOL admits as a
         // first authentication factor, so a pool that does not list this one does
@@ -1224,6 +1267,18 @@ async fn refresh_sign_in(
         let refreshed = state
             .resolve_refresh_token(&user_pool_id, client_id, refresh_token, now)
             .map_err(refresh_refused)?;
+
+        // A CONFIDENTIAL app client authenticates its caller by the secret it
+        // holds ([`SECRET_HASH`]), over the username plus the app client. This
+        // flow names no username of its own — the user is the one the presented
+        // refresh token was issued to — so the gate is asked as soon as that
+        // username is known, before any token is minted for it.
+        if let Some(defect) = client.secret_hash_defect(
+            &refreshed.username,
+            auth_parameters.get(SECRET_HASH).map(String::as_str),
+        ) {
+            return Err(not_authorized(&defect.message(client_id)));
+        }
         (refreshed.user_pool_id, refreshed.username)
     };
 

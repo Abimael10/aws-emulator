@@ -275,6 +275,10 @@ async fn create_confirmed_user(router: &MultiServiceRouter, user_pool_id: &str, 
 
 /// Sign `username` in with its password on `client_id` and return the
 /// `AuthenticationResult`.
+///
+/// A client that holds a secret is a confidential one, so the request proves it holds
+/// that secret: "add a `SECRET_HASH` parameter if your app client has a client secret"
+/// (`InitiateAuth.AuthParameters` in this service's model).
 async fn sign_in(
     router: &MultiServiceRouter,
     client_id: &str,
@@ -284,10 +288,18 @@ async fn sign_in(
     let mut body = Map::new();
     body.insert("ClientId".to_string(), json!(client_id));
     body.insert("AuthFlow".to_string(), json!("USER_PASSWORD_AUTH"));
-    body.insert(
-        "AuthParameters".to_string(),
-        json!({ "USERNAME": username, "PASSWORD": GOOD_PASSWORD }),
-    );
+    let mut parameters = Map::new();
+    parameters.insert("USERNAME".to_string(), json!(username));
+    parameters.insert("PASSWORD".to_string(), json!(GOOD_PASSWORD));
+    if let Some(secret) = client_secret {
+        parameters.insert(
+            "SECRET_HASH".to_string(),
+            json!(super::confidential_client_sign_in::secret_hash(
+                secret, username, client_id
+            )),
+        );
+    }
+    body.insert("AuthParameters".to_string(), Value::Object(parameters));
     if let Some(secret) = client_secret {
         body.insert("ClientSecret".to_string(), json!(secret));
     }
