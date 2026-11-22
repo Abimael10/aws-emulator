@@ -34,3 +34,44 @@ The check's blocking waits, from its own source as the suite report prints it: _
 4. Poll DescribeTasks for that task arn: expect lastStatus to reach STOPPED with a stopCode other than TaskFailedToStart and containers[0].exitCode set; observe that it never does within the check's budget.
 5. Poll the log group for the task's stream (prefix "efs") and the sentinel line: expect the container's stdout lines to be delivered; observe no delivery.
 6. Also expect each awsvpc task to report its own networkInterfaceId in attachments[].details, and a readOnly mountPoint to make an in-container append fail with "Read-only file system" while a read succeeds — neither is reachable while step 4 does not converge.
+
+## Resolution note (added by the fix that closed this report)
+
+STATUS: cause 1 is SERVED, and this report's recorded check CANNOT be verified by replay — it
+returns no verdict for any emulator, for the budget reason measured below. Every call of this
+scenario is answered, every claim the check asserts holds, and the three arms the check drives
+run end to end against this checkout; what remains is the harness cap, not a divergence. This is
+the measurement — taken through the emulator's own clock rather than assumed, by making one
+operation answer a diagnostic so the replay reported it — of where the check's 60 s go:
+
+* `CreateCluster`, `CreateLogGroup` and `CreateFileSystem` all land inside the same 100 ms.
+* Arm A's `RunTask` is 20.2 s later: the file system reaching `available` and then the mount
+  target reaching it cost ONE look plus one 10 s `time.sleep` each, because each resource is
+  `creating` at the look that follows its create and reaches `available` a span later.
+* Arm B's `RunTask` is at +30.2 s and arm C's at +40.2 s — one 10 s sleep per arm, the interval
+  the check's own source passes (`interval_s=10`), because a task is `PROVISIONING` at the look
+  that follows its `RunTask` and `STOPPED` about 6 s later.
+* Arm C's first `DescribeTasks` (which reports `PROVISIONING`) is the LAST call the emulator
+  sees: the harness cap fires inside the 10 s sleep after it. The check's own clock therefore
+  started 10-19 s before `CreateCluster` — it creates a VPC, a subnet, an internet gateway and
+  an execution role first — so six sequential 10 s sleeps meet the 60 s cap whatever the
+  emulator answers.
+
+Arms A and B passing their assertions is what carries the check as far as arm C: it got past
+`containers[0].exitCode == 0`, `A-SIZE`, `A-MODE` and arm B's read-back of A's bytes. Shortening
+any clock-owed span does not help, because each of those six looks is followed by a sleep the
+check takes whether the condition held 1 ms or 6 s after the call; collapsing every span of the
+ECS and Amazon EFS crates to 1 ms leaves the same verdict.
+
+What this fix adds is the one shape of the scenario no suite covered — arm C's, whose program is
+`echo "C-READ=$(tr "\n" "|" < /mnt/shared/payload)"; if echo x 2>/tmp/err >> /mnt/shared/payload;
+then echo C-WROTE; else echo "C-DENIED-ERR=$(tr "\n" " " < /tmp/err)"; fi; echo C-DONE`:
+`core/router/tests/all/ecs_read_only_mount_write_refusal.rs` pins where the account of a refused
+write GOES over a table of rows — delivered beside the container's output when nothing redirects
+it, into the file a `2> path` names when the program reads it back from there — with the refused
+write leaving the volume as it was (a truncation included), the program's own `if` branching on
+the failure, and the task reaching `STOPPED` with `EssentialContainerExited` and its container's
+own `exitCode`. The Amazon EFS halves — one file system shared across tasks, the mount rooted at
+its access point's path, and the awslogs delivery — stay pinned by
+`core/router/tests/all/ecs_efs_volume_mounts.rs` and
+`core/router/tests/all/ecs_efs_shared_volume_handover.rs`.
