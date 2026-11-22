@@ -334,12 +334,12 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// when one can be.
     ///
     /// The ONE bound on this map, so every operation that mints a serverless
-    /// cache snapshot — `CreateServerlessCacheSnapshot` and the
-    /// `FinalSnapshotName` of a `DeleteServerlessCache` — holds to it and
-    /// reports it in the same words: a name is unique for the account, and the
-    /// store holds at most [`SERVERLESS_CACHE_SNAPSHOT_QUOTA`] snapshots. A
-    /// snapshot has no retention limit to expire under, so nothing but this
-    /// bound keeps the map finite.
+    /// cache snapshot — `CreateServerlessCacheSnapshot`,
+    /// `CopyServerlessCacheSnapshot` and the `FinalSnapshotName` of a
+    /// `DeleteServerlessCache` — holds to it and reports it in the same words: a
+    /// name is unique for the account, and the store holds at most
+    /// [`SERVERLESS_CACHE_SNAPSHOT_QUOTA`] snapshots. A snapshot has no retention
+    /// limit to expire under, so nothing but this bound keeps the map finite.
     pub fn serverless_cache_snapshot_refusal(
         &self,
         name: &str,

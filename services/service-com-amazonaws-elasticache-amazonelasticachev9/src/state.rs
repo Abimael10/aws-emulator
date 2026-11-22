@@ -38,9 +38,10 @@
 //! because it outlives the cache it was taken of:
 //! `CreateServerlessCacheSnapshot` mints one from a stored serverless cache (and
 //! `DeleteServerlessCache`'s `FinalSnapshotName` mints the last one),
-//! `DescribeServerlessCacheSnapshots` reports it, and the copy, export and
-//! delete calls for one are still scaffolded 501s that will read and write this
-//! same copy rather than a second one.
+//! `CopyServerlessCacheSnapshot` mints a second from a stored snapshot,
+//! `DescribeServerlessCacheSnapshots` reports it and `ExportServerlessCacheSnapshot`
+//! writes its data set out, while the delete call for one is still a scaffolded
+//! 501 that will read and write this same copy rather than a second one.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster, `CopySnapshot` mints a
@@ -125,8 +126,8 @@
 //! group's `user_ids`, and `User$UserGroupIds` stays derived from it.
 //!
 //! The operations of this service that are still a scaffolded 501, each owning
-//! its own gap issue, are exactly four: `CopyServerlessCacheSnapshot`,
-//! `DeleteServerlessCacheSnapshot`, `PrepareMigration` and `StopMigration`.
+//! its own gap issue, are exactly three: `DeleteServerlessCacheSnapshot`,
+//! `PrepareMigration` and `StopMigration`.
 //! Where a member of an implemented operation belongs to one of those, the
 //! comment beside it says so.
 //!
@@ -146,11 +147,11 @@
 //! The serverless cache is another customer-created resource this store holds:
 //! `CreateServerlessCache` mints one, `ModifyServerlessCache` changes it,
 //! `DescribeServerlessCaches` reports it and `DeleteServerlessCache` removes it.
-//! `CreateServerlessCacheSnapshot`, `DescribeServerlessCacheSnapshots` and
-//! `ExportServerlessCacheSnapshot` do the same for a snapshot of one, while
-//! copying and deleting a serverless snapshot are still scaffolded 501s with
-//! their own gap issues; every one of them reads and writes the SAME record
-//! rather than a copy beside it.
+//! `CreateServerlessCacheSnapshot`, `CopyServerlessCacheSnapshot`,
+//! `DescribeServerlessCacheSnapshots` and `ExportServerlessCacheSnapshot` do the
+//! same for a snapshot of one, while deleting a serverless snapshot is still a
+//! scaffolded 501 with its own gap issue; every one of them reads and writes the
+//! SAME record rather than a copy beside it.
 //!
 //! A replication group is the other resource this state holds:
 //! `CreateReplicationGroup` mints one together with the member cache clusters it

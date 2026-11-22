@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyServerlessCacheSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyServerlessCacheSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyServerlessCacheSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +164,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyServerlessCacheSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyServerlessCacheSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyServerlessCacheSnapshot"))
+        // This operation MUTATES: it "creates a copy of an existing serverless
+        // cache's snapshot", so it mints a second snapshot resource from a
+        // stored one. The source snapshot itself is only read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Both names are identities of stored snapshots, and a snapshot name
+        // "is stored as a lowercase string" — so the lookup and the new
+        // record's key are the lowercased forms.
+        let source_name = input.source_serverless_cache_snapshot_name.to_ascii_lowercase();
+        let target_name = input.target_serverless_cache_snapshot_name.to_ascii_lowercase();
+        // "Must be between 1 and 255 characters": the member carries no
+        // modelled `@length` or `@pattern`, so that bound and the character set
+        // this service's snapshot names carry are enforced here
+        // (`crate::state::is_valid_snapshot_name`), the same way the create of
+        // one enforces them.
+        if !crate::state::is_valid_snapshot_name(&target_name) {
+            return Err(invalid_value(format!(
+                "Invalid value {} for TargetServerlessCacheSnapshotName: a name must contain from \
+                 1 to 255 alphanumeric characters or hyphens.",
+                input.target_serverless_cache_snapshot_name
+            )));
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CopyServerlessCacheSnapshotErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
+                return Err(invalid_value(message))
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // `KmsKeyId` is "the identifier of the KMS key used to encrypt the
+        // target snapshot", which the copy reports for the rest of its life, so
+        // the identifier the request named is resolved to the key's own ARN
+        // before it is stored (`crate::state::kms_key`) — before the store is
+        // locked, because resolving it is a call into KMS.
+        let kms_key_id = crate::state::kms_key::stored_key_id(ctx, &region, input.kms_key_id).await;
+        let mut store = state.lock();
+
+        // The copy is derived from the SOURCE record, with the status change the
+        // clock already owed that record materialised first, so the state check
+        // below reads the status the source is owed at this instant.
+        let copy = {
+            let Some(source) = store.settled_serverless_cache_snapshot_mut(&source_name, now)
+            else {
+                return Err(snapshot_not_found());
+            };
+            // Only a settled snapshot has a finished data set to copy: one still
+            // `creating` holds nothing to take a copy of yet, which is what
+            // `InvalidServerlessCacheSnapshotStateFault` ("the state of the
+            // serverless cache snapshot was not received") refuses.
+            if source.status != crate::state::STATUS_AVAILABLE {
+                return Err(
+                    CopyServerlessCacheSnapshotErrorModeled::InvalidServerlessCacheSnapshotStateFault(
+                        InvalidServerlessCacheSnapshotStateFault {
+                            message: Some(format!(
+                                "Serverless cache snapshot {source_name} is in {} state, not {}.",
+                                source.status,
+                                crate::state::STATUS_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            source.copy_to(crate::state::ServerlessCacheSnapshotCopy {
+                target_name: target_name.clone(),
+                region,
+                kms_key_id,
+                tags,
+                now,
+            })
+        };
+
+        // Whether the copy can be stored under the target name at all is the
+        // store's one rule (`serverless_cache_snapshot_refusal`): the name is
+        // unique for the account, and the store holds at most its quota of
+        // snapshots. Copying a snapshot onto its own name lands here too,
+        // because the source is itself stored under that name. Each kind lifts
+        // into the fault this operation models for it.
+        match store.serverless_cache_snapshot_refusal(&target_name) {
+            Some(crate::state::ServerlessSnapshotRefusal::AlreadyExists(message)) => {
+                return Err(
+                    CopyServerlessCacheSnapshotErrorModeled::ServerlessCacheSnapshotAlreadyExistsFault(
+                        ServerlessCacheSnapshotAlreadyExistsFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Some(crate::state::ServerlessSnapshotRefusal::QuotaExceeded(message)) => {
+                return Err(
+                    CopyServerlessCacheSnapshotErrorModeled::ServerlessCacheSnapshotQuotaExceededFault(
+                        ServerlessCacheSnapshotQuotaExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            None => {}
+        }
+
+        // The response is read back out of the store, so it reports the
+        // persisted record: a copy answers `creating`, and the clock owes it
+        // `available` once the transition span has passed.
+        let stored = store.insert_serverless_cache_snapshot(copy);
+        let stored_name = stored.name.clone();
+        let serverless_cache_snapshot = stored.to_modeled();
+        // Copying a serverless cache snapshot is one of the events this service
+        // records, under the copy itself; see
+        // `crate::state::SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT,
+            &stored_name,
+            format!("Serverless cache snapshot copied from {source_name}"),
+            now,
+        );
+        Ok(CopyServerlessCacheSnapshotOutput {
+            serverless_cache_snapshot: Some(serverless_cache_snapshot),
+        })
     }
+}
+
+/// The modelled refusal for a `SourceServerlessCacheSnapshotName` the account
+/// holds no snapshot under: `ServerlessCacheSnapshotNotFoundFault`, HTTP 404,
+/// worded as
+/// [`crate::state::COPY_SOURCE_SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE`] —
+/// fixed text naming the missing snapshot as the SOURCE of the copy, which is
+/// what tells a client which of the two names a copy resolves could not be
+/// resolved.
+fn snapshot_not_found() -> CopyServerlessCacheSnapshotError {
+    CopyServerlessCacheSnapshotErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+        ServerlessCacheSnapshotNotFoundFault {
+            message: Some(
+                crate::state::COPY_SOURCE_SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE.to_string(),
+            ),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> CopyServerlessCacheSnapshotError {
+    CopyServerlessCacheSnapshotErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

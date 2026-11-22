@@ -255,9 +255,26 @@ pub fn serverless_cache_snapshot_arn(region: &str, name: &str) -> String {
 /// One statement, so every operation that acts on a serverless cache snapshot
 /// by name — `ExportServerlessCacheSnapshot` today — words that fault the same
 /// way. The READ words it differently, as
-/// [`serverless_cache_snapshot_not_described_message`] states.
+/// [`serverless_cache_snapshot_not_described_message`] states, and a COPY whose
+/// SOURCE is missing differently again, as
+/// [`COPY_SOURCE_SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE`] states.
 pub const SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE: &str =
     "Serverless cache snapshot with specified name does not exists.";
+
+/// How ElastiCache words the same fault for a `CopyServerlessCacheSnapshot`
+/// whose `SourceServerlessCacheSnapshotName` names no snapshot this account
+/// holds: `Source serverless cache snapshot does not exist.` — the missing
+/// resource is named as the SOURCE of the copy, and nothing of the request is
+/// interpolated.
+///
+/// A copy resolves TWO snapshot names, so the fault says which of them could not
+/// be resolved rather than restating the class: the same split this service
+/// already makes for the other snapshot it copies, where a taken DESTINATION
+/// name is its own sentence ([`COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE`])
+/// beside the one a snapshot being TAKEN is refused with. The two are observable
+/// apart, so one sentence cannot serve both surfaces.
+pub const COPY_SOURCE_SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE: &str =
+    "Source serverless cache snapshot does not exist.";
 
 /// How `DescribeServerlessCacheSnapshots` words the same fault: a READ names
 /// the snapshot it was asked for, as the fixed text "Serverless Cache Snapshot
@@ -805,6 +822,44 @@ impl ServerlessCacheSnapshotRecord {
         }
     }
 
+    /// A copy of this snapshot stored under another name.
+    ///
+    /// A copy is "a copy of an existing serverless cache's snapshot", so
+    /// everything that describes WHAT was captured — the source cache's name,
+    /// engine and major engine version, the instant the data set was obtained at
+    /// and the data set itself — is carried over unchanged rather than re-read
+    /// from the live cache or re-stamped with the copy's own clock: copying does
+    /// not retake the snapshot. Only the copy's own identity (name and ARN), its
+    /// fresh status and the members the copy request itself carries (KMS key,
+    /// tags) differ — the same split [`SnapshotRecord::copy_to`] makes for the
+    /// other kind of snapshot this service copies.
+    pub fn copy_to(&self, new: ServerlessCacheSnapshotCopy) -> ServerlessCacheSnapshotRecord {
+        ServerlessCacheSnapshotRecord {
+            arn: serverless_cache_snapshot_arn(&new.region, &new.target_name),
+            name: new.target_name,
+            // "The identifier of the KMS key used to encrypt the target
+            // snapshot": the copy keeps the source's key when the request names
+            // none, the way a snapshot taken of a cache keeps the cache's.
+            kms_key_id: new.kms_key_id.or_else(|| self.kms_key_id.clone()),
+            // A copy a caller asked for by name is that caller's own manual
+            // snapshot, whatever the source's type was.
+            snapshot_type: SERVERLESS_SNAPSHOT_TYPE_MANUAL.to_string(),
+            status: STATUS_CREATING.to_string(),
+            pending_status: Some(PendingTransition {
+                due: new.now + SNAPSHOT_TRANSITION,
+                status: STATUS_AVAILABLE.to_string(),
+            }),
+            // `Tags` are "a list of tags to be added to the target snapshot
+            // resource" — the copy's own, not the source's.
+            tags: new.tags,
+            // The copy holds the data set the SOURCE captured, as a copy of its
+            // own: two snapshots are two resources, so neither one's data set is
+            // shared with the other.
+            data: copied_keyspace(&self.data, new.now),
+            ..self.clone()
+        }
+    }
+
     /// Materialise the status change the clock owes this snapshot, if `now` is
     /// past its due instant, and hand back the change it made. The one write a
     /// reporting operation may make; see [`CacheClusterRecord::settle`].
@@ -861,6 +916,20 @@ pub struct NewServerlessCacheSnapshot {
     /// The source cache's data set, captured at this instant
     /// ([`captured_serverless_cache_data`]).
     pub data: SharedKeyspace,
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
+}
+
+/// The values a copy of a serverless cache snapshot is stored under; see
+/// [`ServerlessCacheSnapshotRecord::copy_to`].
+#[derive(Debug, Clone)]
+pub struct ServerlessCacheSnapshotCopy {
+    /// The stored (lowercased) `TargetServerlessCacheSnapshotName`.
+    pub target_name: String,
+    /// The Region the copy is minted in, which its ARN names.
+    pub region: String,
+    /// The `KmsKeyId` the copy request named, resolved to the key's own ARN.
+    pub kms_key_id: Option<String>,
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
 }
