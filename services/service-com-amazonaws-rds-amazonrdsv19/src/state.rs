@@ -188,6 +188,9 @@ mod snapshots;
 // The tenant databases a DB snapshot CAPTURED, beside the snapshot records themselves:
 // their own concern, because they are what `DescribeDBSnapshotTenantDatabases` reports.
 mod snapshot_tenant_databases;
+// What a MODIFICATION of a tenant database stages — the pending values it reports until the
+// clock applies them — and the re-keying applying a rename takes.
+mod tenant_database_modification;
 // The Amazon SNS topic an event subscription delivers to, resolved against the service that
 // owns topics.
 mod sns_topics;
@@ -205,6 +208,7 @@ pub use option_groups::*;
 pub use parameter_groups::*;
 pub use shard_groups::*;
 pub use snapshot_tenant_databases::*;
+pub use tenant_database_modification::*;
 pub use snapshots::*;
 pub use sns_topics::*;
 
@@ -756,6 +760,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             // The instance is gone from the service, so its engine endpoint goes with
             // it: dropping the record closes the port and severs every session on it.
             self.db_engine_endpoints.remove(&key);
+            // And so do its tenant databases: a tenant database is a pluggable database
+            // INSIDE a DB instance, so none of them outlives the instance that held it.
+            self.drop_tenant_databases_of(&key);
         }
         for (from, to) in renamed {
             // An identifier another instance took while the rename was pending is not one
@@ -773,6 +780,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 // connected to stays the endpoint this instance publishes, whatever it is
                 // now called.
                 self.move_engine_endpoint(&from, &to);
+                // Its tenant databases move with it too: each of them is addressed by the
+                // instance that holds it, which is now called something else.
+                self.move_tenant_databases_of(&from, &to);
             }
         }
         for (key, snapshot) in self
@@ -890,20 +900,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone.drain(..) {
             self.integrations.remove(&key);
         }
-        for (key, tenant) in self
-            .tenant_databases
-            .range_mut((region.to_string(), String::new())..)
-        {
-            if key.0 != region {
-                break;
-            }
-            if tenant.settle(now) {
-                gone.push(key.clone());
-            }
-        }
-        for key in gone.drain(..) {
-            self.tenant_databases.remove(&key);
-        }
+        // A tenant database settles in its own walk: applying a staged rename MOVES the
+        // record, because the key it is stored under carries its name.
+        self.settle_tenant_databases(now, region);
         for (key, proxy) in self
             .db_proxies
             .range_mut((region.to_string(), String::new())..)

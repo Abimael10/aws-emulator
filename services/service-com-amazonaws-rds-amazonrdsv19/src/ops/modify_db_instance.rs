@@ -1168,6 +1168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it: the listener a client is connected to stays the endpoint this instance
         // publishes, whatever it is now called.
         store.move_engine_endpoint(&key, &renamed_key);
+        // Its tenant databases move with it too: each of them is addressed by the DB
+        // instance that holds it, which is now called something else.
+        store.move_tenant_databases_of(&key, &renamed_key);
         // A modification can turn Performance Insights on or off and can change the
         // database-insights mode, so the SHARED data-source directory is brought up to
         // date with the settings the instance runs under NOW: a monitoring service reads

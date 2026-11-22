@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTenantDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTenantDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modifies an existing tenant database of a multi-tenant DB instance: it renames the
+//! tenant database, changes its master user password, and turns RDS's management of that
+//! password in Amazon Web Services Secrets Manager on, off or over to a fresh value.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTenantDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call APPLIES what it was given and answers the tenant database as it WAS: the
+//! modelled result carries `TenantDatabasePendingModifiedValues`, "a response element in
+//! the ModifyTenantDatabase operation that describes changes that will be applied. Specific
+//! changes are identified by subelements", so the answer names the new name and the changed
+//! password there, and the next caller finds the tenant database under the name this call
+//! gave it ([`crate::state::TenantDatabaseModification`]). The secret RDS manages for the
+//! master user password is Secrets Manager's own resource, minted, rotated or deleted while
+//! this call runs, and the tenant database reports it from the moment it exists.
+//!
+//! Tenant databases exist only in a MULTI-TENANT DB instance: `MultiTenant` "only applies
+//! to RDS for Oracle container database (CDB) engines", so this operation is not one an
+//! instance on any other engine serves at all — a combination of a real instance and an
+//! operation its configuration does not serve, which is `InvalidParameterCombination`
+//! rather than anything missing.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +199,422 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTenantDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTenantDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyTenantDatabaseError::validation)?;
+        // `DBInstanceIdentifier` "isn't case-sensitive" and is "stored as a lowercase
+        // string" — the folded spelling every operation of this service resolves an
+        // instance by.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        let tenant_db_name = input.tenant_db_name.clone();
+        // The model constrains neither name, so the rules their own documentation states are
+        // enforced here, and nothing caller-sized reaches the store unchecked.
+        if let Some(new_tenant_db_name) = &input.new_tenant_db_name {
+            crate::state::check_new_tenant_db_name(new_tenant_db_name)
+                .map_err(ModifyTenantDatabaseError::invalid_parameter_value)?;
+        }
+        // `ManageMasterUserPassword` turns RDS's management of the master user password ON
+        // for a tenant database that does not manage it — "In this case, you can't specify
+        // MasterUserPassword" — which is a constraint on the REQUEST alone. Turning it OFF
+        // is conditioned on what the tenant database manages NOW, so that refusal is
+        // answered below, where the record is in hand.
+        if input.manage_master_user_password == Some(true) && input.master_user_password.is_some() {
+            return Err(ModifyTenantDatabaseError::invalid_parameter_value(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated modification.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // RDS is regional: only the region the request was signed for is in scope, and a
+        // tenant database is addressed by the DB instance it lives in and its own name.
+        let key = (
+            region.clone(),
+            crate::state::tenant_database_key(&identifier, &tenant_db_name),
+        );
+        let instance_arn = crate::state::db_instance_arn(&region, &identifier);
+
+        // Everything this modification is REFUSED for is decided here, under the state
+        // lock, and the lock is RELEASED at the end of this block: the managed master user
+        // secret is minted, rotated or deleted through Secrets Manager below, and a state
+        // guard cannot be held across an await. NOTHING is written in this scope, so a
+        // modification refused here changes nothing — neither in this store nor in Secrets
+        // Manager. (The same shape `ModifyDBInstance` decides its own refusals in.)
+        let accepted = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            let Some(instance) = store.db_instances.get(&(region.clone(), identifier.clone()))
+            else {
+                return Err(ModifyTenantDatabaseErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        // The sentence the tenant-database operations of this service answer
+                        // the fault with: the fixed phrase, then the identifier in the
+                        // folded spelling the member resolves in, and no terminal period.
+                        message: Some(format!("DBInstance not found: {identifier}")),
+                    },
+                )
+                .into());
+            };
+            // Tenant databases "only appl[y] to RDS for Oracle container database (CDB)
+            // engines", so a single-tenant DB instance does not serve this operation at
+            // all: the request is refused as unsupported FOR THAT INSTANCE rather than as a
+            // tenant database that could not be found in it, which is how this front door
+            // answers an operation addressed at an instance whose configuration has no
+            // place for it.
+            if !crate::state::is_multi_tenant_engine(&instance.engine) {
+                return Err(ModifyTenantDatabaseError::invalid_parameter_combination(
+                    format!(
+                        "The {} operation isn't supported for DB instance {identifier}.",
+                        Self::NAME
+                    ),
+                ));
+            }
+            // An instance already on its way out cannot have a tenant database modified:
+            // the delete it is running takes every tenant database with it.
+            if instance.is_deleting() {
+                return Err(
+                    ModifyTenantDatabaseErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {identifier} is in state {} and cannot have a \
+                                 tenant database modified",
+                                instance.status
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let instance_engine = instance.engine.clone();
+            let dbi_resource_id = instance.dbi_resource_id.clone();
+
+            let Some(tenant) = store.tenant_databases.get(&key) else {
+                return Err(
+                    ModifyTenantDatabaseErrorModeled::TenantDatabaseNotFoundFault(
+                        TenantDatabaseNotFoundFault {
+                            message: Some(format!(
+                                "TenantDatabase {tenant_db_name} not found in DB instance \
+                                 {identifier}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // A delete "can't be canceled or reverted after it begins", so a tenant database
+            // already on its way out takes no modification either.
+            if tenant.is_deleting() {
+                return Err(
+                    ModifyTenantDatabaseErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "Tenant database {tenant_db_name} in DB instance {identifier} \
+                                 is being deleted and cannot be modified"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // `MasterUserPassword` carries the engine's master-password policy, whose length
+            // bound is per engine ([`crate::state::master_user_password_len`]) — the engine
+            // here being the one the instance this tenant database belongs to runs.
+            if let Some(password) = &input.master_user_password {
+                crate::state::check_supplied_master_user_password(&instance_engine, password)
+                    .map_err(ModifyTenantDatabaseError::invalid_parameter_value)?;
+            }
+
+            // `RotateMasterUserPassword` "is valid only if the master user password is
+            // managed by RDS in Amazon Web Services Secrets Manager", so a tenant database
+            // with no managed secret has nothing to rotate. `MasterUserSecretKmsKeyId` is
+            // valid only there too: it names the key of a secret this tenant database would
+            // have to have. And "you must specify MasterUserPassword" is conditioned on the
+            // tenant database ALREADY managing the password, so one that manages none is
+            // not refused for turning off management it never had on.
+            let current_master_user_secret = tenant.master_user_secret.clone();
+            let manages_master_user_password = current_master_user_secret.is_some();
+            if input.rotate_master_user_password == Some(true) && !manages_master_user_password {
+                return Err(ModifyTenantDatabaseError::invalid_parameter_combination(
+                    crate::state::rotate_without_managed_secret_message("tenant database"),
+                ));
+            }
+            if input.master_user_secret_kms_key_id.is_some()
+                && input.manage_master_user_password != Some(true)
+                && !manages_master_user_password
+            {
+                return Err(ModifyTenantDatabaseError::invalid_parameter_combination(
+                    crate::state::master_user_secret_kms_key_without_management_message(
+                        "ManageMasterUserPassword",
+                    ),
+                ));
+            }
+            if input.manage_master_user_password == Some(false)
+                && manages_master_user_password
+                && input.master_user_password.is_none()
+            {
+                return Err(ModifyTenantDatabaseError::invalid_parameter_combination(
+                    crate::state::master_user_password_required_to_stop_management_message(
+                        "MasterUserPassword",
+                    ),
+                ));
+            }
+
+            // `NewTenantDBName` "isn't case-sensitive", so a rename to the name the tenant
+            // database already carries asks for nothing and changes nothing; a name another
+            // tenant database of the same DB instance holds is the modelled conflict: "you
+            // attempted to … modify a tenant database to use the name of an existing tenant
+            // database".
+            let renamed_to = match &input.new_tenant_db_name {
+                Some(new_name) if new_name.eq_ignore_ascii_case(&tenant.tenant_db_name) => None,
+                Some(new_name) => {
+                    if store
+                        .tenant_databases_of(&region, &identifier)
+                        .iter()
+                        .any(|held| held.tenant_db_name.eq_ignore_ascii_case(new_name))
+                    {
+                        return Err(
+                            ModifyTenantDatabaseErrorModeled::TenantDatabaseAlreadyExistsFault(
+                                TenantDatabaseAlreadyExistsFault {
+                                    message: Some(format!(
+                                        "Tenant database {new_name} already exists in DB \
+                                         instance {identifier}"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    Some(new_name.clone())
+                }
+                None => None,
+            };
+
+            AcceptedModification {
+                instance_engine,
+                dbi_resource_id,
+                master_username: tenant.master_username.clone(),
+                current_master_user_secret,
+                renamed_to,
+            }
+        };
+
+        // The managed master user secret, changed now that every refusal above has been
+        // answered and the store's guard released: a request that turned management ON gets
+        // a secret minted for the tenant database, one that turned it OFF has RDS "delete
+        // the secret", and a rotation stakes a new password in the secret already there. The
+        // generated password goes into that secret and nowhere else — the member is
+        // `@sensitive` and RDS reports no member carrying it.
+        let mut minted_master_user_secret = None;
+        let mut released_master_user_secret = false;
+        let mut rotated_master_user_secret = false;
+        match (
+            input.manage_master_user_password,
+            &accepted.current_master_user_secret,
+        ) {
+            (Some(true), None) => {
+                minted_master_user_secret = Some(
+                    crate::state::mint_master_user_secret(
+                        &*self.engine,
+                        ctx,
+                        &region,
+                        &crate::state::MasterSecretRequest {
+                            name: &crate::state::tenant_database_master_user_secret_name(
+                                &accepted.dbi_resource_id,
+                                &tenant_db_name,
+                            ),
+                            username: Some(&accepted.master_username),
+                            engine: &accepted.instance_engine,
+                            // A tenant database's master user is a user of the DB INSTANCE
+                            // that holds it, so the instance is the resource the secret
+                            // belongs to — and the request that rotates the tenant
+                            // database's own password names the tenant database too, which
+                            // is why this is not the instance's own secret.
+                            owner: crate::state::ManagedSecretOwner::tenant_database(
+                                &instance_arn,
+                            ),
+                            kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                        },
+                    )
+                    .await
+                    .map_err(ModifyTenantDatabaseError::internal_failure)?
+                    .secret,
+                );
+            }
+            (Some(false), Some(secret)) => {
+                crate::state::release_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &instance_arn,
+                    &secret.secret_arn,
+                )
+                .await
+                .map_err(ModifyTenantDatabaseError::internal_failure)?;
+                released_master_user_secret = true;
+            }
+            _ => {}
+        }
+        if input.rotate_master_user_password == Some(true) {
+            if let Some(secret) = &accepted.current_master_user_secret {
+                crate::state::rotate_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &instance_arn,
+                    &secret.secret_arn,
+                    Some(&accepted.master_username),
+                    &accepted.instance_engine,
+                )
+                .await
+                .map_err(ModifyTenantDatabaseError::internal_failure)?;
+                rotated_master_user_secret = true;
+            }
+        }
+
+        // The modification is written onto what the store holds NOW: the guard was released
+        // while the secret was changed, so a tenant database another request deleted in the
+        // meantime is the not-found fault rather than a record this call puts back — and a
+        // secret minted for it is deleted rather than left behind, since no tenant database
+        // would ever report it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTenantDatabase"))
+        // The record is TAKEN OUT and put back under this ONE guard, so nothing can see the
+        // tenant database missing while the modification is written onto it, and a rename
+        // moves it to the key its new name belongs under in the same step.
+        let changed = crate::state::TenantDatabaseModification::requested(
+            accepted.renamed_to,
+            input.master_user_password.is_some(),
+        );
+        // The ARN of the secret this call minted, kept while the record takes the secret
+        // itself: it is what a refusal answered under the guard below has to release.
+        let minted_secret_arn = minted_master_user_secret
+            .as_ref()
+            .map(|secret| secret.secret_arn.clone());
+        let written: Result<TenantDatabase, Self::Error> = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            // `DeletionProtection` is "whether deletion protection is enabled for the DB
+            // INSTANCE", so it is read from that instance's record.
+            let deletion_protection = store
+                .db_instances
+                .get(&(region.clone(), identifier.clone()))
+                .is_some_and(|instance| instance.deletion_protection);
+            match store.tenant_databases.remove(&key) {
+                Some(mut record) => {
+                    if let Some(secret) = minted_master_user_secret {
+                        record.master_user_secret = Some(secret);
+                    }
+                    if released_master_user_secret {
+                        record.master_user_secret = None;
+                    }
+                    if rotated_master_user_secret {
+                        if let Some(secret) = &mut record.master_user_secret {
+                            secret.rotating();
+                        }
+                    }
+                    // What this call ANSWERS with: the tenant database as it WAS, and what
+                    // the call changed named in `PendingModifiedValues` — "changes that will
+                    // be applied. Specific changes are identified by subelements". A request
+                    // that renamed nothing and set no password changed neither, so it
+                    // reports no pending values at all.
+                    let mut answered = record.to_wire(deletion_protection);
+                    answered.pending_modified_values =
+                        changed.changes_anything().then(|| changed.to_wire());
+                    // And the change is the tenant database's OWN from here on: the next
+                    // caller finds it under the name this call gave it. A name taken while
+                    // this call was minting the secret is the modelled conflict rather than a
+                    // record displaced under a key two tenant databases would share.
+                    match &changed.tenant_db_name {
+                        Some(new_name) => {
+                            let renamed_key = (
+                                region.clone(),
+                                crate::state::tenant_database_key(&identifier, new_name),
+                            );
+                            if store.tenant_databases.contains_key(&renamed_key) {
+                                store.tenant_databases.insert(key, record);
+                                Err(
+                                    ModifyTenantDatabaseErrorModeled::TenantDatabaseAlreadyExistsFault(
+                                        TenantDatabaseAlreadyExistsFault {
+                                            message: Some(format!(
+                                                "Tenant database {new_name} already exists in \
+                                                 DB instance {identifier}"
+                                            )),
+                                        },
+                                    )
+                                    .into(),
+                                )
+                            } else {
+                                record.tenant_db_name = new_name.clone();
+                                store.tenant_databases.insert(renamed_key, record);
+                                Ok(answered)
+                            }
+                        }
+                        None => {
+                            store.tenant_databases.insert(key, record);
+                            Ok(answered)
+                        }
+                    }
+                }
+                None => Err(
+                    ModifyTenantDatabaseErrorModeled::TenantDatabaseNotFoundFault(
+                        TenantDatabaseNotFoundFault {
+                            message: Some(format!(
+                                "TenantDatabase {tenant_db_name} not found in DB instance \
+                                 {identifier}."
+                            )),
+                        },
+                    )
+                    .into(),
+                ),
+            }
+        };
+        // A refusal answered under that guard leaves no tenant database to report the minted
+        // secret, so the secret goes rather than being left behind.
+        let tenant_database = match written {
+            Ok(tenant_database) => tenant_database,
+            Err(refusal) => {
+                if let Some(secret_arn) = &minted_secret_arn {
+                    crate::state::release_orphaned_master_user_secret(
+                        &*self.engine,
+                        ctx,
+                        &region,
+                        &instance_arn,
+                        secret_arn,
+                    )
+                    .await;
+                }
+                return Err(refusal);
+            }
+        };
+        Ok(ModifyTenantDatabaseOutput {
+            tenant_database: Some(tenant_database),
+        })
     }
+}
+
+/// What the scope that decides this modification's refusals hands on: the values the
+/// modification is applied FROM, read from the records every refusal was decided against.
+///
+/// It exists because the Secrets Manager calls that change the tenant database's managed
+/// master user secret cannot be made while the store's guard is held, so the guard is
+/// released between deciding the modification and applying it — and what the two halves
+/// share travels in one value rather than as a row of loose locals.
+struct AcceptedModification {
+    /// The engine the DB instance holding this tenant database runs, whose published rules
+    /// a generated master user password must satisfy.
+    instance_engine: String,
+    /// That instance's `DbiResourceId`, which a newly minted secret is named after.
+    dbi_resource_id: String,
+    /// `MasterUsername`: the user the managed secret holds the password of.
+    master_username: String,
+    /// The secret the tenant database manages NOW, which decides whether this call mints
+    /// one, rotates it or deletes it.
+    current_master_user_secret: Option<crate::state::ManagedMasterSecret>,
+    /// `NewTenantDBName`, once it is known to be a name this tenant database can take:
+    /// `None` for a request that renamed nothing.
+    renamed_to: Option<String>,
 }

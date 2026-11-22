@@ -1,4 +1,5 @@
-# Ad-hoc diagnostic probes: a file whose name carries `scratch` under `tests/all/` is a
-# throwaway used while tracing a defect, never part of the suite `tests/all/main.rs`
-# declares, so it stays out of the repository.
+# Ad-hoc diagnostic probes: a file whose name carries `scratch` or `probe` under
+# `tests/all/` is a throwaway used while tracing a defect, never part of the suite
+# `tests/all/main.rs` declares, so it stays out of the repository.
 *scratch*.rs
+*probe*.rs

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The tenant database records `CreateTenantDatabase`, `DescribeTenantDatabases` and
-//! `DeleteTenantDatabase` share.
+//! The tenant database records `CreateTenantDatabase`, `DescribeTenantDatabases`,
+//! `ModifyTenantDatabase` and `DeleteTenantDatabase` share.
 //!
 //! A tenant database is a pluggable database INSIDE a DB instance running one of the
 //! Oracle container database (CDB) engines, so every record here names the DB instance it
@@ -9,7 +9,10 @@
 
 use std::time::Instant;
 
-use super::{ManagedMasterSecret, PendingChange, PendingStatus, ARN_NAMESPACE};
+use super::{
+    ComAmazonawsRdsAmazonrdsv19State, ManagedMasterSecret, PendingChange, PendingStatus,
+    RegionalKey, ARN_NAMESPACE,
+};
 use crate::ops::types::{Tag, TenantDatabase};
 
 /// How many tenant databases one DB instance holds. Amazon RDS publishes a per-instance
@@ -170,8 +173,10 @@ impl TenantDatabaseRecord {
     /// INSTANCE" — a property of the instance this tenant database lives in, so it is
     /// passed in from that record rather than stored a second time here.
     ///
-    /// `PendingModifiedValues` is left out rather than invented: nothing here defers a
-    /// change to a maintenance window. `MasterUserSecret` is reported for a tenant database
+    /// `PendingModifiedValues` is what the call that CHANGED the tenant database answers
+    /// with — a modification is applied as part of that call
+    /// ([`TenantDatabaseModification`]) — so a tenant database this service REPORTS carries
+    /// none. `MasterUserSecret` is reported for a tenant database
     /// whose master user password RDS manages, and only for one — one whose password the
     /// caller supplied has no secret of RDS's own.
     pub fn to_wire(&self, deletion_protection: bool) -> TenantDatabase {
@@ -193,6 +198,79 @@ impl TenantDatabaseRecord {
                 .as_ref()
                 .map(ManagedMasterSecret::to_wire),
             tag_list: Some(self.tags.clone()),
+        }
+    }
+}
+
+impl ComAmazonawsRdsAmazonrdsv19State {
+    /// Materialise what the clock owes one region's TENANT DATABASES: the status transitions
+    /// and the removals every record of this service settles
+    /// ([`TenantDatabaseRecord::settle`]).
+    ///
+    /// Called from [`Self::settle_due_transitions`], and only from there, so a tenant
+    /// database settles exactly where every other record family does; it is written here
+    /// beside the record it walks.
+    pub(super) fn settle_tenant_databases(&mut self, now: std::time::Instant, region: &str) {
+        // A record whose pending change is its REMOVAL leaves the store below: the keys are
+        // collected first because the range borrows the map mutably.
+        let mut gone: Vec<RegionalKey> = Vec::new();
+        for (key, tenant) in self
+            .tenant_databases
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if tenant.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.tenant_databases.remove(&key);
+        }
+    }
+
+    /// The store key of every tenant database of the DB instance `key` names: a tenant
+    /// database is keyed by its instance and then its own name ([`tenant_database_key`]), so
+    /// one instance's tenants are an ordered range.
+    fn tenant_databases_range(&self, key: &RegionalKey) -> Vec<RegionalKey> {
+        let prefix = tenant_database_key(&key.1, "");
+        self.tenant_databases
+            .range((key.0.clone(), prefix.clone())..)
+            .take_while(|((region, stored), _)| *region == key.0 && stored.starts_with(&prefix))
+            .map(|(stored_key, _)| stored_key.clone())
+            .collect()
+    }
+
+    /// Drop every tenant database of the DB instance `key` names.
+    ///
+    /// A tenant database is a pluggable database INSIDE a DB instance, reached only through
+    /// that instance, so none of them outlives the instance that held it: the moment the
+    /// instance leaves the store, so do its tenant databases, and no report answers with one
+    /// whose DB instance nothing can resolve.
+    pub(crate) fn drop_tenant_databases_of(&mut self, key: &RegionalKey) {
+        for stored_key in self.tenant_databases_range(key) {
+            self.tenant_databases.remove(&stored_key);
+        }
+    }
+
+    /// Move every tenant database of the DB instance renamed from `from` to `to`.
+    ///
+    /// Each of them is ADDRESSED by the instance that holds it — the identifier is half its
+    /// store key and the `DBInstanceIdentifier` it reports — so a renamed instance carries
+    /// its tenant databases over to the identifier it is now called by.
+    pub(crate) fn move_tenant_databases_of(&mut self, from: &RegionalKey, to: &RegionalKey) {
+        for stored_key in self.tenant_databases_range(from) {
+            let Some(mut record) = self.tenant_databases.remove(&stored_key) else {
+                continue;
+            };
+            record.db_instance_identifier = to.1.clone();
+            record.region = to.0.clone();
+            let moved_key = (
+                to.0.clone(),
+                tenant_database_key(&to.1, &record.tenant_db_name),
+            );
+            self.tenant_databases.insert(moved_key, record);
         }
     }
 }
