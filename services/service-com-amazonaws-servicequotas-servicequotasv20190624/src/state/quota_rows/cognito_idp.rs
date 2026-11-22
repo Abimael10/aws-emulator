@@ -78,13 +78,24 @@ fn cognito_user_pool_category_rate(
 /// the recorded default-quota listing of that code for which `QuotaCode` names which
 /// category's rate, on which plane, at how many requests per second and whether that rate
 /// can be provisioned ([`cognito_user_pool_category_rate`]), and for the name, default
-/// value and adjustability of the RESOURCE COUNTS beside those rates. The remaining codes
-/// that listing reports name quotas no source available here states, and a code identifies
-/// ONE quota, so those rows are left to the default-quota-set gap rather than published
-/// under a binding this catalog would be guessing at (see
+/// value, adjustability and published sentence of the RESOURCE COUNTS beside those rates.
+/// The remaining codes that listing reports name quotas no source available here states,
+/// and a code identifies ONE quota, so those rows are left to the default-quota-set gap
+/// rather than published under a binding this catalog would be guessing at (see
 /// [`crate::state::descriptive_quota_code`]).
 pub(in crate::state) fn cognito_idp_quotas() -> Vec<QuotaRow> {
     vec![
+        // The app-client management category, whose rate AWS serves for the WHOLE ACCOUNT
+        // as a fixed 15 requests per second — the plane the recorded listing reports under
+        // this code, at the value and adjustability it reports for the account-plane
+        // pool-management rates (`L-B7575496` below).
+        cognito_user_pool_category_rate(
+            "L-12C4D74A",
+            "UserPoolClientUpdate",
+            PER_ACCOUNT,
+            15.0,
+            false,
+        ),
         cognito_user_pool_category_rate(
             "L-574C86AE",
             "UserResourceUpdate",
@@ -93,17 +104,28 @@ pub(in crate::state) fn cognito_idp_quotas() -> Vec<QuotaRow> {
             false,
         ),
         cognito_user_pool_category_rate("L-5987B8A0", "UserCreation", PER_USER_POOL, 50.0, true),
+        // The pool-management category, whose rate AWS serves for ONE USER POOL as a fixed
+        // 15 requests per second: the whole record the recorded listing reports under this
+        // code.
+        cognito_user_pool_category_rate("L-60A0B411", "UserPoolUpdate", PER_USER_POOL, 15.0, false),
         // The two RESOURCE COUNTS this catalog can cite: how many user pools the account
         // holds, and how many resource servers one of those pools holds. A count is not a
         // rate, so neither carries the one-second window of the category rates nor a
-        // category's call count. Neither carries a `Description` either: the service
-        // publishes one for each of these quotas and its text is not among the data
-        // available here — unlike the category sentence, which is fixed text around the
-        // category's own name and so is citable for every row of that class — and a
-        // published description is the quota's OWN text, so an absent member reports that
-        // gap where a sentence written here would serve this emulator's wording as AWS's.
-        quota("User pools per account", 1000.0).code("L-66E6DF30"),
-        quota("Resource servers per user pool", 25.0).code("L-7CDAF993"),
+        // category's call count — but each carries the sentence the service publishes for
+        // THAT quota, counting the resources of its own plane, cited from the recorded
+        // default-quota listing of this service code rather than worded here.
+        quota("User pools per account", 1000.0)
+            .code("L-66E6DF30")
+            .describe(&format!(
+                "{}.",
+                maximum_number_phrase("user pools that you can create in this account per region")
+            )),
+        quota("Resource servers per user pool", 25.0)
+            .code("L-7CDAF993")
+            .describe(&format!(
+                "{}. A resource server is a server for access-protected resources.",
+                maximum_number_phrase("resource servers per user pool")
+            )),
         cognito_user_pool_category_rate(
             "L-7D6E8ED3",
             "UserAccountRecovery",

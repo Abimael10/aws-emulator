@@ -43,13 +43,14 @@ enum Published {
         /// of its description and of its metric's `Resource` dimension alike.
         category: &'static str,
     },
-    /// A COUNT of the resources of one plane: no window, no call count, and no
-    /// `Description` — the service publishes one for each of these quotas and its text is
-    /// not among the data available here, unlike the category sentence, which is fixed
-    /// text around the category's own name. The catalog publishes no text it cannot cite,
-    /// so what is asserted here is that the member is ABSENT rather than filled with
-    /// wording authored in this emulator and served as AWS's.
-    Count,
+    /// A COUNT of the resources of one plane: no window and no call count, but the
+    /// sentence the service publishes for THAT quota — a count's published text counts the
+    /// resources of its own plane, so it is cited per row rather than built from a class
+    /// template the way a category rate's is.
+    Count {
+        /// The `Description` AWS publishes for the count.
+        sentence: &'static str,
+    },
 }
 
 /// One published row of the catalog.
@@ -73,6 +74,17 @@ struct Row {
 /// counts of Amazon Cognito User Pools. Restated here so a row that silently changes its
 /// code, its value, its plane or its class fails.
 const ROWS: &[Row] = &[
+    // A category rate AWS serves for the WHOLE ACCOUNT, which is the plane the quota's own
+    // name states.
+    Row {
+        quota_code: "L-12C4D74A",
+        quota_name: "Rate of UserPoolClientUpdate requests per account",
+        value: 15.0,
+        adjustable: false,
+        kind: Published::CategoryRate {
+            category: "UserPoolClientUpdate",
+        },
+    },
     // A category rate AWS publishes as FIXED.
     Row {
         quota_code: "L-574C86AE",
@@ -93,21 +105,37 @@ const ROWS: &[Row] = &[
             category: "UserCreation",
         },
     },
+    Row {
+        quota_code: "L-60A0B411",
+        quota_name: "Rate of UserPoolUpdate requests",
+        value: 15.0,
+        adjustable: false,
+        kind: Published::CategoryRate {
+            category: "UserPoolUpdate",
+        },
+    },
     // The COUNT of the account's user pools, and the count of one pool's resource
-    // servers: neither is a rate, so neither carries a window or a call count.
+    // servers: neither is a rate, so neither carries a window or a call count, and each
+    // carries the sentence the service publishes for that count.
     Row {
         quota_code: "L-66E6DF30",
         quota_name: "User pools per account",
         value: 1000.0,
         adjustable: true,
-        kind: Published::Count,
+        kind: Published::Count {
+            sentence: "The maximum number of user pools that you can create in this account per \
+                       region.",
+        },
     },
     Row {
         quota_code: "L-7CDAF993",
         quota_name: "Resource servers per user pool",
         value: 25.0,
         adjustable: true,
-        kind: Published::Count,
+        kind: Published::Count {
+            sentence: "The maximum number of resource servers per user pool. A resource server \
+                       is a server for access-protected resources.",
+        },
     },
     Row {
         quota_code: "L-7D6E8ED3",
@@ -206,7 +234,9 @@ fn expected_record(row: &Row, region: &str) -> Value {
                 },
             });
         }
-        Published::Count => {}
+        Published::Count { sentence } => {
+            record["Description"] = json!(sentence);
+        }
     }
     record
 }
@@ -228,16 +258,14 @@ fn assert_record(case: &str, served: &Value, row: &Row, region: &str) {
             "case {case}: expected {member} {value}, got {served}"
         );
     }
-    // A count publishes no window, no call count and no description: a row that grew one
-    // would be reporting a rate's facts, or this emulator's own wording, for a quota AWS
-    // publishes as a count.
-    if matches!(row.kind, Published::Count) {
+    // A count publishes no window and no call count: a row that grew one would be
+    // reporting a rate's facts for a quota AWS publishes as a count.
+    if matches!(row.kind, Published::Count { .. }) {
         assert!(
             served.get("Period").is_none_or(Value::is_null)
-                && served.get("UsageMetric").is_none_or(Value::is_null)
-                && served.get("Description").is_none_or(Value::is_null),
-            "case {case}: a count is published over no window, with no call count and with no \
-             text this catalog cannot cite, got {served}"
+                && served.get("UsageMetric").is_none_or(Value::is_null),
+            "case {case}: a count is published over no window and with no call count, got \
+             {served}"
         );
     }
 }

@@ -191,16 +191,27 @@ const CLASSES: &[Class] = &[
 
 /// The rows a class service publishes that belong to NO rate class: a COUNT of a
 /// resource rather than a rate, so such a row is published with the quota's own text and
-/// with neither a window nor a call count. Named by `(ServiceCode, QuotaName)`, so a row
-/// whose name states a rate can never be excused by this table.
+/// with neither a window nor a call count. Named by `(ServiceCode, QuotaName,
+/// Description)`, so a row whose name states a rate can never be excused by this table,
+/// and a count whose text drifts fails too.
 ///
 /// SOURCE: AWS's published Service Quotas data for the service code, as
 /// `src/state/quota_rows/cognito_idp.rs` carries it: Amazon Cognito User Pools publishes
 /// a count of the account's user pools and a count of one pool's resource servers beside
-/// its category rates.
-const COUNT_ROWS: &[(&str, &str)] = &[
-    ("cognito-idp", "Resource servers per user pool"),
-    ("cognito-idp", "User pools per account"),
+/// its category rates, each with the sentence the service publishes for that count — a
+/// count's text is the quota's own rather than a class template's.
+const COUNT_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "cognito-idp",
+        "Resource servers per user pool",
+        "The maximum number of resource servers per user pool. A resource server is a server \
+         for access-protected resources.",
+    ),
+    (
+        "cognito-idp",
+        "User pools per account",
+        "The maximum number of user pools that you can create in this account per region.",
+    ),
 ];
 
 /// The display name AWS's integrated-service inventory reports for a `ServiceCode`.
@@ -425,20 +436,23 @@ async fn a_class_service_publishes_no_row_outside_its_classes() {
                 .iter()
                 .filter(|class| class.service_code == service_code)
                 .any(|class| subject(class, name).is_some());
-            if COUNT_ROWS.contains(&(service_code, name)) {
+            if let Some((_, _, sentence)) = COUNT_ROWS
+                .iter()
+                .find(|(code, quota_name, _)| *code == service_code && *quota_name == name)
+            {
                 // A count is published over no window and with no call count: the class
                 // rules above are about the rates, so the exemption is only ever a row
-                // AWS publishes as a count. Its `Description` is the quota's own text,
-                // which this catalog publishes only where it can cite it — never wording
-                // authored here — so a count carries none.
+                // AWS publishes as a count. Its `Description` is the quota's own text
+                // rather than a class sentence, and it is published like any other row's.
                 assert!(
                     !matched,
                     "case {service_code}/{code}: a count is not a rate, got {name:?}"
                 );
-                assert!(
-                    row.get("Description").is_none_or(Value::is_null),
-                    "case {service_code}/{code}: this catalog cites no text for a count, so it \
-                     publishes none, got {row}"
+                assert_eq!(
+                    row["Description"],
+                    json!(sentence),
+                    "case {service_code}/{code}: a count carries the text the service \
+                     publishes for that quota, got {row}"
                 );
                 assert!(
                     row.get("Period").is_none_or(Value::is_null)

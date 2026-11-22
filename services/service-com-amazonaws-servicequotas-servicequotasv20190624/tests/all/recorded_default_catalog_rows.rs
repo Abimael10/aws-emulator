@@ -219,6 +219,46 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "cognito-idp",
         service_name: "Amazon Cognito User Pools",
+        quota_code: "L-12C4D74A",
+        quota_name: "Rate of UserPoolClientUpdate requests per account",
+        value: 15.0,
+        unit: "None",
+        adjustable: false,
+        description: "The maximum combined call rate (requests per second) for all API operations \
+                      in the UserPoolClientUpdate category. All operations within a category \
+                      share the same quota. For the list of included operations, see \
+                      https://docs.aws.amazon.com/cognito/latest/developerguide/\
+                      limits.html#category_operations.",
+        period: Some((1, "SECOND")),
+        metric: Metric::Calls {
+            usage_service: "Cognito User Pool",
+            resource: "UserPoolClientUpdate",
+        },
+        context: None,
+    },
+    Row {
+        service_code: "cognito-idp",
+        service_name: "Amazon Cognito User Pools",
+        quota_code: "L-60A0B411",
+        quota_name: "Rate of UserPoolUpdate requests",
+        value: 15.0,
+        unit: "None",
+        adjustable: false,
+        description: "The maximum combined call rate (requests per second) for all API operations \
+                      in the UserPoolUpdate category. All operations within a category \
+                      share the same quota. For the list of included operations, see \
+                      https://docs.aws.amazon.com/cognito/latest/developerguide/\
+                      limits.html#category_operations.",
+        period: Some((1, "SECOND")),
+        metric: Metric::Calls {
+            usage_service: "Cognito User Pool",
+            resource: "UserPoolUpdate",
+        },
+        context: None,
+    },
+    Row {
+        service_code: "cognito-idp",
+        service_name: "Amazon Cognito User Pools",
         quota_code: "L-5987B8A0",
         quota_name: "Rate of UserCreation requests",
         value: 50.0,
@@ -258,11 +298,8 @@ const ROWS: &[Row] = &[
     },
     // The service's RESOURCE COUNTS: a count of the account's user pools and a count of
     // one pool's resource servers, neither of them a rate, so neither carries the
-    // category window or the category call count. The service publishes a description for
-    // each, and its text is not among the data available here — unlike the category
-    // sentence, which is fixed text around the category's own name — so the catalog
-    // publishes none for them and the rows below state that gap with an empty
-    // `description`.
+    // category window or the category call count. Each carries the sentence the service
+    // publishes for that count — the quota's own text rather than the category sentence.
     Row {
         service_code: "cognito-idp",
         service_name: "Amazon Cognito User Pools",
@@ -271,7 +308,8 @@ const ROWS: &[Row] = &[
         value: 1000.0,
         unit: "None",
         adjustable: true,
-        description: "",
+        description: "The maximum number of user pools that you can create in this account per \
+                      region.",
         period: None,
         metric: Metric::None,
         context: None,
@@ -284,7 +322,8 @@ const ROWS: &[Row] = &[
         value: 25.0,
         unit: "None",
         adjustable: true,
-        description: "",
+        description: "The maximum number of resource servers per user pool. A resource server is \
+                      a server for access-protected resources.",
         period: None,
         metric: Metric::None,
         context: None,
