@@ -15,8 +15,11 @@
 //!    fault (which reads as "wait and try again") nor as the framework's synthetic
 //!    `ValidationException`, which is no Amazon RDS error code at all.
 //! 2. A call refused because the resource its required identifier NAMES does not exist is
-//!    answered with the not-found fault that operation's own model declares, with that
-//!    model's status.
+//!    answered by the class that operation's own front door words for it:
+//!    `ApplyPendingMaintenanceAction` judges its `ResourceIdentifier` as a parameter value
+//!    rather than resolving it as a resource, so an identifier that names no resource of the
+//!    account is a rule-1 refusal there — HTTP 400 `InvalidParameterValue` echoing the value
+//!    the member carried — and not a not-found fault.
 //! 3. A call refused for the addressed resource's own lifecycle state keeps the modelled
 //!    state fault, and its sentence is worded from the record: a status the resource will
 //!    LEAVE states the state the call needs, and one it cannot leave names that status and
@@ -550,10 +553,10 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             code: INVALID_PARAMETER_VALUE,
             wording: Wording::Says("OptInType"),
         },
-        // Rule 2: the required identifier resolves to no resource, so the call is answered
-        // with the not-found fault that operation's own model declares, naming the resource
-        // the value addresses — whichever resource kind it names and whatever shape the
-        // value takes.
+        // `ApplyPendingMaintenanceAction`'s `ResourceIdentifier` is judged as a parameter
+        // VALUE rather than resolved as a resource, so a value that names no resource of the
+        // account belongs to rule 2: `InvalidParameterValue` at HTTP 400, echoing
+        // the value whole — whichever resource kind it names and whatever shape it takes.
         Row {
             case: "ApplyPendingMaintenanceAction over an ARN of a resource never created",
             action: "ApplyPendingMaintenanceAction",
@@ -562,9 +565,12 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
                 "ApplyAction" => "system-update",
                 "OptInType" => "immediate",
             ],
-            status: 404,
-            code: "ResourceNotFoundFault",
-            wording: Wording::Exact("Resource not found: emu-rcls-absent".to_string()),
+            status: 400,
+            code: INVALID_PARAMETER_VALUE,
+            wording: Wording::Exact(format!(
+                "Unknown resource: {}",
+                instance_arn("emu-rcls-absent")
+            )),
         },
         Row {
             case: "ApplyPendingMaintenanceAction over a value that is no ARN at all",
@@ -574,9 +580,9 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
                 "ApplyAction" => "system-update",
                 "OptInType" => "immediate",
             ],
-            status: 404,
-            code: "ResourceNotFoundFault",
-            wording: Wording::Exact("Resource not found: emu-rcls-live-inst".to_string()),
+            status: 400,
+            code: INVALID_PARAMETER_VALUE,
+            wording: Wording::Exact("Unknown resource: emu-rcls-live-inst".to_string()),
         },
     ];
 

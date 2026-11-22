@@ -75,13 +75,15 @@
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The DB instance isn't in a valid state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
 //!
-//! `ResourceIdentifier` carries the ARN of the resource this call ACTS ON, and a value that
-//! resolves to no resource of the account is reported ABSENT: the modelled
-//! `ResourceNotFoundFault` (HTTP 404) with the `Resource not found: <identifier>` sentence
-//! ([`resource_not_found_message`]), naming the resource the value addresses — the resource
-//! identifier an RDS ARN carries, or the value itself when it is no ARN of this service.
-//! The two state faults need a maintenance action to be pending,
-//! and nothing in this service schedules one.
+//! `ResourceIdentifier` carries the ARN of the resource this call ACTS ON, and Amazon RDS
+//! judges that member as a parameter VALUE rather than resolving it as a resource: a value
+//! that resolves to no resource of the account is refused with the Query API's
+//! `InvalidParameterValue` (HTTP 400) and the `Unknown resource: <resource-identifier>`
+//! sentence ([`unknown_resource_message`]), which echoes the value the member carried whole
+//! — the ARN itself, not the resource identifier inside it. The modelled
+//! `ResourceNotFoundFault` therefore reports no unresolvable identifier here; the two state
+//! faults need a maintenance action to be pending, and nothing in this service schedules
+//! one.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -150,25 +152,15 @@ fn check_value(member: &str, value: &str, allowed: &[&str]) -> Result<(), String
 }
 
 /// The message Amazon RDS reports a `ResourceIdentifier` that resolves to no resource with:
-/// the fixed text `Resource not found: `, then the resource the value ADDRESSES.
+/// the fixed text `Unknown resource: `, then the value the member carried.
 ///
-/// The variable part is the resource rather than the whole ARN: the identifier the caller
-/// gave the resource is what every other operation of this service answers about, and it is
-/// what the caller has to correct.
-fn resource_not_found_message(identifier: &str) -> String {
-    format!("Resource not found: {identifier}")
-}
-
-/// The resource an Amazon RDS `ResourceIdentifier` ADDRESSES: the resource identifier the
-/// ARN carries, or the value itself when it is no ARN of this service.
-///
-/// The ARN is read through the crate's one ARN reader
-/// (`crate::state::parse_rds_resource_arn`), so which resource a value names is decided here
-/// exactly as every other operation that reads one decides.
-fn addressed_resource(value: &str) -> &str {
-    crate::state::parse_rds_resource_arn(value)
-        .map(|arn| arn.identifier)
-        .unwrap_or(value)
+/// The variable part is the value itself — the whole ARN when the caller sent one, not the
+/// resource identifier inside it: the member is judged as a parameter value, so what the
+/// report names is the value the caller has to correct. The caller passes the member as this
+/// handler reads it for resolution, so one reading of `ResourceIdentifier` decides both which
+/// resource the value names and what the sentence says.
+fn unknown_resource_message(resource_identifier: &str) -> String {
+    format!("Unknown resource: {resource_identifier}")
 }
 
 /// The `ApplyPendingMaintenanceAction` operation.
@@ -238,23 +230,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|record| record.arn()),
             )
             .find(|arn| *arn == resource);
-        // An identifier that resolves to no resource of this account is reported ABSENT:
-        // the modelled `ResourceNotFoundFault` (HTTP 404) — "The specified resource ID was
-        // not found" — carrying the `Resource not found: <identifier>` sentence, which names
-        // the resource the value addresses. One answer for every value that names no
-        // resource, whatever shape it takes: a DB instance or cluster ARN this account does
-        // not hold, an ARN of another resource type or vendor, or a value that is no ARN at
-        // all. The resource is what this member selects, so nothing else about the request
-        // is judged first.
+        // An identifier that resolves to no resource of this account is refused as a bad
+        // PARAMETER VALUE rather than reported absent: Amazon RDS validates
+        // `ResourceIdentifier` instead of resolving it, so the answer is the Query API's
+        // `InvalidParameterValue` (HTTP 400) carrying the `Unknown resource: <value>`
+        // sentence, which echoes the value the member carried. One answer for every value
+        // that names no resource, whatever shape it takes: a DB instance or cluster ARN this
+        // account does not hold, an ARN of another resource type or vendor, or a value that
+        // is no ARN at all. The resource is what this member selects, so nothing else about
+        // the request is judged first.
         let Some(resource_arn) = resolved else {
-            return Err(
-                ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
-                    ResourceNotFoundFault {
-                        message: Some(resource_not_found_message(addressed_resource(&resource))),
-                    },
-                )
-                .into(),
-            );
+            return Err(ApplyPendingMaintenanceActionError::invalid_parameter_value(
+                unknown_resource_message(&resource),
+            ));
         };
 
         // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do

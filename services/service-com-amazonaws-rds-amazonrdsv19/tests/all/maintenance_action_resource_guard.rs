@@ -7,10 +7,10 @@
 //! request:
 //!
 //! * `ApplyPendingMaintenanceAction` acts on the resource its `ResourceIdentifier` names,
-//!   and an identifier that resolves to no resource of the account is reported ABSENT: the
-//!   modelled `ResourceNotFoundFault` (HTTP 404) with the fixed text `Resource not found: `
-//!   and the resource the value addresses — the resource identifier an RDS ARN carries, or
-//!   the value itself when it is no ARN of this service. One answer for every value that
+//!   and Amazon RDS judges that member as a PARAMETER VALUE rather than resolving it as a
+//!   resource: a value that resolves to no resource of the account is refused with the Query
+//!   API's `InvalidParameterValue` (HTTP 400) and the fixed text `Unknown resource: `
+//!   followed by the value the member carried, whole. One answer for every value that
 //!   names no resource: a DB instance ARN, a DB cluster ARN, an ARN of another resource type
 //!   or vendor, a value that is no ARN at all. The identifier RESOLVES when it
 //!   is the ARN a DB cluster or a DB instance of the request's region reports for itself,
@@ -42,13 +42,13 @@ use crate::db_instances::{
 /// ARN this service mints belongs to.
 const ACCOUNT: &str = "000000000000";
 
-/// The code an identifier that resolves to no resource is reported absent with.
-const RESOURCE_NOT_FOUND_FAULT: &str = "ResourceNotFoundFault";
+/// The code an identifier that resolves to no resource is refused with.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
-/// The fixed text that report carries, written out here rather than read from the code
+/// The fixed text that refusal carries, written out here rather than read from the code
 /// under test: the wording is part of what this suite pins, so a drift away from it must
 /// fail.
-const RESOURCE_NOT_FOUND: &str = "Resource not found: ";
+const UNKNOWN_RESOURCE: &str = "Unknown resource: ";
 
 /// What an identifier that resolves to nothing earns — the status, the code and the whole
 /// sentence — stated per row rather than computed, so each row is the requirement.
@@ -61,13 +61,13 @@ struct Refusal {
     message: String,
 }
 
-/// The report an identifier that names no resource of the account earns, naming the
-/// resource it addresses.
-fn resource_not_found(identifier: &str) -> Refusal {
+/// The refusal an identifier that names no resource of the account earns, echoing the value
+/// the request carried.
+fn unknown_resource(value: &str) -> Refusal {
     Refusal {
-        status: 404,
-        code: RESOURCE_NOT_FOUND_FAULT,
-        message: format!("{RESOURCE_NOT_FOUND}{identifier}"),
+        status: 400,
+        code: INVALID_PARAMETER_VALUE,
+        message: format!("{UNKNOWN_RESOURCE}{value}"),
     }
 }
 
@@ -125,7 +125,7 @@ async fn apply(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_unknown_maintenance_action_resource_is_reported_absent() {
+async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value() {
     let router = emulator();
 
     // One cluster and one instance that DO resolve, so every row below fails for the
@@ -134,77 +134,85 @@ async fn an_unknown_maintenance_action_resource_is_reported_absent() {
     create_available_instance(&router, "emu-maint-guard-instance").await;
 
     // The shapes an identifier that names no resource of this account can take, each with the
-    // report it earns. The `ApplyAction` / `OptInType` pairings rotate through the values
+    // refusal it earns. The `ApplyAction` / `OptInType` pairings rotate through the values
     // those two members publish, so no row can pass on one pairing being special — and the
     // last row carries an action AWS does not publish, which pins that the identifier is
     // decided FIRST. The rows differ along the resource TYPE the identifier names, along the
     // ARN's account and region, and along whether the value is an ARN of this service at
-    // all, which is what decides the resource the report names.
+    // all; the value the refusal echoes is the one the request carried in every case.
     //
-    // (case, the identifier, ApplyAction, OptInType, the report)
+    // (case, the identifier, ApplyAction, OptInType, the refusal)
     let rows: &[(&str, String, &str, &str, Refusal)] = &[
         (
             "a DB instance ARN for an instance that was never created",
             instance_arn("emu-maint-guard-absent"),
             "system-update",
             "immediate",
-            resource_not_found("emu-maint-guard-absent"),
+            unknown_resource(&instance_arn("emu-maint-guard-absent")),
         ),
         (
             "a DB cluster ARN for a cluster that was never created",
             cluster_arn("emu-maint-guard-absent-cluster"),
             "db-upgrade",
             "next-maintenance",
-            resource_not_found("emu-maint-guard-absent-cluster"),
+            unknown_resource(&cluster_arn("emu-maint-guard-absent-cluster")),
         ),
         (
             "a value that is no ARN at all",
             "emu-maint-guard-instance".to_string(),
             "os-upgrade",
             "undo-opt-in",
-            resource_not_found("emu-maint-guard-instance"),
+            unknown_resource("emu-maint-guard-instance"),
         ),
         (
             "the stored instance's name under the cluster resource type",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-guard-instance"),
             "hardware-maintenance",
             "immediate",
-            resource_not_found("emu-maint-guard-instance"),
+            unknown_resource(&format!(
+                "arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-guard-instance"
+            )),
         ),
         (
             "a DB snapshot ARN, which carries no maintenance action",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:snapshot:emu-maint-guard-snap"),
             "ca-certificate-rotation",
             "next-maintenance",
-            resource_not_found("emu-maint-guard-snap"),
+            unknown_resource(&format!(
+                "arn:aws:rds:{REGION}:{ACCOUNT}:snapshot:emu-maint-guard-snap"
+            )),
         ),
         (
             "the stored instance's ARN in another account",
             format!("arn:aws:rds:{REGION}:210987654321:db:emu-maint-guard-instance"),
             "system-update",
             "immediate",
-            resource_not_found("emu-maint-guard-instance"),
+            unknown_resource(&format!(
+                "arn:aws:rds:{REGION}:210987654321:db:emu-maint-guard-instance"
+            )),
         ),
         (
             "the stored instance's ARN in another region",
             "arn:aws:rds:eu-west-1:000000000000:db:emu-maint-guard-instance".to_string(),
             "db-upgrade",
             "immediate",
-            resource_not_found("emu-maint-guard-instance"),
+            unknown_resource("arn:aws:rds:eu-west-1:000000000000:db:emu-maint-guard-instance"),
         ),
         (
             "the stored cluster's ARN in another region",
             "arn:aws:rds:eu-west-1:000000000000:cluster:emu-maint-guard-cluster".to_string(),
             "db-upgrade",
             "immediate",
-            resource_not_found("emu-maint-guard-cluster"),
+            unknown_resource(
+                "arn:aws:rds:eu-west-1:000000000000:cluster:emu-maint-guard-cluster",
+            ),
         ),
         (
             "another service's ARN",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance:i-0a1b2c3d4e5f60718"),
             "os-upgrade",
             "next-maintenance",
-            resource_not_found(&format!(
+            unknown_resource(&format!(
                 "arn:aws:ec2:{REGION}:{ACCOUNT}:instance:i-0a1b2c3d4e5f60718"
             )),
         ),
@@ -213,13 +221,13 @@ async fn an_unknown_maintenance_action_resource_is_reported_absent() {
             instance_arn("emu-maint-guard-absent-too"),
             "reboot-now",
             "immediate",
-            resource_not_found("emu-maint-guard-absent-too"),
+            unknown_resource(&instance_arn("emu-maint-guard-absent-too")),
         ),
     ];
 
     for (case, resource, action, opt_in, refusal) in rows {
-        // Every row names a resource this account does not hold, and the answer reports it
-        // absent under the fault this operation's model declares.
+        // Every row names a resource this account does not hold, and the answer refuses the
+        // value the member carried as one the parameter does not accept.
         let body = expect_error(
             case,
             apply(&router, resource, action, opt_in).await,
