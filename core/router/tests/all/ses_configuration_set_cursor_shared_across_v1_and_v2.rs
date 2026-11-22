@@ -25,6 +25,13 @@
 //! performs — because the hand-off being asserted exists only when one engine is shared,
 //! and the claim that resolves each request to one service exists only when the peers are
 //! there to compete for it.
+//!
+//! That assembly and the two wire forms over it ([`router`], [`v1`], [`v2`], [`create`],
+//! [`page`], [`emulator_holding_sets`]) are `pub(crate)` because
+//! [`crate::ses_configuration_set_cursor_outlives_collection_changes`] asks the same
+//! listing the same way and must not grow a second copy of them: a suite that writes its
+//! own harness drifts from the one beside it, exactly as `crate::query_wire` exists to
+//! stop.
 
 use std::sync::Arc;
 
@@ -48,11 +55,11 @@ const ROUTER_REFUSALS: &[&str] = &["AmbiguousService", "UnknownService"];
 
 /// How many configuration sets a walk pages over: more than the largest page a row asks
 /// for, so every row's walk crosses at least one page boundary.
-const STORED: usize = 7;
+pub(crate) const STORED: usize = 7;
 
 /// Which API a call is made on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Surface {
+pub(crate) enum Surface {
     /// The classic `awsQuery` API.
     V1,
     /// The v2 REST API.
@@ -61,12 +68,12 @@ enum Surface {
 
 impl Surface {
     /// Both surfaces, so a row can start its walk on either.
-    fn both() -> [Self; 2] {
+    pub(crate) fn both() -> [Self; 2] {
         [Self::V1, Self::V2]
     }
 
     /// The other one, which is the surface a crossing walk asks the next page of.
-    fn other(self) -> Self {
+    pub(crate) fn other(self) -> Self {
         match self {
             Self::V1 => Self::V2,
             Self::V2 => Self::V1,
@@ -76,7 +83,7 @@ impl Surface {
 
 /// The services sharing the SigV4 signing name `ses`, over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These rows exercise routing and handler behaviour, not SigV4.
@@ -110,10 +117,10 @@ fn authorization() -> String {
 }
 
 /// One answered request: its status and its body, as text and as JSON.
-struct Answer {
-    status: u16,
-    text: String,
-    json: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) text: String,
+    pub(crate) json: Value,
     /// The `x-amzn-errortype` header a restJson1 refusal names its shape in.
     error_type: String,
 }
@@ -193,7 +200,7 @@ async fn send(
 
 /// One classic-API call: `awsQuery` under the `ses` credential scope, `POST /` with the
 /// operation in the `Action` form field.
-async fn v1(
+pub(crate) async fn v1(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -219,7 +226,7 @@ async fn v1(
 
 /// One v2-API call: `restJson1` under the `ses` credential scope, in the `/v2/email/…`
 /// path space.
-async fn v2(
+pub(crate) async fn v2(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -242,7 +249,7 @@ async fn v2(
 }
 
 /// Record the configuration set `name` on `surface`, asserting the create succeeded.
-async fn create(router: &MultiServiceRouter, case: &str, surface: Surface, name: &str) {
+pub(crate) async fn create(router: &MultiServiceRouter, case: &str, surface: Surface, name: &str) {
     let answered = match surface {
         Surface::V1 => {
             v1(
@@ -273,7 +280,7 @@ async fn create(router: &MultiServiceRouter, case: &str, surface: Surface, name:
 
 /// One page of the account's configuration-set listing, asked of `surface`: `(the names it
 /// reported, the NextToken it carried)`.
-async fn page(
+pub(crate) async fn page(
     router: &MultiServiceRouter,
     case: &str,
     surface: Surface,
@@ -375,7 +382,7 @@ async fn walk(
 
 /// A router holding [`STORED`] configuration sets, created alternately through the two
 /// APIs, and the names in the one order a listing reports them (lexicographic).
-async fn emulator_holding_sets(case: &str) -> (MultiServiceRouter, Vec<String>) {
+pub(crate) async fn emulator_holding_sets(case: &str) -> (MultiServiceRouter, Vec<String>) {
     let names: Vec<String> = (0..STORED).map(|index| format!("set-{index:02}")).collect();
     let router = router();
     for (index, name) in names.iter().enumerate() {
