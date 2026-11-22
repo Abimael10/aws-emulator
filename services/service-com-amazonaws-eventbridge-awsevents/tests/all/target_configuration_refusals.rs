@@ -359,7 +359,7 @@ fn configuration_rows() -> Vec<Row> {
                 "EcsParameters": { "TaskDefinitionArn": foreign_region_definition.clone() },
             }]),
             refused: Some(format!(
-                "Region of {} does not match region of {foreign_region_definition}",
+                "Region of {} does not match region of {foreign_region_definition}.",
                 cluster_arn()
             )),
             stored: vec![],

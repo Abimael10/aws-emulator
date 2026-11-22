@@ -267,8 +267,12 @@ fn ecs_parameters_violation(target: &Target) -> Option<String> {
 /// What the service states when the task a target names lives in another Region
 /// than the cluster it would run on: the two ARNs, cluster first, as the request
 /// gave them.
+///
+/// A whole sentence, so it carries the terminator the service writes after the
+/// second ARN: a caller comparing the sentence, or splitting it on that
+/// terminator to read the pair back out, reads the same bytes the service sends.
 fn region_mismatch(cluster_arn: &str, task_definition_arn: &str) -> String {
-    format!("Region of {cluster_arn} does not match region of {task_definition_arn}")
+    format!("Region of {cluster_arn} does not match region of {task_definition_arn}.")
 }
 
 /// Why the task a target names could not run on the cluster the target addresses,
