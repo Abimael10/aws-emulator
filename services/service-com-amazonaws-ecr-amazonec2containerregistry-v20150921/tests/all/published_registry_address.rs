@@ -15,13 +15,14 @@
 //!   nowhere either; the endpoint the caller is already talking to is the one address it can
 //!   reach. This suite is what varies that endpoint.
 //! * `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//!   container image `push` and `pull` operations") is PARSED as well as dialled, so it
-//!   carries the registry host layout Amazon ECR publishes — the owning account's id, the
-//!   `dkr` and `ecr` labels and the registry's Region — over the ZONE of that same endpoint
-//!   and its port, with the repository's own name as the path: never the zone AWS serves its
-//!   own registries in, which nothing here answers on. Which registry HOLDS the repository is
-//!   reported beside it by the members that carry that identity (`registryId` and the ARN),
-//!   and those are labels off the stored record that no reader's endpoint moves.
+//!   container image `push` and `pull` operations") is that same address with the
+//!   repository's own name as the path and no scheme: a container client splits it on the
+//!   first `/` and dials what is ahead of it, so it carries the endpoint this emulator
+//!   answers that caller at and never a registry host name composed over that address — no
+//!   resolver answers for a name under an address, and nothing here answers for a name AWS
+//!   serves. Which registry HOLDS the repository is reported beside it by the members that
+//!   carry that identity (`registryId` and the ARN), and those are labels off the stored
+//!   record that no reader's endpoint moves.
 //!
 //! The class the rule generalises over is the endpoint the call arrived on crossed with the
 //! repository name and the operation reporting it, so the rows span the endpoint forms a
@@ -33,7 +34,9 @@
 //! service at and one of ANOTHER service (whose traffic routes there instead, so no registry
 //! client can use it) and a `Host` that is no endpoint at all — crossed with the
 //! repository-name forms `RepositoryName`'s pattern allows. No row is the recorded request;
-//! the recorded case is one name at one endpoint.
+//! the recorded case is one name at one endpoint. The last test crosses those endpoints with
+//! the REGION whose registry holds the repository ([`HOLDING_REGIONS`]) as well, because the
+//! stored record is the other place a published address could wrongly be taken from.
 //!
 //! The last tests follow the reported URI the way a container client does: they pull the
 //! manifest at the very address the `repositoryUri` named, with the credential
@@ -55,19 +58,14 @@ use crate::wire::{
 };
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
-/// header, the request URI's authority, or neither), the address the registry URL a
-/// `docker login` of that call is pointed at is built on, port included, and the authority
-/// this registry publishes a repository at to such a call.
+/// header, the request URI's authority, or neither) and the address the registry URL a
+/// `docker login` of that call is pointed at — and a repository's own URI — is built on, port
+/// included.
 struct Endpoint {
     case: &'static str,
     host: Option<String>,
     uri_authority: Option<&'static str>,
     announced_endpoint: String,
-    /// The registry authority a repository's URI carries to this call: the registry host
-    /// layout over the zone of [`Endpoint::announced_endpoint`] and its port. Spelled out per
-    /// row rather than derived, so the zone this emulator announces in is asserted and not
-    /// recomputed from the implementation's own reading.
-    announced_registry_authority: String,
 }
 
 impl Endpoint {
@@ -76,17 +74,18 @@ impl Endpoint {
         format!("https://{}", self.announced_endpoint)
     }
 
-    /// The URI the repository `name` is reported at to such a call: the registry authority
-    /// this emulator publishes to that caller, followed by the repository's own name as the
-    /// path.
+    /// The URI the repository `name` is reported at to such a call: the endpoint this
+    /// emulator answers that caller's registry requests at, followed by the repository's own
+    /// name as the path.
     fn repository_uri(&self, name: &str) -> String {
-        format!("{}/{name}", self.announced_registry_authority)
+        format!("{}/{name}", self.announced_endpoint)
     }
 }
 
-/// The authority this registry publishes to a caller reached at an endpoint whose zone is
-/// `zone` and whose port is `port`: `<registryId>.dkr.ecr.<region>.<zone>:<port>` for the
-/// Region every call of this suite is signed for.
+/// A registry host of the layout AWS publishes, served in `zone` on `port`:
+/// `<registryId>.dkr.ecr.<region>.<zone>:<port>` for the Region every call of this suite is
+/// signed for. A caller may DIAL such a host; what this suite requires is that no reported
+/// address is one this emulator composed for itself.
 fn registry_authority(zone: &str, port: &str) -> String {
     format!("{REGISTRY_ID}.dkr.ecr.{REGION}.{zone}:{port}")
 }
@@ -102,49 +101,39 @@ fn endpoints() -> Vec<Endpoint> {
             // this process, so this caller is reported the address this emulator is served
             // at instead.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "the emulator's own socket",
             host: Some("127.0.0.1:9297".to_string()),
             uri_authority: None,
             announced_endpoint: "127.0.0.1:9297".to_string(),
-            // An address names no zone and names the interface the loopback zone resolves
-            // to, so a name announced for it is announced in that zone.
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a loopback name with another port",
             host: Some("localhost:39355".to_string()),
             uri_authority: None,
             announced_endpoint: "localhost:39355".to_string(),
-            announced_registry_authority: registry_authority("localhost", "39355"),
         },
         Endpoint {
             case: "an endpoint carried only on the request URI",
             host: None,
             uri_authority: Some("127.0.0.1:8443"),
             announced_endpoint: "127.0.0.1:8443".to_string(),
-            announced_registry_authority: registry_authority("localhost", "8443"),
         },
         Endpoint {
-            case: "the registry authority this emulator itself announced",
+            case: "a registry host of this account and Region, served in a local zone",
             host: Some(registry_authority("localhost", "9297")),
             uri_authority: None,
-            // A host that names THIS registry is one this plane answers on, so the caller is
-            // reported the very value it dialled rather than a second host composed on it.
-            announced_endpoint: registry_authority("localhost", "9297"),
-            announced_registry_authority: registry_authority("localhost", "9297"),
+            // A host that names ONE registry answers for that Region alone, so it is no
+            // address to publish a repository of any Region at: the served address is
+            // reported, and it answers for every registry this emulator serves.
+            announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
         },
         Endpoint {
-            case: "the registry authority this emulator announced for another Region",
+            case: "a registry host of another Region, served in a local zone",
             host: Some(format!("{REGISTRY_ID}.dkr.ecr.us-east-1.localhost:39355")),
             uri_authority: None,
-            announced_endpoint: format!("{REGISTRY_ID}.dkr.ecr.us-east-1.localhost:39355"),
-            // The Region of the authority is the REGISTRY's, read off the stored record, so
-            // the Region the caller happened to dial does not move it; its zone and port are
-            // the ones that caller reaches this emulator at.
-            announced_registry_authority: registry_authority("localhost", "39355"),
+            announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
         },
         Endpoint {
             case: "this service's control-plane endpoint host, which names a service",
@@ -153,7 +142,6 @@ fn endpoints() -> Vec<Endpoint> {
             // No registry client can use a host that routes to a service, so the address
             // this emulator is served at is reported instead.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a host of THIS service an operator serves the emulator at",
@@ -163,8 +151,6 @@ fn endpoints() -> Vec<Endpoint> {
             // registry plane, so the caller is reported the address it is already talking
             // to rather than one it may not reach.
             announced_endpoint: "ecr.localhost:39355".to_string(),
-            // That host is a NAME, so it is the zone a name announced for it sits in.
-            announced_registry_authority: registry_authority("ecr.localhost", "39355"),
         },
         Endpoint {
             case: "a host of ANOTHER service the emulator serves",
@@ -173,14 +159,12 @@ fn endpoints() -> Vec<Endpoint> {
             // That host routes to the service its first label names, so no registry
             // request addressed to it reaches this plane: the served address is reported.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a Host that is no endpoint at all",
             host: Some("elsewhere.example.com/registry".to_string()),
             uri_authority: None,
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a registry host in the China partition's zone",
@@ -189,14 +173,12 @@ fn endpoints() -> Vec<Endpoint> {
             // Another zone AWS publishes its own endpoints in, and so another host this
             // emulator does not answer on.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "this service's dual-stack endpoint host",
             host: Some(format!("api.ecr.{REGION}.api.aws")),
             uri_authority: None,
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
-            announced_registry_authority: registry_authority("localhost", "9297"),
         },
     ]
 }
@@ -254,6 +236,20 @@ async fn call_at(
     operation: &str,
     body: &Value,
 ) -> Value {
+    call_at_in_region(router, endpoint, REGION, operation, body).await
+}
+
+/// The same call as [`call_at`], signed for `region`: the credential scope's Region is the
+/// Region a request is made against, and so the registry that HOLDS the repository it
+/// creates or reads — which is what the table below varies beside the endpoint the call
+/// arrived on.
+async fn call_at_in_region(
+    router: &MultiServiceRouter,
+    endpoint: &Endpoint,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let uri = match endpoint.uri_authority {
         Some(authority) => format!("https://{authority}/"),
         None => "/".to_string(),
@@ -264,7 +260,7 @@ async fn call_at(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ecr/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/ecr/aws4_request, \
                  SignedHeaders=host, Signature=abc"
             ),
         )
@@ -334,9 +330,9 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert_eq!(
-                authority, endpoint.announced_registry_authority,
-                "case {case:?}: expected the host of {created_uri:?} to be the registry \
-                 authority this emulator publishes to this caller, got {authority:?}"
+                authority, endpoint.announced_endpoint,
+                "case {case:?}: expected the host of {created_uri:?} to be the endpoint this \
+                 emulator answers this caller's registry requests at, got {authority:?}"
             );
             assert_ne!(
                 authority,
@@ -642,6 +638,124 @@ async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
                 "case {case:?}: the registry API must answer at the reported address \
                  {authority:?}, got HTTP {status} with {answered:?}"
             );
+        }
+    }
+}
+
+/// The Regions the table below holds repositories in: two commercial Regions and one of a
+/// partition with a DNS suffix of its own, none of them the Region this suite's other rows
+/// are signed for. The Region keys the stored record and names its ARN, so a published
+/// address taken from the record rather than from the endpoint the call arrived on shows up
+/// here.
+const HOLDING_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "cn-north-1"];
+
+/// The label run every Amazon ECR registry host carries between the owning account's id and
+/// the Region (`AuthorizationData$proxyEndpoint`'s registry URL format). An authority
+/// composed out of that layout carries it; an address does not.
+const REGISTRY_LABEL_RUN: &str = ".dkr.ecr.";
+
+#[tokio::test]
+async fn the_published_address_is_the_endpoint_the_call_arrived_on_whichever_registry_holds_it() {
+    // The rule, read across BOTH things the published address could be taken from: the
+    // endpoint the call arrived on (which decides it) and the registry that holds the
+    // repository (which does not). A client DIALS the authority ahead of the first '/', so
+    // every row requires an address this emulator is reached at — the registry API answers
+    // there — and no name composed out of the registry host layout, which no resolver
+    // answers for.
+    for endpoint in endpoints() {
+        for region in HOLDING_REGIONS {
+            let router = emulator();
+            for name in REPOSITORY_NAMES {
+                let case = format!("{}, {region}, repository {name}", endpoint.case);
+                let expected = endpoint.repository_uri(name);
+
+                let created = call_at_in_region(
+                    &router,
+                    &endpoint,
+                    region,
+                    "CreateRepository",
+                    &json!({"repositoryName": name}),
+                )
+                .await;
+                let created_uri = text(&case, &created, "/repository/repositoryUri");
+                assert_eq!(
+                    created_uri, expected,
+                    "case {case:?}: expected CreateRepository to publish {expected:?}, got \
+                     {created_uri:?}"
+                );
+                let (authority, path) = created_uri
+                    .split_once('/')
+                    .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
+                assert_eq!(
+                    path, name,
+                    "case {case:?}: expected the path of {created_uri:?} to be the repository \
+                     name {name:?}, got {path:?}"
+                );
+                assert!(
+                    !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
+                    "case {case:?}: {created_uri:?} carries a registry host name of this \
+                     emulator's own invention, which no resolver answers for"
+                );
+                for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+                    assert!(
+                        !authority.to_ascii_lowercase().contains(suffix),
+                        "case {case:?}: {created_uri:?} carries a name under {suffix:?} — a \
+                         zone AWS publishes its own endpoints in, which this emulator does \
+                         not answer in"
+                    );
+                }
+
+                // The registry that HOLDS the repository is reported beside the address,
+                // off the stored record, so the address carries none of that identity.
+                let registry_id = text(&case, &created, "/repository/registryId");
+                let arn = text(&case, &created, "/repository/repositoryArn");
+                assert_eq!(
+                    (registry_id.as_str(), arn.as_str()),
+                    (
+                        REGISTRY_ID,
+                        format!("arn:aws:ecr:{region}:{REGISTRY_ID}:repository/{name}").as_str()
+                    ),
+                    "case {case:?}: expected the owning account and this Region's ARN beside \
+                     the address, got {registry_id:?} and {arn:?}"
+                );
+
+                // The read and the delete publish the repository at that same address.
+                for (operation, body, pointer) in [
+                    (
+                        "DescribeRepositories",
+                        json!({"repositoryNames": [name]}),
+                        "/repositories/0/repositoryUri",
+                    ),
+                    (
+                        "DeleteRepository",
+                        json!({"repositoryName": name}),
+                        "/repository/repositoryUri",
+                    ),
+                ] {
+                    let answered =
+                        call_at_in_region(&router, &endpoint, region, operation, &body).await;
+                    let reported = text(&case, &answered, pointer);
+                    assert_eq!(
+                        reported, expected,
+                        "case {case:?}: expected {operation} to publish {expected:?}, got \
+                         {reported:?}"
+                    );
+                }
+
+                // What an address is FOR: the registry API answers at it, for the credential
+                // this registry issued that caller.
+                let issued =
+                    call_at_in_region(&router, &endpoint, region, "GetAuthorizationToken", &json!({}))
+                        .await;
+                let token = text(&case, &issued, "/authorizationData/0/authorizationToken");
+                let (status, answered) =
+                    registry_get(&router, authority, "/v2/", &token, None).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the registry API must answer at the published address \
+                     {authority:?}, got HTTP {status} with {answered:?}"
+                );
+            }
         }
     }
 }

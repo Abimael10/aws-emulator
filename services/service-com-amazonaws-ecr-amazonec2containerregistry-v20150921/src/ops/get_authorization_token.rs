@@ -19,10 +19,10 @@
 //! (`crate::state::registry_login_url`, built on
 //! `crate::state::announced_registry_endpoint`), rather than the host AWS publishes its own
 //! registries at, which resolves nowhere near this process — and `crate::service`'s registry
-//! data plane is what answers there. A repository's `repositoryUri` is a reference rather
-//! than a URL dialled as it is handed over, so it names the registry that holds the
-//! repository instead (`crate::state::registry_address`), and this plane answers at either
-//! address. WHICH registry the token speaks for is recorded with the issue, and a pull
+//! data plane is what answers there. A repository's `repositoryUri` is published on that same
+//! address, with the repository's name as its path and no scheme
+//! (`crate::state::registry_address`), and this plane answers at either address. WHICH
+//! registry the token speaks for is recorded with the issue, and a pull
 //! presenting it addresses that registry (`crate::state::registry_v2`).
 //!
 //! `registryIds` selects nothing. The model marks the member `@deprecated` with the
