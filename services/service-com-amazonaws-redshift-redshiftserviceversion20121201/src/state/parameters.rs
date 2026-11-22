@@ -358,13 +358,16 @@ impl EngineParameter {
 /// from where the value sat in the request, and picks the sentence by what is
 /// wrong with the value:
 ///
-/// * a value that is not of the parameter's own `Parameter$DataType` at all —
-///   anything but a published boolean literal for a `boolean`, anything that is
-///   not a whole number for an `integer` — is refused on its FORM, naming the
-///   data type and the value the request carried;
+/// * a value that is not of the parameter's own `Parameter$DataType` at all is
+///   refused on its FORM, in the words the engine's parser FOR THAT TYPE uses:
+///   a value that is not a whole number for an `integer` is
+///   `invalid integer value:<value>`, and anything but a published literal for a
+///   `boolean` is `parameter value is not a valid boolean:<value>`;
 /// * a whole number the published `Parameter$AllowedValues` range does not
 ///   contain is refused on its MAGNITUDE, naming the parameter, the value and
-///   the bounds the catalogue advertises ([`EngineParameter::published_range`]).
+///   the range exactly as the catalogue advertises it — the `AllowedValues`
+///   string itself, which is the set a client reads, and not a re-rendering of
+///   its outer bounds.
 ///
 /// One function for every path that sets a parameter value, so the refusal a
 /// caller reads depends on the value it sent and not on which operation it sent
@@ -373,14 +376,17 @@ pub fn parameter_value_refusal(parameter: &EngineParameter, value: &str) -> Opti
     if parameter.admits(value) {
         return None;
     }
-    if let (true, Some((low, high))) = (
-        value.parse::<i64>().is_ok(),
-        parameter.published_range(),
+    if let (true, Some(allowed)) = (
+        value.parse::<i64>().is_ok() && parameter.published_range().is_some(),
+        parameter.allowed_values,
     ) {
         return Some(format!(
-            "The {} of {value} is outside of the acceptable range of {low}-{high}",
+            "The {} of {value} is outside of the acceptable range of {allowed}",
             parameter.name
         ));
+    }
+    if parameter.data_type == DATA_TYPE_INTEGER {
+        return Some(format!("invalid integer value:{value}"));
     }
     Some(format!(
         "parameter value is not a valid {}:{value}",

@@ -323,8 +323,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let described = match handle {
             None => Vec::new(),
             Some(handle) => {
-                let engine_timeout = crate::state::engine_timeout();
-                let budget = crate::state::CATALOG_REQUEST_BUDGET;
+                let engine_timeout = crate::state::engine_timeout(&*self.engine);
+                let budget = crate::state::catalog_request_budget(&*self.engine);
                 let bound = crate::state::ExecutionBound::new();
                 let interrupt = bound.interrupt();
                 // "The schema that contains the table. If no schema is

@@ -777,6 +777,160 @@ async fn each_cluster_serves_its_own_database_and_a_delete_closes_its_endpoint()
     });
 }
 
+/// RULE: the session a cluster's endpoint serves identifies the SERVER it is —
+/// `version()` names the warehouse behind the PostgreSQL protocol, after the
+/// PostgreSQL version its SQL surface is that of — and the niladic functions the
+/// protocol's grammar lets a client write WITHOUT parentheses answer from the
+/// session they are asked on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_identifies_the_warehouse_and_answers_the_niladic_functions() {
+    let emulator = Emulator::new();
+    let described =
+        available_cluster(&emulator, "wire-identity", &[("ClusterType", "single-node")]).await;
+    let (address, port) = endpoint_of("identity", &described);
+    let mut session = postgres_login(
+        "identity",
+        &address,
+        port,
+        Transport::Plaintext,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(state::DEFAULT_DB_NAME),
+    )
+    .await
+    .unwrap_or_else(|refusal| panic!("case identity: expected a session, got {refusal:?}"));
+
+    let reported = session
+        .query("SELECT version()")
+        .await
+        .unwrap_or_else(|refusal| panic!("case version: version() must run, got {refusal:?}"))
+        .only()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        reported.contains("Redshift") && reported.contains(state::CLUSTER_SERVER_VERSION),
+        "case version: expected the sentence to name the warehouse and the PostgreSQL version its \
+         SQL surface is that of, got {reported:?}"
+    );
+
+    // (case, the statement, the value the session answers)
+    let rows = [
+        (
+            "the bare keyword form",
+            "SELECT current_user",
+            MASTER_USER.to_string(),
+        ),
+        (
+            "the call form",
+            "SELECT current_user()",
+            MASTER_USER.to_string(),
+        ),
+        (
+            "the session user",
+            "SELECT session_user",
+            MASTER_USER.to_string(),
+        ),
+        (
+            "the keyword inside an expression",
+            "SELECT 'as ' || current_user",
+            format!("as {MASTER_USER}"),
+        ),
+        (
+            "a string that only looks like the keyword",
+            "SELECT 'current_user'",
+            "current_user".to_string(),
+        ),
+    ];
+    for (case, sql, expected) in rows {
+        let answer = session
+            .query(sql)
+            .await
+            .unwrap_or_else(|refusal| panic!("case {case}: {sql:?} must run, got {refusal:?}"));
+        assert_eq!(
+            answer.only(),
+            Some(expected.as_str()),
+            "case {case}: expected {expected:?}, got {answer:?}"
+        );
+    }
+}
+
+/// RULE: the one constraint class an Amazon Redshift warehouse enforces itself
+/// — a `NOT NULL` column — is refused under the warehouse's OWN condition code
+/// rather than PostgreSQL's integrity-constraint class, while every other
+/// condition — the object a statement named, the text it could not parse —
+/// carries the code the protocol itself names; and the row is not in the table
+/// either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_constraint_the_warehouse_enforces_carries_its_own_condition_code() {
+    let emulator = Emulator::new();
+    let described =
+        available_cluster(&emulator, "wire-sqlstate", &[("ClusterType", "single-node")]).await;
+    let (address, port) = endpoint_of("sqlstate", &described);
+    let mut session = postgres_login(
+        "sqlstate",
+        &address,
+        port,
+        Transport::Plaintext,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(state::DEFAULT_DB_NAME),
+    )
+    .await
+    .unwrap_or_else(|refusal| panic!("case sqlstate: expected a session, got {refusal:?}"));
+    session
+        .query("CREATE TABLE sim2real_constraints (id INT PRIMARY KEY, val VARCHAR(8) NOT NULL)")
+        .await
+        .unwrap_or_else(|refusal| panic!("case sqlstate: the CREATE must run, got {refusal:?}"));
+    session
+        .query("INSERT INTO sim2real_constraints VALUES (1, 'kept')")
+        .await
+        .unwrap_or_else(|refusal| panic!("case sqlstate: the INSERT must run, got {refusal:?}"));
+
+    // (case, the statement, the condition code the refusal carries)
+    //
+    // No duplicate-key row: "uniqueness, primary key, and foreign key
+    // constraints are informational only" on Amazon Redshift, so a warehouse
+    // does not refuse that INSERT at all and this suite asserts nothing about
+    // what this emulator's engine does with it.
+    let rows = [
+        (
+            "a NOT NULL column given NULL",
+            "INSERT INTO sim2real_constraints VALUES (2, NULL)",
+            "XX000",
+        ),
+        (
+            "a table the database does not hold",
+            "SELECT * FROM sim2real_absent",
+            "42P01",
+        ),
+        ("text that is not SQL", "SELEKT 1", "42601"),
+    ];
+    for (case, sql, code) in rows {
+        let refusal = session
+            .query(sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {case}: expected {sql:?} to be refused"));
+        assert_eq!(
+            refusal.code, code,
+            "case {case}: expected the condition code {code}, got {refusal:?}"
+        );
+        assert!(
+            !refusal.message.is_empty(),
+            "case {case}: expected the engine's own sentence, got {refusal:?}"
+        );
+    }
+    let kept = session
+        .query("SELECT val FROM sim2real_constraints ORDER BY id")
+        .await
+        .unwrap_or_else(|refusal| panic!("case the rows left: the read must run, got {refusal:?}"));
+    assert_eq!(
+        kept.rows,
+        vec![vec![Some("kept".to_string())]],
+        "case the rows left: expected only the row that was accepted, got {kept:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The control plane, as a client drives it
 // ---------------------------------------------------------------------------

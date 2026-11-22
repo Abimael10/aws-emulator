@@ -460,7 +460,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // budget, enforced by its progress handler. The bound belongs to THIS
         // execution, and the statement keeps the handle that abandons it, so
         // `CancelStatement` stops this statement's work and never another's.
-        let engine_timeout = crate::state::engine_timeout();
+        let engine_timeout = crate::state::engine_timeout(&*self.engine);
         let bound = crate::state::ExecutionBound::new();
 
         // Admitted, given a place in its database's queue and recorded as

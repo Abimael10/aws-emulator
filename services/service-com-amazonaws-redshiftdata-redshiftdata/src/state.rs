@@ -340,19 +340,50 @@ impl TargetSelectors {
 /// resolved.
 pub const ABSENT_ENDPOINT_MESSAGE: &str = "Redshift endpoint doesn't exist in this region.";
 
-/// Ceiling on the wall-clock bound one submission's execution runs under. The
-/// SQL engine runs in-process with no isolation boundary, so a statement that
-/// never terminates would take the whole emulator down rather than just its own
-/// request.
+/// The wall-clock bound one submission's execution runs under when nothing has
+/// configured a shorter one ([`set_engine_deadline`]). The SQL engine runs
+/// in-process with no isolation boundary, so a statement that never terminates
+/// would take the whole emulator down rather than just its own request.
 ///
 /// It bounds the EXECUTION and not the request: a submission runs on the
 /// blocking pool, independently of the request that submitted it, so the
 /// statement reaches a terminal status whatever the caller does with its
 /// response — and reaches it because the engine stopped, never because a caller
 /// stopped waiting. A caller's own patience is `WaitTimeSeconds`
-/// ([`wait_budget`]), which is shorter or longer than this and changes nothing
-/// about the statement.
-pub const MAX_ENGINE_DEADLINE: Duration = Duration::from_secs(10);
+/// ([`wait_budget`]), which is shorter than this and changes nothing about the
+/// statement.
+///
+/// It is a NON-TERMINATION backstop and not a budget on how much work a
+/// statement may do: a data warehouse runs an expensive but legal statement to
+/// completion, and a statement this emulator stopped part-way through would
+/// report a failure the warehouse never had. So it is far longer than any
+/// patience the model admits (`WaitTimeSeconds` tops out at 30 seconds), which
+/// is also what keeps a waiting caller from ever observing it, and far longer
+/// than the statements a client of an emulator submits take; what it still
+/// catches is a statement that would not finish at all.
+pub const MAX_ENGINE_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The wall-clock bound the executions of ONE emulator run under.
+///
+/// Held as that emulator's own engine state, like the shared clock, so an
+/// operator — or this service's own suite, which has to observe a statement the
+/// bound stops without waiting [`MAX_ENGINE_DEADLINE`] for it — can hold
+/// executions to a shorter bound than the default. Nothing a REQUEST can reach
+/// moves it: a caller's own patience is `WaitTimeSeconds` and bounds the
+/// response, never the execution.
+#[derive(Debug)]
+pub struct EngineBudget {
+    /// The deadline one execution is armed with.
+    deadline: Duration,
+}
+
+impl Default for EngineBudget {
+    fn default() -> Self {
+        Self {
+            deadline: MAX_ENGINE_DEADLINE,
+        }
+    }
+}
 
 /// Step budget per second of an execution's wall-clock deadline, counted in
 /// SQLite virtual-machine instructions. A wall-clock timeout cannot preempt a
@@ -4666,19 +4697,44 @@ pub fn wait_budget(wait_time_seconds: Option<i32>) -> Option<Duration> {
 
 /// The engine's own wall-clock deadline for one submission's execution.
 ///
-/// [`MAX_ENGINE_DEADLINE`] for every submission: the execution runs
-/// independently of the request that submitted it, so what bounds it is the
+/// Whatever this emulator's [`EngineBudget`] holds, which is
+/// [`MAX_ENGINE_DEADLINE`] until something sets a shorter one: the execution
+/// runs independently of the request that submitted it, so what bounds it is the
 /// engine's own deadline and never a caller's patience.
-pub fn engine_timeout() -> Duration {
-    MAX_ENGINE_DEADLINE
+pub fn engine_timeout<Eng: Send + Sync + 'static>(engine: &Eng) -> Duration {
+    engine_budget(engine).map_or(MAX_ENGINE_DEADLINE, |budget| budget.lock().deadline)
+}
+
+/// Hold the executions of this emulator to `deadline` instead of
+/// [`MAX_ENGINE_DEADLINE`].
+///
+/// The one way the bound moves, and it is not reachable from a request: an
+/// operator — or this service's own suite, which has to observe a statement the
+/// bound stops — sets it in process. No effect on an engine that holds no store
+/// to set.
+pub fn set_engine_deadline<Eng: Send + Sync + 'static>(engine: &Eng, deadline: Duration) {
+    if let Some(budget) = engine_budget(engine) {
+        budget.lock().deadline = deadline;
+    }
+}
+
+/// This emulator's execution budget, or `None` when `engine` is not the shared
+/// in-memory one.
+fn engine_budget<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<EngineBudget>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<EngineBudget>)
 }
 
 /// How long a REQUEST waits for a catalog read: the engine's own deadline plus a
 /// grace period, so what ends the read is that deadline and not the request's
 /// patience — a catalog read answers from the database the request named, so it
 /// is served inside the request rather than left to finish on its own.
-pub const CATALOG_REQUEST_BUDGET: Duration =
-    MAX_ENGINE_DEADLINE.saturating_add(Duration::from_secs(3));
+pub fn catalog_request_budget<Eng: Send + Sync + 'static>(engine: &Eng) -> Duration {
+    engine_timeout(engine).saturating_add(Duration::from_secs(3))
+}
 
 /// The step budget one execution runs under, given its wall-clock `deadline`.
 ///

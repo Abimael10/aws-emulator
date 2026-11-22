@@ -28,7 +28,11 @@
 //! * the TEMPORARY credentials `GetClusterCredentials` and
 //!   `GetClusterCredentialsWithIAM` minted for that cluster's database
 //!   ([`IssuedDatabaseCredential`]), which log on until they expire — the
-//!   lifetime those operations promise, made real.
+//!   lifetime those operations promise, made real;
+//! * which DIALECT of the PostgreSQL protocol the endpoint answers in
+//!   ([`EngineWire::Redshift`]): the server behind it is a data warehouse and
+//!   not a PostgreSQL server, so `version()` names the warehouse and a
+//!   constraint its engine enforces carries the warehouse's own condition code.
 //!
 //! The listener is held on the cluster's own record
 //! ([`StoredCluster::endpoint_plane`]), so the port stays open for as long as
@@ -242,7 +246,7 @@ pub async fn open_cluster_endpoint_plane<Eng: Send + Sync + 'static>(
         clock,
         key: cluster_key.to_string(),
     });
-    sql_wire_planes::open_sql_wire_plane(engine, EngineWire::Postgres, served, SIGNING_NAME).await
+    sql_wire_planes::open_sql_wire_plane(engine, EngineWire::Redshift, served, SIGNING_NAME).await
 }
 
 /// Open the data plane of the cluster `cluster_identifier` and publish it as

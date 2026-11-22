@@ -119,9 +119,10 @@ automod = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 # The client side of the in-band TLS upgrade a `sslmode=require` PostgreSQL
 # session negotiates on a cluster's endpoint, which
-# `tests/all/cluster_engine_endpoint.rs` runs against the core's own listener.
-# Both are already in this repository's Cargo.lock (the same pair the Lightsail
-# engine-endpoint suite uses), so naming them here adds no locked package.
+# `tests/all/cluster_engine_endpoint.rs` and `tests/all/cluster_data_plane.rs`
+# run against the core's own listener. Both are already in this repository's
+# Cargo.lock (the same pair the Lightsail engine-endpoint suite uses), so naming
+# them here adds no locked package.
 tokio-rustls = "0.26"
 rustls = { workspace = true }
 # The snapshot-copy-grant KMS suite mounts the KMS service beside Redshift on one

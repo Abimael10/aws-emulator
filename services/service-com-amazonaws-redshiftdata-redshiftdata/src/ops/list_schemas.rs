@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // bounded exactly as a catalog read is, so a read queued behind a
             // slow statement cannot pin this request.
             Some(handle) => {
-                let budget = crate::state::CATALOG_REQUEST_BUDGET;
+                let budget = crate::state::catalog_request_budget(&*self.engine);
                 let pattern = schema_pattern.clone();
                 let joined = tokio::time::timeout(
                     budget,

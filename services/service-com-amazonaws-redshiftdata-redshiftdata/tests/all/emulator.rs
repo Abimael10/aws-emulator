@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_redshiftdata_redshiftdata::state::{
-    service_state, ConnectionTarget, QueueSlot, MAX_ENGINE_DEADLINE,
+    service_state, set_engine_deadline, ConnectionTarget, QueueSlot,
 };
 use service_com_amazonaws_redshiftdata_redshiftdata::EmulatedService;
 
@@ -57,6 +57,18 @@ pub const LONGEST_MODELLED_WAIT_SECONDS: i32 = 30;
 /// longest wait costs a statement that finishes sooner nothing.
 pub const WAIT_SECONDS: i32 = LONGEST_MODELLED_WAIT_SECONDS;
 
+/// The wall-clock bound the executions of every emulator this harness builds
+/// run under.
+///
+/// The service's own default is a NON-TERMINATION backstop far longer than any
+/// statement a client submits (`MAX_ENGINE_DEADLINE`), because a warehouse runs
+/// an expensive but legal statement to completion. A suite that has to observe
+/// a statement that bound STOPS cannot wait that long, so every emulator here
+/// is held to this much instead ([`set_engine_deadline`], which no request can
+/// reach) — long enough that work meant to finish does, short enough that a
+/// statement meant not to is stopped while the suite is still watching.
+pub const TEST_ENGINE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A wait no longer than the engine's own execution bound cannot see a statement
 /// that bound stops: the execution is armed after the request starts waiting, so
 /// it reports at the earliest when that wait is already over, and the waiting
@@ -65,7 +77,7 @@ pub const WAIT_SECONDS: i32 = LONGEST_MODELLED_WAIT_SECONDS;
 /// waiting suite would pass on one machine and fail on another. Checked here so
 /// the two bounds cannot drift back together unnoticed.
 const _: () = assert!(
-    WAIT_SECONDS > 0 && MAX_ENGINE_DEADLINE.as_secs() < WAIT_SECONDS.unsigned_abs() as u64,
+    WAIT_SECONDS > 0 && TEST_ENGINE_DEADLINE.as_secs() < WAIT_SECONDS.unsigned_abs() as u64,
     "the wait a waiting test asks for must outlast the engine's own execution bound"
 );
 
@@ -157,7 +169,7 @@ pub const TERMINAL_STATUSES: [&str; 3] = ["FINISHED", "FAILED", "ABORTED"];
 /// execution bound and room to spare, so a poll gives up because a statement
 /// never terminated and never because the machine running the test was busy.
 const TERMINAL_STATUS_BUDGET: Duration =
-    MAX_ENGINE_DEADLINE.saturating_add(Duration::from_secs(30));
+    TEST_ENGINE_DEADLINE.saturating_add(Duration::from_secs(30));
 
 /// How long to wait between two polls of a statement's status.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -191,6 +203,7 @@ pub struct Emulator {
 impl Emulator {
     pub fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        set_engine_deadline(&*engine, TEST_ENGINE_DEADLINE);
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -475,6 +488,7 @@ pub struct Warehouses {
 impl Warehouses {
     pub fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        set_engine_deadline(&*engine, TEST_ENGINE_DEADLINE);
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));

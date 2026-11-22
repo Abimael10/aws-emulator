@@ -111,6 +111,7 @@ impl Session {
     ) -> Self {
         let view = EngineView {
             server_version: facts.server_version.clone(),
+            server_banner: version_banner(wire, &facts.server_version),
             database: database.clone(),
             user: user.clone(),
             connection_id,
@@ -142,7 +143,7 @@ impl Session {
     fn server_settings(&self) -> Vec<(String, String)> {
         let version = self.facts.server_version.clone();
         match self.wire {
-            EngineWire::Postgres => vec![
+            EngineWire::Postgres | EngineWire::Redshift => vec![
                 ("server_version".to_string(), version),
                 ("server_encoding".to_string(), "UTF8".to_string()),
                 ("client_encoding".to_string(), "UTF8".to_string()),
@@ -203,6 +204,7 @@ impl Session {
     /// password rotation or a state change reaches the next statement.
     pub fn refresh(&mut self, facts: DatabaseFacts) {
         self.view.server_version = facts.server_version.clone();
+        self.view.server_banner = version_banner(self.wire, &facts.server_version);
         self.facts = facts;
     }
 
@@ -329,7 +331,9 @@ impl Session {
         Err(EngineError::new(
             EngineErrorKind::UndefinedObject,
             match self.wire {
-                EngineWire::Postgres => format!("unrecognized configuration parameter \"{name}\""),
+                EngineWire::Postgres | EngineWire::Redshift => {
+                    format!("unrecognized configuration parameter \"{name}\"")
+                }
                 EngineWire::MySql => format!("Unknown system variable '{name}'"),
             },
         ))
@@ -359,13 +363,30 @@ impl Session {
     }
 
     /// `BEGIN` / `START TRANSACTION`: open one on the engine, or leave the one
-    /// this session already has open as it is.
+    /// that is already open as it is.
+    ///
+    /// A server whose session already has a transaction open answers a `BEGIN`
+    /// with a warning and changes nothing — PostgreSQL's "there is already a
+    /// transaction in progress" — so this is a no-op and never a refusal. The
+    /// ENGINE is asked as well as this session: one database's engine serves
+    /// every session on it, so a transaction another session of the same
+    /// database has open is one this `BEGIN` must not try to nest inside.
     async fn begin(&mut self) -> Result<Answer, EngineError> {
-        if self.in_transaction {
+        if self.in_transaction || !self.engine_is_autocommit().await {
+            self.in_transaction = true;
             return Ok(Answer::done("BEGIN", 0, 0));
         }
         self.engine_statement("BEGIN").await?;
         Ok(Answer::done("BEGIN", 0, 0))
+    }
+
+    /// Whether the engine has NO transaction open at all, read off the engine
+    /// rather than off this session.
+    async fn engine_is_autocommit(&self) -> bool {
+        let engine = Arc::clone(&self.engine);
+        off_the_async_worker(move || engine.is_autocommit())
+            .await
+            .unwrap_or(true)
     }
 
     /// `COMMIT` / `ROLLBACK`: end the transaction, or answer the no-op a server
@@ -459,6 +480,32 @@ impl Drop for Session {
         }
     }
 }
+
+/// What `version()` answers on a session of `wire`, whose resource publishes
+/// the engine version `server_version`.
+///
+/// A MySQL server answers the bare version, and so does this endpoint. A
+/// PostgreSQL server answers a sentence, and an Amazon Redshift warehouse
+/// answers one that NAMES the warehouse after the PostgreSQL version its SQL
+/// surface is that of — which is how a client tells a Redshift warehouse from a
+/// PostgreSQL server over the same protocol (recorded behaviour: a client reads
+/// `version()` and looks for the warehouse's name in it). The PostgreSQL wire
+/// keeps answering the bare version, because that is what every reader of it in
+/// this workspace already reports.
+fn version_banner(wire: EngineWire, server_version: &str) -> String {
+    match wire {
+        EngineWire::Redshift => {
+            format!("PostgreSQL {server_version} on x86_64-pc-linux-gnu, Redshift {REDSHIFT_SQL_RELEASE}")
+        }
+        EngineWire::Postgres | EngineWire::MySql => server_version.to_string(),
+    }
+}
+
+/// The release of the Amazon Redshift SQL surface this endpoint serves, as
+/// `version()` names it: the one release line Amazon Redshift publishes, which
+/// is also what `Cluster$ClusterVersion` carries for every cluster this
+/// workspace's control plane offers.
+const REDSHIFT_SQL_RELEASE: &str = "1.0";
 
 /// Run `work` on the blocking pool, where there is one.
 ///

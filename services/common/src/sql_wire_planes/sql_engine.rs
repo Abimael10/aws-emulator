@@ -155,6 +155,10 @@ impl EngineError {
 pub struct EngineView {
     /// The engine version the resource publishes.
     pub server_version: String,
+    /// What `version()` answers: the sentence the resource's own server
+    /// identifies itself with, which is not always the bare version. Empty
+    /// falls back to [`EngineView::server_version`].
+    pub server_banner: String,
     /// The database the session is using.
     pub database: String,
     /// The user the session was admitted as.
@@ -497,7 +501,48 @@ pub fn statements(wire: super::EngineWire, sql: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            other => current.push(other),
+            other => {
+                // A WORD of the statement — not text inside a string, a quoted
+                // identifier, a comment or a dollar-quoted body, each of which
+                // the branches above have already consumed. This is therefore
+                // the ONE place that knows a word is a word, which is where the
+                // niladic keywords PostgreSQL admits without parentheses are
+                // read as the calls they denote ([`NILADIC_KEYWORDS`]).
+                current.push(other);
+                if mysql || !(other.is_alphabetic() || other == '_') {
+                    continue;
+                }
+                let mut word = String::from(other);
+                while characters
+                    .peek()
+                    .is_some_and(|next| next.is_alphanumeric() || *next == '_')
+                {
+                    if let Some(next) = characters.next() {
+                        word.push(next);
+                        current.push(next);
+                    }
+                }
+                if !NILADIC_KEYWORDS
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+                {
+                    continue;
+                }
+                // A word ALREADY followed by `(` is a call and is left alone.
+                // Read ahead on a clone, as the dollar-quote scan above does,
+                // so the scan itself does not move.
+                let mut ahead = characters.clone();
+                let called = loop {
+                    match ahead.next() {
+                        Some(next) if next.is_whitespace() => continue,
+                        Some('(') => break true,
+                        _ => break false,
+                    }
+                };
+                if !called {
+                    current.push_str("()");
+                }
+            }
         }
     }
     if !current.trim().is_empty() {
@@ -505,6 +550,20 @@ pub fn statements(wire: super::EngineWire, sql: &str) -> Vec<String> {
     }
     statements
 }
+
+/// The niladic functions PostgreSQL lets a statement write WITHOUT parentheses,
+/// each read by [`statements`] as the call it is.
+///
+/// `current_user` and `session_user` are reserved words of the PostgreSQL
+/// grammar that denote a function call — "note that these are not written with
+/// trailing parentheses" (PostgreSQL's "System Information Functions") — so a
+/// client writes `SELECT current_user` and expects the session's own user. The
+/// engine behind this endpoint reads a bare one as a column reference, so each
+/// is read as the call this endpoint registers for it ([`SERVER_FUNCTIONS`]).
+/// Being reserved words, neither can be the unquoted name of a column, so
+/// nothing else can be read differently by mistake.
+const NILADIC_KEYWORDS: [&str; 2] = ["current_user", "session_user"];
+
 
 /// The longest tag a dollar-quoted string may name, so a `$` a statement
 /// carries for another reason cannot make the scan read ahead without bound.
@@ -572,7 +631,13 @@ fn register_server_functions(
         view.lock().unwrap_or_else(PoisonError::into_inner).clone()
     };
     let text_functions: [(&str, TextFunction); 6] = [
-        ("version", |view| view.server_version.clone()),
+        ("version", |view| {
+            if view.server_banner.is_empty() {
+                view.server_version.clone()
+            } else {
+                view.server_banner.clone()
+            }
+        }),
         ("database", |view| view.database.clone()),
         ("current_database", |view| view.database.clone()),
         ("user", |view| view.user.clone()),
@@ -673,6 +738,10 @@ fn unavailable(error: ::rusqlite::Error) -> EngineError {
 fn engine_error(error: ::rusqlite::Error) -> EngineError {
     let message = match &error {
         ::rusqlite::Error::SqliteFailure(_, Some(message)) => message.clone(),
+        // Text the engine could not PARSE: its own sentence is the `msg`, which
+        // names what it stopped at, rather than the `Display` form that repeats
+        // the statement back.
+        ::rusqlite::Error::SqlInputError { msg, .. } => msg.clone(),
         other => other.to_string(),
     };
     let Some(code) = failure_code(&error) else {
@@ -700,6 +769,10 @@ fn engine_error(error: ::rusqlite::Error) -> EngineError {
 fn failure_code(error: &::rusqlite::Error) -> Option<::rusqlite::ffi::Error> {
     match error {
         ::rusqlite::Error::SqliteFailure(code, _) => Some(*code),
+        // The failure a PREPARE reported, which carries the same result code as
+        // any other failure: a statement the engine could not parse is a
+        // statement error and not an internal one.
+        ::rusqlite::Error::SqlInputError { error, .. } => Some(*error),
         _ => None,
     }
 }
@@ -757,6 +830,7 @@ mod tests {
     fn view_of(database: &str) -> EngineView {
         EngineView {
             server_version: "8.4.11".to_string(),
+            server_banner: String::new(),
             database: database.to_string(),
             user: "dbadmin".to_string(),
             connection_id: 7,
@@ -962,5 +1036,113 @@ mod tests {
             "case the answer budget: expected the bounded answer, got {} rows",
             bounded.rows.len()
         );
+    }
+
+    /// RULE: the niladic functions the PostgreSQL grammar lets a client write
+    /// WITHOUT parentheses are read as the calls they denote, on the wires that
+    /// speak that protocol and nowhere else — and only where the word is a word
+    /// of the statement rather than text inside it.
+    #[test]
+    fn the_niladic_keywords_are_read_as_the_calls_they_denote() {
+        use super::super::EngineWire;
+        // (case, the wire, the statement, what the engine is handed)
+        let rows: &[(&str, EngineWire, &str, &str)] = &[
+            (
+                "the bare keyword",
+                EngineWire::Postgres,
+                "SELECT current_user",
+                "SELECT current_user()",
+            ),
+            (
+                "the other keyword, on the warehouse wire",
+                EngineWire::Redshift,
+                "SELECT session_user",
+                "SELECT session_user()",
+            ),
+            (
+                "written in another case",
+                EngineWire::Postgres,
+                "SELECT CURRENT_USER",
+                "SELECT CURRENT_USER()",
+            ),
+            (
+                "already a call",
+                EngineWire::Postgres,
+                "SELECT current_user()",
+                "SELECT current_user()",
+            ),
+            (
+                "a call with a space before the parenthesis",
+                EngineWire::Postgres,
+                "SELECT current_user ()",
+                "SELECT current_user ()",
+            ),
+            (
+                "inside an expression",
+                EngineWire::Postgres,
+                "SELECT 'as ' || current_user || '!'",
+                "SELECT 'as ' || current_user() || '!'",
+            ),
+            (
+                "inside a string literal",
+                EngineWire::Postgres,
+                "SELECT 'current_user'",
+                "SELECT 'current_user'",
+            ),
+            (
+                "inside a quoted identifier",
+                EngineWire::Postgres,
+                "SELECT \"current_user\" FROM t",
+                "SELECT \"current_user\" FROM t",
+            ),
+            (
+                "inside a comment",
+                EngineWire::Postgres,
+                "SELECT 1 -- current_user",
+                "SELECT 1 -- current_user",
+            ),
+            (
+                "inside a block comment",
+                EngineWire::Postgres,
+                "SELECT /* current_user */ 1",
+                "SELECT /* current_user */ 1",
+            ),
+            // A dollar-quoted body carries anything at all, so a word inside
+            // one is text and not a word of the statement.
+            (
+                "inside a dollar-quoted string",
+                EngineWire::Postgres,
+                "SELECT $$current_user$$",
+                "SELECT $$current_user$$",
+            ),
+            (
+                "inside a tagged dollar-quoted string",
+                EngineWire::Redshift,
+                "SELECT $tag$ current_user $tag$ || current_user",
+                "SELECT $tag$ current_user $tag$ || current_user()",
+            ),
+            (
+                "a longer word that only starts with the keyword",
+                EngineWire::Postgres,
+                "SELECT current_users FROM t",
+                "SELECT current_users FROM t",
+            ),
+            // The MySQL wire's grammar has no such form: there the word is a
+            // column reference and is left exactly as written.
+            (
+                "the keyword on the MySQL wire",
+                EngineWire::MySql,
+                "SELECT current_user",
+                "SELECT current_user",
+            ),
+        ];
+        for (case, wire, statement, want) in rows {
+            let answer = statements(*wire, statement);
+            assert_eq!(
+                answer,
+                vec![(*want).to_string()],
+                "case {case:?}: expected {want:?}, got {answer:?}"
+            );
+        }
     }
 }

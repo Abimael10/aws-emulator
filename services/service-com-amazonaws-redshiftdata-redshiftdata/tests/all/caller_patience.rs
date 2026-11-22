@@ -24,11 +24,9 @@
 
 use serde_json::json;
 
-use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_ENGINE_DEADLINE;
-
 use super::emulator::{
     assert_verdict, number, wait_for_terminal, Emulator, PatienceRow, Verdict, QUICK_SQL,
-    SHORTEST_MODELLED_WAIT_SECONDS, UNBOUNDED_SQL, WAIT_SECONDS,
+    SHORTEST_MODELLED_WAIT_SECONDS, TEST_ENGINE_DEADLINE, UNBOUNDED_SQL, WAIT_SECONDS,
 };
 
 /// A caller's `WaitTimeSeconds` bounds its own response and nothing else: the
@@ -171,8 +169,8 @@ fn single_statement(row: &PatienceRow) -> &'static str {
 /// callbacks.
 fn bounded_run_nanos() -> i64 {
     i64::try_from(
-        MAX_ENGINE_DEADLINE
-            .saturating_add(MAX_ENGINE_DEADLINE)
+        TEST_ENGINE_DEADLINE
+            .saturating_add(TEST_ENGINE_DEADLINE)
             .as_nanos(),
     )
     .unwrap_or(i64::MAX)

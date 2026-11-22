@@ -13,6 +13,11 @@
 //! socket this emulator serves that cluster's database on, which
 //! [`crate::cluster_engine_endpoint`] opens a session against.
 //!
+//! The address and the port are the LISTENER's own — the core owns the port
+//! range its listeners are bound in, so what a cluster publishes is the port its
+//! database engine really answers on rather than the one a request asked for —
+//! and the endpoint is proved by dialling it, not by recomputing it.
+//!
 //! Every row drives a real HTTP request through the same `MultiServiceRouter` the
 //! production router builds (the harness is shared with
 //! [`crate::cluster_lifecycle`]), so each assertion covers the whole walk:

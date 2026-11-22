@@ -58,13 +58,17 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// The PostgreSQL wire handler for one database's listener.
 pub struct PostgresWire {
     context: SessionContext,
+    /// Which server answers behind this protocol: a PostgreSQL server, or an
+    /// Amazon Redshift warehouse, which speaks the same protocol and reports its
+    /// own identity and its own SQLSTATEs.
+    wire: EngineWire,
 }
 
 impl PostgresWire {
-    /// The handler for the database `context` names.
+    /// The handler for the database `context` names, serving `wire`.
     #[must_use]
-    pub fn new(context: SessionContext) -> Self {
-        Self { context }
+    pub fn new(context: SessionContext, wire: EngineWire) -> Self {
+        Self { context, wire }
     }
 }
 
@@ -74,10 +78,11 @@ impl ::emulator_server::NativeHandler for PostgresWire {
         conn: ::emulator_server::ListenerConn,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let context = self.context.clone();
+        let wire = self.wire;
         Box::pin(async move {
             // An I/O error is the client's connection going away, which ends
             // the session and nothing else.
-            let _ = serve_session(context, conn).await;
+            let _ = serve_session(context, wire, conn).await;
         })
     }
 }
@@ -85,6 +90,7 @@ impl ::emulator_server::NativeHandler for PostgresWire {
 /// One connection, from its first message to its last.
 async fn serve_session(
     context: SessionContext,
+    wire: EngineWire,
     conn: ::emulator_server::ListenerConn,
 ) -> std::io::Result<()> {
     let mut conn = conn;
@@ -198,7 +204,7 @@ async fn serve_session(
     // 4. The session is open.
     let mut session = Session::new(
         Arc::clone(context.engine()),
-        EngineWire::Postgres,
+        wire,
         facts,
         user.clone(),
         database,
@@ -262,7 +268,7 @@ async fn serve_session(
                         failed_in_transaction = false;
                     }
                     Err(error) => {
-                        engine_error_response(&mut conn, &error).await?;
+                        engine_error_response(&mut conn, wire, &error).await?;
                         failed_in_transaction = session.in_transaction();
                     }
                 }
@@ -474,7 +480,23 @@ fn refusal_sentence(refusal: &LoginRefusal, user: &str) -> (&'static str, String
 }
 
 /// The SQLSTATE a failed statement is reported under.
-fn sqlstate(kind: EngineErrorKind) -> &'static str {
+///
+/// PostgreSQL's "Appendix A. Error Codes" names a condition per class, and a
+/// PostgreSQL server answers that condition's own code. An Amazon Redshift
+/// warehouse does not for the one constraint class it enforces ITSELF: "Amazon
+/// Redshift does enforce NOT NULL column constraints", while "uniqueness,
+/// primary key, and foreign key constraints are informational only" (the Amazon
+/// Redshift Database Developer Guide, "Defining table constraints"), and a row
+/// refused for a `NOT NULL` column reaches the client under the warehouse's
+/// internal-error code `XX000` rather than PostgreSQL's integrity-constraint
+/// class — which is what a client of a Redshift endpoint branches on. Every
+/// other class — the object a statement named, the text it could not parse, the
+/// statement a caller cancelled — is the condition the protocol itself names, on
+/// both.
+fn sqlstate(wire: EngineWire, kind: EngineErrorKind) -> &'static str {
+    if wire == EngineWire::Redshift && kind == EngineErrorKind::NotNullViolation {
+        return "XX000";
+    }
     match kind {
         EngineErrorKind::Syntax => "42601",
         EngineErrorKind::UndefinedObject => "42P01",
@@ -494,9 +516,10 @@ fn sqlstate(kind: EngineErrorKind) -> &'static str {
 /// Report a failed statement, keeping the engine's own message.
 async fn engine_error_response(
     conn: &mut ::emulator_server::ListenerConn,
+    wire: EngineWire,
     error: &EngineError,
 ) -> std::io::Result<()> {
-    error_response(conn, "ERROR", sqlstate(error.kind), &error.message).await
+    error_response(conn, "ERROR", sqlstate(wire, error.kind), &error.message).await
 }
 
 /// One `ErrorResponse`.

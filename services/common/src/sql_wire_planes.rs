@@ -85,6 +85,24 @@ pub fn client_host() -> &'static str {
 pub enum EngineWire {
     MySql,
     Postgres,
+    /// The PostgreSQL protocol as an Amazon Redshift warehouse speaks it.
+    ///
+    /// A Redshift cluster is reached with a stock PostgreSQL driver, so the
+    /// protocol is the same one [`EngineWire::Postgres`] serves — but the SERVER
+    /// behind it is a data warehouse and not a PostgreSQL server, and a client
+    /// tells them apart: `version()` names the warehouse, and the engine's
+    /// errors carry the warehouse's own SQLSTATEs rather than PostgreSQL's
+    /// condition codes.
+    Redshift,
+}
+
+impl EngineWire {
+    /// Whether this wire is the PostgreSQL frontend/backend protocol, which
+    /// both the PostgreSQL server and the Redshift warehouse speak.
+    #[must_use]
+    pub fn is_postgres_protocol(self) -> bool {
+        matches!(self, Self::Postgres | Self::Redshift)
+    }
 }
 
 /// The address and port a database's data plane answers at — what the control
@@ -526,8 +544,8 @@ pub async fn open_sql_wire_plane<Eng: Send + Sync + 'static>(
                 dialable_data_planes::served_in_process(served, None),
             )
         }
-        EngineWire::Postgres => {
-            let served = Arc::new(pg_wire::PostgresWire::new(context));
+        EngineWire::Postgres | EngineWire::Redshift => {
+            let served = Arc::new(pg_wire::PostgresWire::new(context, wire));
             let listener = listeners
                 .tcp_plaintext(SharedHandler(Arc::clone(&served)))
                 .await

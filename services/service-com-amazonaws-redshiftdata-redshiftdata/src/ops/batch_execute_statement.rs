@@ -490,7 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound belongs to THIS batch, and the statement keeps the handle that
         // abandons it, so `CancelStatement` stops this batch's transaction —
         // which is then rolled back — and never another request's.
-        let engine_timeout = crate::state::engine_timeout();
+        let engine_timeout = crate::state::engine_timeout(&*self.engine);
         let bound = crate::state::ExecutionBound::new();
 
         // Admitted, given a place in its database's queue and recorded as

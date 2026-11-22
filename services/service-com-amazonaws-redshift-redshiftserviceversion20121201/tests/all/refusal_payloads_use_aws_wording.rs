@@ -109,21 +109,24 @@ async fn a_parameter_value_refusal_is_worded_from_the_parameter_not_from_the_wir
             message: "parameter value is not a valid boolean:1",
         },
         // An integer parameter: a value that is no whole number is refused on
-        // its form, in the same shape of sentence as a boolean's.
+        // its form, in the words the engine's own integer parser uses — which
+        // are not the words its boolean parser uses.
         ValueRefusal {
             case: "a word for an integer",
             parameter: "max_concurrency_scaling_clusters",
             value: "many",
-            message: "parameter value is not a valid integer:many",
+            message: "invalid integer value:many",
         },
         ValueRefusal {
             case: "a fraction for an integer",
             parameter: "extra_float_digits",
             value: "1.5",
-            message: "parameter value is not a valid integer:1.5",
+            message: "invalid integer value:1.5",
         },
         // A whole number the published range does not contain is refused on its
-        // magnitude, naming the parameter, the value and the range.
+        // magnitude, naming the parameter, the value and the range EXACTLY as
+        // `AllowedValues` advertises it — the set a client reads, not a
+        // re-rendering of its outer bounds.
         ValueRefusal {
             case: "one above the upper bound of 0-10",
             parameter: "max_concurrency_scaling_clusters",
@@ -159,13 +162,23 @@ async fn a_parameter_value_refusal_is_worded_from_the_parameter_not_from_the_wir
             parameter: "statement_timeout",
             value: "50",
             message:
-                "The statement_timeout of 50 is outside of the acceptable range of 0-2147483647",
+                "The statement_timeout of 50 is outside of the acceptable range of 0,100-2147483647",
         },
         ValueRefusal {
             case: "one above the upper bound of 0,100-2147483647",
             parameter: "statement_timeout",
             value: "2147483648",
-            message: "The statement_timeout of 2147483648 is outside of the acceptable range of 0-2147483647",
+            message: "The statement_timeout of 2147483648 is outside of the acceptable range of 0,100-2147483647",
+        },
+        // The lower bound of that same set's RANGE, one below it: the literal 0
+        // is admitted and 99 is not, which is why the advertised set carries
+        // both the literal and the range.
+        ValueRefusal {
+            case: "one below the lower bound of the range of 0,100-2147483647",
+            parameter: "statement_timeout",
+            value: "99",
+            message:
+                "The statement_timeout of 99 is outside of the acceptable range of 0,100-2147483647",
         },
     ];
 

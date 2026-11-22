@@ -390,8 +390,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
             available_at: started + st::PROVISIONING_SPAN,
             // The configuration of the cluster AS IT IS NOW, so a later
             // `RestoreFromClusterSnapshot` rebuilds this instant rather than
-            // whatever the source cluster has become by then.
-            source: Some(stored_cluster),
+            // whatever the source cluster has become by then — and WITHOUT the
+            // source cluster's open endpoint or the credentials issued against
+            // it, neither of which a snapshot is a holder of.
+            source: Some(st::StoredCluster {
+                endpoint_plane: None,
+                issued_credentials: Vec::new(),
+                ..stored_cluster
+            }),
             // ... and its DATABASES as they stood at the same instant, copied
             // before this lock was taken.
             data,
