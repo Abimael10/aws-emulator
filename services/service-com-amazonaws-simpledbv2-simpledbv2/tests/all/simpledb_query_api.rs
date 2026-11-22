@@ -785,46 +785,121 @@ async fn list_domains_pages_in_name_order() {
     );
 }
 
-/// The items written on the query wire are the items an export of that domain counts:
-/// `GetExport` reports the domain's own item count once the export has completed.
-#[tokio::test]
-async fn an_export_counts_the_items_the_query_wire_wrote() {
-    let router = emulator();
-    create_domain(&router, "counted").await;
-    for item in ["item-1", "item-2", "item-3"] {
-        put_attribute(&router, "counted", item, "colour", "blue", false).await;
-    }
-
-    let started = ok_call(
-        &router,
-        "StartDomainExport",
-        &json!({ "domainName": "counted", "s3Bucket": BUCKET }),
-    )
-    .await;
-    let export_arn = member(&started, "exportArn").expect("the start minted an ARN");
-
-    // Poll for the status the clock owes rather than sleeping for it: what is asserted
-    // is that the export completes, not how fast this host is.
+/// Read `export_arn` until it reports `SUCCEEDED`, and hand back the document that first
+/// reported it.
+///
+/// Polls for the CONDITION instead of sleeping a fixed time: what a caller asserts is that
+/// the export completes, never how fast this host is.
+///
+/// The wait between two looks is a BLOCKING sleep: this crate's `tokio` dev-dependency
+/// enables only `macros`/`rt`, not the `time` feature `tokio::time::sleep` needs, and a
+/// case here owns its thread and has no other call in flight while it waits.
+async fn poll_until_succeeded(
+    router: &MultiServiceRouter,
+    case: &str,
+    export_arn: &str,
+) -> serde_json::Value {
     let request = json!({ "exportArn": export_arn });
     let deadline = Instant::now() + SETTLE_DEADLINE;
-    let succeeded = loop {
-        let reported = ok_call(&router, "GetExport", &request).await;
+    loop {
+        let reported = ok_call(router, "GetExport", &request).await;
         if member(&reported, "exportStatus").as_deref() == Some("SUCCEEDED") {
-            break reported;
+            return reported;
         }
         assert!(
             Instant::now() < deadline,
-            "case waiting for the export to complete: it never reached SUCCEEDED; last \
-             report {reported:?}"
+            "case {case}: the export never reached SUCCEEDED; last report {reported:?}"
         );
         std::thread::sleep(POLL_INTERVAL);
-    };
-    assert_eq!(
-        succeeded.get("itemsCount").and_then(serde_json::Value::as_i64),
-        Some(3),
-        "case an export of a domain holding three items: itemsCount must count them, got \
-         {succeeded:?}"
-    );
+    }
+}
+
+/// One row of [`an_exports_item_count_is_the_exported_domains_own_item_total`]: how many
+/// items the exported domain holds, and how many attribute pairs each of those items
+/// carries.
+///
+/// The count under test counts ITEMS, so the pairs per item vary independently of it: a
+/// row whose items are multi-valued must report the same total as a row whose items carry
+/// one pair each.
+type ItemCountRow = (&'static str, usize, usize);
+
+/// `GetExport.itemsCount` is the total of items the export carried out of the domain —
+/// "Total number of exported items"
+/// (`smithy_query(query="doc",shape="GetExportResponse",member="itemsCount")`), a
+/// `@range(min: 0)` long — so it is computed from the exported domain's own contents at the
+/// instant the export completed, and a finished export keeps reporting that total however
+/// the domain changes afterwards. The items it counts are the ones written on the
+/// 2009-04-15 query wire this endpoint serves, which is the ONE store both wires share.
+///
+/// The rows span what the rule generalises over: the number of items in the domain, from
+/// the modelled minimum of zero (an empty domain) upwards, and how many attribute pairs
+/// each item holds, which the total must ignore.
+#[tokio::test]
+async fn an_exports_item_count_is_the_exported_domains_own_item_total() {
+    let rows: &[ItemCountRow] = &[
+        ("a domain nothing was ever written to", 0, 1),
+        ("a domain holding one single-valued item", 1, 1),
+        ("a domain holding two items", 2, 1),
+        ("a domain holding two multi-valued items", 2, 3),
+        ("a domain holding three single-valued items", 3, 1),
+        ("a domain holding seven items", 7, 2),
+    ];
+    let router = emulator();
+
+    for (case, items, pairs_per_item) in rows {
+        let domain = format!("sized-{items}-by-{pairs_per_item}");
+        create_domain(&router, &domain).await;
+        for item in 0..*items {
+            for pair in 0..*pairs_per_item {
+                put_attribute(
+                    &router,
+                    &domain,
+                    &format!("item-{item}"),
+                    "colour",
+                    &format!("shade-{pair}"),
+                    false,
+                )
+                .await;
+            }
+        }
+
+        let started = ok_call(
+            &router,
+            "StartDomainExport",
+            &json!({ "domainName": domain, "s3Bucket": BUCKET }),
+        )
+        .await;
+        let export_arn = member(&started, "exportArn")
+            .unwrap_or_else(|| panic!("case {case:?}: no exportArn in {started:?}"));
+
+        let succeeded = poll_until_succeeded(&router, case, &export_arn).await;
+        let expected = i64::try_from(*items).expect("a row's item count fits a long");
+        let actual = succeeded
+            .get("itemsCount")
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(
+            actual,
+            Some(expected),
+            "case {case:?}: itemsCount is the number of items the export carried; expected \
+             {expected}, got {actual:?} in {succeeded:?}"
+        );
+
+        // A write made AFTER the export completed belongs to no finished export, so the
+        // total that export reports stays the one it exported.
+        put_attribute(&router, &domain, "item-written-later", "colour", "late", false).await;
+        let again = ok_call(
+            &router,
+            "GetExport",
+            &json!({ "exportArn": export_arn.clone() }),
+        )
+        .await;
+        assert_eq!(
+            again.get("itemsCount").and_then(serde_json::Value::as_i64),
+            Some(expected),
+            "case {case:?}: a finished export reports the total it exported, not the \
+             domain's later size; expected {expected}, got {again:?}"
+        );
+    }
 }
 
 /// A read on this wire does not change what a later caller sees.
