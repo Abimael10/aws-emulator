@@ -44,9 +44,20 @@ const MESSAGE_ATTACHMENT_NOT_FOUND: &str = "Message template attachment does not
 const MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
 
-/// The sentence a label that carries a version qualifier is refused with, on an operation
-/// whose own documentation says it may not carry one.
-const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = "The messageTemplateId cannot contain a qualifier.";
+/// The message a label carrying a version qualifier is refused with, on an operation whose
+/// own documentation says its label may not carry one: AWS's report of the member's
+/// `@pattern` violation, stating the expression the service enforces for it — `UuidOrArn`,
+/// quoted without the `^`/`$` pair a whole-value pattern is wrapped in, which is how this
+/// endpoint quotes every other pattern requirement. Written out here rather than imported
+/// from the implementation, so the assertion pins the message a client reads.
+pub(crate) const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = concat!(
+    "1 validation error detected: Value at 'messageTemplateId' failed to satisfy constraint: ",
+    "Member must satisfy regular expression pattern: ",
+    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
+    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
+    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}",
+);
 
 /// The two managed version qualifiers the read's own documentation names
 /// (`smithy_query(query="doc",shape="GetMessageTemplate")`: "either an actual version
@@ -99,7 +110,7 @@ async fn message_template(emulator: &Emulator, knowledge_base_id: &str, name: &s
 }
 
 /// `CreateMessageTemplateAttachment`: one file uploaded to the template's working copy.
-async fn upload(
+pub(crate) async fn upload(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template_label: &str,
@@ -124,7 +135,7 @@ async fn upload(
 }
 
 /// `DeleteMessageTemplateAttachment`.
-async fn delete_attachment(
+pub(crate) async fn delete_attachment(
     emulator: &Emulator,
     knowledge_base_label: &str,
     message_template_label: &str,
@@ -145,7 +156,7 @@ async fn delete_attachment(
 }
 
 /// `GetMessageTemplate` on whatever label the row reads with.
-async fn get_template(
+pub(crate) async fn get_template(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template_label: &str,
@@ -181,7 +192,7 @@ async fn publish(emulator: &Emulator, knowledge_base_id: &str, message_template_
 /// The `attachmentId`s a read of a message template reports, in the order it reports them.
 /// The empty list for a template that reports no `attachments` member at all, which is how
 /// a template holding none answers.
-fn attachment_ids(reply: &Reply) -> Vec<String> {
+pub(crate) fn attachment_ids(reply: &Reply) -> Vec<String> {
     reply
         .field("/messageTemplate/attachments")
         .and_then(Value::as_array)
