@@ -540,6 +540,11 @@ flate2 = "1"
 # GetScheduleGroup — and the role policies that decide those calls are written with IAM's own
 # operations.
 service-com-amazonaws-scheduler-awschronosservice = { workspace = true }
+# Reads the text of an `awsQuery` answer as the XML it is: the apostrophes a service's own
+# not-found sentence quotes a name with travel escaped in that document, and a handler's SDK
+# hands the same sentence over already unescaped, so the two are held against each other
+# through this maintained unescaper rather than a hand-written one.
+quick-xml = "0.41"
 
 [lints]
 workspace = true

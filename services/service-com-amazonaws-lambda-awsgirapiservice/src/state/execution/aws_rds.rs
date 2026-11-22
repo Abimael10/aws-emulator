@@ -24,6 +24,14 @@
 //! role under which the engine reaches Amazon S3. A handler that cannot reach this service can
 //! drive none of it.
 //!
+//! READING THE PROXY A CONNECTION GOES THROUGH is the fourth: an application that connects to
+//! its database through RDS Proxy confirms its own wiring before it dials, which is reading the
+//! proxy (the secret each `Auth` entry names as the credential the proxy logs in with, and the
+//! address and the status the proxy publishes), the target group behind it, the endpoints it
+//! answers on, and the health of each registered target. A handler that cannot reach this
+//! service reads none of that, so it cannot tell a proxy it may connect through from one whose
+//! targets are unhealthy.
+//!
 //! Most services a handler reaches bind their requests with an AWS JSON protocol, where the
 //! request body IS the operation's input document, so one code path serves every operation of
 //! every one of them ([`super::aws_api`]). This service does not: its model declares
@@ -80,8 +88,11 @@ const SERVICE: &str = "Amazon RDS";
 /// engine versions it can launch and the configurations each can be launched in) — and the
 /// surface a handler that drives the database's Amazon S3 integration uses: the export task it
 /// starts, reads and cancels, and the role associations that let the engine reach Amazon S3 at
-/// all. A handler naming any other operation of the service is told the call was not made and
-/// why, because a request this module cannot bind is one it would otherwise be guessing at.
+/// all — and the PROXY READS an application makes to confirm the wiring of the connection it is
+/// about to open: the proxy itself, its target group, its endpoints and the health of each
+/// registered target. A handler naming any other operation of the service is told the call was
+/// not made and why, because a request this module cannot bind is one it would otherwise be
+/// guessing at.
 pub const BOUND_OPERATIONS: &[&str] = &[
     "DescribeDBInstances",
     "ModifyDBInstance",
@@ -89,6 +100,10 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "ModifyDBCluster",
     "DescribeDBEngineVersions",
     "DescribeOrderableDBInstanceOptions",
+    "DescribeDBProxies",
+    "DescribeDBProxyTargets",
+    "DescribeDBProxyTargetGroups",
+    "DescribeDBProxyEndpoints",
     "StartExportTask",
     "DescribeExportTasks",
     "CancelExportTask",
@@ -119,6 +134,16 @@ pub async fn call(
         }
         Some("DescribeOrderableDBInstanceOptions") => {
             describe_orderable_db_instance_options(&client, &input, &observed).await
+        }
+        Some("DescribeDBProxies") => describe_db_proxies(&client, &input, &observed).await,
+        Some("DescribeDBProxyTargets") => {
+            describe_db_proxy_targets(&client, &input, &observed).await
+        }
+        Some("DescribeDBProxyTargetGroups") => {
+            describe_db_proxy_target_groups(&client, &input, &observed).await
+        }
+        Some("DescribeDBProxyEndpoints") => {
+            describe_db_proxy_endpoints(&client, &input, &observed).await
         }
         Some("StartExportTask") => start_export_task(&client, &input, &observed).await,
         Some("DescribeExportTasks") => describe_export_tasks(&client, &input, &observed).await,
@@ -798,6 +823,169 @@ async fn describe_orderable_db_instance_options(
     observed.answer(document)
 }
 
+/// `DescribeDBProxies`: the proxies the account holds, or the one the call names — the first
+/// half of the wiring an application reads before it connects through one, because each proxy
+/// carries the `Auth` whose entries name the secret it logs in to the database with.
+async fn describe_db_proxies(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["DBProxyName", "Filters", "MaxRecords", "Marker"])?;
+    let described = client
+        .describe_db_proxies()
+        .set_db_proxy_name(input.text("DBProxyName")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "DBProxies".to_string(),
+        Value::Array(
+            described
+                .db_proxies()
+                .iter()
+                .map(db_proxy_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
+/// `DescribeDBProxyTargets`: the databases registered behind a proxy, each with the HEALTH of
+/// the proxy's connection to it — the other half of that wiring, and what an application gates
+/// a connection attempt on.
+async fn describe_db_proxy_targets(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "DBProxyName",
+        "TargetGroupName",
+        "Filters",
+        "MaxRecords",
+        "Marker",
+    ])?;
+    let described = client
+        .describe_db_proxy_targets()
+        .db_proxy_name(input.required_text("DBProxyName")?)
+        .set_target_group_name(input.text("TargetGroupName")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "Targets".to_string(),
+        Value::Array(
+            described
+                .targets()
+                .iter()
+                .map(db_proxy_target_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
+/// `DescribeDBProxyTargetGroups`: the target group a proxy's registrations live in, and the
+/// connection pool settings in force for it.
+async fn describe_db_proxy_target_groups(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "DBProxyName",
+        "TargetGroupName",
+        "Filters",
+        "MaxRecords",
+        "Marker",
+    ])?;
+    let described = client
+        .describe_db_proxy_target_groups()
+        .db_proxy_name(input.required_text("DBProxyName")?)
+        .set_target_group_name(input.text("TargetGroupName")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "TargetGroups".to_string(),
+        Value::Array(
+            described
+                .target_groups()
+                .iter()
+                .map(db_proxy_target_group_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
+/// `DescribeDBProxyEndpoints`: the endpoints a proxy answers on — the address a client puts in
+/// its connection string, and whether that address is read/write or read-only.
+async fn describe_db_proxy_endpoints(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "DBProxyName",
+        "DBProxyEndpointName",
+        "Filters",
+        "MaxRecords",
+        "Marker",
+    ])?;
+    let described = client
+        .describe_db_proxy_endpoints()
+        .set_db_proxy_name(input.text("DBProxyName")?)
+        .set_db_proxy_endpoint_name(input.text("DBProxyEndpointName")?)
+        .set_filters(filters(input)?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_marker(input.text("Marker")?)
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    document.insert(
+        "DBProxyEndpoints".to_string(),
+        Value::Array(
+            described
+                .db_proxy_endpoints()
+                .iter()
+                .map(db_proxy_endpoint_document)
+                .collect(),
+        ),
+    );
+    observed.answer(document)
+}
+
 /// The `Filters` a describe carries, read as the name/values pairs the service takes; `None`
 /// where the call carries none, so the member is left off the request rather than sent
 /// emptied.
@@ -1430,6 +1618,219 @@ fn orderable_option_document(
     Value::Object(document)
 }
 
+/// One `DBProxy` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="DBProxy")`): its name and ARN, the status it is in, the
+/// engine family and network placement it serves, the address a client connects to, the role it
+/// reads its credentials with and the `Auth` entries naming those credentials.
+fn db_proxy_document(proxy: &::aws_sdk_rds::types::DbProxy) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "DBProxyName", proxy.db_proxy_name());
+    insert_text(&mut document, "DBProxyArn", proxy.db_proxy_arn());
+    insert_text(
+        &mut document,
+        "Status",
+        proxy.status().map(|status| status.as_str()),
+    );
+    insert_text(&mut document, "EngineFamily", proxy.engine_family());
+    insert_text(&mut document, "VpcId", proxy.vpc_id());
+    insert_list(
+        &mut document,
+        "VpcSecurityGroupIds",
+        proxy.vpc_security_group_ids(),
+    );
+    insert_list(&mut document, "VpcSubnetIds", proxy.vpc_subnet_ids());
+    insert_text(
+        &mut document,
+        "DefaultAuthScheme",
+        proxy.default_auth_scheme(),
+    );
+    insert_text(
+        &mut document,
+        "EndpointNetworkType",
+        proxy.endpoint_network_type().map(|kind| kind.as_str()),
+    );
+    insert_text(
+        &mut document,
+        "TargetConnectionNetworkType",
+        proxy
+            .target_connection_network_type()
+            .map(|kind| kind.as_str()),
+    );
+    insert_text(&mut document, "RoleArn", proxy.role_arn());
+    insert_text(&mut document, "Endpoint", proxy.endpoint());
+    insert_flag(&mut document, "RequireTLS", proxy.require_tls());
+    insert_number(
+        &mut document,
+        "IdleClientTimeout",
+        proxy.idle_client_timeout().map(i64::from),
+    );
+    insert_flag(&mut document, "DebugLogging", proxy.debug_logging());
+    insert_timestamp(&mut document, "CreatedDate", proxy.created_date());
+    insert_timestamp(&mut document, "UpdatedDate", proxy.updated_date());
+    let auth: Vec<Value> = proxy.auth().iter().map(user_auth_config_document).collect();
+    if !auth.is_empty() {
+        document.insert("Auth".to_string(), Value::Array(auth));
+    }
+    Value::Object(document)
+}
+
+/// One `UserAuthConfigInfo` as the answer's document carries it
+/// (`smithy_query(query="shape",shape="UserAuthConfigInfo")`): the database user the proxy logs
+/// in as, the scheme it authenticates with and the SECRET that credential lives in — which is
+/// what a handler resolves to find the credential its proxy connects with. The secret's VALUE is
+/// not part of it: that is Secrets Manager's own answer to whoever may read the secret.
+fn user_auth_config_document(auth: &::aws_sdk_rds::types::UserAuthConfigInfo) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "Description", auth.description());
+    insert_text(&mut document, "UserName", auth.user_name());
+    insert_text(
+        &mut document,
+        "AuthScheme",
+        auth.auth_scheme().map(|scheme| scheme.as_str()),
+    );
+    insert_text(&mut document, "SecretArn", auth.secret_arn());
+    insert_text(
+        &mut document,
+        "IAMAuth",
+        auth.iam_auth().map(|mode| mode.as_str()),
+    );
+    insert_text(
+        &mut document,
+        "ClientPasswordAuthType",
+        auth.client_password_auth_type().map(|kind| kind.as_str()),
+    );
+    Value::Object(document)
+}
+
+/// One `DBProxyTarget` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="DBProxyTarget")`): the database it represents, the
+/// address and port the proxy reaches it at, the kind of database it is, whether it is
+/// read/write or read-only, and the HEALTH of the proxy's connection to it.
+fn db_proxy_target_document(target: &::aws_sdk_rds::types::DbProxyTarget) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "TargetArn", target.target_arn());
+    insert_text(&mut document, "Endpoint", target.endpoint());
+    insert_text(&mut document, "TrackedClusterId", target.tracked_cluster_id());
+    insert_text(&mut document, "RdsResourceId", target.rds_resource_id());
+    insert_number(&mut document, "Port", target.port().map(i64::from));
+    insert_text(
+        &mut document,
+        "Type",
+        target.r#type().map(|kind| kind.as_str()),
+    );
+    insert_text(
+        &mut document,
+        "Role",
+        target.role().map(|role| role.as_str()),
+    );
+    if let Some(health) = target.target_health() {
+        let mut held = Map::new();
+        insert_text(
+            &mut held,
+            "State",
+            health.state().map(|state| state.as_str()),
+        );
+        insert_text(
+            &mut held,
+            "Reason",
+            health.reason().map(|reason| reason.as_str()),
+        );
+        insert_text(&mut held, "Description", health.description());
+        document.insert("TargetHealth".to_string(), Value::Object(held));
+    }
+    Value::Object(document)
+}
+
+/// One `DBProxyTargetGroup` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="DBProxyTargetGroup")`): the proxy it belongs to, its own
+/// name and ARN, the status it is in and the connection pool settings in force for it.
+///
+/// `ConnectionPoolConfig$InitQuery` is among them: the model marks that member sensitive, which
+/// governs what is LOGGED rather than what the service answers — the setting is part of the target
+/// group's configuration, and this seam hands a handler the members the service reported, nothing
+/// of its own and nothing less.
+fn db_proxy_target_group_document(group: &::aws_sdk_rds::types::DbProxyTargetGroup) -> Value {
+    let mut document = Map::new();
+    insert_text(&mut document, "DBProxyName", group.db_proxy_name());
+    insert_text(&mut document, "TargetGroupName", group.target_group_name());
+    insert_text(&mut document, "TargetGroupArn", group.target_group_arn());
+    insert_flag(&mut document, "IsDefault", group.is_default());
+    insert_text(&mut document, "Status", group.status());
+    insert_timestamp(&mut document, "CreatedDate", group.created_date());
+    insert_timestamp(&mut document, "UpdatedDate", group.updated_date());
+    if let Some(pool) = group.connection_pool_config() {
+        let mut held = Map::new();
+        insert_number(
+            &mut held,
+            "MaxConnectionsPercent",
+            pool.max_connections_percent().map(i64::from),
+        );
+        insert_number(
+            &mut held,
+            "MaxIdleConnectionsPercent",
+            pool.max_idle_connections_percent().map(i64::from),
+        );
+        insert_number(
+            &mut held,
+            "ConnectionBorrowTimeout",
+            pool.connection_borrow_timeout().map(i64::from),
+        );
+        insert_list(
+            &mut held,
+            "SessionPinningFilters",
+            pool.session_pinning_filters(),
+        );
+        insert_text(&mut held, "InitQuery", pool.init_query());
+        document.insert("ConnectionPoolConfig".to_string(), Value::Object(held));
+    }
+    Value::Object(document)
+}
+
+/// One `DBProxyEndpoint` as the answer's document carries it, read the same way
+/// (`smithy_query(query="shape",shape="DBProxyEndpoint")`): the proxy it belongs to, its own
+/// name and ARN, the status it is in, where it is placed, the address a client connects to and
+/// whether that address is the proxy's default one.
+fn db_proxy_endpoint_document(endpoint: &::aws_sdk_rds::types::DbProxyEndpoint) -> Value {
+    let mut document = Map::new();
+    insert_text(
+        &mut document,
+        "DBProxyEndpointName",
+        endpoint.db_proxy_endpoint_name(),
+    );
+    insert_text(
+        &mut document,
+        "DBProxyEndpointArn",
+        endpoint.db_proxy_endpoint_arn(),
+    );
+    insert_text(&mut document, "DBProxyName", endpoint.db_proxy_name());
+    insert_text(
+        &mut document,
+        "Status",
+        endpoint.status().map(|status| status.as_str()),
+    );
+    insert_text(&mut document, "VpcId", endpoint.vpc_id());
+    insert_list(
+        &mut document,
+        "VpcSecurityGroupIds",
+        endpoint.vpc_security_group_ids(),
+    );
+    insert_list(&mut document, "VpcSubnetIds", endpoint.vpc_subnet_ids());
+    insert_text(&mut document, "Endpoint", endpoint.endpoint());
+    insert_timestamp(&mut document, "CreatedDate", endpoint.created_date());
+    insert_text(
+        &mut document,
+        "TargetRole",
+        endpoint.target_role().map(|role| role.as_str()),
+    );
+    insert_flag(&mut document, "IsDefault", endpoint.is_default());
+    insert_text(
+        &mut document,
+        "EndpointNetworkType",
+        endpoint.endpoint_network_type().map(|kind| kind.as_str()),
+    );
+    Value::Object(document)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bound_operation, BOUND_OPERATIONS};
@@ -1474,6 +1875,16 @@ mod tests {
                 "the orderable-options catalogue read, titled the same way",
                 "DescribeOrderableDbInstanceOptions",
                 Some("DescribeOrderableDBInstanceOptions"),
+            ),
+            (
+                "the proxy read, titled word by word",
+                "DescribeDbProxies",
+                Some("DescribeDBProxies"),
+            ),
+            (
+                "the proxy's target health read, titled the same way",
+                "DescribeDbProxyTargets",
+                Some("DescribeDBProxyTargets"),
             ),
             ("an operation of this service the seam does not bind", "DeleteDBInstance", None),
             ("an operation of no service at all", "Elsewhere", None),

@@ -70,7 +70,14 @@ fn router() -> MultiServiceRouter {
 
 /// One `awsQuery` call made DIRECTLY against Amazon RDS, as its status and body — the answer
 /// each row's handler-side call is held against.
-async fn rds(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+///
+/// `pub(crate)` so a sibling suite of this one test target calls the service the same way rather
+/// than growing another copy of this request.
+pub(crate) async fn rds(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2014-10-31");
     for (name, value) in params {
         body.push('&');
@@ -99,7 +106,9 @@ async fn rds(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// The text of one element of an `awsQuery` answer.
-fn element(body: &str, tag: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`rds`]: one reader of these answers, not one per suite.
+pub(crate) fn element(body: &str, tag: &str) -> String {
     body.split_once(&format!("<{tag}>"))
         .and_then(|(_, rest)| rest.split_once(&format!("</{tag}>")))
         .map(|(text, _)| text.to_string())

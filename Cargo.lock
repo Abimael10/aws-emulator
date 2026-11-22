@@ -16392,6 +16392,7 @@ dependencies = [
  "nix",
  "pbkdf2 0.12.2",
  "percent-encoding",
+ "quick-xml",
  "rand 0.9.5",
  "regex",
  "rquickjs",
