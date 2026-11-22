@@ -140,10 +140,13 @@ fn every_resource_of(collection_arn: &str) -> String {
 /// an unauthorized caller nothing about what the request named. Each handler returns the
 /// sentence as its own modelled `AccessDeniedException`, which carries this service's 403.
 ///
-/// The sentence is the shared one ([`iam::not_authorized_to_perform`]): the principal that
-/// signed, the action it asked for and the resource it asked for, and nothing after it —
-/// this service's recorded refusal carries no clause naming which of IAM's rules withheld
-/// the grant, so one sentence answers an explicit `Deny` and IAM's default deny alike.
+/// The sentence is the shared one ([`iam::not_authorized_by_identity_policy`]): the principal
+/// that signed, the action it asked for, the resource it asked for, and the clause naming
+/// WHICH of IAM's rules withheld the grant — an explicit `Deny` in one of the principal's own
+/// documents, in the scope the credential was minted with or in its permissions boundary, or
+/// the absence of any grant in one of those three. The clauses are the shared ones
+/// ([`iam::IDENTITY_POLICY_EXPLICIT_DENY`] and its siblings), so this service cannot word a
+/// decision differently from another service that reaches the same one.
 ///
 /// Resolving the caller goes through STS's own `resolve_caller`, which first materialises
 /// the session expiries the clock has already made due; that write is owed at the same
@@ -155,9 +158,16 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Option<String> {
-    let action = format!("{ACTION_PREFIX}:{operation}");
+    let action = iam::iam_action(ACTION_PREFIX, operation);
     let caller = caller(engine, ctx);
-    let refusal = || Some(iam::not_authorized_to_perform(&caller.arn, &action, resource));
+    let refusal = |reason: &str| {
+        Some(iam::not_authorized_by_identity_policy(
+            &caller.arn,
+            &action,
+            resource,
+            reason,
+        ))
+    };
     // Every key the decision may read: the ones that name the principal the request was
     // signed by, and the CLASS of the credential it was signed with, which is what a
     // statement conditioned on `aws:PrincipalType` selects on. A credential that speaks for
@@ -189,28 +199,35 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     // Taken before any grant is read, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries.
     if identity_said == Decision::Denied {
-        return refusal();
+        return refusal(iam::IDENTITY_POLICY_EXPLICIT_DENY);
     }
     // What the SCOPE this credential was minted with says, through the tree's one reading of
     // a resolved scope (`sts_store::ScopingPolicies::decision`): a credential no mint scoped
     // is capped by nothing, which that reading answers as allowed. A session policy takes
     // permissions away and grants none of its own, so a call it does not allow is refused
     // even where the role's own documents grant it.
-    if caller.scope.decision(&request) != Decision::Allowed {
-        return refusal();
+    match caller.scope.decision(&request) {
+        Decision::Allowed => {}
+        // An explicit deny is a fact about the SCOPE's document, so the refusal names it; a
+        // scope that merely states nothing about the action withheld it all the same.
+        Decision::Denied => return refusal(iam::SESSION_POLICY_EXPLICIT_DENY),
+        Decision::NotStated => return refusal(&iam::no_session_policy_allows(&action)),
     }
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return refusal();
+        return refusal(&iam::no_identity_policy_allows(&action));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy
     // can grant" (IAM, permissions boundaries): a grant the boundary does not also allow is
     // not a permission the principal has. The account's own credential carries none.
     if let Some(boundary) = &caller.boundary {
-        if iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed {
-            return refusal();
-        }
+        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+            Decision::Allowed => return None,
+            Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
+            Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+        };
+        return refusal(&reason);
     }
     None
 }

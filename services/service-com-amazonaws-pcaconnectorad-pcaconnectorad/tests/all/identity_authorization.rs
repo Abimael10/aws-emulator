@@ -189,18 +189,62 @@ fn allow(actions: Value) -> Value {
     })
 }
 
-/// Assert the answer is IAM's refusal of `action` on `resource` for the seeded session.
-fn assert_refused(case: &str, status: u16, code: &str, parsed: &Value, action: &str, resource: &str) {
+/// The clause IAM's denial carries when an explicit `Deny` in one of the principal's OWN
+/// identity-based documents refuses the call. Spelled out here rather than read off the
+/// constant the gate renders, so the wording itself is what these cases assert.
+const EXPLICIT_DENY_IN_IDENTITY_POLICY: &str = "with an explicit deny in an identity-based policy";
+
+/// The same clause for an explicit `Deny` in one of the SESSION POLICIES the credential was
+/// minted with.
+const EXPLICIT_DENY_IN_SESSION_POLICY: &str = "with an explicit deny in a session policy";
+
+/// The same clause for an explicit `Deny` in the principal's PERMISSIONS BOUNDARY.
+const EXPLICIT_DENY_IN_PERMISSIONS_BOUNDARY: &str = "with an explicit deny in a permissions boundary";
+
+/// IAM's clause for a call no readable identity-based document allows — its default deny,
+/// which names the action nothing granted.
+fn no_identity_policy_clause(action: &str) -> String {
+    format!("because no identity-based policy allows the {action} action")
+}
+
+/// The same for a grant the SESSION POLICIES the credential was minted with do not also
+/// allow.
+fn no_session_policy_clause(action: &str) -> String {
+    format!("because no session policy allows the {action} action")
+}
+
+/// The same for a grant the principal's PERMISSIONS BOUNDARY does not also allow.
+fn no_permissions_boundary_clause(action: &str) -> String {
+    format!("because no permissions boundary allows the {action} action")
+}
+
+/// IAM's whole denial sentence: the principal that signed, the action and resource it asked
+/// for, and the clause naming which of IAM's rules withheld the grant.
+fn refusal_sentence(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         {reason}"
+    )
+}
+
+/// Assert the answer is IAM's refusal of `action` on `resource` for the seeded session, with
+/// `reason` naming which of IAM's rules withheld the grant.
+fn assert_refused(
+    case: &str,
+    status: u16,
+    code: &str,
+    parsed: &Value,
+    action: &str,
+    resource: &str,
+    reason: &str,
+) {
     assert_eq!(
         (status, code),
         (403, "AccessDeniedException"),
         "case {case:?}: expected HTTP 403 AccessDeniedException, got {status} / {code:?} / \
          {parsed}"
     );
-    let expected = format!(
-        "User: {} is not authorized to perform: {action} on resource: {resource}",
-        session_arn()
-    );
+    let expected = refusal_sentence(&session_arn(), action, resource, reason);
     assert_eq!(
         parsed["Message"].as_str().or(parsed["message"].as_str()),
         Some(expected.as_str()),
@@ -450,7 +494,15 @@ async fn every_operation_is_judged_against_its_own_action_and_resource() {
         let case = format!("{} with no policy", row.operation);
         let (status, code, parsed) =
             call_as(&router, SESSION_KEY_ID, row.method, &row.target, row.body.as_ref()).await;
-        assert_refused(&case, status, &code, &parsed, &action, &row.resource);
+        assert_refused(
+            &case,
+            status,
+            &code,
+            &parsed,
+            &action,
+            &row.resource,
+            &no_identity_policy_clause(&action),
+        );
 
         // ... and so does an allow of every OTHER action of this service: each operation is
         // judged against its own.
@@ -463,7 +515,15 @@ async fn every_operation_is_judged_against_its_own_action_and_resource() {
         let case = format!("{} with every other action allowed", row.operation);
         let (status, code, parsed) =
             call_as(&router, SESSION_KEY_ID, row.method, &row.target, row.body.as_ref()).await;
-        assert_refused(&case, status, &code, &parsed, &action, &row.resource);
+        assert_refused(
+            &case,
+            status,
+            &code,
+            &parsed,
+            &action,
+            &row.resource,
+            &no_identity_policy_clause(&action),
+        );
 
         // An allow of exactly this action reaches the operation's own answer.
         given_role_policy(&engine, Some(&allow(json!(action))));
@@ -494,12 +554,14 @@ async fn a_refused_create_persists_nothing() {
         .unwrap_or_default();
 
     // Three refusals: no policy, an allow of another action, and an explicit deny beside an
-    // allow of the whole service.
-    let documents: Vec<(&str, Option<Value>)> = vec![
-        ("no policy at all", None),
+    // allow of the whole service — each with the clause naming the rule that withheld it.
+    let action = format!("{ACTION_PREFIX}:CreateConnector");
+    let documents: Vec<(&str, Option<Value>, String)> = vec![
+        ("no policy at all", None, no_identity_policy_clause(&action)),
         (
             "an allow of another action",
             Some(allow(json!(format!("{ACTION_PREFIX}:GetConnector")))),
+            no_identity_policy_clause(&action),
         ),
         (
             "an explicit deny beside an allow of the whole service",
@@ -514,10 +576,11 @@ async fn a_refused_create_persists_nothing() {
                     },
                 ]
             })),
+            EXPLICIT_DENY_IN_IDENTITY_POLICY.to_string(),
         ),
     ];
 
-    for (index, (case, document)) in documents.iter().enumerate() {
+    for (index, (case, document, reason)) in documents.iter().enumerate() {
         given_role_policy(&engine, document.as_ref());
         // A fresh `ClientToken` each time (its expression admits no space), so no retry is
         // answered from the idempotency record of an earlier call.
@@ -534,8 +597,9 @@ async fn a_refused_create_persists_nothing() {
             status,
             &code,
             &parsed,
-            &format!("{ACTION_PREFIX}:CreateConnector"),
+            &action,
             &connector_collection(),
+            reason,
         );
         assert!(
             parsed.get("ConnectorArn").is_none(),
@@ -601,7 +665,15 @@ async fn a_statement_scoped_to_one_connector_does_not_reach_another() {
         None,
     )
     .await;
-    assert_refused(case, status, &code, &parsed, &action, &withheld);
+    assert_refused(
+        case,
+        status,
+        &code,
+        &parsed,
+        &action,
+        &withheld,
+        &no_identity_policy_clause(&action),
+    );
     assert!(
         parsed.get("Connector").is_none(),
         "case {case:?}: a refused read must report no connector, got {parsed}"
@@ -642,6 +714,7 @@ async fn the_accounts_own_credential_is_not_bounded_by_the_gate() {
         &parsed,
         &format!("{ACTION_PREFIX}:ListConnectors"),
         &connector_collection(),
+        EXPLICIT_DENY_IN_IDENTITY_POLICY,
     );
 }
 
@@ -692,10 +765,12 @@ async fn a_session_assumed_through_sts_is_judged_on_the_policy_iam_wrote() {
         "case {case:?}: a session whose role does not allow the action is refused, \
          got {status} / {code:?} / {parsed}"
     );
-    let expected = format!(
-        "User: arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{session_name} is not authorized \
-         to perform: {ACTION_PREFIX}:CreateConnector on resource: {}",
-        connector_collection()
+    let action = format!("{ACTION_PREFIX}:CreateConnector");
+    let expected = refusal_sentence(
+        &format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{session_name}"),
+        &action,
+        &connector_collection(),
+        &no_identity_policy_clause(&action),
     );
     assert_eq!(
         parsed["Message"].as_str().or(parsed["message"].as_str()),
@@ -798,10 +873,12 @@ async fn a_session_policy_caps_what_the_roles_own_policy_grants() {
         "case {case:?}: a scope that does not allow the action refuses it, \
          got {status} / {code:?} / {parsed}"
     );
-    let expected = format!(
-        "User: arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{session_name} is not authorized \
-         to perform: {ACTION_PREFIX}:CreateConnector on resource: {}",
-        connector_collection()
+    let action = format!("{ACTION_PREFIX}:CreateConnector");
+    let expected = refusal_sentence(
+        &format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{session_name}"),
+        &action,
+        &connector_collection(),
+        &no_session_policy_clause(&action),
     );
     assert_eq!(
         parsed["Message"].as_str().or(parsed["message"].as_str()),
@@ -836,6 +913,202 @@ async fn a_session_policy_caps_what_the_roles_own_policy_grants() {
         "case {case:?}: an unscoped session keeps the role's own grant, got {status} / \
          {code:?} / {parsed}"
     );
+}
+
+/// A policy allowing the whole of this service and explicitly denying ONE of its actions:
+/// the shape a least-privilege document carves an action out with, and what IAM's
+/// explicit-deny clause is about.
+fn allow_service_but_deny(action: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            { "Effect": "Allow", "Action": format!("{ACTION_PREFIX}:*"), "Resource": "*" },
+            { "Effect": "Deny", "Action": action, "Resource": "*" },
+        ]
+    })
+}
+
+/// One row of the table of IAM's REASONS: what the role's own documents say, what the scope
+/// the session was minted under says, what the role's permissions boundary says, and the
+/// clause the refusal must carry — `None` where the call must be served.
+struct ReasonRow {
+    case: &'static str,
+    /// The role the call signs as a session of. One per row, so the documents of one row
+    /// cannot decide another.
+    role: &'static str,
+    /// The role's inline policy, or `None` for a role carrying none at all.
+    policy: Option<Value>,
+    /// The inline session policy `sts:AssumeRole` scopes the credential to.
+    scope: Option<Value>,
+    /// The role's permissions boundary.
+    boundary: Option<Value>,
+    /// The clause the refusal must name, or `None` where the call is served.
+    reason: Option<String>,
+}
+
+/// The rows of the reason table: one per rule IAM can withhold a grant by, over each of the
+/// three documents the decision reads — the principal's own, the scope the credential was
+/// minted under and the permissions boundary — in both the shapes each can withhold by: an
+/// explicit `Deny` of the action, and an absence of any grant for it.
+fn reason_rows() -> Vec<ReasonRow> {
+    let action = format!("{ACTION_PREFIX}:CreateConnector");
+    let another = format!("{ACTION_PREFIX}:GetConnector");
+    let whole_service = allow(json!(format!("{ACTION_PREFIX}:*")));
+    vec![
+        ReasonRow {
+            case: "a role carrying no document at all",
+            role: "reason-no-document",
+            policy: None,
+            scope: None,
+            boundary: None,
+            reason: Some(no_identity_policy_clause(&action)),
+        },
+        ReasonRow {
+            case: "a document allowing only another action of this service",
+            role: "reason-other-action",
+            policy: Some(allow(json!(another.clone()))),
+            scope: None,
+            boundary: None,
+            reason: Some(no_identity_policy_clause(&action)),
+        },
+        ReasonRow {
+            case: "a document allowing the whole service and denying this action",
+            role: "reason-explicit-deny",
+            policy: Some(allow_service_but_deny(&action)),
+            scope: None,
+            boundary: None,
+            reason: Some(EXPLICIT_DENY_IN_IDENTITY_POLICY.to_string()),
+        },
+        ReasonRow {
+            case: "a document that does nothing but deny this action",
+            role: "reason-deny-alone",
+            policy: Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [{ "Effect": "Deny", "Action": action.clone(), "Resource": "*" }]
+            })),
+            scope: None,
+            boundary: None,
+            reason: Some(EXPLICIT_DENY_IN_IDENTITY_POLICY.to_string()),
+        },
+        ReasonRow {
+            case: "a scope allowing only another action of this service",
+            role: "reason-scope-other",
+            policy: Some(whole_service.clone()),
+            scope: Some(allow(json!(another.clone()))),
+            boundary: None,
+            reason: Some(no_session_policy_clause(&action)),
+        },
+        ReasonRow {
+            case: "a scope allowing the whole service and denying this action",
+            role: "reason-scope-deny",
+            policy: Some(whole_service.clone()),
+            scope: Some(allow_service_but_deny(&action)),
+            boundary: None,
+            reason: Some(EXPLICIT_DENY_IN_SESSION_POLICY.to_string()),
+        },
+        ReasonRow {
+            case: "a boundary allowing only another action of this service",
+            role: "reason-boundary-other",
+            policy: Some(whole_service.clone()),
+            scope: None,
+            boundary: Some(allow(json!(another))),
+            reason: Some(no_permissions_boundary_clause(&action)),
+        },
+        ReasonRow {
+            case: "a boundary allowing the whole service and denying this action",
+            role: "reason-boundary-deny",
+            policy: Some(whole_service.clone()),
+            scope: None,
+            boundary: Some(allow_service_but_deny(&action)),
+            reason: Some(EXPLICIT_DENY_IN_PERMISSIONS_BOUNDARY.to_string()),
+        },
+        ReasonRow {
+            case: "a document allowing exactly this action",
+            role: "reason-allowed",
+            policy: Some(allow(json!(action))),
+            scope: None,
+            boundary: None,
+            reason: None,
+        },
+    ]
+}
+
+/// THE RULE about the WORDS of a denial: IAM's refusal names the principal that signed, the
+/// action and the resource it asked for, and then WHICH of its rules withheld the grant — an
+/// explicit `Deny` in the principal's own documents, in the scope the credential was minted
+/// under or in its permissions boundary, or the absence of any grant in one of those three.
+/// The clause is a fact about the document that withheld it, so a client that reads the
+/// denial learns which one to change.
+#[tokio::test]
+async fn the_refusal_names_which_of_iams_rules_withheld_the_grant() {
+    let (router, _engine) = router_with_identity();
+    let directory_id = "d-00000000a1";
+    given_registration(&router, directory_id).await;
+    let action = format!("{ACTION_PREFIX}:CreateConnector");
+
+    for (index, row) in reason_rows().into_iter().enumerate() {
+        let case = row.case;
+        let role_arn = create_role(&router, case, row.role).await;
+        if let Some(policy) = &row.policy {
+            put_role_policy(&router, case, row.role, &policy.to_string()).await;
+        }
+        if let Some(boundary) = &row.boundary {
+            given_permissions_boundary(&router, case, row.role, &boundary.to_string()).await;
+        }
+        let scope = row.scope.as_ref().map(ToString::to_string);
+        let (session_key, session_name) =
+            assume_role_scoped(&router, case, &role_arn, scope.as_deref()).await;
+
+        // A fresh `ClientToken` per row, so no row is answered from the idempotency record
+        // of an earlier one.
+        let (status, code, parsed) = call_as(
+            &router,
+            &session_key,
+            "POST",
+            "/connectors",
+            Some(&connector_body(directory_id, &format!("reason-token-{index}"))),
+        )
+        .await;
+        match &row.reason {
+            None => {
+                assert_eq!(
+                    status, 202,
+                    "case {case:?}: an allowed create is served, got {status} / {code:?} / \
+                     {parsed}"
+                );
+                assert!(
+                    parsed["ConnectorArn"].as_str().is_some(),
+                    "case {case:?}: an allowed create mints a connector, got {parsed}"
+                );
+            }
+            Some(reason) => {
+                assert_eq!(
+                    (status, code.as_str()),
+                    (403, "AccessDeniedException"),
+                    "case {case:?}: expected HTTP 403 AccessDeniedException, got {status} / \
+                     {code:?} / {parsed}"
+                );
+                let expected = refusal_sentence(
+                    &format!(
+                        "arn:aws:sts::{ACCOUNT}:assumed-role/{}/{session_name}",
+                        row.role
+                    ),
+                    &action,
+                    &connector_collection(),
+                    reason,
+                );
+                assert_eq!(
+                    parsed["Message"].as_str().or(parsed["message"].as_str()),
+                    Some(expected.as_str()),
+                    "case {case:?}: expected IAM's wording {expected:?}, got {parsed}"
+                );
+                assert!(
+                    parsed.get("ConnectorArn").is_none(),
+                    "case {case:?}: a refused create mints no connector, got {parsed}"
+                );
+            }
+        }
+    }
 }
 
 /// Post one awsQuery form body to `signing_name` as the account's own credential, and
@@ -925,6 +1198,48 @@ async fn put_role_policy(router: &MultiServiceRouter, case: &str, role: &str, do
     assert_eq!(
         status, 200,
         "case {case:?}: PutRolePolicy({role}) must answer 200, got {status} with {body}"
+    );
+}
+
+/// Attach `boundary` to `role` as its permissions boundary, through the managed policy a
+/// boundary is attached as ("the ARN of the managed policy that is used to set the
+/// permissions boundary", `PutRolePermissionsBoundary`).
+async fn given_permissions_boundary(
+    router: &MultiServiceRouter,
+    case: &str,
+    role: &str,
+    boundary: &str,
+) {
+    let (status, body) = query(
+        router,
+        "iam",
+        format!(
+            "Action=CreatePolicy&Version=2010-05-08&PolicyName={}&PolicyDocument={}",
+            encode_label(&format!("{role}-boundary")),
+            encode_label(boundary)
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreatePolicy({role}-boundary) must answer 200, got {status} with {body}"
+    );
+    let policy_arn = element(case, &body, "Arn");
+    let (status, body) = query(
+        router,
+        "iam",
+        format!(
+            "Action=PutRolePermissionsBoundary&Version=2010-05-08&RoleName={}\
+             &PermissionsBoundary={}",
+            encode_label(role),
+            encode_label(&policy_arn)
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: PutRolePermissionsBoundary({role}) must answer 200, got {status} with \
+         {body}"
     );
 }
 
