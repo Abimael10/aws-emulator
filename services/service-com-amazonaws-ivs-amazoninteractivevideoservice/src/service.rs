@@ -115,6 +115,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 mod channel_projection;
+mod playback_route;
 mod response_id;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -438,6 +439,10 @@ fn claims_shared_tagging_path(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, so the seams this file owns that are NOT a modelled operation —
+    /// the front-door route a channel's playback URL is fetched on
+    /// ([`playback_route`]) — reach this service's store the way a handler does.
+    engine: Arc<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedEnvelope`] so a constraint refusal is stated the way IVS states it and
     /// every response names the request it answers. Keyed by the routing key the protocol
@@ -519,7 +524,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_playback_restriction_policy::UpdatePlaybackRestrictionPolicy,
         );
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             stated_refusals,
         }
     }
@@ -657,6 +663,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // A request that FOLLOWED the playback URL this service announced for a channel is
+        // claimed by the store that announced it, whatever else the request carries: a
+        // viewer fetches it with no signature at all, and the model binds no operation to
+        // that path, so nothing modelled is diverted here. A path naming a channel this
+        // store does not hold is not claimed. See `crate::state::playback_plane`.
+        if playback_route::claims_playback_path(&*self.engine, parts) {
+            return true;
+        }
         // This service signs as `ivs` — a signing name it SHARES with IVS RealTime
         // (`services/service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime`),
         // whose endpoint is `ivsrealtime` while this one's is `ivs`. The router resolves a
@@ -719,8 +733,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // A request that followed the playback URL this service PUBLISHED for a channel is
+        // exactly that case by construction — the model binds no operation to a playback
+        // path — so this is where that plane is served: the seam is reached BEFORE
+        // authentication precisely for a request that names no modelled operation, which
+        // is what lets a viewer fetch a playlist with no credentials at all. Anything else
+        // keeps the framework's default.
+        playback_route::serve_playback_path(&*self.engine, req)
     }
 
     fn override_framework_error(

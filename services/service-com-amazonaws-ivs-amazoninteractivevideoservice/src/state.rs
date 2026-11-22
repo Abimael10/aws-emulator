@@ -35,15 +35,33 @@ mod ad_breaks;
 /// mints anything that names it. One concern, one file, re-exported here.
 mod referenced_resources;
 
+/// The CONTRIBUTE plane: the socket an encoder publishes a channel's live stream to, the
+/// address it is announced at, and what an accepted publish writes. One concern, one file,
+/// re-exported here.
+mod ingest_plane;
+
+/// The PLAYBACK plane: the HLS playlists and segments a player fetches from the address a
+/// channel announces, packaged from the media the contribute plane ingested. One concern,
+/// one file, re-exported here.
+mod playback_plane;
+
+/// The SESSIONS a channel's broadcasts leave behind, which the session reads report on.
+/// One concern, one file, re-exported here.
+mod stream_sessions;
+
 pub use ad_breaks::*;
 pub use channel_endpoints::*;
+pub use ingest_plane::*;
+pub use playback_plane::*;
 pub use referenced_resources::*;
+pub use stream_sessions::*;
 
 use crate::ops::types::{
-    AdConfiguration, Channel, ChannelNotBroadcasting, ConflictException, InternalServerException,
+    AdConfiguration, AudioConfiguration, Channel, ChannelNotBroadcasting, ConflictException,
+    IngestConfiguration, IngestConfigurations, InternalServerException,
     MultitrackInputConfiguration, PlaybackKeyPair, RecordingConfiguration, RenditionConfiguration,
     ResourceNotFoundException, ServiceQuotaExceededException, ServiceUnavailable, Stream, StreamKey,
-    ThumbnailConfiguration, ValidationException,
+    StreamSession, ThumbnailConfiguration, ValidationException, VideoConfiguration,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -102,6 +120,23 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// How many ids this store has minted. Part of every id's seed, so no two
     /// minted ids collide even when two calls land in the same nanosecond.
     pub minted: u64,
+    /// The socket this deployment's CONTRIBUTE plane answers on, once a call that
+    /// announces it has opened it, and the handle that keeps that port open — see
+    /// [`ensure_ingest_plane`]. One socket serves the whole account, because AWS
+    /// publishes one ingest server per account and the stream key a publisher
+    /// presents is what names the channel it publishes to.
+    pub ingest_plane: Option<IngestPlane>,
+    /// The sessions each channel's broadcasts have left behind, keyed by the ARN of
+    /// that channel and ordered oldest first, so a session read answers the one it
+    /// was asked for or the most recent one. Bounded per channel
+    /// ([`MAX_SESSIONS_PER_CHANNEL`]) and dropped with the channel it belongs to.
+    pub stream_sessions: BTreeMap<String, Vec<StreamSessionRecord>>,
+    /// The media the CURRENT broadcast of each channel has been packaged into, keyed
+    /// by the ARN of that channel: the playlists and segments its announced
+    /// `playbackUrl` serves. An entry lives exactly as long as the broadcast does —
+    /// [`end_stream`] drops it with the stream — because there is no playlist for a
+    /// stream that is not live.
+    pub playlists: BTreeMap<String, ChannelPlaylist>,
 }
 
 /// A persisted recording configuration together with the instant at which the
@@ -1722,11 +1757,11 @@ pub static TAGS: MemberRule = MemberRule {
 /// It is [`live_stream`] read as a yes/no, so every operation that needs an ACTIVE
 /// stream agrees with `GetStream` about whether there is one: a channel is broadcasting
 /// exactly when this store holds a `LIVE` stream for it. A channel goes live only by
-/// PUBLISHING to the ingest endpoint `CreateChannel` advertises (the control plane has
-/// no operation that starts a stream), and this emulator serves no ingest data plane, so
-/// no channel is ingesting today and those operations answer the
-/// `ChannelNotBroadcasting` their models declare for exactly this case — from the
-/// absence of a stream in the store, never from a status invented for work nothing ran.
+/// PUBLISHING to the ingest endpoint `CreateChannel` advertises — the control plane has
+/// no operation that starts a stream, and the publish is admitted on this service's own
+/// contribute plane ([`accept_publish`]) — so a channel nothing is publishing to is not
+/// ingesting, and those operations answer the `ChannelNotBroadcasting` their models
+/// declare for exactly this case, from the absence of a stream in the store.
 pub fn is_broadcasting(
     state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
     channel_arn: &str,
@@ -1741,13 +1776,23 @@ pub fn is_broadcasting(
 /// that need one. The record is dropped rather than left behind in another state —
 /// `GetStream` reports the ACTIVE stream, and a stream that has ended is not one — and
 /// everything that belonged to that broadcast goes with it: the playlist an ad break
-/// was marked in is the ended stream's, so the marker does not outlive it.
+/// was marked in is the ended stream's, so the marker does not outlive it, and so does
+/// the HLS playlist its media was packaged into, because nothing is played back from a
+/// channel that is not live.
+///
+/// The one exit every ended broadcast takes, whichever thing ended it — the publisher
+/// going away, `StopStream` disconnecting it, or the channel being deleted — so the
+/// session that broadcast left behind is CLOSED here: it reports when the channel went
+/// offline, which is the one thing a session read needs that the live stream no longer
+/// carries.
 pub fn end_stream(
     state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
     channel_arn: &str,
 ) {
     state.streams.remove(channel_arn);
     state.ad_breaks.remove(channel_arn);
+    state.playlists.remove(channel_arn);
+    end_session(state, channel_arn, SystemTime::now());
 }
 
 /// Whether this store holds the channel `channel_arn` names.

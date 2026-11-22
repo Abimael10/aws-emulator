@@ -4,32 +4,32 @@
 //! CONTRIBUTES to and the one a player FETCHES from — built here and nowhere else, so
 //! every operation that projects a channel announces the same pair.
 //!
-//! RULE: a member this API fills with a DNS NAME is announced as a DNS name — a minted
-//! label, the domain labels AWS publishes that plane under, and a zone this emulator may
-//! announce a name of its own in — carrying no scheme, no port and no path; a member that
-//! carries a URL the client FETCHES keeps AWS's scheme and the path layout AWS lays the
-//! resource out at, and is rooted on the `host[:port]` this request reached this emulator
-//! at, because a URL is dialed exactly as it stands.
+//! RULE: a member this API fills with an address a client DIALS is announced as an address
+//! this emulator ANSWERS that protocol on; a member that carries a URL the client FETCHES
+//! keeps AWS's scheme and the path layout AWS lays the resource out at, and is rooted on
+//! the `host[:port]` this request reached this emulator at, because a URL is dialed exactly
+//! as it stands.
 //!
 //! Neither member is modelled with a form (`Channel$ingestEndpoint`, `Channel$playbackUrl`
 //! and `Srt$endpoint` are plain strings with no `@length` and no `@pattern`,
-//! `smithy_query(query="shape",shape="Channel,Srt")`), and a client does PARSE what it is
-//! handed: it appends its own port to the contribute address
-//! (`rtmps://<ingestEndpoint>:443/app/<streamKey>`, `srt://<srt.endpoint>:<port>`), splits
-//! the host on `.`, or stores the value in a hostname-typed field — all of which an address
-//! literal carrying an explicit port breaks. So the contribute address is a NAME, while the
-//! playback URL, which a player dials as given, keeps the address it was reached at.
+//! `smithy_query(query="shape",shape="Channel,Srt")`), and a client does not use either as
+//! an opaque string: it points an encoder at `rtmps://<ingestEndpoint>:443/app/<streamKey>`
+//! and a player at the playback URL. So the contribute address is the `host:port` of the
+//! socket this service's own contribute plane answers RTMP and RTMPS on
+//! ([`super::ensure_ingest_plane`]) — an address a broadcaster on this machine can really
+//! dial, which a name in a zone no resolver maps to this process is not — and the playback
+//! URL keeps the address it was reached at.
 //!
 //! What fills the template is this emulator's, because this emulator is the only thing
 //! serving the channel:
 //!
 //! * `ingestEndpoint`, and the `srt.endpoint` that equals it, is "part of the definition
 //!   of an ingest server, used when you set up streaming software" — the ACCOUNT's
-//!   contribute server, under the one contribute domain that plane is published in and not
-//!   a per-channel name ([`announced_ingest_endpoint`]): every channel this emulator serves
-//!   reports the SAME value, so a client that cached the ingest server it was handed once
-//!   configures the next channel's encoder correctly, and nothing of a channel's own
-//!   identity is in it.
+//!   contribute server, which this deployment serves on ONE socket of its own
+//!   ([`announced_ingest_endpoint`]): every channel this emulator serves reports the SAME
+//!   value, so a client that cached the ingest server it was handed once configures the
+//!   next channel's encoder correctly, and nothing of a channel's own identity is in it —
+//!   which channel a publish reaches is carried by the stream key, exactly as on AWS.
 //! * `playbackUrl` is a URL a player FETCHES ("URL of the master playlist, required by the
 //!   video player to play the HLS stream", `Stream$playbackUrl`), so it keeps AWS's `https`
 //!   scheme and the playlist path AWS lays a channel's manifest out at ([`playback_path`]:
@@ -76,7 +76,10 @@ const CONTRIBUTE_LABEL_PURPOSE: &str = "ivs-contribute";
 
 /// The path AWS serves a channel's HLS master playlist at, which is what a `playbackUrl`
 /// carries after its host.
-const PLAYBACK_PATH_PREFIX: &str = "/api/video/v1";
+///
+/// Read by the plane that SERVES that path too ([`super::playback_plane`]), so the address
+/// this module announces and the path that module answers are one layout.
+pub(crate) const PLAYBACK_PATH_PREFIX: &str = "/api/video/v1";
 
 /// The extension of that playlist: an HLS master playlist.
 const PLAYBACK_PATH_SUFFIX: &str = ".m3u8";
@@ -88,13 +91,15 @@ const PLAYBACK_PATH_SUFFIX: &str = ".m3u8";
 /// Every operation that answers a `Channel` runs its record through this, so the single
 /// read, the batch read, the create and the update all announce one pair of addresses. The
 /// `srt` block keeps the passphrase the create generated and stored — the secret is the
-/// channel's, while the endpoint beside it is the account's contribute server.
+/// channel's, while the endpoint beside it is the account's contribute server, read off
+/// `state` because that is where the socket serving it is recorded.
 #[must_use]
 pub fn announced_channel(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
     channel: Channel,
 ) -> Channel {
-    let ingest_endpoint = announced_ingest_endpoint(ctx);
+    let ingest_endpoint = announced_ingest_endpoint(ctx, state);
     let playback_url = channel
         .arn
         .as_deref()
@@ -111,17 +116,30 @@ pub fn announced_channel(
     }
 }
 
-/// The ingest server every channel of this account contributes to:
-/// `<minted label>.global-contribute.<zone>`, a NAME carrying no scheme and no port,
-/// because a client appends its own protocol and port to it.
+/// The ingest server every channel of this account contributes to: the `host:port` of the
+/// socket this deployment's contribute plane answers RTMP and RTMPS on, which is the one
+/// address a broadcaster on this machine can dial.
 ///
 /// It is the ACCOUNT's and not a channel's — two channels report the same value, which is
-/// what lets one encoder configuration serve the next channel — so the label is minted
-/// from the account the channels belong to and nothing else, and the plane is global rather
-/// than regional, so a caller signing for another Region is handed the one contribute
-/// server this deployment has.
+/// what lets one encoder configuration serve the next channel — so nothing of a channel's
+/// identity is in it, and the plane is global rather than regional, so a caller signing for
+/// another Region is handed the one contribute server this deployment has.
+///
+/// A deployment whose contribute socket could not be opened at all — an engine that vends
+/// no listener surface — has no address to announce for it, and falls back to a NAME of
+/// this emulator's own: a label minted for the account, under the domain labels AWS
+/// publishes the contribute plane in, in the zone this emulator may announce a name of its
+/// own in ([`announced_zone`]). That value still names this emulator and never a host
+/// belonging to someone else; nothing answers it, which is the honest report of a plane
+/// that could not be served.
 #[must_use]
-pub fn announced_ingest_endpoint(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+pub fn announced_ingest_endpoint(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+) -> String {
+    if let Some(plane) = state.ingest_plane.as_ref() {
+        return plane.authority().to_string();
+    }
     format!(
         "{}.{CONTRIBUTE_DOMAIN_LABEL}.{}",
         minted_host_label(
@@ -263,7 +281,11 @@ fn playback_path(region: &str, account: &str, channel_id: &str) -> String {
 /// The Region, the account and the channel id a `ChannelArn` names
 /// (`arn:aws:ivs:<region>:<account>:channel/<id>`, the form the modelled `ChannelArn`
 /// pattern pins), or `None` for a value that is not one.
-fn channel_of_arn(arn: &str) -> Option<(&str, &str, &str)> {
+///
+/// The one reader of that form: the plane that serves a channel's playback path resolves
+/// the channel a path names by comparing the identity in the path with the identity each
+/// stored ARN carries ([`super::playback_plane::playback_channel_arn`]).
+pub(crate) fn channel_of_arn(arn: &str) -> Option<(&str, &str, &str)> {
     let segments: Vec<&str> = arn.splitn(6, ':').collect();
     let [_, _, _, region, account, resource] = segments[..] else {
         return None;

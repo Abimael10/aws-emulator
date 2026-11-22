@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // read of a channel shares, so one batch read and the single-ARN read of
                 // the same channel answer the same addresses.
                 Some(channel) => {
-                    channels.push(crate::state::announced_channel(ctx, channel.clone()))
+                    channels.push(crate::state::announced_channel(ctx, &store, channel.clone()))
                 }
                 None => errors.push(BatchError {
                     arn: Some(arn.clone()),

@@ -217,6 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validation(CreateChannelErrorModeled::ValidationException, message)
         })?;
 
+        // The address every channel announces as its ingest server is a socket of this
+        // emulator's OWN, and the call that creates the thing an encoder contributes to is
+        // the call that has to be able to tell it where. Opened once per deployment and
+        // before the store is read, because the bind is awaited and a store guard cannot
+        // be held across an await; a deployment that could open none announces the name
+        // `announced_ingest_endpoint` falls back to.
+        crate::state::ensure_ingest_plane(&*self.engine, &state).await;
+
         let mut store = state.lock();
         // The store grows by one channel and one stream key per call and lives for
         // the life of the process, so the growth is capped; past the cap the service
@@ -289,8 +297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateChannelOutput {
             // What the create answers is the channel it persisted, announced to THIS
             // request: the playback URL names a host in the zone this caller reached the
-            // emulator in, which is the zone it can fetch the channel back from.
-            channel: Some(crate::state::announced_channel(ctx, channel)),
+            // emulator in, which is the zone it can fetch the channel back from, and the
+            // ingest endpoint is the address the contribute socket opened above answers
+            // RTMP and RTMPS on.
+            channel: Some(crate::state::announced_channel(ctx, &store, channel)),
             stream_key: Some(stream_key),
         })
     }

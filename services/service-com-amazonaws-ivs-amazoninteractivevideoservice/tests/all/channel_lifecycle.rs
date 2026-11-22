@@ -68,6 +68,15 @@ pub(crate) struct Reply {
     pub(crate) raw: String,
 }
 
+/// One answer to an unsigned data-plane `GET` ([`Ivs::fetch`]): the status, what the body
+/// is, and the body itself.
+#[derive(Debug)]
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) body: String,
+}
+
 impl Ivs {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -106,9 +115,9 @@ impl Ivs {
         read(&store)
     }
 
-    /// Write this service's store, for the state no operation can create yet: an
-    /// ingest session bringing a channel live (see `live_stream_reads.rs`) has no
-    /// control-plane operation behind it until the filed RTMPS listener lands.
+    /// Write this service's store, for state a suite seeds rather than drives: a stream
+    /// brought up without a publisher (see `live_stream_reads.rs`, whose own ingest cases
+    /// drive the real contribute plane instead).
     pub(crate) fn with_store_mut<T>(
         &self,
         write: impl FnOnce(&mut ComAmazonawsIvsAmazoninteractivevideoserviceState) -> T,
@@ -177,6 +186,30 @@ impl Ivs {
             reply.status, reply.body
         );
         reply.body
+    }
+
+    /// Fetch `url` the way a VIEWER does: an unsigned `GET` carrying no credentials at
+    /// all, which is how a player fetches the playback URL a channel announces.
+    ///
+    /// The URL is sent as the channel announced it, so what this exercises is the address
+    /// the emulator published rather than a path a suite composed.
+    pub(crate) async fn fetch(&self, url: &str) -> Fetched {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(url)
+            .body(bytes::Bytes::new())
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        Fetched {
+            status: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            body: String::from_utf8_lossy(response.body()).into_owned(),
+        }
     }
 
     /// Create a channel and return the whole `CreateChannel` output.

@@ -148,7 +148,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetChannelErrorModeled::InternalServerException)
         })?;
-        let channel = state.lock().channels.get(&input.arn).cloned().ok_or_else(|| {
+        let store = state.lock();
+        let channel = store.channels.get(&input.arn).cloned().ok_or_else(|| {
             crate::state::resource_not_found(
                 GetChannelErrorModeled::ResourceNotFoundException,
                 &input.arn,
@@ -159,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The record the store holds, announced to THIS request: the playback URL
             // names the address this caller reached the emulator at, because that is the
             // address the channel is played back from.
-            channel: Some(crate::state::announced_channel(ctx, channel)),
+            channel: Some(crate::state::announced_channel(ctx, &store, channel)),
         })
     }
 }

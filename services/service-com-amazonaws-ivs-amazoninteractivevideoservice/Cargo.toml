@@ -51,6 +51,10 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # The AWS SDK for AWS Elemental MediaTailor, over the same transport:
 # `CreateAdConfiguration` resolves each playback configuration its request references.
 aws-sdk-mediatailor = { version = "1", default-features = false }
+# The RTMP protocol: the handshake, the chunk stream and the AMF0 commands an encoder
+# publishing to a channel's contribute endpoint speaks, which the ingest listener serves
+# the server half of.
+rml_rtmp = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -58,6 +62,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The RTMP protocol, for the PUBLISHER side of the contribute plane: the suite that proves
+# the announced ingest address is dialable drives a real encoder's handshake, commands and
+# media messages over a socket.
+rml_rtmp = "0.8"
 # Real key pairs for the playback-key-pair tests, so what they import is a genuine
 # public key rather than a hand-built byte string.
 rcgen = "0.13"

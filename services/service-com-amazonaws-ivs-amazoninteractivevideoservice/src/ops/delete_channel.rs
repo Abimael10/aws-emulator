@@ -194,6 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `end_stream` a stopped ingest goes through, so everything that belongs to
         // the broadcast (its ad marker included) goes with it.
         crate::state::end_stream(&mut store, &input.arn);
+        // And the broadcasts it already had: a session is "the properties of the channel
+        // at the time of going live", so with the channel gone there is no channel to
+        // report a session of, and a session read answers the way it does for an ARN this
+        // store never held.
+        store.stream_sessions.remove(&input.arn);
 
         Ok(DeleteChannelOutput)
     }

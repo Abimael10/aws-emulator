@@ -6,12 +6,12 @@
 //!
 //! The rules under test, each stated once and then exercised over a SET of inputs:
 //!
-//! 1. A member this API fills with a DNS NAME is announced as a DNS name: a minted
-//!    lowercase-hex label, the domain labels the plane is published under, and a zone this
-//!    emulator may announce a name of its own in — no scheme, no port and no path. So a
-//!    channel's `ingestEndpoint`, and the `srt.endpoint` that equals it, reads
-//!    `<label>.global-contribute.<zone>`, which is what lets a client compose
-//!    `rtmps://<ingestEndpoint>:443/app/<streamKey>` the way it would against AWS.
+//! 1. A member this API fills with an address a client DIALS is announced as an address
+//!    this emulator ANSWERS that protocol on. So a channel's `ingestEndpoint`, and the
+//!    `srt.endpoint` that equals it, is the `host:port` of the socket this deployment
+//!    serves RTMP and RTMPS contributions on — a host of this machine's own and a port it
+//!    really listens on, carrying no scheme and no path — which is what lets a client point
+//!    an encoder at `rtmps://<ingestEndpoint>/app/<streamKey>` and have the publish arrive.
 //! 2. A member that carries a URL the client FETCHES keeps AWS's `https` scheme and the
 //!    playlist path `/api/video/v1/<region>.<account>.channel.<id>.m3u8`, with the Region,
 //!    the account and the channel id read off the channel's own ARN, and is rooted on the
@@ -46,15 +46,6 @@ const PLAYBACK_PATH_PREFIX: &str = "/api/video/v1";
 
 /// The suffix of that path.
 const PLAYBACK_PATH_SUFFIX: &str = ".m3u8";
-
-/// The domain label the IVS CONTRIBUTE plane is published under, from the same recorded
-/// form (`<label>.global-contribute.<domain>`): one contribute server for the whole
-/// account, which is what the label says.
-const CONTRIBUTE_DOMAIN_LABEL: &str = "global-contribute";
-
-/// How many characters a minted IVS host label is written with, from that same recorded
-/// form: twelve lowercase-hex characters.
-const HOST_LABEL_LENGTH: usize = 12;
 
 /// Hosts no address this emulator announces may name: a value on one of these leaves the
 /// sandbox, because nothing here answers on an Amazon production host.
@@ -118,28 +109,55 @@ fn host_only(authority: &str) -> String {
     }
 }
 
-/// Rule 1's form, on one announced NAME: dotted, non-empty labels written with the
-/// characters a hostname carries, no scheme, no port, no userinfo and no path, so a client
-/// that appends its own `:<port>` or splits the host on `.` gets what it would get from
-/// AWS.
-fn assert_name_only(case: &str, member: &str, host: &str) {
+/// Rule 1's form, on the announced contribute ADDRESS: a `host:port` carrying no scheme,
+/// no path and no userinfo, whose host is one of this machine's own spellings and whose
+/// port is one this process really listens on — so an encoder can dial it.
+pub(crate) fn assert_dialable_address(case: &str, member: &str, authority: &str) {
     assert!(
-        !host.is_empty(),
-        "case {case:?}: {member} must be announced, got {host:?}"
+        !authority.is_empty(),
+        "case {case:?}: {member} must be announced, got {authority:?}"
     );
-    for forbidden in [':', '/', '@', '[', ']', ' '] {
+    for forbidden in ["://", "/", "@", " "] {
         assert!(
-            !host.contains(forbidden),
-            "case {case:?}: {member} must be a bare DNS name, carrying no {forbidden:?} \
-             (no scheme, no port, no path), got {host:?}"
+            !authority.contains(forbidden),
+            "case {case:?}: {member} must be a bare address, carrying no {forbidden:?} (no \
+             scheme, no path), got {authority:?}"
         );
     }
-    let labels: Vec<&str> = host.split('.').collect();
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: {member} must carry a port, got {authority:?}"));
+    let port: u16 = port.parse().unwrap_or_else(|error| {
+        panic!("case {case:?}: {member} must carry a port, got {authority:?} ({error})")
+    });
     assert!(
-        labels.len() >= 2,
-        "case {case:?}: {member} must be a label under a domain, got {host:?}"
+        port > 0,
+        "case {case:?}: {member} must carry the port this emulator listens on, got \
+         {authority:?}"
     );
-    assert_dns_labels(case, member, host);
+    assert!(
+        names_this_machine(host),
+        "case {case:?}: {member} must name a host this emulator answers on, got {authority:?}"
+    );
+}
+
+/// Whether `host` is one of this machine's own spellings: a loopback literal, the loopback
+/// name RFC 6761 reserves for that interface, or a name under it.
+pub(crate) fn names_this_machine(host: &str) -> bool {
+    let named = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = named.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+    named == "localhost" || named.ends_with(".localhost")
+}
+
+/// The port an announced `host:port` names, which is the port this emulator listens on for
+/// that plane.
+pub(crate) fn announced_port(case: &str, authority: &str) -> u16 {
+    authority
+        .rsplit_once(':')
+        .and_then(|(_host, port)| port.parse().ok())
+        .unwrap_or_else(|| panic!("case {case:?}: {authority:?} must carry a port"))
 }
 
 /// Every label of an announced host is a DNS label, and no announced host is a foreign
@@ -163,39 +181,12 @@ fn assert_dns_labels(case: &str, member: &str, host: &str) {
     }
 }
 
-/// Rule 1's label class: the twelve lowercase-hex characters a minted IVS host label is
-/// written with.
-fn assert_minted_label(case: &str, member: &str, label: &str) {
-    assert_eq!(
-        label.chars().count(),
-        HOST_LABEL_LENGTH,
-        "case {case:?}: the first label of {member} must be {HOST_LABEL_LENGTH} characters, \
-         got {label:?}"
-    );
-    assert!(
-        label
-            .chars()
-            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
-        "case {case:?}: the first label of {member} must be lowercase hex, got {label:?}"
-    );
-}
-
-/// Rules 1, 3 and 5 on a channel's INGEST address: the account's contribute name in the
-/// caller's own zone, with the `srt.endpoint` beside it the same value — one address serves
-/// both protocols. Answers the value, so a caller can compare it across projections.
-fn assert_announced_ingest(case: &str, member: &str, channel: &Value, zone: &str) -> String {
+/// Rules 1 and 5 on a channel's INGEST address: the account's contribute socket, with the
+/// `srt.endpoint` beside it the same value — one address serves both protocols. Answers the
+/// value, so a caller can compare it across projections.
+pub(crate) fn assert_announced_ingest(case: &str, member: &str, channel: &Value) -> String {
     let ingest = text(channel, "ingestEndpoint");
-    assert_name_only(case, &format!("{member} ingestEndpoint"), &ingest);
-    let (label, domain) = ingest
-        .split_once('.')
-        .unwrap_or_else(|| panic!("case {case:?}: {member} ingestEndpoint {ingest:?}"));
-    assert_minted_label(case, &format!("{member} ingestEndpoint"), label);
-    assert_eq!(
-        domain,
-        format!("{CONTRIBUTE_DOMAIN_LABEL}.{zone}"),
-        "case {case:?}: {member} ingestEndpoint must be a label under the contribute domain \
-         in this caller's own zone, got {ingest:?}"
-    );
+    assert_dialable_address(case, &format!("{member} ingestEndpoint"), &ingest);
     assert_eq!(
         text(&channel["srt"], "endpoint"),
         ingest,
@@ -249,9 +240,8 @@ struct Addressing {
     /// The host the client addressed, or `None` for a client that names only this
     /// service's published endpoint on the request URI.
     host: Option<&'static str>,
-    /// The DNS zone every name announced to that client must sit in.
-    zone: &'static str,
-    /// The `host[:port]` every URL announced to that client must be rooted on.
+    /// The `host[:port]` every URL announced to that client must be rooted on — whose host
+    /// is the zone that client's own addressing puts this emulator in.
     authority: &'static str,
 }
 
@@ -267,7 +257,6 @@ fn addressings() -> Vec<Addressing> {
             host: None,
             // `smithy_server_runtime::UNSERVED_URL_BASE`: the one base an emulator that
             // is served on no port reports, and still this emulator's own.
-            zone: "emulator.invalid",
             authority: "emulator.invalid",
         },
         Addressing {
@@ -277,42 +266,36 @@ fn addressings() -> Vec<Addressing> {
             // An ADDRESS names no zone, and the zone a resolver answers with the
             // interface it names is the loopback zone RFC 6761 reserves — which is also
             // how that address is spelled inside a URL.
-            zone: "localhost",
             authority: "localhost:9297",
         },
         Addressing {
             case: "a client naming the loopback by name, on another port",
             served_at: None,
             host: Some("localhost:40305"),
-            zone: "localhost",
             authority: "localhost:40305",
         },
         Addressing {
             case: "a client on an IPv6 literal",
             served_at: None,
             host: Some("[::1]:9297"),
-            zone: "localhost",
             authority: "localhost:9297",
         },
         Addressing {
             case: "a client that resolves AWS's own hosts, on an emulator served on a port",
             served_at: Some("https://127.0.0.1:40305"),
             host: Some("ivs.us-east-1.amazonaws.com"),
-            zone: "localhost",
             authority: "localhost:40305",
         },
         Addressing {
             case: "an SDK client on an emulator served at a name",
             served_at: Some("https://emulator.test:8443"),
             host: None,
-            zone: "emulator.test",
             authority: "emulator.test:8443",
         },
         Addressing {
             case: "a client on the loopback address of an emulator served elsewhere",
             served_at: Some("https://127.0.0.1:40305"),
             host: Some("localhost:9297"),
-            zone: "localhost",
             authority: "localhost:9297",
         },
     ]
@@ -340,8 +323,8 @@ fn create_requests() -> Vec<(&'static str, Value)> {
 }
 
 /// Rules 1-4 over the addressing table: every operation that projects a channel announces
-/// the contribute name in its caller's own zone and the playlist URL on the address that
-/// caller reached this emulator at.
+/// the one contribute address this deployment answers RTMP on and the playlist URL on the
+/// address that caller reached this emulator at.
 #[tokio::test]
 async fn every_channel_projection_announces_both_addresses_for_its_own_caller() {
     for addressing in addressings() {
@@ -349,7 +332,6 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             served_at,
             host,
-            zone,
             authority,
         } = addressing;
         let ivs = match served_at {
@@ -380,7 +362,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             authority,
             &arn,
         );
-        let ingest = assert_announced_ingest(case, "CreateChannel $.channel", channel, zone);
+        let ingest = assert_announced_ingest(case, "CreateChannel $.channel", channel);
 
         // Rule 4: every other projection of the same channel agrees, for the same caller.
         let read = call("GetChannel", json!({ "arn": arn })).await;
@@ -391,7 +373,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             authority,
             &arn,
         );
-        assert_announced_ingest(case, "GetChannel $.channel", &read["channel"], zone);
+        assert_announced_ingest(case, "GetChannel $.channel", &read["channel"]);
         let updated = call("UpdateChannel", json!({ "arn": arn, "name": "renamed" })).await;
         assert_announced_playback(
             case,
@@ -400,7 +382,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             authority,
             &arn,
         );
-        assert_announced_ingest(case, "UpdateChannel $.channel", &updated["channel"], zone);
+        assert_announced_ingest(case, "UpdateChannel $.channel", &updated["channel"]);
         let batch = call("BatchGetChannel", json!({ "arns": [arn] })).await;
         let batched = &batch["channels"][0];
         assert_announced_playback(
@@ -410,7 +392,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             authority,
             &arn,
         );
-        assert_announced_ingest(case, "BatchGetChannel $.channels[0]", batched, zone);
+        assert_announced_ingest(case, "BatchGetChannel $.channels[0]", batched);
 
         // The live stream is played back from its channel's own URL, so the same rule
         // holds for the stream a broadcasting channel reports.
@@ -435,6 +417,55 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
     }
 }
 
+/// Rule 1's point: the announced contribute address is DIALED, so a client that takes the
+/// value a channel reports and opens a connection to it reaches this emulator.
+///
+/// Rows differ along how the caller read the value: an SDK client naming this service's
+/// endpoint, a client on the loopback address, and a client that resolves AWS's own hosts —
+/// none of which changes the socket the contribution arrives on. What a publisher then
+/// SPEAKS on that socket is `live_stream_reads.rs`'s subject.
+#[tokio::test]
+async fn the_announced_contribute_address_accepts_a_connection() {
+    let ivs = Ivs::new();
+    let callers = [
+        ("an SDK client naming this service's endpoint", None),
+        ("a client on the loopback address", Some("127.0.0.1:9297")),
+        (
+            "a client that resolves AWS's own hosts",
+            Some("ivs.us-east-1.amazonaws.com"),
+        ),
+    ];
+    let mut announced: BTreeSet<String> = BTreeSet::new();
+    for (case, host) in callers {
+        let created = ivs
+            .call_as("CreateChannel", &json!({ "name": "dialed" }), host, AUTHORIZATION)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateChannel must answer HTTP 200, got {} {}",
+            created.status, created.body
+        );
+        let ingest = assert_announced_ingest(case, "CreateChannel $.channel", &created.body["channel"]);
+        // The announced host is one of this machine's own spellings (asserted above), so
+        // the publisher's connection is this emulator's own loopback port.
+        let port = announced_port(case, &ingest);
+        let dialled = ::tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await;
+        assert!(
+            dialled.is_ok(),
+            "case {case:?}: the announced ingest endpoint {ingest:?} must accept a \
+             connection, got {:?}",
+            dialled.err()
+        );
+        announced.insert(ingest);
+    }
+    assert_eq!(
+        announced.len(),
+        1,
+        "every caller is told the one contribute address this deployment serves, got \
+         {announced:?}"
+    );
+}
+
 /// Rule 4's other half: a read announces its OWN caller's addresses and changes nothing, so
 /// a second caller reached through another addressing is answered its own, and the first
 /// caller still gets what it got before.
@@ -449,12 +480,12 @@ async fn a_read_through_one_address_does_not_change_what_another_caller_is_told(
     // Rows: the addresses two clients of one emulator reach it at, each read twice so the
     // second read of the first address proves the first read of the second changed nothing.
     let addresses = [
-        ("127.0.0.1:9297", "localhost", "localhost:9297"),
-        ("localhost:40305", "localhost", "localhost:40305"),
-        ("[::1]:8443", "localhost", "localhost:8443"),
+        ("127.0.0.1:9297", "localhost:9297"),
+        ("localhost:40305", "localhost:40305"),
+        ("[::1]:8443", "localhost:8443"),
     ];
     for round in 1..=2 {
-        for (host, zone, authority) in addresses {
+        for (host, authority) in addresses {
             let case = format!("round {round} at {host}");
             let read = ivs
                 .call_as("GetChannel", &json!({ "arn": arn }), Some(host), AUTHORIZATION)
@@ -471,12 +502,12 @@ async fn a_read_through_one_address_does_not_change_what_another_caller_is_told(
                 authority,
                 &arn,
             );
-            assert_announced_ingest(&case, "GetChannel $.channel", &read.body["channel"], zone);
+            assert_announced_ingest(&case, "GetChannel $.channel", &read.body["channel"]);
         }
     }
 }
 
-/// Rule 5: the ingest server is the ACCOUNT's, not a channel's — one contribute name for
+/// Rule 5: the ingest server is the ACCOUNT's, not a channel's — one contribute address for
 /// every channel of the account whatever Region its caller's credential scope names,
 /// carrying no part of the channel's own identity, and unmoved by a read or an update.
 #[tokio::test]
@@ -510,13 +541,7 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
             );
             let channel = &created.body["channel"];
             let arn = text(channel, "arn");
-            // No `Host` and an unserved emulator: the zone is the unserved base's own.
-            let ingest = assert_announced_ingest(
-                &case,
-                "CreateChannel $.channel",
-                channel,
-                "emulator.invalid",
-            );
+            let ingest = assert_announced_ingest(&case, "CreateChannel $.channel", channel);
 
             // The ingest server is not the channel: nothing of the channel's own identity
             // is in the address it contributes to.
@@ -577,7 +602,7 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
     assert_eq!(
         announced.len(),
         1,
-        "every channel of this account ingests on ONE contribute name, whatever Region its \
-         caller named, got {announced:?}"
+        "every channel of this account ingests on ONE contribute address, whatever Region \
+         its caller named, got {announced:?}"
     );
 }

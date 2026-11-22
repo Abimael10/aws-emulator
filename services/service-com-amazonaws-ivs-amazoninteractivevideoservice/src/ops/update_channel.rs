@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The updated record, announced to THIS request through the same projection
             // every other read of a channel uses, so an update cannot hand back a
             // playback address a read would not.
-            channel: Some(crate::state::announced_channel(ctx, channel)),
+            channel: Some(crate::state::announced_channel(ctx, &store, channel)),
         })
     }
 }
