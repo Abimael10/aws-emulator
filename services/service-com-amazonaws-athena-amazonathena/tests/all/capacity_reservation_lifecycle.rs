@@ -477,7 +477,7 @@ async fn a_cancelled_reservation_can_be_deleted_and_is_then_gone() {
     let router = router();
 
     create(&router, "cancelled", SOME_TARGET_DPUS).await;
-    wait_out(CAPACITY_ALLOCATION);
+    await_reservation_status(&router, "cancelled", CAPACITY_RESERVATION_STATUS_ACTIVE).await;
 
     let (status, body) = call(
         &router,
@@ -498,13 +498,8 @@ async fn a_cancelled_reservation_can_be_deleted_and_is_then_gone() {
          {CAPACITY_RESERVATION_STATUS_CANCELLING}, got {cancelling:?}"
     );
 
-    wait_out(CAPACITY_RESERVATION_CANCELLATION);
-    let (_, cancelled) = read_reservation(&router, "cancelled").await;
-    assert_eq!(
-        cancelled["Status"].as_str(),
-        Some(CAPACITY_RESERVATION_STATUS_CANCELLED),
-        "the cancellation is complete once it is due, got {cancelled:?}"
-    );
+    let cancelled =
+        await_reservation_status(&router, "cancelled", CAPACITY_RESERVATION_STATUS_CANCELLED).await;
     assert_eq!(
         cancelled["AllocatedDpus"].as_i64(),
         Some(0),
@@ -512,8 +507,15 @@ async fn a_cancelled_reservation_can_be_deleted_and_is_then_gone() {
     );
     assert_eq!(
         cancelled["TargetDpus"].as_i64(),
-        Some(i64::from(SOME_TARGET_DPUS)),
-        "a cancelled reservation can still be viewed for historical reference, got \
+        Some(0),
+        "a cancellation releases the capacity the reservation requested, got {cancelled:?}"
+    );
+    // The allocation history survives the cancellation: the reservation can still be
+    // "referred to for historical reference".
+    assert_eq!(
+        cancelled["LastAllocation"]["Status"].as_str(),
+        Some("SUCCEEDED"),
+        "a cancelled reservation still reports the allocation it completed, got \
          {cancelled:?}"
     );
 

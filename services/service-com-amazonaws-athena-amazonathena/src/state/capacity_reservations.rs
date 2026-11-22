@@ -58,6 +58,16 @@ pub const CAPACITY_ALLOCATION_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// (`CapacityReservation`).
 pub const INITIAL_ALLOCATED_DPUS: i32 = 0;
 
+/// The number of data processing units a CANCELLED reservation requests.
+///
+/// A cancellation releases the capacity the reservation asked for, so there is no requested
+/// amount left to report. A constant of its own rather than [`INITIAL_ALLOCATED_DPUS`], which
+/// is about the amount a reservation HOLDS: the two happen to be the same number and are not
+/// the same quantity. RECORDED behaviour, not modelled — the reported value falls below the
+/// minimum of the `@range` on `TargetDpusInteger`, which constrains what a REQUEST may ask
+/// for and not what a read of a released reservation reports.
+pub const RELEASED_TARGET_DPUS: i32 = 0;
+
 /// How long after a create or an update the requested allocation is DUE.
 ///
 /// Athena hands back a reservation in a non-terminal status and the allocation arrives
@@ -132,9 +142,9 @@ pub const MAX_CAPACITY_RESERVATIONS: usize = 1000;
 pub struct CapacityReservationRecord {
     /// The reservation name, which is also its key in the registry.
     pub name: String,
-    /// The number of data processing units currently REQUESTED, reported as
-    /// `CapacityReservation$TargetDpus`. The create's amount until an update asks for
-    /// another.
+    /// The number of data processing units currently REQUESTED: the create's amount until an
+    /// update asks for another. Reported as `CapacityReservation$TargetDpus` through
+    /// [`Self::target_dpus_at`], which releases it on a cancellation.
     pub target_dpus: i32,
     /// When the reservation was created, reported as `CapacityReservation$CreationTime`.
     pub creation_time: SystemTime,
@@ -219,9 +229,13 @@ impl CapacityReservationRecord {
     /// `CapacityReservation$AllocatedDpus` ("The number of data processing units currently
     /// allocated").
     ///
-    /// Zero once the cancellation is complete: a cancelled reservation's capacity is
+    /// Zero once the cancellation is COMPLETE: a cancelled reservation's capacity is
     /// released, and `CancelCapacityReservation` documents that it cannot be re-purposed or
-    /// reused, so nothing is currently allocated to it.
+    /// reused, so nothing is currently allocated to it. That is a different instant from the
+    /// one the REQUESTED amount is released at ([`Self::target_dpus_at`]): a reservation whose
+    /// cancellation is still in flight has asked for the release but is still holding the
+    /// capacity until the release is done, so it reports the capacity it holds while reporting
+    /// no requested amount.
     pub fn allocated_dpus_at(&self, now: SystemTime) -> i32 {
         if self.status_at(now) == CAPACITY_RESERVATION_STATUS_CANCELLED {
             return INITIAL_ALLOCATED_DPUS;
@@ -245,38 +259,84 @@ impl CapacityReservationRecord {
         }
     }
 
-    /// The most recent allocation request as the modelled `CapacityAllocation` shape, as of
-    /// `now`: its submission instant and "the most recent status of the attempted
-    /// allocation".
+    /// How many data processing units are REQUESTED at `now`, reported as
+    /// `CapacityReservation$TargetDpus` ("The number of data processing units requested").
+    ///
+    /// [`RELEASED_TARGET_DPUS`] from the instant the reservation was cancelled:
+    /// `CancelCapacityReservation` releases the capacity the reservation asked for ("you
+    /// cannot re-purpose or reuse a reservation that has been cancelled"), so there is no
+    /// requested amount left to report from the call that asked for the release rather than
+    /// from the instant the release is done — the capacity the reservation still HOLDS while
+    /// cancelling is reported by [`Self::allocated_dpus_at`], which is why the two read off
+    /// different instants.
+    pub fn target_dpus_at(&self, now: SystemTime) -> i32 {
+        if self.cancelled_at.is_some_and(|at| now >= at) {
+            return RELEASED_TARGET_DPUS;
+        }
+        self.target_dpus
+    }
+
+    /// The most recent allocation request as the `CapacityAllocation` shape, as of `now`: its
+    /// submission instant and "the most recent status of the attempted allocation".
+    ///
+    /// The allocation's status travels twice — as the modelled `Status` and as the wire's own
+    /// `LastAllocationStatus` — and its submission instant travels as both `RequestTime` and
+    /// `SubmissionTime`, so a client reading either name of either value reads the same
+    /// allocation.
     pub fn last_allocation_at(&self, now: SystemTime) -> CapacityAllocation {
         let pending = now < self.allocation_complete_at;
+        let status = if pending {
+            CAPACITY_ALLOCATION_STATUS_PENDING
+        } else {
+            CAPACITY_ALLOCATION_STATUS_SUCCEEDED
+        };
         CapacityAllocation {
-            status: if pending {
-                CAPACITY_ALLOCATION_STATUS_PENDING.to_string()
-            } else {
-                CAPACITY_ALLOCATION_STATUS_SUCCEEDED.to_string()
-            },
+            status: status.to_string(),
             // `CapacityAllocation$StatusMessage` is "the status message of the capacity
             // allocation"; no allocation here fails, so there is nothing to report.
             status_message: None,
             request_time: reported_time(self.allocation_requested_at),
             request_completion_time: (!pending).then(|| reported_time(self.allocation_complete_at)),
+            last_allocation_status: Some(status.to_string()),
+            submission_time: Some(reported_time(self.allocation_requested_at)),
         }
     }
 
-    /// The record as the modelled `CapacityReservation` shape a read answers with, as of
-    /// `now`.
+    /// When the capacity this reservation holds became usable, reported as the wire's
+    /// `CapacityLockTime`: the instant the most recent allocation that SUCCEEDED completed,
+    /// and `None` while no allocation has completed yet, there being no capacity locked to
+    /// report.
+    ///
+    /// Retained past a cancellation, exactly as the allocation it belongs to is: cancelling
+    /// releases the capacity but does not unmake the allocation history a reservation "can
+    /// refer to ... for historical reference" (`CancelCapacityReservation`).
+    ///
+    /// That instant is the one [`Self::last_successful_allocation_at`] reports, so the two
+    /// members a read carries it under never differ: capacity is locked by the allocation that
+    /// locked it, and there is no allocation that succeeded without locking capacity.
+    pub fn capacity_lock_time_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.last_successful_allocation_at(now)
+    }
+
+    /// The record as the `CapacityReservation` shape a read answers with, as of `now`.
+    ///
+    /// The one allocation this reservation last asked for is reported under BOTH names the
+    /// wire carries it under — the modelled `LastAllocation` and `LastCapacityAllocation` —
+    /// so the two views cannot disagree about the allocation they describe.
     pub fn to_capacity_reservation(&self, now: SystemTime) -> CapacityReservation {
+        let last_allocation = self.last_allocation_at(now);
         CapacityReservation {
             name: self.name.clone(),
             status: self.status_at(now).to_string(),
-            target_dpus: self.target_dpus,
+            target_dpus: self.target_dpus_at(now),
             allocated_dpus: self.allocated_dpus_at(now),
-            last_allocation: Some(self.last_allocation_at(now)),
+            last_allocation: Some(last_allocation.clone()),
             last_successful_allocation_time: self
                 .last_successful_allocation_at(now)
                 .map(reported_time),
             creation_time: reported_time(self.creation_time),
+            capacity_lock_time: self.capacity_lock_time_at(now).map(reported_time),
+            last_capacity_allocation: Some(last_allocation),
         }
     }
 

@@ -608,7 +608,23 @@ pub struct CapacityAssignment {
     pub work_group_names: Option<Vec<String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#CapacityReservation")]
+/// A reservation of provisioned capacity, as a read of one reports it.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="CapacityReservation")`, plus two members that are
+/// RECORDED BEHAVIOUR rather than modelled: `CapacityLockTime`, when the reservation's
+/// allocated capacity became usable, and `LastCapacityAllocation`, the same allocation
+/// `LastAllocation` carries under the name the wire also publishes it under. Both are
+/// REPORTED and never read off the wire (`out`) — a read computes them from the
+/// reservation's own allocation history (see
+/// [`crate::state::CapacityReservationRecord::to_capacity_reservation`]) — and
+/// `types::recorded_member_wire` says why this shape is hand-written.
+///
+/// No member below carries a constraint trait, deliberately: this shape appears in no
+/// operation INPUT, so the framework's validating walk never reads one off it, and the
+/// `@range` on `TargetDpus` applies to what a REQUEST for capacity may ask for — a
+/// reservation whose capacity a cancellation released reports an amount below that minimum
+/// (see [`crate::state::RELEASED_TARGET_DPUS`]).
 #[derive(Debug, Clone)]
 pub struct CapacityReservation {
     pub name: String,
@@ -618,16 +634,123 @@ pub struct CapacityReservation {
     pub last_allocation: Option<CapacityAllocation>,
     pub last_successful_allocation_time: Option<::aws_smithy_types::DateTime>,
     pub creation_time: ::aws_smithy_types::DateTime,
+    pub capacity_lock_time: Option<::aws_smithy_types::DateTime>,
+    pub last_capacity_allocation: Option<CapacityAllocation>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#CapacityAllocation")]
+ath_schema_and_codec!(
+    CapacityReservation,
+    CAPACITY_RESERVATION_SCHEMA,
+    "com.amazonaws.athena#CapacityReservation",
+    "com.amazonaws.athena",
+    "CapacityReservation",
+    (M_NAME, name, "Name", 0, req, string),
+    (M_STATUS, status, "Status", 1, req, string),
+    (M_TARGET_DPUS, target_dpus, "TargetDpus", 2, req, integer),
+    (
+        M_ALLOCATED_DPUS,
+        allocated_dpus,
+        "AllocatedDpus",
+        3,
+        req,
+        integer
+    ),
+    (
+        M_LAST_ALLOCATION,
+        last_allocation,
+        "LastAllocation",
+        4,
+        opt,
+        struct_of(CapacityAllocation)
+    ),
+    (
+        M_LAST_SUCCESSFUL_ALLOCATION_TIME,
+        last_successful_allocation_time,
+        "LastSuccessfulAllocationTime",
+        5,
+        opt,
+        date_time
+    ),
+    (M_CREATION_TIME, creation_time, "CreationTime", 6, req, date_time),
+    (
+        M_CAPACITY_LOCK_TIME,
+        capacity_lock_time,
+        "CapacityLockTime",
+        7,
+        out,
+        recorded(date_time)
+    ),
+    (
+        M_LAST_CAPACITY_ALLOCATION,
+        last_capacity_allocation,
+        "LastCapacityAllocation",
+        8,
+        out,
+        recorded(struct_of(CapacityAllocation))
+    ),
+);
+
+/// One allocation request against a capacity reservation: "the submission time of a single
+/// allocation request for a capacity reservation and the most recent status of the attempted
+/// allocation" (`CapacityAllocation`).
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="CapacityAllocation")`, plus two members that are
+/// RECORDED BEHAVIOUR rather than modelled: `LastAllocationStatus`, the allocation's status
+/// under the name the wire also publishes it under, and `SubmissionTime`, when the allocation
+/// was submitted. Both are REPORTED and never read off the wire (`out`); see
+/// [`CapacityReservation`] and `types::recorded_member_wire`.
 #[derive(Debug, Clone)]
 pub struct CapacityAllocation {
     pub status: String,
     pub status_message: Option<String>,
     pub request_time: ::aws_smithy_types::DateTime,
     pub request_completion_time: Option<::aws_smithy_types::DateTime>,
+    pub last_allocation_status: Option<String>,
+    pub submission_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ath_schema_and_codec!(
+    CapacityAllocation,
+    CAPACITY_ALLOCATION_SCHEMA,
+    "com.amazonaws.athena#CapacityAllocation",
+    "com.amazonaws.athena",
+    "CapacityAllocation",
+    (M_STATUS, status, "Status", 0, req, string),
+    (
+        M_STATUS_MESSAGE,
+        status_message,
+        "StatusMessage",
+        1,
+        opt,
+        string
+    ),
+    (M_REQUEST_TIME, request_time, "RequestTime", 2, req, date_time),
+    (
+        M_REQUEST_COMPLETION_TIME,
+        request_completion_time,
+        "RequestCompletionTime",
+        3,
+        opt,
+        date_time
+    ),
+    (
+        M_LAST_ALLOCATION_STATUS,
+        last_allocation_status,
+        "LastAllocationStatus",
+        4,
+        out,
+        recorded(string)
+    ),
+    (
+        M_SUBMISSION_TIME,
+        submission_time,
+        "SubmissionTime",
+        5,
+        out,
+        recorded(date_time)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#Database")]
 #[derive(Debug, Clone, Default)]

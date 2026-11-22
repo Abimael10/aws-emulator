@@ -267,6 +267,8 @@ async fn every_created_reservation_is_listed_with_what_the_create_persisted() {
 struct Seeded {
     case: &'static str,
     name: &'static str,
+    /// The number of data processing units the stored instants imply is REQUESTED: the
+    /// amount the record asked for until it was cancelled, which releases it.
     target_dpus: i32,
     /// The status the stored instants imply.
     status: &'static str,
@@ -358,7 +360,10 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<Seeded> {
         Seeded {
             case: "a cancellation still in flight",
             name: "cancelling",
-            target_dpus: 32,
+            // Cancelling released the requested capacity, so nothing is requested any
+            // more, while the capacity it still holds is reported as allocated until the
+            // cancellation is complete.
+            target_dpus: 0,
             status: CAPACITY_RESERVATION_STATUS_CANCELLING,
             allocated_dpus: 32,
             listed: true,
@@ -366,7 +371,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<Seeded> {
         Seeded {
             case: "a cancellation the clock completed, inside the retention",
             name: "cancelled",
-            target_dpus: 128,
+            target_dpus: 0,
             status: CAPACITY_RESERVATION_STATUS_CANCELLED,
             allocated_dpus: 0,
             listed: true,
