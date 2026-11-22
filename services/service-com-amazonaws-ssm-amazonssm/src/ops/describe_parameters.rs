@@ -393,11 +393,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             Vec::new()
         };
-        // The asynchronous `aws:ec2:image` validation a put left owing was due at the same
-        // instant whether or not anybody called, so it is materialised before the store is
-        // read — with no guard of it held
-        // ([`crate::state::parameter_image_validation`]).
-        crate::state::parameter_image_validation::settle_validations(&*self.engine, &region);
         let store = state.lock();
         let mut parameters = Vec::new();
         let mut next_token = None;

@@ -371,6 +371,10 @@ async fn a_history_read_reports_every_version_a_put_created_oldest_first() {
 async fn each_entry_reports_the_members_its_own_put_carried() {
     let router = router();
     let name = "/hist/members";
+    // The image version's value is an id the published catalogue resolves: an
+    // `aws:ec2:image` parameter lands only when its value names an image the account can
+    // see ([`crate::parameter_store::published_image_id`]).
+    let image = crate::parameter_store::published_image_id(&router).await;
 
     // An `Expiration` policy document, which only an advanced parameter may carry
     // ("Standard parameters ... can't be configured to use parameter policies",
@@ -443,7 +447,7 @@ async fn each_entry_reports_the_members_its_own_put_carried() {
             "a version naming another data type and another pattern",
             json!({
                 "Name": name,
-                "Value": "ami-0abcdef1234567890",
+                "Value": image,
                 "Overwrite": true,
                 "AllowedPattern": "^ami-[0-9a-f]+$",
                 "DataType": "aws:ec2:image"

@@ -109,7 +109,11 @@ type NativeRow<'a> = (&'a str, &'a str, Value, Value);
 ///
 /// The rows differ along the form of the name, the type of parameter, the tier and the
 /// properties carried: a tag set, a description, a data type.
-fn native_rows() -> [NativeRow<'static>; 4] {
+///
+/// `image` is the value of the `aws:ec2:image` row: a parameter of that data type lands only
+/// when its value names an image the account can see, so the caller resolves it out of the
+/// published catalogue ([`published_image_id`]).
+fn native_rows(image: &str) -> [NativeRow<'static>; 4] {
     [
         (
             "a top-level String parameter with tags",
@@ -169,7 +173,7 @@ fn native_rows() -> [NativeRow<'static>; 4] {
             "advanced-image",
             json!({
                 "Name": "advanced-image",
-                "Value": "ami-0123456789abcdef0",
+                "Value": image,
                 "Type": "String",
                 "Tier": "Advanced",
                 "DataType": "aws:ec2:image",
@@ -178,17 +182,36 @@ fn native_rows() -> [NativeRow<'static>; 4] {
                 "Name": "advanced-image",
                 "Arn": parameter_arn("advanced-image"),
                 "Type": "String",
-                "Value": "ami-0123456789abcdef0",
+                "Value": image,
                 "DataType": "aws:ec2:image",
             }),
         ),
     ]
 }
 
+/// The image id the published Systems Manager AMI alias resolves to at this endpoint, read
+/// through the owning service's own `GetParameter`.
+///
+/// A parameter of the `aws:ec2:image` data type lands only when its value names an image the
+/// account can see — "validates the parameter value is in the required format … and that the
+/// specified AMI is available in your Amazon Web Services account"
+/// (`smithy_query(query="doc", shape="PutParameterRequest", member="DataType")`) — so a row
+/// that writes one takes its value from the catalogue rather than inventing an id.
+async fn published_image_id(emulator: &Emulator) -> String {
+    let alias = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64";
+    let (status, body) = emulator.ssm("GetParameter", json!({ "Name": alias })).await;
+    assert_eq!(
+        status, 200,
+        "ssm:GetParameter {alias} must resolve an image id, got {status} with body {body:?}"
+    );
+    text(&body["Parameter"], "Value")
+}
+
 #[tokio::test]
 async fn a_parameter_systems_manager_holds_is_resolved_and_listed_through_cloud_control() {
     let emulator = Emulator::with_ssm();
-    for (case, name, put, expected) in native_rows() {
+    let image = published_image_id(&emulator).await;
+    for (case, name, put, expected) in native_rows(&image) {
         // Created through the OWNING service's own API: nothing of this parameter is ever
         // named to Cloud Control API before the reads below.
         emulator.ssm_ok("PutParameter", put).await;

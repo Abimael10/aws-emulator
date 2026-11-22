@@ -214,7 +214,11 @@ fn parameter_arn(region: &str, name: &str) -> String {
 /// both tiers, two of the documented `DataType`s, a tagged parameter, a described one
 /// with an `AllowedPattern`, and one written twice so a describe has a newer version to
 /// report than the one the parameter was created with.
-fn seed_puts() -> Vec<Value> {
+///
+/// `image` is the value of the `aws:ec2:image` seed: a parameter of that data type lands
+/// only when its value names an image the account can see, so the caller resolves it out of
+/// the published catalogue ([`super::parameter_store::published_image_id_in`]).
+fn seed_puts(image: &str) -> Vec<Value> {
     vec![
         json!({ "Name": "/Describe/Dev/db-port", "Type": "String", "Value": "3306" }),
         json!({
@@ -241,7 +245,7 @@ fn seed_puts() -> Vec<Value> {
         json!({
             "Name": "/Describe/Prod/image",
             "Type": "String",
-            "Value": "ami-0123456789abcdef0",
+            "Value": image,
             "DataType": "aws:ec2:image",
         }),
         json!({
@@ -284,7 +288,8 @@ async fn seed_as(router: &MultiServiceRouter, region: &str, access_key: &str) {
     // The customer managed key one of the seeds names, created through KMS's own
     // operations: a `SecureString` is sealed under the key its put names.
     super::parameter_store::kms_key_with_alias_in(router, region, "alias/custom-key").await;
-    for body in seed_puts() {
+    let image = super::parameter_store::published_image_id_in(router, region).await;
+    for body in seed_puts(&image) {
         let (status, response) =
             call_as(router, region, access_key, None, "PutParameter", &body).await;
         assert_eq!(

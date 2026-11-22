@@ -59,10 +59,11 @@
 //!
 //! ## What is written, and why a report may write it
 //!
-//! Registration takes a while after the launch — the agent has to come up and reach the
-//! service — so it falls due [`REGISTRATION_DELAY`] after the instance was launched,
+//! The agent is a process of the GUEST, started by it, so the node it registers appears as
+//! the instance comes up: the registration falls due [`REGISTRATION_DELAY`] after the launch,
 //! whether or not anybody calls in between, and a caller that reads straight after
-//! `RunInstances` sees the instance not yet managed, as it would against the real service.
+//! `RunInstances` sees the instance not managed yet — as it would against the real service,
+//! and as Amazon EC2's own reads report the instance itself for that same span.
 //! [`settle_registrations`] is what materialises the registrations the clock has already
 //! made due: that write was owed at the same instant whether or not anybody called, which
 //! is why a REPORTING operation of this service takes it before it reads the node store.
@@ -85,13 +86,20 @@ use super::{ManagedNodeRecord, PING_STATUS_CONNECTION_LOST, PING_STATUS_ONLINE, 
 
 /// How long after its launch an instance's registration with Systems Manager falls due.
 ///
-/// AWS publishes no span for it — it is however long the agent takes to come up and reach
-/// the service — so this is the emulator's CHOSEN transient window: three seconds, the span
-/// this emulator gives a transition nobody documents (see
-/// [`super::DOCUMENT_TRANSITION_DELAY`]). It is deliberately never zero: a caller that
-/// describes managed nodes straight after a launch sees the instance not managed yet, the
-/// way it would against the real service.
-pub const REGISTRATION_DELAY: Duration = Duration::from_secs(3);
+/// AWS publishes no span for it — it is however long the agent takes to come up and reach the
+/// service — so the span is the emulator's CHOSEN one, and what it is chosen to be is the
+/// span the instance's OWN boot takes: the agent is a process of the guest, started by it, so
+/// the node it registers appears as the instance reaches `running`, which is the move the
+/// service that owns the instance owes it ([`ec2::TRANSITION_DELAY`], read from that crate so
+/// the two cannot drift apart). An instance that service does not yet hold `running` has no
+/// guest for the agent to run in, and so registers no node whatever this span says.
+///
+/// It is deliberately never zero: a caller that describes managed nodes straight after a
+/// launch sees the instance not managed yet, the way it would against the real service — and
+/// a node reported before its guest is up would be one every `SendCommand` to it could
+/// deliver nothing to, the guest run needing a running, booted instance
+/// ([`super::guest_execution::perform_in_guest`]).
+pub const REGISTRATION_DELAY: Duration = ec2::TRANSITION_DELAY;
 
 /// The IAM action an agent registers its node with, and so the one a profile's role has to
 /// allow for the instance to become a managed node: `ssm:UpdateInstanceInformation`
@@ -419,7 +427,8 @@ fn agent_reaches_service(
 }
 
 /// When `instance`'s registration with Systems Manager fell due: [`REGISTRATION_DELAY`]
-/// after the instant it was launched.///
+/// after the instant it was launched.
+///
 /// Derived from the stored launch instant rather than from the clock, so it is the same
 /// instant on every read — which is what lets the node record report one `RegistrationDate`
 /// however often it is materialised.
@@ -428,6 +437,11 @@ fn registered_at(instance: &ec2::InstanceRecord) -> SystemTime {
 }
 
 /// Whether Amazon EC2 holds `instance` in the one state a managed node is reported in.
+///
+/// "This operation does not return information for nodes that are either Stopped or
+/// Terminated" (`DescribeInstanceInformation`), and the other states an instance passes
+/// through are ones whose guest is not up: the agent reports itself from a guest that is
+/// running, so a node is reported for a running instance and for no other.
 ///
 /// The state is the one that service owes the instance at `settled`: an instance whose move
 /// to `running` has already fallen due IS running, whether or not anybody has called Amazon

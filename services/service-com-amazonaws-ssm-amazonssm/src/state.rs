@@ -208,7 +208,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 /// Whether the IAM role a hybrid activation is handed is one this service can act as,
 /// which is what a create of an activation resolves before it mints one.
@@ -491,8 +491,8 @@ pub mod guest_packages;
 /// and why they are separate.
 pub mod ec2_managed_nodes;
 
-/// The validation a put of an `aws:ec2:image` parameter leaves owing, and the version that
-/// validation discards when the value is no image the account can see.
+/// The validation a put of an `aws:ec2:image` parameter is held to, and the write that
+/// validation gates when the value is no image the account can see.
 pub mod parameter_image_validation;
 /// The `ParameterStringFilter` vocabulary both filter-taking parameter reads publish, how
 /// a filter matches a stored parameter, and the sentences a rejected filter is refused
@@ -802,7 +802,8 @@ pub const DEFAULT_DATA_TYPE: &str = "text";
 /// parameter and specify aws:ec2:image, Amazon Web Services Systems Manager validates the
 /// parameter value is in the required format … and that the specified AMI is available in
 /// your Amazon Web Services account" (`PutParameterRequest$DataType`). That validation is
-/// the asynchronous one [`parameter_image_validation`] performs after the put has answered.
+/// the one [`parameter_image_validation`] makes, and it gates the WRITE: the put answers
+/// success either way, and a value it rejects lands nowhere.
 pub const DATA_TYPE_EC2_IMAGE: &str = "aws:ec2:image";
 
 /// The key a `SecureString` is encrypted under when the request names no `KeyId`: "If
@@ -1345,17 +1346,6 @@ pub struct ParameterVersionRecord {
     /// `name:label` selector resolves against it rather than against anything invented,
     /// so a label nothing created resolves to nothing.
     pub labels: BTreeSet<String>,
-    /// When the ASYNCHRONOUS validation this version still owes falls due, on the monotonic
-    /// clock, or `None` for a version nothing is owed for.
-    ///
-    /// Only a version written with the [`DATA_TYPE_EC2_IMAGE`] data type owes one: "a
-    /// successful HTTP 200 response does not guarantee that your parameter was successfully
-    /// created or updated … the asynchronous validation will fail and the parameter will not
-    /// be created or updated" (`PutParameterRequest$DataType`). The instant is held beside
-    /// the version rather than in a second map, so a version this store stops holding owes
-    /// nothing, and the validation that discards it is
-    /// [`parameter_image_validation::settle_validations`].
-    pub image_validation_due_at: Option<Instant>,
 }
 
 impl ParameterVersionRecord {
@@ -2897,25 +2887,6 @@ impl ComAmazonawsSsmAmazonssmState {
     /// refuses a create past it rather than persisting it.
     pub fn can_hold_another_parameter(&self) -> bool {
         self.parameters.len() < MAX_PARAMETERS_TOTAL
-    }
-
-    /// Take version `version` of the parameter `name` in `region` back out of the store, and
-    /// the parameter with it when that was the only version it held.
-    ///
-    /// The one seam a version is UNWRITTEN through, so a version an asynchronous validation
-    /// discarded ([`parameter_image_validation`]) leaves the store exactly as the put that
-    /// wrote it found it: a parameter whose only version is discarded "will not be created",
-    /// so nothing of it is left for a read to report, while an overwrite's discarded version
-    /// leaves the versions the parameter already had.
-    pub fn discard_parameter_version(&mut self, region: &str, name: &str, version: i64) {
-        let key = (region.to_string(), canonical_name(name).to_string());
-        let Some(record) = self.parameters.get_mut(&key) else {
-            return;
-        };
-        record.versions.retain(|held| held.version != version);
-        if record.versions.is_empty() {
-            self.parameters.remove(&key);
-        }
     }
 
     /// Every parameter `region` holds, in ascending canonical-name order, as

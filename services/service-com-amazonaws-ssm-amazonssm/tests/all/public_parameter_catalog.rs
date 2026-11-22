@@ -48,7 +48,7 @@ const PCS_X86_LEAF: &str = "/x86_64/latest/ami-id";
 pub(super) const AMAZON_LINUX_NAMESPACE: &str = "/aws/service/ami-amazon-linux-latest";
 
 /// See [`AMAZON_LINUX_NAMESPACE`].
-const WINDOWS_NAMESPACE: &str = "/aws/service/ami-windows-latest";
+pub(super) const WINDOWS_NAMESPACE: &str = "/aws/service/ami-windows-latest";
 
 /// The published bounds of `GetParametersByPathMaxResults`
 /// (`smithy_query(query="shape", shape="GetParametersByPathMaxResults")`: range 1..10).

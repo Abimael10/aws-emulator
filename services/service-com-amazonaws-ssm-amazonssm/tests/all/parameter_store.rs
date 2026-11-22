@@ -265,6 +265,45 @@ async fn put_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value 
     response
 }
 
+/// The published AMI alias a fixture that writes an `aws:ec2:image` parameter resolves its
+/// value through: AWS publishes the current image id of that family under it.
+pub(crate) const PUBLISHED_IMAGE_ALIAS: &str =
+    "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64";
+
+/// The image id [`PUBLISHED_IMAGE_ALIAS`] resolves to at `region`'s endpoint, read through
+/// this service's own `GetParameter`.
+///
+/// A parameter of the `aws:ec2:image` data type lands only when its value names an image the
+/// account can see — "validates the parameter value is in the required format … and that the
+/// specified AMI is available in your Amazon Web Services account"
+/// (`smithy_query(query="doc", shape="PutParameterRequest", member="DataType")`) — so a
+/// fixture that writes one takes its value from the catalogue rather than inventing an id.
+pub(crate) async fn published_image_id_in(router: &MultiServiceRouter, region: &str) -> String {
+    let (status, body) = call_in_region(
+        router,
+        region,
+        "GetParameter",
+        &json!({ "Name": PUBLISHED_IMAGE_ALIAS }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "GetParameter {PUBLISHED_IMAGE_ALIAS} must resolve an image id in {region}, got \
+         {status} with {body}"
+    );
+    body["Parameter"]["Value"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("GetParameter {PUBLISHED_IMAGE_ALIAS} reports a value, got {body}")
+        })
+        .to_string()
+}
+
+/// [`published_image_id_in`] at [`REGION`].
+pub(crate) async fn published_image_id(router: &MultiServiceRouter) -> String {
+    published_image_id_in(router, REGION).await
+}
+
 /// `GetParameter`'s `Parameter`, asserting the read succeeded.
 async fn get_ok(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
     let (status, response) = get(router, name).await;
@@ -302,6 +341,9 @@ type RoundTrip<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
 async fn put_then_get_reports_what_was_persisted() {
     let router = router();
     let deep = name_of_depth(MAX_LEVELS);
+    // The image row's value is an id the published catalogue resolves: an `aws:ec2:image`
+    // parameter lands only when its value names an image the account can see.
+    let image = published_image_id(&router).await;
     let cases: Vec<RoundTrip<'_>> = vec![
         ("MyParameter", "String", "flat-value", None),
         (
@@ -312,12 +354,7 @@ async fn put_then_get_reports_what_was_persisted() {
         ),
         ("/Dev/List", "StringList", "alpha,beta,gamma", None),
         ("/Dev/Secret", "SecureString", "s3cr3t", None),
-        (
-            "/Dev/Image",
-            "String",
-            "ami-0123456789abcdef0",
-            Some("aws:ec2:image"),
-        ),
+        ("/Dev/Image", "String", &image, Some("aws:ec2:image")),
         (
             "/Dev/Integration",
             "String",

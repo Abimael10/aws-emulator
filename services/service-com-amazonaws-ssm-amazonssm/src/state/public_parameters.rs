@@ -336,10 +336,6 @@ fn published_record(
             // this account last changed it and none is reported as having done so.
             last_modified_user: None,
             labels: Default::default(),
-            // AWS publishes this parameter already validated — no put of this service wrote
-            // it — so nothing about it is owed
-            // ([`super::parameter_image_validation`]).
-            image_validation_due_at: None,
         }],
     }
 }

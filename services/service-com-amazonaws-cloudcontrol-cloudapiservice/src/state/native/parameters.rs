@@ -124,13 +124,21 @@ const SUPPORTED_TYPES: &[&str] = &[ssm::TYPE_STRING, ssm::TYPE_STRING_LIST];
 pub struct ParameterProvider {
     /// The owning service's store. A handle, so every answer is read from the live store.
     state: ::engine::ServiceState<SsmState>,
+    /// The image catalogue the owning service decides its `aws:ec2:image` data type's
+    /// validation against, held the same way and for the same reason: a write through this
+    /// path is held to that service's rule, whichever API made it. `None` when this engine
+    /// carries no such catalogue.
+    images: Option<ssm::parameter_image_validation::ImageCatalogue>,
 }
 
 impl ParameterProvider {
     /// The provider for the Systems Manager store THIS engine carries, or `None` when it
     /// carries none.
     pub fn for_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Self> {
-        ssm::service_state(engine).map(|state| Self { state })
+        ssm::service_state(engine).map(|state| Self {
+            state,
+            images: ssm::parameter_image_validation::image_catalogue(engine),
+        })
     }
 }
 
@@ -206,7 +214,7 @@ impl NativeResourceProvider for ParameterProvider {
         if in_region >= ssm::MAX_PARAMETERS_PER_REGION || !store.can_hold_another_parameter() {
             return Err(NativeRefusal::AtCapacity(parameters_quota_message()));
         }
-        let version = desired.version(None, in_region, at)?;
+        let version = desired.version(None, in_region, at, self.images.as_ref())?;
         let record = ssm::ParameterRecord {
             // The name is rendered the one way the owning service renders a parameter name,
             // so every read of this parameter — through either API — reports the name it is
@@ -240,7 +248,7 @@ impl NativeResourceProvider for ParameterProvider {
         // or update a parameter in Parameter Store", the overwrite half of the one call
         // that does both — so the model is applied by appending a version rather than by
         // editing the one a reader may already have seen.
-        let version = desired.version(Some(&held), in_region, at)?;
+        let version = desired.version(Some(&held), in_region, at, self.images.as_ref())?;
         let record = store
             .parameter_mut(region, identifier)
             .ok_or(NativeRefusal::NotFound)?;
@@ -592,12 +600,14 @@ impl DesiredModel {
     /// `held` is what the parameter holds today, so an update inherits the type and the
     /// tier it is not asked to change; `in_region` is how many parameters the Region holds,
     /// which is one of the three options the `Intelligent-Tiering` tier is evaluated
-    /// against.
+    /// against; `images` is the catalogue the owning service's `aws:ec2:image` validation is
+    /// decided against.
     fn version(
         &self,
         held: Option<&Held>,
         in_region: usize,
         at: SystemTime,
+        images: Option<&ssm::parameter_image_validation::ImageCatalogue>,
     ) -> Result<ssm::ParameterVersionRecord, NativeRefusal> {
         // "Specifying a parameter type isn't required when updating a parameter. You must
         // specify a parameter type when creating a parameter."
@@ -653,17 +663,23 @@ impl DesiredModel {
             .data_type
             .clone()
             .unwrap_or_else(|| ssm::DEFAULT_DATA_TYPE.to_string());
+        // The data type in force carries the owning service's own validation of the value:
+        // "If you submit an invalid AMI value, the PutParameter operation will return
+        // success, but the asynchronous validation will fail and the parameter will not be
+        // created or updated" (`PutParameterRequest$DataType`). A version that service would
+        // not persist is not one this path persists either — a resource whose parameter the
+        // owning service holds nothing of is no resource — so the operation is refused
+        // instead of leaving one behind (`ssm::parameter_image_validation`).
+        if !ssm::parameter_image_validation::validates_against(images, &data_type, &value) {
+            return Err(NativeRefusal::Rejected(format!(
+                "{VALUE} must name an Amazon Machine Image this account can see for the \
+                 {data_type} {DATA_TYPE}"
+            )));
+        }
         Ok(ssm::ParameterVersionRecord {
             version: held.map_or(1, |held| held.next_version),
             value,
             type_,
-            // "The aws:ec2:image value is validated asynchronously, and the PutParameter
-            // call returns before the validation is complete": a version written under that
-            // data type owes the owning service's own check of it, whichever API wrote the
-            // version (`ssm::parameter_image_validation`).
-            image_validation_due_at: ssm::parameter_image_validation::validation_due_at(
-                &data_type,
-            ),
             data_type,
             tier,
             description: self.description.clone(),

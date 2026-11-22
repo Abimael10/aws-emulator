@@ -207,11 +207,6 @@ fn parameter_version<Eng: Send + Sync + 'static>(
             query.path
         )));
     }
-    // A version the clock has already made due to be discarded is discarded before the
-    // store is read, by Parameter Store's own reading of it, so a deployed configuration
-    // and a direct read of the parameter agree on which versions exist. Called with no
-    // guard held.
-    parameter_store::parameter_image_validation::settle_validations(engine, region);
     let Some(state) = parameter_store::service_state(engine) else {
         return Err(unavailable(
             "no Systems Manager service is mounted beside AppConfig, so a parameter-backed \

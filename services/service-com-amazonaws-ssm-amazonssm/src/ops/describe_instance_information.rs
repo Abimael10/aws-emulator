@@ -12,9 +12,9 @@
 //! registered none is reported as holding none — the same answer AWS gives for an
 //! instance that never came under Systems Manager management. The one write it makes is
 //! materialising the registrations the clock already owed
-//! ([`crate::state::node_registration::settle_registrations`]): an instance that has been
-//! running long enough with a profile that lets its agent register was a managed node at
-//! that instant whether or not anybody called.
+//! ([`crate::state::node_registration::settle_registrations`]): an instance Amazon EC2 holds
+//! running, with a profile that lets its agent register, was a managed node at that instant
+//! whether or not anybody called.
 //!
 //! ## Which requests are refused, and with which modelled error
 //!

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ASYNCHRONOUS validation `PutParameter` owes an `aws:ec2:image` parameter, end to end
-//! over the front door.
+//! The validation `PutParameter` holds an `aws:ec2:image` parameter to, end to end over the
+//! front door.
 //!
-//! RULE under test: a `PutParameter` whose `DataType` is `aws:ec2:image` answers 200 with
-//! the version it wrote and only afterwards validates the value against the catalogue of
-//! images the account can see — "a successful HTTP 200 response does not guarantee that your
+//! RULE under test: a `PutParameter` whose `DataType` is `aws:ec2:image` answers 200 with the
+//! version it allocated whatever the value is, and the value lands only when it names an
+//! image the account can see — "a successful HTTP 200 response does not guarantee that your
 //! parameter was successfully created or updated … If you submit an invalid AMI value, the
 //! PutParameter operation will return success, but the asynchronous validation will fail and
 //! the parameter will not be created or updated"
-//! (`smithy_query(query="doc",shape="PutParameterRequest",member="DataType")`). So a version
-//! whose value is no image Amazon EC2 holds for the account is taken back out of the store:
-//! a create's only version leaves no parameter behind, so every read of that name is refused
-//! `ParameterNotFound` and no listing carries it, while an overwrite's leaves the versions
-//! the parameter already had. A version written under any other data type owes no such check
-//! and stands whatever its value looks like.
+//! (`smithy_query(query="doc",shape="PutParameterRequest",member="DataType")`). So a value
+//! that is no image Amazon EC2 holds for the account never becomes part of what the store
+//! serves: a create leaves no parameter behind, so every read of that name is refused
+//! `ParameterNotFound` and no listing carries it, while an overwrite leaves the versions the
+//! parameter already had. A value written under any other data type carries no such check
+//! and lands whatever it looks like.
 //!
 //! Every call goes through the wire a client uses: `POST /` with
 //! `X-Amz-Target: AmazonSSM.<Operation>` and an `awsJson1_1` body for Parameter Store
@@ -24,11 +24,11 @@
 //! The rows differ along what the rule generalises over: the FORM of the value (an id of an
 //! image the account can see, a well-formed long-form id no image has, the retired short-form
 //! id, a value that is not an image id at all) and the `DataType` the value was written under
-//! (the one whose check is asynchronous, the default one, and none at all).
+//! (the one carrying the check, the default one, and none at all).
 //!
-//! Nothing here waits a fixed time: the validation is a stored due instant, so a case LOOKS
-//! AGAIN until the condition holds or [`DEADLINE`] passes. Every row's put is made before any
-//! row is polled, so the spans run together rather than one after another.
+//! Nothing here waits a fixed time: a case LOOKS AGAIN until the condition holds or
+//! [`DEADLINE`] passes. The suite about the window a client can observe — that there is none
+//! — is [`crate::parameter_image_validation_gates_the_write`].
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -50,26 +50,26 @@ const WINDOWS_PARAMETER: &str =
 /// The `DataType` whose validation is asynchronous
 /// (`smithy_query(query="doc",shape="PutParameterRequest",member="DataType")`: "text
 /// aws:ec2:image aws:ssm:integration").
-const DATA_TYPE_EC2_IMAGE: &str = "aws:ec2:image";
+pub(crate) const DATA_TYPE_EC2_IMAGE: &str = "aws:ec2:image";
 
 /// The `DataType` a parameter carries when the request names none (the same doc: "The
 /// default is text").
-const DATA_TYPE_TEXT: &str = "text";
+pub(crate) const DATA_TYPE_TEXT: &str = "text";
 
 /// A well-formed LONG-form AMI id — `ami-` and 17 lowercase hexadecimal digits — that no
 /// image of this account has, which is the typo'd or deleted id a client stores by accident.
-const ABSENT_LONG_FORM_ID: &str = "ami-0123456789abcdef0";
+pub(crate) const ABSENT_LONG_FORM_ID: &str = "ami-0123456789abcdef0";
 
 /// The retired SHORT form of the same thing — `ami-` and 8 digits — so the rows span both id
 /// forms Amazon EC2 reads.
-const ABSENT_SHORT_FORM_ID: &str = "ami-0abcd123";
+pub(crate) const ABSENT_SHORT_FORM_ID: &str = "ami-0abcd123";
 
 /// A value that is no image id at all, which the same validation rejects: it is not "in the
 /// required format" either.
-const NOT_AN_IMAGE_ID: &str = "latest";
+pub(crate) const NOT_AN_IMAGE_ID: &str = "latest";
 
 /// What a read of a parameter that never landed is refused with.
-const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
+pub(crate) const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
 
 /// One row: a value written under a data type, and whether the parameter it wrote survives
 /// the validation the put left owing.
@@ -104,7 +104,7 @@ async fn published_image_id(router: &MultiServiceRouter, name: &str) -> String {
 /// Whether Amazon EC2 itself holds an image under `image_id`, asked through its own
 /// `DescribeImages` over the `ec2Query` wire — the catalogue the validation is decided
 /// against, read here through the service that OWNS it.
-async fn ec2_holds_image(router: &MultiServiceRouter, image_id: &str) -> bool {
+pub(crate) async fn ec2_holds_image(router: &MultiServiceRouter, image_id: &str) -> bool {
     let body = format!("Action=DescribeImages&Version=2016-11-15&ImageId.1={image_id}");
     let request = http::Request::builder()
         .method("POST")
