@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyPublicIpDnsNameOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyPublicIpDnsNameOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyPublicIpDnsNameOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Chooses the PUBLIC hostname type of ONE network interface
+//! ([`crate::state::choose_public_ip_dns_hostname_type`], the setting
+//! `NetworkInterface$PublicIpDnsNameOptions$DnsHostnameType` reports back), leaving the
+//! addresses the interface holds and the hostnames naming them exactly as they stand: the
+//! request names which KIND of public hostname the interface answers to, never an address.
+//!
+//! The type is one member of the modelled `PublicIpDnsOption` catalog, and choosing one
+//! REPLACES whatever was chosen before, so a second call is the last word. The options every
+//! report of the interface then carries are derived in one place
+//! ([`crate::state::interface_public_ip_dns_name_options`]) from that choice and from the
+//! public hostname the interface holds, so the interface read through
+//! `DescribeNetworkInterfaces` and the same interface read under the instance holding it
+//! cannot disagree about it.
+//!
+//! A `NetworkInterfaceId` this account holds no interface for is refused
+//! `InvalidNetworkInterfaceId.Malformed` whatever FORM the value is in, in this operation's own
+//! sentence ([`unresolvable_network_interface_id`]), rather than the
+//! `InvalidNetworkInterfaceId.Malformed` / `InvalidNetworkInterfaceID.NotFound` pair most of
+//! this service's readers of one named interface split an unresolvable id into: which refusal
+//! an operation answers is a fact of that operation, and this one's is what its recorded
+//! contract call carries.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +89,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -106,6 +120,35 @@ impl From<ModifyPublicIpDnsNameOptionsErrorModeled> for ModifyPublicIpDnsNameOpt
     fn from(modeled: ModifyPublicIpDnsNameOptionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The request member a hostname type outside the `PublicIpDnsOption` catalog is refused by
+/// name with: `ModifyPublicIpDnsNameOptionsRequest$HostnameType`, the parameter the caller
+/// wrote.
+const HOSTNAME_TYPE: &str = "HostnameType";
+
+/// Refuse a `NetworkInterfaceId` this operation cannot resolve: HTTP 400
+/// `InvalidNetworkInterfaceId.Malformed`, in THIS operation's own sentence — `The
+/// network-interface ID '<id>' is malformed`, naming the resource with the hyphenated word,
+/// where the readers recorded answering the malformed/not-found PAIR word the malformed half
+/// of it `The interface ID '<id>' is malformed`
+/// ([`crate::state::invalid_network_interface_id_malformed`]). Which sentence an operation
+/// answers is a fact of that operation, recorded by its caller.
+///
+/// The id named is the value the REQUEST sent, bounded by the one echo every refusal of this
+/// crate quotes a request value through ([`crate::state::echoed_resource_id`]), and no state of
+/// this service is part of the sentence.
+fn unresolvable_network_interface_id(
+    network_interface_id: &str,
+) -> ModifyPublicIpDnsNameOptionsError {
+    crate::scaffolded::Scaffolded::service_error(
+        state::INVALID_NETWORK_INTERFACE_ID_MALFORMED,
+        400,
+        format!(
+            "The network-interface ID '{}' is malformed",
+            state::echoed_resource_id(network_interface_id)
+        ),
+    )
 }
 
 /// The `ModifyPublicIpDnsNameOptions` operation.
@@ -144,18 +187,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyPublicIpDnsNameOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyPublicIpDnsNameOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // "The public hostname type" (`$HostnameType`), resolved against the catalog of its
+        // own modelled enum — so what reaches the store is a catalog member, never the
+        // request's own text. A word outside the catalog is already refused by that modelled
+        // enum before this handler runs, so the ordering here decides nothing; the member is
+        // required, so there is always one to resolve.
+        let hostname_type = state::requested_word(
+            HOSTNAME_TYPE,
+            Some(input.hostname_type.as_str()),
+            PUBLIC_IP_DNS_OPTION_VALUES,
+        )?;
+
+        let network_interface_id = input.network_interface_id.as_str();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock has made due happened at that instant whether or not anybody
+        // called — a completed detachment took an attachment away — so it is applied before
+        // the interface is read: this writes onto the record the same instant's
+        // `DescribeNetworkInterfaces` reports.
+        store.materialize_due_transitions();
+
+        // "A network interface ID" (`$NetworkInterfaceId`): an id this account holds no
+        // interface for has no hostname options to modify.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyPublicIpDnsNameOptions"))
+        // WHICH refusal that is, is a fact of this operation rather than of the id space:
+        // this operation's validator draws NO split between a value that is not an interface
+        // id at all and a well-formed id the account holds no interface for — every id it
+        // cannot resolve is answered the one refusal this operation was recorded answering
+        // ([`unresolvable_network_interface_id`]). The readers of one named interface that
+        // were recorded answering the `.Malformed` / `.NotFound` PAIR keep it
+        // (`DeleteNetworkInterface`, `ModifyNetworkInterfaceAttribute`), so the id is resolved
+        // here in one step rather than through the two-step check those operations share.
+        let Some(interface) = store.network_interfaces.get_mut(network_interface_id) else {
+            return Err(unresolvable_network_interface_id(network_interface_id));
+        };
+
+        // DryRun sits after every refusal above and before the one write: "If you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the interface's options exactly where they were.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The ONE write: which public hostname type this interface answers to. Every member
+        // the options report beside it is derived from the addresses the interface holds,
+        // which this call does not touch.
+        if let Some(hostname_type) = hostname_type {
+            state::choose_public_ip_dns_hostname_type(interface, hostname_type);
+        }
+
+        // "Whether or not the request was successful" (`$Successful`): the write above is the
+        // request succeeding.
+        Ok(ModifyPublicIpDnsNameOptionsOutput {
+            successful: Some(true),
+        })
     }
 }

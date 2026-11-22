@@ -137,7 +137,8 @@ fn held_subnet_dhcp_options(subnet_id: &str) -> Option<String> {
 
 thread_local! {
     /// The public hostname each network interface THIS response reports under the instance
-    /// holding it holds, keyed by `NetworkInterfaceId`.
+    /// holding it holds, and the public-hostname options naming it, keyed by
+    /// `NetworkInterfaceId`.
     ///
     /// Held for the same reason as [`SUBNET_DHCP_OPTIONS`], and on the same invariant: a
     /// public hostname is a member of the interface's OWN shape
@@ -145,22 +146,43 @@ thread_local! {
     /// projection that reports an interface under its instance
     /// ([`crate::state::instance_network_interfaces`]) hands the hostname here and this seam
     /// writes it. An interface left out of the slot is reported without the elements below.
-    static INSTANCE_INTERFACE_PUBLIC_HOSTNAMES: RefCell<BTreeMap<String, String>> =
+    static INSTANCE_INTERFACE_PUBLIC_HOSTNAMES: RefCell<BTreeMap<String, HeldPublicHostname>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
-/// Hold the public hostname the network interface `network_interface_id` holds, as the
-/// instance's projection of that interface read it off the interface's own record.
+/// What the instance's projection of one network interface read off that interface's own
+/// record: the public hostname it holds, and the public-hostname options naming it.
+///
+/// Both are members of the interface's OWN shape, so the projection resolves them ONCE —
+/// through [`crate::state::interface_public_ip_dns_name_options`], the one derivation of an
+/// interface's options — and this seam only writes what it was handed. An interface the
+/// derivation gives no options holds none here either.
+#[derive(Debug, Clone)]
+struct HeldPublicHostname {
+    public_dns_name: String,
+    options: Option<crate::ops::types::PublicIpDnsNameOptions>,
+}
+
+/// Hold the public hostname the network interface `network_interface_id` holds and the options
+/// naming it, as the instance's projection of that interface read them off the interface's own
+/// record.
 ///
 /// Keyed by interface id and added to rather than replacing, because one response reports the
 /// interfaces of every instance it answers with, projected one instance at a time. The run
 /// about to serve a call clears the slot ([`forget_any_held_instance_interface_hostnames`]),
 /// so nothing another call held can be written onto this one's interfaces.
-pub fn hold_instance_interface_public_hostname(network_interface_id: &str, public_dns_name: &str) {
+pub fn hold_instance_interface_public_hostname(
+    network_interface_id: &str,
+    public_dns_name: &str,
+    options: Option<crate::ops::types::PublicIpDnsNameOptions>,
+) {
     INSTANCE_INTERFACE_PUBLIC_HOSTNAMES.with(|slot| {
         slot.borrow_mut().insert(
             network_interface_id.to_string(),
-            public_dns_name.to_string(),
+            HeldPublicHostname {
+                public_dns_name: public_dns_name.to_string(),
+                options,
+            },
         )
     });
 }
@@ -173,7 +195,9 @@ pub fn forget_any_held_instance_interface_hostnames() {
 
 /// The public hostname held for the interface `network_interface_id`, or `None` when the
 /// projection held none for it.
-fn held_instance_interface_public_hostname(network_interface_id: &str) -> Option<String> {
+fn held_instance_interface_public_hostname(
+    network_interface_id: &str,
+) -> Option<HeldPublicHostname> {
     INSTANCE_INTERFACE_PUBLIC_HOSTNAMES
         .with(|slot| slot.borrow().get(network_interface_id).cloned())
 }
@@ -787,8 +811,8 @@ fn write_instance_recorded_members(
 ///
 /// The hostname is written whenever one was held, EMPTY included: an interface holding no
 /// public address reports the empty hostname, which is the member AWS renders for one rather
-/// than no member at all. The options are written only when there is a hostname for them to
-/// name.
+/// than no member at all. The options are written only when the projection resolved some —
+/// there is a hostname for them to name, or a hostname type a caller chose for the interface.
 fn write_instance_network_interface_recorded_members(
     s: &mut dyn ShapeSerializer,
     written: &WrittenMembers,
@@ -797,15 +821,14 @@ fn write_instance_network_interface_recorded_members(
     let Some(network_interface_id) = written.network_interface_id.as_deref() else {
         return Ok(());
     };
-    let Some(public_dns_name) = held_instance_interface_public_hostname(network_interface_id)
-    else {
+    let Some(held) = held_instance_interface_public_hostname(network_interface_id) else {
         return Ok(());
     };
     s.write_string(
         &INSTANCE_NETWORK_INTERFACE_PUBLIC_DNS_NAME,
-        &public_dns_name,
+        &held.public_dns_name,
     )?;
-    let Some(options) = crate::state::public_ip_dns_name_options(&public_dns_name) else {
+    let Some(options) = held.options else {
         return Ok(());
     };
     s.write_struct(

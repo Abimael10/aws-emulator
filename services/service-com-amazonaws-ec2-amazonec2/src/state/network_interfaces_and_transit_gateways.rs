@@ -740,20 +740,81 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// The public hostname type a caller has CHOSEN for the interface `interface`
+/// (`ModifyPublicIpDnsNameOptions`), or `None` for one no call has chosen a type for.
+///
+/// The choice is held on the stored record's own
+/// `NetworkInterface$PublicIpDnsNameOptions$DnsHostnameType` — the member that reports it —
+/// rather than in a second map beside the interface, so a writer and the reports below cannot
+/// disagree about which type one interface answers to, and the choice goes when the interface
+/// does. The hostnames in that structure are DERIVED where the interface is reported
+/// ([`interface_public_ip_dns_name_options`]), so the stored structure carries the type alone.
+pub fn chosen_public_ip_dns_hostname_type(interface: &NetworkInterface) -> Option<&str> {
+    interface
+        .public_ip_dns_name_options
+        .as_ref()
+        .and_then(|options| options.dns_hostname_type.as_deref())
+}
+
+/// Record that the interface `interface` answers to the public hostname type `hostname_type`,
+/// which has to be a member of the modelled `PublicIpDnsOption` catalog
+/// (`crate::ops::types::PUBLIC_IP_DNS_OPTION_VALUES`) — the one write behind
+/// `ModifyPublicIpDnsNameOptions`, read back by [`chosen_public_ip_dns_hostname_type`].
+///
+/// "The public hostname type" is a single setting, so choosing one REPLACES the type chosen
+/// before it and leaves everything else about the interface — the addresses it holds and the
+/// hostnames naming them — exactly as it stands.
+pub fn choose_public_ip_dns_hostname_type(interface: &mut NetworkInterface, hostname_type: &str) {
+    interface.public_ip_dns_name_options = Some(PublicIpDnsNameOptions {
+        dns_hostname_type: Some(hostname_type.to_string()),
+        ..PublicIpDnsNameOptions::default()
+    });
+}
+
+/// The "Public hostname type options" (`PublicIpDnsNameOptions`) one stored network interface
+/// reports: the type it answers to, and the public hostnames it actually holds.
+///
+/// The ONE derivation of an interface's options, read by every report of one — the interface's
+/// own shape (`NetworkInterface$PublicIpDnsNameOptions`) and the projection of it the instance
+/// holding it carries ([`instance_network_interface_view`]) — so the two cannot disagree.
+/// Two facts meet in it:
+///
+/// * the hostnames are those of the public addresses the interface HOLDS, derived from the
+///   public hostname on the record ([`public_ip_dns_name_options`]), so no option names a
+///   hostname nothing answers to;
+/// * the type is the one a caller chose ([`chosen_public_ip_dns_hostname_type`]), and for an
+///   interface nobody has chosen one for it is the IPv4 one that names the only kind of public
+///   hostname anything here holds ([`PUBLIC_IP_DNS_OPTION_IPV4`]).
+///
+/// An interface that holds no public hostname and that nobody has chosen a type for has no
+/// options at all: there is nothing for them to report.
+pub fn interface_public_ip_dns_name_options(
+    interface: &NetworkInterface,
+) -> Option<PublicIpDnsNameOptions> {
+    let held =
+        public_ip_dns_name_options(interface.public_dns_name.as_deref().unwrap_or_default());
+    let Some(chosen) = chosen_public_ip_dns_hostname_type(interface) else {
+        return held;
+    };
+    Some(PublicIpDnsNameOptions {
+        dns_hostname_type: Some(chosen.to_string()),
+        ..held.unwrap_or_default()
+    })
+}
+
 /// One stored network interface as the operations that report the interface's OWN shape
 /// answer with it (`NetworkInterface`).
 ///
 /// The stored record with the members DERIVED from the public hostname it holds filled in:
-/// the public-hostname options NAME that hostname ([`public_ip_dns_name_options`]), so they
-/// are computed where the interface is reported rather than written beside the hostname by
-/// every caller that assigns, moves or releases a public address — which is what keeps the
-/// two from disagreeing. The same derivation the instance's projection of an interface takes
+/// the public-hostname options NAME that hostname
+/// ([`interface_public_ip_dns_name_options`]), so they are computed where the interface is
+/// reported rather than written beside the hostname by every caller that assigns, moves or
+/// releases a public address — which is what keeps the two from disagreeing. The same
+/// derivation the instance's projection of an interface takes
 /// ([`instance_network_interface_view`]).
 pub fn reported_network_interface(interface: &NetworkInterface) -> NetworkInterface {
     NetworkInterface {
-        public_ip_dns_name_options: public_ip_dns_name_options(
-            interface.public_dns_name.as_deref().unwrap_or_default(),
-        ),
+        public_ip_dns_name_options: interface_public_ip_dns_name_options(interface),
         ..interface.clone()
     }
 }
@@ -781,6 +842,7 @@ pub(super) fn instance_network_interface_view(
         crate::service::recorded_response_members::hold_instance_interface_public_hostname(
             network_interface_id,
             interface.public_dns_name.as_deref().unwrap_or_default(),
+            interface_public_ip_dns_name_options(interface),
         );
     }
     // The public address the interface holds, in the shape the INSTANCE report carries it
