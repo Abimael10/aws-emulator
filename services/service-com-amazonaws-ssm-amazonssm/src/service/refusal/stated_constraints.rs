@@ -101,6 +101,13 @@ const PREVIEW_DOCUMENT_NAME_PATTERN: &str = r"^[a-zA-Z0-9_\-.:/]{3,200}$";
 /// (`smithy_query(query="shape",shape="DocumentName")`).
 const DOCUMENT_NAME_PATTERN: &str = r"^[a-zA-Z0-9_\-.]{3,128}$";
 
+/// The run of characters a NAME a caller chooses is held to, as the model declares it
+/// (`smithy_query(query="shape",shape="PatchGroup")`; `ActivationDefaultInstanceName`
+/// carries the same text), and as this service publishes it: a refusal of a patch group
+/// outside it quotes the expression with the pair, so the sentence states the whole-value
+/// match it was refused for rather than a run a rejected value contains.
+const CHOSEN_NAME_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+
 /// The expressions this service publishes exactly as the model declares them, the outer
 /// anchors included — every other expression is published without the whole-value pair the
 /// model wrote around it ([`quoted_pattern`]).
@@ -112,6 +119,7 @@ const PUBLISHED_AS_DECLARED: &[&str] = &[
     COMMAND_ID_PATTERN,
     INVENTORY_ITEM_TYPE_NAME_PATTERN,
     PREVIEW_DOCUMENT_NAME_PATTERN,
+    CHOSEN_NAME_PATTERN,
 ];
 
 /// One constraint of a shape's stated set.
@@ -1011,6 +1019,11 @@ mod tests {
                 "the command id the service itself requires",
                 COMMAND_ID_PATTERN,
                 COMMAND_ID_PATTERN,
+            ),
+            (
+                "a name a caller chooses, which this service publishes as the model declares it",
+                CHOSEN_NAME_PATTERN,
+                CHOSEN_NAME_PATTERN,
             ),
             (
                 "an expression with no pair to drop",
