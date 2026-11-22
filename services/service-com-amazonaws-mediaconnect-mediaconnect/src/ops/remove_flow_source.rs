@@ -216,13 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This request can be made only if there is more than one source on the flow": a
         // flow always ingests from at least one source, so removing its last one is a
-        // semantic error rather than a flow with no source.
+        // semantic error rather than a flow with no source. The refusal carries the fixed
+        // text MediaConnect words that rule with, read from the one place this crate holds
+        // it (`crate::state::LAST_FLOW_SOURCE_REMOVAL_DETAIL`) and rendered through the
+        // service's own refusal envelope: nothing of the request is interpolated into it.
         if flow.sources.len() <= 1 {
-            return Err(bad_request(format!(
-                "Flow {} has only one source. A source can be removed only from a flow that \
-                 has more than one.",
-                input.flow_arn
-            )));
+            return Err(bad_request(crate::state::LAST_FLOW_SOURCE_REMOVAL_DETAIL));
         }
 
         // The failover setting the flow STORES names its primary source by NAME

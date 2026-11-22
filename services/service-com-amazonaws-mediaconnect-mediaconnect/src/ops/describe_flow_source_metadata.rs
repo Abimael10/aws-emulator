@@ -15,18 +15,19 @@
 //!
 //! ## What there is to report, and what there is not
 //!
-//! `TransportMediaInfo` is "information about the flow's transport media" — the transport
-//! stream's `TsId` and its programs, each with its PCR PID and its elementary streams'
-//! codecs, resolutions and frame rates. Those values exist only once a transport stream
-//! has actually been RECEIVED on the source and demultiplexed, and this emulator ingests
-//! no media: nothing listens on a source's ingest endpoint, so no program, PID, codec or
-//! resolution has ever been observed for any flow. The member is therefore ABSENT rather
-//! than carrying a synthesised stream — an empty `TransportMediaInfo` would itself be a
-//! claim about a stream (`TransportMediaInfo$Programs` is required, so an empty list says
-//! "a transport stream with no programs"), and a populated one would be fabricated.
-//! `Timestamp` ("the timestamp of the most recent change in metadata for this flow's
-//! source") is absent for the same reason: no metadata has ever been observed, so there is
-//! no instant at which it last changed.
+//! `TransportMediaInfo` is "the metadata of the transport stream in the current flow's
+//! source" and is reported for every flow this read is served for: its `Programs` member is
+//! REQUIRED, so the structure is the SHAPE of the report rather than a claim that content
+//! was seen, and a caller reading it off a running flow finds it there. What it reports is
+//! what this emulator has observed: NO program. Programs, their PCR PIDs and their
+//! elementary streams' codecs, resolutions and frame rates exist only once a transport
+//! stream has actually been RECEIVED on the source and demultiplexed, and this emulator
+//! ingests no media — nothing listens on a source's ingest endpoint — so the program list
+//! is EMPTY and the optional `TsId` ("the transport stream ID (TSID) of the source, from the
+//! Program Association Table") is absent: no Program Association Table has ever been read.
+//! A populated program would be fabricated. `Timestamp` ("the timestamp of the most recent
+//! change in metadata for this flow's source") is absent for the same reason: no metadata
+//! has ever been observed, so there is no instant at which it last changed.
 //!
 //! What the operation CAN report is the status of that absence, which is what `Messages`
 //! is for ("provides a status code and message regarding issues found with the flow source
@@ -255,12 +256,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             flow_arn: Some(flow.flow_arn.clone()),
             messages: Some(source_metadata_messages(flow)),
             // No source metadata has ever been observed for a flow of this emulator, so
-            // there is no transport stream to describe and no "most recent change in
-            // metadata" to timestamp. See the module docs.
+            // there is no "most recent change in metadata" to timestamp. See the module
+            // docs.
             timestamp: None,
-            transport_media_info: None,
+            transport_media_info: Some(observed_transport_media_info()),
             ndi_info: ndi_source_metadata_info(flow),
         })
+    }
+}
+
+/// `TransportMediaInfo`: the transport-stream metadata of a flow this read is served for.
+///
+/// Reported for every such flow, because the report is the structure the model declares
+/// (`Programs` is a required member) rather than a claim about content: what a caller reads
+/// off it is how many programs the service has demultiplexed. This emulator ingests no
+/// media, so the answer is NONE — an empty program list — and no transport stream ID, which
+/// is read out of a Program Association Table that has never arrived. See the module docs.
+fn observed_transport_media_info() -> TransportMediaInfo {
+    TransportMediaInfo {
+        programs: Vec::new(),
+        ts_id: None,
     }
 }
 

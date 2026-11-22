@@ -409,6 +409,16 @@ pub struct StoredBridge {
     pub bridge_state: String,
     /// The state change the clock owes, if any. See [`TRANSITION_SPAN`].
     pub pending: Option<PendingStatus>,
+    /// When DeleteBridge accepted the delete of this bridge, or `None` while it is live.
+    ///
+    /// A bridge delete is a SOFT delete — `BridgeState` carries the terminal `DELETED`
+    /// value, so a deleted bridge stays a readable resource (see [`BRIDGE_STATE_DELETED`])
+    /// — and this is the record of it, exactly as [`StoredGateway::deleted_at`] is for a
+    /// gateway: it makes a repeated delete idempotent rather than a not-found, keeps a
+    /// deleted bridge out of every reference and count that reads "a bridge of this
+    /// account" ([`ComAmazonawsMediaconnectMediaconnectState::live_bridge`]), and orders
+    /// the retired records the store retains (see [`MAX_RETIRED_BRIDGES`]).
+    pub deleted_at: Option<SystemTime>,
     /// Set on a cloud-to-ground bridge, exclusive with [`Self::ingress_gateway_bridge`].
     pub egress_gateway_bridge: Option<EgressGatewayBridge>,
     /// Set on a ground-to-cloud bridge, exclusive with [`Self::egress_gateway_bridge`].
@@ -457,6 +467,13 @@ impl StoredBridge {
             Some(pending) => &pending.status,
             None => &self.bridge_state,
         }
+    }
+
+    /// Whether this bridge has been DELETED: DeleteBridge accepted the delete, so the
+    /// record is retired — kept readable in the terminal [`BRIDGE_STATE_DELETED`] state —
+    /// rather than live. The bridge counterpart of [`StoredGateway::is_retired`].
+    pub fn is_retired(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     /// Whether this bridge is still PLACED on the gateway its placement ARN names, i.e. has

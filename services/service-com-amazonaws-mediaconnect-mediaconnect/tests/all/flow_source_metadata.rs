@@ -10,8 +10,10 @@
 //! refused instead, which is the subject of
 //! `tests/all/flow_source_report_preconditions.rs`; the fixtures here are therefore started
 //! before they are read. Nothing in this emulator ingests media, so no transport stream has
-//! ever been observed: `transportMediaInfo` and `timestamp` are absent for every flow, and
-//! the NDI block reports an empty discovery rather than an invented sender.
+//! ever been observed: `transportMediaInfo` carries an EMPTY program list for every flow
+//! (the structure is the shape of the report, `Programs` being a required member),
+//! `timestamp` is absent, and the NDI block reports an empty discovery rather than an
+//! invented sender.
 //!
 //! Each rule is asserted over a TABLE whose rows differ along what it generalises over —
 //! how many sources the flow holds, what they are named, which protocol they use, whether
@@ -354,12 +356,14 @@ async fn source_metadata_reports_the_stored_flow_and_its_sources() {
         );
         assert_messages_are_worded(case, &body["messages"]);
 
-        // Nothing is ingested, so there is no transport stream to describe and no instant
-        // at which the source's metadata last changed.
-        assert!(
-            body["transportMediaInfo"].is_null(),
-            "case {case:?}: no transport media info is reported for a flow nothing has \
-             been ingested on, got {}",
+        // Nothing is ingested, so the transport-stream report is the modelled structure
+        // with NO program in it, and there is no instant at which the source's metadata
+        // last changed.
+        assert_eq!(
+            body["transportMediaInfo"],
+            json!({ "programs": [] }),
+            "case {case:?}: a flow nothing has been ingested on reports a transport media \
+             info with no program, got {}",
             body["transportMediaInfo"]
         );
         assert!(
@@ -531,10 +535,13 @@ async fn the_read_is_served_exactly_while_the_flow_is_running() {
         "case {case:?}: the wording names the status the flow is in, got {}",
         served["messages"][0]["message"]
     );
-    // Never any media: a running flow of this emulator receives nothing either.
+    // Never any media: a running flow of this emulator receives nothing either, so its
+    // transport-stream report carries no program and no metadata timestamp.
     assert!(
-        served["transportMediaInfo"].is_null() && served["timestamp"].is_null(),
-        "case {case:?}: no transport media info and no metadata timestamp, got {served}"
+        served["transportMediaInfo"] == json!({ "programs": [] })
+            && served["timestamp"].is_null(),
+        "case {case:?}: a transport media info with no program and no metadata timestamp, \
+         got {served}"
     );
 
     // Stopped: STOPPING until the clock settles it STANDBY. Every answer before it leaves
@@ -711,6 +718,73 @@ async fn an_unheld_flow_label_is_refused_not_found() {
         assert!(
             message.contains("flowArn"),
             "case {case:?}: the refusal names the member it judged, got {message:?}"
+        );
+    }
+}
+
+/// The transport-stream report a RUNNING flow is answered with: the modelled
+/// `TransportMediaInfo` structure, whose required `Programs` list is EMPTY because nothing
+/// has been ingested, and no `TsId`, which is read out of a Program Association Table that
+/// has never arrived.
+///
+/// Asserted as a whole value, so an invented program or stream id fails it.
+fn reported_transport_media_info() -> Value {
+    json!({ "programs": [] })
+}
+
+/// `TransportMediaInfo` is part of every SERVED report and of no refused one: the identical
+/// call is refused while the flow is not running and answers the structure once it is, for
+/// every shape of flow — so a client that reads the member off a running flow always finds
+/// it, and never has to read it out of a refusal.
+///
+/// The rows are the whole report table (`report_cases`), which differs along how many
+/// sources the flow holds, how they are named, which protocol they use and whether NDI is
+/// part of the source — none of which changes what the service has ingested, and so none of
+/// which may change this report.
+#[tokio::test]
+async fn the_transport_media_info_is_reported_exactly_while_the_flow_is_running() {
+    let emulator = Emulator::new();
+
+    for ReportCase { case, flow, .. } in report_cases() {
+        let (flow_arn, _) = create(&emulator, case, flow).await;
+
+        // As created the flow waits in STANDBY: the read is REFUSED, so there is no report
+        // to read a transport media info off at all.
+        let (status, code, refused) = source_metadata(&emulator, &flow_arn).await;
+        assert_eq!(
+            (status, code.as_deref(), refused["message"].as_str()),
+            (400, Some("BadRequestException"), Some(METADATA_REFUSAL)),
+            "case {case:?}: a flow that is not running is refused the read, got {status} \
+             {code:?}: {refused}"
+        );
+        assert!(
+            refused["transportMediaInfo"].is_null(),
+            "case {case:?}: a refusal carries no report, got {refused}"
+        );
+
+        // Running: the identical call is served, and the report carries the structure.
+        start_and_settle(&emulator, case, &flow_arn).await;
+        let (status, code, served) = source_metadata(&emulator, &flow_arn).await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (200, None),
+            "case {case:?}: a running flow is served the read, got {status} {code:?}: {served}"
+        );
+        assert_eq!(
+            served["transportMediaInfo"],
+            reported_transport_media_info(),
+            "case {case:?}: expected {}, got {}",
+            reported_transport_media_info(),
+            served["transportMediaInfo"]
+        );
+
+        // A report changes nothing, so reading it again answers the same structure rather
+        // than one that has grown a program.
+        let (_, _, again) = source_metadata(&emulator, &flow_arn).await;
+        assert_eq!(
+            again["transportMediaInfo"], served["transportMediaInfo"],
+            "case {case:?}: a second read answers the same report, got {}",
+            again["transportMediaInfo"]
         );
     }
 }

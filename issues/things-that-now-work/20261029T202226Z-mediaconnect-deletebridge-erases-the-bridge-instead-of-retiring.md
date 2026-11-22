@@ -1,12 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: mediaconnect.bridge-create-and-delete-lifecycle mediaconnect.describe-flow-source-metadata-not-yet-available mediaconnect.remove-only-flow-source-rejected mediaconnect.native-media-ingest-udp-round-trip
+Issue-Trace-Ids: mediaconnect.bridge-create-and-delete-lifecycle mediaconnect.describe-flow-source-metadata-not-yet-available mediaconnect.remove-only-flow-source-rejected
 Issue-Shape-Id: com.amazonaws.mediaconnect#MediaConnect
 Issue-Key: mediaconnect|DescribeBridge|NotFoundException
 Issue-Key: mediaconnect.describe-flow-source-metadata-not-yet-available|_client_error#4|AssertionError|raise AssertionError(f"expected rejection, but the call SUCCEEDED and returned {result!r}")
 Issue-Key: mediaconnect.remove-only-flow-source-rejected|run#11|AssertionError|assert error.get("Message") == expected, (
-Issue-Key: mediaconnect.native-media-ingest-udp-round-trip|_poll_for_peer_ip#13|Timeout|time.sleep(3)
 Issue-Commit: 0d251cb15d5c6a3e8a766cb6c72620a30f43ef7f
 
 # MediaConnect: DeleteBridge erases the bridge instead of retiring it DELETED, DescribeFlowSourceMetadata answers 200 on a non-ACTIVE flow, RemoveFlowSource's last-source refusal uses non-AWS prose, and no UDP ingest listener exists
@@ -83,3 +82,38 @@ Cause 2: f = mc.create_flow(Name='f1', Source={'Name':'source1','Protocol':'rtp'
 Cause 3: f = mc.create_flow(Name='f2', Source={'Name':'source1','Protocol':'rtp','WhitelistCidr':'203.0.113.0/24'})['Flow']['FlowArn']; s = mc.describe_flow(FlowArn=f)['Flow']['Sources'][0]['SourceArn']; mc.remove_flow_source(FlowArn=f, SourceArn=s) -> compare Error.Message to AWS's fixed text 'Validation failed:\nYour request removes the only source that is assigned to this flow. Each flow must have at least one source. Review the existing source and make changes as needed. Your request removes all sources that are assigned to this flow.'
 
 Cause 4: f = mc.create_flow(Name='f3', Source={'Name':'source1','Protocol':'rtp','WhitelistCidr':<your egress CIDR>})['Flow']['FlowArn']; mc.start_flow(FlowArn=f); poll DescribeFlow until Status == 'ACTIVE'; read Source.IngestIp/IngestPort; send 188-byte UDP datagrams there from a plain socket; poll DescribeFlow for Source.PeerIpAddress -> never populates.
+
+## Resolution
+
+Causes 1, 2 and 3 are fixed; their recorded units replay green.
+
+* Cause 1: DeleteBridge now retires the bridge into the terminal `DELETED` `BridgeState` and
+  keeps it readable (the way DeleteGateway settles a gateway), the record stops being a
+  bridge any reference, count or create quota resolves, and UpdateBridge refuses a bridge
+  that is not waiting in `STANDBY` with the fixed text MediaConnect words that precondition
+  with.
+* Cause 2: DescribeFlowSourceMetadata reports the modelled `TransportMediaInfo` for every
+  flow the read is served for, with the required `Programs` list empty because nothing has
+  been ingested.
+* Cause 3: RemoveFlowSource's last-source refusal carries MediaConnect's fixed text for that
+  error class, with nothing interpolated from the request.
+
+Cause 4 is NOT fixed here and nothing about it was changed: MediaConnect's data plane is raw
+UDP, and the emulator cannot open a UDP endpoint — the core's listener API offers TCP and
+HTTP surfaces only (`vendor/server/src/listeners.rs`: `tcp`, `tcp_plaintext`, `http`,
+`tls_upgrader`), and `vendor/engine/src/lib.rs` states that a service never binds a socket or
+chooses a port itself. `vendor/` is read-only to a fix, so serving the advertised ingest
+endpoint needs a core-owned UDP listener first (`Listeners::udp(handler)`, returning the
+bound host and port for the control plane to publish and handing each datagram to the handler
+with its sender address). That cause stays filed as NOT working, and its replay key with it,
+under the issues that own it:
+
+* `issues/things-that-do-not-work/20261109T182619Z-mediaconnect-an-active-flow-advertises-a-source-ingestip-the.md`
+  (same trace, current failure frame),
+* `issues/things-that-do-not-work/20261101T213636Z-mediaconnect-an-active-flow-advertises-source-ingestip-in-the.md`
+  (same defect, earlier frame), and
+* Cause 5 of
+  `issues/things-that-do-not-work/20261022T132818Z-mediaconnect-router-interface-union-payload-rejected-no-flow.md`.
+
+Its `Issue-Key` and trace id were therefore removed from this report's header rather than
+filed as working, so a later scan still sees the cause as open where those issues hold it.

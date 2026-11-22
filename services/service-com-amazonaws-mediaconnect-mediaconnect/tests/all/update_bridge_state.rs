@@ -32,6 +32,7 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 use crate::bridge_lifecycle::{
     cloud_flow, create_bridge, describe_bridge, gateway_with_networks,
 };
+use crate::bridge_members_and_deletion::poll_until_bridge_state;
 use crate::flow_lifecycle::{Emulator, REGION};
 
 /// Long enough for the clock to have made a transition due: the span the service holds a
@@ -493,24 +494,30 @@ async fn a_bridge_asked_to_run_is_not_deletable_until_it_is_asked_back_to_standb
         update_bridge_state(&emulator, &arn, json!({ "desiredState": "ACTIVE" })).await;
     assert_eq!(status, 202, "asking for ACTIVE expects 202, got {started}");
 
-    // While it is starting, and once it is running, the delete is refused.
-    for case in ["starting", "running"] {
-        let (status, code, refused) = delete_bridge(&emulator, &arn).await;
-        assert_eq!(
-            (status, code.as_deref()),
-            (400, Some("BadRequestException")),
-            "case {case:?}: a bridge that was not stopped is refused, got {status} {code:?}: \
-             {refused}"
-        );
-        if case == "starting" {
-            tokio::time::sleep(settle_span()).await;
-        }
-    }
+    // While it is starting the delete is refused, and once the clock has settled the bridge
+    // in the state it was asked for it is refused again: the precondition is the state, not
+    // the call that set it.
+    let (status, code, refused) = delete_bridge(&emulator, &arn).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (400, Some("BadRequestException")),
+        "case \"starting\": a bridge that was not stopped is refused, got {status} {code:?}: \
+         {refused}"
+    );
+    poll_until_bridge_state(&emulator, "asked to run", &arn, mc::BRIDGE_STATE_ACTIVE).await;
+    let (status, code, refused) = delete_bridge(&emulator, &arn).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (400, Some("BadRequestException")),
+        "case \"running\": a bridge that was not stopped is refused, got {status} {code:?}: \
+         {refused}"
+    );
 
     let (status, _, stopped) =
         update_bridge_state(&emulator, &arn, json!({ "desiredState": "STANDBY" })).await;
     assert_eq!(status, 202, "asking for STANDBY expects 202, got {stopped}");
-    tokio::time::sleep(settle_span()).await;
+    poll_until_bridge_state(&emulator, "asked back to STANDBY", &arn, mc::BRIDGE_STATE_STANDBY)
+        .await;
 
     let (status, code, deleted) = delete_bridge(&emulator, &arn).await;
     assert_eq!(
@@ -519,10 +526,11 @@ async fn a_bridge_asked_to_run_is_not_deletable_until_it_is_asked_back_to_standb
         "case \"stopped\": a bridge asked back to STANDBY is deletable, got {status} {code:?}: \
          {deleted}"
     );
-    let (status, code, gone) = describe_bridge(&emulator, &arn).await;
+    let (status, code, described) = describe_bridge(&emulator, &arn).await;
     assert_eq!(
-        (status, code.as_deref()),
-        (404, Some("NotFoundException")),
-        "case \"stopped\": the deleted bridge is gone, got {status} {code:?}: {gone}"
+        (status, code.as_deref(), described["bridge"]["bridgeState"].as_str()),
+        (200, None, Some(mc::BRIDGE_STATE_DELETED)),
+        "case \"stopped\": the deleted bridge stays readable in DELETED, got {status} \
+         {code:?}: {described}"
     );
 }

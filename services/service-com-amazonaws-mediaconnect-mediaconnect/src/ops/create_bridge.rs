@@ -384,10 +384,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The bridge store is bounded: nothing evicts a bridge and DescribeBridge must
+        // The bridge store is bounded: nothing evicts a LIVE bridge and DescribeBridge must
         // still answer what this operation created, so the create refuses once the store is
-        // full rather than growing it without limit. See `crate::state::MAX_BRIDGES`.
-        if store.bridges.len() >= crate::state::MAX_BRIDGES {
+        // full rather than growing it without limit. A deleted bridge no longer occupies one
+        // of the account's slots (`live_bridge_count`), and the retired records the store
+        // keeps are bounded by `crate::state::MAX_RETIRED_BRIDGES`. See
+        // `crate::state::MAX_BRIDGES`.
+        if store.live_bridge_count() >= crate::state::MAX_BRIDGES {
             return Err(CreateBridgeErrorModeled::CreateBridge420Exception(
                 CreateBridge420Exception {
                     message: format!(
@@ -425,6 +428,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: crate::state::BRIDGE_STATE_STANDBY.to_string(),
                     due_at: now + crate::state::TRANSITION_SPAN,
                 }),
+                // Nothing has deleted this bridge: the create answers a LIVE record
+                // (`StoredBridge::deleted_at`).
+                deleted_at: None,
                 // `EgressGatewayBridge$InstanceId` / `IngressGatewayBridge$InstanceId` is
                 // "the ID of the instance running this bridge". A bridge this emulator
                 // creates runs on no gateway instance (none is registered, and the bridge

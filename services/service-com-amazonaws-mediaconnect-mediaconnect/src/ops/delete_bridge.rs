@@ -2,14 +2,17 @@
 
 //! @op DeleteBridge
 //!
-//! Deletes one bridge out of [`crate::state`] and answers with the ARN of the bridge it
-//! deleted: DescribeBridge stops answering for that bridge afterwards.
+//! RETIRES one bridge of [`crate::state`] and answers with the ARN of the bridge it
+//! deleted: the record is kept in the terminal `DELETED` bridge state, so DescribeBridge
+//! keeps answering for it (the way a deleted gateway stays readable), while every reference
+//! and count that reads "a bridge of this account" resolves it no more
+//! ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::live_bridge`]).
 //!
 //! The delete is refused with the modelled `BadRequestException` (400), and the bridge left
 //! intact, while a FLOW the store holds takes its content from the bridge in a flow source:
 //! that reference is a required member of the stored source and every path that writes one
-//! resolves it against this store, so taking the bridge away would leave the flow source
-//! pointing at nothing — see
+//! resolves it against this store, so retiring the bridge would leave the flow source
+//! pointing at a bridge nothing resolves — see
 //! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::bridge_gateway_source_rejection`],
 //! the mirror of the refusal DeleteFlow answers while a bridge source names the flow.
 //!
@@ -184,6 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        let bridge_arn = bridge.bridge_arn.clone();
+        // A bridge whose delete this operation already accepted is past both preconditions
+        // below: the repeat of an `@idempotent` delete answers the same ARN rather than
+        // refusing (see the retirement itself, further down).
+        let retired = bridge.is_retired();
 
         // "Deletes a bridge. Before you can delete a bridge, you must stop the bridge":
         // the precondition is the bridge's STATE, and a bridge that is started — or moving
@@ -191,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::is_stopped_bridge_state`). Refusing it is a semantic error,
         // which is what `BadRequestException` is "thrown if the request contains", and the
         // bridge is left exactly as it was.
-        if !crate::state::is_stopped_bridge_state(&bridge.bridge_state) {
+        if !retired && !crate::state::is_stopped_bridge_state(&bridge.bridge_state) {
             return Err(DeleteBridgeErrorModeled::BadRequestException(
                 BadRequestException {
                     message: crate::state::state_precondition_message(
@@ -213,36 +221,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and for the router network interface a router record ingests on
         // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`),
         // and the bridge is left exactly as it was.
-        if let Some(detail) = store.bridge_gateway_source_rejection(&input.bridge_arn) {
-            return Err(DeleteBridgeErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: crate::state::bad_request_message(&detail),
-                },
-            )
-            .into());
+        if !retired {
+            if let Some(detail) = store.bridge_gateway_source_rejection(&input.bridge_arn) {
+                return Err(DeleteBridgeErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::bad_request_message(&detail),
+                    },
+                )
+                .into());
+            }
         }
 
-        // The record is dropped rather than retired: `DeleteBridgeResponse` reports only
-        // the ARN of the deleted bridge — unlike a gateway, whose terminal `DELETED` state
-        // keeps it readable — so nothing in the model asks a deleted bridge to stay
-        // describable, and the ARN this answer carries is the one of the record removed.
-        let Some(deleted) = store.bridges.remove(&input.bridge_arn) else {
+        // The bridge is RETIRED rather than evicted: `BridgeState` carries the terminal
+        // `DELETED` value (see `crate::state::BRIDGE_STATE_DELETED`), which is the model's
+        // own statement that a deleted bridge stays a readable resource, so the record is
+        // moved into that state and KEPT — exactly as DeleteGateway settles a gateway — and
+        // the ARN this answer carries is the one of the record it retired. The delete is
+        // admitted only for a bridge that is already STOPPED, so nothing is still being torn
+        // down and the terminal state is reached at once; a state change the clock still
+        // owed is superseded by it. A bridge already retired keeps the state it has, so a
+        // repeat of this `@idempotent` call answers the same ARN rather than failing.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
             return Err(DeleteBridgeErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
-                    message: "the bridge could not be removed after it was read".to_string(),
+                    message: "the bridge disappeared between the read and the retirement"
+                        .to_string(),
                 },
             )
             .into());
         };
+        if !retired {
+            bridge.deleted_at = Some(now);
+            bridge.bridge_state = crate::state::BRIDGE_STATE_DELETED.to_string();
+            bridge.pending = None;
+        }
 
-        // The outputs the deleted bridge's flow sources asked for on their cloud flows go
-        // with the bridge: nothing records why they exist once it is gone, so the one
+        // The outputs the retired bridge's flow sources asked for on their cloud flows go
+        // with the bridge: a bridge the account has given up asks for nothing, so the one
         // reconciliation every path that writes a bridge source runs drops them (see
         // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
         store.sync_bridge_source_flow_outputs(&region, now);
 
+        // The retired records the store keeps are bounded: see
+        // `crate::state::MAX_RETIRED_BRIDGES`.
+        store.evict_oldest_retired_bridges();
+
         Ok(DeleteBridgeOutput {
-            bridge_arn: Some(deleted.bridge_arn),
+            bridge_arn: Some(bridge_arn),
         })
     }
 }

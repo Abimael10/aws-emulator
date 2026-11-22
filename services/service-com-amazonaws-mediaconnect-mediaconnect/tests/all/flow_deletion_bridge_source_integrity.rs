@@ -174,6 +174,12 @@ async fn created_bridge(
 /// The reference is read through the crate's own reading of that relation
 /// ([`mc::ComAmazonawsMediaconnectMediaconnectState::holds_flow`]), the same one every write
 /// path resolves a flow reference through, so this sees exactly what the service resolves.
+///
+/// Only a LIVE bridge is walked ([`mc::ComAmazonawsMediaconnectMediaconnectState::live_bridge`]):
+/// a bridge whose delete has been accepted is retired and keeps the configuration it was
+/// left with so it stays readable in its terminal `DELETED` state, and no request writes to
+/// it any more — the invariant is about the references a request could still be refused or
+/// served against.
 fn dangling_bridge_flow_references(emulator: &Emulator) -> Vec<(String, String)> {
     let store = emulator
         .engine
@@ -181,6 +187,9 @@ fn dangling_bridge_flow_references(emulator: &Emulator) -> Vec<(String, String)>
     let store = store.lock();
     let mut dangling = Vec::new();
     for (bridge_arn, bridge) in store.bridges.iter() {
+        if store.live_bridge(bridge_arn).is_none() {
+            continue;
+        }
         for source in &bridge.sources {
             if let Some(flow_source) = source.flow_source.as_ref() {
                 if !store.holds_flow(&flow_source.flow_arn) {

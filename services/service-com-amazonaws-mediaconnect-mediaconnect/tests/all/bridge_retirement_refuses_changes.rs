@@ -6,10 +6,13 @@
 //! The rule under test: a bridge whose move to the `DELETED` member of `DesiredState` has
 //! been accepted is RETIRED — it reports `DELETING` until the clock settles it in the
 //! terminal `DELETED`, and from that instant no request may write to it any more, because
-//! the deletion it is settling into is irreversible. Every such request is refused with
-//! `ConflictException` (HTTP 409) and the stored bridge is left byte for byte as it was. A
-//! bridge in any other state of the modelled `BridgeState` enum is live and takes the same
-//! request.
+//! the deletion it is settling into is irreversible. Every such request is refused and the
+//! stored bridge is left byte for byte as it was. A bridge in any other state of the
+//! modelled `BridgeState` enum is live and takes the same request — except UpdateBridge,
+//! which states a precondition of its OWN on the bridge's state (it changes a bridge's
+//! settings only while the bridge waits in `STANDBY`) and so is refused `BadRequestException`
+//! (HTTP 400) with MediaConnect's fixed text for that precondition in every other state,
+//! retired or not. Every other write is refused with `ConflictException` (HTTP 409).
 //!
 //! The rows below vary what that rule generalises over:
 //!
@@ -28,21 +31,27 @@
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine), so every
 //! case here drives the same request path a MediaConnect client reaches.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::BRIDGE_STATE_VALUES;
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
-use crate::bridge_members_and_deletion::force_bridge_state;
+use crate::bridge_members_and_deletion::{force_bridge_state, poll_until_bridge_state};
 use crate::flow_lifecycle::Emulator;
 
-/// Long enough for the clock to have made a transition due: the span the service holds a
-/// bridge in a transient state (`mc::TRANSITION_SPAN`) plus slack for a slow runner.
-fn settle_span() -> Duration {
-    mc::TRANSITION_SPAN + Duration::from_millis(400)
+/// The refusal MediaConnect answers an update of a bridge that is not in `STANDBY` with:
+/// the whole `BadRequestException$Message`, read through the crate's own constants so the
+/// test and the service state one text.
+fn standby_refusal() -> String {
+    mc::validation_failed_message(mc::BRIDGE_UPDATE_STANDBY_DETAIL)
+}
+
+/// Whether `change` is refused unless the bridge waits in `STANDBY` — UpdateBridge's own
+/// precondition, which the other writes to a bridge do not state. UpdateBridge is the one
+/// row that addresses the bridge ITSELF, so it is the one with no path suffix.
+fn is_standby_gated(change: &Change) -> bool {
+    change.suffix.is_empty()
 }
 
 /// Every value of the modelled `BridgeState` enum (the catalog is `BRIDGE_STATE_VALUES`,
@@ -218,7 +227,8 @@ async fn bridge_of(emulator: &Emulator, case: &str, arn: &str) -> Value {
 }
 
 /// Every request that writes to a bridge is refused exactly while that bridge is retired,
-/// and a refused request leaves the stored bridge byte for byte as it was.
+/// and a refused request leaves the stored bridge byte for byte as it was. UpdateBridge is
+/// refused in every state but `STANDBY`, which is the precondition it states for itself.
 #[tokio::test]
 async fn a_retired_bridge_refuses_every_change() {
     let emulator = Emulator::new();
@@ -239,7 +249,20 @@ async fn a_retired_bridge_refuses_every_change() {
             let before = bridge_of(&emulator, &case, &arn).await;
 
             let (status, code, answered) = send_change(&emulator, &arn, change).await;
-            if retired {
+            let standby_gated =
+                is_standby_gated(change) && bridge_state != mc::BRIDGE_STATE_STANDBY;
+            if standby_gated {
+                // UpdateBridge's own precondition answers first, in every state but the one
+                // it requires: one status, one code and one fixed message, whether or not
+                // the bridge is also on its way out.
+                assert_eq!(
+                    (status, code.as_deref(), answered["message"].as_str()),
+                    (400, Some("BadRequestException"), Some(standby_refusal().as_str())),
+                    "case {case:?}: an update of a bridge that is not in STANDBY expects 400 \
+                     BadRequestException with MediaConnect's fixed text, got {status} \
+                     {code:?}: {answered}"
+                );
+            } else if retired {
                 assert_eq!(
                     (status, code.as_deref()),
                     (409, Some("ConflictException")),
@@ -252,18 +275,20 @@ async fn a_retired_bridge_refuses_every_change() {
                     "case {case:?}: the refusal names the bridge and the state it is in, \
                      got {answered}"
                 );
-                let after = bridge_of(&emulator, &case, &arn).await;
-                assert_eq!(
-                    after, before,
-                    "case {case:?}: a refused change leaves the bridge byte for byte as it \
-                     was, got {after}"
-                );
             } else {
                 assert_eq!(
                     (status, code.as_deref()),
                     (202, None),
                     "case {case:?}: a live bridge takes the same change, got {status} \
                      {code:?}: {answered}"
+                );
+            }
+            if standby_gated || retired {
+                let after = bridge_of(&emulator, &case, &arn).await;
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: a refused change leaves the bridge byte for byte as it \
+                     was, got {after}"
                 );
             }
         }
@@ -283,7 +308,13 @@ async fn accepting_a_bridge_deletion_refuses_every_later_change() {
 
     // The bridge the create left in a transient state settles into the one a created bridge
     // waits in, and that live bridge takes a change.
-    tokio::time::sleep(settle_span()).await;
+    poll_until_bridge_state(
+        &emulator,
+        "a created bridge settles",
+        &arn,
+        mc::BRIDGE_STATE_STANDBY,
+    )
+    .await;
     let (status, code, updated) = emulator
         .send(
             "PUT",
@@ -322,31 +353,46 @@ async fn accepting_a_bridge_deletion_refuses_every_later_change() {
     // Twice over: while the deletion is in flight, and once the clock has settled the
     // terminal state.
     for expected_state in [mc::BRIDGE_STATE_DELETING, mc::BRIDGE_STATE_DELETED] {
-        for change in changes(&flow_arn) {
-            let case = format!("{expected_state} / {}", change.case);
-            let (status, code, answered) = send_change(&emulator, &arn, &change).await;
-            assert_eq!(
-                (status, code.as_deref()),
-                (409, Some("ConflictException")),
-                "case {case:?}: a change to a bridge on its way out expects 409 \
-                 ConflictException, got {status} {code:?}: {answered}"
-            );
-        }
-
-        let described = bridge_of(&emulator, expected_state, &arn).await;
-        assert_eq!(
-            described["bridgeState"].as_str(),
-            Some(expected_state),
-            "case {expected_state:?}: the bridge is readable in the state it is in, got \
-             {described}"
-        );
+        let described = poll_until_bridge_state(&emulator, expected_state, &arn, expected_state)
+            .await;
         for member in ["egressGatewayBridge", "sourceFailoverConfig", "sources", "outputs"] {
             assert_eq!(
                 described[member], configured[member],
-                "case {expected_state:?}: the refused changes left {member} as it was \
+                "case {expected_state:?}: the bridge is readable with {member} as it was \
                  stored, got {described}"
             );
         }
-        tokio::time::sleep(settle_span()).await;
+
+        for change in changes(&flow_arn) {
+            let case = format!("{expected_state} / {}", change.case);
+            let (status, code, answered) = send_change(&emulator, &arn, &change).await;
+            if is_standby_gated(&change) {
+                assert_eq!(
+                    (status, code.as_deref(), answered["message"].as_str()),
+                    (400, Some("BadRequestException"), Some(standby_refusal().as_str())),
+                    "case {case:?}: an update of a bridge on its way out expects 400 \
+                     BadRequestException with MediaConnect's fixed text, got {status} \
+                     {code:?}: {answered}"
+                );
+            } else {
+                assert_eq!(
+                    (status, code.as_deref()),
+                    (409, Some("ConflictException")),
+                    "case {case:?}: a change to a bridge on its way out expects 409 \
+                     ConflictException, got {status} {code:?}: {answered}"
+                );
+            }
+        }
+
+        // Nothing the refusals touched moved, and the bridge is still reported in the state
+        // it is in.
+        let after = bridge_of(&emulator, expected_state, &arn).await;
+        for member in ["egressGatewayBridge", "sourceFailoverConfig", "sources", "outputs"] {
+            assert_eq!(
+                after[member], configured[member],
+                "case {expected_state:?}: the refused changes left {member} as it was \
+                 stored, got {after}"
+            );
+        }
     }
 }

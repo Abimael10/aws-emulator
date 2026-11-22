@@ -833,3 +833,164 @@ async fn sources_added_then_removed_leave_the_flow_consistent() {
         "case {case:?}: the flow holds both sources"
     );
 }
+
+/// MediaConnect's message for the last-source refusal, as the service words it: the
+/// `Validation failed:` envelope, a newline, then the sentences that state the rule.
+///
+/// Written out HERE rather than read from the crate, because the point of the rule is the
+/// TEXT a client matches: a message the service reworded would still agree with its own
+/// constant.
+const LAST_SOURCE_REFUSAL: &str = "Validation failed:\n\
+     Your request removes the only source that is assigned to this flow. Each flow must \
+     have at least one source. Review the existing source and make changes as needed. Your \
+     request removes all sources that are assigned to this flow.";
+
+/// One flow a last-source removal is attempted on: how it came to hold exactly one source,
+/// and what that source is.
+struct LastSourceCase {
+    case: &'static str,
+    name: &'static str,
+    /// The sources the flow is created with, under source failover ACTIVE so a second one
+    /// can be added.
+    initial: Value,
+    /// Whether the extra sources are removed first, so the flow is down to its first source
+    /// when the refused call arrives.
+    remove_the_rest: bool,
+}
+
+/// The rows span what the rule generalises over: how many sources the flow was created
+/// with and how it got down to one, what the remaining source is named, and which protocol
+/// and ingest form it uses. The message is FIXED text for this error class, so none of that
+/// may change it.
+fn last_source_cases() -> Vec<LastSourceCase> {
+    vec![
+        LastSourceCase {
+            case: "a flow created with its one named rtp source",
+            name: "flow-last-source-rtp",
+            initial: json!([{ "name": "source1", "protocol": "rtp", "whitelistCidr": "203.0.113.0/24" }]),
+            remove_the_rest: false,
+        },
+        LastSourceCase {
+            case: "a flow created with one unnamed source, so the service named it",
+            name: "flow-last-source-generated",
+            initial: json!([{ "protocol": "udp" }]),
+            remove_the_rest: false,
+        },
+        LastSourceCase {
+            case: "a flow created with one zixi-push source",
+            name: "flow-last-source-zixi",
+            initial: json!([{
+                "name": "ingest-a",
+                "protocol": "zixi-push",
+                "whitelistCidr": "198.51.100.0/24",
+                "maxBitrate": 80_000_000,
+            }]),
+            remove_the_rest: false,
+        },
+        LastSourceCase {
+            case: "a flow taken down to one source by an earlier remove",
+            name: "flow-last-source-after-remove",
+            initial: json!([
+                { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" },
+                { "name": "secondary", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16" },
+            ]),
+            remove_the_rest: true,
+        },
+    ]
+}
+
+/// Removing the only source a flow has is refused with MediaConnect's FIXED text for that
+/// error class: the same message for every flow and every source, carrying no ARN, no
+/// source name and nothing else taken from the request — and the flow keeps its source, so
+/// the identical call is served once a second source exists.
+#[tokio::test]
+async fn the_last_source_refusal_is_one_fixed_message_for_every_flow() {
+    let emulator = Emulator::new();
+
+    for LastSourceCase {
+        case,
+        name,
+        initial,
+        remove_the_rest,
+    } in last_source_cases()
+    {
+        let flow_arn = create_flow_with_sources_and_failover(
+            &emulator,
+            case,
+            name,
+            initial,
+            // Failover ACTIVE for every row: "if the state is active, the flow can have one
+            // or two sources" (`FailoverConfig$State`), which is what lets each row add the
+            // second source its last step needs.
+            Some(failover_active()),
+        )
+        .await;
+        let mut sources = described_sources(&emulator, case, &flow_arn).await;
+        if remove_the_rest {
+            for extra in sources.iter().skip(1) {
+                let arn = extra["sourceArn"].as_str().unwrap_or_default();
+                let (status, code, removed) =
+                    remove_flow_source(&emulator, &flow_arn, arn).await;
+                assert_eq!(
+                    (status, code.as_deref()),
+                    (202, None),
+                    "case {case:?}: taking the flow down to one source expected 202, got \
+                     {status} {code:?}: {removed}"
+                );
+            }
+            sources = described_sources(&emulator, case, &flow_arn).await;
+        }
+        assert_eq!(
+            sources.len(),
+            1,
+            "case {case:?}: the flow under test holds exactly one source, got {sources:?}"
+        );
+        let only = sources[0]["sourceArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let source_name = sources[0]["name"].as_str().unwrap_or_default().to_string();
+
+        let (status, code, refused) = remove_flow_source(&emulator, &flow_arn, &only).await;
+        assert_eq!(
+            (status, code.as_deref(), refused["message"].as_str()),
+            (400, Some("BadRequestException"), Some(LAST_SOURCE_REFUSAL)),
+            "case {case:?}: expected 400 BadRequestException with MediaConnect's fixed text, \
+             got {status} {code:?}: {refused}"
+        );
+        let message = refused["message"].as_str().unwrap_or_default();
+        for interpolated in [flow_arn.as_str(), only.as_str(), source_name.as_str()] {
+            assert!(
+                !message.contains(interpolated),
+                "case {case:?}: the message states the rule and interpolates nothing, but it \
+                 carries {interpolated:?}: {message:?}"
+            );
+        }
+
+        // Nothing was removed, and the rule is about the COUNT: with a second source the
+        // identical call is served.
+        let after = described_sources(&emulator, case, &flow_arn).await;
+        assert_eq!(
+            after, sources,
+            "case {case:?}: a refused remove drops nothing, got {after:?}"
+        );
+        let (status, code, added) = add_flow_sources(
+            &emulator,
+            &flow_arn,
+            json!([{ "name": "spare", "protocol": "rtp", "whitelistCidr": "10.9.0.0/16" }]),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (201, None),
+            "case {case:?}: the spare source must be added, got {status} {code:?}: {added}"
+        );
+        let (status, code, served) = remove_flow_source(&emulator, &flow_arn, &only).await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (202, None),
+            "case {case:?}: the identical call is served once a second source exists, got \
+             {status} {code:?}: {served}"
+        );
+    }
+}

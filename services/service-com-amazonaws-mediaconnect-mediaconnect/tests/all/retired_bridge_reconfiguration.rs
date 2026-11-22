@@ -7,7 +7,7 @@
 //! REFUSES; this suite pins the limit of that refusal, which is the other half of the same
 //! rule: the record is kept readable rather than evicted, so the reporting operations keep
 //! answering for it with the configuration it was left with, and DeleteBridge — which
-//! removes the RECORD rather than changing it — still takes it. A refusal that spread to
+//! retires the record rather than changing it — still takes it. A refusal that spread to
 //! these calls would make a retired bridge unobservable and undeletable, which is what this
 //! suite fails on.
 //!
@@ -170,9 +170,9 @@ async fn a_retired_bridge_is_still_reported_in_the_state_it_is_in() {
     }
 }
 
-/// DeleteBridge removes the RECORD rather than changing it, so a retired bridge still takes
-/// it — from either state a retirement reaches — and afterwards it is no longer a resource
-/// at all.
+/// DeleteBridge retires the record rather than changing it, so a retired bridge still takes
+/// it — from either state a retirement reaches — and afterwards the record is still
+/// reported, in the terminal `DELETED` state the delete settles it in.
 #[tokio::test]
 async fn a_retired_bridge_is_still_deletable() {
     let emulator = Emulator::new();
@@ -204,19 +204,23 @@ async fn a_retired_bridge_is_still_deletable() {
         assert_eq!(
             deleted["bridgeArn"].as_str(),
             Some(arn.as_str()),
-            "case {bridge_state:?}: the answer names the record that was removed, got {deleted}"
+            "case {bridge_state:?}: the answer names the record that was retired, got {deleted}"
         );
 
-        let (status, code, gone) = describe_bridge(&emulator, &arn).await;
+        let (status, code, described) = describe_bridge(&emulator, &arn).await;
         assert_eq!(
-            (status, code.as_deref()),
-            (404, Some("NotFoundException")),
-            "case {bridge_state:?}: the removed record is gone, got {status} {code:?}: {gone}"
+            (status, code.as_deref(), described["bridge"]["bridgeState"].as_str()),
+            (200, None, Some(mc::BRIDGE_STATE_DELETED)),
+            "case {bridge_state:?}: the retired record stays readable in DELETED, got \
+             {status} {code:?}: {described}"
         );
         assert_eq!(
-            listed_bridge(&emulator, bridge_state, &arn).await,
-            None,
-            "case {bridge_state:?}: the listing no longer holds the removed record"
+            listed_bridge(&emulator, bridge_state, &arn)
+                .await
+                .as_ref()
+                .and_then(|summary| summary["bridgeState"].as_str()),
+            Some(mc::BRIDGE_STATE_DELETED),
+            "case {bridge_state:?}: the listing still holds the retired record, in DELETED"
         );
     }
 }

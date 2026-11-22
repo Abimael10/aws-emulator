@@ -16,8 +16,9 @@
 //!   refusal is byte for byte the one it reported before;
 //! * ListBridges reports every stored bridge exactly once, in ARN order, as the summary of
 //!   the stored record, optionally restricted to one placement;
-//! * DeleteBridge removes the bridge — DescribeBridge stops answering for it — and refuses
-//!   a bridge that has not been stopped.
+//! * DeleteBridge RETIRES the bridge — DescribeBridge keeps answering for it in the
+//!   terminal `DELETED` state, and a repeat of the delete answers the same ARN — and
+//!   refuses a bridge that has not been stopped.
 //!
 //! Each table's rows differ along what the rule generalises over: the KIND of member (a
 //! source of the kind the bridge's direction admits, a network output), how MANY one
@@ -28,6 +29,8 @@
 //!
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine), so every
 //! case drives the same request path a MediaConnect client reaches.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -156,6 +159,40 @@ async fn bridge_with(
         body["outputs"] = json!(outputs);
     }
     let (status, code, created) = create_bridge(emulator, body).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "fixture {name:?}: create expected 201, got {status} {code:?}: {created}"
+    );
+    created["bridge"]["bridgeArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture {name:?}: the create answers an ARN: {created}"))
+        .to_string()
+}
+
+/// Create one ground-to-cloud (ingress) bridge carrying `sources`, and answer its ARN.
+///
+/// The direction decides which bridge-type wrapper the create names and which KIND of
+/// source the bridge ingests ("a network source originates at your premises"), so the
+/// retirement table below covers both directions through this and [`bridge_with`]. A
+/// ground-to-cloud bridge takes no output in a request: the outputs it carries are the ones
+/// the cloud flows that name it ask for.
+async fn ingress_bridge_with(
+    emulator: &Emulator,
+    name: &str,
+    placement_arn: &str,
+    sources: Vec<Value>,
+) -> String {
+    let (status, code, created) = create_bridge(
+        emulator,
+        json!({
+            "name": name,
+            "placementArn": placement_arn,
+            "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 2 },
+            "sources": sources,
+        }),
+    )
+    .await;
     assert_eq!(
         (status, code.as_deref()),
         (201, None),
@@ -877,10 +914,11 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
     }
 }
 
-/// DeleteBridge removes the bridge: its ARN is answered, DescribeBridge stops reporting
-/// it, ListBridges stops listing it, and a second delete of the same ARN resolves nothing.
+/// DeleteBridge retires the bridge: its ARN is answered, DescribeBridge keeps reporting it
+/// in the terminal `DELETED` state, ListBridges keeps listing it there, and a second delete
+/// of the same ARN answers the same ARN again (`@idempotent`).
 #[tokio::test]
-async fn delete_bridge_removes_the_bridge_from_the_store() {
+async fn delete_bridge_retires_the_bridge_in_the_store() {
     let emulator = Emulator::new();
     let placement = gateway_with_networks(&emulator, "gw-delete", &["net-1"]).await;
     let flow_arn = cloud_flow(&emulator, "flow-delete").await;
@@ -905,26 +943,44 @@ async fn delete_bridge_removes_the_bridge_from_the_store() {
         "the delete answers the ARN of the bridge it deleted, got {deleted}"
     );
 
-    let (status, code, described) = describe_bridge(&emulator, &arn).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (404, Some("NotFoundException")),
-        "a deleted bridge is no longer described, got {status} {code:?}: {described}"
-    );
+    // Read twice: the terminal state is where the record stays, so a second read repeats it
+    // rather than moving it on.
+    for read in ["first read", "second read"] {
+        let (status, code, described) = describe_bridge(&emulator, &arn).await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (200, None),
+            "case {read:?}: a deleted bridge is still described, got {status} {code:?}: \
+             {described}"
+        );
+        assert_eq!(
+            described["bridge"]["bridgeState"].as_str(),
+            Some(mc::BRIDGE_STATE_DELETED),
+            "case {read:?}: the deleted bridge reports the terminal DELETED state, got \
+             {described}"
+        );
+    }
 
     let (status, _, listed) = list_bridges(&emulator, "").await;
     assert_eq!(status, 200, "a listing expects 200, got {listed}");
     assert_eq!(
         listed["bridges"],
-        json!([]),
-        "a deleted bridge is no longer listed, got {listed}"
+        json!([{
+            "bridgeArn": arn,
+            "bridgeState": mc::BRIDGE_STATE_DELETED,
+            "bridgeType": mc::BRIDGE_TYPE_EGRESS,
+            "name": "bridge-delete",
+            "placementArn": placement,
+        }]),
+        "a deleted bridge is still listed, in the state it is in, got {listed}"
     );
 
     let (status, code, repeated) = delete_bridge(&emulator, &arn).await;
     assert_eq!(
-        (status, code.as_deref()),
-        (404, Some("NotFoundException")),
-        "deleting the same bridge twice expected 404, got {status} {code:?}: {repeated}"
+        (status, code.as_deref(), repeated["bridgeArn"].as_str()),
+        (200, None, Some(arn.as_str())),
+        "deleting the same bridge twice answers the same ARN, got {status} {code:?}: \
+         {repeated}"
     );
 }
 
@@ -1002,10 +1058,10 @@ async fn deleting_a_bridge_that_was_not_stopped_is_refused() {
             );
             let (status, code, described) = describe_bridge(&emulator, &arn).await;
             assert_eq!(
-                (status, code.as_deref()),
-                (404, Some("NotFoundException")),
-                "case {bridge_state:?}: the deleted bridge is gone, got {status} {code:?}: \
-                 {described}"
+                (status, code.as_deref(), described["bridge"]["bridgeState"].as_str()),
+                (200, None, Some(mc::BRIDGE_STATE_DELETED)),
+                "case {bridge_state:?}: the deleted bridge stays readable in the terminal \
+                 DELETED state, got {status} {code:?}: {described}"
             );
         } else {
             assert_eq!(
@@ -1086,4 +1142,308 @@ async fn a_gateway_a_bridge_is_placed_on_is_deleted_only_after_the_bridge() {
         (200, None),
         "with its bridge deleted the gateway is deletable, got {status} {code:?}: {deleted}"
     );
+}
+
+/// How long a case waits for a state change the clock owes before it gives up.
+///
+/// Generous on purpose: the wait is for the CONDITION (see [`poll_until_bridge_state`]) and
+/// not for a span of time, so this only bounds a loop that would otherwise never end — the
+/// change itself is due one `mc::TRANSITION_SPAN` after the call that started it. The value
+/// is the one the flow suites already wait with (`crate::flow_source_metadata::POLL_DEADLINE`),
+/// so a heavily loaded runner, where a single request can take seconds, still reaches the
+/// condition rather than this ceiling.
+const STATE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long one poll of [`poll_until_bridge_state`] waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll DescribeBridge for the bridge `arn` until it reports `expected`, and answer the
+/// `Bridge` it reported then.
+///
+/// The move is one the CLOCK owes (`mc::TRANSITION_SPAN`), so the wait is for the state to
+/// be reported rather than for a span of time to pass: a slower runner polls more often, not
+/// a different test.
+///
+/// `pub(crate)` because every bridge suite that drives a bridge through a state change needs
+/// this same wait (`crate::bridge_retirement_refuses_changes`,
+/// `crate::update_bridge_state`), so the polling policy lives in ONE place rather than one
+/// copy per suite.
+pub(crate) async fn poll_until_bridge_state(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+    expected: &str,
+) -> Value {
+    let deadline = Instant::now() + STATE_DEADLINE;
+    loop {
+        let bridge = bridge_of(emulator, case, arn).await;
+        if bridge["bridgeState"].as_str() == Some(expected) {
+            return bridge;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the bridge never reached {expected}, got {bridge}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The bridge's `Sources` as a read reports them, with the ARN of the flow output a flow
+/// source was given dropped from each entry.
+///
+/// That output is the service's own record of the cloud flow this bridge source feeds, and
+/// it exists exactly while the bridge asks for it — so it is the one thing a retirement
+/// clears, and comparing a record before and after a retirement compares everything else.
+fn sources_without_output_arn(bridge: &Value) -> Vec<Value> {
+    bridge["sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut source| {
+            if let Some(flow_source) = source["flowSource"].as_object_mut() {
+                flow_source.remove("outputArn");
+            }
+            source
+        })
+        .collect()
+}
+
+/// MediaConnect's message for an update of a bridge that is not in `STANDBY`, as the
+/// service words it: the `Validation failed:` envelope, a newline, then the sentence that
+/// states the precondition.
+///
+/// Written out HERE rather than read from the crate, because the point of the rule is the
+/// TEXT a client matches: a message the service reworded would still agree with its own
+/// constant.
+const UPDATE_REFUSAL: &str =
+    "Validation failed:\nYou cannot update a bridge unless it is in STANDBY.";
+
+/// One bridge a delete is attempted on: the direction it was created in, what it holds, the
+/// state it is in when the delete arrives, and the update a client sends afterwards.
+struct RetirementCase {
+    case: &'static str,
+    /// `true` for a cloud-to-ground (egress) bridge, which ingests cloud flows and delivers
+    /// to the premises network; `false` for a ground-to-cloud (ingress) one.
+    egress: bool,
+    /// Whether the bridge is created holding an output.
+    with_output: bool,
+    /// The state the bridge is put in before the delete, or `None` to delete the bridge in
+    /// the transient state the create left it in.
+    forced_state: Option<&'static str>,
+    /// Whether the case waits for the create to settle before it deletes.
+    settle_first: bool,
+}
+
+/// The rows span what the retirement rule generalises over: the KIND of bridge (each
+/// direction, so each bridge-type wrapper and each kind of source), whether the bridge
+/// holds an output at all, and the STOPPED state the bridge is in when the delete arrives —
+/// the transient one a create leaves it in, the one a created bridge settles into, and a
+/// state the store holds it in after a start that never took effect.
+fn retirement_cases() -> Vec<RetirementCase> {
+    vec![
+        RetirementCase {
+            case: "an egress bridge deleted while it is still being created",
+            egress: true,
+            with_output: true,
+            forced_state: None,
+            settle_first: false,
+        },
+        RetirementCase {
+            case: "an egress bridge deleted once it waits in STANDBY",
+            egress: true,
+            with_output: false,
+            forced_state: None,
+            settle_first: true,
+        },
+        RetirementCase {
+            case: "an ingress bridge deleted once it waits in STANDBY",
+            egress: false,
+            with_output: false,
+            forced_state: None,
+            settle_first: true,
+        },
+        RetirementCase {
+            case: "an ingress bridge deleted out of START_FAILED",
+            egress: false,
+            with_output: false,
+            forced_state: Some(mc::BRIDGE_STATE_START_FAILED),
+            settle_first: true,
+        },
+    ]
+}
+
+/// DeleteBridge RETIRES the bridge rather than erasing it: the record stays readable in the
+/// terminal `DELETED` state, that state does not revert across repeated reads, the delete
+/// repeats idempotently — and the bridge is nevertheless unusable, so the very update that
+/// a waiting bridge takes is refused with MediaConnect's fixed text for that precondition.
+#[tokio::test]
+async fn a_deleted_bridge_is_retired_in_deleted_and_takes_no_update() {
+    let emulator = Emulator::new();
+    let placement = gateway_with_networks(&emulator, "gw-retire", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-retire").await;
+
+    for (index, RetirementCase {
+        case,
+        egress,
+        with_output,
+        forced_state,
+        settle_first,
+    }) in retirement_cases().into_iter().enumerate()
+    {
+        let name = format!("bridge-retire-{index}");
+        let update = if egress {
+            json!({ "egressGatewayBridge": { "maxBitrate": 30_000_000 } })
+        } else {
+            json!({ "ingressGatewayBridge": { "maxBitrate": 30_000_000, "maxOutputs": 2 } })
+        };
+        let arn = if egress {
+            bridge_with(
+                &emulator,
+                &name,
+                &placement,
+                vec![flow_source("src", &flow_arn)],
+                if with_output {
+                    vec![network_output("out", 6500, "udp", 32)]
+                } else {
+                    Vec::new()
+                },
+            )
+            .await
+        } else {
+            ingress_bridge_with(
+                &emulator,
+                &name,
+                &placement,
+                vec![network_source("src", 6600, "udp")],
+            )
+            .await
+        };
+        if settle_first {
+            poll_until_bridge_state(&emulator, case, &arn, mc::BRIDGE_STATE_STANDBY).await;
+            // The state the create settles into is the one an update is served in, so the
+            // same request is accepted here and refused once the bridge is deleted.
+            let (status, code, updated) = emulator
+                .send("PUT", &format!("/v1/bridges/{arn}"), Some(update.clone()))
+                .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: a waiting bridge takes the update, got {status} {code:?}: \
+                 {updated}"
+            );
+        }
+        if let Some(bridge_state) = forced_state {
+            force_bridge_state(&emulator, &arn, bridge_state);
+        }
+        let configured = bridge_of(&emulator, case, &arn).await;
+
+        let (status, code, deleted) = delete_bridge(&emulator, &arn).await;
+        assert_eq!(
+            (status, code.as_deref(), deleted["bridgeArn"].as_str()),
+            (200, None, Some(arn.as_str())),
+            "case {case:?}: the delete is served and answers the bridge's own ARN, got \
+             {status} {code:?}: {deleted}"
+        );
+
+        // Read twice: `DELETED` is terminal, so the second read repeats it rather than
+        // moving the bridge on or dropping the record.
+        for read in ["first read", "second read"] {
+            let (status, code, described) = describe_bridge(&emulator, &arn).await;
+            assert_eq!(
+                (status, code.as_deref(), described["bridge"]["bridgeState"].as_str()),
+                (200, None, Some(mc::BRIDGE_STATE_DELETED)),
+                "case {case:?} ({read}): a deleted bridge is reported in DELETED, got \
+                 {status} {code:?}: {described}"
+            );
+            for member in ["bridgeArn", "name", "placementArn", "outputs"] {
+                assert_eq!(
+                    described["bridge"][member], configured[member],
+                    "case {case:?} ({read}): the retirement moved no configuration, so \
+                     {member} is reported as it was stored, got {:?}",
+                    described["bridge"][member]
+                );
+            }
+            // The sources are reported as they were stored too, except for the one
+            // reference the retirement DOES clear: the flow output a bridge flow source
+            // asked for on its cloud flow goes with the bridge, so the source that asked
+            // for it carries no output ARN any more.
+            assert_eq!(
+                sources_without_output_arn(&described["bridge"]),
+                sources_without_output_arn(&configured),
+                "case {case:?} ({read}): the retirement moved no source configuration, got \
+                 {:?}",
+                described["bridge"]["sources"]
+            );
+            assert!(
+                described["bridge"]["sources"]
+                    .as_array()
+                    .unwrap_or(&Vec::new())
+                    .iter()
+                    .all(|source| source["flowSource"]["outputArn"].is_null()),
+                "case {case:?} ({read}): the flow output a retired bridge's source asked \
+                 for is gone, so no source names one, got {:?}",
+                described["bridge"]["sources"]
+            );
+        }
+
+        // The listing reports the retired record too, in the state it is in.
+        let (status, _, listed) = list_bridges(&emulator, "").await;
+        assert_eq!(status, 200, "case {case:?}: the listing expects 200, got {listed}");
+        let summary = listed["bridges"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .find(|summary| summary["bridgeArn"].as_str() == Some(arn.as_str()))
+            .cloned();
+        assert_eq!(
+            summary
+                .as_ref()
+                .and_then(|summary| summary["bridgeState"].as_str()),
+            Some(mc::BRIDGE_STATE_DELETED),
+            "case {case:?}: the listing still holds the retired bridge, in DELETED, got \
+             {listed}"
+        );
+
+        // Unusable all the same: the update a waiting bridge took is refused, with one
+        // fixed message, and nothing of the bridge moves.
+        let retired = bridge_of(&emulator, case, &arn).await;
+        let (status, code, refused) = emulator
+            .send("PUT", &format!("/v1/bridges/{arn}"), Some(update))
+            .await;
+        assert_eq!(
+            (status, code.as_deref(), refused["message"].as_str()),
+            (400, Some("BadRequestException"), Some(UPDATE_REFUSAL)),
+            "case {case:?}: updating a deleted bridge is refused with MediaConnect's fixed \
+             text, got {status} {code:?}: {refused}"
+        );
+        // The WHOLE record, so each row asserts the member its own update addressed: the
+        // state is terminal and nothing else moves, so a refused update leaves the bridge
+        // byte for byte as the retirement left it.
+        assert_eq!(
+            bridge_of(&emulator, case, &arn).await,
+            retired,
+            "case {case:?}: the refused update wrote nothing"
+        );
+
+        // The delete is `@idempotent`: a repeat answers the same ARN rather than a
+        // not-found or a second retirement.
+        let (status, code, repeated) = delete_bridge(&emulator, &arn).await;
+        assert_eq!(
+            (status, code.as_deref(), repeated["bridgeArn"].as_str()),
+            (200, None, Some(arn.as_str())),
+            "case {case:?}: a repeated delete answers the same ARN, got {status} {code:?}: \
+             {repeated}"
+        );
+
+        // And the record is no longer a bridge of the account: every path that resolves a
+        // bridge REFERENCE reads the store's own `holds_bridge`, which no longer does.
+        let store = emulator
+            .engine
+            .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
+        assert!(
+            !store.lock().holds_bridge(&arn),
+            "case {case:?}: a deleted bridge is no longer a bridge a reference resolves to"
+        );
+    }
 }

@@ -214,15 +214,17 @@ pub const BRIDGE_STATE_UPDATING: &str = "UPDATING";
 /// UpdateBridgeState asks it to reach [`BRIDGE_STATE_DELETED`]; the clock settles it into
 /// that state one [`TRANSITION_SPAN`] later.
 pub const BRIDGE_STATE_DELETING: &str = "DELETING";
-/// See [`BRIDGE_STATE_CREATING`]. The TERMINAL state of a bridge asked to reach the
-/// `DELETED` member of `DesiredState`: its presence in the `BridgeState` enum is the
-/// model's own statement that such a bridge stays a readable resource, exactly as
-/// [`GATEWAY_STATE_DELETED`] is for a gateway, so UpdateBridgeState retires the record in
-/// this state rather than evicting it. DeleteBridge is the other thing: it deletes the
-/// RESOURCE and its answer carries only the ARN of the record it removed, so it drops the
-/// record — and a bridge sitting in `DELETED` is stopped
-/// ([`is_stopped_bridge_state`]), so that delete is admitted whenever a caller wants the
-/// record gone.
+/// See [`BRIDGE_STATE_CREATING`]. The TERMINAL state of a deleted bridge: its presence in
+/// the `BridgeState` enum is the model's own statement that such a bridge stays a readable
+/// resource, exactly as [`GATEWAY_STATE_DELETED`] is for a gateway. BOTH ways a bridge is
+/// deleted settle in it and neither evicts the record: UpdateBridgeState asked for the
+/// `DELETED` member of `DesiredState` retires the bridge through [`BRIDGE_STATE_DELETING`],
+/// and DeleteBridge retires it at once (see [`StoredBridge::deleted_at`]), after which
+/// DescribeBridge keeps answering for the bridge in this state while every reference and
+/// count that reads "a bridge of this account" resolves it no more
+/// ([`ComAmazonawsMediaconnectMediaconnectState::live_bridge`]). A bridge sitting in
+/// `DELETED` is stopped ([`is_stopped_bridge_state`]), so a repeat of the `@idempotent`
+/// DeleteBridge is admitted and answers the same ARN.
 pub const BRIDGE_STATE_DELETED: &str = "DELETED";
 
 /// The pair of `BridgeState` values a bridge passes through to reach the `DesiredState`
@@ -287,7 +289,9 @@ pub fn is_bridge_retirement_state(bridge_state: &str) -> bool {
 /// ([`StoredBridge::settling_state`]), through this one function, with `ConflictException`
 /// (HTTP 409): the request "would cause a conflict with the current state of a service
 /// resource associated with the request". DeleteBridge is the one call a retired bridge
-/// still admits, because it removes the record rather than changing it.
+/// still admits, because it retires the record rather than changing it, and UpdateBridge is
+/// the one that states a precondition of its own on the bridge's state
+/// ([`bridge_update_precondition_refusal`]).
 pub fn retired_bridge_rejection(bridge: &StoredBridge) -> Option<String> {
     let retired = is_bridge_retirement_state(&bridge.bridge_state)
         || is_bridge_retirement_state(bridge.settling_state());
@@ -297,6 +301,38 @@ pub fn retired_bridge_rejection(bridge: &StoredBridge) -> Option<String> {
             bridge.bridge_arn, bridge.bridge_state
         )
     })
+}
+
+/// The detail MediaConnect words the refusal of an update to a bridge that is not
+/// [`BRIDGE_STATE_STANDBY`] with, under the validation envelope — fixed text for that error
+/// class, carrying no value from the request or from the store. See
+/// [`bridge_update_precondition_refusal`].
+pub const BRIDGE_UPDATE_STANDBY_DETAIL: &str =
+    "You cannot update a bridge unless it is in STANDBY.";
+
+/// Why UpdateBridge cannot change `bridge` — the whole `BadRequestException$Message` the
+/// request is refused with — or `None` while the bridge is in the state an update requires.
+///
+/// A bridge's settings are changed only while the bridge WAITS: [`BRIDGE_STATE_STANDBY`] is
+/// the state a created bridge settles in and a stopped one returns to, and it is read
+/// through [`StoredBridge::settling_state`] — the state the bridge has settled into or is
+/// settling into — so a bridge still being created, which is on its way to exactly that
+/// state, is updatable, and the same reading governs both halves of this rule as governs
+/// [`retired_bridge_rejection`]. A bridge that is running, moving to or from running, or on
+/// its way out to the terminal [`BRIDGE_STATE_DELETED`] is not waiting, and MediaConnect
+/// refuses the update with `BadRequestException` (HTTP 400) — the error the model describes
+/// as the one for "a semantic error" in the request — leaving the bridge exactly as it was.
+///
+/// The message is FIXED text for this error class ([`BRIDGE_UPDATE_STANDBY_DETAIL`]): it
+/// states the one state an update requires and interpolates nothing from the request or
+/// from the store, so a caller that matches MediaConnect's refusal text reads the same
+/// sentence whatever bridge it addressed and whatever state that bridge was in. It carries
+/// the service's validation envelope ([`validation_failed_message`]).
+pub fn bridge_update_precondition_refusal(bridge: &StoredBridge) -> Option<String> {
+    if bridge.settling_state() == BRIDGE_STATE_STANDBY {
+        return None;
+    }
+    Some(validation_failed_message(BRIDGE_UPDATE_STANDBY_DETAIL))
 }
 
 /// The `RouterInputState` enum the model declares for a router input
@@ -503,6 +539,20 @@ pub fn state_precondition_message(resource: &str, required_state: &str, operatio
     ))
 }
 
+/// The detail MediaConnect refuses the removal of a flow's ONLY source with, under the
+/// validation envelope ([`validation_failed_message`]): "this request can be made only if
+/// there is more than one source on the flow" (RemoveFlowSource), so a request that would
+/// leave the flow with none is refused `BadRequestException` (HTTP 400) and removes nothing.
+///
+/// FIXED text for that error class: every word of it is the service's, and it interpolates
+/// nothing from the request or from the store — no flow ARN, no source ARN and no source
+/// name — so a caller matching MediaConnect's refusal text reads the same sentence whatever
+/// flow and source it addressed.
+pub const LAST_FLOW_SOURCE_REMOVAL_DETAIL: &str =
+    "Your request removes the only source that is assigned to this flow. Each flow must \
+     have at least one source. Review the existing source and make changes as needed. Your \
+     request removes all sources that are assigned to this flow.";
+
 /// The ceiling on how many flows this store holds: the cap that bounds caller-driven
 /// growth of the flow map.
 ///
@@ -577,6 +627,18 @@ pub const MAX_GATEWAY_EGRESS_CIDR_BLOCKS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 /// (never on a read). The number is the emulator's own bound, not a published AWS
 /// default, and it is high enough that no ordinary workflow meets it.
 pub const MAX_BRIDGES: usize = 1_000;
+
+/// How many RETIRED (deleted) bridge records this store keeps beside its live ones.
+///
+/// A bridge delete is a soft delete, so a deleted bridge stays readable in
+/// [`BRIDGE_STATE_DELETED`] (see [`StoredBridge::deleted_at`]) — which, left unbounded,
+/// would let a create-then-delete loop grow the bridge map without limit. So the store
+/// retains the most recently deleted bridges up to this count and drops the oldest retired
+/// record past it, exactly as [`MAX_RETIRED_GATEWAYS`] bounds the retired gateways. The
+/// number is this emulator's own bound (AWS publishes no retention for a deleted bridge)
+/// and it is high enough that a client reading a delete it just made always finds its
+/// record.
+pub const MAX_RETIRED_BRIDGES: usize = MAX_BRIDGES;
 
 /// The ceiling on how many router inputs this store holds, for the same reason as
 /// [`MAX_GATEWAYS`]: nothing evicts a router input and GetRouterInput must still answer
@@ -2530,13 +2592,26 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         ))
     }
 
-    /// Whether the store holds the bridge `arn` — the bridge-level counterpart of
-    /// [`Self::holds_flow`]. A bridge leaves the store when DeleteBridge takes it out, so a
-    /// reference to a deleted bridge resolves nothing — which is why that removal is refused
-    /// while a stored flow source names the bridge
-    /// ([`Self::bridge_gateway_source_rejection`]).
+    /// Whether the store holds a LIVE bridge for `arn` — the bridge-level counterpart of
+    /// [`Self::holds_gateway`].
+    ///
+    /// A bridge whose delete has been accepted does not count: the record is retired
+    /// ([`StoredBridge::is_retired`]) and kept readable in the terminal
+    /// [`BRIDGE_STATE_DELETED`] state, so a record stored against it would name a bridge the
+    /// account has already given up — which is why that delete is refused while a stored
+    /// flow source names the bridge ([`Self::bridge_gateway_source_rejection`]).
     pub fn holds_bridge(&self, arn: &str) -> bool {
-        self.bridges.contains_key(arn)
+        self.live_bridge(arn).is_some()
+    }
+
+    /// The LIVE bridge `arn`, or `None` when the store holds no bridge for it or holds a
+    /// retired one. The crate's ONE reading of "a bridge of this account": every path that
+    /// resolves a bridge REFERENCE asks here, so they cannot disagree about which bridges
+    /// the account has — the bridge-level counterpart of [`Self::live_gateway`]. The
+    /// operations that address a bridge BY its own ARN resolve the record itself instead, so
+    /// a retired bridge stays readable and still answers its own delete.
+    pub fn live_bridge(&self, arn: &str) -> Option<&StoredBridge> {
+        self.bridges.get(arn).filter(|bridge| !bridge.is_retired())
     }
 
     /// Why `arn` names no gateway this account holds, or `None` when the store holds a live
@@ -2950,6 +3025,7 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     pub fn bridge_flow_source_count(&self, flow_arn: &str) -> usize {
         self.bridges
             .values()
+            .filter(|bridge| !bridge.is_retired())
             .filter(|bridge| {
                 bridge.sources.iter().any(|source| {
                     source
@@ -3042,7 +3118,7 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         if adding == 0 {
             return None;
         }
-        let bridge = self.bridges.get(bridge_arn)?;
+        let bridge = self.live_bridge(bridge_arn)?;
         let detail = bridge_output_count_rejection(
             bridge
                 .ingress_gateway_bridge
@@ -3100,14 +3176,17 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .flat_map(|flow| {
                 flow.sources.iter().filter_map(move |source| {
                     let bridge = source.gateway_bridge_source.as_ref()?;
-                    bridges.contains_key(&bridge.bridge_arn).then(|| {
-                        (
-                            bridge.bridge_arn.clone(),
-                            flow.flow_arn.clone(),
-                            source.source_arn.clone(),
-                            source.name.clone(),
-                        )
-                    })
+                    bridges
+                        .get(&bridge.bridge_arn)
+                        .is_some_and(|held| !held.is_retired())
+                        .then(|| {
+                            (
+                                bridge.bridge_arn.clone(),
+                                flow.flow_arn.clone(),
+                                source.source_arn.clone(),
+                                source.name.clone(),
+                            )
+                        })
                 })
             })
             .collect();
@@ -3215,6 +3294,7 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         let requested: Vec<(String, BridgeSourceOrigin)> = self
             .bridges
             .values()
+            .filter(|bridge| !bridge.is_retired())
             .flat_map(|bridge| {
                 let bridge_arn = bridge.bridge_arn.clone();
                 bridge.sources.iter().filter_map(move |source| {
@@ -3429,6 +3509,19 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .count()
     }
 
+    /// How many LIVE bridges the store holds — the count [`MAX_BRIDGES`] bounds, read the
+    /// same way as [`Self::live_gateway_count`].
+    ///
+    /// A retired (deleted) bridge stays in the map so it remains readable in its terminal
+    /// `DELETED` state, but it no longer occupies one of the account's bridge slots: the
+    /// ceiling counts the bridges that exist, so deleting one makes room for another.
+    pub fn live_bridge_count(&self) -> usize {
+        self.bridges
+            .values()
+            .filter(|bridge| !bridge.is_retired())
+            .count()
+    }
+
     /// Register an instance with the gateway `gateway_arn` names, and hand back the record
     /// as it is now STORED — read back out of the map after the insert, so the ARN a caller
     /// sees is the key the store holds.
@@ -3569,6 +3662,35 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         let excess = retired.len() - MAX_RETIRED_GATEWAYS;
         for (_, gateway_arn) in retired.into_iter().take(excess) {
             self.gateways.remove(&gateway_arn);
+        }
+    }
+
+    /// Drop the oldest retired bridge records once the store holds more than
+    /// [`MAX_RETIRED_BRIDGES`] of them, so a create-then-delete loop cannot grow the bridge
+    /// map without limit — the bridge counterpart of
+    /// [`Self::evict_oldest_retired_gateways`], and the same reading of "oldest".
+    ///
+    /// Called from DeleteBridge — the call that retires a record — and never from a read:
+    /// what a reporting operation reports is the record the store holds.
+    pub fn evict_oldest_retired_bridges(&mut self) {
+        let mut retired: Vec<(SystemTime, String)> = self
+            .bridges
+            .values()
+            .filter_map(|bridge| {
+                bridge
+                    .deleted_at
+                    .map(|deleted_at| (deleted_at, bridge.bridge_arn.clone()))
+            })
+            .collect();
+        if retired.len() <= MAX_RETIRED_BRIDGES {
+            return;
+        }
+        // Oldest first, so the records dropped are the ones retired longest ago; the ARN
+        // breaks a tie between two retired in the same instant.
+        retired.sort();
+        let excess = retired.len() - MAX_RETIRED_BRIDGES;
+        for (_, bridge_arn) in retired.into_iter().take(excess) {
+            self.bridges.remove(&bridge_arn);
         }
     }
 }

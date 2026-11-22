@@ -149,15 +149,33 @@ fn assert_no_dangling_references(emulator: &Emulator, case: &str) {
     );
 }
 
-/// Whether DescribeBridge still answers for `bridge_arn`.
+/// Whether the store still holds a LIVE bridge for `bridge_arn`, read the way a client
+/// reads it.
+///
+/// DescribeBridge keeps answering for a DELETED bridge — the delete retires the record
+/// rather than evicting it — so a bridge is live exactly while the state it is reported in
+/// is not the terminal one. The answer is cross-checked against the crate's own reading of
+/// that relation ([`mc::ComAmazonawsMediaconnectMediaconnectState::holds_bridge`]), the one
+/// every write path resolves a bridge reference through, so the two cannot disagree.
 async fn bridge_is_held(emulator: &Emulator, case: &str, bridge_arn: &str) -> bool {
     let (status, code, described) = describe_bridge(emulator, bridge_arn).await;
-    assert!(
-        status == 200 || (status, code.as_deref()) == (404, Some("NotFoundException")),
-        "case {case:?}: DescribeBridge answers either the bridge or a not-found, got {status} \
-         {code:?}: {described}"
+    assert_eq!(
+        (status, code.as_deref()),
+        (200, None),
+        "case {case:?}: DescribeBridge answers for every bridge this suite stored, got \
+         {status} {code:?}: {described}"
     );
-    status == 200
+    let live = described["bridge"]["bridgeState"].as_str() != Some(mc::BRIDGE_STATE_DELETED);
+    let store = emulator
+        .engine
+        .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
+    assert_eq!(
+        store.lock().holds_bridge(bridge_arn),
+        live,
+        "case {case:?}: the state the bridge is reported in and the store's own reading of \
+         a live bridge must agree, got {described}"
+    );
+    live
 }
 
 /// The bridge as DescribeBridge reports it, without the one member the CLOCK moves on its own
@@ -307,7 +325,7 @@ async fn a_bridge_a_flow_source_names_is_not_deleted() {
             );
             assert!(
                 !bridge_is_held(&emulator, case, &bridge_arn).await,
-                "case {case:?}: the deleted bridge stopped existing"
+                "case {case:?}: the deleted bridge is no longer a live bridge"
             );
         } else {
             assert_eq!(
@@ -457,7 +475,7 @@ async fn the_bridge_delete_is_served_once_no_flow_source_names_it() {
         );
         assert!(
             !bridge_is_held(&emulator, case, &bridge_arn).await,
-            "case {case:?}: the deleted bridge stopped existing"
+            "case {case:?}: the deleted bridge is no longer a live bridge"
         );
         assert!(
             bridge_is_held(&emulator, case, &other_bridge).await,
