@@ -109,6 +109,14 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         event_name: "TagChangeOnResource",
         components: TAG_CHANGE_COMPONENTS,
     },
+    // The other event type the tag source publishes: the notification that a resource's
+    // effective tag policy is invalid. AWS documents the event, not the members of its
+    // `detail`, so it is written with [`ManagedEventType::identified`].
+    ManagedEventType::identified(
+        "aws.tag",
+        "Invalid Effective Tag Policy",
+        "InvalidEffectiveTagPolicy",
+    ),
     ManagedEventType {
         source: "aws.acm",
         detail_type: "ACM Certificate Available",
@@ -243,15 +251,6 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         "aws.application-autoscaling",
         "Application Auto Scaling Scaling Activity State Change",
         "ApplicationAutoScalingScalingActivityStateChange",
-    ),
-    // The spelling of the API-call `detail-type` the catalogue publishes for
-    // `aws.autoscaling` BESIDE the one [`CLOUD_TRAIL_EVENT_FAMILY`] carries: AWS has
-    // published this event with a capital and with a lower-case "via", and a client
-    // resolving either spelling by name reads the entry for it.
-    ManagedEventType::cloud_trail(
-        "aws.autoscaling",
-        "AWS API Call Via CloudTrail",
-        "AWSAPICallViaCloudTrail",
     ),
     // `aws.b2bi` publishes the acknowledgement event of its own BESIDE the
     // CloudTrail-delivered family [`AWS_EVENT_SOURCES`] carries for it.
@@ -1090,7 +1089,12 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.support",
     "aws.swf",
     "aws.synthetics",
-    "aws.tag",
+    // `aws.tag` is deliberately NOT here: it is the source EventBridge delivers tag
+    // notifications under, not the namespace of an API whose calls CloudTrail records,
+    // so the catalogue publishes the event types held for it
+    // ([`AWS_SERVICE_EVENT_TYPES`]) and no CloudTrail-delivered schema. The calls of the
+    // tagging API are recorded under the namespace below.
+    "aws.tagging",
     "aws.textract",
     "aws.timestream",
     "aws.transcribe",
@@ -1109,3 +1113,23 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.workspaces",
     "aws.xray",
 ];
+
+/// The event sources the catalogue publishes the LEGACY spelling of the API-call event
+/// for, BESIDE the current spelling every source in [`AWS_EVENT_SOURCES`] carries.
+///
+/// AWS has delivered the CloudTrail API-call event under two spellings of its
+/// `detail-type` — the current one, which writes "via" in lower case
+/// ([`super::CLOUD_TRAIL_DETAIL_TYPE`]), and an older one writing it with a capital V
+/// ([`super::LEGACY_CLOUD_TRAIL_DETAIL_TYPE`]) — and the catalogue holds the entry each
+/// spelling yields, because each is a name a client resolves a schema by. The legacy
+/// entry collates immediately AHEAD of the current one, a capital `V` preceding a
+/// lower-case `v`, so a source that carries it opens its block with it.
+///
+/// Source: the sources the published catalogue carries the legacy entry under, read off
+/// the catalogue one source at a time. It is per-source published data exactly as
+/// membership of [`AWS_EVENT_SOURCES`] is: the catalogue publishes the legacy entry for
+/// the sources whose API calls it recorded under that spelling and for no others, so a
+/// source is written here rather than the spelling being fanned out over every source.
+/// Kept in alphabetical order for reading.
+pub const LEGACY_API_CALL_SOURCES: &[&str] =
+    &["aws.autoscaling", "aws.ec2", "aws.ecs", "aws.sagemaker"];

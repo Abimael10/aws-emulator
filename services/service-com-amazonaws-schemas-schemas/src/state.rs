@@ -1736,6 +1736,19 @@ pub const CLOUD_TRAIL_EVENT_NAME: &str = "AWSAPICallviaCloudTrail";
 /// The `detail-type` EventBridge delivers a CloudTrail-recorded API call under.
 pub const CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call via CloudTrail";
 
+/// The LEGACY spelling of that `detail-type`: the same event, delivered under a
+/// `detail-type` that writes "Via" with a capital V.
+///
+/// AWS has published the API-call event under both spellings, and the catalogue holds
+/// the entry each spelling yields for the sources it published this one for —
+/// [`LEGACY_API_CALL_SOURCES`] says which.
+pub const LEGACY_CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call Via CloudTrail";
+
+/// The event name the legacy API-call spelling is published as: its `detail-type`
+/// ([`LEGACY_CLOUD_TRAIL_DETAIL_TYPE`]) with the spaces taken out, as the catalogue
+/// derives every schema's name.
+pub const LEGACY_CLOUD_TRAIL_EVENT_NAME: &str = "AWSAPICallViaCloudTrail";
+
 /// The CloudTrail-delivered event family the catalogue publishes for a source in
 /// [`AWS_EVENT_SOURCES`], as `(detail-type, EventName)` pairs.
 ///
@@ -2218,9 +2231,20 @@ fn managed_publication_instant(schema_name: &str) -> &'static str {
 ///
 /// Each instant is a whole-second `date-time`, as [`published_instant`] reads it.
 const MANAGED_PUBLICATIONS: &[(&str, &[&str])] = &[
+    // The legacy API-call spelling ([`LEGACY_API_CALL_SOURCES`]) was written before the
+    // rest of its sources' blocks: each of its entries reports the instant of the pass
+    // that wrote it, years before the publication the source's other entries report.
+    (
+        "2019-12-01T00:59:39Z",
+        &["aws.ec2@AWSAPICallViaCloudTrail"],
+    ),
     (
         "2019-12-01T00:59:43Z",
         &["aws.autoscaling@AWSAPICallViaCloudTrail"],
+    ),
+    (
+        "2019-12-01T00:59:47Z",
+        &["aws.ecs@AWSAPICallViaCloudTrail"],
     ),
     // The EC2 Fleet entries: the fleet events were published in one pass and the spot
     // fleet events in the next second, so each set reports its own pass's instant —
@@ -2394,7 +2418,8 @@ pub fn managed_schema_title(source: &str, detail_type: &str) -> String {
 
 /// Every event type the service-owned catalogue holds a schema for: the whole
 /// CloudTrail-delivered event family ([`CLOUD_TRAIL_EVENT_FAMILY`]) of every source in
-/// [`AWS_EVENT_SOURCES`], followed by the service-specific event types in
+/// [`AWS_EVENT_SOURCES`], the legacy API-call spelling of every source in
+/// [`LEGACY_API_CALL_SOURCES`], followed by the service-specific event types in
 /// [`AWS_SERVICE_EVENT_TYPES`].
 ///
 /// The service-specific entries come last, so one of them wins over a generated entry
@@ -2409,6 +2434,13 @@ pub fn aws_managed_event_types() -> Vec<ManagedEventType> {
                     ManagedEventType::cloud_trail(source, detail_type, event_name)
                 })
         })
+        .chain(LEGACY_API_CALL_SOURCES.iter().map(|source| {
+            ManagedEventType::cloud_trail(
+                source,
+                LEGACY_CLOUD_TRAIL_DETAIL_TYPE,
+                LEGACY_CLOUD_TRAIL_EVENT_NAME,
+            )
+        }))
         .chain(AWS_SERVICE_EVENT_TYPES.iter().copied())
         .collect()
 }
@@ -4096,4 +4128,4 @@ mod tests;
 /// its own, so it lives in a module of its own; re-exported by name, so every reader
 /// reaches the two tables as `crate::state::…` like the rest of this store's seed.
 mod aws_managed_catalog;
-pub use aws_managed_catalog::{AWS_EVENT_SOURCES, AWS_SERVICE_EVENT_TYPES};
+pub use aws_managed_catalog::{AWS_EVENT_SOURCES, AWS_SERVICE_EVENT_TYPES, LEGACY_API_CALL_SOURCES};

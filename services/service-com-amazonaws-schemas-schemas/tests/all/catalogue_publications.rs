@@ -103,10 +103,25 @@ struct SourceRow {
 /// investigation lifecycle and carries no CloudTrail-delivered entry); the other rows it
 /// did not cite, and they differ along what the rule generalises over: a second source
 /// that publishes no CloudTrail-delivered family at all, sources that publish the family
-/// beside one, two or no event types of their own, and a source publishing a second
-/// `detail-type` spelling of a family event.
+/// beside one, two or no event types of their own, a source publishing a second
+/// `detail-type` spelling of a family event, and a pair of neighbouring namespaces of
+/// which only one is the namespace of an API whose calls CloudTrail records.
 fn source_rows() -> Vec<SourceRow> {
     vec![
+        SourceRow {
+            source: "aws.tag",
+            own: &[
+                "InvalidEffectiveTagPolicy",
+                "TagChangeOnResource",
+                "TagChangeonResource",
+            ],
+            cloud_trail_family: false,
+        },
+        SourceRow {
+            source: "aws.tagging",
+            own: &[],
+            cloud_trail_family: true,
+        },
         SourceRow {
             source: "aws.aidevops",
             own: &[

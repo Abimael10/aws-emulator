@@ -25,7 +25,10 @@
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_schemas_schemas::state::{AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY};
+use service_com_amazonaws_schemas_schemas::state::{
+    AWS_MANAGED_REGISTRY, CLOUD_TRAIL_DETAIL_TYPE, CLOUD_TRAIL_EVENT_FAMILY, CLOUD_TRAIL_EVENT_NAME,
+    LEGACY_CLOUD_TRAIL_DETAIL_TYPE, LEGACY_CLOUD_TRAIL_EVENT_NAME,
+};
 
 use crate::registry_schema_lifecycle::{
     published_summary, schema_names, schema_uri, versions_uri, walk, Emulator,
@@ -64,7 +67,8 @@ struct SourceRow {
 /// generalises over — a source whose every entry is its own and that carries no
 /// CloudTrail-delivered family, a source whose own entries sit beside that family, a
 /// source publishing two names that differ only in a letter's case, a source publishing
-/// one entry alone, and an event name carrying punctuation of its own.
+/// one entry alone, a source carrying nothing but that family, and an event name carrying
+/// punctuation of its own.
 fn source_rows() -> Vec<SourceRow> {
     vec![
         SourceRow {
@@ -118,7 +122,21 @@ fn source_rows() -> Vec<SourceRow> {
         },
         SourceRow {
             source: "aws.tag",
-            own: &["TagChangeOnResource", "TagChangeonResource"],
+            // The tag source publishes the event types held for it and no
+            // CloudTrail-delivered family: it is the source EventBridge delivers tag
+            // notifications under, not the namespace of an API whose calls CloudTrail
+            // records — those are published under `aws.tagging`.
+            own: &[
+                "InvalidEffectiveTagPolicy",
+                "TagChangeOnResource",
+                "TagChangeonResource",
+            ],
+            cloud_trail_family: false,
+            extra_cloud_trail_spelling: None,
+        },
+        SourceRow {
+            source: "aws.tagging",
+            own: &[],
             cloud_trail_family: true,
             extra_cloud_trail_spelling: None,
         },
@@ -308,6 +326,176 @@ fn prefix_of(pair: &SpellingPair) -> String {
         .take_while(|(left, right)| left == right)
         .map(|(left, _)| left)
         .collect()
+}
+
+/// One event source and what the catalogue publishes under it for the API-call event.
+struct ApiCallRow {
+    source: &'static str,
+    /// Whether the catalogue publishes the LEGACY spelling of the event for it, beside
+    /// the current spelling every CloudTrail-delivered source carries.
+    legacy: bool,
+    /// The instant the pass that wrote that legacy entry reports for this source, where
+    /// the catalogue publishes one of its own for it.
+    legacy_published: Option<&'static str>,
+}
+
+/// The rows the API-call spelling case runs over.
+///
+/// Source: the published `aws.events` catalogue, one source at a time — which sources
+/// carry the legacy spelling is per-source data, like membership of the catalogue itself.
+/// They differ along what the rule generalises over: sources that carry the legacy entry
+/// with a publication instant of their own and one that carries it without one, and
+/// sources that carry only the current spelling — among them the two namespaces that
+/// collate next to a carrier (`aws.ec2-instance-connect` after `aws.ec2`, `aws.ecr`
+/// before `aws.ecs`), where a spelling fanned out over every source would show up.
+fn api_call_rows() -> Vec<ApiCallRow> {
+    vec![
+        ApiCallRow {
+            source: "aws.autoscaling",
+            legacy: true,
+            legacy_published: Some("2019-12-01T00:59:43Z"),
+        },
+        ApiCallRow {
+            source: "aws.ec2",
+            legacy: true,
+            legacy_published: Some("2019-12-01T00:59:39Z"),
+        },
+        ApiCallRow {
+            source: "aws.ecs",
+            legacy: true,
+            legacy_published: Some("2019-12-01T00:59:47Z"),
+        },
+        ApiCallRow {
+            source: "aws.sagemaker",
+            legacy: true,
+            legacy_published: None,
+        },
+        ApiCallRow {
+            source: "aws.a4b",
+            legacy: false,
+            legacy_published: None,
+        },
+        ApiCallRow {
+            source: "aws.ec2-instance-connect",
+            legacy: false,
+            legacy_published: None,
+        },
+        ApiCallRow {
+            source: "aws.ecr",
+            legacy: false,
+            legacy_published: None,
+        },
+        ApiCallRow {
+            source: "aws.tagging",
+            legacy: false,
+            legacy_published: None,
+        },
+    ]
+}
+
+/// RULE: the catalogue publishes the legacy `detail-type` spelling of the API-call event
+/// for the sources it published that spelling for and for no others — so such a source
+/// lists BOTH entries, the legacy one ahead of the current one because its name collates
+/// first, each readable under its own name and titling the spelling it was published
+/// under, while a source the catalogue publishes no legacy entry for lists the current
+/// spelling alone and resolves the legacy name to nothing.
+#[tokio::test]
+async fn the_legacy_api_call_spelling_is_published_for_the_sources_that_carry_it() {
+    let emulator = Emulator::new();
+
+    for row in api_call_rows() {
+        let current = format!("{}@{CLOUD_TRAIL_EVENT_NAME}", row.source);
+        let legacy = format!("{}@{LEGACY_CLOUD_TRAIL_EVENT_NAME}", row.source);
+
+        // The listing of just this source's API-call entries, so the case reads the
+        // membership and the ORDER without depending on which page they land on.
+        let listed = walk(
+            &emulator,
+            &format!(
+                "{}?schemaNamePrefix={}@AWSAPICall",
+                catalogue_uri(),
+                row.source
+            ),
+            None,
+            schema_names,
+        )
+        .await;
+        let expected: Vec<String> = if row.legacy {
+            vec![legacy.clone(), current.clone()]
+        } else {
+            vec![current.clone()]
+        };
+        assert_eq!(
+            listed, expected,
+            "case {:?}: the catalogue must publish exactly these API-call entries, in \
+             this order, got {listed:?}",
+            row.source
+        );
+
+        // Every published spelling is readable under its own name, and its document
+        // titles the detail-type that spelling was published under.
+        let spellings = [
+            (&current, CLOUD_TRAIL_DETAIL_TYPE),
+            (&legacy, LEGACY_CLOUD_TRAIL_DETAIL_TYPE),
+        ];
+        for (name, detail_type) in spellings {
+            if !expected.contains(name) {
+                continue;
+            }
+            let described = emulator
+                .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, name), None)
+                .await;
+            assert_eq!(
+                described.status, 200,
+                "case {name:?}: expected 200 from DescribeSchema, got {} {:?}",
+                described.status, described.body
+            );
+            let document: Value = serde_json::from_str(&described.str_at("Content"))
+                .unwrap_or_else(|e| panic!("case {name:?}: Content must be JSON: {e}"));
+            assert_eq!(
+                document["info"]["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(" published by ")
+                    .next()
+                    .unwrap_or_default(),
+                detail_type,
+                "case {name:?}: the document titles the detail-type this spelling was \
+                 published under, got {document:?}"
+            );
+        }
+
+        // A source the catalogue publishes no legacy entry for resolves that name to
+        // nothing: the spelling is not a second name every source answers under.
+        if !row.legacy {
+            let described = emulator
+                .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &legacy), None)
+                .await;
+            assert_eq!(
+                described.status, 404,
+                "case {legacy:?}: the catalogue publishes no such entry, got {} {:?}",
+                described.status, described.body
+            );
+        }
+
+        // The legacy entry reports the instant of the publication that wrote IT, which
+        // is not the one the current spelling of the same event reports.
+        if let Some(published) = row.legacy_published {
+            let summary = published_summary(&emulator, AWS_MANAGED_REGISTRY, &legacy).await;
+            assert_eq!(
+                summary["LastModified"],
+                json!(published),
+                "case {legacy:?}: the summary must report the instant of the publication \
+                 that wrote it, got {summary:?}"
+            );
+            let sibling = published_summary(&emulator, AWS_MANAGED_REGISTRY, &current).await;
+            assert_ne!(
+                summary["LastModified"], sibling["LastModified"],
+                "case {legacy:?}: two entries two publications wrote must report two \
+                 instants, got {summary:?} and {sibling:?}"
+            );
+        }
+    }
 }
 
 /// One entry and the number of versions the catalogue publishes for it.
