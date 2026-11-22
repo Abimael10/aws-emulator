@@ -109,6 +109,184 @@ const KIND_FULFILLMENT: &[(&str, &[&str])] = &[
     ("Studio", &["SAAS"]),
 ];
 
+/// What a row of this tier STATES about its product, by the kind of product it is: its
+/// detailed description, its use cases and the captions of its promotional media.
+///
+/// A record's prose is content OF the record — `longDescription` is "[a] detailed
+/// description of what the listing offers, in paragraph format" and `UseCase$description`
+/// describes "a scenario where the product can be applied"
+/// (`smithy_query(query="operation",operation="GetListing")`) — so this tier states it
+/// instead of having [`seed_rows`] compose one from the row's other members. None of it
+/// restates the record's short description, its key features ([`KIND_HIGHLIGHTS`]), the
+/// categories it is classified under or the route it is fulfilled through: the response
+/// already carries each of those in a member of its own, and a client reading the detail
+/// view is shown what the product DOES.
+///
+/// Stated per kind of product because that is what the rest of this tier's row is derived
+/// from ([`PRODUCT_KINDS`], [`KIND_FULFILLMENT`]): what a platform offers its buyer is what
+/// every platform of this tier offers.
+struct KindContent {
+    kind: &'static str,
+    long_description: &'static str,
+    use_cases: &'static [UseCaseSeed<'static>],
+    /// The promotional images a row of this kind carries, captioned by what they show.
+    promotional_media: &'static [PromotionalImageSeed<'static>],
+}
+
+/// The content each kind of [`PRODUCT_KINDS`] states.
+const KIND_CONTENT: &[KindContent] = &[
+    KindContent {
+        kind: "Platform",
+        long_description: "Teams sign in with their own identity provider, work in a shared \
+                           workspace and keep their records in storage scoped to their \
+                           tenant. The seller operates it, applies upgrades without a \
+                           maintenance window and keeps a rolling thirty-day log of every \
+                           change an administrator made.",
+        use_cases: &[UseCaseSeed {
+            value: "shared-workspace",
+            display_name: "Shared team workspace",
+            description: "Give several teams one governed workspace with records scoped to \
+                          each of them.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Workspace overview",
+            description: "A shared workspace as its members see it.",
+        }],
+    },
+    KindContent {
+        kind: "Suite",
+        long_description: "The modules share one permission model and one audit trail, so a \
+                           buyer can adopt them one at a time without keeping a second set of \
+                           accounts. Reporting reads across whichever modules are enabled, \
+                           and a module switched off leaves its history in place.",
+        use_cases: &[UseCaseSeed {
+            value: "phased-rollout",
+            display_name: "Phased module rollout",
+            description: "Adopt one module first and add the rest without a second set of \
+                          accounts.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Module list",
+            description: "The modules one tenant has enabled.",
+        }],
+    },
+    KindContent {
+        kind: "Service",
+        long_description: "The seller runs it for the buyer against a published availability \
+                           target and reports each month on the target, the result and any \
+                           credit due. Support is answered by the engineers who operate it, \
+                           and every incident ends in a written review.",
+        use_cases: &[UseCaseSeed {
+            value: "outsourced-operation",
+            display_name: "Outsourced operation",
+            description: "Hand an operational workload to a team that reports against a \
+                          published target.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Monthly report",
+            description: "One month's target beside the result reported against it.",
+        }],
+    },
+    KindContent {
+        kind: "Hub",
+        long_description: "It runs inside the buyer's own cluster, admits every connection \
+                           through its policy layer and keeps its state in a namespace the \
+                           buyer controls. Upgrades roll out one replica at a time, and a \
+                           replica that fails its readiness check stops the rollout.",
+        use_cases: &[UseCaseSeed {
+            value: "in-cluster-integration",
+            display_name: "In-cluster integration",
+            description: "Mediate traffic between in-cluster workloads without leaving the \
+                          cluster.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Connection policy",
+            description: "The policy every connection is admitted through.",
+        }],
+    },
+    KindContent {
+        kind: "Workbench",
+        long_description: "Toolchains are pinned, so a rebuilt machine reproduces an existing \
+                           environment exactly rather than approximately. Work in progress \
+                           lives on a separate volume that survives the rebuild, and each \
+                           quarterly refresh keeps the previous revision available.",
+        use_cases: &[UseCaseSeed {
+            value: "reproducible-environment",
+            display_name: "Reproducible engineering environment",
+            description: "Give engineers an identical, rebuildable environment on demand.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Pinned toolchain",
+            description: "The revisions a rebuilt machine reproduces.",
+        }],
+    },
+    KindContent {
+        kind: "Toolkit",
+        long_description: "The build steps compose, each is versioned and testable on its \
+                           own, and the verification step fails a pipeline rather than \
+                           letting an unchecked artifact through. Every step reports what it \
+                           changed, so a reviewer reads a diff instead of a log.",
+        use_cases: &[UseCaseSeed {
+            value: "pipeline-hardening",
+            display_name: "Pipeline hardening",
+            description: "Add checked build steps to a pipeline without writing them from \
+                          scratch.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Verification step",
+            description: "A step stopping a pipeline on an unchecked artifact.",
+        }],
+    },
+    KindContent {
+        kind: "Gateway",
+        long_description: "It is provisioned into the buyer's own network, terminates sessions \
+                           at its edge and forwards only what its policy allows. The policy is \
+                           declarative, so a reviewer sees the whole of it before it is \
+                           applied, and each decision is logged with the rule that made it.",
+        use_cases: &[UseCaseSeed {
+            value: "controlled-ingress",
+            display_name: "Controlled ingress",
+            description: "Admit partner traffic into a private network under a reviewable \
+                          policy.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Session policy",
+            description: "The policy a reviewer reads before it is applied.",
+        }],
+    },
+    KindContent {
+        kind: "Studio",
+        long_description: "Authors work on drafts, and nothing a draft changes reaches a \
+                           consumer until it has been reviewed and published. Every published \
+                           version is kept, so a change can be compared with the one before it \
+                           and rolled back to it in a single step.",
+        use_cases: &[UseCaseSeed {
+            value: "reviewed-publishing",
+            display_name: "Reviewed publishing",
+            description: "Let authors prepare changes that reach consumers only after \
+                          review.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Draft review",
+            description: "A draft under review before anything is published.",
+        }],
+    },
+];
+
+/// The content a product of `kind` states ([`KIND_CONTENT`]).
+///
+/// Every kind of [`PRODUCT_KINDS`] states its own, so this lookup fails loudly where its
+/// neighbours ([`fulfillment_for_kind`], [`pricing_for_kind`], [`highlights_for_kind`]) fall
+/// back: a kind added without content of its own would otherwise seed records whose prose
+/// describes a different kind of product, which is a false statement about the record rather
+/// than a missing one.
+fn kind_content(kind: &str) -> &'static KindContent {
+    KIND_CONTENT
+        .iter()
+        .find(|content| content.kind == kind)
+        .expect("every kind of product this tier seeds states content of its own")
+}
+
 /// How a row of this tier is PRICED, by the kind of product it is: `(kind,
 /// PricingModelType, PricingUnitType)`.
 ///
@@ -212,7 +390,7 @@ const KIND_HIGHLIGHTS: &[(&str, &[&str])] = &[
 ];
 
 /// The `FulfillmentOptionType`s a product of `kind` is delivered through, per
-/// [`KIND_FULFILLMENT`], the first of them being the route the row's prose names.
+/// [`KIND_FULFILLMENT`].
 ///
 /// A kind this table does not name is delivered as SaaS, the way a product the catalog
 /// knows nothing more about than that its seller hosts it is reached.
@@ -310,6 +488,10 @@ struct BuiltRow {
     /// row of a multi-route kind offers several options and one of a single-route kind
     /// offers one.
     fulfillment: Vec<&'static str>,
+    /// What this row states about its product ([`KIND_CONTENT`]): its detailed description,
+    /// its use cases and its promotional captions, stated rather than composed from the
+    /// row's other members.
+    content: &'static KindContent,
     /// The key features its record offers customers, read off the kind of product it is
     /// ([`highlights_for_kind`]).
     highlights: Vec<&'static str>,
@@ -340,6 +522,7 @@ impl BuiltRow {
             ),
             categories: vec![category, paired],
             fulfillment: fulfillment_for_kind(kind).to_vec(),
+            content: kind_content(kind),
             highlights: highlights_for_kind(kind).to_vec(),
             pricing: pricing_for_kind(kind),
             support_phone: format!(
@@ -358,6 +541,9 @@ impl BuiltRow {
             slug: &self.slug,
             name: &self.name,
             short_description: &self.short_description,
+            long_description: self.content.long_description,
+            use_cases: self.content.use_cases,
+            promotional_media: self.content.promotional_media,
             categories: &self.categories,
             // The options the record offers, which this tier reads off the kind of product
             // the row is rather than from the row's position in the model's enum.

@@ -197,6 +197,21 @@ pub(crate) async fn whole_catalog(router: &MultiServiceRouter) -> Vec<Value> {
     summaries
 }
 
+/// The products a listing associates, as `GetProduct` returns them.
+///
+/// One copy for every suite that drills from a listing into its products.
+pub(crate) async fn products_of(router: &MultiServiceRouter, listing: &Value) -> Vec<Value> {
+    let mut products: Vec<Value> = Vec::new();
+    for entity in array(listing, "associatedEntities") {
+        let Some(product) = entity.get("product") else {
+            continue;
+        };
+        let product_id = text(product, "productId");
+        products.push(ok(router, "getProduct", &json!({ "productId": product_id })).await);
+    }
+    products
+}
+
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -3566,6 +3566,32 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
 // union and the category taxonomy reachable.
 // ---------------------------------------------------------------------------
 
+/// One use case a catalog record states: the value the catalog holds it under, the name it
+/// is displayed by and the scenario it describes.
+///
+/// `UseCase` models all three as required members
+/// (`smithy_query(query="shape",shape="UseCase")`), and the description is the record's own
+/// prose about where its product applies — so a seeded tier states it beside the rest of the
+/// row rather than having [`seed_rows`] compose one.
+pub(crate) struct UseCaseSeed<'a> {
+    pub value: &'a str,
+    pub display_name: &'a str,
+    pub description: &'a str,
+}
+
+/// One promotional image a catalog record carries: what the image shows, as the creator of
+/// the product captions it.
+///
+/// `PromotionalMedia` is "[e]mbedded promotional media provided by the creator of the
+/// product" and `PromotionalEmbeddedImage` carries a `title` and an optional `description`
+/// (`smithy_query(query="shape",shape="PromotionalEmbeddedImage")`), so the caption is the
+/// creator's own text about that image rather than another member of the record repeated
+/// back.
+pub(crate) struct PromotionalImageSeed<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+}
+
 /// One row of the catalog's breadth: a single-product listing whose listing, product,
 /// offer, offer terms and (for every third row) offer set are all derived from this row.
 ///
@@ -3587,14 +3613,21 @@ struct BreadthRow {
     slug: &'static str,
     name: &'static str,
     short_description: &'static str,
+    /// The record's own detailed description, as `GetListingOutput$longDescription` ("A
+    /// detailed description of what the listing offers, in paragraph format") carries it.
+    long_description: &'static str,
+    /// The use cases the record states, which `GetListingOutput$useCases` carries.
+    use_cases: &'static [UseCaseSeed<'static>],
+    /// The promotional images the record carries, each with the creator's own caption.
+    promotional_media: &'static [PromotionalImageSeed<'static>],
     /// The taxonomy categories the listing is classified under; each one's ancestors come
     /// with it through [`classified_under`]. A record may sit at more than one category
     /// (`CategoryList` holds up to 30), and then carries every one of their paths.
     categories: &'static [&'static str],
     /// The `FulfillmentOptionType`s its single product is fulfilled through — the options
-    /// the record itself offers, the first of them being the one its prose names and the
-    /// one its `deployedOnAws` follows ([`Product::deployed_on_aws`]). A record that is
-    /// delivered one way names one type; one a seller offers through two routes names both.
+    /// the record itself offers, and what its `deployedOnAws` follows
+    /// ([`Product::deployed_on_aws`]). A record that is delivered one way names one type; one
+    /// a seller offers through two routes names both.
     fulfillment: &'static [&'static str],
     /// The key features this record offers customers, which is what `highlights` ("A list of
     /// key features that the listing offers to customers") carries for both its listing and
@@ -3621,6 +3654,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-linux-hardened",
         name: "Aurora Hardened Linux",
         short_description: "Hardened Linux images with CIS benchmark profiles applied.",
+        long_description: "Every build applies the CIS Level 1 profile, enables the audit \
+                           daemon and carries a signed attestation of the controls it \
+                           remediated. Patches land monthly, and each release keeps its \
+                           predecessor available for thirty days so a rollback needs no \
+                           rebuild.",
+        use_cases: &[UseCaseSeed {
+            value: "regulated-workload-baseline",
+            display_name: "Regulated workload baseline",
+            description: "Start regulated workloads from a base whose controls are already \
+                          remediated and attested.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Benchmark report",
+            description: "The benchmark report a completed build publishes.",
+        }],
         highlights: &[
             "CIS Level 1 and Level 2 benchmark profiles",
             "Unattended security patching on first boot",
@@ -3638,6 +3686,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-market-data",
         name: "Borealis Market Data Feed",
         short_description: "End-of-day and intraday reference prices for listed equities.",
+        long_description: "Prices are consolidated from twelve venues onto one symbology, \
+                           adjusted for corporate actions and published with a per-symbol \
+                           audit trail. Intraday snapshots arrive every fifteen minutes; the \
+                           end-of-day file is final within ninety minutes of the closing \
+                           auction.",
+        use_cases: &[UseCaseSeed {
+            value: "portfolio-valuation",
+            display_name: "Portfolio valuation",
+            description: "Value a book of listed equities each evening from one consolidated, \
+                          adjusted price file.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Symbol coverage",
+            description: "The venues and symbols one daily file covers.",
+        }],
         highlights: &[
             "Corporate action adjusted price history",
             "Intraday snapshots every five minutes",
@@ -3655,6 +3718,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-waf",
         name: "Cirrus Web Application Firewall",
         short_description: "Managed web application firewall rules for edge and VPC traffic.",
+        long_description: "The managed rule groups cover the OWASP top ten, credential \
+                           stuffing and known bad bots, and the research team updates them \
+                           without a redeploy. A rule can be run in count mode first, and \
+                           every decision is sampled to the buyer's own log bucket.",
+        use_cases: &[UseCaseSeed {
+            value: "edge-protection",
+            display_name: "Edge protection",
+            description: "Put maintained rules in front of a public web tier without writing \
+                          them.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Rule console",
+            description: "A rule group running in count mode before it blocks anything.",
+        }],
         highlights: &[
             "Managed rule groups updated daily",
             "Bot and credential-stuffing detection",
@@ -3670,6 +3747,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-vision-labeler",
         name: "Delta Vision Labeler",
         short_description: "Image classification models for industrial inspection.",
+        long_description: "The model family is trained on sixty thousand annotated inspection \
+                           frames and separates surface defects from benign variation at a \
+                           published precision and recall per class. A calibration set ships \
+                           with it, so drift can be measured against the baseline rather than \
+                           guessed at.",
+        use_cases: &[UseCaseSeed {
+            value: "surface-defect-detection",
+            display_name: "Surface defect detection",
+            description: "Flag surface defects on a production line from frames captured in \
+                          place.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Inspection review",
+            description: "A reviewer confirming a flagged frame against its score.",
+        }],
         highlights: &[
             "Defect classes trained on factory imagery",
             "Batch and real-time inference endpoints",
@@ -3685,6 +3777,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-fleet-telemetry",
         name: "Equinox Fleet Telemetry",
         short_description: "Telemetry ingestion and alerting for connected equipment.",
+        long_description: "Equipment reports over MQTT or HTTPS, and every message is \
+                           validated against its own fleet's schema before it is stored. \
+                           Alert rules evaluate on a rolling window, and an engineer can \
+                           replay thirty days of one unit's history to confirm a rule before \
+                           it pages anyone.",
+        use_cases: &[UseCaseSeed {
+            value: "predictive-maintenance",
+            display_name: "Predictive maintenance",
+            description: "Raise a work order when one unit's readings drift away from its \
+                          peers.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Fleet overview",
+            description: "One fleet's units with the alerts raised against them.",
+        }],
         highlights: &[
             "Device shadows with offline buffering",
             "Threshold and anomaly alert rules",
@@ -3701,6 +3808,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-object-vault",
         name: "Aurora Object Vault",
         short_description: "Immutable object storage with compliance retention.",
+        long_description: "Objects are written once and sealed under a retention clock no \
+                           operator can shorten, and a background scrubber reports every \
+                           checksum mismatch it finds. Legal holds are independent of \
+                           retention, so a hold outlives the clock it was placed against.",
+        use_cases: &[UseCaseSeed {
+            value: "regulatory-archive",
+            display_name: "Regulatory archive",
+            description: "Keep records for a statutory period with evidence that nothing was \
+                          rewritten.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Retention view",
+            description: "A sealed object with its retention clock and any hold on it.",
+        }],
         highlights: &[
             "Write-once retention locks per bucket",
             "Server-side encryption with your own keys",
@@ -3717,6 +3838,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-health-atlas",
         name: "Borealis Health Atlas",
         short_description: "De-identified claims and prescription records for research.",
+        long_description: "The cohort follows eighteen million de-identified lives with \
+                           linked claims, prescriptions and outcomes, re-certified by an \
+                           external statistician each quarter. Small cells are suppressed \
+                           before publication, and every field carries its own provenance \
+                           note.",
+        use_cases: &[UseCaseSeed {
+            value: "comparative-effectiveness",
+            display_name: "Comparative effectiveness research",
+            description: "Compare treatment pathways across a longitudinal, de-identified \
+                          cohort.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Cohort explorer",
+            description: "Cohort counts as they read after small-cell suppression.",
+        }],
         highlights: &[
             "Longitudinal patient journeys over ten years",
             "HIPAA de-identification certified annually",
@@ -3732,6 +3868,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-secrets-broker",
         name: "Cirrus Secrets Broker",
         short_description: "Short-lived credential brokering for cluster workloads.",
+        long_description: "A workload exchanges its own identity for a credential that \
+                           expires in minutes, so nothing long-lived is mounted beside it. \
+                           Every exchange is written to an append-only log with the identity \
+                           that asked, what it asked for and the lifetime it was granted.",
+        use_cases: &[UseCaseSeed {
+            value: "secret-free-workloads",
+            display_name: "Secret-free workloads",
+            description: "Take long-lived credentials out of running workloads without \
+                          changing their code.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Exchange log",
+            description: "The exchanges recorded for one namespace over an hour.",
+        }],
         highlights: &[
             "Credentials minted per workload identity",
             "Automatic rotation without redeploys",
@@ -3747,6 +3897,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-speech-studio",
         name: "Delta Speech Studio",
         short_description: "Speech transcription and diarisation for contact centres.",
+        long_description: "Transcription runs with speaker diarisation, a confidence figure \
+                           per word and a redaction pass that masks spoken card and account \
+                           numbers. A custom vocabulary can be supplied per queue, which \
+                           raises accuracy on product names without retraining.",
+        use_cases: &[UseCaseSeed {
+            value: "quality-monitoring",
+            display_name: "Contact centre quality monitoring",
+            description: "Score a sample of each day's calls against a scripted quality \
+                          rubric.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Transcript view",
+            description: "A diarised transcript with its redactions in place.",
+        }],
         highlights: &[
             "Speaker diarisation for multi-party calls",
             "Custom vocabulary per queue",
@@ -3762,6 +3926,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-grid-forecast",
         name: "Equinox Grid Forecast",
         short_description: "Load and generation forecasting for energy networks.",
+        long_description: "Forecasts are issued every half hour for horizons from one hour to \
+                           ten days, with a probabilistic band beside each central estimate. \
+                           Every issue is archived with the weather inputs it used, so a \
+                           settlement dispute can be re-run against what was known at the \
+                           time.",
+        use_cases: &[UseCaseSeed {
+            value: "day-ahead-bidding",
+            display_name: "Day-ahead bidding",
+            description: "Size a day-ahead position from a forecast whose uncertainty is \
+                          published with it.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Forecast bands",
+            description: "One issue's central estimate inside its uncertainty band.",
+        }],
         highlights: &[
             "Day-ahead and intraday forecast horizons",
             "Weather-adjusted demand curves",
@@ -3777,6 +3956,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-build-cache",
         name: "Aurora Build Cache",
         short_description: "Distributed build caching for large monorepos.",
+        long_description: "Compiler and test outputs are addressed by the hash of their \
+                           inputs, so a second build of unchanged code fetches instead of \
+                           compiling. The store is tenant-scoped, and a poisoned entry can be \
+                           evicted by input hash without clearing everything else.",
+        use_cases: &[UseCaseSeed {
+            value: "monorepo-integration",
+            display_name: "Monorepo continuous integration",
+            description: "Cut the build time of a large monorepo by reusing unchanged \
+                          outputs.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Hit report",
+            description: "Which steps of a run were fetched rather than rebuilt.",
+        }],
         highlights: &[
             "Content-addressed artefact reuse across branches",
             "Remote execution for cold caches",
@@ -3792,6 +3985,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-climate-grid",
         name: "Borealis Climate Grid",
         short_description: "Gridded climate observations and reanalysis series.",
+        long_description: "Observations and reanalysis are regridded onto one nine-kilometre \
+                           lattice, so a model reads them without resampling. The series runs \
+                           from 1979 to the current month and is versioned: a correction is \
+                           published as a new version rather than rewritten in place.",
+        use_cases: &[UseCaseSeed {
+            value: "physical-risk-scoring",
+            display_name: "Physical risk scoring",
+            description: "Score a portfolio of sites against one consistent gridded \
+                          history.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Grid viewer",
+            description: "One variable rendered on the published lattice.",
+        }],
         highlights: &[
             "Half-degree global grids since 1950",
             "Reanalysis and observation series aligned",
@@ -3807,6 +4014,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-migration-studio",
         name: "Cirrus Migration Studio",
         short_description: "Assessment and replatforming services for legacy estates.",
+        long_description: "A four-week assessment inventories the estate, ranks its \
+                           applications by the effort each move takes and produces a wave plan \
+                           with named owners. The delivery team then moves the first wave \
+                           alongside the buyer's own engineers, who keep the runbooks that \
+                           come out of it.",
+        use_cases: &[UseCaseSeed {
+            value: "datacentre-exit",
+            display_name: "Datacentre exit",
+            description: "Plan and run the first waves of a datacentre exit from an \
+                          inventoried estate.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Wave plan",
+            description: "An inventoried estate ranked into waves with named owners.",
+        }],
         highlights: &[
             "Estate discovery and dependency mapping",
             "Wave plan with cutover runbooks",
@@ -3822,6 +4044,19 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-forms-reader",
         name: "Delta Forms Reader",
         short_description: "Document understanding for structured and semi-structured forms.",
+        long_description: "The reader extracts key-value pairs, tables and checkboxes, and \
+                           returns the page coordinates of every value so a reviewer can see \
+                           where it came from. A field below a configurable confidence is \
+                           routed to a human queue instead of being accepted.",
+        use_cases: &[UseCaseSeed {
+            value: "invoice-intake",
+            display_name: "Invoice intake",
+            description: "Turn scanned supplier invoices into reviewed, structured records.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Extraction review",
+            description: "Extracted values highlighted on the page they came from.",
+        }],
         highlights: &[
             "Table and key-value extraction from scans",
             "Handwriting recognition on form fields",
@@ -3837,6 +4072,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-retail-planner",
         name: "Equinox Retail Planner",
         short_description: "Assortment and replenishment planning for retailers.",
+        long_description: "Planners build assortments by store cluster, and the replenishment \
+                           engine proposes orders from the sell-through of comparable stores \
+                           rather than from a chain-wide average. Each proposal shows the \
+                           demand signal behind it, and a planner's override is kept with its \
+                           reason.",
+        use_cases: &[UseCaseSeed {
+            value: "seasonal-assortment",
+            display_name: "Seasonal assortment planning",
+            description: "Plan a season per store cluster and replenish it from local \
+                          sell-through.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Cluster plan",
+            description: "One store cluster's plan beside the signal behind it.",
+        }],
         highlights: &[
             "Store-level assortment recommendations",
             "Replenishment plans from live sell-through",
@@ -3852,6 +4102,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-golden-images",
         name: "Aurora Golden Images",
         short_description: "Image pipeline components for compliant base images.",
+        long_description: "The components install the agent set, apply the hardening profile \
+                           and run a verification step that fails the pipeline when a control \
+                           is missing. Each component is versioned, so a pipeline pins the \
+                           exact revision it was tested against.",
+        use_cases: &[UseCaseSeed {
+            value: "compliant-base-images",
+            display_name: "Compliant base images",
+            description: "Bake a compliant base in your own pipeline and prove the controls \
+                          are present.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Pipeline run",
+            description: "A run whose verification step passed every control.",
+        }],
         highlights: &[
             "Hardening components for Image Builder recipes",
             "Compliance evidence written to the build log",
@@ -3867,6 +4131,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-spectrum-usage",
         name: "Borealis Spectrum Usage",
         short_description: "Mobile network coverage and spectrum usage records.",
+        long_description: "Coverage and occupancy are published per cell and per band, \
+                           aggregated from drive tests and crowd-sourced measurements with \
+                           the sample count beside each figure. Deliveries are monthly, and \
+                           the prior twelve months stay addressable for comparison.",
+        use_cases: &[UseCaseSeed {
+            value: "network-planning",
+            display_name: "Network planning",
+            description: "Compare measured coverage against plan before committing a build \
+                          programme.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Coverage map",
+            description: "Measured coverage for one band with its sample counts.",
+        }],
         highlights: &[
             "Cell-level coverage polygons per operator",
             "Spectrum assignments with licence expiry",
@@ -3882,6 +4160,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-observability",
         name: "Cirrus Observability Stack",
         short_description: "Metrics, traces and log correlation for microservices.",
+        long_description: "Metrics, traces and logs are correlated on one request identifier, \
+                           so a latency spike opens onto the traces and log lines behind it. \
+                           Retention is set per signal, and cardinality limits are enforced \
+                           at ingest rather than discovered on an invoice.",
+        use_cases: &[UseCaseSeed {
+            value: "latency-investigation",
+            display_name: "Latency investigation",
+            description: "Follow a latency regression from a dashboard to the request that \
+                          caused it.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Correlated view",
+            description: "A spike opened onto the requests behind it.",
+        }],
         highlights: &[
             "Trace-to-log correlation on one timeline",
             "Service level objective burn-rate alerts",
@@ -3897,6 +4189,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-crm-sync",
         name: "Delta CRM Sync",
         short_description: "Two-way synchronisation between CRM and billing systems.",
+        long_description: "Records flow both ways on a field-level map, and a conflicting edit \
+                           is resolved by a rule the administrator chooses rather than by \
+                           whichever write arrived last. Each run keeps a result per record, \
+                           and a failed record can be replayed on its own.",
+        use_cases: &[UseCaseSeed {
+            value: "quote-to-cash",
+            display_name: "Quote to cash",
+            description: "Keep accounts, opportunities and invoices consistent across two \
+                          systems of record.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Field map",
+            description: "The field map between two systems, with its conflict rules.",
+        }],
         highlights: &[
             "Field-level mapping with conflict rules",
             "Replay of failed synchronisations",
@@ -3912,6 +4218,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-hpc-solver",
         name: "Equinox HPC Solver",
         short_description: "Finite element solver for structural simulation.",
+        long_description: "The solver spreads a model across nodes over the cluster's \
+                           high-speed interconnect and checkpoints each load step, so a long \
+                           run survives the loss of a node. Results are written in a \
+                           documented format other post-processors already read.",
+        use_cases: &[UseCaseSeed {
+            value: "certification-runs",
+            display_name: "Structural certification runs",
+            description: "Run certification load cases overnight and restart one without \
+                          losing finished steps.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Solver progress",
+            description: "A multi-node run with the load steps it has finished.",
+        }],
         highlights: &[
             "Implicit and explicit solvers in one image",
             "MPI scaling across cluster placement groups",
@@ -3927,6 +4247,19 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-training-labs",
         name: "Aurora Training Labs",
         short_description: "Instructor-led enablement for platform engineering teams.",
+        long_description: "Each cohort of twelve engineers works through graded labs in a \
+                           sandbox of its own, with an instructor present at every session and \
+                           an assessment at the end. The labs stay open for four weeks \
+                           afterwards, so a team can repeat the exercises unaided.",
+        use_cases: &[UseCaseSeed {
+            value: "team-enablement",
+            display_name: "Platform team enablement",
+            description: "Bring a team to a measured baseline before it takes a system on.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Lab workspace",
+            description: "A graded lab as an engineer taking it sees it.",
+        }],
         highlights: &[
             "Hands-on labs in a sandbox account",
             "Curriculum tailored to your platform",
@@ -3942,6 +4275,21 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-data-prep",
         name: "Borealis Data Prep Studio",
         short_description: "Profiling, cleansing and join authoring for analytics data sets.",
+        long_description: "An analyst profiles a source, authors cleansing and join steps as a \
+                           recipe, and publishes the recipe as a scheduled job once it has \
+                           been reviewed. Each run records the rows it rejected and the rule \
+                           that rejected them, so a report can show the quality of what it was \
+                           built from.",
+        use_cases: &[UseCaseSeed {
+            value: "analytics-onboarding",
+            display_name: "Analytics data onboarding",
+            description: "Prepare a new source for analysis with a reviewed, repeatable \
+                          recipe.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Recipe editor",
+            description: "A recipe under review before it is scheduled.",
+        }],
         highlights: &[
             "Column profiles with outlier detection",
             "Join authoring against sampled data",
@@ -3959,6 +4307,20 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-query-lens",
         name: "Cirrus Query Lens",
         short_description: "Interactive dashboards over warehouse and lakehouse tables.",
+        long_description: "Dashboards query the warehouse directly, and a result cache keyed by \
+                           the query and the table version keeps a shared dashboard from \
+                           re-scanning for every viewer. Row-level rules are evaluated in the \
+                           query itself rather than in the browser.",
+        use_cases: &[UseCaseSeed {
+            value: "self-service-reporting",
+            display_name: "Self-service reporting",
+            description: "Give analysts dashboards over governed tables without copying \
+                          data.",
+        }],
+        promotional_media: &[PromotionalImageSeed {
+            title: "Dashboard view",
+            description: "A shared dashboard answered from the result cache.",
+        }],
         highlights: &[
             "Push-down queries to the warehouse",
             "Row-level access from your directory groups",
@@ -4226,6 +4588,9 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
             slug: row.slug,
             name: row.name,
             short_description: row.short_description,
+            long_description: row.long_description,
+            use_cases: row.use_cases,
+            promotional_media: row.promotional_media,
             categories: row.categories,
             fulfillment: row.fulfillment,
             highlights: row.highlights,
@@ -4259,11 +4624,23 @@ pub(crate) struct CatalogRow<'a> {
     pub slug: &'a str,
     pub name: &'a str,
     pub short_description: &'a str,
+    /// The record's own detailed description, in paragraph format.
+    ///
+    /// Stated by the row rather than composed here: `longDescription` is content of the
+    /// record, so it restates no other member of it (the categories it is classified under,
+    /// the route it is fulfilled through) and a client reading the detail view is shown the
+    /// record's prose.
+    pub long_description: &'a str,
+    /// The use cases the record states.
+    pub use_cases: &'a [UseCaseSeed<'a>],
+    /// The promotional images the record carries, captioned by the creator of the product
+    /// rather than from the record's other members.
+    pub promotional_media: &'a [PromotionalImageSeed<'a>],
     /// The taxonomy categories the listing is classified under; each one's ancestors come
     /// with it through [`classified_under`].
     pub categories: &'a [&'a str],
     /// The `FulfillmentOptionType`s its single product is fulfilled through: the options
-    /// the record offers, the first being the one its prose names.
+    /// the record offers.
     pub fulfillment: &'a [&'a str],
     /// The key features the record offers customers, which both its listing and its product
     /// report as `highlights` ("A list of key features that the listing offers to
@@ -4326,17 +4703,13 @@ fn seed_rows(
             .iter()
             .map(|feature| (*feature).to_string())
             .collect();
-        // The record's own prose: what it offers, followed by the features it offers it
-        // through. Nothing here restates the record's classification or its fulfillment,
-        // both of which the response already carries as `categories` and
-        // `fulfillmentOptionSummaries`.
-        let long_description = if highlights.is_empty() {
-            row.short_description.to_string()
-        } else {
-            format!("{} {}.", row.short_description, highlights.join(". "))
-        };
+        // The record's detailed description is the row's OWN prose, stored as stated. A
+        // record's prose is content of the record, so none of it is composed here from the
+        // record's other members — its short description, its key features, the categories it
+        // is classified under or the route it is fulfilled through — each of which the
+        // response already carries in a member of its own.
         let listing_text = Localized {
-            default: text(row.name, row.short_description, &long_description),
+            default: text(row.name, row.short_description, row.long_description),
             translations: BTreeMap::new(),
         };
         let logo = LogoMedia::of_listing(&listing_id);
@@ -4364,22 +4737,28 @@ fn seed_rows(
                 product_ids: vec![product_id.clone()],
                 offer_ids: vec![offer_id.clone()],
                 publisher: publisher.clone(),
-                promotional_media: vec![promotional_image(
-                    row.name,
-                    &format!("https://example.com/media/{slug}/overview.png"),
-                    row.short_description,
-                )],
+                promotional_media: row
+                    .promotional_media
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        promotional_image(
+                            image.title,
+                            &format!("https://example.com/media/{slug}/{}.png", index + 1),
+                            image.description,
+                        )
+                    })
+                    .collect(),
                 resources: support_resources(&support_email, support_phone, &docs),
                 seller_engagements: engagements(&contact),
-                use_cases: vec![use_case(
-                    slug,
-                    row.name,
-                    &format!(
-                        "{} {}",
-                        row.short_description,
-                        highlights.first().cloned().unwrap_or_default()
-                    ),
-                )],
+                // The use cases the record states, each as stated: `UseCase$description`
+                // describes a scenario the product applies to, so it is the record's own
+                // prose rather than its short description with a feature appended.
+                use_cases: row
+                    .use_cases
+                    .iter()
+                    .map(|seed| use_case(seed.value, seed.display_name, seed.description))
+                    .collect(),
                 reviews: reviews(
                     &listing_id,
                     row.reviews.average_rating,

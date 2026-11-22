@@ -49,7 +49,7 @@ use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::{
 
 // The router, the `POST /2026-02-05/<op>` dispatch and the JSON readers are this crate's
 // one test harness, owned by the `catalog_drilldown` suite.
-use crate::catalog_drilldown::{array, ok, router, text};
+use crate::catalog_drilldown::{array, ok, products_of, router, text};
 
 /// What deployment each `FulfillmentOptionType` implies for the product it fulfills, written
 /// out here independently of the service's own table so the two have to agree.
@@ -121,19 +121,6 @@ async fn every_listing(router: &MultiServiceRouter) -> BTreeMap<String, Value> {
         listings.len()
     );
     listings
-}
-
-/// The products a listing associates, as `GetProduct` returns them.
-async fn products_of(router: &MultiServiceRouter, listing: &Value) -> Vec<Value> {
-    let mut products: Vec<Value> = Vec::new();
-    for entity in array(listing, "associatedEntities") {
-        let Some(product) = entity.get("product") else {
-            continue;
-        };
-        let product_id = text(product, "productId");
-        products.push(ok(router, "getProduct", &json!({ "productId": product_id })).await);
-    }
-    products
 }
 
 /// The `fulfillmentOptionType` of every fulfillment option a product reports, read from the
