@@ -1242,6 +1242,9 @@ fn instance_ids(instances: &[(String, String)]) -> Vec<String> {
 /// The target groups the group holds an attachment to, in EITHER form the attachment takes
 /// — its own `TargetGroupARNs` and an `elbv2` traffic source — which is what a registration
 /// of its instances follows.
+///
+/// ONE attachment, however many of the group's members report it: the two members are two
+/// views of the same association, so a target group named by both is one entry here.
 async fn attached_identifiers(router: &MultiServiceRouter, name: &str) -> Vec<String> {
     let body = described(router, name).await;
     let mut held = tag_values(
@@ -1250,7 +1253,10 @@ async fn attached_identifiers(router: &MultiServiceRouter, name: &str) -> Vec<St
     );
     for source in members(element_inner(&body, "TrafficSources").unwrap_or_default()) {
         if tag_value(source, "Type") == TRAFFIC_SOURCE_TYPE_ELBV2 {
-            held.push(tag_value(source, "Identifier"));
+            let identifier = tag_value(source, "Identifier");
+            if !held.contains(&identifier) {
+                held.push(identifier);
+            }
         }
     }
     held

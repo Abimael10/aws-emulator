@@ -206,8 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The identifier is what the association IS — the same reading the attach holds
             // two entries to be one traffic source by — so a request names a held attachment
-            // when it names its identifier, whatever type it states for it.
-            let held = group.traffic_sources.clone().unwrap_or_default();
+            // when it names its identifier, whatever type it states for it. What the group
+            // holds is the projection its own reads report
+            // ([`crate::state::elbv2_targets::traffic_source_views`]): a target group the
+            // client attached under the legacy member is the same association, so a group
+            // that REPORTS a traffic source cannot refuse the call that removes it.
+            let held = crate::state::elbv2_targets::traffic_source_views(group);
             // Checked for EVERY named traffic source before any of them is removed: the
             // request is one unit of work, so one identifier this group does not hold refuses
             // the whole call and leaves the attachments it does hold in place.
@@ -226,7 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            let remaining: Vec<TrafficSourceIdentifier> = held
+            let remaining: Vec<TrafficSourceIdentifier> = group
+                .traffic_sources
+                .clone()
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|attached| {
                     !requested
@@ -234,7 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .any(|source| source.identifier == attached.identifier)
                 })
                 .collect();
+            // The same association under its legacy spelling goes with it: one attachment is
+            // removed once, whichever member the client wrote it in, so the group's two views
+            // of it stay the one set the detach left behind.
+            let kept_target_groups: Vec<String> = group
+                .attached_target_groups()
+                .iter()
+                .filter(|arn| {
+                    !requested
+                        .iter()
+                        .any(|source| &source.identifier == *arn)
+                })
+                .cloned()
+                .collect();
             group.traffic_sources = Some(remaining);
+            group.target_group_arns = Some(kept_target_groups);
         }
 
         crate::state::audit(ctx.parts(), Self::NAME, &name, "traffic sources detached");

@@ -451,7 +451,13 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         context: group.context.clone(),
         desired_capacity_type: group.desired_capacity_type.clone(),
         default_instance_warmup: group.default_instance_warmup,
-        traffic_sources: Some(group.traffic_sources.clone().unwrap_or_default()),
+        // Every traffic source the group HOLDS, through the one projection of them
+        // ([`crate::state::elbv2_targets::traffic_source_views`]): a target group this group
+        // is attached to is one association however the client stated it, so it is reported
+        // here as the `elbv2` traffic source it is, beside the ones attached as traffic
+        // sources — a list, empty for a group attached to nothing, like the collections
+        // above.
+        traffic_sources: Some(crate::state::elbv2_targets::traffic_source_views(group)),
         instance_maintenance_policy: group.instance_maintenance_policy.clone(),
         deletion_protection: group.deletion_protection.clone(),
         availability_zone_distribution: group.availability_zone_distribution.clone(),

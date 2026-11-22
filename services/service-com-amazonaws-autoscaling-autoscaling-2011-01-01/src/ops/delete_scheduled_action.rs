@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScheduledAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScheduledAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScheduledAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes ONE scheduled scaling action of an Auto Scaling group, out of the one collection
+//! every writer and reader of a scheduled action shares
+//! ([`crate::state::scheduled_actions`]) — so the action the call takes out is the action
+//! `DescribeScheduledActions` stops reporting, and the group goes on holding every action
+//! beside it.
+//!
+//! A scheduled action is a CHILD of one group, named uniquely within it, so the group is
+//! resolved first: a name no group of the account answers to names no action to delete, and
+//! the request is refused for the group ([`crate::state::absent_group_message`]). A group the
+//! account does hold, under which it holds no action of that name, names no action either and
+//! is refused for the action ([`crate::state::absent_scheduled_action_message`]) — the same
+//! answer the batch form of this delete reports that name under, because a delete that
+//! removed nothing is not a delete that succeeded.
+//!
+//! Whether the CALLER may change THIS group at all is decided first, against the group's own
+//! ARN ([`crate::service::authorization`]): a request IAM does not permit deletes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +164,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScheduledAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScheduledActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScheduledAction"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteScheduledActionErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let action_name = input.scheduled_action_name;
+
+        // Whether IAM lets this caller delete a scheduled action of THIS group, decided
+        // against the group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // The group the action belongs to is resolved before the action is: a call naming
+            // no stored group is refused for the group whatever action it names.
+            if !state.groups.contains_key(&group_name) {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &group_name,
+                    "refused: no such group",
+                );
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(&group_name),
+                ));
+            }
+            // The delete is the batch form's delete of one name
+            // ([`crate::state::AutoScalingState::delete_scheduled_actions`]), so one call of
+            // either operation takes an action out of the group the same way; a name the group
+            // holds no action under comes back from it, and is refused here rather than
+            // reported per action, because this call speaks for that one action alone.
+            let names = [action_name.clone()];
+            if !state
+                .delete_scheduled_actions(&group_name, &names)
+                .is_empty()
+            {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &group_name,
+                    "refused: no such scheduled action",
+                );
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_scheduled_action_message(&action_name),
+                ));
+            }
+        }
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &group_name,
+            "scheduled action deleted",
+        );
+        Ok(DeleteScheduledActionOutput)
     }
 }

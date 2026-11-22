@@ -221,24 +221,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // Every ARN has to RESOLVE to a target group of the Region and account this request
-        // is addressed to: a target group is identified within one Region, and the group is
+        // is addressed to, and that target group has to take Amazon EC2 INSTANCES as its
+        // targets: a target group is identified within one Region, and the group is
         // in the Region the request is signed for, so an ARN of anywhere else — and one
         // Elastic Load Balancing v2 holds no target group under at all — names nothing this
-        // endpoint could register an instance in. Checked on the INPUT, with this service's
+        // endpoint could register an instance in, and neither does a target group whose
+        // targets are of another kind. Checked on the INPUT, with this service's
         // lock RELEASED, so no request holds two stores at once, and before the group is
         // touched, so the attachment the group would then claim can never be one that cannot
-        // resolve.
+        // resolve or could take no registration.
         let region = crate::state::request_region(ctx.parts());
-        if crate::state::elbv2_targets::first_unresolvable_target_group(
+        if let Some(refusal) = crate::state::elbv2_targets::attach_refusal(
             &*self.engine,
             &region,
             requested.iter().map(String::as_str),
-        )
-        .is_some()
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
-            ));
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
 
         {

@@ -450,12 +450,29 @@ async fn every_list_member_of_a_described_group_is_a_list() {
             "case {case:?}: expected {} instance(s), got {instances:?}",
             holds.instances
         );
-        // The group names no traffic source, so the member is the empty list rather than
-        // absent — the same answer for a collection nothing was ever put in.
+        // The group named no traffic source of its own, but a target group it is attached to
+        // IS a traffic source — the same association under its modern spelling — so the
+        // member carries one `elbv2` entry per target group the group holds, and the empty
+        // list is what a group attached to nothing reports.
+        let reported_sources: Vec<String> = list_member(case, &body, "TrafficSources")
+            .iter()
+            .map(|member| {
+                format!(
+                    "{}/{}",
+                    tag_value(member, "Identifier"),
+                    tag_value(member, "Type")
+                )
+            })
+            .collect();
+        let expected_sources: Vec<String> = holds
+            .target_group_arns
+            .iter()
+            .map(|arn| format!("{arn}/elbv2"))
+            .collect();
         assert_eq!(
-            list_member(case, &body, "TrafficSources"),
-            Vec::<String>::new(),
-            "case {case:?}: expected TrafficSources to be an empty list, got {body}"
+            sorted(reported_sources),
+            sorted(expected_sources.clone()),
+            "case {case:?}: expected TrafficSources to carry {expected_sources:?}, got {body}"
         );
         // The collections the create fills by itself are lists too, and non-empty ones: the
         // zones the group places instances in, their ids, and the termination policy a group

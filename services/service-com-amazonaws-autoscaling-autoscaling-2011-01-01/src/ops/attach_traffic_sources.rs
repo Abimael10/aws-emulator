@@ -13,9 +13,10 @@
 //! target group" (`TrafficSourceIdentifier$Type`), which is the same association
 //! `AttachLoadBalancerTargetGroups` adds under its own member — so such an identifier has to
 //! RESOLVE to a target group Elastic Load Balancing v2 holds in the Region and account the
-//! call is addressed to, exactly as that operation's does, and the call is otherwise refused
-//! whole: nothing is attached and nothing is registered
-//! ([`crate::state::elbv2_targets::first_unresolvable_target_group`]). Once attached, the
+//! call is addressed to, and that target group has to take Amazon EC2 INSTANCES as its
+//! targets, exactly as that operation's does; the call is otherwise refused whole: nothing is
+//! attached and nothing is registered
+//! ([`crate::state::elbv2_targets::attach_refusal`]). Once attached, the
 //! group's instances are registered as targets of that target group, which is what
 //! `DescribeTargetHealth` then reports ([`crate::state::elbv2_targets`]).
 //!
@@ -217,8 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // Every identifier that names an Elastic Load Balancing v2 TARGET GROUP has to
-        // resolve to one, for the reason the module docs state. Checked on the INPUT, with
-        // this service's lock RELEASED, so no request holds two stores at once.
+        // resolve to one that takes this group's instances as its targets, for the reason the
+        // module docs state. Checked on the INPUT, with this service's lock RELEASED, so no
+        // request holds two stores at once, and before the group is touched, so a refused
+        // call leaves the group's attachments exactly as they were.
         let region = crate::state::request_region(ctx.parts());
         let target_groups: Vec<&str> = requested
             .iter()
@@ -230,16 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .map(|source| source.identifier.as_str())
             .collect();
-        if crate::state::elbv2_targets::first_unresolvable_target_group(
+        if let Some(refusal) = crate::state::elbv2_targets::attach_refusal(
             &*self.engine,
             &region,
             target_groups.iter().copied(),
-        )
-        .is_some()
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
-            ));
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
 
         {

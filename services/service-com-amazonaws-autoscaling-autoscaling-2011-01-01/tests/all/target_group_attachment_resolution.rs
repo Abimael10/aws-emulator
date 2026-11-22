@@ -49,12 +49,12 @@ use crate::support::{
     REGION,
 };
 
-/// The `TargetTypeEnum` values of the target groups these rows create: an Auto Scaling group's
-/// own instances are `instance` targets, and an `ip` target group is one the account holds
-/// just as much — resolving the ARN is about whether the target group EXISTS, not about what
-/// it takes.
+/// The `TargetTypeEnum` value of the target groups these rows create: an Auto Scaling group's
+/// own instances are `instance` targets, which is the only target type a group may be
+/// associated with at all — what a target group of any OTHER target type is answered with is
+/// its own suite's subject (`target_group_target_type`), so every target group here is one
+/// these rows are free to resolve.
 const TARGET_TYPE_INSTANCE: &str = "instance";
-const TARGET_TYPE_IP: &str = "ip";
 
 /// The port the target groups of this suite listen on.
 const TARGET_GROUP_PORT: i32 = 80;
@@ -174,20 +174,16 @@ async fn an_attach_resolves_every_target_group_it_names() {
     let vpc_id = vpc_of(&router, &subnets[0]).await;
     seed_launch_templates(&engine, &[LAUNCH_TEMPLATE]);
 
-    // Three target groups the account really holds, one of them an `ip` group, so a served
-    // row is not served because of the target type; and one created and then DELETED, whose
+    // Three target groups the account really holds, and one created and then DELETED, whose
     // ARN is well formed and resolves to nothing.
     let mut held: Vec<String> = Vec::new();
-    for (index, target_type) in [TARGET_TYPE_INSTANCE, TARGET_TYPE_INSTANCE, TARGET_TYPE_IP]
-        .into_iter()
-        .enumerate()
-    {
+    for index in 0..3 {
         held.push(
             create_target_group(
                 &router,
                 &format!("tg-resolve-{index}"),
                 TARGET_GROUP_PORT,
-                target_type,
+                TARGET_TYPE_INSTANCE,
                 &vpc_id,
             )
             .await,
@@ -234,7 +230,7 @@ async fn an_attach_resolves_every_target_group_it_names() {
             true,
         ),
         (
-            "two target groups the account holds, of two target types",
+            "two target groups the account holds",
             vec![Entry::Held(1), Entry::Held(2)],
             true,
         ),

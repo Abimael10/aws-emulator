@@ -80,9 +80,11 @@
 //! A target group is identified within ONE Region and ONE account, and the Auto Scaling
 //! group it serves is the one in that same Region, so an association whose ARN carries
 //! another Region or account — or is no target group ARN at all — names nothing that could
-//! ever take a registration. Such a value is refused on the INPUT
-//! ([`first_unattachable_target_group`]), before the group is touched, rather than stored as
-//! attachment that can never resolve.
+//! ever take a registration. Neither does an ARN that resolves to no target group, nor one
+//! whose target group takes a different KIND of target than an Amazon EC2 instance. An
+//! ATTACH is refused for such a value on the INPUT ([`attach_refusal`]), before the group is
+//! touched, rather than leaving the group holding an attachment that can never resolve or
+//! never register anything.
 //!
 //! LOCKING. A reconcile reads the wanted set under this service's own lock, RELEASES it,
 //! and only then takes the Elastic Load Balancing v2 store's lock for the one pass that
@@ -222,6 +224,41 @@ pub fn attached_arns(group: &StoredGroup) -> Vec<&str> {
     arns
 }
 
+/// Every traffic source the group `group` HOLDS, as the modern read of them reports each one:
+/// its identifier and the kind of traffic source that identifier names.
+///
+/// A target group associated with an Auto Scaling group is ONE association however the client
+/// stated it — `AttachTrafficSources` names it as a traffic source, `AttachLoadBalancerTargetGroups`
+/// and the group's own create name the same association under `TargetGroupARNs`, and
+/// `AttachTrafficSources`' own documentation says the two are one surface ("after the
+/// operation completes, use the DescribeTrafficSources API to return details about the state
+/// of the attachments between traffic sources and your Auto Scaling group") — so the
+/// traffic-source view reports every one of them, an `elbv2` entry per target group the group
+/// is attached to ([`attached_arns`]), whichever member the client wrote it in.
+///
+/// Each traffic source once, in attachment order: a stored traffic source keeps the position
+/// it has, and a target group named only under the legacy member follows the ones stated as
+/// traffic sources. Nothing is stored for the projection — it is DERIVED from the group's own
+/// attachments every time it is asked for, so the two views can never disagree.
+///
+/// A traffic source of any other kind (a Classic Load Balancer's name, a VPC Lattice target
+/// group) is reported exactly as the client attached it: this is the one projection the
+/// Elastic Load Balancing v2 association owes, and nothing is invented for a traffic source
+/// whose other spelling this service holds no collection for.
+pub fn traffic_source_views(group: &StoredGroup) -> Vec<crate::ops::types::TrafficSourceIdentifier> {
+    let mut held: Vec<crate::ops::types::TrafficSourceIdentifier> =
+        group.traffic_sources.clone().unwrap_or_default();
+    for arn in attached_arns(group) {
+        if !held.iter().any(|source| source.identifier == arn) {
+            held.push(crate::ops::types::TrafficSourceIdentifier {
+                identifier: arn.to_string(),
+                r#type: Some(TRAFFIC_SOURCE_TYPE_ELBV2.to_string()),
+            });
+        }
+    }
+    held
+}
+
 /// What a load-balancer attachment of an Auto Scaling group has to NAME: an Elastic Load
 /// Balancing v2 TARGET GROUP, whose ARN carries that service's own namespace and the
 /// `targetgroup` resource type (`CreateTargetGroup` mints
@@ -300,7 +337,8 @@ pub fn names_a_target_group(source_type: Option<&str>, identifier: &str) -> bool
 /// Resolving the ARN is what makes an attachment one that can take a registration: the
 /// association is what registers the group's instances as targets of that target group, so
 /// an ARN that resolves to nothing is an association no instance could ever be registered
-/// through — the condition the refusal above words ("please ensure they exist").
+/// through — the condition [`UNATTACHABLE_TARGET_GROUPS_MESSAGE`] words ("please ensure they
+/// exist").
 ///
 /// A READ of the other service's store, under that store's lock alone, exactly as
 /// [`unresolved_attachments`] reads it — this module's header states the order. On an engine
@@ -325,6 +363,89 @@ where
         .into_iter()
         .find(|arn| !store.target_groups.contains_key(*arn))
         .map(str::to_string)
+}
+
+/// The FIRST entry of `requested` whose target group takes a different KIND of target than an
+/// Amazon EC2 instance, in request order — `None` when every entry takes instances, and
+/// `None` for an entry that resolves to no target group at all, which
+/// [`first_unresolvable_target_group`] is what answers for.
+///
+/// An Auto Scaling group registers its own instances, by instance id, and only a target group
+/// whose `TargetType` is `instance` takes a target stated that way ("`instance` - Targets are
+/// specified by instance ID"): an `ip`, `lambda` or `alb` target group takes a different kind
+/// of target altogether, so it is an association no instance of the group could ever be
+/// registered through.
+///
+/// A READ of the other service's store, under that store's lock alone, exactly as
+/// [`first_unresolvable_target_group`] reads it. On an engine that carries no such store
+/// nothing is concluded, for the same reason it states.
+fn first_target_group_of_another_target_type<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    requested: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let requested: Vec<&str> = requested.into_iter().collect();
+    let state = elbv2::service_state(engine)?;
+    let store = state.lock();
+    requested
+        .into_iter()
+        .find(|arn| {
+            store
+                .target_groups
+                .get(*arn)
+                .is_some_and(|target_group| target_group.target_type != TARGET_TYPE_INSTANCE)
+        })
+        .map(str::to_string)
+}
+
+/// The message Amazon EC2 Auto Scaling refuses a request associating a target group that
+/// takes a different KIND of target than the instances an Auto Scaling group has to register
+/// there with: fixed text around one variable part, the offending target group's own
+/// identifier as the request wrote it.
+///
+/// The refusal is for the request as a WHOLE, exactly as the one above is — a call that
+/// mixes an `instance` target group with one of another target type associates none of them —
+/// and it names the target group that broke the rule so a caller holding several knows which
+/// one to replace.
+#[must_use]
+pub fn invalid_target_type_message(target_group: &str) -> String {
+    format!(
+        "Provided Target Group '{target_group}' has invalid target type. Please ensure all \
+         provided Target Groups have target type of instance."
+    )
+}
+
+/// The whole sentence an ATTACH of the target groups `requested` to an Auto Scaling group of
+/// the Region `region` is refused with, for the FIRST entry that is not one such a group may
+/// be associated with, in request order — `None` when every entry is one it may hold.
+///
+/// A target group an attach may associate has to satisfy BOTH conditions, because the
+/// association is what registers the group's instances as targets of that target group:
+///
+/// * it has to RESOLVE to a target group of this Region and account
+///   ([`first_unresolvable_target_group`]);
+/// * and it has to take Amazon EC2 instances as its targets
+///   ([`first_target_group_of_another_target_type`]).
+///
+/// Taken on the INPUT, before the group is touched, so a refused attach leaves the group's
+/// attachments exactly as they were and no group ever comes to hold an attachment that can
+/// take no registration at all.
+pub fn attach_refusal<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    region: &str,
+    requested: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let requested: Vec<&str> = requested.into_iter().collect();
+    if first_unresolvable_target_group(engine, region, requested.iter().copied()).is_some() {
+        return Some(UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string());
+    }
+    first_target_group_of_another_target_type(engine, requested)
+        .map(|arn| invalid_target_type_message(&arn))
 }
 
 /// Whether an instance running in `instance_vpc` is OUTSIDE the VPC `target_group_vpc` of a

@@ -198,17 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // What the group HOLDS, in attachment order, narrowed to the type the request asked
-        // about when it asked about one.
-        let held: Vec<crate::ops::types::TrafficSourceIdentifier> = group
-            .traffic_sources
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|source| match selected_type.as_deref() {
-                Some(wanted) => source.r#type.as_deref() == Some(wanted),
-                None => true,
-            })
-            .collect();
+        // about when it asked about one. Through the ONE projection of a group's traffic
+        // sources ([`crate::state::elbv2_targets::traffic_source_views`]), so this read and
+        // the group's own read report the same set: a target group the client attached under
+        // the legacy member is the same association as one attached as a traffic source.
+        let held: Vec<crate::ops::types::TrafficSourceIdentifier> =
+            crate::state::elbv2_targets::traffic_source_views(group)
+                .into_iter()
+                .filter(|source| match selected_type.as_deref() {
+                    Some(wanted) => source.r#type.as_deref() == Some(wanted),
+                    None => true,
+                })
+                .collect();
         let identifiers: Vec<String> = held
             .iter()
             .map(|source| source.identifier.clone())
