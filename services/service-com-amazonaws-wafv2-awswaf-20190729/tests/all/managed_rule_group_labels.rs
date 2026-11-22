@@ -10,8 +10,9 @@
 //! FULLY QUALIFIED under the namespace the publishing vendor states for the group
 //! (`awswaf:managed:<vendor>:<published slug>:`, whose slug is published and is not
 //! the group's API name), with a list the vendor publishes nothing for left OFF
-//! rather than answered empty, and with that same namespace reported in
-//! `LabelNamespace`, the prefix "all labels added by rules in this rule group have".
+//! rather than answered empty, and with `LabelNamespace` left off entirely — a
+//! vendor-published group states no namespace member, so the prefix is read off the
+//! leading segments of the fully qualified labels themselves.
 //!
 //! The labels a group publishes are therefore the texts a `LabelMatchStatement`
 //! composing against that group is written with: the last suite here DISCOVERS a
@@ -111,14 +112,13 @@ async fn every_published_group_reports_its_label_surface_as_published() {
             let consumed = reported(&response, "ConsumedLabels");
             let namespace = group.managed_label_namespace();
 
-            // "The label namespace prefix for this rule group. All labels added by
-            // rules in this rule group have this prefix": a property of the group, so
-            // it is reported whichever of its labels the catalogue can cite.
-            assert_eq!(
-                response["LabelNamespace"].as_str(),
-                Some(namespace.as_str()),
-                "case {case:?}: expected the group's own published label namespace \
-                 {namespace:?}, got {response}"
+            // A vendor-published group states no `LabelNamespace` of its own: the
+            // prefix is carried by each fully qualified label, which is where a
+            // client reads it from.
+            assert!(
+                response.get("LabelNamespace").is_none(),
+                "case {case:?}: a vendor-published group reports no LabelNamespace \
+                 member at all, got {response}"
             );
 
             if available.is_empty() {

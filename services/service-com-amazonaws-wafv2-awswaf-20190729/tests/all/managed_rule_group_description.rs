@@ -5,7 +5,8 @@
 //! The rule asserted here: `DescribeManagedRuleGroup` reports what the VENDOR
 //! publishes about the group a `(VendorName, Name)` pair names — the capacity a web
 //! ACL spends on running it, the rules it runs with the action each takes, the
-//! namespace every label those rules add carries, and the version being described
+//! fully qualified labels those rules add and match (and NO label-namespace member,
+//! which a vendor-published group states none of), and the version being described
 //! (the one the request names, or the vendor's default when it names none) — all of
 //! it read from the service's managed-rule-group catalogue
 //! (`service_…::state::MANAGED_RULE_GROUP_CATALOGUE`), the same catalogue that
@@ -29,6 +30,9 @@ use service_com_amazonaws_wafv2_awswaf_20190729::state::{
 };
 
 use crate::managed_rule_groups::managed_statement;
+use crate::rule_group_lifecycle::{
+    byte_match_statement, create_rule_group, label_namespace, label_summaries, labelled_rule,
+};
 use crate::web_acl_lifecycle::{visibility, Waf};
 
 /// A `DescribeManagedRuleGroup` request body for `(vendor, name)` in `scope`.
@@ -131,17 +135,14 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                  got {response}"
             );
 
-            // "The label namespace prefix for this rule group. All labels added by
-            // rules in this rule group have this prefix"
-            // (`DescribeManagedRuleGroupResponse$LabelNamespace`): a property of the
-            // group, so it is reported for every published group, whichever of its
-            // labels this catalogue can cite.
-            assert_eq!(
-                response["LabelNamespace"],
-                json!(group.managed_label_namespace()),
-                "case {case:?}: expected the group's own published label namespace \
-                 {:?}, got {response}",
-                group.managed_label_namespace()
+            // `LabelNamespace` is the optional member a group states its own prefix
+            // in, and a vendor-published group states none: the prefix is carried by
+            // each of the fully qualified labels below, which is where a client reads
+            // it from. So the key is absent from the response.
+            assert!(
+                response.get("LabelNamespace").is_none(),
+                "case {case:?}: a vendor-published group reports no LabelNamespace \
+                 member at all, got {response}"
             );
 
             let expected_rules: Vec<(String, Value)> = group
@@ -215,6 +216,135 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                 );
             }
         }
+    }
+}
+
+/// The namespace prefix a fully qualified managed label carries: its four leading
+/// colon-separated segments and the separator that closes a prefix, as in
+/// `awswaf:managed:aws:core-rule-set:`. `DescribeManagedRuleGroupResponse$LabelNamespace`
+/// states the syntax (`awswaf:managed:<vendor>:<rule group name>:`) and that a fully
+/// qualified label is "the label namespace from the rule group … and the label from the
+/// rule, separated by a colon", so a client reads the prefix off the label itself.
+fn namespace_prefix(label: &str) -> String {
+    let segments: Vec<&str> = label.split(':').take(4).collect();
+    format!("{}:", segments.join(":"))
+}
+
+/// A vendor-published managed rule group states NO label namespace of its own:
+/// `LabelNamespace` is an optional member, and the describe of a catalogued group
+/// leaves it off the response entirely, so the key is absent — while the labels it
+/// does publish stay FULLY QUALIFIED, which is where a client reads the group's
+/// namespace from.
+///
+/// The table is the WHOLE catalogue crossed with both declared scopes and with every
+/// version each group offers plus the request that names none: it spans versioned and
+/// unversioned groups, groups whose label texts the catalogue cites and groups it
+/// cites none for, and both the default-version and the pinned-version paths. Each row
+/// also asserts the describe still answers the rest of the published description, so
+/// the absent member is an omission of one member rather than a lost response.
+#[tokio::test]
+async fn a_vendor_published_group_reports_no_label_namespace_member() {
+    let waf = Waf::new();
+    let mut rows = 0_usize;
+    let mut groups_whose_namespace_is_derivable = 0_usize;
+    for scope in ["REGIONAL", "CLOUDFRONT"] {
+        for group in MANAGED_RULE_GROUP_CATALOGUE {
+            let versions: Vec<Option<&str>> = std::iter::once(None)
+                .chain(group.versions.iter().map(|release| Some(release.name)))
+                .collect();
+            for version in versions {
+                rows += 1;
+                let case = format!("{scope} {}/{} @{version:?}", group.vendor_name, group.name);
+                let mut body = request(scope, group.vendor_name, group.name);
+                if let Some(version) = version {
+                    body["VersionName"] = json!(version);
+                }
+                let response = waf.ok("DescribeManagedRuleGroup", body).await;
+
+                assert!(
+                    response.get("LabelNamespace").is_none(),
+                    "case {case:?}: a vendor-published group states no label namespace, \
+                     so the member must be absent, got {response}"
+                );
+                assert_eq!(
+                    response["Capacity"],
+                    json!(group.capacity),
+                    "case {case:?}: the rest of the published description is still \
+                     reported, got {response}"
+                );
+                assert!(
+                    !reported_rules(&response).is_empty(),
+                    "case {case:?}: the rest of the published description is still \
+                     reported, got {response}"
+                );
+
+                // The namespace a client needs is carried by each published label, so
+                // it is derivable from the response the member is absent from.
+                let published: Vec<String> = reported_labels(&response, "AvailableLabels")
+                    .into_iter()
+                    .chain(reported_labels(&response, "ConsumedLabels"))
+                    .collect();
+                if published.is_empty() {
+                    continue;
+                }
+                if scope == "REGIONAL" && version.is_none() {
+                    groups_whose_namespace_is_derivable += 1;
+                }
+                let derived: BTreeSet<String> =
+                    published.iter().map(|label| namespace_prefix(label)).collect();
+                assert!(
+                    derived.contains(&group.managed_label_namespace()),
+                    "case {case:?}: the group's namespace {:?} must be derivable from \
+                     its fully qualified labels, got {derived:?}",
+                    group.managed_label_namespace()
+                );
+            }
+        }
+    }
+    assert!(
+        rows > 2 * MANAGED_RULE_GROUP_CATALOGUE.len()
+            && groups_whose_namespace_is_derivable > 1,
+        "the table must span every group in both scopes at its default and each offered \
+         version ({rows} rows), including more than one group whose namespace is \
+         derivable ({groups_whose_namespace_is_derivable})"
+    );
+}
+
+/// The absent member is a property of what a VENDOR publishes, not of the member
+/// itself: an entity this ACCOUNT owns states its own label namespace, because its
+/// labels are reported as its rules specify them — unqualified — so the namespace is
+/// derivable from nothing else and has to be reported.
+///
+/// One row per declared scope, each creating its own rule group and reading it back.
+#[tokio::test]
+async fn an_account_owned_rule_group_still_states_its_own_label_namespace() {
+    let waf = Waf::new();
+    for scope in ["REGIONAL", "CLOUDFRONT"] {
+        let name = format!("namespace-{}", scope.to_lowercase());
+        let rules = json!([labelled_rule(
+            "adds",
+            byte_match_statement(),
+            &["own-label"]
+        )]);
+        let (id, _arn, _lock_token) = create_rule_group(&waf, scope, &name, 100, rules).await;
+        let got = waf
+            .ok(
+                "GetRuleGroup",
+                json!({ "Name": &name, "Scope": scope, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["RuleGroup"]["LabelNamespace"],
+            json!(label_namespace(&name)),
+            "case {scope:?}: an account-owned rule group reports its own label \
+             namespace, got {got}"
+        );
+        assert_eq!(
+            got["RuleGroup"]["AvailableLabels"],
+            label_summaries(&["own-label"]),
+            "case {scope:?}: an account-owned group's labels are reported as its rules \
+             specify them, unqualified, got {got}"
+        );
     }
 }
 
