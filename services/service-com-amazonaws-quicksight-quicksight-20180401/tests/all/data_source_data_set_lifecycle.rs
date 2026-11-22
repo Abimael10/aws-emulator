@@ -115,6 +115,26 @@ impl Harness {
         path: &str,
         body: Option<Value>,
     ) -> (u16, Value) {
+        let (status, parsed, _headers) = self
+            .call_reporting_headers(region, method, path, body)
+            .await;
+        (status, parsed)
+    }
+
+    /// [`Self::call_in_region`], reporting the response HEADERS beside its status and
+    /// body.
+    ///
+    /// Part of what an answer states travels in a header rather than in the document —
+    /// the error shape in `x-amzn-errortype`, the request id of a failed call in
+    /// `x-amzn-RequestId` — so a case about one of those reads it here rather than from
+    /// the body.
+    pub(crate) async fn call_reporting_headers(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value, http::HeaderMap) {
         let payload = match &body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("a JSON request body")),
             None => Bytes::new(),
@@ -134,13 +154,14 @@ impl Harness {
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.body();
         let parsed = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(bytes).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        (status, parsed, headers)
     }
 
     async fn create_data_source(

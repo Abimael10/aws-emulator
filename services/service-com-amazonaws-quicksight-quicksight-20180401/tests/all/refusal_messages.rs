@@ -22,6 +22,11 @@
 //! So the rows below vary what the rule generalises over — the resource kind, the
 //! operation that refuses, the account, the region, and the form and length of the id
 //! or name — rather than re-running one recorded call.
+//!
+//! The last two suites are about WHERE a refusal states the request id of the call,
+//! which is the same rule read across error classes: a failure reports it in the
+//! `x-amzn-RequestId` response header and its document carries the error shape's other
+//! members only, while a SUCCESS reports it as the body member its output shape declares.
 
 use serde_json::{json, Value};
 
@@ -786,4 +791,326 @@ async fn deleting_a_namespace_nothing_holds_names_the_delete_that_failed() {
         status, 200,
         "the refusals must leave the stored namespace readable, got {status} with {body}"
     );
+}
+
+/// The response header a QuickSight answer reports the request id of a failed call in.
+/// HTTP header names are case-insensitive, and `HeaderMap` is keyed on the lowercase
+/// spelling.
+const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// Every member a refusal document of this service may carry: the shape discriminator the
+/// JSON envelope names the error class in, the error shape's own `Message` and
+/// `ResourceType`, and the lowercase `message` the framework's synthetic shapes word a
+/// 501 in. `RequestId` is deliberately NOT one of them.
+/// Source: smithy_query(query="shape", shape="ResourceNotFoundException,
+/// ResourceExistsException,InvalidParameterValueException").
+const REFUSAL_BODY_MEMBERS: [&str; 4] = ["__type", "Message", "ResourceType", "message"];
+
+/// One row of the refusal-answer table: the call to make, and what its answer states.
+struct RefusalRow {
+    case: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    /// The status the class is rendered under.
+    status: u16,
+    /// The error class, as `__type` and `x-amzn-errortype` name it.
+    shape: &'static str,
+    /// The `ResourceType` discriminator the class reports, where it reports one.
+    resource_type: Option<&'static str>,
+    /// Whether the rendered error shape declares a request-id member at all, and so
+    /// whether the answer reports an id in its header. The framework's synthetic shapes
+    /// (the 501 among them) declare none, so they report none anywhere.
+    reports_a_request_id: bool,
+}
+
+#[tokio::test]
+async fn a_refusal_reports_its_request_id_in_the_header_and_never_in_the_document() {
+    let harness = Harness::new();
+
+    // Fixtures the rows refuse against: a folder and a group whose ids are taken, a
+    // readable data source, and one created and then deleted.
+    let held_folder = "held-folder-id";
+    let (status, body) = create_folder(&harness, WEST, ACCOUNT, held_folder).await;
+    assert_eq!(status, 200, "fixture folder: got {status} with {body}");
+    let held_group = "held-group";
+    let (status, body) = create_group(&harness, WEST, ACCOUNT, DEFAULT_NAMESPACE, held_group).await;
+    assert_eq!(status, 201, "fixture group: got {status} with {body}");
+    let held_source = "held-source-id";
+    let (status, body) = create_data_source(&harness, WEST, ACCOUNT, held_source).await;
+    assert_eq!(status, 202, "fixture source: got {status} with {body}");
+    let deleted_source = "deleted-source-id";
+    let (status, body) = create_data_source(&harness, WEST, ACCOUNT, deleted_source).await;
+    assert_eq!(status, 202, "fixture source: got {status} with {body}");
+    let (status, body) = call_data_source(&harness, "DELETE", WEST, ACCOUNT, deleted_source).await;
+    assert_eq!(status, 200, "fixture delete: got {status} with {body}");
+
+    // Rows: the error class and the status it renders under, the operation that refuses,
+    // whether the class reports a `ResourceType` beside its sentence, and — the last row
+    // — a rendered shape that declares no request-id member at all.
+    let rows: Vec<RefusalRow> = vec![
+        RefusalRow {
+            case: "a data source deleted before the read, 404",
+            method: "GET",
+            path: format!("/accounts/{ACCOUNT}/data-sources/{deleted_source}"),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+            resource_type: None,
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a data source nothing created, on the update, 404",
+            method: "PUT",
+            path: format!("/accounts/{ACCOUNT}/data-sources/absent-source"),
+            body: Some(json!({ "Name": "whatever" })),
+            status: 404,
+            shape: "ResourceNotFoundException",
+            resource_type: None,
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a second create of the same folder id, 409",
+            method: "POST",
+            path: format!("/accounts/{ACCOUNT}/folders/{held_folder}"),
+            body: Some(json!({ "Name": "a folder" })),
+            status: 409,
+            shape: "ResourceExistsException",
+            resource_type: None,
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a second create of the same data source id, 409",
+            method: "POST",
+            path: format!("/accounts/{ACCOUNT}/data-sources"),
+            body: Some(json!({
+                "DataSourceId": held_source,
+                "Name": "a source",
+                "Type": "ATHENA",
+            })),
+            status: 409,
+            shape: "ResourceExistsException",
+            resource_type: Some("DATA_SOURCE"),
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a second create of the same group name, which reports a ResourceType",
+            method: "POST",
+            path: format!("/accounts/{ACCOUNT}/namespaces/{DEFAULT_NAMESPACE}/groups"),
+            body: Some(json!({ "GroupName": held_group })),
+            status: 409,
+            shape: "ResourceExistsException",
+            resource_type: Some("GROUP"),
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a folder the account holds none of, 404",
+            method: "GET",
+            path: format!("/accounts/{OTHER_ACCOUNT}/folders/{held_folder}"),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+            resource_type: None,
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a namespace nothing holds, on the delete, 404",
+            method: "DELETE",
+            path: format!("/accounts/{ACCOUNT}/namespaces/absent-ns"),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+            resource_type: Some("NAMESPACE"),
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            case: "a parameter value naming an address with no route, 400",
+            method: "POST",
+            path: format!("/accounts/{ACCOUNT}/data-sources"),
+            body: Some(json!({
+                "DataSourceId": "unroutable-source",
+                "Name": "a source",
+                "Type": "SPARK",
+                "DataSourceParameters": { "SparkParameters": { "Host": "100::1", "Port": 10000 } },
+            })),
+            status: 400,
+            shape: "InvalidParameterValueException",
+            resource_type: None,
+            reports_a_request_id: true,
+        },
+        RefusalRow {
+            // `DescribeIpRestriction` is still a stub, so its 501 is rendered from the
+            // framework's own synthetic shape, which declares no request-id member.
+            // Source: smithy_query(query="operation", operation="DescribeIpRestriction").
+            case: "an operation this emulator has not implemented, 501",
+            method: "GET",
+            path: format!("/accounts/{ACCOUNT}/ip-restriction"),
+            body: None,
+            status: 501,
+            shape: "NotImplemented",
+            resource_type: None,
+            reports_a_request_id: false,
+        },
+    ];
+
+    // Every id reported across the table, so no two answers can report the same one.
+    let mut reported_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in rows {
+        let RefusalRow {
+            case,
+            method,
+            path,
+            body,
+            status: expected_status,
+            shape,
+            resource_type,
+            reports_a_request_id,
+        } = row;
+
+        let (status, document, headers) = harness
+            .call_reporting_headers(WEST, method, &path, body)
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {document}"
+        );
+        assert_eq!(
+            document["__type"],
+            json!(shape),
+            "case {case:?}: expected the class {shape}, got {document}"
+        );
+        assert_eq!(
+            headers.get("x-amzn-errortype").and_then(|v| v.to_str().ok()),
+            Some(shape),
+            "case {case:?}: the class also travels in x-amzn-errortype, got {headers:?}"
+        );
+
+        // The document carries the error shape's own members and NOT the request id.
+        assert!(
+            document.get("RequestId").is_none(),
+            "case {case:?}: the document must carry no RequestId member, got {document}"
+        );
+        let unexpected: Vec<&String> = document
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| !REFUSAL_BODY_MEMBERS.contains(&key.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            unexpected.is_empty(),
+            "case {case:?}: the document carries members the shape does not declare \
+             {unexpected:?}: {document}"
+        );
+        assert_eq!(
+            document["ResourceType"],
+            resource_type.map_or(Value::Null, |kind| json!(kind)),
+            "case {case:?}: expected the ResourceType {resource_type:?}, got {document}"
+        );
+
+        let reported = headers
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if reports_a_request_id {
+            // The sentence of the class is still the handler's, beside the moved id.
+            assert!(
+                document["Message"]
+                    .as_str()
+                    .is_some_and(|sentence| !sentence.is_empty()),
+                "case {case:?}: the document must still carry the class's sentence, got \
+                 {document}"
+            );
+            let reported = reported.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the request id in the {REQUEST_ID_HEADER} \
+                     header, got {headers:?}"
+                )
+            });
+            assert!(
+                !reported.is_empty(),
+                "case {case:?}: the reported request id is empty: {headers:?}"
+            );
+            assert!(
+                reported_ids.insert(reported.clone()),
+                "case {case:?}: the request id {reported:?} was reported for another call too"
+            );
+        } else {
+            assert!(
+                reported.is_none(),
+                "case {case:?}: a shape declaring no request-id member reports none, got \
+                 {reported:?}"
+            );
+        }
+    }
+
+    // The fixtures the refusals addressed are still readable, so none of them disturbed
+    // the store.
+    let (status, body) = call_data_source(&harness, "GET", WEST, ACCOUNT, held_source).await;
+    assert_eq!(
+        status, 200,
+        "the refusals must leave the stored source readable, got {status} with {body}"
+    );
+    let (status, body) = describe_folder(&harness, WEST, ACCOUNT, held_folder).await;
+    assert_eq!(
+        status, 200,
+        "the refusals must leave the stored folder readable, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_answer_still_reports_its_request_id_as_a_body_member() {
+    let harness = Harness::new();
+    let folder_id = "answered-folder";
+    let source_id = "answered-source";
+    let group_name = "answered-group";
+
+    // Rows: the write and the read of two resources plus an identity create, so the
+    // success contract is read through a 200, a 201 and a 202. Each output shape declares
+    // `RequestId` as a body member, which is where a success reports it.
+    // Source: smithy_query(query="operation", operation="CreateFolder,DescribeFolder,
+    // CreateDataSource,DescribeDataSource,CreateGroup").
+    let rows: Vec<(&str, u16, (u16, Value))> = vec![
+        (
+            "CreateFolder",
+            200,
+            create_folder(&harness, WEST, ACCOUNT, folder_id).await,
+        ),
+        (
+            "DescribeFolder",
+            200,
+            describe_folder(&harness, WEST, ACCOUNT, folder_id).await,
+        ),
+        (
+            "CreateDataSource",
+            202,
+            create_data_source(&harness, WEST, ACCOUNT, source_id).await,
+        ),
+        (
+            "DescribeDataSource",
+            200,
+            call_data_source(&harness, "GET", WEST, ACCOUNT, source_id).await,
+        ),
+        (
+            "CreateGroup",
+            201,
+            create_group(&harness, WEST, ACCOUNT, DEFAULT_NAMESPACE, group_name).await,
+        ),
+    ];
+
+    for (case, expected_status, (status, body)) in rows {
+        assert_eq!(
+            status, expected_status,
+            "case {case}: expected {expected_status}, got {status} with {body}"
+        );
+        assert!(
+            body["RequestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "case {case}: a success reports its RequestId in the body, got {body}"
+        );
+    }
 }

@@ -39,11 +39,18 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! A sixth seam, `override_protocol`, is one this service also takes, for one thing the
+//! generic renderer cannot express: a failure reports its request id in the
+//! `x-amzn-RequestId` response header rather than as a member of the error document. See
+//! [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+pub mod wire;
 
 /// The `com-amazonaws-quicksight-quicksight-20180401` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +59,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol: the model's own `restJson1`, with the error answer
+    /// of [`wire`]. Built once here because [`Service::override_protocol`] hands back a
+    /// borrow of it.
+    protocol: wire::RequestIdInHeaderRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +72,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: wire::RequestIdInHeaderRestJson::new(),
         }
     }
 }
@@ -135,5 +147,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic renderer
+        // cannot express: a modelled failure reports the request id of the call in the
+        // `x-amzn-RequestId` response header, and its error document carries the error
+        // shape's other members only (see `wire`). Borrowed from the field built in
+        // `new`, never constructed per request.
+        //
+        // This seam drives the MODELLED sequence only. A refusal rendered before a
+        // handler runs still renders in the generated entry's envelope, which is correct:
+        // its synthetic shape has no request-id member to report anywhere.
+        Some(&self.protocol)
     }
 }
