@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeChangeSetOutput {
             change_set_id: Some(record.id.clone()),
             change_set_arn: Some(record.arn.clone()),
-            change_set_name: record.name.clone(),
+            change_set_name: Some(record.name.clone()),
             intent: Some(record.intent.clone()),
             start_time: Some(record.start_time.clone()),
             end_time: record.end_time.clone(),

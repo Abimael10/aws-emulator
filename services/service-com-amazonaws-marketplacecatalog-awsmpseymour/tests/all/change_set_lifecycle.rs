@@ -61,6 +61,19 @@ fn is_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@')
 }
 
+/// `ChangeSetName`'s `^[\w\s+=.:@-]+$` with its `@length(min: 1, max: 100)`, spelled out
+/// here rather than taken from the crate's own predicate so a wrong implementation cannot
+/// make this test pass.
+fn is_change_set_name(value: &str) -> bool {
+    (1..=100).contains(&value.chars().count())
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c.is_whitespace()
+                || c == '_'
+                || matches!(c, '+' | '=' | '.' | ':' | '@' | '-')
+        })
+}
+
 /// `ARN`'s `^[a-zA-Z0-9:*/-]+$`.
 fn is_arn(value: &str) -> bool {
     !value.is_empty()
@@ -104,6 +117,25 @@ fn is_iso8601(value: &str) -> bool {
         && value[11..13].parse::<u32>().unwrap_or(99) <= 23
         && value[14..16].parse::<u32>().unwrap_or(99) <= 59
         && value[17..19].parse::<u32>().unwrap_or(99) <= 59
+}
+
+/// Read a change set until the clock has carried it to a terminal status, and answer that
+/// description. The wait is for the CONDITION, bounded by a deadline generous enough for a
+/// loaded machine.
+async fn poll_until_terminal(router: &MultiServiceRouter, id: &str) -> Answer {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let described = describe_change_set(router, id).await;
+        let status = described.text("/Status");
+        if ["SUCCEEDED", "FAILED", "CANCELLED"].contains(&status.as_str()) {
+            return described;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "change set {id} must reach a terminal status, last reported {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
@@ -400,12 +432,23 @@ async fn a_started_change_set_is_reported_from_what_was_stored() {
             "case {case:?}: the described ARN must be the started one, got {:?}",
             running.body
         );
-        assert_eq!(
-            running.text("/ChangeSetName"),
-            request["ChangeSetName"].as_str().unwrap_or_default(),
-            "case {case:?}: the described name must be the submitted one, got {:?}",
-            running.body
-        );
+        match request["ChangeSetName"].as_str() {
+            Some(submitted) => assert_eq!(
+                running.text("/ChangeSetName"),
+                submitted,
+                "case {case:?}: the described name must be the submitted one, got {:?}",
+                running.body
+            ),
+            // "The optional name provided in the StartChangeSet request. If you do not
+            // provide a name, one is set by default" — so a change set started without a
+            // name still reports one, within `ChangeSetName`'s own contract.
+            None => assert!(
+                is_change_set_name(&running.text("/ChangeSetName")),
+                "case {case:?}: a change set started with no name must report the name the \
+                 service set, got {:?}",
+                running.body
+            ),
+        }
         assert_eq!(
             running.text("/Intent"),
             request["Intent"].as_str().unwrap_or("APPLY"),
@@ -463,8 +506,7 @@ async fn a_started_change_set_is_reported_from_what_was_stored() {
         }
 
         // The clock, not a call, is what finishes the change set.
-        wait_for_success();
-        let settled = describe_change_set(&router, &id).await;
+        let settled = poll_until_terminal(&router, &id).await;
         assert_eq!(
             settled.text("/Status"),
             "SUCCEEDED",

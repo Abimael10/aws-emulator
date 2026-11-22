@@ -689,7 +689,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::ChangeSetRecord {
             arn: crate::state::change_set_arn(&region, &id),
             id: id.clone(),
-            name: input.change_set_name,
+            // "The optional name provided in the StartChangeSet request. If you
+            // do not provide a name, one is set by default" — a change set the
+            // request did not name is named by the SERVICE, so every change
+            // set reports a name and can be selected by one, exactly as the
+            // sibling default (`Intent`) is applied above.
+            name: input
+                .change_set_name
+                .unwrap_or_else(|| crate::state::default_change_set_name(&id)),
             intent,
             // A change set is asynchronous: it starts out running, and the
             // clock owes it `APPLYING` and then `SUCCEEDED`.

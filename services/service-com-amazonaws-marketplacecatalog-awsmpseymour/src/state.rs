@@ -127,6 +127,22 @@ pub const ENTITY_ID_FILTER_NAME: &str = "EntityId";
 /// when you call the `StartChangeSet` action").
 pub const CHANGE_SET_NAME_FILTER_NAME: &str = "ChangeSetName";
 
+/// The name a change set started WITHOUT a `ChangeSetName` carries: the
+/// `ChangeSetName` members of `DescribeChangeSetResponse` and
+/// `ChangeSetSummaryListItem` are documented "the optional name provided in the
+/// `StartChangeSet` request. If you do not provide a name, one is set by
+/// default", so the service — not the caller — names an unnamed change set, and
+/// that name is reported and filtered on like a submitted one.
+///
+/// The name set by default is the change set's own identifier: it is already
+/// unique over the store, it never changes for the life of the record, and
+/// `ResourceId`'s `^[\w\-]+$` is a subset of `ChangeSetName`'s
+/// `^[\w\s+=.:@-]+$` within its 1..100 length, so the default satisfies the
+/// member's own contract ([`is_change_set_name`]).
+pub fn default_change_set_name(change_set_id: &str) -> String {
+    change_set_id.to_string()
+}
+
 /// The `ListChangeSets` filters whose `ValueList` is a single instant rather
 /// than a set of values to match: each one is documented as "all change sets
 /// that started/ended before/after THE filter value".
@@ -965,7 +981,11 @@ pub struct ChangeSetRecord {
     /// [`ComAmazonawsMarketplacecatalogAwsmpseymourState::mint_change_set_id`].
     pub id: String,
     pub arn: String,
-    pub name: Option<String>,
+    /// The change set's `ChangeSetName`: the one the start named, or the one
+    /// the service set for a start that named none ([`default_change_set_name`]).
+    /// Never absent, so every change set reports a name and can be selected by
+    /// one.
+    pub name: String,
     /// One of `Intent`'s values.
     pub intent: String,
     /// One of `ChangeStatus`'s values.
@@ -1029,7 +1049,7 @@ impl ChangeSetRecord {
         ChangeSetSummaryListItem {
             change_set_id: Some(self.id.clone()),
             change_set_arn: Some(self.arn.clone()),
-            change_set_name: self.name.clone(),
+            change_set_name: Some(self.name.clone()),
             start_time: Some(self.start_time.clone()),
             end_time: self.end_time.clone(),
             status: Some(self.status.clone()),
@@ -1058,10 +1078,7 @@ impl ChangeSetRecord {
     pub fn matches_filter(&self, name: &str, values: &[String]) -> bool {
         let bound = values.first().map(String::as_str).unwrap_or_default();
         match name {
-            "ChangeSetName" => self
-                .name
-                .as_deref()
-                .is_some_and(|held| values.iter().any(|value| value == held)),
+            "ChangeSetName" => values.iter().any(|value| value == &self.name),
             "Status" => values.iter().any(|value| value == &self.status),
             "EntityId" => self
                 .entity_ids()
