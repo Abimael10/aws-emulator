@@ -71,7 +71,13 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(50);
 
 /// One ElastiCache call that must answer 200, as its awsQuery XML body.
-async fn elasticache(
+///
+/// `pub(crate)` from here down to [`given_subnet_group`], and again on the readers below,
+/// because the sibling suite
+/// [`crate::elasticache_cluster_event_notification_raises_the_queues_depth`] drives the same
+/// wiring over the same four services: a second copy of this plumbing would drift from this
+/// one.
+pub(crate) async fn elasticache(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -104,13 +110,13 @@ async fn ec2(
 /// The network a cluster of this suite is placed in: one VPC, one subnet per zone, one
 /// security group — all minted through Amazon EC2's own operations, so every identifier
 /// handed to ElastiCache is one the owner of subnets handed out.
-struct Network {
-    subnets: Vec<String>,
-    security_group: String,
+pub(crate) struct Network {
+    pub(crate) subnets: Vec<String>,
+    pub(crate) security_group: String,
 }
 
 /// Build that network in `region`, spanning `zones`.
-async fn given_network(
+pub(crate) async fn given_network(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -160,7 +166,7 @@ async fn given_network(
 }
 
 /// `CreateCacheSubnetGroup` over `network`'s subnets.
-async fn given_subnet_group(
+pub(crate) async fn given_subnet_group(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -217,7 +223,7 @@ fn notification_configuration(body: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Wait until the cluster `cluster` reports `available`, and answer that describe's body.
-async fn settled(
+pub(crate) async fn settled(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -240,7 +246,7 @@ async fn settled(
 
 /// Wait until the cluster's notification configuration reports `status`, and answer the
 /// `TopicArn` it reports beside it.
-async fn notification_status_reaches(
+pub(crate) async fn notification_status_reaches(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -265,7 +271,12 @@ async fn notification_status_reaches(
 
 /// Every message waiting on the queue at `url`, as the SNS envelope the queue carries it in,
 /// deleting what it hands over so a later leg reads only what arrived since.
-async fn drain(router: &MultiServiceRouter, case: &str, region: &str, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    url: &str,
+) -> Vec<Value> {
     let received = sqs(
         router,
         case,
@@ -321,7 +332,7 @@ async fn drain_until(
 }
 
 /// Whether `envelope`'s `Message` is a cluster notification naming `event`.
-fn names_event(envelope: &Value, event: &str) -> bool {
+pub(crate) fn names_event(envelope: &Value, event: &str) -> bool {
     envelope["Message"]
         .as_str()
         .and_then(|message| serde_json::from_str::<Value>(message).ok())
@@ -329,7 +340,7 @@ fn names_event(envelope: &Value, event: &str) -> bool {
 }
 
 /// The cluster the notification `envelope` names for `event`.
-fn cluster_named(envelope: &Value, event: &str) -> Option<String> {
+pub(crate) fn cluster_named(envelope: &Value, event: &str) -> Option<String> {
     let message = envelope["Message"].as_str()?;
     let document: Value = serde_json::from_str(message).ok()?;
     document
@@ -361,7 +372,7 @@ async fn recorded_events(
 
 /// Wait until `DescribeEvents` reports at least `wanted` events for the cluster, and answer
 /// them.
-async fn events_reach(
+pub(crate) async fn events_reach(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -605,7 +616,7 @@ async fn a_cluster_event_reaches_the_queue_subscribed_to_its_notification_topic(
 }
 
 /// `RebootCacheCluster` naming `nodes` of `cluster`.
-async fn reboot(
+pub(crate) async fn reboot(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
