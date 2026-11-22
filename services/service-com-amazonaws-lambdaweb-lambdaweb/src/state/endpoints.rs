@@ -18,7 +18,8 @@ use crate::ops::types::{
 };
 
 use super::{
-    resource_name_violation, ComAmazonawsLambdawebLambdawebState, PROVISIONING_DELAY,
+    resource_name_violation, ComAmazonawsLambdawebLambdawebState, RevisionState, WebFunction,
+    PROVISIONING_DELAY,
 };
 
 /// The longest `endpointName` the service accepts.
@@ -58,6 +59,22 @@ pub const AUTH_TYPE_IAM: &str = "IamAuth";
 /// The `authType` under which "your application handles authorization" (`AuthType`), so
 /// the published data plane refuses nothing itself.
 pub const AUTH_TYPE_APPLICATION_MANAGED: &str = "ApplicationManaged";
+
+/// The `updateStatus` an endpoint carries while the configuration change it was just
+/// given is being applied: "InProgress – The update is in progress."
+/// (`EndpointUpdateStatus`).
+pub const ENDPOINT_UPDATE_IN_PROGRESS: &str = "InProgress";
+
+/// The `updateStatus` an endpoint carries once that change has been applied:
+/// "Successful – The update completed successfully." (`EndpointUpdateStatus`).
+pub const ENDPOINT_UPDATE_SUCCESSFUL: &str = "Successful";
+
+/// `updateStatusReason` while an endpoint's update is still in progress.
+pub const ENDPOINT_UPDATE_IN_PROGRESS_REASON: &str = "The endpoint update is in progress.";
+
+/// `updateStatusReason` once an endpoint's update has completed.
+pub const ENDPOINT_UPDATE_SUCCESSFUL_REASON: &str =
+    "The endpoint update completed successfully.";
 
 /// The `endpointType` that serves traffic only from the Region the function was
 /// created in.
@@ -144,6 +161,10 @@ pub struct Endpoint {
     /// The instant the clock owes this endpoint its `Pending -> Active`
     /// transition, or `None` once it has been materialised.
     pub activates_at: Option<SystemTime>,
+    /// The instant the clock owes this endpoint the END of the update it was last
+    /// given — its `updateStatus` moving `InProgress -> Successful` — or `None` when
+    /// no update of it is outstanding.
+    pub update_completes_at: Option<SystemTime>,
 }
 
 impl Endpoint {
@@ -244,16 +265,177 @@ impl Endpoint {
     /// to the instant the transition was DUE, so the timestamp a caller reads is
     /// stable across reads.
     pub(super) fn materialise_due(&mut self, now: SystemTime) {
-        if self.state != EndpointState::Pending {
-            return;
+        if self.state == EndpointState::Pending {
+            if let Some(due) = self.activates_at.filter(|due| now >= *due) {
+                self.state = EndpointState::Active;
+                self.state_reason = ENDPOINT_ACTIVE_REASON.to_string();
+                self.updated_at = due;
+                self.activates_at = None;
+            }
         }
-        if let Some(due) = self.activates_at.filter(|due| now >= *due) {
-            self.state = EndpointState::Active;
-            self.state_reason = ENDPOINT_ACTIVE_REASON.to_string();
-            self.updated_at = due;
-            self.activates_at = None;
+        self.materialise_due_update(now);
+    }
+
+    /// Settle the update this endpoint was last given if the clock has already made
+    /// its end due: `updateStatus` moves to `Successful`. Owed at
+    /// [`Self::update_completes_at`] whether or not anybody called, and `updated_at`
+    /// moves to the instant it was DUE, so what a caller reads is stable across reads.
+    fn materialise_due_update(&mut self, now: SystemTime) {
+        if let Some(due) = self.update_completes_at.filter(|due| now >= *due) {
+            self.update_status = Some(ENDPOINT_UPDATE_SUCCESSFUL.to_string());
+            self.update_status_reason = Some(ENDPOINT_UPDATE_SUCCESSFUL_REASON.to_string());
+            self.updated_at = self.updated_at.max(due);
+            self.update_completes_at = None;
         }
     }
+
+    /// Apply `update` to this endpoint: every member the request named takes its new
+    /// value and every member it omitted keeps the stored one ("Omit this field to keep
+    /// the current …", stated by each updatable member of
+    /// `UpdateWebFunctionEndpointRequest`).
+    ///
+    /// The configuration change is asynchronous — the operation answers `202` — so the
+    /// endpoint reports its update `InProgress` and the clock owes it `Successful` one
+    /// [`PROVISIONING_DELAY`] later, which is never zero, so a caller reading straight
+    /// back still sees the transient status.
+    fn apply(&mut self, update: EndpointUpdate, now: SystemTime) {
+        if let Some(description) = update.description {
+            self.description = Some(description);
+        }
+        if let Some(auth_type) = update.auth_type {
+            self.auth_type = auth_type;
+        }
+        if let Some(auto_deployment_mode) = update.auto_deployment_mode {
+            self.auto_deployment_mode = auto_deployment_mode;
+        }
+        if let Some(revision_weights) = update.revision_weights {
+            self.revision_weights = revision_weights;
+        }
+        // "On an update, omit `scalingConfig` to keep the current value, or specify an
+        // empty object to clear a previously set value." (source: `smithy_query(
+        // query="doc", shape="ScalingConfig", member="maxEnvironments")`, and the same
+        // sentence for `ThrottleConfig$rateLimit`), so a configuration that sets none of
+        // its members clears the stored one rather than storing an empty shape.
+        if let Some(scaling_config) = update.scaling_config {
+            self.scaling_config = scaling_config
+                .max_environments
+                .is_some()
+                .then_some(scaling_config);
+        }
+        if let Some(throttle_config) = update.throttle_config {
+            self.throttle_config = throttle_config.rate_limit.is_some().then_some(throttle_config);
+        }
+        self.updated_at = now;
+        self.update_status = Some(ENDPOINT_UPDATE_IN_PROGRESS.to_string());
+        self.update_status_reason = Some(ENDPOINT_UPDATE_IN_PROGRESS_REASON.to_string());
+        self.update_completes_at = Some(now + PROVISIONING_DELAY);
+    }
+}
+
+/// The configuration change `UpdateWebFunctionEndpoint` was asked for: one member per
+/// member of its request that modifies the stored endpoint, `None` for a member the
+/// request omitted.
+///
+/// A `scaling_config` or `throttle_config` that sets none of its own members is the
+/// documented CLEAR of a previously set value, not an absent member — which is why the
+/// two are carried as the modelled shapes rather than as their inner values.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointUpdate {
+    pub description: Option<String>,
+    pub auth_type: Option<String>,
+    pub auto_deployment_mode: Option<String>,
+    pub revision_weights: Option<Vec<RevisionWeight>>,
+    pub scaling_config: Option<ScalingConfig>,
+    pub throttle_config: Option<ThrottleConfig>,
+}
+
+/// Why a requested `revisionWeights` list is not one an endpoint of a web function can
+/// serve. Two different refusals, kept apart because they are different classes: the
+/// caller answers [`Self::UnknownRevision`] with the modelled `ResourceNotFoundException`
+/// and [`Self::RepeatedRevision`] with a `ValidationException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionWeightProblem {
+    /// A weight names a revision the function does not have.
+    UnknownRevision { revision_id: String },
+    /// Two weights name ONE revision.
+    RepeatedRevision { revision_id: String },
+}
+
+impl RevisionWeightProblem {
+    /// The refusal's message, worded once here so every operation that applies the rule
+    /// reports it identically.
+    pub fn message(&self, function_name: &str) -> String {
+        match self {
+            Self::UnknownRevision { revision_id } => format!(
+                "The revision {revision_id} of web function {function_name} doesn't exist."
+            ),
+            Self::RepeatedRevision { revision_id } => format!(
+                "The revisionWeights parameter names revision {revision_id} more than once: each \
+                 entry must name a different revision."
+            ),
+        }
+    }
+}
+
+/// Why `requested` is not a set of revision weights an endpoint of `function` can serve,
+/// or `None` when it is.
+///
+/// A named revision has to be one of the function's own: an endpoint "maps a revision to
+/// a weight", so a weight naming no stored revision names nothing. The list is
+/// `@uniqueItems`, which refuses two identical ENTRIES at the boundary but not two
+/// weights for one revision, and "you can assign weights to up to two revisions"
+/// (`RevisionWeight`) — one revision twice is not two revisions.
+pub fn revision_weight_problem(
+    function: &WebFunction,
+    requested: &[RevisionWeight],
+) -> Option<RevisionWeightProblem> {
+    let mut named: Vec<&str> = Vec::with_capacity(requested.len());
+    for weight in requested {
+        if !function.revisions.contains_key(&weight.revision_id) {
+            return Some(RevisionWeightProblem::UnknownRevision {
+                revision_id: weight.revision_id.clone(),
+            });
+        }
+        if named.contains(&weight.revision_id.as_str()) {
+            return Some(RevisionWeightProblem::RepeatedRevision {
+                revision_id: weight.revision_id.clone(),
+            });
+        }
+        named.push(&weight.revision_id);
+    }
+    None
+}
+
+/// Why `function`'s newest revision is not one an endpoint can be switched onto, or
+/// `None` when it is. The caller answers `Some` with the modelled `ConflictException`.
+///
+/// An endpoint in the [`AUTO_DEPLOYMENT_MODE_LATEST_REVISION`] mode "automatically serves
+/// the newest revision" (`AutoDeploymentMode`), and only a revision the service reports
+/// `Active` is "ready to serve traffic" (`RevisionState`) — so putting an endpoint into
+/// that mode while the newest revision is still building, or while its build failed,
+/// would route the endpoint's traffic onto a revision that cannot take it: a conflict
+/// with the current state of the resource rather than a change the service can make.
+///
+/// A function with no revision at all has nothing for the mode to switch the endpoint
+/// ONTO, so there is no conflict to report: the endpoint keeps serving the revisions its
+/// `@required` `revisionWeights` already name.
+///
+/// The refusal reports the resource the request conflicts with and the state it is in,
+/// and closes with the sentence the model's own `ConflictException` documentation states
+/// for this class — "Resolve the conflict and try again." — with the revision, the
+/// function and the state taken from the store.
+pub fn latest_revision_switch_conflict(function: &WebFunction) -> Option<String> {
+    let newest = function.latest_revision()?;
+    if newest.state == RevisionState::Active {
+        return None;
+    }
+    Some(format!(
+        "The revision {} of web function {} is in the {} state. Resolve the conflict and try \
+         again.",
+        newest.revision_id,
+        function.function_name,
+        newest.state.wire()
+    ))
 }
 
 /// The endpoint a create was asked for, as the two create paths supply it: the
@@ -296,6 +478,17 @@ pub fn resolve_endpoint_name(value: &str) -> &str {
     value
         .split_once("/endpoint/")
         .map_or(value, |(_, name)| name)
+}
+
+/// AWS's `ResourceNotFoundException` message for an endpoint a web function does not
+/// carry, naming it by `identifier` — the value the request addressed it by, verbatim,
+/// whether that was the name or the ARN.
+///
+/// The model fixes the status (404), the code and `message` being `@required`, but not
+/// the text, so the sentence is this service's behaviour — worded once here, so every
+/// operation that resolves an endpoint reports the absent endpoint alike.
+pub fn endpoint_not_found_message(identifier: &str, function_name: &str) -> String {
+    format!("The endpoint {identifier} doesn't exist on web function {function_name}.")
 }
 
 /// Why `config` is not an endpoint this service can create in `home_region`, or
@@ -432,11 +625,37 @@ impl ComAmazonawsLambdawebLambdawebState {
             created_at: now,
             updated_at: now,
             activates_at: Some(now + PROVISIONING_DELAY + PROVISIONING_DELAY),
+            update_completes_at: None,
         };
         let endpoint_name = endpoint.endpoint_name.clone();
         function.endpoints.insert(endpoint_name.clone(), endpoint);
         function.updated_at = now;
         Some(endpoint_name)
+    }
+
+    /// Apply `update` to the endpoint `endpoint_name` of `function_name`, reporting
+    /// whether both are stored.
+    ///
+    /// An endpoint left in the [`AUTO_DEPLOYMENT_MODE_LATEST_REVISION`] mode serves the
+    /// newest revision that has built, so the switch the clock owes every endpoint in
+    /// that mode is taken here too — an update that turns the mode on routes the
+    /// endpoint onto that revision at once instead of at whatever call comes next.
+    pub fn update_endpoint(
+        &mut self,
+        function_name: &str,
+        endpoint_name: &str,
+        update: EndpointUpdate,
+        now: SystemTime,
+    ) -> bool {
+        let Some(function) = self.functions.get_mut(function_name) else {
+            return false;
+        };
+        let Some(endpoint) = function.endpoints.get_mut(endpoint_name) else {
+            return false;
+        };
+        endpoint.apply(update, now);
+        function.deploy_latest_revision();
+        true
     }
 }
 
@@ -474,6 +693,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             activates_at: None,
+            update_completes_at: None,
         }
     }
 

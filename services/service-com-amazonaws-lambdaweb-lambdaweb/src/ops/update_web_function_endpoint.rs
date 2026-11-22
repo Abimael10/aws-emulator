@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebFunctionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebFunctionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebFunctionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the configuration of an endpoint the store already holds, in the endpoint
+//! slice of this service's state ([`crate::state::endpoints`]) — the same record
+//! `CreateWebFunction`'s initial endpoint, `CreateWebFunctionEndpoint` and
+//! `GetWebFunctionEndpoint` write and read, so what this update reports is what every
+//! endpoint reader of this service reports for the same endpoint.
+//!
+//! Only the members the request names are changed; every member it omits keeps its
+//! stored value. Switching an endpoint into the auto-deployment mode is refused while
+//! the function's newest revision is not ready to serve traffic
+//! ([`crate::state::latest_revision_switch_conflict`]), and the change itself is
+//! asynchronous: the endpoint reports its `updateStatus` `InProgress` until the clock
+//! owes it `Successful`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,6 +193,104 @@ impl From<UpdateWebFunctionEndpointErrorModeled> for UpdateWebFunctionEndpointEr
     }
 }
 
+/// One refusal of a request this operation models no other error for: a 400
+/// `ValidationException` carrying `message`.
+fn validation(message: String) -> UpdateWebFunctionEndpointError {
+    UpdateWebFunctionEndpointErrorModeled::ValidationException(ValidationException { message })
+        .into()
+}
+
+/// The modelled 404 for a resource this store does not hold, carrying `message`.
+fn not_found(message: String) -> UpdateWebFunctionEndpointError {
+    UpdateWebFunctionEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: None,
+        resource_type: None,
+    })
+    .into()
+}
+
+/// The modelled 409 for a change that conflicts with the current state of the resource,
+/// carrying `message`.
+fn conflict(message: String) -> UpdateWebFunctionEndpointError {
+    UpdateWebFunctionEndpointErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id: None,
+        resource_type: None,
+    })
+    .into()
+}
+
+/// The modelled 500 for a store this handler cannot reach, or whose record moved out
+/// from under the guard that found it — never a success reported for a change nothing
+/// was written for.
+fn unavailable() -> UpdateWebFunctionEndpointError {
+    UpdateWebFunctionEndpointErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the web function store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The stored web function `function_name` names, or the modelled 404 for a function this
+/// store does not hold. `identifier` is what the request named it by, which is what the
+/// refusal quotes back.
+fn require_function<'store>(
+    state: &'store crate::state::ComAmazonawsLambdawebLambdawebState,
+    function_name: &str,
+    identifier: &str,
+) -> Result<&'store crate::state::WebFunction, UpdateWebFunctionEndpointError> {
+    state
+        .functions
+        .get(function_name)
+        .ok_or_else(|| not_found(crate::state::function_not_found_message(identifier)))
+}
+
+/// The stored endpoint `endpoint_name` names on `function`, or the modelled 404 for an
+/// endpoint that function does not carry.
+fn require_endpoint<'store>(
+    function: &'store crate::state::WebFunction,
+    endpoint_name: &str,
+    identifier: &str,
+) -> Result<&'store crate::state::Endpoint, UpdateWebFunctionEndpointError> {
+    function.endpoints.get(endpoint_name).ok_or_else(|| {
+        not_found(crate::state::endpoint_not_found_message(
+            identifier,
+            &function.function_name,
+        ))
+    })
+}
+
+/// Why the endpoint cannot serve the revisions `requested` names, or `None` when it can:
+/// the one rule the create path applies too, mapped onto this operation's error channel.
+fn refuse_requested_weights(
+    function: &crate::state::WebFunction,
+    requested: Option<&[RevisionWeight]>,
+) -> Result<(), UpdateWebFunctionEndpointError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let Some(problem) = crate::state::revision_weight_problem(function, requested) else {
+        return Ok(());
+    };
+    let message = problem.message(&function.function_name);
+    Err(match problem {
+        crate::state::RevisionWeightProblem::UnknownRevision { .. } => not_found(message),
+        crate::state::RevisionWeightProblem::RepeatedRevision { .. } => validation(message),
+    })
+}
+
+/// Whether this request SWITCHES `endpoint` into the auto-deployment mode — asks for
+/// [`crate::state::AUTO_DEPLOYMENT_MODE_LATEST_REVISION`] on an endpoint that is not in
+/// it already. An endpoint that is in that mode is serving what the mode already chose,
+/// so a request repeating it moves the endpoint onto nothing.
+fn switches_to_latest_revision(
+    endpoint: &crate::state::Endpoint,
+    requested: Option<&str>,
+) -> bool {
+    requested == Some(crate::state::AUTO_DEPLOYMENT_MODE_LATEST_REVISION)
+        && endpoint.auto_deployment_mode != crate::state::AUTO_DEPLOYMENT_MODE_LATEST_REVISION
+}
+
 /// The `UpdateWebFunctionEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -225,18 +327,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebFunctionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebFunctionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebFunctionEndpoint"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // Either resource may be named by name or by ARN; both resolve to the one stored
+        // record.
+        let function_name = crate::state::resolve_function_name(&input.function_name).to_string();
+        let endpoint_name = crate::state::resolve_endpoint_name(&input.endpoint_name).to_string();
+
+        // ONE guard decides and writes, so nothing can move between the refusals below
+        // and the change they clear.
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.materialise_due_transitions(now);
+
+        {
+            let function = require_function(&store, &function_name, &input.function_name)?;
+            let endpoint = require_endpoint(function, &endpoint_name, &input.endpoint_name)?;
+            refuse_requested_weights(function, input.revision_weights.as_deref())?;
+            // Switching the endpoint onto the newest revision is only a change the
+            // service can make while that revision is ready to serve traffic.
+            if switches_to_latest_revision(endpoint, input.auto_deployment_mode.as_deref()) {
+                if let Some(message) = crate::state::latest_revision_switch_conflict(function) {
+                    return Err(conflict(message));
+                }
+            }
+        }
+
+        if !store.update_endpoint(
+            &function_name,
+            &endpoint_name,
+            crate::state::EndpointUpdate {
+                description: input.description,
+                auth_type: input.auth_type,
+                auto_deployment_mode: input.auto_deployment_mode,
+                revision_weights: input.revision_weights,
+                scaling_config: input.scaling_config,
+                throttle_config: input.throttle_config,
+            },
+            now,
+        ) {
+            return Err(unavailable());
+        }
+
+        // Every member below comes out of the stored record, so what this update reports
+        // is what the endpoint readers of this service report for the same endpoint.
+        let function = store.functions.get(&function_name).ok_or_else(unavailable)?;
+        let endpoint = function
+            .endpoints
+            .get(&endpoint_name)
+            .ok_or_else(unavailable)?;
+        // The audit record for a state change: who, what, outcome. No secret and no
+        // credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        ::tracing::info!(
+            operation = "UpdateWebFunctionEndpoint",
+            akid = %akid,
+            function_name = %function.function_name,
+            endpoint_arn = %endpoint.endpoint_arn,
+            outcome = "updated",
+            "web function endpoint updated"
+        );
+        Ok(UpdateWebFunctionEndpointOutput {
+            function_arn: function.function_arn.clone(),
+            endpoint_arn: endpoint.endpoint_arn.clone(),
+            endpoint_name: endpoint.endpoint_name.clone(),
+            description: endpoint.description.clone(),
+            endpoint_type: endpoint.endpoint_type.clone(),
+            domain_name: endpoint.domain_name.clone(),
+            auth_type: endpoint.auth_type.clone(),
+            auto_deployment_mode: endpoint.auto_deployment_mode.clone(),
+            revision_weights: endpoint.revision_weights.clone(),
+            regions: endpoint.region_list(),
+            scaling_config: endpoint.scaling_config.clone(),
+            throttle_config: endpoint.throttle_config.clone(),
+            state: endpoint.state.wire().to_string(),
+            state_reason: endpoint.state_reason.clone(),
+            update_status: endpoint.update_status.clone(),
+            update_status_reason: endpoint.update_status_reason.clone(),
+            regional_endpoints: endpoint.regional_endpoints(),
+            created_at: ::aws_smithy_types::DateTime::from(endpoint.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(endpoint.updated_at),
+        })
     }
 }

@@ -1733,6 +1733,703 @@ type AddressRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], u16);
 const SIGNED_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
                                     lambda/aws4_request, SignedHeaders=host, Signature=deadbeef";
 
+/// `PATCH /web-functions/{functionName}/endpoints/{endpointName}` —
+/// `UpdateWebFunctionEndpoint` (model: `smithy_query(query="operation",
+/// operation="UpdateWebFunctionEndpoint")`).
+async fn update_endpoint(
+    emulator: &Emulator,
+    function_name: &str,
+    endpoint_name: &str,
+    body: Value,
+) -> Reply {
+    emulator
+        .send(
+            "PATCH",
+            &format!("/web-functions/{function_name}/endpoints/{endpoint_name}"),
+            REGION,
+            Some(body),
+        )
+        .await
+}
+
+/// The `description` every endpoint an update starts from carries.
+const BASELINE_DESCRIPTION: &str = "the endpoint an update starts from";
+
+/// The endpoint every update row below starts from: every member an update may change
+/// is already set, so a row that names ONE member proves the others keep their stored
+/// value.
+fn baseline_config(endpoint_name: &str, revision_id: &str) -> Value {
+    json!({
+        "endpointName": endpoint_name,
+        "endpointType": "HomeRegion",
+        "authType": "IamAuth",
+        "autoDeploymentMode": "Disabled",
+        "description": BASELINE_DESCRIPTION,
+        "revisionWeights": [{ "revisionId": revision_id, "weight": 100 }],
+        "scalingConfig": { "maxEnvironments": 5 },
+        "throttleConfig": { "rateLimit": 100 },
+    })
+}
+
+/// Every member an update may change, as the baseline endpoint reports it.
+fn baseline_members(revision_id: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("description", json!(BASELINE_DESCRIPTION)),
+        ("authType", json!("IamAuth")),
+        ("autoDeploymentMode", json!("Disabled")),
+        (
+            "revisionWeights",
+            json!([{ "revisionId": revision_id, "weight": 100 }]),
+        ),
+        ("scalingConfig", json!({ "maxEnvironments": 5 })),
+        ("throttleConfig", json!({ "rateLimit": 100 })),
+    ]
+}
+
+/// One row of the update table: the members the request names, and the members the
+/// endpoint has to report afterwards — every member a row does not list keeps its
+/// baseline value.
+struct UpdateCase {
+    case: &'static str,
+    /// The body the request sends, built from the function's two revisions.
+    patch: fn(&str, &str) -> Value,
+    /// Address the function and the endpoint by their ARNs rather than by their names.
+    by_arn: bool,
+    /// The members that must have changed, built from those same two revisions.
+    changed: fn(&str, &str) -> Vec<(&'static str, Value)>,
+}
+
+/// The table: the rule generalises over WHICH member an update names and what kind of
+/// change it is, so the rows differ along both — one member and several at once, a
+/// value replaced, a value set to the empty string, a configuration cleared by the
+/// documented empty object, traffic moved and traffic split, nothing named at all, and
+/// the resources addressed by ARN rather than by name. `scalingConfig.maxEnvironments`
+/// is `@range(2..10000)` and `throttleConfig.rateLimit` is `@range(0..)` (model:
+/// shapes `ScalingConfig` / `ThrottleConfig`), so the rows that set them sit on those
+/// published bounds, and `Description` is `@length(0..256)`, so the empty string is a
+/// value the member takes.
+fn update_cases() -> Vec<UpdateCase> {
+    vec![
+        UpdateCase {
+            case: "another description",
+            patch: |_, _| json!({ "description": "a second description" }),
+            by_arn: false,
+            changed: |_, _| vec![("description", json!("a second description"))],
+        },
+        UpdateCase {
+            case: "the empty description",
+            patch: |_, _| json!({ "description": "" }),
+            by_arn: false,
+            changed: |_, _| vec![("description", json!(""))],
+        },
+        UpdateCase {
+            case: "another authType",
+            patch: |_, _| json!({ "authType": "ApplicationManaged" }),
+            by_arn: false,
+            changed: |_, _| vec![("authType", json!("ApplicationManaged"))],
+        },
+        UpdateCase {
+            case: "the scaling configuration at its published maximum",
+            patch: |_, _| json!({ "scalingConfig": { "maxEnvironments": 10000 } }),
+            by_arn: false,
+            changed: |_, _| vec![("scalingConfig", json!({ "maxEnvironments": 10000 }))],
+        },
+        UpdateCase {
+            case: "the scaling configuration at its published minimum",
+            patch: |_, _| json!({ "scalingConfig": { "maxEnvironments": 2 } }),
+            by_arn: false,
+            changed: |_, _| vec![("scalingConfig", json!({ "maxEnvironments": 2 }))],
+        },
+        UpdateCase {
+            case: "the scaling configuration cleared by an empty object",
+            patch: |_, _| json!({ "scalingConfig": {} }),
+            by_arn: false,
+            changed: |_, _| vec![("scalingConfig", Value::Null)],
+        },
+        UpdateCase {
+            case: "the throttling configuration at its published minimum",
+            patch: |_, _| json!({ "throttleConfig": { "rateLimit": 0 } }),
+            by_arn: false,
+            changed: |_, _| vec![("throttleConfig", json!({ "rateLimit": 0 }))],
+        },
+        UpdateCase {
+            case: "the throttling configuration cleared by an empty object",
+            patch: |_, _| json!({ "throttleConfig": {} }),
+            by_arn: false,
+            changed: |_, _| vec![("throttleConfig", Value::Null)],
+        },
+        UpdateCase {
+            case: "the traffic moved onto another revision",
+            patch: |_, revision_b| {
+                json!({ "revisionWeights": [{ "revisionId": revision_b, "weight": 100 }] })
+            },
+            by_arn: false,
+            changed: |_, revision_b| {
+                vec![(
+                    "revisionWeights",
+                    json!([{ "revisionId": revision_b, "weight": 100 }]),
+                )]
+            },
+        },
+        UpdateCase {
+            case: "the traffic split across two revisions",
+            patch: |revision_a, revision_b| {
+                json!({
+                    "revisionWeights": [
+                        { "revisionId": revision_a, "weight": 70 },
+                        { "revisionId": revision_b, "weight": 30 },
+                    ],
+                })
+            },
+            by_arn: false,
+            changed: |revision_a, revision_b| {
+                vec![(
+                    "revisionWeights",
+                    json!([
+                        { "revisionId": revision_a, "weight": 70 },
+                        { "revisionId": revision_b, "weight": 30 },
+                    ]),
+                )]
+            },
+        },
+        UpdateCase {
+            case: "every changeable member at once",
+            patch: |_, revision_b| {
+                json!({
+                    "description": "everything at once",
+                    "authType": "ApplicationManaged",
+                    "revisionWeights": [{ "revisionId": revision_b, "weight": 100 }],
+                    "scalingConfig": { "maxEnvironments": 9 },
+                    "throttleConfig": { "rateLimit": 10000 },
+                })
+            },
+            by_arn: false,
+            changed: |_, revision_b| {
+                vec![
+                    ("description", json!("everything at once")),
+                    ("authType", json!("ApplicationManaged")),
+                    (
+                        "revisionWeights",
+                        json!([{ "revisionId": revision_b, "weight": 100 }]),
+                    ),
+                    ("scalingConfig", json!({ "maxEnvironments": 9 })),
+                    ("throttleConfig", json!({ "rateLimit": 10000 })),
+                ]
+            },
+        },
+        UpdateCase {
+            case: "no member at all",
+            patch: |_, _| json!({}),
+            by_arn: false,
+            changed: |_, _| Vec::new(),
+        },
+        UpdateCase {
+            case: "the function and the endpoint addressed by ARN",
+            patch: |_, _| json!({ "description": "addressed by ARN" }),
+            by_arn: true,
+            changed: |_, _| vec![("description", json!("addressed by ARN"))],
+        },
+    ]
+}
+
+/// `expected` with `name` reporting `value`, replacing the entry it already has for it.
+fn with_member(
+    mut expected: Vec<(&'static str, Value)>,
+    name: &'static str,
+    value: Value,
+) -> Vec<(&'static str, Value)> {
+    match expected.iter_mut().find(|(member, _)| *member == name) {
+        Some(entry) => entry.1 = value,
+        None => expected.push((name, value)),
+    }
+    expected
+}
+
+/// RULE: an update of an endpoint changes exactly the members the request names — every
+/// other member keeps the value the store holds ("Omit this field to keep the current
+/// …"), and a `scalingConfig` or `throttleConfig` that sets none of its own members
+/// clears a previously set value — and persists it in the function's own endpoint
+/// slice, so `GetWebFunctionEndpoint` reports the same record afterwards.
+#[tokio::test]
+async fn an_update_changes_the_members_it_names_and_keeps_the_rest() {
+    let emulator = Emulator::new();
+    // One web function per row, each with two revisions of its own: an endpoint cannot
+    // be removed from a function, so a row that needs a fresh baseline endpoint needs a
+    // function to put it on.
+    for (index, row) in update_cases().into_iter().enumerate() {
+        let function_name = format!("endpoint-updates-{index}");
+        let revision_a = function_with_a_revision(&emulator, &function_name).await;
+        let revision_b = create_revision(&emulator, &function_name).await;
+        let function_arn = expected_arn(REGION, &function_name);
+        let endpoint_name = "ep".to_string();
+        let created = create_endpoint(
+            &emulator,
+            &function_name,
+            baseline_config(&endpoint_name, &revision_a),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {:?}: the baseline endpoint must be created, got {} with {:?}",
+            row.case, created.status, created.body
+        );
+        let endpoint_arn = created.string("endpointArn").unwrap_or_default();
+
+        let (function_id, endpoint_id) = if row.by_arn {
+            (
+                percent_encoded(&function_arn),
+                percent_encoded(&endpoint_arn),
+            )
+        } else {
+            (function_name.clone(), endpoint_name.clone())
+        };
+        let updated = update_endpoint(
+            &emulator,
+            &function_id,
+            &endpoint_id,
+            (row.patch)(&revision_a, &revision_b),
+        )
+        .await;
+        assert_eq!(
+            updated.status, 202,
+            "case {:?}: UpdateWebFunctionEndpoint expected 202, got {} with {:?}",
+            row.case, updated.status, updated.body
+        );
+
+        let mut expected = baseline_members(&revision_a);
+        for (name, value) in (row.changed)(&revision_a, &revision_b) {
+            expected = with_member(expected, name, value);
+        }
+        let read = get_endpoint(&emulator, &function_name, &endpoint_name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: GetWebFunctionEndpoint expected 200, got {} with {:?}",
+            row.case, read.status, read.body
+        );
+        // The answer and the read-back are the same stored record, so both are held to
+        // the whole expected configuration.
+        for reported in [&updated.body, &read.body] {
+            for (name, value) in &expected {
+                assert_eq!(
+                    &member(reported, name),
+                    value,
+                    "case {:?}: expected {name} to report {value:?}, got {reported:?}",
+                    row.case
+                );
+            }
+            // What an update never moves: the endpoint's identity, its type, the
+            // address it is published at and when it was created.
+            for name in [
+                "endpointName",
+                "endpointArn",
+                "endpointType",
+                "domainName",
+                "createdAt",
+                "functionArn",
+            ] {
+                assert_eq!(
+                    member(reported, name),
+                    member(&created.body, name),
+                    "case {:?}: {name} must not move, got {reported:?}",
+                    row.case
+                );
+            }
+            assert_eq!(
+                region_set(reported),
+                region_set(&created.body),
+                "case {:?}: the Regions must not move, got {reported:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// Poll `GetWebFunctionEndpoint` until the endpoint reports `update_status`, and report
+/// that read.
+///
+/// The end of an update is owed to the CLOCK, so the test waits for the CONDITION: it
+/// looks again until it holds, or until a deadline far longer than the service's own
+/// span has passed.
+async fn poll_until_update_status(
+    emulator: &Emulator,
+    function_name: &str,
+    endpoint_name: &str,
+    update_status: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let read = get_endpoint(emulator, function_name, endpoint_name).await;
+        if member(&read.body, "updateStatus") == json!(update_status) {
+            return read.body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {function_name}/{endpoint_name}: the update never reached \
+             {update_status}, last read {:?}",
+            read.body
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// RULE: the configuration change an update asks for is applied asynchronously — the
+/// operation answers `202 Accepted` — so the endpoint reports the update `InProgress`
+/// with the reason for that status, and the clock owes it `Successful`: the status
+/// settles whether or not anybody calls, and then stays put.
+#[tokio::test]
+async fn an_update_reports_its_status_until_the_clock_completes_it() {
+    let emulator = Emulator::new();
+    let function_name = "endpoint-update-status";
+    let revision_a = function_with_a_revision(&emulator, function_name).await;
+
+    // The rows differ in what the update changed: the status an endpoint reports is
+    // the status of the most recent update, whatever that update named.
+    let rows: [(&str, Value); 3] = [
+        ("a description", json!({ "description": "a changed endpoint" })),
+        ("an authType", json!({ "authType": "ApplicationManaged" })),
+        ("no member at all", json!({})),
+    ];
+    for (index, (case, patch)) in rows.into_iter().enumerate() {
+        let endpoint_name = format!("ep-{index}");
+        let created = create_endpoint(
+            &emulator,
+            function_name,
+            baseline_config(&endpoint_name, &revision_a),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: the baseline endpoint must be created, got {} with {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            member(&created.body, "updateStatus"),
+            Value::Null,
+            "case {case:?}: an endpoint nobody updated reports no update status, got {:?}",
+            created.body
+        );
+
+        let updated = update_endpoint(&emulator, function_name, &endpoint_name, patch).await;
+        assert_eq!(
+            updated.status, 202,
+            "case {case:?}: UpdateWebFunctionEndpoint expected 202, got {} with {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            member(&updated.body, "updateStatus"),
+            json!("InProgress"),
+            "case {case:?}: an accepted update is in progress, got {:?}",
+            updated.body
+        );
+        assert!(
+            member(&updated.body, "updateStatusReason")
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case:?}: an in-progress update reports the reason for its status, got {:?}",
+            updated.body
+        );
+
+        let settled =
+            poll_until_update_status(&emulator, function_name, &endpoint_name, "Successful").await;
+        assert!(
+            member(&settled, "updateStatusReason")
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case:?}: a completed update reports the reason for its status, got {settled:?}"
+        );
+        let again = get_endpoint(&emulator, function_name, &endpoint_name).await;
+        assert_eq!(
+            member(&again.body, "updateStatus"),
+            json!("Successful"),
+            "case {case:?}: a completed update stays completed, got {:?}",
+            again.body
+        );
+        assert_eq!(
+            member(&again.body, "updatedAt"),
+            member(&settled, "updatedAt"),
+            "case {case:?}: the timestamp a caller reads must be stable across reads, got {:?}",
+            again.body
+        );
+    }
+}
+
+/// RULE: an update writes the ONE record the endpoint's own data plane is served from,
+/// so the `authType` it stores decides the next request at the published address:
+/// `IamAuth` ("requests … must be signed with Signature Version 4") refuses a request
+/// presenting no SigV4 credential, while `ApplicationManaged` ("your application
+/// handles authorization") refuses nothing of its own.
+#[tokio::test]
+async fn an_updated_auth_type_decides_the_published_address() {
+    let emulator = Emulator::new();
+    let function_name = "endpoint-update-auth";
+    function_with_a_revision(&emulator, function_name).await;
+    let endpoint_name = "ep";
+    let created = create_endpoint(
+        &emulator,
+        function_name,
+        json!({
+            "endpointName": endpoint_name,
+            "endpointType": "HomeRegion",
+            "authType": "ApplicationManaged",
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "the endpoint must be created, got {} with {:?}",
+        created.status, created.body
+    );
+    poll_until_active(&emulator, function_name, endpoint_name).await;
+
+    // (case, the authType the update asks for, whether the address then refuses a
+    // request presenting no SigV4 credential)
+    let rows: [(&str, &str, bool); 3] = [
+        ("application-managed, as created", "ApplicationManaged", false),
+        ("switched to IamAuth", "IamAuth", true),
+        ("switched back to ApplicationManaged", "ApplicationManaged", false),
+    ];
+    for (case, auth_type, refuses_unsigned) in rows {
+        let updated = update_endpoint(
+            &emulator,
+            function_name,
+            endpoint_name,
+            json!({ "authType": auth_type }),
+        )
+        .await;
+        assert_eq!(
+            updated.status, 202,
+            "case {case:?}: UpdateWebFunctionEndpoint expected 202, got {} with {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            member(&updated.body, "authType"),
+            json!(auth_type),
+            "case {case:?}: the update reports the stored authType, got {:?}",
+            updated.body
+        );
+        // What an authorized request is answered with is the web function's own
+        // handler's answer, which no `authType` decides — so it is the signed request's
+        // own answer each row is read against, never a status written out here.
+        let signed = request_endpoint(
+            &emulator,
+            function_name,
+            endpoint_name,
+            "/",
+            &[("authorization", SIGNED_AUTHORIZATION)],
+        )
+        .await;
+        assert_ne!(
+            signed.status().as_u16(),
+            403,
+            "case {case:?}: a request presenting a SigV4 credential is never refused for \
+             presenting none, got {} with {:?}",
+            signed.status(),
+            String::from_utf8_lossy(signed.body())
+        );
+        let unsigned = request_endpoint(&emulator, function_name, endpoint_name, "/", &[]).await;
+        if refuses_unsigned {
+            assert_eq!(
+                unsigned.status().as_u16(),
+                403,
+                "case {case:?}: an unsigned GET expected 403, got {} with {:?}",
+                unsigned.status(),
+                String::from_utf8_lossy(unsigned.body())
+            );
+        } else {
+            assert_eq!(
+                unsigned.status().as_u16(),
+                signed.status().as_u16(),
+                "case {case:?}: ApplicationManaged refuses nothing of its own, so an \
+                 unsigned GET is answered exactly as a signed one, got {} with {:?}",
+                unsigned.status(),
+                String::from_utf8_lossy(unsigned.body())
+            );
+        }
+    }
+}
+
+/// RULE: an update addresses a stored endpoint of a stored web function and may only
+/// point it at that function's own revisions, once each — so a request naming anything
+/// else is refused with the modelled error for what it named, and a refused update
+/// leaves the stored endpoint exactly as it was.
+#[tokio::test]
+async fn an_update_that_names_what_the_store_does_not_hold_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    let function_name = "endpoint-update-refusals";
+    let revision_a = function_with_a_revision(&emulator, function_name).await;
+    let endpoint_name = "ep";
+    let created = create_endpoint(
+        &emulator,
+        function_name,
+        baseline_config(endpoint_name, &revision_a),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "the baseline endpoint must be created, got {} with {:?}",
+        created.status, created.body
+    );
+
+    // A `revisionId` in the shape this service mints them in that nothing was ever
+    // minted under (`^[0-9a-f-]{36}$`).
+    let absent_revision = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    // One row of the refusal table: what the request addressed and sent, and the
+    // refusal it earns. `message` is set where THIS service words the refusal; a
+    // modelled constraint is worded by the boundary validator, so those rows assert the
+    // status and the error shape only.
+    struct RefusalCase {
+        case: &'static str,
+        function_id: String,
+        endpoint_id: String,
+        patch: Value,
+        status: u16,
+        error: &'static str,
+        message: Option<String>,
+    }
+    // The addressing every row but the two that name an absent resource uses.
+    let addressed = |case: &'static str,
+                     patch: Value,
+                     status: u16,
+                     error: &'static str,
+                     message: Option<String>| RefusalCase {
+        case,
+        function_id: function_name.to_string(),
+        endpoint_id: endpoint_name.to_string(),
+        patch,
+        status,
+        error,
+        message,
+    };
+    let rows: Vec<RefusalCase> = vec![
+        RefusalCase {
+            case: "a function nobody created",
+            function_id: "no-such-function".to_string(),
+            endpoint_id: endpoint_name.to_string(),
+            patch: json!({ "description": "x" }),
+            status: 404,
+            error: "ResourceNotFoundException",
+            message: Some("The function no-such-function does not exist.".to_string()),
+        },
+        RefusalCase {
+            case: "an endpoint the function does not carry",
+            function_id: function_name.to_string(),
+            endpoint_id: "no-such-endpoint".to_string(),
+            patch: json!({ "description": "x" }),
+            status: 404,
+            error: "ResourceNotFoundException",
+            message: Some(format!(
+                "The endpoint no-such-endpoint doesn't exist on web function {function_name}."
+            )),
+        },
+        addressed(
+            "a weight naming a revision the function does not have",
+            json!({ "revisionWeights": [{ "revisionId": absent_revision, "weight": 100 }] }),
+            404,
+            "ResourceNotFoundException",
+            Some(format!(
+                "The revision {absent_revision} of web function {function_name} doesn't exist."
+            )),
+        ),
+        addressed(
+            "two weights naming ONE revision",
+            json!({
+                "revisionWeights": [
+                    { "revisionId": revision_a, "weight": 60 },
+                    { "revisionId": revision_a, "weight": 40 },
+                ],
+            }),
+            400,
+            "ValidationException",
+            Some(format!(
+                "The revisionWeights parameter names revision {revision_a} more than once: each \
+                 entry must name a different revision."
+            )),
+        ),
+        addressed(
+            "a weight below the published range",
+            json!({ "revisionWeights": [{ "revisionId": revision_a, "weight": 0 }] }),
+            400,
+            "ValidationException",
+            None,
+        ),
+        addressed(
+            "a weight above the published range",
+            json!({ "revisionWeights": [{ "revisionId": revision_a, "weight": 101 }] }),
+            400,
+            "ValidationException",
+            None,
+        ),
+        addressed(
+            "more revisions than an endpoint may split traffic across",
+            json!({
+                "revisionWeights": [
+                    { "revisionId": revision_a, "weight": 50 },
+                    { "revisionId": revision_a, "weight": 30 },
+                    { "revisionId": revision_a, "weight": 20 },
+                ],
+            }),
+            400,
+            "ValidationException",
+            None,
+        ),
+        addressed(
+            "a scaling configuration below the published range",
+            json!({ "scalingConfig": { "maxEnvironments": 1 } }),
+            400,
+            "ValidationException",
+            None,
+        ),
+        addressed(
+            "an authType outside the enum",
+            json!({ "authType": "SomethingElse" }),
+            400,
+            "ValidationException",
+            None,
+        ),
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let refused = update_endpoint(&emulator, &row.function_id, &row.endpoint_id, row.patch).await;
+        assert_eq!(
+            refused.status, row.status,
+            "case {case:?}: expected {}, got {} with {:?}",
+            row.status, refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error(),
+            row.error,
+            "case {case:?}: expected {}, got {:?}",
+            row.error,
+            refused.body
+        );
+        if let Some(message) = row.message {
+            assert_eq!(
+                refused.string("message"),
+                Some(message.clone()),
+                "case {case:?}: expected the message {message:?}, got {:?}",
+                refused.body
+            );
+        }
+        // Nothing the refused request named was applied.
+        let read = get_endpoint(&emulator, function_name, endpoint_name).await;
+        for (name, value) in baseline_members(&revision_a) {
+            assert_eq!(
+                member(&read.body, name),
+                value,
+                "case {case:?}: a refused update must leave {name} at {value:?}, got {:?}",
+                read.body
+            );
+        }
+        assert_eq!(
+            member(&read.body, "updateStatus"),
+            Value::Null,
+            "case {case:?}: a refused update is no update of the endpoint, got {:?}",
+            read.body
+        );
+    }
+}
+
 /// One request to a published endpoint's address, answered by the decision the core's
 /// listener serves there — read out of the ONE store this service's handlers write.
 async fn request_endpoint(

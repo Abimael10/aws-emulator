@@ -316,33 +316,26 @@ fn revision_weights_for(
             weight: crate::state::FULL_WEIGHT,
         }]);
     };
-    let mut named: Vec<&str> = Vec::with_capacity(requested.len());
-    for weight in requested {
-        if !function.revisions.contains_key(&weight.revision_id) {
-            return Err(
-                CreateWebFunctionEndpointErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "The revision {} of web function {} doesn't exist.",
-                            weight.revision_id, function.function_name
-                        ),
-                        resource_id: None,
-                        resource_type: None,
-                    },
-                )
-                .into(),
-            );
-        }
-        if named.contains(&weight.revision_id.as_str()) {
-            return Err(validation(format!(
-                "The revisionWeights parameter names revision {} more than once: each entry \
-                 must name a different revision.",
-                weight.revision_id
-            )));
-        }
-        named.push(&weight.revision_id);
+    // The rule itself, and its wording, live beside the endpoint slice
+    // ([`crate::state::revision_weight_problem`]), so the create path and the update path
+    // hold a requested weight list to ONE rule.
+    let Some(problem) = crate::state::revision_weight_problem(function, requested) else {
+        return Ok(requested.to_vec());
+    };
+    let message = problem.message(&function.function_name);
+    match problem {
+        crate::state::RevisionWeightProblem::UnknownRevision { .. } => Err(
+            CreateWebFunctionEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message,
+                    resource_id: None,
+                    resource_type: None,
+                },
+            )
+            .into(),
+        ),
+        crate::state::RevisionWeightProblem::RepeatedRevision { .. } => Err(validation(message)),
     }
-    Ok(requested.to_vec())
 }
 
 /// The HOME Region of `function`: "the Region where you created the web function",

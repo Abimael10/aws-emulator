@@ -491,3 +491,351 @@ fn served_revisions(endpoint: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// `PUT /web-functions` with an initial revision built from `key` and one endpoint, in
+/// the `auto_deployment_mode` the row asks for.
+async fn create_function_with_endpoint(
+    emulator: &Emulator,
+    name: &str,
+    key: &str,
+    auto_deployment_mode: &str,
+) -> Reply {
+    emulator
+        .send(
+            "PUT",
+            "/web-functions",
+            REGION,
+            Some(json!({
+                "functionName": name,
+                "revisionConfig": {
+                    "buildConfig": build_config("nodejs24.x", BUCKET, key, None),
+                    "serviceConfig": { "executionRoleArn": role_arn(name) },
+                },
+                "endpointConfig": {
+                    "endpointName": ENDPOINT_NAME,
+                    "endpointType": "HomeRegion",
+                    "authType": "ApplicationManaged",
+                    "autoDeploymentMode": auto_deployment_mode,
+                },
+            })),
+        )
+        .await
+}
+
+/// The endpoint every function below carries.
+const ENDPOINT_NAME: &str = "ep";
+
+/// `PATCH /web-functions/{name}/endpoints/{endpointName}` —
+/// `UpdateWebFunctionEndpoint` (model: `smithy_query(query="operation",
+/// operation="UpdateWebFunctionEndpoint")`).
+async fn update_endpoint(emulator: &Emulator, name: &str, body: Value) -> Reply {
+    emulator
+        .send(
+            "PATCH",
+            &format!("/web-functions/{name}/endpoints/{ENDPOINT_NAME}"),
+            REGION,
+            Some(body),
+        )
+        .await
+}
+
+/// The body that asks for the auto-deployment mode under which "the endpoint
+/// automatically serves the newest revision" (`AutoDeploymentMode`).
+fn switch_to_latest_revision() -> Value {
+    json!({ "autoDeploymentMode": "LatestRevision" })
+}
+
+/// Poll `GetWebFunctionRevision` until the revision's build has SETTLED — `Active` or
+/// `Failed` — and report the state it settled in.
+///
+/// The end of a build is owed to the CLOCK, so the test waits for the CONDITION: it
+/// looks again until it holds, or until a deadline far longer than the service's own
+/// span has passed. Nothing here is decided by how fast the host runs.
+async fn poll_until_settled(emulator: &Emulator, name: &str, revision_id: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let revision = get_revision(emulator, name, revision_id).await;
+        let state = text(&revision, "state");
+        if state != "Pending" {
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the revision {name}/{revision_id} never settled, last read {revision:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// RULE: an endpoint in the `LatestRevision` auto-deployment mode serves the function's
+/// newest revision, and only a revision the service reports `Active` is "ready to serve
+/// traffic" (`RevisionState`) — so a request that switches an endpoint into that mode
+/// while the newest revision is not `Active` conflicts with the current state of the
+/// resource: it is refused `409 ConflictException`, the endpoint keeps serving what it
+/// was serving, and any other change to it is still accepted.
+#[tokio::test]
+async fn switching_an_endpoint_onto_a_newest_revision_that_did_not_build_is_refused() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "switch-first.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'first';")]),
+    )
+    .await;
+    stage_object(
+        &emulator,
+        "switch-newer.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'newer';")]),
+    )
+    .await;
+    stage_object(&emulator, "switch-broken.zip", b"not a zip archive".to_vec()).await;
+
+    // The rows span what the rule generalises over: the state the function's NEWEST
+    // revision settled in, and whether there is an older revision behind it.
+    // (case, the key the initial revision is built from, the key of a revision created
+    // after it, the state the newest revision settles in, whether the switch is
+    // accepted)
+    let rows: [(&str, &str, Option<&str>, &str, bool); 4] = [
+        (
+            // The recorded case: the newest revision's build failed while an older
+            // revision is serving traffic.
+            "the newest revision's build failed, an older one serves",
+            "switch-first.zip",
+            Some("switch-broken.zip"),
+            "Failed",
+            false,
+        ),
+        (
+            "the only revision's build failed",
+            "switch-broken.zip",
+            None,
+            "Failed",
+            false,
+        ),
+        (
+            "the newest revision built",
+            "switch-first.zip",
+            Some("switch-newer.zip"),
+            "Active",
+            true,
+        ),
+        (
+            "the only revision built",
+            "switch-first.zip",
+            None,
+            "Active",
+            true,
+        ),
+    ];
+
+    for (index, (case, initial_key, later_key, settles, accepted)) in rows.into_iter().enumerate() {
+        let name = format!("latest-revision-switch-{index}");
+        let created = create_function_with_endpoint(&emulator, &name, initial_key, "Disabled").await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunction expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        let initial_revision = text(
+            created.field("revision").unwrap_or(&Value::Null),
+            "revisionId",
+        );
+        let newest_revision = match later_key {
+            Some(key) => {
+                let later = create_revision(&emulator, &name, key).await;
+                assert_eq!(
+                    later.status, 202,
+                    "case {case:?}: CreateWebFunctionRevision expected 202, got {} with {:?}",
+                    later.status, later.body
+                );
+                text(&later.body, "revisionId")
+            }
+            None => initial_revision.clone(),
+        };
+        // Every build has settled before the switch is attempted, so the switch's
+        // outcome follows from the state the newest revision settled in.
+        let state = poll_until_settled(&emulator, &name, &newest_revision).await;
+        assert_eq!(
+            state, settles,
+            "case {case:?}: expected the newest revision's build to settle {settles}, got {state}"
+        );
+        let before = get_endpoint(&emulator, &name, ENDPOINT_NAME).await;
+
+        let switched = update_endpoint(&emulator, &name, switch_to_latest_revision()).await;
+        if accepted {
+            assert_eq!(
+                switched.status, 202,
+                "case {case:?}: UpdateWebFunctionEndpoint expected 202, got {} with {:?}",
+                switched.status, switched.body
+            );
+            assert_eq!(
+                text(&switched.body, "autoDeploymentMode"),
+                "LatestRevision",
+                "case {case:?}: the update reports the stored mode, got {:?}",
+                switched.body
+            );
+            // In that mode the endpoint serves the newest revision, and the read-back
+            // reports the same record.
+            let expected = vec![newest_revision.clone()];
+            assert_eq!(
+                served_revisions(&switched.body),
+                expected,
+                "case {case:?}: expected the endpoint to serve {expected:?}, got {:?}",
+                switched.body
+            );
+            let read = get_endpoint(&emulator, &name, ENDPOINT_NAME).await;
+            assert_eq!(
+                served_revisions(&read),
+                expected,
+                "case {case:?}: expected the stored endpoint to serve {expected:?}, got {read:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            switched.status, 409,
+            "case {case:?}: expected 409, got {} with {:?}",
+            switched.status, switched.body
+        );
+        assert_eq!(
+            switched.error(),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {:?}",
+            switched.body
+        );
+        assert!(
+            text(&switched.body, "message").contains(&newest_revision),
+            "case {case:?}: the refusal names the revision it conflicts with, got {:?}",
+            switched.body
+        );
+        let after = get_endpoint(&emulator, &name, ENDPOINT_NAME).await;
+        assert_eq!(
+            text(&after, "autoDeploymentMode"),
+            "Disabled",
+            "case {case:?}: a refused switch leaves the mode where it was, got {after:?}"
+        );
+        assert_eq!(
+            served_revisions(&after),
+            served_revisions(&before),
+            "case {case:?}: a refused switch leaves the traffic where it was, got {after:?}"
+        );
+
+        // The endpoint is still updatable: it is the switch that conflicts, not the
+        // endpoint.
+        let described = update_endpoint(
+            &emulator,
+            &name,
+            json!({ "description": "still updatable" }),
+        )
+        .await;
+        assert_eq!(
+            described.status, 202,
+            "case {case:?}: another change to the same endpoint expected 202, got {} with {:?}",
+            described.status, described.body
+        );
+        assert_eq!(
+            text(&described.body, "autoDeploymentMode"),
+            "Disabled",
+            "case {case:?}: a change that names no mode keeps the stored one, got {:?}",
+            described.body
+        );
+    }
+}
+
+/// RULE, at the instant the newest revision is still BUILDING: an endpoint is never
+/// left serving a revision that has not built, whichever of the clock and the caller
+/// got there first — the switch is either refused with the modelled conflict, in which
+/// case it is accepted once that build has settled `Active`, or accepted straight away
+/// onto a revision that had already built.
+#[tokio::test]
+async fn a_switch_onto_a_revision_still_building_waits_for_the_build() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "building-first.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'first';")]),
+    )
+    .await;
+    stage_object(
+        &emulator,
+        "building-newer.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'newer';")]),
+    )
+    .await;
+
+    let name = "latest-revision-switch-while-building";
+    let created =
+        create_function_with_endpoint(&emulator, name, "building-first.zip", "Disabled").await;
+    assert_eq!(
+        created.status, 202,
+        "CreateWebFunction expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    let first_revision = text(
+        created.field("revision").unwrap_or(&Value::Null),
+        "revisionId",
+    );
+    assert_eq!(
+        poll_until_settled(&emulator, name, &first_revision).await,
+        "Active",
+        "the first revision's build must succeed"
+    );
+
+    // The switch is attempted with no wait at all after the revision was created, so
+    // the newest revision may or may not have built yet.
+    let later = create_revision(&emulator, name, "building-newer.zip").await;
+    let newer_revision = text(&later.body, "revisionId");
+    let switched = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+
+    match switched.status {
+        202 => {
+            // Accepted, so the newest revision had built: the endpoint serves it.
+            assert_eq!(
+                served_revisions(&switched.body),
+                vec![newer_revision.clone()],
+                "an accepted switch serves the newest revision, got {:?}",
+                switched.body
+            );
+            assert_eq!(
+                poll_until_settled(&emulator, name, &newer_revision).await,
+                "Active",
+                "an accepted switch's revision must have built"
+            );
+        }
+        409 => {
+            assert_eq!(
+                switched.error(),
+                "ConflictException",
+                "a refused switch is the modelled conflict, got {:?}",
+                switched.body
+            );
+            let during = get_endpoint(&emulator, name, ENDPOINT_NAME).await;
+            assert_eq!(
+                served_revisions(&during),
+                vec![first_revision.clone()],
+                "a refused switch leaves the traffic where it was, got {during:?}"
+            );
+            // Once the build has settled `Active`, the same switch is accepted.
+            assert_eq!(
+                poll_until_settled(&emulator, name, &newer_revision).await,
+                "Active",
+                "the newest revision's build must succeed"
+            );
+            let again = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+            assert_eq!(
+                again.status, 202,
+                "the switch must be accepted once the revision is Active, got {} with {:?}",
+                again.status, again.body
+            );
+            assert_eq!(
+                served_revisions(&again.body),
+                vec![newer_revision.clone()],
+                "the accepted switch serves the newest revision, got {:?}",
+                again.body
+            );
+        }
+        other => panic!("expected 202 or 409 from the switch, got {other} with {:?}", switched.body),
+    }
+}
