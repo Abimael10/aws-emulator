@@ -1487,12 +1487,24 @@ pub fn pipe_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("pipes", region, &format!("pipe/{name}"))
 }
 
-/// A stored instant as the modelled `Timestamp`.
+/// A stored instant as the modelled `Timestamp`, at the granularity this service REPORTS
+/// one: whole seconds.
+///
+/// The members this projects onto — `CreationTime` and `LastModifiedTime`, on the record
+/// every lifecycle call answers with, on the read of one pipe and on the `ListPipes` summary
+/// — target `com.amazonaws.pipes#Timestamp`, which carries no `@timestampFormat`, so under
+/// this model's `restJson1` protocol they go on the wire as epoch-seconds numbers, and the
+/// recorded answers of this service state them with no sub-second remainder.
+///
+/// The STORED instant keeps the precision the host clock gave it — it is what this service's
+/// own spans and ordering are computed from — and the remainder is dropped HERE, at the one
+/// projection every reported pipe timestamp passes through, so no read can report a
+/// granularity the service does not report.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    let millis = at
+    let seconds = at
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
-    ::aws_smithy_types::DateTime::from_millis(millis)
+        .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+    ::aws_smithy_types::DateTime::from_secs(seconds)
 }
 
 /// Encode the exclusive start key of the next `ListPipes` page as an opaque `NextToken`.

@@ -358,9 +358,12 @@ async fn update_pipe_changes_only_the_members_the_request_carries() {
             created.number("CreationTime"),
             "case {name:?}: CreationTime must never change, got {updated:?}"
         );
+        // The two stamps are reported at the granularity this service reports one — whole
+        // seconds — so an update that lands in the SAME second as the create reports the
+        // same value; what the rule forbids is the stamp going backwards.
         assert!(
-            updated.number("LastModifiedTime") > created.number("LastModifiedTime"),
-            "case {name:?}: the update must advance LastModifiedTime past {}, got {:?}",
+            updated.number("LastModifiedTime") >= created.number("LastModifiedTime"),
+            "case {name:?}: the update must not move LastModifiedTime back from {}, got {:?}",
             created.number("LastModifiedTime"),
             updated.number("LastModifiedTime")
         );

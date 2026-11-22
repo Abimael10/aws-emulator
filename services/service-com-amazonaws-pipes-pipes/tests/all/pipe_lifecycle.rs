@@ -1052,3 +1052,276 @@ async fn create_pipe_stops_at_the_record_cap() {
         "a create below the cap again must succeed, got {after_delete:?}"
     );
 }
+
+/// The member reporting when the pipe was created, and the one reporting when it last
+/// changed. Source: the `CreatePipe`/`DescribePipe`/`UpdatePipe`/`StartPipe`/`StopPipe`/
+/// `DeletePipe` outputs and the `Pipe` summary `ListPipes` returns
+/// (`smithy_query(query="operation",operation="DescribePipe,DeletePipe")`), where both
+/// target `com.amazonaws.pipes#Timestamp` and neither the member nor the shape carries a
+/// `@timestampFormat` — so under this model's `restJson1` protocol both go on the wire as
+/// epoch-seconds numbers.
+const CREATION_TIME: &str = "CreationTime";
+const LAST_MODIFIED_TIME: &str = "LastModifiedTime";
+
+/// How long a wait for a state move to land is given before it is a failure. Far above the
+/// span this service owes such a move, so a loaded host does not fail the wait.
+const MOVE_BUDGET: Duration = Duration::from_secs(60);
+
+/// The whole-second epoch value `member` carries on the reported `record`.
+///
+/// `serde_json` reads a number carrying a sub-second tail as a float, for which `as_i64`
+/// answers `None`, so this asserts exactly "an epoch-seconds number with no sub-second
+/// part".
+fn whole_second(case: &str, operation: &str, record: &Value, member: &str) -> i64 {
+    let reported = record.get(member).unwrap_or(&Value::Null);
+    let seconds = reported.as_i64();
+    assert!(
+        seconds.is_some_and(|secs| secs > 0),
+        "case {case:?}/{operation}: {member} must be an epoch-seconds number with no \
+         sub-second part, got {reported}"
+    );
+    seconds.unwrap_or_default()
+}
+
+/// Both pipe-record timestamps of one reported `record`, each asserted to be a whole-second
+/// epoch number: `(CreationTime, LastModifiedTime)`.
+fn record_timestamps(case: &str, operation: &str, record: &Value) -> (i64, i64) {
+    (
+        whole_second(case, operation, record, CREATION_TIME),
+        whole_second(case, operation, record, LAST_MODIFIED_TIME),
+    )
+}
+
+/// Read the pipe until it RESTS in a settled state, so the next lifecycle call is not
+/// refused the 409 a move already in flight answers with
+/// (`tests/all/pipe_lifecycle_conflicts.rs`).
+///
+/// The CONDITION is polled — the pipe is looked at again until it holds — rather than a span
+/// being waited out, and the deadline it is given is far longer than the move needs.
+async fn resting(router: &MultiServiceRouter, name: &str) -> Reply {
+    let deadline = std::time::Instant::now() + MOVE_BUDGET;
+    loop {
+        let read = describe(router, name).await;
+        let state = read.string("CurrentState");
+        if !service_com_amazonaws_pipes_pipes::state::TRANSIENT_PIPE_STATES
+            .contains(&state.as_str())
+        {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {name:?}: the pipe is still in {state:?} and the move never landed, \
+             got {read:?}"
+        );
+        tokio::time::sleep(crate::pipe_data_plane::LOOK_AGAIN).await;
+    }
+}
+
+/// The `Pipe` summary `ListPipes` reported for `name`.
+fn summary_of(listed: &Reply, name: &str) -> Value {
+    listed
+        .member("Pipes")
+        .as_array()
+        .and_then(|pipes| {
+            pipes
+                .iter()
+                .find(|pipe| pipe.get("Name").and_then(Value::as_str) == Some(name))
+                .cloned()
+        })
+        .unwrap_or(Value::Null)
+}
+
+/// RULE: the pipe-record timestamps this service reports — the creation instant and the
+/// last-modified instant — are epoch-seconds numbers at WHOLE-second granularity, whatever
+/// precision the host clock that stamped them has, on every operation that reports a pipe
+/// record; across the life of one pipe the creation instant is the same value on every
+/// report and the last-modified instant never moves backwards.
+#[tokio::test]
+async fn every_operation_reports_the_record_timestamps_in_whole_epoch_seconds() {
+    let router = router();
+    let long_name = "t".repeat(64);
+    // The rows differ along what the rule generalises over: the kind of source the pipe
+    // reads (a queue, a stream, a self-managed broker — each carrying the parameters its
+    // kind cannot be created without), which optional members the create carries, and the
+    // length of the name. The rule is the MEMBER's, not the pipe's, so every row is driven
+    // through every operation that reports the record.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "ts-required-only",
+            minimal_body(
+                "arn:aws:sqs:us-west-2:000000000000:orders",
+                "arn:aws:lambda:us-west-2:000000000000:function:handler",
+            ),
+        ),
+        (
+            "ts-described-and-tagged",
+            json!({
+                "Source": "arn:aws:sqs:us-west-2:000000000000:orders",
+                "Target": "arn:aws:sqs:us-west-2:000000000000:results",
+                "RoleArn": "arn:aws:iam::000000000000:role/pipes-role",
+                "Description": "the record every reader reports",
+                "Tags": {"env": "test"},
+            }),
+        ),
+        (
+            "ts-kinesis-source",
+            json!({
+                "Source": "arn:aws:kinesis:us-west-2:000000000000:stream/events",
+                "Target": "arn:aws:lambda:us-west-2:000000000000:function:handler",
+                "RoleArn": "arn:aws:iam::000000000000:role/pipes-role",
+                "SourceParameters": {"KinesisStreamParameters": {"StartingPosition": "LATEST"}},
+            }),
+        ),
+        (
+            "ts-self-managed-kafka-source",
+            json!({
+                "Source": "smk://b-1.broker.kafka.us-west-2.amazonaws.com:9092",
+                "Target": "arn:aws:sqs:us-west-2:000000000000:results",
+                "RoleArn": "arn:aws:iam::000000000000:role/pipes-role",
+                "SourceParameters": {"SelfManagedKafkaParameters": {"TopicName": "orders"}},
+            }),
+        ),
+        (
+            long_name.as_str(),
+            minimal_body(
+                "arn:aws:sqs:us-west-2:000000000000:orders",
+                "arn:aws:sqs:us-west-2:000000000000:results",
+            ),
+        ),
+    ];
+
+    for (name, body) in rows {
+        let created = create(&router, name, body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: CreatePipe must succeed, got {created:?}"
+        );
+        let (creation, mut previous_modified) = record_timestamps(name, "CreatePipe", &created.body);
+
+        // Every operation that reports a pipe record, in an order no row refuses: the two
+        // readers first, then each lifecycle writer with the move it starts landed before
+        // the next call arrives, and the delete last.
+        let described = describe(&router, name).await;
+        let reported = record_timestamps(name, "DescribePipe", &described.body);
+        assert_eq!(
+            reported.0, creation,
+            "case {name:?}/DescribePipe: {CREATION_TIME} must be the value the create \
+             reported, got {described:?}"
+        );
+        previous_modified = reported.1.max(previous_modified);
+
+        let listed = list(&router, "?Limit=50").await;
+        let summary = summary_of(&listed, name);
+        let reported = record_timestamps(name, "ListPipes", &summary);
+        assert_eq!(
+            reported.0, creation,
+            "case {name:?}/ListPipes: the summary must report the same {CREATION_TIME}, \
+             got {summary}"
+        );
+        previous_modified = reported.1.max(previous_modified);
+
+        resting(&router, name).await;
+        let writers: Vec<(&str, &str, String, Option<Value>)> = vec![
+            ("StopPipe", "POST", format!("/v1/pipes/{name}/stop"), None),
+            ("StartPipe", "POST", format!("/v1/pipes/{name}/start"), None),
+            (
+                "UpdatePipe",
+                "PUT",
+                format!("/v1/pipes/{name}"),
+                Some(json!({"RoleArn": "arn:aws:iam::000000000000:role/pipes-role"})),
+            ),
+            ("DeletePipe", "DELETE", format!("/v1/pipes/{name}"), None),
+        ];
+        for (operation, method, uri, payload) in writers {
+            let answered = call(&router, method, &uri, payload, REGION).await;
+            assert_eq!(
+                answered.status, 200,
+                "case {name:?}/{operation} must succeed, got {answered:?}"
+            );
+            let (reported_creation, reported_modified) =
+                record_timestamps(name, operation, &answered.body);
+            assert_eq!(
+                reported_creation, creation,
+                "case {name:?}/{operation}: {CREATION_TIME} must never change, got {answered:?}"
+            );
+            assert!(
+                reported_modified >= previous_modified,
+                "case {name:?}/{operation}: {LAST_MODIFIED_TIME} must not go backwards from \
+                 {previous_modified}, got {reported_modified}"
+            );
+            previous_modified = reported_modified;
+            if operation != "DeletePipe" {
+                resting(&router, name).await;
+            }
+        }
+    }
+}
+
+/// RULE, at the one projection every reported pipe timestamp passes through, over instants
+/// the host clock cannot be asked for: a stored instant is reported at the whole second it
+/// falls in, with its sub-second remainder dropped rather than carried onto the wire.
+#[test]
+fn the_reported_timestamp_drops_a_stored_instant_s_sub_second_remainder() {
+    let at_millis = |millis: u64| std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
+    // (the case, the stored instant, the whole second it is reported at). The rows differ
+    // along where in its second the stored instant falls — exactly on it, a millisecond
+    // past, half way through, the last nanosecond before the next one — and along the
+    // magnitude of the instant: the epoch itself, a recent instant, one far ahead.
+    let rows: Vec<(&str, std::time::SystemTime, i64)> = vec![
+        ("the epoch itself", std::time::SystemTime::UNIX_EPOCH, 0),
+        ("a whole second", at_millis(1_700_000_000_000), 1_700_000_000),
+        (
+            "one millisecond past a whole second",
+            at_millis(1_700_000_000_001),
+            1_700_000_000,
+        ),
+        (
+            "the millisecond tail a host clock gives",
+            at_millis(1_700_000_000_384),
+            1_700_000_000,
+        ),
+        (
+            "half a second past",
+            at_millis(1_700_000_000_500),
+            1_700_000_000,
+        ),
+        (
+            "the last nanosecond before the next second",
+            std::time::SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999),
+            1_700_000_000,
+        ),
+        (
+            "an instant far ahead of any run",
+            at_millis(4_000_000_000_000),
+            4_000_000_000,
+        ),
+    ];
+
+    for (case, stored, expected) in rows {
+        let reported = service_com_amazonaws_pipes_pipes::state::timestamp(stored);
+        assert_eq!(
+            reported.secs(),
+            expected,
+            "case {case:?}: expected the instant reported at {expected}, got {}",
+            reported.secs()
+        );
+        assert_eq!(
+            reported.subsec_nanos(),
+            0,
+            "case {case:?}: a reported stamp carries no sub-second remainder, got {}",
+            reported.subsec_nanos()
+        );
+        // And what the protocol writes for it: the epoch-seconds number itself, with no
+        // fractional part for a client to parse.
+        let on_the_wire = reported
+            .fmt(::aws_smithy_types::date_time::Format::EpochSeconds)
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: the epoch-seconds rendering failed: {error}")
+            });
+        assert_eq!(
+            on_the_wire,
+            expected.to_string(),
+            "case {case:?}: expected the wire form {expected}, got {on_the_wire:?}"
+        );
+    }
+}

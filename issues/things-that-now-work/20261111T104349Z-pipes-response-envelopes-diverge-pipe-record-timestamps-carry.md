@@ -93,3 +93,37 @@ Emulator code consulted: services/service-com-amazonaws-pipes-pipes/src/state.rs
 4. Cause 3: POST /tags/<url-encoded pipe ARN> with body {"tags":{"k":"v"}} (TagResource). The response is 204 with an empty body and NO content-length header, where AWS sends content-length: 0. Fixture: pipes-pipe-tag-management#task#10.
 5. Cause 4: DELETE /tags/<url-encoded pipe ARN>?tagKeys=k (UntagResource). Same observation: 204 with no content-length header. Fixture: pipes-pipe-tag-management#task#12.
 6. Pass criteria: (Causes 1-2) CreationTime/LastModifiedTime are emitted in the timestamp shape the recorded AWS responses carry, with no host sub-second remainder, on both the read and the delete path; (Causes 3-4) both empty 204 responses reach the client carrying content-length: 0, with the status still 204 and the body still empty. Re-replay pipes-error-conflict-and-source-notfound#task#11, pipes-list-pipes-pagination#teardown#17, pipes-pipe-tag-management#task#10 AND pipes-pipe-tag-management#task#12; all four must pass.
+
+## Fix status
+
+Causes 1 and 2: FIXED, at the one projection every reported pipe timestamp passes through
+(`crate::state::timestamp`, services/service-com-amazonaws-pipes-pipes/src/state.rs). A
+stored instant is now reported at the whole second it falls in, so the sub-second remainder
+the host clock gives never reaches the wire. The rule is the member's, not the operation's,
+so it covers every report of a pipe record — `CreatePipe`, `DescribePipe`, the `ListPipes`
+summary, `StartPipe`, `StopPipe`, `UpdatePipe` and `DeletePipe` — and nothing else about the
+record changes. Replay reports all four timestamp keys `fixed`
+(`pipes-error-conflict-and-source-notfound`, `pipes-filter-criteria-nested-json-preserved`,
+`pipes-list-pipes-filtering`, `pipes-list-pipes-pagination` and `pipes-pipe-error-paths` now
+pass end to end). `tests/all/pipe_lifecycle.rs` pins both halves: the whole-second shape and
+the record invariants over a table of pipes driven through every operation that reports the
+record, and the projection itself over instants a host clock cannot be asked for.
+
+Causes 3 and 4: NOT FIXED, blocked outside every path a fix may change — unchanged by this
+fix, which deliberately touched nothing on that path rather than substituting another status
+or header to move the key. The service already states the framing at its single no-content
+seam: `Service::override_protocol` (src/service.rs) hands every response through
+`service_common::no_content_responses::without_content`, which empties the `{}` the
+serializer renders for a member-less output and states `content-length: 0`;
+`tests/all/tag_mutation_no_content.rs` pins that over a table of both operations and nine
+tag-mutation shapes. The header is removed AFTER that, below this crate: the vendored
+listener hands the finished response to hyper's HTTP/1.1 server writer
+(vendor/server/src/lib.rs — `serve_on_ephemeral_port`'s `service_fn` and the production
+serve path's connection builder), which drops `content-length` from a status that cannot
+carry a body. That writer is in the read-only vendored tree, no seam a service crate or
+`core/router/tests` owns runs after it, and `override_protocol` runs before it. It needs the
+vendored bodyless-success response writer to preserve a handler-stated `content-length` on a
+`204`. Both operations are one blocker because one writer serves both. The same boundary is
+recorded for the other services of this family, e.g.
+issues/things-that-now-work/20261030T154619Z-mq-tagging-operations-omit-content-length-from-their.md
+and issues/things-that-now-work/20261102T020000Z-notifications-mp-buyer-agreements-text-and-the-two-204-content-length-keys-remain-open.md.
