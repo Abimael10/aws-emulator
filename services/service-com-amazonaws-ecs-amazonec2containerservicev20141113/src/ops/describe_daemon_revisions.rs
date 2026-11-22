@@ -8,9 +8,10 @@
 //! "Daemon revisions are immutable": nothing rewrites one.
 //!
 //! A daemon-revision ARN carries the daemon whose history the revision belongs to
-//! (`daemon-revision/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
-//! before anything is looked up: an entry that is not shaped like such an ARN could name no
-//! revision of any account and is refused as the invalid revision ARN it is
+//! (`daemon-revision/<cluster>/<daemon>/<id>`), so what the required member can identify is
+//! settled before anything is looked up: a member that holds no usable ARN — an entry that is
+//! not shaped like such an ARN and could name no revision of any account, or no entry at all —
+//! asks about no revision and is refused as the invalid revision ARN it is
 //! (`InvalidParameterException`). An entry that IS shaped like one names a revision of this
 //! account, so whatever leaves it unresolved here — a cluster this store never created, a
 //! cluster that holds no such daemon, an id nothing is stored under — is reported on the
@@ -169,38 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "You can specify up to 20 ARNs."
-        if input.daemon_revision_arns.len() > crate::state::MAX_DESCRIBE_DAEMON_REVISIONS {
-            return Err(
-                DescribeDaemonRevisionsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(crate::state::arn_count_message(
-                            "Daemon Revision",
-                            crate::state::MAX_DESCRIBE_DAEMON_REVISIONS,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // Each entry is "the ARN of the daemon revision" and nothing else, so what it can
-        // identify is settled before any revision is looked up: a value that is not shaped
-        // like a revision's ARN ([`crate::state::is_daemon_revision_arn`]) could name no
-        // revision of ANY account and is refused as the unusable ARN the member was given.
-        // The `failures` channel answers for an entry that COULD name a revision of this
-        // account and resolves to none.
-        if input
-            .daemon_revision_arns
-            .iter()
-            .any(|reference| !crate::state::is_daemon_revision_arn(reference))
+        // Each entry is "the ARN of the daemon revision" and nothing else, so what this
+        // member can identify is settled before any revision is looked up: a member that
+        // holds no usable ARN — an entry that is not shaped like a revision's ARN and so
+        // could name no revision of ANY account, or no entry at all — asks about nothing and
+        // is refused as the unusable ARN the member was given, as is one that names more
+        // revisions than a call may ask about ([`crate::state::DaemonArnListRead`]). The
+        // `failures` channel answers for an entry that COULD name a revision of this account
+        // and resolves to none.
+        if let Some(message) =
+            crate::state::DaemonArnListRead::REVISIONS.refusal(&input.daemon_revision_arns)
         {
             return Err(
                 DescribeDaemonRevisionsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            crate::state::DAEMON_REVISION_ARN_INVALID_MESSAGE.to_string(),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into(),

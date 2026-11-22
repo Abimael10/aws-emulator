@@ -11,17 +11,19 @@
 //!   every daemon ARN that resolves to no rollout — a cluster this account never held, a
 //!   cluster that holds no such daemon — and keeps its 400s for a value that identifies no
 //!   daemon of any account;
-//! * a read whose required member is a LIST OF RESOURCE ARNS refuses an entry that is not
-//!   shaped like that resource's ARN, and so could identify no resource of ANY account, as the
-//!   invalid parameter it is (`InvalidParameterException`, with the sentence the member's own
-//!   read words), and keeps the `failures` channel for every entry that IS shaped like one and
-//!   resolves to nothing here — a cluster this account never created, a cluster that holds no
-//!   such daemon, an id nothing is stored under — answering HTTP 200 with one `MISSING` failure
-//!   per such entry beside the resources the request did resolve;
-//! * the ID in the last segment of such an ARN is MINTED by the service, so how it is spelled
-//!   is no part of what makes the ARN an identifier: an entry of that shape is read as the
-//!   resource it names whatever its id looks like, and one this store holds nothing under is
-//!   one `MISSING` failure of its own entry;
+//! * a read whose required member is a LIST OF RESOURCE ARNS refuses a member that holds no
+//!   usable ARN — an entry that is not shaped like that resource's ARN, and so could identify
+//!   no resource of ANY account, or no entry at all — as the invalid parameter it is
+//!   (`InvalidParameterException`, with the sentence the member's own read words), and keeps
+//!   the `failures` channel for every entry that IS shaped like one and resolves to nothing
+//!   here — a cluster this account never created, a cluster that holds no such daemon, an id
+//!   nothing is stored under — answering HTTP 200 with one `MISSING` failure per such entry
+//!   beside the resources the request did resolve;
+//! * the ID in the last segment of such an ARN is MINTED by the service, so what a client is
+//!   asked for is an id of the FORM it hands out rather than one this store holds: an id of
+//!   that form the store holds nothing under is one `MISSING` failure of its own entry, while
+//!   a value outside the form identifies no resource of any account and is refused with the
+//!   rest of the request;
 //! * a daemon write resolves the resources its own PARAMETERS name — the daemon task
 //!   definition first, then the capacity providers — before the cluster and the daemon its
 //!   `daemonArn` identifies, so a request naming a task definition that does not exist is
@@ -50,10 +52,12 @@ const DEPLOYMENT_ARNS_INVALID: &str = "Request parameter(s) are invalid.";
 /// revision of this account.
 const REVISION_ARN_INVALID: &str = "The Daemon Revision ARN is invalid.";
 
-/// An id token of the width a daemon's deployments and revisions are numbered by — the form
-/// this service's own `daemon-deployment`/`daemon-revision` ARNs carry.
+/// An id of the form a daemon's deployments and revisions are numbered by — the UUID (five
+/// hyphen-separated groups of 8, 4, 4, 4 and 12 hexadecimal digits) this service's own
+/// `daemon-deployment`/`daemon-revision` ARNs carry — with `value` spelled into it, so two
+/// rows of a table below differ along the id while both are of that form.
 fn sequence_id(value: u64) -> String {
-    format!("{value:019}")
+    format!("{value:08x}-0000-0000-0000-{value:012x}")
 }
 
 /// The ARN of a daemon of `cluster`.
@@ -280,16 +284,18 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_any_acc
     create_cluster(&router, CLUSTER, CASE).await;
 
     for (operation, member, resource_type, expected) in ARN_LIST_READS {
-        // The rows differ along WHAT about the ARN makes it name nothing of any account: its
-        // not being an ARN, its partition/vendor fields, its resource type, how many segments
-        // its resource path carries, and the character set of the names in it. What the ARN
-        // RESOLVES to here is NOT one of them — neither the daemon it sits under nor how its
-        // id is spelled — since an entry of this shape names a resource of this account and is
-        // reported on the `failures` channel when this store holds none
+        // The rows differ along WHAT about the member makes it hold no usable ARN: its being
+        // empty, an entry's not being an ARN, its partition/vendor fields, its resource type,
+        // how many segments its resource path carries, the character set of the names in it,
+        // and the form of the id it ends in. What an entry RESOLVES to here is NOT one of them
+        // — neither the daemon it sits under nor which id of that form it carries — since an
+        // entry of this shape names a resource of this account and is reported on the
+        // `failures` channel when this store holds none
         // ([`a_daemon_read_reports_an_entry_under_a_daemon_it_does_not_hold_as_a_failure`]).
         // The last row pairs an unusable entry with a usable one, so the refusal is of the
         // REQUEST and not of one entry's own report.
-        let rows: [(&str, Value); 10] = [
+        let rows: [(&str, Value); 11] = [
+            ("a member that holds no entry at all", json!([])),
             ("a value that is no ARN at all", json!(["not-an-arn"])),
             (
                 "an ARN of another service",
@@ -612,7 +618,7 @@ async fn minted_daemon_arns(
 }
 
 #[tokio::test]
-async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled() {
+async fn a_daemon_read_reads_an_unheld_id_of_the_form_it_mints_and_refuses_a_value_outside_it() {
     let router = service();
     const CLUSTER: &str = "daemon-arn-id-forms";
     const CASE: &str = "setup";
@@ -622,7 +628,7 @@ async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled(
     let (deployment, revision) =
         minted_daemon_arns(&router, CLUSTER, &provider, &definition, CASE).await;
 
-    for (operation, member, resource_type, _) in ARN_LIST_READS {
+    for (operation, member, resource_type, expected) in ARN_LIST_READS {
         // The ARN this service minted for the resource, so every row below is answered by
         // what the store holds under the id rather than by a read that reports nothing
         // whatever it is asked.
@@ -636,29 +642,40 @@ async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled(
         } else {
             ("daemonRevisions", "daemonRevisionArn")
         };
+        // The id this service minted is one of the form it hands out, so the rows below read
+        // against a store whose own ids are of that form too.
+        assert!(
+            held.rsplit_once('/')
+                .is_some_and(|(_, id)| is_uuid(id)),
+            "case {CASE:?}: expected the minted ARN to end in an id of the form the service \
+             spells such an id in, got {held:?}"
+        );
 
-        // The rows differ along HOW the id is spelled: a short decimal, the width this
-        // service renders its counter at, a minted id carrying a suffix, a hyphenated hex id
-        // of the form other Amazon ECS resources are named by, a word, and a long token.
-        // None of them is a fault of the request — each is an id of this account's daemon
-        // that this store holds nothing under.
-        let ids: [(&str, String); 6] = [
-            ("a short decimal", "1".to_string()),
+        // One half of the rule: an id OF THAT FORM this store holds nothing under is the
+        // entry's own `MISSING` failure at HTTP 200. The rows differ along which id of the
+        // form it is — a counter this store never reached, the nil uuid, a uuid of mixed hex
+        // digits, and the same uuid spelled in upper case (both cases are that form).
+        let unheld_ids: [(&str, String); 4] = [
             (
-                "the width this service numbers these resources at",
+                "an id of the form under a counter this store never reached",
                 sequence_id(987_654),
             ),
-            ("a minted id with a suffix", format!("{}-gone", sequence_id(1))),
             (
-                "a hyphenated hex id",
+                "the nil uuid",
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+            (
+                "a uuid of mixed hex digits",
                 "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7c88".to_string(),
             ),
-            ("a word", "latest".to_string()),
-            ("a long token", "z".repeat(64)),
+            (
+                "that uuid spelled in upper case",
+                "7F3C1A2B-9D84-4E55-B0C6-2A1F5E6D7C88".to_string(),
+            ),
         ];
-        for (row, id) in ids {
+        for (row, id) in unheld_ids {
             let unheld = below_daemon(resource_type, CLUSTER, "agents", &id);
-            let case = format!("{operation} given {row} as the id");
+            let case = format!("{operation} given {row}");
             // Paired with the ARN that DOES resolve, so the answer carries both channels:
             // the request is not lost, and the entry that names nothing is its own failure.
             let body = ok(
@@ -689,7 +706,88 @@ async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled(
                 "case {case:?}: expected the entry echoed as MISSING, got {body}"
             );
         }
+
+        // The other half: a value in the id's place that is OUTSIDE that form could name no
+        // resource of any account, so the whole read is refused about the parameter that
+        // carried it. The rows differ along HOW the value departs from the form — a bare
+        // counter, a word, a word with a counter after it, a minted id with a suffix, each
+        // group width one digit short and one too long, one group too few and one too many,
+        // the hex digits with their hyphens taken out, a digit outside hexadecimal, and a
+        // long token — and each is paired with the entry that DOES resolve, so what is
+        // refused is the request rather than that entry's own report.
+        let unusable_ids: [(&str, String); 12] = [
+            ("a bare counter", "1".to_string()),
+            ("a word", "latest".to_string()),
+            ("a word with a counter after it", "rollout-0000000017".to_string()),
+            (
+                "a minted id with a suffix",
+                format!("{}-gone", sequence_id(1)),
+            ),
+            (
+                "a group one digit short",
+                "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7c8".to_string(),
+            ),
+            (
+                "a group one digit too long",
+                "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7c889".to_string(),
+            ),
+            (
+                "a leading group one digit short",
+                "7f3c1a2-9d84-4e55-b0c6-2a1f5e6d7c88".to_string(),
+            ),
+            (
+                "one group too few",
+                "7f3c1a2b-9d84-4e55-2a1f5e6d7c88".to_string(),
+            ),
+            (
+                "one group too many",
+                "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7c88-0000".to_string(),
+            ),
+            (
+                "the hex digits with their hyphens taken out",
+                "7f3c1a2b9d844e55b0c62a1f5e6d7c88".to_string(),
+            ),
+            (
+                "a digit outside hexadecimal",
+                "7f3c1a2b-9d84-4e55-b0c6-2a1f5e6d7cg8".to_string(),
+            ),
+            ("a long token", "z".repeat(64)),
+        ];
+        for (row, id) in unusable_ids {
+            let unusable = below_daemon(resource_type, CLUSTER, "agents", &id);
+            let case = format!("{operation} given {row} as the id");
+            let (code, message) = refusal(
+                &router,
+                operation,
+                json!({ member: [held.clone(), unusable] }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (INVALID_PARAMETER, expected),
+                "case {case:?}: expected the sentence this read words for an unusable \
+                 {member} entry, got {code:?} with {message:?}"
+            );
+        }
     }
+}
+
+/// Whether `value` is spelled as the UUID this service's daemon-scoped ids are spelled in:
+/// five hyphen-separated groups of 8, 4, 4, 4 and 12 hexadecimal digits, in either case.
+/// Read here off the value a response carried, so a row asserts the FORM rather than the id
+/// one run happened to mint.
+fn is_uuid(value: &str) -> bool {
+    let mut groups = value.split('-');
+    for width in [8, 4, 4, 4, 12] {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
 }
 
 #[tokio::test]
@@ -872,9 +970,10 @@ async fn a_daemon_read_answers_every_entry_it_resolves_beside_the_ones_it_does_n
 
         // Entries of the ARN's own shape that this store resolves nothing for, one per part
         // of the identifier it holds nothing for.
-        let unknown_cluster = below_daemon(resource_type, "daemon-nowhere", "agents", "17");
-        let empty_cluster = below_daemon(resource_type, EMPTY_CLUSTER, "agents", "17");
-        let unknown_daemon = below_daemon(resource_type, CLUSTER, "nosuchdaemon", "17");
+        let unknown_cluster =
+            below_daemon(resource_type, "daemon-nowhere", "agents", &sequence_id(17));
+        let empty_cluster = below_daemon(resource_type, EMPTY_CLUSTER, "agents", &sequence_id(17));
+        let unknown_daemon = below_daemon(resource_type, CLUSTER, "nosuchdaemon", &sequence_id(17));
         let unknown_id = below_daemon(
             resource_type,
             CLUSTER,

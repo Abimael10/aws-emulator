@@ -784,10 +784,12 @@ async fn an_update_captures_a_new_revision_and_rolls_the_daemon_tasks_over_onto_
     }
 
     // An ARN under a cluster that IS there but names no stored revision is reported as a
-    // failure of its own entry rather than refusing the whole read.
+    // failure of its own entry rather than refusing the whole read. The id is one of the form
+    // this service spells such an id in (the UUID `daemon_read_arn_rules` spans), so what the
+    // entry resolves to is the only thing it differs along.
     let unknown = format!(
         "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:daemon-revision/{CLUSTER}/agents/\
-         0000000000000009999"
+         00009999-0000-0000-0000-000000009999"
     );
     let body = ok(
         &router,

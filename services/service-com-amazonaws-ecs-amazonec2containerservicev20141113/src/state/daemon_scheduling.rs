@@ -134,21 +134,28 @@ pub fn daemon_revision_arn(
     )
 }
 
-/// How many characters the id a daemon's deployments and revisions are numbered by is
-/// spelled in: the fixed width [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_deployment_arn`]
-/// and [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_revision_arn`]
-/// render their counter at, so sorting two such ARNs orders what they name oldest first.
+/// The id token one daemon deployment or daemon revision is numbered with: the counter that
+/// makes every one of them distinct, spelled as the UUID such an id is spelled in
+/// ([`is_daemon_sequence_id`]).
 ///
-/// How this service SPELLS that id is its own doing, so it is no part of what an ARN a
-/// caller supplies has to look like ([`is_daemon_scoped_arn`]): the id is minted here, and
-/// a client cannot be asked to reproduce this service's numbering for its ARN to be read as
-/// the identifier it is.
-pub const DAEMON_SEQUENCE_ID_WIDTH: usize = 19;
-
-/// The id token one daemon deployment or daemon revision is numbered with, spelled at the
-/// one width [`DAEMON_SEQUENCE_ID_WIDTH`] fixes.
+/// The counter leads the spelling ([`uuid_from_sequence`] carries it in the first group), so
+/// sorting two of these ARNs still orders what they name oldest first — which is what the
+/// listings break a tie on ([`DaemonDeploymentRecord::order_key`]).
 pub(super) fn daemon_sequence_id(sequence: u64) -> String {
-    format!("{sequence:0width$}", width = DAEMON_SEQUENCE_ID_WIDTH)
+    uuid_from_sequence(sequence)
+}
+
+/// Whether `token` is an id a daemon's deployments and revisions are numbered by: the UUID
+/// Amazon ECS spells such an id in ([`is_uuid`]).
+///
+/// The id is MINTED by the service, so a client cannot be asked to reproduce this store's
+/// counter — but it can be asked for an id of the FORM the service hands out, which is what
+/// makes the value an identifier of a resource at all. An id of that form this store holds
+/// nothing under names a resource of this account's daemon all the same, so a read reports
+/// it as the MISSING resource it is; a value outside the form names no resource of ANY
+/// account, and the read is refused about the parameter that carried it.
+pub(super) fn is_daemon_sequence_id(token: &str) -> bool {
+    is_uuid(token)
 }
 
 /// The segments of the RESOURCE PATH `arn` carries when it is an ARN of a `resource_type`
@@ -173,14 +180,15 @@ fn daemon_scoped_arn_path<'a>(arn: &'a str, resource_type: &str) -> Option<Vec<&
 
 /// Whether `arn` is SHAPED like the ARN of a `resource_type` resource BELOW a daemon —
 /// `<type>/<cluster>/<daemon>/<id>` ([`daemon_scoped_arn_path`]), with names a cluster and a
-/// daemon may carry ([`is_valid_name`]) and an id in the last segment.
+/// daemon may carry ([`is_valid_name`]) and an id of the form such an id is spelled in
+/// ([`is_daemon_sequence_id`]) in the last segment.
 ///
 /// What is asked is which RESOURCE the value identifies, so it is asked of the ARN's shape:
-/// the resource type, the cluster and the daemon the resource sits under, and an id. How
-/// that id is SPELLED is no part of it — the service mints it
-/// ([`DAEMON_SEQUENCE_ID_WIDTH`]) — so an ARN of this shape whose id this store holds
-/// nothing under still names a resource of this account's daemon, and a read reports it as
-/// the MISSING resource it is rather than refusing the request that carried it.
+/// the resource type, the cluster and the daemon the resource sits under, and the id of the
+/// resource itself. WHICH resource of that shape this store holds is not asked here — an ARN
+/// of this shape whose cluster, daemon or id nothing is stored under still names a resource
+/// of this account, and a read reports it as the MISSING resource it is rather than refusing
+/// the request that carried it.
 fn is_daemon_scoped_arn(arn: &str, resource_type: &str) -> bool {
     daemon_scoped_arn_path(arn, resource_type).is_some_and(|segments| {
         matches!(
@@ -188,21 +196,9 @@ fn is_daemon_scoped_arn(arn: &str, resource_type: &str) -> bool {
             [cluster_name, daemon_name, id]
                 if is_valid_name(cluster_name)
                     && is_valid_name(daemon_name)
-                    && !id.is_empty()
+                    && is_daemon_sequence_id(id)
         )
     })
-}
-
-/// Whether `arn` is shaped like a DAEMON DEPLOYMENT's ARN
-/// (`daemon-deployment/<cluster>/<daemon>/<id>`, [`is_daemon_scoped_arn`]).
-pub fn is_daemon_deployment_arn(arn: &str) -> bool {
-    is_daemon_scoped_arn(arn, DAEMON_DEPLOYMENT_RESOURCE_TYPE)
-}
-
-/// Whether `arn` is shaped like a DAEMON REVISION's ARN
-/// (`daemon-revision/<cluster>/<daemon>/<id>`, [`is_daemon_scoped_arn`]).
-pub fn is_daemon_revision_arn(arn: &str) -> bool {
-    is_daemon_scoped_arn(arn, DAEMON_REVISION_RESOURCE_TYPE)
 }
 
 /// Whether `arn` is shaped like a DAEMON's own ARN — `daemon/<cluster>/<name>`, with names
@@ -220,17 +216,87 @@ pub fn is_daemon_arn(arn: &str) -> bool {
     })
 }
 
-/// `InvalidParameterException$message` for a `daemonDeploymentArns` entry that is not
-/// shaped like a daemon deployment's ARN ([`is_daemon_deployment_arn`]): the whole sentence
-/// is fixed text, stating that the request's parameters are not usable and echoing none of
-/// the values it carried.
+/// `InvalidParameterException$message` for a `daemonDeploymentArns` member that holds no
+/// usable daemon-deployment ARN ([`DaemonArnListRead::DEPLOYMENTS`]): the whole sentence is
+/// fixed text, stating that the request's parameters are not usable and echoing none of the
+/// values it carried.
 pub const DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE: &str = "Request parameter(s) are invalid.";
 
-/// `InvalidParameterException$message` for a `daemonRevisionArns` entry that is not shaped
-/// like a daemon revision's ARN ([`is_daemon_revision_arn`]): fixed text naming the
+/// `InvalidParameterException$message` for a `daemonRevisionArns` member that holds no
+/// usable daemon-revision ARN ([`DaemonArnListRead::REVISIONS`]): fixed text naming the
 /// parameter whose syntax is wrong, as [`invalid_service_deployment_arn_message`] does one
 /// resource along.
 pub const DAEMON_REVISION_ARN_INVALID_MESSAGE: &str = "The Daemon Revision ARN is invalid.";
+
+/// One daemon READ whose `@required` input member is a LIST OF RESOURCE ARNS — the daemon
+/// deployments or the daemon revisions to describe — and everything that settles what such
+/// a member may hold: the resource its entries name, the words that resource is counted in,
+/// how many entries one call may carry, and the sentence the read words for a member it
+/// cannot use.
+///
+/// The member carries the resources to describe and NOTHING else, so what it can identify
+/// is settled before any state is consulted, and the question is the same for every such
+/// read — which is why it is asked here once rather than once per handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonArnListRead {
+    /// The ARN resource type below a daemon every entry has to name
+    /// ([`is_daemon_scoped_arn`]).
+    resource_type: &'static str,
+    /// How the bound's sentence names that resource ([`arn_count_message`]).
+    counted_as: &'static str,
+    /// The most entries one call may carry, as the member's own doc bounds it.
+    max_entries: usize,
+    /// `InvalidParameterException$message` for a member holding no usable ARN, in the words
+    /// this read states it in.
+    unusable_message: &'static str,
+}
+
+impl DaemonArnListRead {
+    /// `DescribeDaemonDeployments$daemonDeploymentArns`: "The ARN of the daemon deployments
+    /// to describe. You can specify up to 20 ARNs."
+    pub const DEPLOYMENTS: Self = Self {
+        resource_type: DAEMON_DEPLOYMENT_RESOURCE_TYPE,
+        counted_as: "Daemon Deployment",
+        max_entries: MAX_DESCRIBE_DAEMON_DEPLOYMENTS,
+        unusable_message: DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE,
+    };
+
+    /// `DescribeDaemonRevisions$daemonRevisionArns`: "The ARN of the daemon revisions to
+    /// describe. You can specify up to 20 ARNs."
+    pub const REVISIONS: Self = Self {
+        resource_type: DAEMON_REVISION_RESOURCE_TYPE,
+        counted_as: "Daemon Revision",
+        max_entries: MAX_DESCRIBE_DAEMON_REVISIONS,
+        unusable_message: DAEMON_REVISION_ARN_INVALID_MESSAGE,
+    };
+
+    /// `InvalidParameterException$message` for the `entries` this member was given, and
+    /// `None` when every one of them identifies a resource of this read's type.
+    ///
+    /// A required list of resource ARNs is WHAT the read is asked about, so a member that
+    /// holds no usable ARN asks about nothing and is refused before any lookup. It holds
+    /// none when an entry is not shaped like such an ARN and so could name no resource of
+    /// ANY account ([`is_daemon_scoped_arn`]), and when it carries NO entry at all — a
+    /// member present and empty names no resource either. A member holding more entries
+    /// than one call may ask about is refused for that count instead, since it is the
+    /// number rather than any one entry that is wrong with it.
+    ///
+    /// What an entry of the right shape fails to RESOLVE to is none of this: an ARN that
+    /// could name a resource of this account and names none here is that entry's own
+    /// `MISSING` report on the modelled `failures` channel ([`missing_failure`]), with the
+    /// resources the request did resolve answered beside it.
+    #[must_use]
+    pub fn refusal(&self, entries: &[String]) -> Option<String> {
+        if entries.len() > self.max_entries {
+            return Some(arn_count_message(self.counted_as, self.max_entries));
+        }
+        let holds_no_usable_arn = entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| !is_daemon_scoped_arn(entry, self.resource_type));
+        holds_no_usable_arn.then(|| self.unusable_message.to_string())
+    }
+}
 
 /// How many deployments this emulator keeps for ONE daemon, and how many revisions with
 /// them. EMULATOR-CHOSEN, for the same reason as
@@ -969,27 +1035,36 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // A rollout ends once every container instance of the daemon runs the revision
             // it was rolling out and none runs another — which the placement pass below
             // brings about, so the end waits for the task set rather than for the clock
-            // alone. Weighed only for a rollout whose end is already DUE, so the cost of
-            // this pass is one comparison per stored rollout and the task set is walked
-            // only for the one rollout that can end now.
+            // alone. Weighed only for a rollout whose end is already DUE, and the due
+            // instant is SINGLE-SHOT: a rollout the task set has not caught up with yet is
+            // owed its next weighing one span on, so the instant the pump waits for is
+            // always in the future and the task set is walked at most once per span per
+            // rollout, however long a rollout takes to converge or whether it ever does.
             if let Some(due) = deployment.finished_due_at.filter(|due| *due <= now) {
-                if let Some(reached) = self.daemon_rollout_reached_its_target(deployment) {
-                    if let Some(deployment) = self.daemon_deployments.get_mut(&arn) {
-                        deployment.finished_due_at = None;
-                        deployment.status = DAEMON_DEPLOYMENT_SUCCESSFUL.to_string();
-                        deployment.status_reason =
-                            Some(DAEMON_DEPLOYMENT_COMPLETED_REASON.to_string());
-                        // The instant the rollout FINISHED: the instant it was owed at, or
-                        // the instant its last task started when that came later — a
-                        // rollout cannot be reported as finished before the work it
-                        // reports.
-                        let owed = reported_instant(due);
-                        deployment.finished_at = Some(if timestamp_key(reached) > timestamp_key(owed)
-                        {
-                            reached
-                        } else {
-                            owed
-                        });
+                let reached = self.daemon_rollout_reached_its_target(deployment);
+                if let Some(deployment) = self.daemon_deployments.get_mut(&arn) {
+                    match reached {
+                        Some(reached) => {
+                            deployment.finished_due_at = None;
+                            deployment.status = DAEMON_DEPLOYMENT_SUCCESSFUL.to_string();
+                            deployment.status_reason =
+                                Some(DAEMON_DEPLOYMENT_COMPLETED_REASON.to_string());
+                            // The instant the rollout FINISHED: the instant it was owed at,
+                            // or the instant its last task started when that came later — a
+                            // rollout cannot be reported as finished before the work it
+                            // reports.
+                            let owed = reported_instant(due);
+                            deployment.finished_at =
+                                Some(if timestamp_key(reached) > timestamp_key(owed) {
+                                    reached
+                                } else {
+                                    owed
+                                });
+                        }
+                        // Not converged at the instant its end was owed: the end is owed
+                        // again one span on, the span every other step of this rollout is
+                        // owed at.
+                        None => deployment.finished_due_at = Some(now + TRANSITION_SPAN),
                     }
                 }
             }

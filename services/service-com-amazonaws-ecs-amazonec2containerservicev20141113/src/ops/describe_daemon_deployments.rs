@@ -7,9 +7,10 @@
 //! deployment configuration turned on.
 //!
 //! A daemon-deployment ARN carries the daemon whose rollout it is
-//! (`daemon-deployment/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
-//! before anything is looked up: an entry that is not shaped like such an ARN could name no
-//! rollout of any account and is refused as the unusable parameter the member was given
+//! (`daemon-deployment/<cluster>/<daemon>/<id>`), so what the required member can identify is
+//! settled before anything is looked up: a member that holds no usable ARN — an entry that is
+//! not shaped like such an ARN and could name no rollout of any account, or no entry at all —
+//! asks about no rollout and is refused as the unusable parameter the member was given
 //! (`InvalidParameterException`). An entry that IS shaped like one names a rollout of this
 //! account, so whatever leaves it unresolved here — a cluster this store never created, a
 //! cluster that holds no such daemon, an id nothing is stored under — is reported on the
@@ -168,37 +169,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "You can specify up to 20 ARNs."
-        if input.daemon_deployment_arns.len() > crate::state::MAX_DESCRIBE_DAEMON_DEPLOYMENTS {
-            return Err(
-                DescribeDaemonDeploymentsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(crate::state::arn_count_message(
-                            "Daemon Deployment",
-                            crate::state::MAX_DESCRIBE_DAEMON_DEPLOYMENTS,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // Each entry is "the ARN of the daemon deployment" and nothing else, so the SHAPE of
-        // every one of them is settled before any state is consulted: a value that could
-        // name no rollout of ANY account is refused for what it IS
-        // ([`crate::state::is_daemon_deployment_arn`]). What an entry of that shape fails to
-        // RESOLVE to is left to the per-entry `failures` channel below.
-        if input
-            .daemon_deployment_arns
-            .iter()
-            .any(|reference| !crate::state::is_daemon_deployment_arn(reference))
+        // Each entry is "the ARN of the daemon deployment" and nothing else, so what this
+        // member can identify is settled before any state is consulted: a member that holds
+        // no usable ARN — an entry that could name no rollout of ANY account, or no entry at
+        // all — asks about nothing and is refused for what it IS, as is one that names more
+        // rollouts than a call may ask about ([`crate::state::DaemonArnListRead`]). What an
+        // entry of that shape fails to RESOLVE to is left to the per-entry `failures`
+        // channel below.
+        if let Some(message) =
+            crate::state::DaemonArnListRead::DEPLOYMENTS.refusal(&input.daemon_deployment_arns)
         {
             return Err(
                 DescribeDaemonDeploymentsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            crate::state::DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE.to_string(),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into(),
