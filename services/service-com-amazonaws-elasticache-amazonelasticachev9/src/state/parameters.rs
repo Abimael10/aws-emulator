@@ -194,6 +194,18 @@ pub(super) fn version_rank(version: &str) -> (i32, i32) {
 /// version it applies to, whether a change to it is immediate or needs a reboot,
 /// and whether its value depends on the cache node type.
 ///
+/// The DESCRIPTION column is the published catalog's own one-line description of
+/// the parameter, transcribed verbatim — `Parameter$Description` ("A description
+/// of the parameter.") is a catalog FACT about the parameter rather than a
+/// sentence a read composes, so the published wording, with its own
+/// capitalisation and its own stop or lack of one, is what every read reports
+/// and what two reads of the same parameter report alike. A row whose published
+/// wording this crate has not transcribed yet carries this emulator's own
+/// summary of the parameter instead, which is the catalog-wide divergence
+/// `issues/things-that-do-not-work/20261116T175951Z-elasticache-reference-catalogs-are-emulator-authored-engine-defaults.md`
+/// owns; a row transcribed here must never be re-authored back into prose of
+/// this crate's own.
+///
 /// The allowed-values column is the `Parameter$AllowedValues` the catalog
 /// publishes, in the three forms ElastiCache writes it in: an enumeration of the
 /// literal values (`yes,no`), a numeric RANGE as `<lo>-<hi>` where the engine
@@ -223,8 +235,9 @@ pub(super) struct ParameterRow(
 ///
 /// Source: the parameter tables of the ElastiCache User Guide's "Redis-specific
 /// parameters" / "Valkey-specific parameters" sections — the names, data types,
-/// value sets, modifiability, change types and minimum engine versions below are
-/// that published catalog, and the engine's own defaults are the values. Nothing
+/// value sets, modifiability, change types, minimum engine versions and
+/// transcribed descriptions ([`ParameterRow`]) below are that published catalog,
+/// and the engine's own defaults are the values. Nothing
 /// in the Smithy model enumerates parameters (`Parameter` describes only the
 /// shape of one), so this table is the emulator's single statement of what the
 /// Redis OSS-compatible engine defaults ARE: the parameters the published
@@ -246,7 +259,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "acl-pubsub-default",
         "resetchannels",
-        "The default pub/sub channel permissions a newly created user is given.",
+        // The published description of the parameter, verbatim.
+        "Default pubsub channel permissions for ACL users deployed to this cluster",
         "string",
         "allchannels,resetchannels",
         true,
@@ -499,7 +513,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "cluster-enabled",
         "no",
-        "Whether cluster mode is enabled for the cluster.",
+        // The published description of the parameter, verbatim.
+        "Enable cluster mode",
         "string",
         "yes,no",
         // The published table marks the cluster-mode flag modifiable, applied
