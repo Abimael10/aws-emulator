@@ -25,6 +25,11 @@
 //! what else the body carries (tags), whether a named block would itself have been refused (an
 //! unsupported `KafkaVersion`, a serverless block naming no VPC configuration) and whether the
 //! name is free or already taken.
+//!
+//! The other half of the rule — that the sentence is FIXED TEXT, identical for every such
+//! body and carrying no part of the request — is driven by
+//! `create_cluster_v2_invalid_body_message`, which reuses the bodies and the assertion this
+//! suite exports.
 
 use serde_json::{json, Value};
 
@@ -44,7 +49,7 @@ const NO_CLUSTER_TYPE_MESSAGE: &str =
 const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 
 /// A `provisioned` block asking for `brokers` brokers of broker software `version`.
-fn provisioned(version: &str, brokers: i64) -> Value {
+pub(crate) fn provisioned(version: &str, brokers: i64) -> Value {
     json!({
         "kafkaVersion": version,
         "numberOfBrokerNodes": brokers,
@@ -59,7 +64,7 @@ fn provisioned(version: &str, brokers: i64) -> Value {
 /// each, with the SASL/IAM client authentication a serverless cluster must use —
 /// the one scheme MSK admits a serverless cluster's clients through, and one a
 /// serverless create has to turn on.
-fn serverless(configurations: usize) -> Value {
+pub(crate) fn serverless(configurations: usize) -> Value {
     json!({
         "vpcConfigs": (0..configurations)
             .map(|index| json!({ "subnetIds": [format!("subnet-{index:017x}")] }))
@@ -120,7 +125,7 @@ fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
 
 /// Assert `reply` is the body-level refusal: MSK's sentence for a body it will not accept,
 /// and no member named.
-fn assert_one_cluster_type(reply: &Reply, case: &str) {
+pub(crate) fn assert_one_cluster_type(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
         (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
@@ -136,10 +141,10 @@ fn assert_one_cluster_type(reply: &Reply, case: &str) {
     );
 }
 
-/// The cluster names the account holds, as `ListClustersV2` reports them.
-async fn listed_names(emulator: &Emulator) -> Vec<String> {
+/// The cluster names the account holds in `region`, as `ListClustersV2` reports them.
+pub(crate) async fn listed_names_in(emulator: &Emulator, region: &str) -> Vec<String> {
     emulator
-        .list_v2("")
+        .list_v2_in(region, "")
         .await
         .at("/clusterInfoList")
         .as_array()
@@ -155,6 +160,11 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The same, in the region the harness signs for by default.
+async fn listed_names(emulator: &Emulator) -> Vec<String> {
+    listed_names_in(emulator, crate::kafka_harness::REGION).await
 }
 
 /// RULE: a body naming both cluster types is refused on the SELECTION, whatever the two blocks
