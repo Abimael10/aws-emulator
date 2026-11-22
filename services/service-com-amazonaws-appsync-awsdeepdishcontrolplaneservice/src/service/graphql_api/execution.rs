@@ -48,6 +48,7 @@ use super::lambda;
 use super::mapping_template::{self, Raised};
 use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
+use crate::ops::types::SyncConfig;
 use crate::state::{DataSourceRecord, GraphqlApiRecord, ResolverRecord};
 
 /// The stage that validates one request's document against the schema the API SERVES,
@@ -1000,6 +1001,7 @@ impl Execution<'_> {
             ),
             data_source: step_data_source(api, resolver.data_source_name.as_deref()),
             functions: pipeline_steps(api, resolver),
+            sync_config: resolver.sync_config.clone(),
             is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
             max_batch_size: resolver.max_batch_size,
         })
@@ -1180,6 +1182,7 @@ impl Execution<'_> {
                 code: plan.code.clone(),
                 templates: plan.templates.clone(),
                 data_source: plan.data_source.clone(),
+                sync_config: plan.sync_config.clone(),
                 max_batch_size: plan.max_batch_size,
             };
             return self.run_step(&step, &base, &mut stash, None).await;
@@ -1290,10 +1293,12 @@ impl Execution<'_> {
         // A data source that was CALLED and did not answer is handed to the step's own
         // `ctx.error`, over which the response half still runs; a step no data source was
         // called for is reported to the caller ([`Self::run_templates`] states the rule).
-        let (result, error, unhandled) = match self.data_source_outcome(step, &requested.value).await
-        {
+        let (result, error, unhandled) =
+            match self.data_source_outcome(step, base, &requested.value).await {
             DataSourceOutcome::Result(result) => (result, Json::Null, None),
-            DataSourceOutcome::Answered(failure) => (Json::Null, failure.reported(), Some(failure)),
+            DataSourceOutcome::Answered(failure) => {
+                (failure.reported_value(), failure.reported(), Some(failure))
+            }
             DataSourceOutcome::NotCalled(failure) => return Err(failure),
         };
         let context = step_context(base, stash, &result, previous, &error);
@@ -1439,10 +1444,11 @@ impl Execution<'_> {
         // What the data source answered, and — for a call that FAILED over a step with a
         // response half — the failure that half runs over, kept because a half that handles
         // it in neither of the two ways a definition can does not make the call succeed.
-        let (result, error, unhandled) = match self.data_source_outcome(step, &requested).await {
+        let (result, error, unhandled) = match self.data_source_outcome(step, base, &requested).await
+        {
             DataSourceOutcome::Result(result) => (result, Json::Null, None),
             DataSourceOutcome::Answered(failure) if templates.response.is_some() => {
-                (Json::Null, failure.reported(), Some(failure))
+                (failure.reported_value(), failure.reported(), Some(failure))
             }
             DataSourceOutcome::Answered(failure) | DataSourceOutcome::NotCalled(failure) => {
                 return Err(failure)
@@ -1612,6 +1618,7 @@ impl Execution<'_> {
     async fn data_source_outcome(
         &mut self,
         step: &PipelineStep,
+        base: &FieldContext,
         requested: &Json,
     ) -> DataSourceOutcome {
         let Some(data_source) = step.data_source.clone() else {
@@ -1675,6 +1682,30 @@ impl Execution<'_> {
                     table_region: data_source.table_region.as_deref(),
                     use_caller_credentials: data_source.use_caller_credentials,
                     service_role_arn: data_source.service_role_arn.as_deref(),
+                    versioned: data_source.versioned,
+                    base_table_ttl: data_source.base_table_ttl,
+                },
+                // What the resolver asks of a conflict on such a data source, beside the two
+                // parts of the field's own context a LAMBDA conflict handler's event carries.
+                &super::dynamodb::versioned::Syncing {
+                    detection: step
+                        .sync_config
+                        .as_ref()
+                        .and_then(|sync| sync.conflict_detection.as_deref()),
+                    handler: step
+                        .sync_config
+                        .as_ref()
+                        .and_then(|sync| sync.conflict_handler.as_deref()),
+                    handler_arn: step
+                        .sync_config
+                        .as_ref()
+                        .and_then(|sync| sync.lambda_conflict_handler_config.as_ref())
+                        .and_then(|configured| {
+                            configured.lambda_conflict_handler_arn.as_deref()
+                        }),
+                    arguments: &base.arguments,
+                    info: &base.info,
+                    identity: &base.identity,
                 },
                 self.request.caller.as_ref(),
                 requested,
@@ -1684,9 +1715,13 @@ impl Execution<'_> {
                 Ok(result) => DataSourceOutcome::Result(result),
                 // Carried as a RAISED failure, so the step's own `ctx.error` states the type
                 // the refusal is of and an error of the field reports it as its `errorType`.
+                // A refusal that carries a VALUE beside its sentence — the row an unresolved
+                // conflict reports as the server holds it — carries it on as the error's own
+                // `data`.
                 Err(refused) => DataSourceOutcome::Answered(Failure::Raised(Box::new(Raised {
                     message: refused.message,
                     error_type: Some(refused.error_type),
+                    data: refused.data,
                     ..Raised::default()
                 }))),
             },
@@ -2202,6 +2237,9 @@ struct ResolverPlan {
     data_source: Option<StepDataSource>,
     /// The steps of a `PIPELINE` resolver, in the order the pipeline invokes them.
     functions: Vec<PipelineStep>,
+    /// "The `SyncConfig` for a resolver attached to a versioned data source"
+    /// (`Resolver$syncConfig`) the resolver carries, which its own step is made under.
+    sync_config: Option<SyncConfig>,
     /// Whether the resolver is of the `PIPELINE` kind.
     is_pipeline: bool,
     /// "The maximum batching size for a resolver" (`Resolver$maxBatchSize`): how many field
@@ -2234,6 +2272,7 @@ impl ResolverPlan {
                 code: self.code.clone(),
                 templates: self.templates.clone(),
                 data_source: self.data_source.clone(),
+                sync_config: self.sync_config.clone(),
                 max_batch_size: self.max_batch_size,
             };
             // A batching size configures `BatchInvoke` outright. A resolver whose own
@@ -2323,6 +2362,11 @@ struct PipelineStep {
     code: Option<String>,
     templates: Option<Templates>,
     data_source: Option<StepDataSource>,
+    /// "The `SyncConfig` for a resolver attached to a versioned data source"
+    /// (`Resolver$syncConfig`, `FunctionConfiguration$syncConfig`): which conflict detection
+    /// and which resolution strategy a write of this step is made under
+    /// ([`super::dynamodb::versioned`]).
+    sync_config: Option<SyncConfig>,
     /// The maximum batching size the definition this step came from configures, which says
     /// whether its data source is invoked with the BATCHED event document.
     max_batch_size: i32,
@@ -2413,6 +2457,21 @@ impl Failure {
                 "message": raised.message,
                 "type": raised.error_type.clone(),
             }),
+        }
+    }
+
+    /// The value this failure reports BESIDE its sentence, which is the step's own `ctx.result`
+    /// while its response half runs over the failure.
+    ///
+    /// A refusal that carries one is a refusal about a VALUE the caller has to see: the row an
+    /// unresolved conflict on a versioned data source reports as the SERVER holds it
+    /// ([`super::dynamodb::versioned`]), which is exactly what a definition passes on as the
+    /// error's own data (`$util.error($ctx.error.message, $ctx.error.type, $ctx.result)`).
+    /// `null` for every other failure: a call that failed produced no value.
+    fn reported_value(&self) -> Json {
+        match self {
+            Self::Message(_) => Json::Null,
+            Self::Raised(raised) => raised.data.clone().unwrap_or(Json::Null),
         }
     }
 }
@@ -2533,6 +2592,13 @@ struct StepDataSource {
     /// `dynamodbConfig.useCallerCredentials` — whether such a call is made under the CALLER's
     /// own credentials rather than under the data source's role.
     use_caller_credentials: bool,
+    /// `dynamodbConfig.versioned` and the retention window of the `deltaSyncConfig` beside it:
+    /// whether the data source keeps the item versions AppSync's conflict detection compares,
+    /// and how long the row a versioned delete leaves behind is retained
+    /// ([`super::dynamodb::versioned`]). `false` and `0` for every other type, which keeps no
+    /// versions.
+    versioned: bool,
+    base_table_ttl: i64,
     /// `httpConfig.endpoint` of an `HTTP` data source: the endpoint a step resolving against it
     /// sends its request to, and `None` for every other type — which configures none.
     endpoint: Option<String>,
@@ -2576,6 +2642,15 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
                 .dynamodb_config
                 .as_ref()
                 .is_some_and(|config| config.use_caller_credentials),
+            versioned: record
+                .dynamodb_config
+                .as_ref()
+                .is_some_and(|config| config.versioned),
+            base_table_ttl: record
+                .dynamodb_config
+                .as_ref()
+                .and_then(|config| config.delta_sync_config.as_ref())
+                .map_or(0, |delta| delta.base_table_ttl),
             endpoint: record
                 .http_config
                 .as_ref()
@@ -2625,6 +2700,7 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
                     function.response_mapping_template.as_deref(),
                 ),
                 data_source: step_data_source(api, Some(&function.data_source_name)),
+                sync_config: function.sync_config.clone(),
                 max_batch_size: function.max_batch_size,
             },
             None => PipelineStep {
@@ -2632,6 +2708,7 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
                 code: None,
                 templates: None,
                 data_source: None,
+                sync_config: None,
                 max_batch_size: 0,
             },
         })
@@ -3400,8 +3477,10 @@ const NOT_ONE_RESULT: &str =
 
 /// The `errorType` AppSync reports for an invocation of a data source's function that COULD
 /// NOT BE MADE — the class its errors of that kind carry, under the `Lambda:` prefix every
-/// error of a Lambda data source is reported under.
-const LAMBDA_INVOCATION_ERROR_TYPE: &str = "Lambda:IllegalArgument";
+/// error of a Lambda data source is reported under. Read by the one other place this endpoint
+/// invokes a function a resolver names, the conflict handler of a versioned data source
+/// ([`super::dynamodb::versioned`]), so a failed invocation is reported one way.
+pub(super) const LAMBDA_INVOCATION_ERROR_TYPE: &str = "Lambda:IllegalArgument";
 
 #[cfg(test)]
 mod tests {

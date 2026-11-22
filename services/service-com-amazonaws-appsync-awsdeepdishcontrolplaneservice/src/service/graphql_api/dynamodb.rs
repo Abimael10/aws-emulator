@@ -33,6 +33,12 @@
 //! * an operation this data source does not serve, and a request missing what its operation
 //!   takes, is refused BEFORE the hop, so no half-built call reaches the table.
 //!
+//! A data source configured for VERSIONED items — "set to TRUE to use Conflict Detection and
+//! Resolution with this data source" (`DynamodbDataSourceConfig$versioned`) — makes more of a
+//! write than the one call: AppSync keeps the item's version and the time of its last change on
+//! the item itself, a write whose stated version is not the stored one is a CONFLICT, and what
+//! becomes of such a write is the resolution strategy the resolver configured ([`versioned`]).
+//!
 //! Nothing of the stored record is changed here: this module reads the data source's
 //! configuration and calls another service.
 
@@ -46,6 +52,8 @@ use super::mapping_template::utilities::dynamodb::{
     BINARY, BINARY_SET, BOOLEAN, LIST, MAP, NULL, NUMBER, NUMBER_SET, STRING, STRING_SET,
 };
 use super::PlaneContext;
+
+pub mod versioned;
 
 /// The `AMAZON_DYNAMODB` data source a step resolves against, as the step's own record
 /// carries it.
@@ -65,6 +73,15 @@ pub struct Configured<'a> {
     /// `serviceRoleArn`, the role AppSync makes the call under where the data source does not
     /// use the caller's own credentials, or `None` for a data source that names none.
     pub service_role_arn: Option<&'a str>,
+    /// `dynamodbConfig.versioned` — "Set to TRUE to use Conflict Detection and Resolution with
+    /// this data source", which is what makes a write of this data source a VERSIONED one
+    /// ([`versioned`]): AppSync keeps the item's version and the time of its last change on
+    /// the item itself, and a write whose stated version is not the stored one is a conflict.
+    pub versioned: bool,
+    /// `dynamodbConfig.deltaSyncConfig.baseTableTTL` — "the number of minutes that an Item is
+    /// stored in the data source", which is how long the row a versioned delete leaves behind
+    /// is retained, and `0` for a data source that configures no delta sync at all.
+    pub base_table_ttl: i64,
 }
 
 /// Make the call `requested` asks for against `source`'s table and answer the result the
@@ -79,6 +96,7 @@ pub struct Configured<'a> {
 pub async fn answered(
     context: &PlaneContext,
     source: &Configured<'_>,
+    sync: &versioned::Syncing<'_>,
     caller: Option<&SignedCaller>,
     requested: &Json,
 ) -> Result<Json, Refused> {
@@ -119,7 +137,30 @@ pub async fn answered(
             return Err(Refused {
                 message: refusal,
                 error_type: answered_error_type(ACCESS_DENIED_EXCEPTION),
+                data: None,
             });
+        }
+    }
+    // A write through a data source configured for VERSIONED items is not the plain call: the
+    // item's own version decides whether it is applied at all, and what it comes to is the
+    // resolution strategy the resolver configured ([`versioned`]). Every other call — a read,
+    // a selection, and the batches, which that detection is not defined over — is made as it
+    // stands.
+    if source.versioned {
+        if let Some(write) = versioned::Write::of(call) {
+            return versioned::written(
+                context,
+                source,
+                sync,
+                &versioned::Asked {
+                    write,
+                    region,
+                    table,
+                    requested,
+                    body: &body,
+                },
+            )
+            .await;
         }
     }
     let answer = called(context, region, call.target(), &body).await?;
@@ -887,6 +928,7 @@ async fn called(
     Err(Refused {
         message: answered_message(&document),
         error_type: answered_error_type(&answered_code(&document)),
+        data: None,
     })
 }
 
@@ -926,6 +968,11 @@ pub struct Refused {
     pub message: String,
     /// The class of the refusal, as an error of the field reports it as its `errorType`.
     pub error_type: String,
+    /// What the refusal carries BESIDE its sentence, where the refusal is one AppSync reports a
+    /// value with: the row as the server holds it, which is what the error of an unresolved
+    /// conflict carries so the caller can build the write it retries with
+    /// ([`versioned::written`]). `None` for every refusal that reports no value of its own.
+    pub data: Option<Json>,
 }
 
 impl Refused {
@@ -935,6 +982,7 @@ impl Refused {
         Self {
             message,
             error_type: REQUEST_ERROR_TYPE.to_string(),
+            data: None,
         }
     }
 
@@ -945,6 +993,7 @@ impl Refused {
         Self {
             message: reason.to_string(),
             error_type: answered_error_type(BASE_EXCEPTION),
+            data: None,
         }
     }
 }

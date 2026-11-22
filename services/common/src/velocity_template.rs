@@ -216,6 +216,7 @@ impl Parse<'_> {
                 '#' => {
                     // A comment, an unparsed block, a directive — or, for anything else, a
                     // `#` of the text.
+                    let hash = self.at;
                     if self.matches(&['#', '#']) {
                         self.skip_line();
                         continue;
@@ -286,10 +287,13 @@ impl Parse<'_> {
                             return Ok((nodes, Terminator::ElseIf(condition)));
                         }
                         // A directive this does not know is text: a `#` followed by a word
-                        // is only a directive when it is one of the above.
+                        // is only a directive when it is one of the above. Reading the name
+                        // left the cursor past it, so the whole of it is read again AS TEXT —
+                        // the `#` and the word both belong to the template's output, as they
+                        // do in the `#name` an expression attribute name is written as.
                         _ => {
                             text.push('#');
-                            self.at += 1;
+                            self.at = hash.saturating_add(1);
                         }
                     }
                 }
@@ -1329,6 +1333,45 @@ mod tests {
             assert_eq!(
                 shape, *first,
                 "case {case:?}: expected a {first} node, got {shape}"
+            );
+        }
+    }
+
+    /// RULE: a `#` that opens no directive of this grammar is TEXT — the whole of it, the word
+    /// after it included — because that is what the template renders. A body stating an
+    /// expression attribute name (`#title`) depends on it: every character of the name belongs
+    /// to the output.
+    #[test]
+    fn a_hash_that_opens_no_directive_renders_as_the_text_it_is() {
+        // The rows span what FOLLOWS the `#`: a word that is no directive of this grammar, a
+        // word that merely starts like one, the formal braced spelling of such a word, a
+        // character no name can start with, and the name written twice in one body.
+        let rows: &[(&str, &str)] = &[
+            ("{\"#title\": \"title\"}", "{\"#title\": \"title\"}"),
+            ("#sets", "#sets"),
+            ("#{title}", "#{title}"),
+            ("#fff0aa", "#fff0aa"),
+            ("#-tag", "#-tag"),
+            (
+                "{\"#a\": \"a\", \"#b\": \"b\"}",
+                "{\"#a\": \"a\", \"#b\": \"b\"}",
+            ),
+        ];
+        for (case, expected) in rows {
+            let parsed = parse(case);
+            let nodes = parsed
+                .as_ref()
+                .unwrap_or_else(|why| panic!("case {case:?}: expected a parse, got {why}"));
+            let rendered: String = nodes
+                .iter()
+                .map(|node| match node {
+                    Node::Text(text) => text.clone(),
+                    other => panic!("case {case:?}: expected text alone, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                rendered, *expected,
+                "case {case:?}: expected {expected:?}, got {rendered:?}"
             );
         }
     }
