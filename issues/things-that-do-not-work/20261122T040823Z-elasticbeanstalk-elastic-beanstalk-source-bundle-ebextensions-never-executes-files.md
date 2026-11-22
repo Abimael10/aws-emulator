@@ -1,0 +1,37 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: elasticbeanstalk.eb-ebextensions-config-files-really-run-on-the-instance
+Issue-Shape-Id: com.amazonaws.elasticbeanstalk#AWSElasticBeanstalkService
+Issue-Key: elasticbeanstalk.eb-ebextensions-config-files-really-run-on-the-instance|_http_get#24|Timeout|return exc.code, exc.read().decode("utf-8", "replace")
+Issue-Commit: e6dce30b243860da21c421a4fb52b6fdf5624066
+
+# Elastic Beanstalk source-bundle .ebextensions never executes: files: and container_commands: produce no artefacts on the environment's instance
+
+> _Note: this issue was identified against the code base at commit `e6dce30b243860da21c421a4fb52b6fdf5624066`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateApplicationVersion
+
+## Description
+One net-new root cause in the Elastic Beanstalk environment data plane. The failing check runs to the harness cap ("Check timed out after 60.0s") because a data-plane poll it issues never satisfies. This replay did NOT report the check as owned by any open issue. Context, not cover: open issue 20261121T153828Z-elasticbeanstalk-elastic-beanstalk-environment-data-plane-ebextensions-files-container.md describes this same behaviour and even lists this check id in its Issue-Trace-Ids, but its recorded Issue-Key for this check (_http_until#24) no longer matches the replayed failure, so the replay left the check unowned and it is re-filed here rather than dropped; a fixer closing that issue should close this one with it. 20261121T141417Z-elasticbeanstalk-elastic-beanstalk-environments-have-no-running-application-process.md covers the neighbouring "no persistent application process" defect.
+
+Cause 1 of 1: a source bundle's `.ebextensions/*.config` is never interpreted during deployment, so neither its `files:` entries nor its `container_commands:` side effects exist on the environment's instance.
+AWS: recorded behavior only for the provisioning step. Smithy (service com.amazonaws.elasticbeanstalk#AWSElasticBeanstalkService) models only the control-plane calls: CreateApplicationVersion input {ApplicationName required @length 1-100, VersionLabel required @length 1-100, SourceBundle S3Location, Process boolean}, errors S3LocationNotInServiceRegionException 400, CodeBuildNotInServiceRegionException 400, InsufficientPrivilegesException 403, TooManyApplicationVersionsException 400; CreateEnvironment input {ApplicationName required, EnvironmentName @length 4-40, CNAMEPrefix @length 4-63, VersionLabel, SolutionStackName, OptionSettings}, output carries Status/CNAME/EndpointURL. The model says nothing about bundle provisioning; AWS's documented deployment behaviour, and what the recording shows, is that when the uploaded bundle contains `.ebextensions/*.config`, the platform applies it on each instance before the web process is started: every `files:` entry is written to its declared path with exactly the declared content and the declared mode/owner/group, and every `container_commands:` shell command really runs, so its side-effect file exists on the instance filesystem afterwards. A path no section of the config mentions does not exist and a read of it fails. The declared paths, contents and tokens are variable parts taken from the request's bundle; the requirement is that rule, never any single run's token value.
+Emulator: the environment's instance filesystem shows neither artefact. The check publishes a PROCESSED application version whose bundle carries one `files:` entry (a /tmp path, mode 000644, a minted content token) and one `container_commands:` entry (`printf %s <token> > <other /tmp path>`), launches an environment on it, waits for Status Ready, verifies the negative control (the on-instance file reader correctly answers 404 for a path the config never mentions), then polls that same reader for the two declared paths. Neither ever answers 200 within the check's 300s-per-path budget, so the check never reaches its content assertions and is cut off at the 60s harness cap. The reader itself works (it 404s), so the declared paths genuinely do not exist: the config was a no-op.
+Why: bundle-carried provisioning is silently skipped while the control plane reports a successful deployment on a Ready environment. A client whose deployment depends on `.ebextensions` to drop config files, install hooks, or run build/migration commands gets an environment that is not configured and no signal at all, and cannot distinguish "my .ebextensions is wrong" from "the platform never ran it". Any test of platform customisation is unexercisable.
+Fix: the application-version deployment path of the elasticbeanstalk service — unpacking a source bundle must parse `.ebextensions/*.config` and apply its `files:` and `container_commands:` sections against the simulated instance filesystem before the web process is started, and reads of paths it never wrote must keep failing.
+Traces: elasticbeanstalk.eb-ebextensions-config-files-really-run-on-the-instance.
+
+## Evidence
+Cause 1: [mismatch] elasticbeanstalk.eb-ebextensions-config-files-really-run-on-the-instance — Error: Check timed out after 60.0s.
+Expected: after the version carrying `.ebextensions/sim2real.config` is deployed and the environment is Ready, GET http://<cname>/sim2real/file?<files-path> returns 200 whose body, stripped, is exactly the content token declared by the config's `files:` section, GET http://<cname>/sim2real/file?<cmd-path> returns 200 whose body is exactly the token the `container_commands:` entry printed, the two bodies differ, and GET http://<cname>/sim2real/file?<never-written-path> returns 404 both before and after. (Paths and tokens are per-run values filling that template.)
+Actual: the never-written control path correctly returns 404, but neither declared path ever returns 200 within the check's 300s-per-path poll; the check never reaches its assertions and is killed at the 60s harness cap. No HTTP status or error code diverges on the control plane — CreateApplicationVersion reports PROCESSED and the environment reports Status Ready — the divergence is that the deployment produced none of the on-instance artefacts the bundle declares.
+
+## Steps to Reproduce
+1. CreateApplication.
+2. CreateStorageLocation, then PutObject a source bundle ZIP containing: a Procfile (`web: python3 -u server.py`), a stdlib HTTP server exposing a route that reads an arbitrary on-instance path (200 with its contents, 404 on OSError), and `.ebextensions/sim2real.config` declaring one `files:` entry (a /tmp path, mode 000644, owner/group root, a minted content token) plus one `container_commands:` entry (`printf %s <cmd-token> > /tmp/<other-path>`).
+3. CreateApplicationVersion with that SourceBundle and Process=true; poll DescribeApplicationVersions until Status is PROCESSED.
+4. CreateEnvironment with that VersionLabel, a CNAMEPrefix, an AL2023 Python SolutionStackName from ListAvailableSolutionStacks, and the instance-profile/service-role option settings; poll DescribeEnvironments until Status is Ready.
+5. GET http://<cname>/sim2real/file?<a-path-the-config-never-mentions> — correctly 404.
+6. GET http://<cname>/sim2real/file?<files-path> and GET http://<cname>/sim2real/file?<container-command-output-path> — neither ever returns 200, so the `files:` content and the container_command side effect never appear on the instance.
