@@ -844,6 +844,12 @@ async fn a_client_that_dials_the_published_address_is_answered_there() {
 /// from the published value and the host is this process's own loopback address. Nothing
 /// outside this machine is reachable from here.
 async fn dial(authority: &str, headers: &str) -> String {
+    dial_request(authority, "GET", "/", headers).await
+}
+
+/// [`dial`] for a request of any method and request target, which is what a client that
+/// followed `domainName` issues: the handler's answer is computed from both.
+async fn dial_request(authority: &str, method: &str, target: &str, headers: &str) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let host = service_common::data_plane_addressing::host_only(authority);
@@ -857,7 +863,9 @@ async fn dial(authority: &str, headers: &str) -> String {
     let mut socket = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .unwrap_or_else(|error| panic!("the published address {authority} must accept a connection: {error}"));
-    let request = format!("GET / HTTP/1.1\r\nhost: {authority}\r\n{headers}connection: close\r\n\r\n");
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nhost: {authority}\r\n{headers}connection: close\r\n\r\n"
+    );
     socket
         .write_all(request.as_bytes())
         .await
@@ -868,6 +876,26 @@ async fn dial(authority: &str, headers: &str) -> String {
         .await
         .expect("the answer is read");
     String::from_utf8_lossy(&read).to_string()
+}
+
+/// The status code of a raw answer read off the socket.
+fn status_on_the_wire(answered: &str) -> u16 {
+    answered
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("the answer must open with a status line, got {answered:?}"))
+}
+
+/// The body of a raw answer read off the socket, empty when the answer carries none.
+fn body_on_the_wire(answered: &str) -> String {
+    answered
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
 }
 
 /// The value of the response header `name` on a raw answer read off the socket, empty when
@@ -930,6 +958,133 @@ async fn a_dialled_unsigned_request_is_served_the_page_and_its_id() {
         named[0], named[1],
         "each refusal must name its own response, got {named:?}"
     );
+}
+
+/// The SHA-256 a signed request states for an empty body, which a signed GET carries in its
+/// `x-amz-content-sha256` header.
+const EMPTY_BODY_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// One row of the dialled-handler table: the case, the headers the request presents its
+/// SigV4 credential in, its method, its request target, and the status, the content type and
+/// the body the revision's own code answered it with.
+type DialledRow<'a> = (&'a str, String, &'a str, &'a str, u16, &'a str, &'a str);
+
+/// RULE: the address `GetWebFunctionEndpoint` reports as `domainName` IS the web function's
+/// HTTP data plane once that same read says the endpoint's `state` is `Active` — so an
+/// authorized request a client issues there is answered with the response the revision the
+/// endpoint routes it to produced: its status, its headers and its body are all that code's
+/// own, and nothing fixed of this emulator's is served in their place.
+///
+/// This walks the whole path a client walks, over a real socket: read `domainName` off the
+/// Active endpoint, present a SigV4 credential, read what comes back. The rows differ along
+/// everything the handler decides — the status (a `2xx` of its own and a non-`2xx` one), the
+/// content type, the shape of the body, and the method and path the answer is computed from
+/// — and along the two forms a credential is presented in (an `Authorization` header, and
+/// the query parameters of a presigned URL), because what is served is the code's answer
+/// whichever way the request was authorized.
+#[tokio::test]
+async fn a_signed_request_to_an_active_endpoints_domain_name_is_served_the_handlers_response() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+    let name = "dialled-handler-response";
+    create_serving(
+        &emulator,
+        name,
+        "IamAuth",
+        CJS_KEY,
+        json!({ "GREETING": "the dialled revision" }),
+    )
+    .await;
+
+    // The address a client uses is the one the READ reports, taken once that same read says
+    // the endpoint is serving traffic — the order a client follows.
+    let active = poll_until_active(&emulator, name, "ep").await;
+    let domain_name = active
+        .get("domainName")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("an Active endpoint reports the domain name it is served at, got {active:?}")
+        })
+        .to_string();
+
+    let signed = format!("authorization: {SIGNED}\r\nx-amz-content-sha256: {EMPTY_BODY_SHA256}\r\n");
+    let rows: [DialledRow<'_>; 5] = [
+        (
+            "a signed GET of the route the code answers from its own environment",
+            signed.clone(),
+            "GET",
+            "/",
+            200,
+            "text/plain",
+            "hello from the dialled revision",
+        ),
+        (
+            "a signed GET of a route the code answers as JSON built from the path",
+            signed.clone(),
+            "GET",
+            "/items/42",
+            200,
+            "application/json",
+            "{\"item\":\"42\",\"method\":\"GET\"}",
+        ),
+        (
+            "a signed POST of that same route",
+            signed.clone(),
+            "POST",
+            "/items/42",
+            200,
+            "application/json",
+            "{\"item\":\"42\",\"method\":\"POST\"}",
+        ),
+        (
+            "a signed GET of a route the code answers with a status of its own",
+            signed.clone(),
+            "GET",
+            "/teapot",
+            418,
+            "text/plain",
+            "short and stout",
+        ),
+        (
+            "a presigned GET, whose credential is in the query",
+            String::new(),
+            "GET",
+            "/?X-Amz-Credential=AKIDEXAMPLE&X-Amz-Signature=deadbeef",
+            200,
+            "text/plain",
+            "hello from the dialled revision",
+        ),
+    ];
+    for (case, headers, method, target, status, content_type, body) in rows {
+        let answered = dial_request(&domain_name, method, target, &headers).await;
+        assert_eq!(
+            status_on_the_wire(&answered),
+            status,
+            "case {case:?}: expected the status the code set, got {answered:?}"
+        );
+        assert_eq!(
+            header_on_the_wire(&answered, "content-type"),
+            content_type,
+            "case {case:?}: expected the content type the code set, got {:?}",
+            header_on_the_wire(&answered, "content-type")
+        );
+        assert_eq!(
+            header_on_the_wire(&answered, "x-served-by"),
+            "commonjs",
+            "case {case:?}: expected the header the code set, got {answered:?}"
+        );
+        assert_eq!(
+            body_on_the_wire(&answered),
+            body,
+            "case {case:?}: expected the body the code produced, got {:?}",
+            body_on_the_wire(&answered)
+        );
+        assert!(
+            !header_on_the_wire(&answered, REQUEST_ID_HEADER).is_empty(),
+            "case {case:?}: every answer names the response it is, got {answered:?}"
+        );
+    }
 }
 
 /// RULE: the address belongs to the endpoint — once the endpoint is gone, nothing is
