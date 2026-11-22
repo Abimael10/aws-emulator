@@ -31,9 +31,17 @@
 //! which the auth-policy operations share ([`AuthPolicy`], [`auth_policy_target`],
 //! [`check_auth_policy_document`], [`auth_policy_state`](
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::auth_policy_state)).
+//!
+//! Which resource an ARN names it for, where that resource keeps its TAGS and what a tag
+//! write does to them live in the `tags` child module, which the three tag operations
+//! share ([`tag_target`], [`tags_of`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::tags_of), [`add_tags`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::add_tags), [`remove_tags`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::remove_tags)).
 
 mod announced_dns;
 mod auth_policies;
+mod tags;
 mod targets;
 mod vpc_associations;
 
@@ -43,6 +51,7 @@ pub use auth_policies::{
     AUTH_POLICY_STATE_ACTIVE, AUTH_POLICY_STATE_INACTIVE, AUTH_TYPE_AWS_IAM,
     MALFORMED_AUTH_POLICY_MESSAGE,
 };
+pub use tags::{tag_target, TAGGABLE_KINDS, TAG_TARGET_NOT_FOUND_MESSAGE};
 pub use targets::{
     check_target_owner, connections_drain, not_registered_message, TargetHealth, TargetRejection,
     HEALTH_CHECK_MEMBER, TARGET_DRAINING_TIME, TARGET_FAILURE_INVALID_TARGET,
@@ -2441,7 +2450,14 @@ fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex>
 /// A map's value is rendered as its entry count, the way the framework's own collection
 /// `@length` check renders one.
 pub fn check_tag_count(tags: Option<&HashMap<String, String>>) -> Result<(), FieldViolation> {
-    let count = tags.map_or(0, HashMap::len);
+    check_tag_total(tags.map_or(0, HashMap::len))
+}
+
+/// Refuse `count` tags on one resource, as [`check_tag_count`] refuses an over-long
+/// `tags` map: the same member, the same modelled ceiling and the same rendering, so a
+/// create that sends too many tags at once and a tag call that would accumulate too many
+/// are refused in one voice.
+pub fn check_tag_total(count: usize) -> Result<(), FieldViolation> {
     if count > MAX_TAGS {
         return Err(Violation {
             path: "tags".to_string(),

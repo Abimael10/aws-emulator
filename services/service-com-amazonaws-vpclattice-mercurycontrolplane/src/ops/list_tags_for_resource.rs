@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +101,16 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// HTTP 404 for a `resourceArn` that names no resource whose tags this operation can
+/// report.
+///
+/// The tag operations' own refusal, which carries nothing from the request
+/// ([`crate::state::TAG_TARGET_NOT_FOUND_MESSAGE`]) and answers the error code
+/// `NotFoundException` rather than the `ResourceNotFoundException` their model declares.
+fn not_found() -> ListTagsForResourceError {
+    crate::scaffolded::Scaffolded::not_found(crate::state::TAG_TARGET_NOT_FOUND_MESSAGE)
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +147,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // The tags belong to the resource the ARN names, so the ARN is resolved to the
+        // kind and the id it names first; an ARN naming no kind of this service names no
+        // resource whose tags can be reported, which is the same refusal as one naming a
+        // kind whose resource was never created.
+        let Some((kind, id)) = crate::state::tag_target(&input.resource_arn) else {
+            return Err(not_found());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A target group whose asynchronous removal the clock has already made due is
+        // gone: this read materialises that removal first and then answers the same
+        // not-found as an ARN nothing ever stored. It writes nothing that was not already
+        // owed at the same instant.
+        store.expire_deleted_target_groups(now);
+        let Some(tags) = store.tags_of(kind, &id) else {
+            return Err(not_found());
+        };
+        // Read straight off the resource's own record: a resource carrying no tags reports
+        // the empty map rather than no member, because every stored resource HAS a tag map
+        // — a create with no `tags` stored an empty one.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone()),
+        })
     }
 }

@@ -43,6 +43,30 @@
 //!    modelled 400 in AWS's words, and the policy the resource already carried is left
 //!    exactly as it was; so is an identifier that names no persisted resource (404) and a
 //!    value outside a modelled constraint (400).
+//!
+//! TAGS are the third thing this service attaches to a resource by `resourceArn`, so the
+//! tag operations (`TagResource`, `ListTagsForResource`, `UntagResource`) are asserted
+//! here too, over tables of the same shape:
+//!
+//! 6. A tag call addresses the tag map of the resource its `resourceArn` names — the ONE
+//!    map that resource's create stored: `TagResource` MERGES the pairs it sends into it
+//!    (replacing the keys it names, case-sensitively, and leaving every other key), and
+//!    `ListTagsForResource` reports exactly that map, so one resource's tags never change
+//!    another's.
+//! 7. `UntagResource` removes only the keys it names, and a key the resource does not
+//!    carry removes nothing.
+//! 8. A `resourceArn` naming no resource a tag call can address is refused the way the
+//!    tag front-end refuses one — HTTP 404 with the error code `NotFoundException` and a
+//!    sentence that names nothing from the request — for every one of the three
+//!    operations, and a write that would take a resource past the modelled `TagMap`
+//!    ceiling is a 400 that stores nothing.
+//!
+//! The tag tables span what rules 6–8 generalise over: the KIND of resource the ARN names
+//! (one of every kind this emulator mints, including the two whose ARN NESTS under another
+//! resource's), and the tags written (pair count, a replaced key, an empty value,
+//! non-ASCII text, and a key and value at their modelled `@length` ceilings).
+
+use std::collections::BTreeMap;
 
 use crate::resource_not_found_messages::absent_id;
 use crate::vpclattice_service_slice::{
@@ -1254,4 +1278,642 @@ async fn an_auth_policy_call_outside_a_modelled_constraint_is_400_and_writes_not
             STATE_ACTIVE,
         );
     }
+}
+
+// --- the TAGS slice (rules 6, 7 and 8) -------------------------------------------
+
+/// The ARN resource segments and id prefixes of the kinds a tag `resourceArn` can name
+/// beyond the three a policy ARN does. SOURCE: each kind's own modelled ARN pattern
+/// (`smithy_query(query="shape",shape="ServiceNetworkServiceAssociationArn,ServiceNetworkVpcAssociationArn,ListenerArn,RuleArn,TargetGroupArn")`),
+/// which pairs the segment with the id prefix.
+const ARN_KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
+const ARN_KIND_VPC_ASSOCIATION: &str = "servicenetworkvpcassociation";
+const ARN_KIND_LISTENER: &str = "listener";
+const ARN_KIND_RULE: &str = "rule";
+const ARN_KIND_TARGET_GROUP: &str = "targetgroup";
+const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
+const PREFIX_VPC_ASSOCIATION: &str = "snva-";
+const PREFIX_LISTENER: &str = "listener-";
+const PREFIX_RULE: &str = "rule-";
+const PREFIX_TARGET_GROUP: &str = "tg-";
+
+/// The `@length` ceiling the model puts on `TagMap`, which bounds both one request's
+/// `tags` and the map `ListTagsForResource` reports
+/// (`smithy_query(query="shape",shape="TagMap")`).
+const TAG_MAP_MAX: usize = 200;
+
+/// The `@length` ceilings of one tag's key and value
+/// (`smithy_query(query="shape",shape="TagKey,TagValue")`: `TagKey` 1..128, `TagValue`
+/// 0..256).
+const TAG_KEY_MAX: usize = 128;
+const TAG_VALUE_MAX: usize = 256;
+
+/// `POST /tags/{resourceArn}` with the pairs this case writes.
+async fn tag_resource(lattice: &Lattice, resource_arn: &str, pairs: &[(String, String)]) -> Answer {
+    let mut tags = serde_json::Map::new();
+    for (key, value) in pairs {
+        tags.insert(key.clone(), serde_json::json!(value));
+    }
+    lattice
+        .call(
+            "POST",
+            &format!("/tags/{}", as_label(resource_arn)),
+            Some(serde_json::json!({ "tags": tags })),
+        )
+        .await
+}
+
+/// `GET /tags/{resourceArn}`.
+async fn list_tags(lattice: &Lattice, resource_arn: &str) -> Answer {
+    lattice
+        .call("GET", &format!("/tags/{}", as_label(resource_arn)), None)
+        .await
+}
+
+/// `DELETE /tags/{resourceArn}?tagKeys=…`, with one query entry per key: `tagKeys` is
+/// bound to the query string
+/// (`smithy_query(query="operation",operation="UntagResource")`). Every key a case removes
+/// here is made of characters that need no escaping.
+async fn untag_resource(lattice: &Lattice, resource_arn: &str, keys: &[&str]) -> Answer {
+    let query: Vec<String> = keys.iter().map(|key| format!("tagKeys={key}")).collect();
+    lattice
+        .call(
+            "DELETE",
+            &format!("/tags/{}?{}", as_label(resource_arn), query.join("&")),
+            None,
+        )
+        .await
+}
+
+/// The tag map a `ListTagsForResource` answer reports, as a sorted map so two answers
+/// compare by content rather than by order.
+fn listed_tags(case: &str, answer: &Answer) -> BTreeMap<String, String> {
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200 from ListTagsForResource, got {} / {}",
+        answer.status, answer.body
+    );
+    let reported = answer.body["tags"].as_object().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: ListTagsForResource must report the modelled tags map, got {}",
+            answer.body
+        )
+    });
+    reported
+        .iter()
+        .map(|(key, value)| {
+            let text = value.as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: the tag {key:?} must be a string, got {value}")
+            });
+            (key.clone(), text.to_string())
+        })
+        .collect()
+}
+
+/// One resource a tag call can name: how a case labels it, its ARN, and the tags its
+/// create stored.
+struct Taggable {
+    label: &'static str,
+    arn: String,
+    created_with: BTreeMap<String, String>,
+}
+
+/// The ARN of a resource a create must have minted, with the status that create answers.
+fn created_arn(case: &str, expected_status: u16, answer: &Answer) -> String {
+    assert_eq!(
+        answer.status, expected_status,
+        "case fixture {case}: expected {expected_status}, got {} / {}",
+        answer.status, answer.body
+    );
+    answer.str_field("arn")
+}
+
+/// The map form of the `tags` a create sent, so a tag read can be compared against it.
+fn sent_tags(tags: &serde_json::Value) -> BTreeMap<String, String> {
+    tags.as_object()
+        .map(|members| {
+            members
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One resource of every kind this emulator mints, so the tag rules are asserted over the
+/// KIND of resource as well as over the tags written — including a listener and a rule,
+/// whose ARNs nest under another resource's, and the two associations, whose creates answer
+/// 200 rather than 201.
+///
+/// Some creates send `tags` and some send none, so the table also covers the map a create
+/// stored: the tag operations read and write that same map.
+async fn every_taggable_kind(lattice: &Lattice) -> Vec<Taggable> {
+    let network_tags = serde_json::json!({ "made-by": "create-service-network" });
+    let network = lattice
+        .create_service_network(serde_json::json!({
+            "name": "tagged-network",
+            "tags": network_tags,
+        }))
+        .await;
+    let network_arn = created_arn("service network", 201, &network);
+    let network_id = network.str_field("id");
+
+    let service = lattice
+        .create_service(serde_json::json!({ "name": "tagged-service" }))
+        .await;
+    let service_arn = created_arn("service", 201, &service);
+    let service_id = service.str_field("id");
+
+    let association_tags = serde_json::json!({ "made-by": "create-association" });
+    let association = lattice
+        .call(
+            "POST",
+            "/servicenetworkserviceassociations",
+            Some(serde_json::json!({
+                "serviceIdentifier": service_id,
+                "serviceNetworkIdentifier": network_id,
+                "tags": association_tags,
+            })),
+        )
+        .await;
+    let association_arn = created_arn("service association", 200, &association);
+
+    let vpc_association = lattice
+        .call(
+            "POST",
+            "/servicenetworkvpcassociations",
+            Some(serde_json::json!({
+                "serviceNetworkIdentifier": network_id,
+                "vpcIdentifier": crate::target_groups::A_VPC,
+            })),
+        )
+        .await;
+    let vpc_association_arn = created_arn("VPC association", 200, &vpc_association);
+
+    let listener = lattice
+        .call(
+            "POST",
+            &format!("/services/{service_id}/listeners"),
+            Some(serde_json::json!({
+                "name": "tagged-listener",
+                "protocol": "HTTP",
+                "defaultAction": { "fixedResponse": { "statusCode": 404 } },
+            })),
+        )
+        .await;
+    let listener_arn = created_arn("listener", 201, &listener);
+    let listener_id = listener.str_field("id");
+
+    let rule_tags = serde_json::json!({ "made-by": "create-rule" });
+    let rule = lattice
+        .call(
+            "POST",
+            &format!("/services/{service_id}/listeners/{listener_id}/rules"),
+            Some(serde_json::json!({
+                "name": "tagged-rule",
+                "priority": 7,
+                "match": { "httpMatch": { "pathMatch": { "match": { "prefix": "/" } } } },
+                "action": { "fixedResponse": { "statusCode": 404 } },
+                "tags": rule_tags,
+            })),
+        )
+        .await;
+    let rule_arn = created_arn("rule", 201, &rule);
+
+    let target_group = lattice
+        .call(
+            "POST",
+            "/targetgroups",
+            Some(serde_json::json!({
+                "name": "tagged-target-group",
+                "type": "IP",
+                "config": { "protocol": "HTTP", "vpcIdentifier": crate::target_groups::A_VPC },
+            })),
+        )
+        .await;
+    let target_group_arn = created_arn("target group", 201, &target_group);
+
+    vec![
+        Taggable {
+            label: "a service network",
+            arn: network_arn,
+            created_with: sent_tags(&network_tags),
+        },
+        Taggable {
+            label: "a service",
+            arn: service_arn,
+            created_with: BTreeMap::new(),
+        },
+        Taggable {
+            label: "a service-network/service association",
+            arn: association_arn,
+            created_with: sent_tags(&association_tags),
+        },
+        Taggable {
+            label: "a service-network/VPC association",
+            arn: vpc_association_arn,
+            created_with: BTreeMap::new(),
+        },
+        Taggable {
+            label: "a listener, whose ARN nests under its service's",
+            arn: listener_arn,
+            created_with: BTreeMap::new(),
+        },
+        Taggable {
+            label: "a rule, whose ARN nests under its listener's",
+            arn: rule_arn,
+            created_with: sent_tags(&rule_tags),
+        },
+        Taggable {
+            label: "a target group",
+            arn: target_group_arn,
+            created_with: BTreeMap::new(),
+        },
+    ]
+}
+
+/// The tag maps the write table spans. No single map is the requirement: the rule is that
+/// whatever pairs a call sends are merged into the resource's map, so the rows differ in
+/// pair count, in whether they replace a key the resource already carries, and in the
+/// characters and lengths their keys and values use — up to the `@length` ceilings
+/// `TagKey` and `TagValue` declare.
+fn tag_write_rows() -> Vec<(&'static str, Vec<(String, String)>)> {
+    vec![
+        (
+            "one pair",
+            vec![("team".to_string(), "payments".to_string())],
+        ),
+        (
+            "a second key, which leaves the first alone",
+            vec![("env".to_string(), "prod".to_string())],
+        ),
+        (
+            "two pairs, one replacing a held key beside its case-different sibling",
+            vec![
+                ("team".to_string(), "platform".to_string()),
+                ("TEAM".to_string(), "shouting".to_string()),
+            ],
+        ),
+        (
+            "an empty value, which TagValue's @length(0, 256) admits",
+            vec![("note".to_string(), String::new())],
+        ),
+        (
+            "a non-ASCII key and value",
+            vec![("équipe".to_string(), "paiements ❤".to_string())],
+        ),
+        (
+            "a key and a value at their modelled @length ceilings",
+            vec![("k".repeat(TAG_KEY_MAX), "v".repeat(TAG_VALUE_MAX))],
+        ),
+    ]
+}
+
+/// Rule 6, over the two tables: every kind of resource, and every row of tags written onto
+/// each. The recorded case — tags written on two resources and read back on each — is one
+/// row of it.
+#[tokio::test]
+async fn tags_are_merged_into_the_map_of_the_resource_the_arn_names() {
+    let lattice = Lattice::new();
+    let resources = every_taggable_kind(&lattice).await;
+
+    // What each resource must report once every row has been written onto it.
+    let mut expected: Vec<BTreeMap<String, String>> = Vec::new();
+    for resource in &resources {
+        let label = resource.label;
+        // The tags a create stored ARE the resource's tag map: a tag read reports them
+        // without anything else having written them.
+        let case = format!("{label} as created");
+        let mut held = listed_tags(&case, &list_tags(&lattice, &resource.arn).await);
+        assert_eq!(
+            held, resource.created_with,
+            "case {case:?}: expected the tags the create stored {:?}, got {held:?}",
+            resource.created_with
+        );
+
+        for (row, pairs) in tag_write_rows() {
+            let case = format!("{label} / {row}");
+            let written = tag_resource(&lattice, &resource.arn, &pairs).await;
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}: expected 200 from TagResource, got {} / {}",
+                written.status, written.body
+            );
+            for (key, value) in &pairs {
+                held.insert(key.clone(), value.clone());
+            }
+            let listed = listed_tags(&case, &list_tags(&lattice, &resource.arn).await);
+            assert_eq!(
+                listed, held,
+                "case {case:?}: expected the merged map {held:?}, got {listed:?}"
+            );
+        }
+        expected.push(held);
+    }
+
+    // Each resource carries its OWN map: having written the same keys onto every kind, a
+    // read of each still reports exactly what was written onto that one.
+    for (resource, held) in resources.iter().zip(&expected) {
+        let case = format!("{} after every other resource was tagged", resource.label);
+        let listed = listed_tags(&case, &list_tags(&lattice, &resource.arn).await);
+        assert_eq!(
+            listed, *held,
+            "case {case:?}: expected this resource's own map {held:?}, got {listed:?}"
+        );
+    }
+}
+
+/// Rule 7, over a table of key sets and two kinds of resource.
+#[tokio::test]
+async fn untagging_removes_only_the_keys_it_names() {
+    let lattice = Lattice::new();
+    let network = lattice
+        .create_service_network(serde_json::json!({ "name": "untag-network" }))
+        .await;
+    let network_arn = created_arn("service network", 201, &network);
+    let target_group = lattice
+        .call(
+            "POST",
+            "/targetgroups",
+            Some(serde_json::json!({
+                "name": "untag-target-group",
+                "type": "IP",
+                "config": { "protocol": "HTTP", "vpcIdentifier": crate::target_groups::A_VPC },
+            })),
+        )
+        .await;
+    let target_group_arn = created_arn("target group", 201, &target_group);
+
+    // (case, the keys the call removes, the keys the resource must still carry)
+    let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        ("one key", vec!["a"], vec!["b", "c", "keep"]),
+        ("two keys at once", vec!["b", "c"], vec!["keep"]),
+        (
+            "a key the resource never carried",
+            vec!["never-written"],
+            vec!["keep"],
+        ),
+        ("a key already removed", vec!["a"], vec!["keep"]),
+        ("the last key it carries", vec!["keep"], vec![]),
+    ];
+
+    for (label, arn) in [
+        ("a service network", &network_arn),
+        ("a target group", &target_group_arn),
+    ] {
+        let initial: Vec<(String, String)> = ["a", "b", "c", "keep"]
+            .iter()
+            .map(|key| ((*key).to_string(), format!("value-of-{key}")))
+            .collect();
+        assert_eq!(
+            tag_resource(&lattice, arn, &initial).await.status,
+            200,
+            "case fixture tags on {label}: expected 200 from TagResource"
+        );
+
+        for (row, removed, remaining) in &rows {
+            let case = format!("{label} / {row}");
+            let answer = untag_resource(&lattice, arn, removed).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected 200 from UntagResource, got {} / {}",
+                answer.status, answer.body
+            );
+            let listed = listed_tags(&case, &list_tags(&lattice, arn).await);
+            let expected: BTreeMap<String, String> = remaining
+                .iter()
+                .map(|key| ((*key).to_string(), format!("value-of-{key}")))
+                .collect();
+            assert_eq!(
+                listed, expected,
+                "case {case:?}: expected the remaining tags {expected:?}, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// The ARNs rule 8 spans: one of every kind a tag `resourceArn` can name, each of the
+/// modelled shape and naming a resource nothing ever created, plus two an ARN can be
+/// without naming a resource of this service at all.
+fn absent_resource_arns() -> Vec<(&'static str, String)> {
+    let absent_service = absent_id(PREFIX_SERVICE, "1");
+    let absent_listener = absent_id(PREFIX_LISTENER, "2");
+    vec![
+        (
+            "a service network",
+            expected_arn(
+                ARN_KIND_SERVICE_NETWORK,
+                &absent_id(PREFIX_SERVICE_NETWORK, "0"),
+            ),
+        ),
+        (
+            "a service",
+            expected_arn(ARN_KIND_SERVICE, &absent_id(PREFIX_SERVICE, "0")),
+        ),
+        (
+            "a service-network/service association",
+            expected_arn(
+                ARN_KIND_SERVICE_ASSOCIATION,
+                &absent_id(PREFIX_SERVICE_ASSOCIATION, "0"),
+            ),
+        ),
+        (
+            "a service-network/VPC association",
+            expected_arn(
+                ARN_KIND_VPC_ASSOCIATION,
+                &absent_id(PREFIX_VPC_ASSOCIATION, "0"),
+            ),
+        ),
+        (
+            "a listener under a service nothing created",
+            expected_arn(
+                &format!("{ARN_KIND_SERVICE}/{absent_service}/{ARN_KIND_LISTENER}"),
+                &absent_listener,
+            ),
+        ),
+        (
+            "a rule under a listener nothing created",
+            expected_arn(
+                &format!(
+                    "{ARN_KIND_SERVICE}/{absent_service}/{ARN_KIND_LISTENER}/{absent_listener}/{ARN_KIND_RULE}"
+                ),
+                &absent_id(PREFIX_RULE, "3"),
+            ),
+        ),
+        (
+            "a target group",
+            expected_arn(ARN_KIND_TARGET_GROUP, &absent_id(PREFIX_TARGET_GROUP, "0")),
+        ),
+        (
+            "a resource configuration, a kind no create of this emulator mints yet",
+            expected_arn(
+                ARN_KIND_RESOURCE_CONFIGURATION,
+                &absent_id(PREFIX_RESOURCE_CONFIGURATION, "0"),
+            ),
+        ),
+        (
+            "an ARN whose resource part names no kind of this service",
+            expected_arn("mystery", "thing-0000000000000"),
+        ),
+        (
+            "an ARN of a known kind with trailing text after the id",
+            format!(
+                "{}-does-not-exist",
+                expected_arn(
+                    ARN_KIND_SERVICE_NETWORK,
+                    &absent_id(PREFIX_SERVICE_NETWORK, "4")
+                )
+            ),
+        ),
+    ]
+}
+
+/// The refusal every row of rule 8's not-found table must get: HTTP 404, the
+/// `NotFoundException` wire code, and the fixed sentence, which names nothing the request
+/// carried.
+const TAG_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+fn assert_tag_not_found(case: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status, 404,
+        "case {case:?}: expected 404, got {} / {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code.as_deref(),
+        Some("NotFoundException"),
+        "case {case:?}: expected the NotFoundException wire code, got {:?} / {}",
+        answer.error_code,
+        answer.body
+    );
+    let message = message_of(case, answer);
+    assert_eq!(
+        message, TAG_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected the tag front-end's refusal {TAG_NOT_FOUND_MESSAGE:?}, \
+         got {message:?}"
+    );
+}
+
+/// Rule 8's not-found half, over every kind of ARN and all three tag operations.
+#[tokio::test]
+async fn a_tag_call_naming_no_resource_is_refused_as_the_tag_front_end_refuses_one() {
+    let lattice = Lattice::new();
+    // A persisted resource whose tags must be untouched by any of the refused calls.
+    let network = lattice
+        .create_service_network(serde_json::json!({
+            "name": "tag-not-found-bystander",
+            "tags": { "kept": "yes" },
+        }))
+        .await;
+    let bystander = created_arn("bystander service network", 201, &network);
+
+    let written = vec![("team".to_string(), "payments".to_string())];
+    for (row, arn) in absent_resource_arns() {
+        for (operation, answer) in [
+            ("TagResource", tag_resource(&lattice, &arn, &written).await),
+            ("ListTagsForResource", list_tags(&lattice, &arn).await),
+            (
+                "UntagResource",
+                untag_resource(&lattice, &arn, &["team"]).await,
+            ),
+        ] {
+            let case = format!("{operation} on {row}");
+            assert_tag_not_found(&case, &answer);
+        }
+    }
+
+    let listed = listed_tags("the bystander", &list_tags(&lattice, &bystander).await);
+    let expected: BTreeMap<String, String> = [("kept".to_string(), "yes".to_string())]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "a refused tag call must leave another resource's tags alone: expected \
+         {expected:?}, got {listed:?}"
+    );
+}
+
+/// Rule 8's ceiling half: the modelled `TagMap` bound is what a resource can hold, so a
+/// write that would add a key past it is refused and changes nothing, while one that only
+/// replaces a held key's value is accepted at the ceiling.
+#[tokio::test]
+async fn a_tag_write_past_the_modelled_ceiling_is_refused_and_writes_nothing() {
+    let lattice = Lattice::new();
+    let network = lattice
+        .create_service_network(serde_json::json!({ "name": "tag-ceiling" }))
+        .await;
+    let arn = created_arn("service network", 201, &network);
+
+    let full: Vec<(String, String)> = (0..TAG_MAP_MAX)
+        .map(|index| (format!("key-{index}"), index.to_string()))
+        .collect();
+    assert_eq!(
+        tag_resource(&lattice, &arn, &full).await.status,
+        200,
+        "case the whole ceiling at once: expected 200 from TagResource"
+    );
+    let at_ceiling = listed_tags(
+        "the whole ceiling at once",
+        &list_tags(&lattice, &arn).await,
+    );
+    assert_eq!(
+        at_ceiling.len(),
+        TAG_MAP_MAX,
+        "case the whole ceiling at once: expected {TAG_MAP_MAX} tags, got {}",
+        at_ceiling.len()
+    );
+
+    let refused = tag_resource(
+        &lattice,
+        &arn,
+        &[("one-too-many".to_string(), "x".to_string())],
+    )
+    .await;
+    assert_eq!(
+        refused.status, 400,
+        "case one key past the ceiling: expected 400, got {} / {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_code.as_deref(),
+        Some("ValidationException"),
+        "case one key past the ceiling: expected the ValidationException wire code, got {:?} / {}",
+        refused.error_code,
+        refused.body
+    );
+    let unchanged = listed_tags("one key past the ceiling", &list_tags(&lattice, &arn).await);
+    assert_eq!(
+        unchanged, at_ceiling,
+        "case one key past the ceiling: the refused write must store nothing, expected \
+         {at_ceiling:?}, got {unchanged:?}"
+    );
+
+    // Replacing a held key adds no entry, so it is still inside the ceiling.
+    let replaced = tag_resource(
+        &lattice,
+        &arn,
+        &[("key-0".to_string(), "replaced".to_string())],
+    )
+    .await;
+    assert_eq!(
+        replaced.status, 200,
+        "case replacing a held key at the ceiling: expected 200, got {} / {}",
+        replaced.status, replaced.body
+    );
+    let after = listed_tags(
+        "replacing a held key at the ceiling",
+        &list_tags(&lattice, &arn).await,
+    );
+    assert_eq!(
+        after.len(),
+        TAG_MAP_MAX,
+        "case replacing a held key at the ceiling: expected {TAG_MAP_MAX} tags, got {}",
+        after.len()
+    );
+    assert_eq!(
+        after.get("key-0").map(String::as_str),
+        Some("replaced"),
+        "case replacing a held key at the ceiling: expected the new value, got {:?}",
+        after.get("key-0")
+    );
 }
