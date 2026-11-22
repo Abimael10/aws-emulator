@@ -323,31 +323,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // within its five-minute window the same token answers with the connector it
         // already created rather than minting another one. If that connector has since been
         // deleted — gone, or accepted for teardown and reporting `DELETING` — there is
-        // nothing to answer with, so the call falls through and creates one.
-        if let Some(existing) = store.connector_for_token(&region, input.client_token.as_deref()) {
-            if store
-                .connector(&region, &existing.arn)
-                .is_some_and(|connector| !connector.is_deleting())
-            {
-                // Same token, different request: the caller is not retrying the call this
-                // token stands for, so answering with that connector would answer for a
-                // request nobody made.
-                if existing.request != request {
-                    return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "The ClientToken was already used to create connector {} with \
-                             different parameters",
-                            existing.arn
-                        ),
-                        resource_id: existing.arn,
-                        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
-                    })
-                    .into());
-                }
+        // nothing to answer with, so the call falls through and creates one. The decision is
+        // the one this service makes for every create carrying such a token
+        // (`crate::state::token_replay`); what is this call's own is the predicate below and
+        // the refusal it words a reused token with.
+        let replay = crate::state::token_replay(
+            &store.connector_tokens,
+            &region,
+            input.client_token.as_deref(),
+            &request,
+            |arn| {
+                store
+                    .connector(&region, arn)
+                    .filter(|connector| !connector.is_deleting())
+                    .map(|connector| connector.arn.clone())
+            },
+        );
+        match replay {
+            // Same token, different request: the caller is not retrying the call this token
+            // stands for, so answering with that connector would answer for a request nobody
+            // made.
+            crate::state::TokenReplay::Conflict { arn } => {
+                return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "The ClientToken was already used to create connector {arn} with \
+                         different parameters"
+                    ),
+                    resource_id: arn,
+                    resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+                })
+                .into());
+            }
+            crate::state::TokenReplay::Answer(connector_arn) => {
                 return Ok(CreateConnectorOutput {
-                    connector_arn: Some(existing.arn),
+                    connector_arn: Some(connector_arn),
                 });
             }
+            crate::state::TokenReplay::Fresh => {}
         }
 
         // Two ceilings, both the emulator's own and both answered with the error this
@@ -466,16 +478,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.connectors.insert(arn.clone(), record);
 
-        if let Some(token) = input.client_token {
-            store.connector_tokens.insert(
-                crate::state::token_key(&region, &token),
-                crate::state::IdempotencyRecord {
-                    arn: arn.clone(),
-                    created_at: now,
-                    request,
-                },
-            );
-        }
+        // The token this call carried is filed against the connector it created, in the one
+        // place this service files one.
+        crate::state::remember_token(
+            &mut store.connector_tokens,
+            &region,
+            input.client_token,
+            &arn,
+            now,
+            request,
+        );
 
         // `arn` is the key the record was just stored under, and it carries the Region this
         // call was signed for, so this answers exactly what a later GetConnector /

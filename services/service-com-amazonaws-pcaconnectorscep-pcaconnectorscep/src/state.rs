@@ -431,9 +431,12 @@ pub struct ComAmazonawsPcaconnectorscepPcaconnectorscepState {
     /// `CreateConnector`'s (Region, `ClientToken`) -> the connector ARN it created. The
     /// Region is half the key because a token identifies a retry of a call made against ONE
     /// Region's endpoint: the same token sent to another Region asks for a connector there.
-    pub connector_tokens: BTreeMap<(String, String), IdempotencyRecord>,
-    /// `CreateChallenge`'s (Region, `ClientToken`) -> the challenge ARN it created.
-    pub challenge_tokens: BTreeMap<(String, String), IdempotencyRecord>,
+    /// Read and written through [`token_replay`] and [`remember_token`], which is where the
+    /// rule both creates apply to a reused token lives.
+    pub connector_tokens: IdempotencyTable,
+    /// `CreateChallenge`'s (Region, `ClientToken`) -> the challenge ARN it created, reached
+    /// through the same two helpers.
+    pub challenge_tokens: IdempotencyTable,
 }
 
 impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
@@ -596,30 +599,6 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
             &connector.status,
         ))
     }
-
-    /// The record a still-live `ClientToken` of `CreateConnector`, sent to `region`, is
-    /// bound to.
-    pub fn connector_for_token(
-        &self,
-        region: &str,
-        client_token: Option<&str>,
-    ) -> Option<IdempotencyRecord> {
-        client_token
-            .and_then(|token| self.connector_tokens.get(&token_key(region, token)))
-            .cloned()
-    }
-
-    /// The record a still-live `ClientToken` of `CreateChallenge`, sent to `region`, is
-    /// bound to.
-    pub fn challenge_for_token(
-        &self,
-        region: &str,
-        client_token: Option<&str>,
-    ) -> Option<IdempotencyRecord> {
-        client_token
-            .and_then(|token| self.challenge_tokens.get(&token_key(region, token)))
-            .cloned()
-    }
 }
 
 /// One of this service's taggable records, borrowed to write its tags: the single tag map the
@@ -701,6 +680,103 @@ impl TaggableMut<'_> {
 /// call against one Region's endpoint.
 pub fn token_key(region: &str, client_token: &str) -> (String, String) {
     (region.to_string(), client_token.to_string())
+}
+
+/// One create's `ClientToken` table: (Region, `ClientToken`) -> the record the call carrying
+/// that token created ([`ComAmazonawsPcaconnectorscepPcaconnectorscepState::connector_tokens`],
+/// [`ComAmazonawsPcaconnectorscepPcaconnectorscepState::challenge_tokens`]).
+pub type IdempotencyTable = BTreeMap<(String, String), IdempotencyRecord>;
+
+/// What a create must do with the `ClientToken` its request carried, as [`token_replay`]
+/// decides it.
+#[derive(Debug)]
+pub enum TokenReplay<T> {
+    /// The token is bound to a resource that can still be answered with, and this call is the
+    /// one the token stands for: answer with that resource and mint nothing.
+    Answer(T),
+    /// The token is bound to a resource that can still be answered with, but this call is NOT
+    /// the one it stands for, so answering with that resource would answer for a request
+    /// nobody made. The ARN is the resource the token already created, which is what the
+    /// refusal reports.
+    Conflict { arn: String },
+    /// The token binds nothing that can be answered with — it is unused, expired, or the
+    /// resource it created can no longer be handed out — so the call is served exactly as a
+    /// first one, and files this token itself ([`remember_token`]).
+    Fresh,
+}
+
+/// What the `@idempotencyToken` rule makes of the `ClientToken` a create carried: look the
+/// (Region, `ClientToken`) record up in that create's own table, ask `answerable` whether the
+/// resource it created can still be answered with, refuse a token reused for a DIFFERENT
+/// request, and otherwise answer with that resource.
+///
+/// The ONE place this service applies that rule, for every operation that mints a resource
+/// under an `@idempotencyToken` — `CreateConnector` over the connectors it mints and
+/// `CreateChallenge` over the challenge passwords it mints — so the sibling creates cannot
+/// decide one reused token two ways. Each caller supplies only what genuinely differs: its own
+/// table, its own fingerprint of the resource-defining inputs
+/// ([`connector_request`], [`challenge_request`]), the liveness predicate that says whether
+/// its resource can still be handed out, and the error payload it words a [`TokenReplay::Conflict`]
+/// with.
+///
+/// `answerable` is handed the ARN the token is bound to and answers with what the caller would
+/// return for it, or `None` when that resource can no longer be answered with — a retry is not
+/// exempt from the preconditions of the call it stands for, so a token whose resource is gone,
+/// or is in a state that could not serve a fresh create, binds nothing and the call falls
+/// through to [`TokenReplay::Fresh`]. It is the caller's own read, so it reports exactly what a
+/// first call would.
+///
+/// A record past [`CLIENT_TOKEN_TTL`] is not here to be found: it is dropped by
+/// [`ComAmazonawsPcaconnectorscepPcaconnectorscepState::settle`] at the top of the handler, so
+/// an expired token is a token nobody has used.
+pub fn token_replay<T>(
+    tokens: &IdempotencyTable,
+    region: &str,
+    client_token: Option<&str>,
+    request: &str,
+    answerable: impl FnOnce(&str) -> Option<T>,
+) -> TokenReplay<T> {
+    let Some(record) = client_token.and_then(|token| tokens.get(&token_key(region, token))) else {
+        return TokenReplay::Fresh;
+    };
+    let Some(answer) = answerable(&record.arn) else {
+        return TokenReplay::Fresh;
+    };
+    if record.request != request {
+        return TokenReplay::Conflict {
+            arn: record.arn.clone(),
+        };
+    }
+    TokenReplay::Answer(answer)
+}
+
+/// File the `ClientToken` a create carried against the resource it just created, so the next
+/// call carrying that token is answered by [`token_replay`] rather than minting a second
+/// resource.
+///
+/// The write half of the same rule, in the same one place: a call that carried no token files
+/// nothing — there is nothing to recognise a retry by — and one that did is remembered under
+/// [`token_key`], with the fingerprint of the inputs it was made with, which is what tells a
+/// retry from a token reused for another request.
+pub fn remember_token(
+    tokens: &mut IdempotencyTable,
+    region: &str,
+    client_token: Option<String>,
+    arn: &str,
+    now: SystemTime,
+    request: String,
+) {
+    let Some(token) = client_token else {
+        return;
+    };
+    tokens.insert(
+        token_key(region, &token),
+        IdempotencyRecord {
+            arn: arn.to_string(),
+            created_at: now,
+            request,
+        },
+    );
 }
 
 /// The Region segment of an ARN: field four of

@@ -692,6 +692,351 @@ async fn client_token_reused_with_different_inputs_conflicts() {
     );
 }
 
+/// The `ResourceType` this service names a connector with, from its own constant.
+const RESOURCE_TYPE_CONNECTOR: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::RESOURCE_TYPE_CONNECTOR;
+/// The `ResourceType` it names a challenge with.
+const RESOURCE_TYPE_CHALLENGE: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::RESOURCE_TYPE_CHALLENGE;
+
+/// Which of the two creates a row drives. Both mint a resource under an `@idempotencyToken`,
+/// and the same decision is made over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenCreate {
+    /// `CreateConnector`, whose resource is the connector itself.
+    Connector,
+    /// `CreateChallenge`, whose resource is a challenge password under a connector.
+    Challenge,
+}
+
+/// What the row's SECOND call is — the three ways a `ClientToken` can arrive at a create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenReuse {
+    /// The identical request, carrying the token the first call carried.
+    SameRequest,
+    /// The same token with a resource-defining input changed, so it stands for a call nobody
+    /// made.
+    OtherRequest,
+    /// The identical request, made once the resource that token created is no longer one this
+    /// call could answer with.
+    NothingAnswerable,
+}
+
+/// One row: which create, what its second call is, and the token both calls carry.
+#[derive(Debug)]
+struct TokenCase {
+    name: &'static str,
+    create: TokenCreate,
+    reuse: TokenReuse,
+    /// `ClientToken` is `@length(1, 64)` with pattern `^[!-~]+$` — any printable ASCII run.
+    token: &'static str,
+}
+
+/// The refusal a token reused for a DIFFERENT request is answered with: 409
+/// `ConflictException`, naming the resource that token already created in the sentence and in
+/// the two members that carry its id and its kind.
+///
+/// One reader for both creates: they refuse over their own resource — the kind, and the noun
+/// the sentence names it with — so the row supplies that kind and the ARN and nothing else
+/// differs.
+fn assert_token_conflict(answer: &Answer, case: &str, resource_type: &str, arn: &str) {
+    assert_eq!(
+        (answer.status, answer.error_type.as_str()),
+        (409, "ConflictException"),
+        "case {case:?}: a token reused for a different request must be refused 409 \
+         ConflictException, got {} / {:?}",
+        answer.status,
+        answer.body
+    );
+    let expected = format!(
+        "The ClientToken was already used to create {} {arn} with different parameters",
+        resource_type.to_lowercase()
+    );
+    assert_eq!(
+        answer.message(),
+        expected,
+        "case {case:?}: expected the refusal to name the resource the token created, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body["ResourceId"],
+        json!(arn),
+        "case {case:?}: expected ResourceId {arn:?}, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body["ResourceType"],
+        json!(resource_type),
+        "case {case:?}: expected ResourceType {resource_type:?}, got {:?}",
+        answer.body
+    );
+}
+
+/// Both creates decide a reused `ClientToken` by the ONE rule the service applies to it: a
+/// token bound to a resource that can still be answered with answers with that resource when
+/// the call is the one the token stands for and is refused 409 when it is not, and a token
+/// that binds nothing answerable is served exactly as a first call.
+///
+/// The rows span both operations — `CreateConnector` over its connectors, `CreateChallenge`
+/// over the challenge passwords it mints — and all three of those outcomes, and they differ in
+/// the token's shape and in the resource that stops being answerable (a connector accepted for
+/// teardown, a challenge that was deleted), so no row is the only one that holds the rule up.
+#[tokio::test]
+async fn both_creates_decide_a_reused_client_token_by_one_rule() {
+    let cases = [
+        TokenCase {
+            name: "connector, identical retry",
+            create: TokenCreate::Connector,
+            reuse: TokenReuse::SameRequest,
+            token: "a",
+        },
+        TokenCase {
+            name: "connector, token reused for another private CA",
+            create: TokenCreate::Connector,
+            reuse: TokenReuse::OtherRequest,
+            token: "!~-_.+",
+        },
+        TokenCase {
+            name: "connector, token of a connector accepted for teardown",
+            create: TokenCreate::Connector,
+            reuse: TokenReuse::NothingAnswerable,
+            // The published upper bound of `ClientToken`'s `@length(1, 64)`.
+            token: "t0kent0kent0kent0kent0kent0kent0kent0kent0kent0kent0kent0kent0ke",
+        },
+        TokenCase {
+            name: "challenge, identical retry",
+            create: TokenCreate::Challenge,
+            reuse: TokenReuse::SameRequest,
+            token: "7f8e9d0c-1b2a-3948-5766-859493827160",
+        },
+        TokenCase {
+            name: "challenge, token reused for another connector",
+            create: TokenCreate::Challenge,
+            reuse: TokenReuse::OtherRequest,
+            token: "Token.With/Mixed:Case",
+        },
+        TokenCase {
+            name: "challenge, token of a deleted challenge",
+            create: TokenCreate::Challenge,
+            reuse: TokenReuse::NothingAnswerable,
+            token: "9",
+        },
+    ];
+
+    for case in &cases {
+        let name = case.name;
+        assert!(
+            (1..=64).contains(&case.token.len()),
+            "case {name:?}: the row's token must stay inside ClientToken's modelled length, \
+             got {} bytes",
+            case.token.len()
+        );
+        let (router, engine) = new_router();
+
+        match case.create {
+            TokenCreate::Connector => {
+                let request = json!({
+                    "CertificateAuthorityArn": CA_ARNS[0],
+                    "ClientToken": case.token,
+                });
+                let created = create_connector(&router, request.clone()).await;
+                assert_eq!(
+                    created.status, 202,
+                    "case {name:?}: expected 202 from the first CreateConnector, got {} / {:?}",
+                    created.status, created.body
+                );
+                let arn = created.text("ConnectorArn");
+
+                match case.reuse {
+                    TokenReuse::SameRequest => {
+                        let again = create_connector(&router, request).await;
+                        assert_eq!(
+                            (again.status, again.text("ConnectorArn")),
+                            (202, arn.clone()),
+                            "case {name:?}: the identical retry must answer with the connector \
+                             the token created, got {} / {:?}",
+                            again.status,
+                            again.body
+                        );
+                        let listed = arns_of(&list_connectors(&router, "").await, "Connectors");
+                        assert_eq!(
+                            listed,
+                            vec![arn.clone()],
+                            "case {name:?}: the retry must mint no second connector, got {listed:?}"
+                        );
+                    }
+                    TokenReuse::OtherRequest => {
+                        let refused = create_connector(
+                            &router,
+                            json!({
+                                "CertificateAuthorityArn": CA_ARNS[1],
+                                "ClientToken": case.token,
+                            }),
+                        )
+                        .await;
+                        assert_token_conflict(&refused, name, RESOURCE_TYPE_CONNECTOR, &arn);
+                        let listed = arns_of(&list_connectors(&router, "").await, "Connectors");
+                        assert_eq!(
+                            listed,
+                            vec![arn.clone()],
+                            "case {name:?}: the refused call must leave state as it was, got \
+                             {listed:?}"
+                        );
+                    }
+                    TokenReuse::NothingAnswerable => {
+                        harness::release_pending(&engine, &arn);
+                        let deleted = delete_connector(&router, &arn).await;
+                        assert_eq!(
+                            deleted.status, 202,
+                            "case {name:?}: expected 202 from DeleteConnector, got {} / {:?}",
+                            deleted.status, deleted.body
+                        );
+                        // The teardown window is held open rather than raced, so the row is
+                        // about a connector the service still REPORTS and can no longer
+                        // answer a token with.
+                        harness::hold_pending(&engine, &arn);
+                        let reported = get_connector(&router, &arn).await;
+                        assert_eq!(
+                            reported.connector("Status"),
+                            &json!(STATUS_DELETING),
+                            "case {name:?}: the row needs the connector to report \
+                             {STATUS_DELETING}, got {:?}",
+                            reported.body
+                        );
+
+                        let again = create_connector(&router, request).await;
+                        assert_eq!(
+                            again.status, 202,
+                            "case {name:?}: a token binding nothing answerable must be served \
+                             as a first call, got {} / {:?}",
+                            again.status, again.body
+                        );
+                        let minted = again.text("ConnectorArn");
+                        assert_ne!(
+                            minted, arn,
+                            "case {name:?}: the retry must mint its own connector"
+                        );
+                        let read = get_connector(&router, &minted).await;
+                        assert_eq!(
+                            read.status, 200,
+                            "case {name:?}: the ARN the retry answered with must resolve, got \
+                             {} / {:?}",
+                            read.status, read.body
+                        );
+                    }
+                }
+            }
+            TokenCreate::Challenge => {
+                let connector = active_connector(&router, &engine, CA_ARNS[2]).await;
+                let request = json!({
+                    "ConnectorArn": connector.clone(),
+                    "ClientToken": case.token,
+                });
+                let created = create_challenge(&router, request.clone()).await;
+                assert_eq!(
+                    created.status, 202,
+                    "case {name:?}: expected 202 from the first CreateChallenge, got {} / {:?}",
+                    created.status, created.body
+                );
+                let arn = created
+                    .challenge("Arn")
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case {name:?}: expected a challenge Arn in {:?}", created.body)
+                    })
+                    .to_string();
+                let password = created
+                    .challenge("Password")
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {name:?}: expected a challenge Password in {:?}",
+                            created.body
+                        )
+                    })
+                    .to_string();
+
+                match case.reuse {
+                    TokenReuse::SameRequest => {
+                        let again = create_challenge(&router, request).await;
+                        assert_eq!(
+                            (
+                                again.status,
+                                again.challenge("Arn").as_str(),
+                                again.challenge("Password").as_str()
+                            ),
+                            (202, Some(arn.as_str()), Some(password.as_str())),
+                            "case {name:?}: the identical retry must answer with the challenge \
+                             the token created, password included, got {} / {:?}",
+                            again.status,
+                            again.body
+                        );
+                        let listed =
+                            arns_of(&list_challenge_metadata(&router, &connector, "").await, "Challenges");
+                        assert_eq!(
+                            listed,
+                            vec![arn.clone()],
+                            "case {name:?}: the retry must mint no second challenge, got \
+                             {listed:?}"
+                        );
+                    }
+                    TokenReuse::OtherRequest => {
+                        let other = active_connector(&router, &engine, CA_ARNS[3]).await;
+                        let refused = create_challenge(
+                            &router,
+                            json!({ "ConnectorArn": other, "ClientToken": case.token }),
+                        )
+                        .await;
+                        assert_token_conflict(&refused, name, RESOURCE_TYPE_CHALLENGE, &arn);
+                        assert!(
+                            !refused.body.to_string().contains(password.as_str()),
+                            "case {name:?}: a refused call must not hand out the challenge \
+                             password, got {:?}",
+                            refused.body
+                        );
+                    }
+                    TokenReuse::NothingAnswerable => {
+                        let deleted = delete_challenge(&router, &arn).await;
+                        assert_eq!(
+                            deleted.status, 202,
+                            "case {name:?}: expected 202 from DeleteChallenge, got {} / {:?}",
+                            deleted.status, deleted.body
+                        );
+
+                        let again = create_challenge(&router, request).await;
+                        assert_eq!(
+                            again.status, 202,
+                            "case {name:?}: a token binding nothing answerable must be served \
+                             as a first call, got {} / {:?}",
+                            again.status, again.body
+                        );
+                        let minted = again
+                            .challenge("Arn")
+                            .as_str()
+                            .unwrap_or_else(|| {
+                                panic!("case {name:?}: expected a challenge Arn in {:?}", again.body)
+                            })
+                            .to_string();
+                        assert_ne!(
+                            minted, arn,
+                            "case {name:?}: the retry must mint its own challenge"
+                        );
+                        let read = get_challenge_password(&router, &minted).await;
+                        assert_eq!(
+                            (read.status, read.body["Password"].as_str()),
+                            (200, again.challenge("Password").as_str()),
+                            "case {name:?}: the challenge the retry answered with must read \
+                             back, got {} / {:?}",
+                            read.status,
+                            read.body
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A challenge password round-trips: `GetChallengePassword` answers byte for byte what
 /// `CreateChallenge` returned, the metadata listing names exactly the challenges of the
 /// connector that was asked about, and no metadata response carries a password.

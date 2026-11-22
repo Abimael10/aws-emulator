@@ -215,40 +215,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is how the caller says "this is a retry": within its documented
         // five-minute window the same token answers with the challenge it already created,
-        // password included, rather than minting a second password.
+        // password included, rather than minting a second password. The decision itself is
+        // the one this service makes for every create carrying such a token
+        // (`crate::state::token_replay`); what is this call's own is the predicate below and
+        // the refusal it words a reused token with.
         //
         // A retry is not exempt from the preconditions of the call it stands for, so the
         // token answers only while the connector that challenge lives under could still
         // serve a fresh one: once that connector is gone, or accepted for teardown and
         // reporting `DELETING`, there is nothing to hand out and the call falls through to
-        // be answered exactly as the same request with a token nobody has used yet. (The
-        // sibling create decides the same situation the same way — see
-        // `create_connector.rs`.)
-        if let Some(existing) = store.challenge_for_token(&region, input.client_token.as_deref()) {
-            let answerable = store.challenge(&region, &existing.arn).filter(|challenge| {
+        // be answered exactly as the same request with a token nobody has used yet.
+        let replay = crate::state::token_replay(
+            &store.challenge_tokens,
+            &region,
+            input.client_token.as_deref(),
+            &request,
+            |arn| {
                 store
-                    .connector(&region, &challenge.connector_arn)
-                    .is_some_and(crate::state::StoredConnector::is_active)
-            });
-            if let Some(challenge) = answerable {
-                // Same token, different request: the caller is not retrying the call this
-                // token stands for.
-                if existing.request != request {
-                    return Err(CreateChallengeErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "The ClientToken was already used to create challenge {} with \
-                             different parameters",
-                            existing.arn
-                        ),
-                        resource_id: existing.arn.clone(),
-                        resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
+                    .challenge(&region, arn)
+                    .filter(|challenge| {
+                        store
+                            .connector(&region, &challenge.connector_arn)
+                            .is_some_and(crate::state::StoredConnector::is_active)
                     })
-                    .into());
-                }
+                    .map(crate::state::StoredChallenge::to_challenge)
+            },
+        );
+        match replay {
+            // Same token, different request: the caller is not retrying the call this token
+            // stands for.
+            crate::state::TokenReplay::Conflict { arn } => {
+                return Err(CreateChallengeErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "The ClientToken was already used to create challenge {arn} with \
+                         different parameters"
+                    ),
+                    resource_id: arn,
+                    resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
+                })
+                .into());
+            }
+            crate::state::TokenReplay::Answer(challenge) => {
                 return Ok(CreateChallengeOutput {
-                    challenge: Some(challenge.to_challenge()),
+                    challenge: Some(challenge),
                 });
             }
+            crate::state::TokenReplay::Fresh => {}
         }
 
         let connector_arn = input.connector_arn.clone();
@@ -326,16 +338,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         connector.challenges.insert(arn.clone(), record);
 
-        if let Some(token) = input.client_token {
-            store.challenge_tokens.insert(
-                crate::state::token_key(&region, &token),
-                crate::state::IdempotencyRecord {
-                    arn,
-                    created_at: now,
-                    request,
-                },
-            );
-        }
+        // The token this call carried is filed against the challenge it created, in the one
+        // place this service files one.
+        crate::state::remember_token(
+            &mut store.challenge_tokens,
+            &region,
+            input.client_token,
+            &arn,
+            now,
+            request,
+        );
 
         Ok(CreateChallengeOutput {
             challenge: Some(challenge),
