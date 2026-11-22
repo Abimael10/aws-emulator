@@ -247,6 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // document Systems Manager owns is not the account's to version, which is the
         // operation `InvalidDocumentOperation` refuses; a name neither holds names no
         // document at all.
+        //
+        // `InvalidDocument`'s `Message` is an OPTIONAL member, and which refusal states it
+        // is the operation's own: a document READ states the not-found sentence
+        // (`crate::state::document_not_found_message`), while THIS operation's
+        // existence precondition states nothing at all — it answers `InvalidDocument`
+        // with no `Message` member, whatever the reason the name resolves to no document
+        // of this Region (never created, or deleted). Nothing of the request is echoed,
+        // and the name stays free for a later create.
         let Some(record) = store.document_mut(&region, &input.name) else {
             return Err(if crate::state::published_document(&input.name).is_some() {
                 UpdateDocumentErrorModeled::InvalidDocumentOperation(InvalidDocumentOperation {
@@ -257,9 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
             } else {
-                UpdateDocumentErrorModeled::InvalidDocument(InvalidDocument {
-                    message: Some(crate::state::document_not_found_message(&input.name)),
-                })
+                UpdateDocumentErrorModeled::InvalidDocument(InvalidDocument { message: None })
             }
             .into());
         };
