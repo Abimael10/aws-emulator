@@ -7,7 +7,10 @@
 //!
 //! * `DeploymentAlreadyCompletedException` says
 //!   `The deployment <deploymentId> has already completed, current state <STATE>.`
-//!   — the id the
+//!   for an operation that acts on a deployment still making PROGRESS, and
+//!   `The deployment <deploymentId> is already in state <STATE>` for a STOP of one
+//!   that has already settled — each operation's own sentence, both carrying the
+//!   id the
 //!   request named and the deployment's INTERNAL state name, the upper-snake form
 //!   of its `DeploymentStatus`, in which a deployment a caller stopped is
 //!   `ABORTED` rather than `Stopped`. Rows span the three outcomes a deployment
@@ -18,7 +21,8 @@
 //!   is already in, so it is answered rather than refused (`stop_deployment`
 //!   holds that rule). The same sentence is what a deployment one of those
 //!   operations ITSELF completed is refused with, and its fixed phrase is what a
-//!   client reads the state back out of.
+//!   client reads the state back out of; the stop's own sentence has a suite of
+//!   its own (`stop_deployment_already_in_state_sentence`).
 //! * `UnsupportedActionForDeploymentTypeException` says
 //!   `Operation is not supported for the deployment <deploymentId> of type <TYPE>.`
 //!   — the id and the `DeploymentType` the deployment runs as, so a caller
@@ -164,12 +168,13 @@ fn blue_green_style() -> Value {
     json!({"deploymentType": "BLUE_GREEN", "deploymentOption": "WITH_TRAFFIC_CONTROL"})
 }
 
-/// RULE: `DeploymentAlreadyCompletedException` says
-/// `The deployment <deploymentId> has already completed, current state <STATE>.` —
-/// the deployment
+/// RULE: `DeploymentAlreadyCompletedException` carries the sentence the refused
+/// operation words it with — `has already completed, current state <STATE>.` for
+/// an operation over a deployment's progress, `is already in state <STATE>` for a
+/// stop — and either way the deployment
 /// id the request carried and the deployment's internal state name, which for a
-/// stopped deployment is `ABORTED` and not its API status — whichever operation
-/// was refused and however the deployment reached its outcome.
+/// stopped deployment is `ABORTED` and not its API status, however the deployment
+/// reached its outcome.
 #[tokio::test]
 async fn a_completed_deployment_is_refused_with_its_internal_state() {
     // Rows span every outcome a deployment reaches (Succeeded, Failed, Stopped),
@@ -283,12 +288,19 @@ async fn a_completed_deployment_is_refused_with_its_internal_state() {
             row.status
         );
 
-        let expected = format!(
-            "The deployment {deployment_id} has already completed, current state {}.",
-            row.state
-        );
         for operation in row.operations {
             let case = format!("{}/{operation}", row.case);
+            // Each operation's own sentence: a stop of a settled deployment reports
+            // the state it is ALREADY IN, the operations over a deployment's
+            // progress report that it has completed. Both name the same state.
+            let expected = if *operation == "StopDeployment" {
+                format!("The deployment {deployment_id} is already in state {}", row.state)
+            } else {
+                format!(
+                    "The deployment {deployment_id}{ALREADY_COMPLETED_PHRASE}{}.",
+                    row.state
+                )
+            };
             let actual = refused(
                 &emulator,
                 operation,

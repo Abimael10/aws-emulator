@@ -246,7 +246,7 @@ async fn stopping_a_completed_deployment_is_refused() {
             body["message"].as_str(),
             Some(
                 format!(
-                    "The deployment {deployment_id} has already completed, current state {}.",
+                    "The deployment {deployment_id} is already in state {}",
                     terminal.to_uppercase()
                 )
                 .as_str()

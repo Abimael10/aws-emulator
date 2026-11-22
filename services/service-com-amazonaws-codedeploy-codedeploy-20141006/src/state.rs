@@ -395,6 +395,29 @@ pub fn deployment_already_completed(deployment_id: &str, status: &str) -> String
     )
 }
 
+/// `DeploymentAlreadyCompletedException` (HTTP 400) as a STOP of a deployment that
+/// has already settled is refused: the deployment id the request named and the
+/// state that deployment is already in ([`deployment_internal_state`]).
+///
+/// CodeDeploy does not word this refusal the same way for every operation that
+/// raises it. A stop asks a deployment to END, so the refusal reports the state the
+/// deployment is ALREADY IN — there is nothing left for the stop to do — while an
+/// operation that acts on a deployment still making progress reports that the
+/// deployment has completed ([`deployment_already_completed`]). Each sentence is
+/// what the service answers for that call, and both carry the same state token, so a
+/// client reads the outcome it was refused for out of either.
+///
+/// The two readings of that token cannot differ for this sentence: they differ only
+/// for a deployment a caller stopped, and a stop of such a deployment asks for the
+/// state it is already in, so it is answered rather than refused
+/// (`crate::ops::stop_deployment`).
+pub fn deployment_stop_already_completed(deployment_id: &str, status: &str) -> String {
+    format!(
+        "The deployment {deployment_id} is already in state {}",
+        deployment_internal_state(status)
+    )
+}
+
 /// `DeploymentLimitExceededException` (HTTP 400): the deployment group a second
 /// deployment was refused for, and the deployment of it that is still active.
 ///
