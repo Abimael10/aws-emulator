@@ -60,6 +60,19 @@ pub(super) fn random_token(len: usize) -> String {
     token
 }
 
+/// `len` random BYTES, drawn from the same randomness [`random_token`] draws
+/// on: each hex pair of that token is read as the byte it renders, so an opaque
+/// blob and an opaque hex string carry the same generator and this crate holds
+/// no second one.
+pub(super) fn random_bytes(len: usize) -> Vec<u8> {
+    random_token(len.saturating_mul(2))
+        .as_bytes()
+        .chunks(2)
+        .filter_map(|pair| ::std::str::from_utf8(pair).ok())
+        .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+        .collect()
+}
+
 /// `len` random characters of [`ALPHANUMERIC_ALPHABET`]
 /// ([`random_from_alphabet`]).
 pub(super) fn random_alphanumeric_token(len: usize) -> String {

@@ -4256,10 +4256,34 @@ pub fn new_uuid() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
 }
 
-/// A fresh `Session` token: 64 characters, inside the modelled length 20..4096.
+/// A fresh `Session` token: an opaque blob of server-side material carried
+/// base64url, inside the modelled length 20..4096.
+///
+/// `SessionType` fixes no encoding, and the member's own description says what
+/// the value is FOR: "the session identifier that maintains the state of
+/// authentication requests and challenge responses"
+/// (`AdminInitiateAuth.Session` in this service's model), which the caller only
+/// ever hands back verbatim. Amazon Cognito vends that identifier as a long
+/// opaque token — several hundred base64url characters of encrypted challenge
+/// state — rather than as a short rendering of the state the server holds, so a
+/// client, proxy or store calibrated against an Amazon Cognito session accepts
+/// it and nothing reads structure out of it. It therefore carries
+/// [`SESSION_TOKEN_BYTES`] of the randomness every other minted value in this
+/// file draws on, encoded the way this service's other opaque blobs are
+/// ([`base64_url`]).
+///
+/// One token is minted per outstanding challenge and is the key that challenge
+/// is stored under ([`ServiceState::start_session`]), so the value a response
+/// publishes is the session the rest of the flow carries.
 fn new_session_token() -> String {
-    random_token(64)
+    base64_url(&random_bytes(SESSION_TOKEN_BYTES))
 }
+
+/// How many bytes of opaque material a minted `Session` carries: enough that
+/// its base64url encoding is the several-hundred-character token an Amazon
+/// Cognito challenge session is, and well inside `SessionType`'s modelled
+/// maximum of 4096 characters.
+const SESSION_TOKEN_BYTES: usize = 288;
 
 /// A fresh passkey registration challenge: the value the authenticator signs
 /// over, carried base64url as the creation options encode one (W3C Web
