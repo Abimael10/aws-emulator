@@ -103,6 +103,19 @@ pub const CANCELLED_CAPACITY_RESERVATION_RETENTION: Duration =
 /// multiple of it is not an amount the service can allocate.
 pub const CAPACITY_DPUS_INCREMENT: i32 = 4;
 
+/// The smallest amount of data processing units a request for capacity may STATE.
+///
+/// A request states an amount of capacity, so the amount has to be a positive number of data
+/// processing units: an amount below this bound is not a smaller request than the service can
+/// serve but a value the member does not carry, and it is refused for the BOUND — in the
+/// validation wording any member outside its range is refused in, naming the member and this
+/// number — rather than for the block rule below. One unit, not one block: the amount that is
+/// not positive and the amount that is not a whole number of blocks are two different
+/// refusals, and this is the bound the service states for the first of them. RECORDED rather
+/// than modelled — the `@range` on `TargetDpusInteger` carries one whole block as its minimum,
+/// which is the bound a GENERATED client measures a request against before it sends one.
+pub const MIN_REQUESTED_CAPACITY_DPUS: i32 = 1;
+
 /// The sentence a request for an amount of data processing units that cannot be allocated is
 /// refused with.
 ///
@@ -113,15 +126,26 @@ pub fn capacity_dpus_not_in_increments() -> String {
     format!("Capacity must be requested in increments of {CAPACITY_DPUS_INCREMENT}.")
 }
 
+/// Whether `target_dpus` states less capacity than a request may state at all: below
+/// [`MIN_REQUESTED_CAPACITY_DPUS`], which is the bound such a request is refused for and not
+/// the block rule [`capacity_dpus_error`] asks.
+pub fn capacity_dpus_below_minimum(target_dpus: i32) -> bool {
+    target_dpus < MIN_REQUESTED_CAPACITY_DPUS
+}
+
 /// Why `target_dpus` is not an amount of data processing units this service can allocate, if
-/// it is not: anything that is not a positive multiple of [`CAPACITY_DPUS_INCREMENT`] — zero,
-/// a negative amount, an amount below one block, or one between two blocks.
+/// it is not: it is not a whole multiple of [`CAPACITY_DPUS_INCREMENT`] — an amount below one
+/// block, or one between two blocks.
 ///
 /// Asked by every operation that requests capacity, so a create and an update refuse the
-/// same amount with the same sentence.
+/// same amount with the same sentence. Asked of an amount that STATES capacity at all: one
+/// below [`MIN_REQUESTED_CAPACITY_DPUS`] is refused for that bound before any handler runs,
+/// since the modelled `@range` minimum both operations carry is a whole block and such an
+/// amount therefore never reaches one; it is refused here too rather than allocated, which is
+/// the safe direction for a caller this check is all that stands between.
 pub fn capacity_dpus_error(target_dpus: i32) -> Option<String> {
-    let allocatable =
-        target_dpus >= CAPACITY_DPUS_INCREMENT && target_dpus % CAPACITY_DPUS_INCREMENT == 0;
+    let allocatable = !capacity_dpus_below_minimum(target_dpus)
+        && target_dpus % CAPACITY_DPUS_INCREMENT == 0;
     (!allocatable).then(capacity_dpus_not_in_increments)
 }
 

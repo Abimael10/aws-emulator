@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the one rule both Athena operations that request provisioned
-//! capacity enforce: the number of data processing units asked for is allocated in whole
-//! blocks, so an amount that is not a positive multiple of the block size cannot be
-//! allocated and is refused.
+//! End-to-end tests for the two rules both Athena operations that request provisioned
+//! capacity enforce on the amount of data processing units a request states.
 //!
-//! The block size is the minimum of the modelled `@range` on `TargetDpusInteger`, the shape
+//! The first is the BLOCK rule: capacity is allocated in whole blocks, so an amount of at
+//! least one data processing unit that is not a whole multiple of the block size cannot be
+//! allocated and is refused with the one sentence that states that rule. The block size is
+//! the minimum of the modelled `@range` on `TargetDpusInteger`, the shape
 //! `CreateCapacityReservationInput$TargetDpus` and `UpdateCapacityReservationInput$TargetDpus`
 //! both target
 //! (`smithy_query(query="operation",operation="CreateCapacityReservation,UpdateCapacityReservation")`),
-//! and the rule covers every amount outside it — below one block, between two blocks, zero
-//! and negative — whether the FRAMEWORK measured it against that modelled bound (an amount
-//! below it never reaches a handler) or the HANDLER measured it against the rule (an amount
-//! above it that is not a whole number of blocks). Both are the same refusal: HTTP 400,
-//! `InvalidRequestException`, the class `INVALID_INPUT` under both of the names the wire
-//! gives a refusal's code, and the one sentence that states the rule.
+//! and the rule holds whether the FRAMEWORK measured the amount against that modelled bound
+//! (an amount below it never reaches a handler) or the HANDLER measured it against the rule
+//! (an amount above it that is not a whole number of blocks).
+//!
+//! The second is the service's own lower BOUND: an amount of capacity is a positive number of
+//! data processing units, so an amount below one states no capacity at all and is refused for
+//! that bound — in the validation wording any member outside its range is refused in, naming
+//! the member and the bound the service applies, which is one unit and not one block. That is
+//! a different refusal from the block rule and is covered by
+//! `tests/all/capacity_dpus_minimum_bound.rs`.
+//!
+//! Either way the refusal is the same otherwise: HTTP 400, `InvalidRequestException`, and the
+//! class `INVALID_INPUT` under both of the names the wire gives a refusal's code.
 //!
 //! Every call goes over the wire (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`)
 //! through the same router the emulator boots, so each assertion is about what an SDK client
@@ -44,14 +52,13 @@ const CAPACITY_SENTENCE: &str = "Capacity must be requested in increments of 4."
 /// number of blocks, well above one.
 const ALLOCATABLE_DPUS: i32 = CAPACITY_DPUS_INCREMENT * 6;
 
-/// The amounts no reservation can be allocated: zero, negative, below one block, and every
-/// position strictly between two block boundaries.
+/// The amounts that state capacity but no WHOLE NUMBER of blocks: every position strictly
+/// between two block boundaries, low and high.
+///
+/// An amount below the smallest a request may state is not here: it broke the other rule, and
+/// `tests/all/capacity_dpus_minimum_bound.rs` is where that class is asserted.
 fn unallocatable_amounts() -> Vec<(String, i32)> {
-    let mut rows: Vec<(String, i32)> = vec![
-        ("a negative whole number of blocks".to_string(), -CAPACITY_DPUS_INCREMENT),
-        ("a negative amount inside a block".to_string(), -1),
-        ("no capacity at all".to_string(), 0),
-    ];
+    let mut rows: Vec<(String, i32)> = Vec::new();
     // Each position inside the first block, then each inside a block much further up, so
     // the rule is seen to hold away from the modelled floor as well as at it.
     for offset in 1..CAPACITY_DPUS_INCREMENT {
@@ -258,11 +265,12 @@ async fn a_whole_number_of_blocks_is_allocated() {
     }
 }
 
-/// A request that breaks the DPU rule AND another input constraint is stated in AWS's
-/// validation envelope, which names every clause — the one sentence for the rule is what a
-/// request breaking that rule ALONE is answered with, so no broken constraint goes unstated.
+/// A request whose amount is inside a block AND whose name breaks another input constraint is
+/// stated in AWS's validation envelope over the constraint it really broke: the amount meets
+/// the lower bound the service states, so no clause about that bound is raised, and the block
+/// rule's one sentence is what a request breaking that rule ALONE is answered with.
 #[tokio::test]
-async fn a_request_that_also_breaks_another_constraint_states_every_clause() {
+async fn a_request_that_also_breaks_another_constraint_states_that_constraint() {
     let router = router();
     let (status, body) = call(
         &router,
@@ -280,6 +288,27 @@ async fn a_request_that_also_breaks_another_constraint_states_every_clause() {
         error_code(&body),
         INVALID_REQUEST,
         "expected {INVALID_REQUEST}, got {body:?}"
+    );
+    let stated = message(&body);
+    assert_eq!(
+        stated,
+        "1 validation error detected: Value at 'name' failed to satisfy constraint: Member \
+         must satisfy regular expression pattern: [a-zA-Z0-9._-]+",
+        "expected the clause for the constraint the request broke, got {stated:?}"
+    );
+
+    // And a request that breaks the DPU rule beside a constraint the service has no sentence
+    // of its own for is still stated over every clause: a request stating no capacity at all
+    // broke the lower bound, which IS a numeric bound and is named as one.
+    let (status, body) = call(
+        &router,
+        "CreateCapacityReservation",
+        &json!({ "Name": "not a name!", "TargetDpus": 0 }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "expected HTTP 400, got {status} with {body:?}"
     );
     let stated = message(&body);
     assert!(

@@ -38,9 +38,15 @@
 //!
 //! One kind of broken bound is NOT stated in that envelope at all: a bound the service also
 //! states as a RULE of its own is reported as that rule, in the service's own sentence for it
-//! ([`own_sentence`]). A client is told what it must do differently, and it is told the same
-//! thing whether the framework measured the value against the model's bound or a handler
-//! measured it against the rule.
+//! ([`own_sentence`]), which is the one place that choice is made — a clause stated that way is
+//! not also stated as a numeric requirement in the envelope. A client is told what it must do
+//! differently, and it is told the same thing whether the framework measured the value against
+//! the model's bound or a handler measured it against the rule.
+//!
+//! And one bound is stated in that envelope against a DIFFERENT number from the one the
+//! framework measured: where the service's own bound on a member is not the modelled one, the
+//! clause names the service's ([`at_requested_capacity_bound`]), because a bound a client is
+//! told to satisfy is the one the service applies.
 //!
 //! # Why two seams
 //!
@@ -123,24 +129,29 @@ pub fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
         // framework's own 403 code and wording.
         return None;
     };
-    // A request that broke ONE constraint the service states itself is answered with that
-    // statement. One that also broke another is answered in the validation envelope, which
-    // names every clause rather than dropping the ones this service has no sentence for.
-    if let [only] = violations.as_slice() {
-        if let Some(stated) = own_sentence(only) {
-            return Some(Refused {
-                code: INVALID_REQUEST_EXCEPTION.to_string(),
-                message: stated,
-            });
-        }
-    }
-    // Only the ORDER of an enumerated type's value set moves, and it moves before the
-    // envelope is rendered; every clause, its member path and its requirement stay the
-    // framework's.
+    // Only the ORDER of an enumerated type's value set and the BOUND of a clause the service
+    // states its own bound for move, and both move before the envelope is rendered; every
+    // clause, its member path and its requirement stay the framework's. A clause this service
+    // states in a sentence of its OWN is not stated here at all ([`own_sentence`]).
     let stated: Vec<Violation> = violations
         .iter()
         .map(service_common::validation_message::in_hashed_enum_order)
+        .filter(|violation| own_sentence(violation).is_none())
+        .map(at_requested_capacity_bound)
         .collect();
+    if stated.is_empty() {
+        // Nothing is left for the envelope because every clause the framework wrote is one
+        // this service states itself, so that statement is the answer: it is the rule the
+        // request broke. A refusal carrying no clause at all states nothing here and keeps the
+        // framework's own code and wording.
+        return violations
+            .iter()
+            .find_map(own_sentence)
+            .map(|message| Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message,
+            });
+    }
     let stated = service_common::validation_message::aws_validation_refusal_withholding_violations(
         &Refusal::Invalid(stated),
         withholds_value,
@@ -155,21 +166,65 @@ pub fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
 /// The sentence this service states `violation` in ITSELF, where it has one, and `None`
 /// where the refusal is stated in AWS's validation wording.
 ///
+/// The ONE place that choice is made: a clause this answers for is not stated in the envelope
+/// either, because a rule the service words itself is not also a numeric requirement the
+/// framework words.
+///
 /// A modelled bound the service also states as a rule of its own is reported as that rule:
 /// the amount of provisioned capacity a reservation asks for is allocated in blocks, and the
 /// `@range` minimum on `TargetDpusInteger` — the only bound that shape declares — is the size
-/// of one block, so an amount below it is refused with the service's own sentence for an
-/// amount it cannot allocate ([`crate::state::capacity_dpus_error`]) rather than with a clause
-/// about a numeric bound. That is also what keeps the refusal of such an amount one sentence
-/// whether the framework measured it against the model's bound or the handler against the
-/// rule.
+/// of one block, so an amount of capacity that is not a whole number of blocks is refused with
+/// the service's own sentence for an amount it cannot allocate
+/// ([`crate::state::capacity_dpus_not_in_increments`]) rather than with a clause about a
+/// numeric bound. That is also what keeps the refusal of such an amount one sentence whether
+/// the framework measured it against the model's bound or the handler against the rule.
+///
+/// An amount that states no capacity at all broke a different rule — the bound a request's
+/// amount has to be positive ([`crate::state::capacity_dpus_below_minimum`]) — and that one IS
+/// a numeric bound, so it keeps the validation wording, with the service's own number for it
+/// ([`at_requested_capacity_bound`]).
 fn own_sentence(violation: &Violation) -> Option<String> {
-    let member = violation.path.split('.').next_back()?;
-    match (member, &violation.kind) {
-        (TARGET_DPUS_MEMBER, ViolationKind::MinValue(_)) => {
-            Some(crate::state::capacity_dpus_not_in_increments())
-        }
-        _ => None,
+    if !measures_requested_capacity(violation) {
+        return None;
+    }
+    let amount = submitted_capacity(violation)?;
+    (!crate::state::capacity_dpus_below_minimum(amount))
+        .then(crate::state::capacity_dpus_not_in_increments)
+}
+
+/// Whether `violation` is the clause the framework raises for the amount of requested
+/// capacity being below the `@range` minimum of `TargetDpusInteger`.
+///
+/// The WHOLE member path, not its last segment: these rules are about the one top-level member
+/// both operations that request capacity declare, so a nested member that happened to share
+/// its name would not be measured against a bound that is not its own.
+fn measures_requested_capacity(violation: &Violation) -> bool {
+    violation.path == TARGET_DPUS_MEMBER && matches!(violation.kind, ViolationKind::MinValue(_))
+}
+
+/// The amount of capacity the refused request stated, read back off the clause the framework
+/// wrote — the value half it echoes — and `None` when that half holds no whole number this
+/// service's capacity rules are stated over.
+///
+/// A clause whose amount cannot be read is left to the envelope, where it is stated as the
+/// bound the service applies: the fail-safe direction, since the framework writes that half for
+/// every `@range` violation and an unreadable one says nothing about which rule was broken.
+fn submitted_capacity(violation: &Violation) -> Option<i32> {
+    violation.value.as_deref()?.parse().ok()
+}
+
+/// `violation` with the bound a clause about an amount of requested capacity states: the
+/// smallest amount a request may state ([`crate::state::MIN_REQUESTED_CAPACITY_DPUS`]) rather
+/// than the `@range` minimum the framework measured the value against, which is one whole
+/// block and the bound a GENERATED client checks. Every other violation is returned as the
+/// framework wrote it.
+fn at_requested_capacity_bound(violation: Violation) -> Violation {
+    if !measures_requested_capacity(&violation) {
+        return violation;
+    }
+    Violation {
+        kind: ViolationKind::MinValue(crate::state::MIN_REQUESTED_CAPACITY_DPUS.to_string()),
+        ..violation
     }
 }
 
@@ -380,7 +435,8 @@ mod tests {
     }
 
     /// RULE: a refusal that is not about the request's VALUES keeps the framework's own code
-    /// and wording — an unauthenticated caller is answered 403, not as a bad request.
+    /// and wording — an unauthenticated caller is answered 403, not as a bad request — and so
+    /// does one that names no broken constraint at all.
     #[test]
     fn a_refusal_that_is_not_a_constraint_refusal_is_not_restated() {
         assert_eq!(
@@ -388,20 +444,40 @@ mod tests {
             None,
             "expected the framework's own wording for a refusal of another class"
         );
+        assert_eq!(
+            stated_refusal(&Refusal::Invalid(Vec::new())),
+            None,
+            "expected the framework's own wording for a refusal naming no clause"
+        );
     }
 
     /// RULE: a bound the service states as a rule of its own is reported as that rule, in the
-    /// service's sentence for it, wherever the request broke that bound alone.
+    /// service's sentence for it, wherever the request broke that bound alone — and an amount
+    /// that states no capacity at all broke the service's own POSITIVE bound instead, which
+    /// keeps the validation wording and names that bound.
     #[test]
     fn a_bound_the_service_states_itself_is_reported_as_that_rule() {
-        // (case, the amount the request carried) — `TargetDpusInteger` declares one bound, the
-        // minimum of its `@range`, so every row breaks that one.
-        let rows: Vec<(&str, &str)> = vec![
-            ("an amount inside the first block", "1"),
-            ("no capacity at all", "0"),
-            ("a negative amount", "-4"),
+        // (case, the amount the request carried, the sentence it is refused with) —
+        // `TargetDpusInteger` declares one bound, the minimum of its `@range`, so every row
+        // breaks that one and the service tells the two rules apart from the amount itself.
+        let below_the_bound = format!(
+            "1 validation error detected: Value at '{TARGET_DPUS_MEMBER}' failed to satisfy \
+             constraint: Member must have value greater than or equal to {}",
+            crate::state::MIN_REQUESTED_CAPACITY_DPUS
+        );
+        let inside_a_block = crate::state::capacity_dpus_not_in_increments();
+        let rows: Vec<(&str, &str, &str)> = vec![
+            ("an amount inside the first block", "1", &inside_a_block),
+            (
+                "another amount inside the first block",
+                "3",
+                &inside_a_block,
+            ),
+            ("no capacity at all", "0", &below_the_bound),
+            ("a negative amount", "-4", &below_the_bound),
+            ("a far negative amount", "-2147483648", &below_the_bound),
         ];
-        for (case, amount) in rows {
+        for (case, amount, expected) in rows {
             let stated = stated_refusal(&Refusal::Invalid(vec![violation(
                 "targetDpus",
                 ViolationKind::MinValue("4".to_string()),
@@ -413,15 +489,48 @@ mod tests {
                 "case {case:?}: expected this service's own refusal shape"
             );
             assert_eq!(
-                stated.message,
-                crate::state::capacity_dpus_not_in_increments(),
-                "case {case:?}: expected the sentence that states the rule, got {:?}",
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
                 stated.message
             );
         }
 
-        // A request that broke that bound AND another constraint is stated in the envelope,
-        // which names every clause rather than dropping the one it has no sentence for.
+        // A request that broke the service's own bound AND another constraint is stated in the
+        // envelope, which names every clause rather than dropping the ones this service has a
+        // sentence of its own for — and the clause about the amount names the bound the SERVICE
+        // applies rather than the modelled block size.
+        let stated = stated_refusal(&Refusal::Invalid(vec![
+            violation(
+                "targetDpus",
+                ViolationKind::MinValue("4".to_string()),
+                Some("0"),
+            ),
+            violation(
+                "name",
+                ViolationKind::Pattern("^[a-zA-Z0-9._-]+$".to_string()),
+                Some("not a name!"),
+            ),
+        ]))
+        .expect("expected the refusal to be stated");
+        assert!(
+            stated.message.starts_with("2 validation errors detected: "),
+            "expected the envelope to count both clauses, got {:?}",
+            stated.message
+        );
+        assert!(
+            stated.message.contains(&format!(
+                "Value at '{TARGET_DPUS_MEMBER}' failed to satisfy constraint: Member must \
+                 have value greater than or equal to {}",
+                crate::state::MIN_REQUESTED_CAPACITY_DPUS
+            )),
+            "expected the clause to name the bound the service applies, got {:?}",
+            stated.message
+        );
+
+        // An amount that MEETS that bound is not stated in the envelope at all: the clause the
+        // framework wrote is about the modelled block size, which is a requirement the amount
+        // satisfies as the service states the bound, so only the constraint the request really
+        // broke is named.
         let stated = stated_refusal(&Refusal::Invalid(vec![
             violation(
                 "targetDpus",
@@ -435,9 +544,11 @@ mod tests {
             ),
         ]))
         .expect("expected the refusal to be stated");
-        assert!(
-            stated.message.starts_with("2 validation errors detected: "),
-            "expected the envelope to count both clauses, got {:?}",
+        assert_eq!(
+            stated.message,
+            "1 validation error detected: Value at 'name' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [a-zA-Z0-9._-]+",
+            "expected only the constraint the request broke, got {:?}",
             stated.message
         );
     }
