@@ -33,9 +33,11 @@ mod burstable_rows;
 mod burstable_xen_rows;
 mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
+mod fourth_generation_xen_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
 mod intel_nvme_compute_rows;
+mod memory_optimized_nvme_rows;
 mod network_optimized_rows;
 mod neuron_accelerated_rows;
 mod newest_generation_graviton_rows;
@@ -4755,9 +4757,10 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// hardware, the dense HDD storage ones, the eighth generation Intel compute optimized ones,
 /// those of them that carry local NVMe devices, the general purpose families with local
 /// NVMe devices, the families whose accelerators are Neuron devices, the compute optimized
-/// families on the newest AWS Graviton hardware, and the storage optimized Graviton ones. A row
-/// is reached by its instance type alone, so which table it is written in is nothing but where
-/// the figures of one group of families are kept together.
+/// families on the newest AWS Graviton hardware, the storage optimized Graviton ones, the
+/// fourth generation families on the Xen hypervisor and the memory optimized ones with local
+/// NVMe devices. A row is reached by its instance type alone, so which table it is written in
+/// is nothing but where the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
@@ -4774,7 +4777,9 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
         .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
+        .chain(fourth_generation_xen_rows::FOURTH_GENERATION_XEN_INSTANCE_TYPE_FACTS)
         .chain(general_purpose_nvme_rows::GENERAL_PURPOSE_NVME_INSTANCE_TYPE_FACTS)
+        .chain(memory_optimized_nvme_rows::MEMORY_OPTIMIZED_NVME_INSTANCE_TYPE_FACTS)
         .chain(
             storage_optimized_graviton_rows::STORAGE_OPTIMIZED_GRAVITON_INSTANCE_TYPE_FACTS,
         )

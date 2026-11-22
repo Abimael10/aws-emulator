@@ -1700,10 +1700,13 @@ pub(super) const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
 /// reads that one) — so a previous generation family of the same age as one of these, M3
 /// among them, has no IPv6 address to report while its volumes can still be encrypted.
 ///
-/// The dense HDD storage family `d2` is on it beside the three the page names: the recorded
-/// catalog reports that family as previous generation AND reports IPv6 addresses per interface
-/// for it, so the two facts are read apart here the way the doc comment above says.
-pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 4] = ["c3", "d2", "i2", "r3"];
+/// The dense HDD storage family `d2` is on it beside the three the page names, as are the
+/// families the recorded catalog reports as previous generation while still reporting IPv6
+/// addresses per interface for them — the fourth generation general purpose and memory
+/// optimized families and the fifth generation graphics one: those two facts are read apart
+/// here the way the doc comment above says.
+pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 7] =
+    ["c3", "d2", "g5", "i2", "m4", "r3", "r4"];
 
 /// The families that run on the Nitro System from BEFORE their fifth generation, as the
 /// EC2 User Guide's list of "instances built on the Nitro System" names them. The
