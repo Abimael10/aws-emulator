@@ -186,8 +186,10 @@ const QUALIFIER_MEMBER: &str = "Qualifier";
 /// A record names the resource a data event acted on because that is what a trail's selector
 /// SELECTS the event by: `resources.type` names the class of data events a trail logs and
 /// `resources.ARN` narrows it to one function, so a record naming no resource is admitted by
-/// no such selector. A MANAGEMENT call of this service names none, so this answers a resource
-/// only for the operations in the catalog above.
+/// no such selector — and so the function is named by its ARN here, while a MANAGEMENT record
+/// of the same function names it by its NAME, which is what a lookup by `ResourceName` filters
+/// on ([`super::management_events::management_event_resources`]). This answers a resource only
+/// for the operations in the catalog above.
 ///
 /// The ARN is this service's own ([`crate::state::function_arn`]), built from the function the
 /// request addressed — whichever of the documented `FunctionName` forms it used, since all of
@@ -259,8 +261,13 @@ fn addressed_function(
 /// The non-empty text a record's `request_parameters` holds at the modelled member `member`.
 ///
 /// The document names its members the way a record spells them
-/// ([`recorded_member_name`]), which is the one place that spelling is decided.
-fn text_member<'a>(request_parameters: &'a ::serde_json::Value, member: &str) -> Option<&'a str> {
+/// ([`recorded_member_name`]), which is the one place that spelling is decided — so the
+/// MANAGEMENT leg reads a member of a record through this same function
+/// ([`super::management_events`]) rather than through a second reading of that spelling.
+pub(crate) fn text_member<'a>(
+    request_parameters: &'a ::serde_json::Value,
+    member: &str,
+) -> Option<&'a str> {
     request_parameters
         .get(recorded_member_name(member))
         .and_then(::serde_json::Value::as_str)

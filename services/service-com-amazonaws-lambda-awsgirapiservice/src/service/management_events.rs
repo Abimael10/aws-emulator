@@ -16,6 +16,8 @@
 //! * the `eventName` CloudTrail PUBLISHES the operation's calls under, which for this
 //!   service is not the operation's shape name ([`published_event_name`]);
 //! * the Region and the account the call was served for;
+//! * the FUNCTION each call acted on, which a lookup by `ResourceName` or `ResourceType`
+//!   selects the record by ([`management_event_resources`]);
 //! * the members whose values its records WITHHOLD ([`OMITTED_MEMBERS`]); and
 //! * which operations REPORT state and which CHANGE it — the one fact a record cannot read
 //!   off a request, so it is stated per operation in [`MANAGEMENT_EVENT_OPERATIONS`].
@@ -36,12 +38,21 @@ use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
-use service_common::management_events::{RecordedSession, ServedApiCall};
+use service_common::management_events::{AuditedResource, RecordedSession, ServedApiCall};
 use smithy_server_runtime::OperationContext;
+
+/// The non-empty text a record's `requestParameters` holds at one modelled member, read the
+/// one way this service reads a record's members — the DATA leg states it, because the
+/// spelling a record names its members with is decided in one place.
+use super::data_events::text_member;
 
 /// The `eventSource` every record of this service carries, stated once beside the DATA leg
 /// that shares it: the modelled `awsService.cloudTrailEventSource`.
 pub use super::data_events::EVENT_SOURCE;
+
+/// The type a FUNCTION is named by in a record's resource list, stated once beside the DATA
+/// leg that shares it.
+pub use super::data_events::FUNCTION_RESOURCE_TYPE;
 
 /// The members a record of a control-plane call carries the redaction literal in place of
 /// the value of: none. What this service withholds, it withholds WHOLE
@@ -309,6 +320,110 @@ fn row(operation: &str) -> Option<&'static (&'static str, CallKind, &'static str
         .find(|(named, _, _)| *named == operation)
 }
 
+/// The members of this service's requests that address a FUNCTION, as the model spells
+/// them.
+///
+/// `FunctionName` is the function-reference member every function operation binds (a bare
+/// name, a name with a qualifier, a partial ARN or a full ARN — all documented forms of one
+/// reference). The other two carry an ARN whose own resource segment says what it names:
+/// `Resource` is the `TaggableResource` the tagging trio addresses
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTags")`), and
+/// `ResourceArn` the `PolicyResourceArn` of the resource-policy trio
+/// (`…operation="PutResourcePolicy,GetResourcePolicy,DeleteResourcePolicy"`); either may
+/// name a function or another kind of Lambda resource, and only a function's ARN reads as
+/// one.
+///
+/// The set is by member NAME, so it holds for every operation that carries a member of that
+/// name rather than for a list of operations.
+const FUNCTION_REFERENCE_MEMBERS: &[&str] = &["FunctionName", "Resource", "ResourceArn"];
+
+/// The fault shape this service answers a call whose addressed resource is not there with
+/// (`smithy_query(query="operation",…)` lists `ResourceNotFoundException`, `httpError` 404,
+/// among the errors of every operation that addresses one).
+///
+/// The shape alone does not say WHICH resource was missing, so it is read together with the
+/// message below (see [`resolved_resources_only`]).
+const RESOURCE_NOT_FOUND_SHAPE: &str = "ResourceNotFoundException";
+
+/// The fixed opening of the sentence this service refuses a call with when THE FUNCTION a
+/// request addressed is not there (`crate::state::resolve_function` builds
+/// `Function not found: <arn>`, and every operation that words that absence itself states the
+/// same prefix before the ARN).
+///
+/// A refusal whose message opens with it is the one that says the function did not resolve;
+/// the same fault shape with another sentence — an alias, a URL configuration — is a
+/// sub-resource of a function the call DID act on.
+const FUNCTION_NOT_FOUND_OPENING: &str = "Function not found: ";
+
+/// The resources a management call of `operation` acted on, read off the parameters its
+/// record carries: the FUNCTION the request addressed.
+///
+/// A record names the resource a call acted on because that is what a lookup by
+/// `ResourceName` or `ResourceType` selects the record by, and `Resource$ResourceName` is
+/// "the name of the resource referenced by the event … user-created names" — so the function
+/// is named by its own NAME, whichever of the documented reference forms the request happened
+/// to write ([`crate::state::parse_function_reference`] folds all of them to one name), and
+/// neither the Region nor the account a full ARN carried is part of that name. A reference
+/// naming a function this account does not hold is answered
+/// [`RESOURCE_NOT_FOUND_SHAPE`] and that record names no resource at all
+/// ([`resolved_resources_only`]), so a lookup still reports only resources this account has.
+/// The FUNCTION is the one kind of resource named here because it is the one kind CloudTrail
+/// identifies this service's events by ([`FUNCTION_RESOURCE_TYPE`], the type a trail's event
+/// selector names Lambda resources with too); a reference that names another kind of Lambda
+/// resource, or no function at all, contributes nothing rather than a resource built from a
+/// value this service does not recognise.
+///
+/// A call of an operation this service records no management event for names no resource:
+/// an invocation is a data event, which names the function it ran itself and by its ARN
+/// rather than its name ([`super::data_events::data_event_resources`]) — a data event is
+/// SELECTED by a trail's event selector, which matches `resources.ARN`, while a management
+/// record is LOOKED UP by `ResourceName`, which is the user-created name. The two legs
+/// therefore name one function differently on purpose.
+#[must_use]
+pub fn management_event_resources(
+    operation: &str,
+    request_parameters: &::serde_json::Value,
+) -> Vec<AuditedResource> {
+    if recorded_class(operation).is_none() {
+        return Vec::new();
+    }
+    let mut named: Vec<AuditedResource> = Vec::new();
+    for member in FUNCTION_REFERENCE_MEMBERS {
+        let Some(reference) = text_member(request_parameters, member)
+            .and_then(crate::state::parse_function_reference)
+        else {
+            continue;
+        };
+        let resource = AuditedResource::new(FUNCTION_RESOURCE_TYPE, reference.name);
+        if !named.contains(&resource) {
+            named.push(resource);
+        }
+    }
+    named
+}
+
+/// `call` with the resources it names dropped when the FUNCTION it addressed did not
+/// resolve: the one refusal that says the function itself is not there.
+///
+/// The resources a record names are the ones the call acted on, and a call refused because
+/// the function is not there acted on nothing — so naming the reference it carried would
+/// report a function this account does not hold to a lookup by `ResourceName` as fact. It is
+/// the MESSAGE and not the fault shape alone that says so: this service answers
+/// [`RESOURCE_NOT_FOUND_SHAPE`] for a sub-resource of a function it resolved perfectly well
+/// (an alias, a URL configuration, an event-invoke configuration), and such a call did act
+/// on its function, so its record keeps it. Every other outcome keeps the function too.
+fn resolved_resources_only(mut call: ServedApiCall) -> ServedApiCall {
+    let function_missing = call.error_code.as_deref() == Some(RESOURCE_NOT_FOUND_SHAPE)
+        && call
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with(FUNCTION_NOT_FOUND_OPENING));
+    if function_missing {
+        call.resources.clear();
+    }
+    call
+}
+
 /// What this service contributes to the record of each control-plane call it serves.
 ///
 /// Holds the shared engine — the record goes into the log that engine carries, the one
@@ -346,7 +461,7 @@ impl<Eng: Send + Sync + 'static> AuditedService for FunctionManagementEvents<Eng
         // handle it borrows, which a temporary at the end of this block would not be.
         let mut recording = log.lock();
         recording.record_delivered(
-            call,
+            resolved_resources_only(call),
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
         )
@@ -373,11 +488,19 @@ impl<Eng: Send + Sync + 'static> AuditedService for FunctionManagementEvents<Eng
         ::engine::emulator_account_id().to_string()
     }
 
-    // `resources` is the shared recorder's default: none. The pairs CloudTrail reports in
-    // an event's `Resources` are the DATA leg's own concern here — a data event is selected
-    // by the resource it acted on (see [`super::data_events`]) — while a management record
-    // of this service carries the call, its parameters and its outcome.
-
+    fn resources(
+        &self,
+        operation: &str,
+        request_parameters: &::serde_json::Value,
+        region: &str,
+    ) -> Vec<AuditedResource> {
+        // The function the call acted on, read off the parameters it was dispatched with: a
+        // record names it so that a lookup by `ResourceName` or `ResourceType` finds the
+        // call (see [`management_event_resources`]). The Region is not read — a function is
+        // named by its NAME, which every documented reference form carries.
+        let _ = region;
+        management_event_resources(operation, request_parameters)
+    }
     fn sensitive_members(&self) -> &'static [&'static str] {
         SENSITIVE_MEMBERS
     }
@@ -505,6 +628,196 @@ mod tests {
                 None,
                 "case {operation:?}: an invocation is no management event of this service"
             );
+        }
+    }
+
+    /// RULE: a management record names the FUNCTION the call addressed, by the function's
+    /// own name, whichever documented reference form the request wrote and whichever member
+    /// carried it; a request that addresses no function of this service names no resource.
+    ///
+    /// The rows span what the rule generalises over rather than the one create that
+    /// motivated it: each documented `FunctionName` form (bare name, name with a qualifier,
+    /// the `function:` prefix form, a partial ARN, a full ARN — including one of another
+    /// Region), both ARN-carrying members, an ARN of a Lambda resource that is NOT a
+    /// function, a request carrying no reference at all, and an operation that is no
+    /// management event.
+    #[test]
+    fn a_management_record_names_the_function_the_call_addressed() {
+        let rows: &[(&str, &str, ::serde_json::Value, Vec<&str>)] = &[
+            (
+                "a create naming the function it makes",
+                "CreateFunction",
+                ::serde_json::json!({ "functionName": "ledger" }),
+                vec!["ledger"],
+            ),
+            (
+                "a read addressing the function with a qualifier",
+                "GetFunction",
+                ::serde_json::json!({ "functionName": "ledger:3" }),
+                vec!["ledger"],
+            ),
+            (
+                "a grant addressing it by the bare resource-type form",
+                "AddPermission",
+                ::serde_json::json!({ "functionName": "function:ledger" }),
+                vec!["ledger"],
+            ),
+            (
+                "a read addressing it by partial ARN",
+                "GetFunctionConfiguration",
+                ::serde_json::json!({ "functionName": "000000000000:function:ledger" }),
+                vec!["ledger"],
+            ),
+            (
+                "a write addressing it by full ARN",
+                "UpdateFunctionConfiguration",
+                ::serde_json::json!({
+                    "functionName": "arn:aws:lambda:us-east-1:000000000000:function:ledger",
+                }),
+                vec!["ledger"],
+            ),
+            (
+                "a read addressing another Region's function by ARN",
+                "GetFunction",
+                ::serde_json::json!({
+                    "functionName": "arn:aws:lambda:eu-west-1:000000000000:function:ledger",
+                }),
+                vec!["ledger"],
+            ),
+            (
+                "a read addressing another ACCOUNT's function by ARN",
+                "GetFunction",
+                ::serde_json::json!({
+                    "functionName": "arn:aws:lambda:us-east-1:999999999999:function:ledger",
+                }),
+                vec!["ledger"],
+            ),
+            (
+                "a tagging write, whose ARN member names the function",
+                "TagResource",
+                ::serde_json::json!({
+                    "resource": "arn:aws:lambda:us-east-1:000000000000:function:ledger",
+                }),
+                vec!["ledger"],
+            ),
+            (
+                "a resource-policy write, whose ARN member names the function",
+                "PutResourcePolicy",
+                ::serde_json::json!({
+                    "resourceArn": "arn:aws:lambda:us-east-1:000000000000:function:ledger",
+                }),
+                vec!["ledger"],
+            ),
+            (
+                "a tagging write on a LAYER, which is no function",
+                "TagResource",
+                ::serde_json::json!({
+                    "resource": "arn:aws:lambda:us-east-1:000000000000:layer:shared",
+                }),
+                vec![],
+            ),
+            (
+                "a list over the account, which addresses no function",
+                "ListFunctions",
+                ::serde_json::json!({ "maxItems": 10 }),
+                vec![],
+            ),
+            (
+                "an invocation, which is a data event and names its function itself",
+                "Invoke",
+                ::serde_json::json!({ "functionName": "ledger" }),
+                vec![],
+            ),
+        ];
+        for (case, operation, parameters, expected) in rows {
+            let actual = management_event_resources(operation, parameters);
+            let names: Vec<&str> = actual
+                .iter()
+                .map(|resource| resource.resource_name.as_str())
+                .collect();
+            assert_eq!(
+                &names, expected,
+                "case {case:?}: expected the record to name {expected:?}, got {actual:?}"
+            );
+            for resource in &actual {
+                assert_eq!(
+                    resource.resource_type, FUNCTION_RESOURCE_TYPE,
+                    "case {case:?}: a function is named by its own resource type, got \
+                     {resource:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE (the other half): a call the service refused because the FUNCTION it addressed
+    /// is not there acted on nothing, so its record names no resource; a refusal about a
+    /// sub-resource of a function that resolved, and a refusal for any other reason, acted on
+    /// that function and keep it.
+    #[test]
+    fn a_call_that_resolved_no_function_names_none() {
+        let rows: &[(&str, Option<&str>, Option<&str>, usize)] = &[
+            ("a served call", None, None, 1),
+            (
+                "the function itself is not there",
+                Some(RESOURCE_NOT_FOUND_SHAPE),
+                Some("Function not found: arn:aws:lambda:us-east-1:000000000000:function:ledger"),
+                0,
+            ),
+            (
+                "the function resolved and its alias did not",
+                Some(RESOURCE_NOT_FOUND_SHAPE),
+                Some("Cannot find alias arn: arn:aws:lambda:us-east-1:000000000000:function:ledger:live"),
+                1,
+            ),
+            (
+                "the statement is already there",
+                Some("ResourceConflictException"),
+                Some("The statement id (named) provided already exists."),
+                1,
+            ),
+            (
+                "a parameter the service refused",
+                Some("InvalidParameterValueException"),
+                Some("1 validation error detected"),
+                1,
+            ),
+        ];
+        for (case, error_code, error_message, expected) in rows {
+            let mut call = recorded_call();
+            call.error_code = error_code.map(ToString::to_string);
+            call.error_message = error_message.map(ToString::to_string);
+            let kept = resolved_resources_only(call);
+            assert_eq!(
+                kept.resources.len(),
+                *expected,
+                "case {case:?}: expected {expected} named resource(s), got {:?}",
+                kept.resources
+            );
+        }
+    }
+
+    /// One served call naming one function, as the wrapper hands it to the recorder.
+    fn recorded_call() -> ServedApiCall {
+        ServedApiCall {
+            event_name: published_event_name("GetFunction"),
+            event_source: EVENT_SOURCE.to_string(),
+            aws_region: "us-east-1".to_string(),
+            read_only: true,
+            access_key_id: None,
+            user_name: None,
+            principal_type: String::new(),
+            principal_id: None,
+            identity_provider: None,
+            invoked_by: None,
+            session: None,
+            account_id: "000000000000".to_string(),
+            user_agent: None,
+            resources: vec![AuditedResource::new(FUNCTION_RESOURCE_TYPE, "ledger")],
+            request_parameters: ::serde_json::json!({ "functionName": "ledger" }),
+            response_elements: None,
+            additional_event_data: None,
+            error_code: None,
+            error_message: None,
         }
     }
 }
