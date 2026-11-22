@@ -19,13 +19,16 @@
 //!   other state-dependent check below and before anything is registered;
 //! * a `TopicName` Apache Kafka itself would refuse (see
 //!   [`crate::state::topic_name_error`]) is a `BadRequestException`;
-//! * a `ReplicationFactor` above the cluster's broker count is a
+//! * a `ReplicationFactor` above the brokers the cluster has AVAILABLE is a
 //!   `BadRequestException`: Kafka cannot place more replicas of a partition than
-//!   it has brokers to place them on. The count it is judged against is the one
-//!   the cluster holds at the instant of the call, so the brokers an accepted
-//!   broker-count update installs are available to this check as soon as that
-//!   operation falls due — the cluster is resolved through the settling lookup, as
-//!   every other operation that answers from a cluster's own values does;
+//!   it has brokers that are up to place them on
+//!   ([`crate::state::replication_factor_shortfall`]). The count it is judged
+//!   against is the one the cluster offers at the instant of the call — its own
+//!   nodes, less the ones an in-flight reboot operation has down — so the brokers
+//!   an accepted broker-count update installs are available to this check as soon
+//!   as that operation falls due, and a node being restarted is not: the cluster
+//!   is resolved through the settling lookup, as every other operation that
+//!   answers from a cluster's own values does;
 //! * a name the cluster already holds a topic for is a `TopicExistsException`,
 //!   leaving the existing topic untouched;
 //! * a cluster already at [`crate::state::MAX_TOPICS_PER_CLUSTER`] topics answers
@@ -286,17 +289,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::serverless_topic_apis_unsupported());
         }
 
-        // Apache Kafka cannot place more replicas of a partition than the cluster
-        // has brokers to place them on, so the replication factor is bounded by
-        // THIS cluster's broker count rather than by any fixed number.
-        if input.replication_factor > cluster.number_of_broker_nodes {
+        // Apache Kafka cannot place more replicas of a partition than it has
+        // brokers AVAILABLE to place them on, so the replication factor is bounded
+        // by the brokers THIS cluster has up at this instant — its own nodes, less
+        // the ones an in-flight operation has down — rather than by any fixed
+        // number.
+        if let Some(message) = crate::state::replication_factor_shortfall(
+            input.replication_factor,
+            cluster.available_broker_count(),
+        ) {
             return Err(
                 CreateTopicErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("ReplicationFactor".to_string()),
-                    message: Some(format!(
-                        "Replication factor: {} larger than available brokers: {}.",
-                        input.replication_factor, cluster.number_of_broker_nodes
-                    )),
+                    message: Some(message),
                 })
                 .into(),
             );

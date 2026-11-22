@@ -318,11 +318,12 @@ fn partition_count(
 /// number of brokers its first manual assignment places a partition on, or the
 /// broker's own default where it named neither.
 ///
-/// Bounded by the cluster's OWN broker count, because Apache Kafka cannot place more
-/// replicas of a partition than there are brokers to place them on — the same bound
-/// the control plane's create enforces. A cluster whose brokers are not the
-/// customer's (an Amazon MSK Serverless cluster reports no broker nodes at all) has
-/// no such count, so nothing there bounds what the service places.
+/// Bounded by the brokers the cluster has AVAILABLE, because Apache Kafka cannot
+/// place more replicas of a partition than there are brokers up to place them on —
+/// the same bound the control plane's create enforces
+/// ([`crate::state::replication_factor_shortfall`]). A cluster whose brokers are not
+/// the customer's (an Amazon MSK Serverless cluster reports no broker nodes at all)
+/// publishes no such count, so nothing there bounds what the service places.
 fn replication_factor(
     requested: &CreatableTopic,
     cluster: &Cluster,
@@ -343,11 +344,13 @@ fn replication_factor(
             "Replication factor must be larger than 0, or -1 to use the default value.",
         ));
     }
-    let brokers = cluster.number_of_broker_nodes;
-    if brokers > 0 && factor > brokers {
+    if let Some(message) = crate::state::replication_factor_shortfall(
+        factor,
+        cluster.available_broker_count(),
+    ) {
         return Err(Refusal::new(
             ResponseError::InvalidReplicationFactor,
-            format!("Replication factor: {factor} larger than available brokers: {brokers}."),
+            message,
         ));
     }
     // A cluster whose brokers are the SERVICE's publishes no count to bound the
@@ -560,7 +563,11 @@ pub fn delete(
 /// Apache Kafka only ADDS partitions: a request that names a total below the count the
 /// topic holds, or the count it already holds, is refused for that topic
 /// (`INVALID_PARTITIONS`) with the sentence that error class carries, and the topics it
-/// does not name are untouched. The partitions are added to the SAME registry record
+/// does not name are untouched. Adding partitions also PLACES them, so a topic whose
+/// replication factor is above the brokers the cluster has available is refused
+/// (`INVALID_REPLICATION_FACTOR`) with the shortfall sentence
+/// ([`crate::state::replication_factor_shortfall`]) — the same bound [`create`]
+/// applies. The partitions are added to the SAME registry record
 /// every other reader of the topic reports from, through the one path a topic change
 /// comes through, so a client that grows a topic can produce to the new partitions at
 /// once and reads the new count back out of `Metadata` and the control plane alike.
@@ -570,6 +577,7 @@ pub fn delete(
 /// entries are served, for the reason [`create`] bounds its own list.
 pub fn create_partitions(
     store: &mut ComAmazonawsKafkaKafkaState,
+    region: &str,
     cluster_arn: &str,
     request: &::kafka_protocol::messages::CreatePartitionsRequest,
     withheld: &BTreeSet<String>,
@@ -578,6 +586,32 @@ pub fn create_partitions(
 ) -> ::kafka_protocol::messages::CreatePartitionsResponse {
     use ::kafka_protocol::messages::create_partitions_response::CreatePartitionsTopicResult;
 
+    // The brokers the cluster has available to place a new partition's replicas on,
+    // read once for the whole request through the settling lookup every other reader
+    // of a cluster uses, so an operation whose completion the clock already owed has
+    // given its nodes back before this request is judged. A socket is opened FOR one
+    // cluster, so a registry that holds none under that ARN has no broker left to
+    // grow a topic on, which is what every entry is then answered with — the same
+    // absence [`create`] reports.
+    let Some(available_brokers) = store
+        .settled_cluster_in(region, cluster_arn, now)
+        .map(super::Cluster::available_broker_count)
+    else {
+        return ::kafka_protocol::messages::CreatePartitionsResponse::default().with_results(
+            request
+                .topics
+                .iter()
+                .take(max_topics)
+                .map(|requested| {
+                    let gone = broker_gone();
+                    CreatePartitionsTopicResult::default()
+                        .with_name(requested.name.clone())
+                        .with_error_code(gone.code)
+                        .with_error_message(Some(StrBytes::from_string(gone.message)))
+                })
+                .collect(),
+        );
+    };
     // The same rule the create and the delete follow: a request that names one topic
     // twice says two things about one name, so every entry for it is refused.
     let repeated = repeated_names(request.topics.iter().map(|topic| topic.name.0.to_string()));
@@ -594,7 +628,15 @@ pub fn create_partitions(
                         ResponseError::TopicAuthorizationFailed,
                         "Topic authorization failed.",
                     )),
-                    false => grow_one(store, cluster_arn, &name, requested.count, request.validate_only, now),
+                    false => grow_one(
+                        store,
+                        cluster_arn,
+                        &name,
+                        requested.count,
+                        available_brokers,
+                        request.validate_only,
+                        now,
+                    ),
                 },
             };
             let result = CreatePartitionsTopicResult::default()
@@ -617,12 +659,13 @@ fn grow_one(
     cluster_arn: &str,
     name: &str,
     wanted: i32,
+    available_brokers: Option<i32>,
     validate_only: bool,
     now: SystemTime,
 ) -> Option<Refusal> {
-    let Some(held) = store
+    let Some((held, replication_factor)) = store
         .observable_topic_in(cluster_arn, name, now)
-        .map(|topic| topic.partition_count)
+        .map(|topic| (topic.partition_count, topic.replication_factor))
     else {
         return Some(topic_does_not_exist(name));
     };
@@ -648,6 +691,18 @@ fn grow_one(
         return Some(Refusal::new(
             ResponseError::InvalidPartitions,
             format!("This broker places at most {MAX_PARTITIONS_PER_TOPIC} partitions per topic."),
+        ));
+    }
+    // The new partitions have to be PLACED, and this topic's replicas go on as many
+    // brokers as its own replication factor names: a cluster short of them (one of
+    // its nodes is being rebooted) cannot carry the assignment, which is the refusal
+    // the controller answers.
+    if let Some(message) =
+        crate::state::replication_factor_shortfall(replication_factor, available_brokers)
+    {
+        return Some(Refusal::new(
+            ResponseError::InvalidReplicationFactor,
+            message,
         ));
     }
     if validate_only {

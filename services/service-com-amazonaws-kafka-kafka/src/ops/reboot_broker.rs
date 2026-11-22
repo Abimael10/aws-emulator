@@ -257,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a node, so a value naming none of them names nothing to restart. The ids
         // are the nodes' own (`BrokerNodeInfo$BrokerId`), read off the stored broker
         // records, which is also what the refusal reports.
-        if !names_held_broker(broker_id, &held_broker_ids) {
+        let Some(rebooting) = held_broker_number(broker_id, &held_broker_ids) else {
             return Err(bad_request(
                 BROKER_IDS_MEMBER,
                 format!(
@@ -269,13 +269,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .join(", ")
                 ),
             ));
-        }
+        };
 
         // The registry starts the operation: it files the cluster operation, moves
         // the cluster to REBOOTING_BROKER and stores the instant the reboot comes
         // due — the same path every cluster operation of this service is filed
         // through, so one cluster holds one in-flight operation whatever began it.
-        let Some(operation_arn) = state.start_broker_reboot(&region, &input.cluster_arn, now)
+        // The nodes the operation restarts travel WITH it, so for as long as it is
+        // in flight the cluster reports one fewer broker available to place a
+        // partition replica on.
+        let Some(operation_arn) =
+            state.start_broker_reboot(&region, &input.cluster_arn, now, vec![rebooting])
         else {
             return Err(RebootBrokerErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -298,15 +302,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// refusals spell a request member.
 const BROKER_IDS_MEMBER: &str = "BrokerIds";
 
-/// Whether `broker_id`, as the request spelled it, names one of the broker nodes
-/// `held` lists.
+/// The broker node `broker_id`, as the request spelled it, names among the ones
+/// `held` lists — and `None` when it names none of them.
 ///
 /// A broker id is a number (`BrokerNodeInfo$BrokerId`), so the comparison is on the
 /// number the value denotes rather than on its text: a value that denotes no number
 /// — including one padded with whitespace, which is not how a broker id is spelled
-/// — names no broker.
-fn names_held_broker(broker_id: &str, held: &[i32]) -> bool {
-    broker_id.parse::<i32>().is_ok_and(|id| held.contains(&id))
+/// — names no broker. The number is handed back because the accepted reboot files
+/// the NODE it restarts, not the text the request spelled it with.
+fn held_broker_number(broker_id: &str, held: &[i32]) -> Option<i32> {
+    broker_id
+        .parse::<i32>()
+        .ok()
+        .filter(|id| held.contains(id))
 }
 
 /// Refuse the request with the modeled `BadRequestException`, naming the member at

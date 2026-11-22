@@ -206,6 +206,13 @@ pub mod broker_plane;
 mod broker_capacity;
 pub use broker_capacity::*;
 
+/// What Apache Kafka can place a topic's replicas ON: the bound a replication
+/// factor is admitted under, and the sentence the service refuses a factor it
+/// cannot place with. A function of two counts rather than of anything this module
+/// holds, so it sits beside this one.
+mod topic_placement;
+pub use topic_placement::*;
+
 /// The registry's own operations — every lookup, insertion and removal over the
 /// maps the state struct below holds. Its own file so this module keeps to the
 /// RECORDS and the service's fixed values.
@@ -1394,12 +1401,17 @@ pub enum ClusterChange {
     /// nothing optional about this change.
     Rebalancing { rebalancing: Rebalancing },
     /// `RebootBroker`: the broker nodes the request named are restarted. It
-    /// carries no attribute, because a reboot changes none: the nodes come back
-    /// under the same placement, endpoints and software, and this API reports no
-    /// per-node status for a reader to see one of them down — so what the reboot
-    /// leaves behind is the cluster's state while it runs
-    /// ([`Self::in_flight_state`]) and the operation record filed for it.
-    BrokerReboot,
+    /// changes no cluster ATTRIBUTE — the nodes come back under the same
+    /// placement, endpoints and software — so what the reboot leaves behind is the
+    /// cluster's state while it runs ([`Self::in_flight_state`]), the operation
+    /// record filed for it, and the nodes it names being DOWN for as long as it is
+    /// in flight ([`Cluster::available_broker_count`]): a restarting node is not a
+    /// broker Apache Kafka can place a partition replica on.
+    BrokerReboot {
+        /// The broker ids (`BrokerNodeInfo$BrokerId`) this operation restarts, as
+        /// the request named them: the nodes that are down while it runs.
+        broker_ids: Vec<i32>,
+    },
 }
 
 impl ClusterChange {
@@ -1414,7 +1426,7 @@ impl ClusterChange {
     /// puts its cluster in instead of inheriting `UPDATING` silently.
     pub fn in_flight_state(&self) -> &'static str {
         match self {
-            Self::BrokerReboot => CLUSTER_STATE_REBOOTING_BROKER,
+            Self::BrokerReboot { .. } => CLUSTER_STATE_REBOOTING_BROKER,
             Self::Connectivity { .. }
             | Self::Storage(_)
             | Self::BrokerType { .. }
@@ -1440,7 +1452,7 @@ impl ClusterChange {
     /// it takes.
     pub fn settling_delay(&self) -> Duration {
         match self {
-            Self::BrokerReboot => BROKER_REBOOT_DELAY,
+            Self::BrokerReboot { .. } => BROKER_REBOOT_DELAY,
             Self::Connectivity { .. }
             | Self::Storage(_)
             | Self::BrokerType { .. }
@@ -1465,7 +1477,7 @@ impl ClusterChange {
     /// Decided the same way, variant by variant, for the same reason.
     pub fn generates_new_version(&self) -> bool {
         match self {
-            Self::BrokerReboot => false,
+            Self::BrokerReboot { .. } => false,
             Self::Connectivity { .. }
             | Self::Storage(_)
             | Self::BrokerType { .. }

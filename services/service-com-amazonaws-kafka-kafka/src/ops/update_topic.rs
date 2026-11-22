@@ -26,7 +26,13 @@
 //!
 //! The number of partitions of a topic can only GROW: Apache Kafka adds
 //! partitions to a topic and never takes them away, so a count below the topic's
-//! own is refused, as is the count it already has. An accepted increase is held
+//! own is refused, as is the count it already has. A growth is also a PLACEMENT:
+//! each new partition's replicas have to go on brokers that are up, so a topic
+//! whose replication factor is above the brokers its cluster has available — its
+//! nodes, less the ones an in-flight reboot operation has down — is refused with
+//! the sentence Apache Kafka words that shortfall in
+//! ([`crate::state::replication_factor_shortfall`]), the same bound `CreateTopic`
+//! applies to the factor a create names. An accepted increase is held
 //! by the topic at once — Kafka creates the partitions as it admits the change —
 //! and the topic reports `UPDATING` until the clock owes it the end of the
 //! reassignment that follows
@@ -255,7 +261,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A topic belongs to ONE cluster, so a `ClusterArn` this endpoint's region
         // holds no cluster for names a resource that is not there: reported as the
         // 404 every other topic operation answers for it.
-        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+        //
+        // Resolved through the SETTLING lookup because the available-broker count
+        // below comes off that record: the nodes an in-flight operation has down
+        // are back at the instant that operation was due, whether or not anybody
+        // read the cluster since, so the placement this call judges is the one the
+        // cluster offers AT `now`.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
             return Err(
                 UpdateTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some(
@@ -274,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if cluster.is_serverless() {
             return Err(crate::state::serverless_topic_apis_unsupported());
         }
+        // Copied out of the record before the topic is resolved, for the reason the
+        // topic's own values are below: the judgement that reads it is followed by a
+        // write, so no borrow of the registry may outlive this point.
+        let available_brokers = cluster.available_broker_count();
 
         // The topic as it stands at this instant, with the transitions the clock
         // already owed it materialised. A name this cluster holds no topic of is
@@ -298,6 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the borrow of the registry has to end here.
         let topic_state = topic.state.clone();
         let held_partitions = topic.partition_count;
+        let replication_factor = topic.replication_factor;
 
         // A topic whose creation, whose deletion or whose last accepted change is
         // still in flight is not a topic a further change applies to. This is also
@@ -332,6 +349,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     PARTITION_COUNT_PARAMETER,
                     format!("Topic already has {held_partitions} partitions."),
                 ));
+            }
+            // Partitions are added by PLACING the replicas of each new one, and
+            // Apache Kafka places a partition's replicas on brokers that are up: a
+            // topic whose replication factor is above the brokers the cluster has
+            // available describes an assignment the controller cannot make, so the
+            // growth is refused for as long as the cluster is short of them — which
+            // is what a client rolling a restart meets while one of its brokers is
+            // being rebooted. The factor is the TOPIC's own (no request member
+            // carries one) and the count is the cluster's at this instant, so the
+            // member the caller can act on is the one the refusal names.
+            if let Some(message) =
+                crate::state::replication_factor_shortfall(replication_factor, available_brokers)
+            {
+                return Err(bad_request(PARTITION_COUNT_PARAMETER, message));
             }
         }
 

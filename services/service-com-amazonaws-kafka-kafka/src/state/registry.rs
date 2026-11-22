@@ -670,26 +670,28 @@ impl ComAmazonawsKafkaKafkaState {
         Some(operation_arn)
     }
 
-    /// Start a broker REBOOT: the brokers of the cluster `arn` names restart, so
-    /// the cluster is `REBOOTING_BROKER` until the clock owes the operation its
+    /// Start a broker REBOOT: the broker nodes `broker_ids` names restart, so the
+    /// cluster is `REBOOTING_BROKER` until the clock owes the operation its
     /// completion and `ACTIVE` again after it, at the version it already was.
     ///
     /// Filed through the same path every cluster operation is, under this call's
     /// own `OperationType`, so a reboot appears in the cluster's operation history
     /// and resolves for the cluster-operation readers exactly as an update does. It
-    /// reports no mutable attribute on either side because it changes none: an
-    /// operation describes what it touches.
+    /// reports no mutable attribute on either side because it changes none: what
+    /// the change carries is the nodes it restarts, which are the ones DOWN while
+    /// it runs ([`Cluster::available_broker_count`]).
     pub fn start_broker_reboot(
         &mut self,
         region: &str,
         arn: &str,
         now: SystemTime,
+        broker_ids: Vec<i32>,
     ) -> Option<String> {
         self.start_cluster_operation(region, arn, now, OPERATION_TYPE_REBOOT_NODE, |_cluster| {
             (
                 MutableClusterInfo::default(),
                 MutableClusterInfo::default(),
-                ClusterChange::BrokerReboot,
+                ClusterChange::BrokerReboot { broker_ids },
             )
         })
     }

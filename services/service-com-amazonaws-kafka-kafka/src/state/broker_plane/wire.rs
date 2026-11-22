@@ -763,6 +763,7 @@ impl Broker {
                 let mut store = self.state.lock();
                 let response = topics::create_partitions(
                     &mut store,
+                    &self.region,
                     &self.cluster_arn,
                     &request,
                     &withheld,

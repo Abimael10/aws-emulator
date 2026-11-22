@@ -438,6 +438,55 @@ impl Cluster {
         }
     }
 
+    /// How many of this cluster's broker nodes are AVAILABLE to place a
+    /// partition replica on at this instant: the nodes it holds, less the ones an
+    /// in-flight operation has down.
+    ///
+    /// `None` for a cluster that publishes no broker nodes of its own: the
+    /// brokers of an Amazon MSK Serverless cluster are the service's
+    /// ([`Self::is_serverless`]), so there is no count for a placement to be
+    /// bounded by rather than a count of zero.
+    ///
+    /// Derived from the STORED record (the configured count and the pending
+    /// operation), so every caller that places replicas gets the same answer at
+    /// one instant and none of them has to know which operation took a node out:
+    /// [`Self::settle`] is what retires an operation the clock has already
+    /// finished, after which every node is back.
+    pub fn available_broker_count(&self) -> Option<i32> {
+        if self.is_serverless() {
+            return None;
+        }
+        Some((self.number_of_broker_nodes - self.brokers_down()).max(0))
+    }
+
+    /// How many broker nodes the operation this cluster has in flight has DOWN.
+    ///
+    /// A reboot restarts the nodes it names, so for as long as its operation runs
+    /// those nodes are not serving; every other change this service applies
+    /// leaves the brokers up (the cluster keeps serving while it rolls out), so it
+    /// takes none away. Matched variant by variant for the reason
+    /// [`ClusterChange::in_flight_state`] is: a change added later has to say
+    /// which of the cluster's nodes it takes out of service.
+    fn brokers_down(&self) -> i32 {
+        let Some(pending) = self.pending_update.as_ref() else {
+            return 0;
+        };
+        match &pending.change {
+            ClusterChange::BrokerReboot { broker_ids } => {
+                i32::try_from(broker_ids.len()).unwrap_or(i32::MAX)
+            }
+            ClusterChange::Connectivity { .. }
+            | ClusterChange::Storage(_)
+            | ClusterChange::BrokerType { .. }
+            | ClusterChange::BrokerCount { .. }
+            | ClusterChange::KafkaVersion { .. }
+            | ClusterChange::Configuration { .. }
+            | ClusterChange::Security { .. }
+            | ClusterChange::Rebalancing { .. }
+            | ClusterChange::Monitoring { .. } => 0,
+        }
+    }
+
     /// The cluster's broker type as the `MutableClusterInfo` a cluster operation
     /// reports: the one attribute an `UpdateBrokerType` call changes, since an
     /// operation describes what it touches rather than the whole cluster.
@@ -853,8 +902,10 @@ impl Cluster {
             }
             // A reboot restarts the brokers and changes no stored attribute: the
             // nodes come back under the same placement, endpoints and software, so
-            // completing one only returns the cluster to `ACTIVE` (above).
-            ClusterChange::BrokerReboot => {}
+            // completing one only returns the cluster to `ACTIVE` (above) and puts
+            // the nodes it had down back among the available ones, which the
+            // retired operation is what decides ([`Self::available_broker_count`]).
+            ClusterChange::BrokerReboot { .. } => {}
         }
     }
 
