@@ -23,6 +23,18 @@
 //! endpoint at all, which is a different fault from an address whose queue is absent, and
 //! the two are reported as the two different modelled errors every one of those operations
 //! declares ([`unresolved_queue_address`]).
+//!
+//! # The region a url addresses
+//!
+//! WHICH region's queue a `QueueUrl` names is the REQUEST's region for a call that has
+//! already arrived: a regional endpoint serves the queues of its own region and no other's
+//! ([`super::ComAmazonawsSqsAmazonsqsState::queue_by_url`]). A caller that has NOT made the
+//! call yet — another service of this emulator acting on a caller's behalf at the queue one
+//! of its own configurations names by url — has the opposite question: which region to
+//! address, which on AWS is the one the url's authority names. A url minted on this
+//! emulator's own endpoint names none, because that one endpoint answers for every region,
+//! so the reading for such a caller is [`holding_region`]: the region this store holds the
+//! queue that url names in.
 
 use crate::ops::types::{InvalidAddress, QueueDoesNotExist};
 
@@ -146,6 +158,42 @@ fn addresses_an_account(segment: &str) -> bool {
         && segment.chars().all(|character| character.is_ascii_digit())
 }
 
+/// The region this emulator HOLDS the queue `queue_url` addresses in, for a CALLER that
+/// holds that url and has to address its call to one region — another service of this
+/// emulator making a call on a caller's behalf at the queue a configuration of its own
+/// names by url ([`QueueAddress`] read for a request that is not yet made).
+///
+/// A queue url is the queue's whole address: its `/<accountId>/<QueueName>` path names the
+/// queue and its authority names the region, which is how a caller holding one reaches a
+/// queue of a region other than its own. A url minted on THIS emulator's endpoint names no
+/// region at all — one endpoint answers for every one of them
+/// ([`reported_endpoint_authority`]) — so what such a url addresses is decided by where the
+/// queue it names is held: `caller_region` wherever that region holds a queue of the name,
+/// since a queue of the caller's own region is the one its endpoint serves and two queues
+/// of one name are addressed here by one identical string, and otherwise the single region
+/// that does hold it.
+///
+/// `None` when nothing of the kind can be read — the value addresses no queue of this
+/// account, this engine carries no queue store, or no single region holds the name — which
+/// leaves the call where its caller already is.
+pub fn holding_region<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    queue_url: &str,
+    caller_region: &str,
+) -> Option<String> {
+    let name = super::queue_name_from_url(queue_url)?;
+    let store = super::service_state(engine)?;
+    let state = store.lock();
+    let holding = state.regions_holding_queue(name);
+    if holding.contains(&caller_region) {
+        return Some(caller_region.to_string());
+    }
+    match holding.as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
+    }
+}
+
 /// Which modelled refusal a `QueueUrl` that resolved no queue earns.
 ///
 /// The two faults are not the same, and a client recovers from them differently: an address
@@ -234,4 +282,129 @@ pub fn addressed_endpoint(value: &str) -> String {
         .next()
         .unwrap_or(after_scheme);
     format!("{scheme}://{authority}/")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    /// An engine whose queue store holds a queue called `name` in each of `regions`.
+    fn store_holding(regions: &[&str], name: &str) -> Arc<::engine::InMemoryEngine> {
+        let engine: Arc<::engine::InMemoryEngine> = Arc::new(::engine::InMemoryEngine::new());
+        let store = super::super::service_state(&*engine).expect("this engine holds the store");
+        for region in regions {
+            store.lock().insert_queue(super::super::Queue::created(
+                region,
+                name,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SystemTime::now(),
+            ));
+        }
+        engine
+    }
+
+    /// RULE: a url minted on this emulator's own endpoint names no region, so the region
+    /// it addresses is the one this store holds the queue it names in — the caller's own
+    /// wherever that region holds one, and otherwise the single region that does.
+    ///
+    /// The rows span what the rule generalises over: WHICH regions hold the name (the
+    /// caller's own, one other, the caller's own beside another, two others, none at all)
+    /// and where the caller is.
+    #[test]
+    fn a_region_less_url_addresses_the_region_that_holds_the_queue() {
+        let name = "holding-region";
+        let caller = "us-west-2";
+        // (case, the regions holding the name, the region the call is addressed to)
+        let rows: &[(&str, &[&str], Option<&str>)] = &[
+            (
+                "only another region holds it, which is the queue the url names",
+                &["us-east-1"],
+                Some("us-east-1"),
+            ),
+            (
+                "the caller's own region holds it",
+                &["us-west-2"],
+                Some("us-west-2"),
+            ),
+            (
+                "both hold it, and the caller's own endpoint serves its own",
+                &["eu-central-1", "us-west-2"],
+                Some("us-west-2"),
+            ),
+            (
+                "two other regions hold it, so one url names two queues and neither is \
+                 addressed",
+                &["ap-southeast-2", "eu-central-1"],
+                None,
+            ),
+            ("no region holds it", &[], None),
+        ];
+        for (case, holding, expected) in rows {
+            let engine = store_holding(holding, name);
+            let url = queue_url_at(
+                "127.0.0.1:9297",
+                ::engine::emulator_account_id(),
+                name,
+            );
+            let actual = holding_region(&*engine, &url, caller);
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// An account id that is not this emulator's, for the row about another account's
+    /// address.
+    const OTHER_ACCOUNT: &str = "123456789012";
+
+    /// RULE, at its boundary: a value that addresses no queue of this account addresses no
+    /// region either, whatever this store holds.
+    ///
+    /// The rows span the forms such a value arrives in: another account's address, a value
+    /// that is no queue address at all, and an empty one — beside the bare `QueueName`,
+    /// which IS an address of this account.
+    #[test]
+    fn a_value_addressing_no_queue_of_this_account_addresses_no_region() {
+        let name = "no-account-region";
+        let engine = store_holding(&["us-east-1"], name);
+        assert_ne!(
+            OTHER_ACCOUNT,
+            ::engine::emulator_account_id(),
+            "the row about another account needs an account this endpoint does not answer for"
+        );
+        // (case, the value, the region it addresses)
+        let rows: &[(&str, String, Option<&str>)] = &[
+            (
+                "another account's address",
+                queue_url_at("127.0.0.1:9297", OTHER_ACCOUNT, name),
+                None,
+            ),
+            (
+                "a value that names no queue at all",
+                "https://127.0.0.1:9297/".to_string(),
+                None,
+            ),
+            ("an empty value", String::new(), None),
+            (
+                "the bare QueueName, which is an address of this account",
+                name.to_string(),
+                Some("us-east-1"),
+            ),
+        ];
+        for (case, value, expected) in rows {
+            let actual = holding_region(&*engine, value, "us-west-2");
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
 }

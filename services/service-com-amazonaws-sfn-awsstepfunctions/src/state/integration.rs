@@ -2981,6 +2981,16 @@ struct Dispatcher {
 /// the question.
 pub type RoleGate = ::std::sync::Arc<dyn Fn(&Call, &Value) -> Option<Failed> + Send + Sync>;
 
+/// What answers WHERE one integration call is addressed: the Region the call is made in
+/// and the access request over its target is formed in, for a call whose target is named
+/// by a value that carries no Region of its own; `None` leaves the call in the Region the
+/// caller runs in.
+///
+/// A closure rather than a trait, for the reason [`RoleGate`] is one: the answer is read
+/// out of the OWNING service's store through the engine the operation holds
+/// ([`super::target_addressing`]), and the walk knows neither.
+pub type Addressing = ::std::sync::Arc<dyn Fn(&Call, &Value) -> Option<String> + Send + Sync>;
+
 /// What a task fails with when the call could not be handed over or answered at all
 /// — the walk and the operation running it parted company, which is this emulator
 /// failing to ask rather than the service refusing.
@@ -3266,6 +3276,9 @@ where
     let resumed_map_runs = acting.map_runs;
     let known_activities = acting.activities;
     let express_machines = acting.express_machines;
+    // WHERE each of this walk's calls is addressed, for a call whose target is named by a
+    // value that carries no Region of its own ([`super::target_addressing`]).
+    let addressing = acting.addressing;
     // WHO the calls of this walk are made as: a session of the state machine's
     // execution role, which is the identity Step Functions does an execution's work as
     // ([`super::execution_role_session`]).
@@ -3297,7 +3310,15 @@ where
             let callback = callback.clone();
             let connections = connections.clone();
             let signing = signing.clone();
-            let region = region.to_string();
+            // WHERE this call goes: the Region the resource its request names is held in,
+            // by the same reading the gate that judged the call formed its access request
+            // in ([`super::target_addressing`]), so a call is made in the Region it was
+            // judged in — and the execution's own Region for every call whose target
+            // names none.
+            let region = addressing
+                .as_ref()
+                .and_then(|addressing| addressing(&handover.call, &handover.request))
+                .unwrap_or_else(|| region.to_string());
             serving.spawn(async move {
                 // The SERVING half is bounded by the same ceiling the waiting half is:
                 // a call that has not answered inside it is abandoned here too, so
@@ -3554,7 +3575,10 @@ pub async fn call_api_as(
         }
     };
     // The call goes to the endpoint the request's own target names when that target
-    // carries one ([`addressed_region`]), and to the caller's own Region otherwise.
+    // carries one ([`addressed_region`]), and to the Region it is handed otherwise: the
+    // caller's own, or — for a target named by a value that carries no Region at all —
+    // the one it was resolved to before the call was handed over
+    // ([`super::target_addressing`]).
     let addressed = addressed_region(call, request);
     let region = addressed.as_deref().unwrap_or(region);
     match dispatch(callback, api, region, built, signing).await {

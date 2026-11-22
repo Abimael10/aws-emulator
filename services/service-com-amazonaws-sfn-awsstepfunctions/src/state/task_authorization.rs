@@ -109,8 +109,8 @@ use ::std::sync::Arc;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{
-    access_requests, Activities, Api, Call, Denied, ExpressMachines, Failed, Family, Handovers,
-    MapRuns, RoleGate, TASK_FAILED_ERROR,
+    access_requests, Activities, Addressing, Api, Call, Denied, ExpressMachines, Failed, Family,
+    Handovers, MapRuns, RoleGate, TASK_FAILED_ERROR,
 };
 
 /// The GLOBAL service principal Step Functions assumes a state machine's execution
@@ -441,6 +441,15 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         // is left to the invoked operation's own answer.
         let targets = call.targets?;
         let iam = iam_state(&*engine)?;
+        // WHERE this call is addressed, which is the Region the resource its request
+        // names lives in: the one the target's own value carries, the one this emulator
+        // holds that resource in for a value that carries none
+        // ([`super::target_addressing`]), and the execution's own otherwise. The access
+        // request is formed in it, so the ARN it is over is the ARN of the resource the
+        // call really acts on — and the call is made in the same Region
+        // ([`super::integration::Addressing`]).
+        let region = super::target_addressing::call_region(&*engine, call, request, &region)
+            .unwrap_or_else(|| region.clone());
         // Every resource the call acts on, each decided in the order the request names
         // them: a call whose request carries one unit of work per resource — a
         // publication naming a bus per entry — is the execution's call on each of them,
@@ -554,6 +563,10 @@ pub struct Acting {
     /// EXPRESS workflow type ([`super::express_machines::express_machines`]), which is
     /// what decides how such a task RUNS its child.
     pub express_machines: Option<ExpressMachines>,
+    /// What answers WHERE one of the walk's calls is addressed, for a call whose target is
+    /// named by a value that carries no Region of its own
+    /// ([`super::target_addressing::addressing`]).
+    pub addressing: Option<Addressing>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -568,6 +581,7 @@ impl ::std::fmt::Debug for Acting {
             .field("map_runs", &self.map_runs.is_some())
             .field("activities", &self.activities.is_some())
             .field("express_machines", &self.express_machines.is_some())
+            .field("addressing", &self.addressing.is_some())
             .field("signing", &self.signing.is_some())
             .finish()
     }
@@ -618,6 +632,7 @@ pub fn acting<Eng: Send + Sync + 'static>(
         map_runs: None,
         activities: super::activity_resources::activities(engine),
         express_machines: super::express_machines::express_machines(engine),
+        addressing: Some(super::target_addressing::addressing(engine, region)),
         signing,
     }
 }

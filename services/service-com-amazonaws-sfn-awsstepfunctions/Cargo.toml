@@ -100,6 +100,11 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 # the same place `sts:GetCallerIdentity` answers from — so the `iam:PassRole` a
 # control-plane request makes is decided for the identity that signed it.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# WHERE the queue a `Task` state's Amazon SQS integration addresses by url is held: a url
+# minted on this emulator's own endpoint carries no Region label, so the Region such a call
+# is addressed to is read out of that service's own store (`state::target_addressing`),
+# through its own accessor.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # Where this service's own observability goes: the `AWS/States` metric series an
 # execution publishes — written into the store CloudWatch's own readers answer from, so a
 # published metric and its reader cannot disagree. The execution-history events a logging
@@ -140,8 +145,9 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # EventBridge and SQS are mounted beside Step Functions in
 # `tests/all/execution_status_change_events.rs`, because an execution's status changes are
 # published onto the default event bus and a rule on that bus delivers them to an SQS
-# queue target: without them mounted there is nothing for the publication to reach.
-service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# queue target: without them mounted there is nothing for the publication to reach. (The
+# SQS crate is a dependency above, because the Region a queue url addresses is read out of
+# its own store.)
 # The same, for the service a `Task` state whose `Resource` names a Lambda FUNCTION
 # invokes (`tests/all/lambda_task_control_flow.rs`): the function really runs there, so
 # the control flow around the task is driven by what the run answered. (The crate is a

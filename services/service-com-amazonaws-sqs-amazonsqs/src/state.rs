@@ -2380,6 +2380,21 @@ impl ComAmazonawsSqsAmazonsqsState {
         self.queues.contains_key(&queue_key(region, name))
     }
 
+    /// Every region whose namespace holds a queue called `name`, in region order.
+    ///
+    /// For a CALLER that holds a queue url and has to address its call to ONE region: the
+    /// url's `/<accountId>/<QueueName>` path names the queue and its authority names the
+    /// region, so a url whose authority names NO region leaves the regions this store holds
+    /// that name in as the whole of what it addresses
+    /// ([`queue_addressing::holding_region`]).
+    pub fn regions_holding_queue(&self, name: &str) -> Vec<&str> {
+        self.queues
+            .keys()
+            .filter(|(_, held)| held == name)
+            .map(|(region, _)| region.as_str())
+            .collect()
+    }
+
     /// Every queue of ONE region, in name order: the set a listing of that region pages
     /// over, since a queue belongs to the region its create addressed and nothing outside
     /// it is addressable.

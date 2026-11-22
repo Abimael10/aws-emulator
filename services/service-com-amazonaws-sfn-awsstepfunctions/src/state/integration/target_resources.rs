@@ -260,6 +260,24 @@ pub fn addressed_region(call: &Call, request: &Value) -> Option<String> {
     targets.named.addressed_region(&named)
 }
 
+/// The queue URL one integration call addresses its target by, for a call whose target
+/// is named that way ([`TargetNaming::QueueUrl`]); `None` for every other call, and for
+/// one whose request names no target at all.
+///
+/// The value itself, unread: a url whose own host names no Region names no endpoint
+/// ([`endpoint_region`]), so WHERE such a call is addressed cannot be read off the url —
+/// it is the Region the queue that url names is held in, which only the service that
+/// owns the queue can answer ([`super::super::target_addressing`]). Read off the invoked
+/// operation's own input, exactly as [`addressed_region`] and [`access_request`] read
+/// it, so one call is addressed in one place however its family spells the member.
+pub fn addressed_queue_url(call: &Call, request: &Value) -> Option<String> {
+    let targets = call.targets?;
+    if targets.named != TargetNaming::QueueUrl {
+        return None;
+    }
+    targets.named_in(&call.operation_input(request))
+}
+
 /// The Region the endpoint host of `url` names, for a url addressed to one of a
 /// service's own regional endpoints (`<prefix>.<region>.<suffix>`); `None` for a url
 /// whose host names no Region, which is what this emulator's own endpoint does.
