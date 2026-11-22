@@ -1,0 +1,84 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: asglf-lt-contents-refusals
+Issue-Step: task#16
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: asglf-lt-contents-refusals asglf-mixed-instances-policy-refusals autoscaling-asgeni-traj-create-group-validates-template-network-interfaces asglf-lt-identity-refusals asglf-lt-version-refusals autoscaling-group-and-policy-dependent-operations-on-nonexistent-group autoscaling-resource-creation-validation-errors
+Issue-Shape-Id: com.amazonaws.autoscaling#AutoScaling_2011_01_01
+Issue-Key: autoscaling|CreateAutoScalingGroup|4xx->4xx|$.ErrorResponse.Error.Message
+Issue-Key: autoscaling|GetPredictiveScalingForecast|4xx->4xx|$.ErrorResponse.Error.Message
+Issue-Related: 20261102T114505Z-autoscaling-createautoscalinggroup-and-updateautoscalinggroup-launch-template-and-argument-validation.md
+Issue-Commit: ea39dba1da951c7945754830175526ec44cfb5ae
+
+# autoscaling refusals select the wrong error code and precedence on launch-template and forecast paths
+
+> _Note: this issue was identified against the code base at commit `ea39dba1da951c7945754830175526ec44cfb5ae`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateAutoScalingGroup
+
+## Description
+THREE net-new root causes in the Auto Scaling refusal-selection path. In each one the emulator answers the correct HTTP status but picks a DIFFERENT verdict than AWS does for the same request: it either runs its validations in the wrong order or collapses two distinct AWS verdicts onto one. This bundle carries 3 causes and ALL THREE must be closed before it is submitted.
+
+Cause 1 of 3 — CreateAutoScalingGroup never validates the referenced launch template's contents, so a create AWS refuses with InvalidQueryParameter is instead refused AlreadyExists by the group-name uniqueness check.
+AWS: HTTP 400. Smithy (services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01/smithy-model/com-amazonaws-autoscaling-autoscaling-2011-01-01.json, awsQuery, version 2011-01-01) models CreateAutoScalingGroup errors as only AlreadyExistsFault (awsQueryError AlreadyExists/400), LimitExceededFault (LimitExceeded/400), ResourceContentionFault (500) and ServiceLinkedRoleFailure (500); neither InvalidQueryParameter nor any launch-template error is modeled, so this refusal rides the awsQuery service-common error set and its code/sentence are recorded behavior only. Recorded behavior: when the request's LaunchTemplate resolves to a template version whose LaunchTemplateData declares NO InstanceType, and the group is NOT configured as a mixed-instances group (no MixedInstancesPolicy with instance-type Overrides), AWS refuses with Error.Code 'InvalidQueryParameter' and Error.Message 'An instance type does not exist in the specified launch template. An instance type must be defined in the launch template while the Auto Scaling group is not configured as a mixed instances group. Use a different launch template that contains the InstanceType parameter, and try again.' Message anatomy: the sentence is entirely FIXED text — it has no variable part, and in particular it names neither the group nor the template. Because AWS refuses, no group of that name exists afterwards, so a retry of the same create is refused on the SAME grounds again.
+Emulator: it performs no launch-template content validation at all. The earlier create in the same fixture is accepted (HTTP 200) where AWS refuses it, so by the time the fixture re-issues the create the emulator holds a group of that name and answers HTTP 400 with Error.Code 'AlreadyExists' and Error.Message 'AutoScalingGroup by this name already exists - A group with the name <auto-scaling-group-name> already exists'. The status matches by coincidence; the error code and the message are a different verdict about a different thing.
+Why: the code, not just the message, is what a client branches on. A caller told 'AlreadyExists' concludes the group is already provisioned and either treats the call as idempotent and proceeds, or renames and retries — and the rename then SUCCEEDS against the emulator, leaving the caller with a group whose launch template cannot launch anything. AWS's 'InvalidQueryParameter' tells it the opposite: nothing was created and the launch template must gain an InstanceType (or the group must be declared mixed-instances) first. Infrastructure tooling that asserts the refusal, and any retry loop keyed to AlreadyExists, both take the wrong branch.
+Fix: the CreateAutoScalingGroup handler's request validation — it must resolve the referenced launch template version, check that its data defines an InstanceType unless the request supplies a MixedInstancesPolicy carrying instance-type Overrides, and raise InvalidQueryParameter with AWS's fixed sentence; and that validation must run BEFORE the group-name uniqueness check, so a template-content failure is never reported as a name collision. This is the operation's validation step, not the awsQuery serializer. Related but NOT covering: open issue 20261102T114505Z-autoscaling-createautoscalinggroup-and-updateautoscalinggroup-launch-template-and-argument-validation.md owns the sibling cluster where the create is wrongly ACCEPTED (400->200) on these fixtures; it does not describe the InvalidQueryParameter instance-type verdict and does not carry this fixture step.
+Traces: asglf-lt-contents-refusals#task#16 (representative) and #task#17; asglf-mixed-instances-policy-refusals#task#7, #task#8, #task#9, #task#10, #task#11, #task#13; autoscaling-asgeni-traj-create-group-validates-template-network-interfaces#task#8 — 9 steps in one cluster.
+
+Cause 2 of 3 — CreateAutoScalingGroup collapses AWS's malformed-launch-template-Id verdict onto the deleted-template sentence.
+AWS: HTTP 400, Error.Code 'ValidationError'. Smithy models no launch-template error on CreateAutoScalingGroup (see the error list above), so the sentence is recorded behavior only. Recorded behavior: a LaunchTemplate={LaunchTemplateId: <id>} whose id is shaped like an lt- identifier but was never issued in this account/region is refused with Error.Message 'Malformed launch template Id: <launch-template-id>'. Message anatomy: fixed text 'Malformed launch template Id: ' followed by ONE variable part, the LaunchTemplateId copied verbatim out of the request's LaunchTemplateSpecification. AWS keeps two distinct sentences on this path: this one for an identifier it cannot recognise as a reference at all, and 'The specified launch template, with template ID <id>, does not exist.' for a reference it recognises but which resolves to nothing.
+Emulator: HTTP 400 and Error.Code 'ValidationError' are both correct, but it answers Error.Message 'The specified launch template, with template ID <id>, does not exist.' — it serves the does-not-exist sentence for an unissued id and so never produces the malformed-id sentence.
+Why: ValidationError is Auto Scaling's generic client-error code, so the message is the only machine-visible explanation. The two sentences drive different remediation — 'the reference in your template/config is wrong, fix it' versus 'the template existed and is gone, re-provision it' — and a caller, test or runbook keyed to AWS's wording is pointed at the wrong one.
+Emulator/AWS status agree, so this is a message-only divergence on an otherwise correct refusal.
+Fix: the CreateAutoScalingGroup handler's launch-template resolution step, in the ValidationError message it builds — keep AWS's two verdicts apart and emit the malformed-id sentence for a LaunchTemplateId that resolves to no template ever issued. Related but NOT covering: open issue 20261121T220026Z-autoscaling-2-net-new-refusal-message-causes-createautoscalinggroup.md describes this same wording from the BEHAVIORAL corpus and carries only behavioral check ids — it holds no fixture/step replay key, so a fixer replaying it never exercises these wire steps; open issue 20261115T105104Z-autoscaling-ec2-createautoscalinggroup-s-refusal-for-a-launch.md and 20261121T213740Z-autoscaling-ec2-kms-createautoscalinggroup-s-validationerror-for-a.md concern the DELETED/nonexistent-template sentences, which is the verdict the emulator wrongly reuses here.
+Traces: asglf-lt-identity-refusals#task#7 (representative) and asglf-lt-version-refusals#task#8.
+
+Cause 3 of 3 — GetPredictiveScalingForecast validates the StartTime window before looking the group up, so a call against a nonexistent group is refused with the date-range sentence.
+AWS: HTTP 400, Error.Code 'ValidationError'. Smithy models GetPredictiveScalingForecast with AutoScalingGroupName, PolicyName, StartTime and EndTime all required and only ResourceContentionFault (500) as a modeled error, so this client refusal rides the awsQuery service-common ValidationError and its sentence is recorded behavior only. Recorded behavior: when AutoScalingGroupName names no existing group, AWS refuses with Error.Message 'Group <auto-scaling-group-name> not found.' regardless of the StartTime/EndTime supplied — the group reference is resolved FIRST. Message anatomy: fixed text 'Group ' + ONE variable part, the AutoScalingGroupName copied from the request, + the fixed trailing ' not found.' (including the period).
+Emulator: HTTP 400 (correct) but Error.Message 'At most, the date and time can be one year before the current date and time.' — it applies its StartTime one-year-window check before the group lookup, so the missing group is never reported and the caller is told its timestamps are wrong instead.
+Why: the caller is sent to fix the wrong input. It will adjust StartTime/EndTime and retry forever while the real fault — the group does not exist (wrong name, wrong region, or a group not yet created) — stays invisible. Precedence is observable AWS behavior here: the same request with a valid window still must report the missing group.
+Fix: the GetPredictiveScalingForecast handler's validation order — resolve AutoScalingGroupName (and emit 'Group <name> not found.') before any StartTime/EndTime range validation runs. Related but NOT covering: open issue 20261122T001207Z-autoscaling-getpredictivescalingforecast-returns-empty-forecast-series-for-a-fresh.md covers the empty forecast series and the UNKNOWN-POLICY message on this operation; it does not describe the group-not-found sentence or this ordering, and does not carry these fixture steps.
+Traces: autoscaling-group-and-policy-dependent-operations-on-nonexistent-group#task#10 (representative) and autoscaling-resource-creation-validation-errors#task#5.
+
+## Evidence
+Wire replay of trace set simparity-wire-aws-v1 against this checkout (emulator_up=true, bootstrap_signal=false; 976/1066 steps passed, 39 divergence clusters). All three clusters below report stub_path='' and owned_by=[] — no unimplemented operation blocks them and no open issue carries their replay key.
+
+Cause 1 — cluster service=autoscaling|CreateAutoScalingGroup|status=400->400, representative asglf-lt-contents-refusals#task#16, 9 affected steps:
+  expected_status 400, actual_status 400
+  $.ErrorResponse.Error.Code: value_mismatch (expected 'InvalidQueryParameter', got 'AlreadyExists')
+  $.ErrorResponse.Error.Message: value_mismatch (expected 'An instance type does not exist in the specified launch template. An instance type must be defined in the launch template while the Auto Scaling group is not configured as a mixed instances group. Use a different launch template that contains the InstanceType parameter, and try again.', got 'AutoScalingGroup by this name already exists - A group with the name sim2real-probe-asglf-lt-5e08b7d3 already exists')
+  The expected message is 100% fixed text. In the actual message 'AutoScalingGroup by this name already exists - A group with the name ' and ' already exists' are the emulator's own fixed text and 'sim2real-probe-asglf-lt-5e08b7d3' is that one run's group name — neither the code nor any part of that message belongs on this path.
+
+Cause 2 — cluster service=autoscaling|CreateAutoScalingGroup|status=400->400 (keys=$.ErrorResponse.Error.Message), representative asglf-lt-identity-refusals#task#7, 2 affected steps:
+  expected_status 400, actual_status 400; Error.Code 'ValidationError' matched, only the message key diverged
+  $.ErrorResponse.Error.Message: value_mismatch (expected 'Malformed launch template Id: lt-0123456789abcdef0', got 'The specified launch template, with template ID lt-0123456789abcdef0, does not exist.')
+  Required anatomy: fixed 'Malformed launch template Id: ' + the request's LaunchTemplateId. 'lt-0123456789abcdef0' is the fixture's chosen well-formed-but-unissued value; the requirement is the template, not that literal.
+
+Cause 3 — cluster service=autoscaling|GetPredictiveScalingForecast|status=400->400, representative autoscaling-group-and-policy-dependent-operations-on-nonexistent-group#task#10, 2 affected steps:
+  expected_status 400, actual_status 400
+  $.ErrorResponse.Error.Message: value_mismatch (expected 'Group sim2real-probe-autoscaling-asg-f393fafd not found.', got 'At most, the date and time can be one year before the current date and time.')
+  Required anatomy: fixed 'Group ' + the request's AutoScalingGroupName + fixed ' not found.'; 'sim2real-probe-autoscaling-asg-f393fafd' is the fixture's group name. The actual sentence is the emulator's date-window message, which must not be reachable while the group reference is unresolvable.
+
+Model grounding (Smithy com.amazonaws.autoscaling 2011-01-01, awsQuery):
+- CreateAutoScalingGroup: errors AlreadyExistsFault (AlreadyExists/400), LimitExceededFault (LimitExceeded/400), ResourceContentionFault (500), ServiceLinkedRoleFailure (500). InvalidQueryParameter and ValidationError are NOT modeled on the operation — they come from the awsQuery service-common set, so both sentences are recorded behavior only. Input carries LaunchTemplate (LaunchTemplateSpecification) and MixedInstancesPolicy as the two launch sources relevant to cause 1.
+- GetPredictiveScalingForecast: input AutoScalingGroupName / PolicyName / StartTime / EndTime all required; only ResourceContentionFault (500) modeled, so the client refusal is the service-common ValidationError and the sentence plus its precedence are recorded behavior only.
+
+## Steps to Reproduce
+Build and boot the emulator from this checkout and replay trace set simparity-wire-aws-v1.
+
+Cause 1 (fixture asglf-lt-contents-refusals, step task#16):
+1) ec2 CreateLaunchTemplate(LaunchTemplateName=<name>, LaunchTemplateData={ImageId: <a valid ami>}) — deliberately WITHOUT InstanceType.
+2) autoscaling CreateAutoScalingGroup(AutoScalingGroupName=<name>, MinSize=0, MaxSize=1, LaunchTemplate={LaunchTemplateId: <the id from step 1>}, AvailabilityZones=[<an AZ>], VPCZoneIdentifier=<a subnet in that AZ>) with NO MixedInstancesPolicy. Expect HTTP 400, Error.Code 'InvalidQueryParameter', Error.Message exactly 'An instance type does not exist in the specified launch template. An instance type must be defined in the launch template while the Auto Scaling group is not configured as a mixed instances group. Use a different launch template that contains the InstanceType parameter, and try again.'
+3) Re-issue the identical create. It must be refused the SAME way (same code, same sentence) — never with AlreadyExists — because step 2 created nothing.
+4) autoscaling DescribeAutoScalingGroups(AutoScalingGroupNames=[<name>]) must return an empty AutoScalingGroups list.
+
+Cause 2 (fixture asglf-lt-identity-refusals, step task#7):
+5) autoscaling CreateAutoScalingGroup(AutoScalingGroupName=<fresh name>, MinSize=0, MaxSize=1, LaunchTemplate={LaunchTemplateId: 'lt-0123456789abcdef0'}, AvailabilityZones=[<an AZ>], VPCZoneIdentifier=<a subnet>) where that id was never issued. Expect HTTP 400, Error.Code 'ValidationError', Error.Message 'Malformed launch template Id: lt-0123456789abcdef0' (fixed prefix + the request's id).
+6) Contrast: create a launch template, delete it, then repeat step 5 with its (now dangling) id — that path keeps the 'The specified launch template, with template ID <id>, does not exist.' sentence, which must NOT be reused for step 5.
+
+Cause 3 (fixture autoscaling-group-and-policy-dependent-operations-on-nonexistent-group, step task#10):
+7) autoscaling GetPredictiveScalingForecast(AutoScalingGroupName=<a name that does not exist>, PolicyName=<any>, StartTime=<a timestamp more than one year in the past>, EndTime=<later>). Expect HTTP 400, Error.Code 'ValidationError', Error.Message 'Group <that name> not found.' — the group lookup must win over the StartTime window check.
+8) Repeat step 7 with a StartTime inside the permitted window. The refusal must stay the identical group-not-found sentence, proving the lookup precedes range validation.
