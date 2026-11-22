@@ -107,7 +107,7 @@ use super::template::{
     NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
     NETWORK_SECURITY_MANAGER_POLICY, NETWORK_SECURITY_MANAGER_RULE,
     NETWORK_SECURITY_MANAGER_SCOPE, NETWORK_SECURITY_MANAGER_TEMPLATE,
-    RBIN_RULE, SES_EMAIL_IDENTITY,
+    RBIN_RULE, SES_EMAIL_IDENTITY, SSM_QUICKSETUP_CONFIGURATION_MANAGER,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -966,6 +966,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::SSM::Parameter",
     "AWS::SSM::PatchBaseline",
     "AWS::SSM::ResourceDataSync",
+    // AWS Systems Manager Quick Setup. The configuration manager a template declares is
+    // created in that service (`super::provisioner::ssm_quicksetup_configuration_managers`),
+    // which is where its definitions are deployed from.
+    SSM_QUICKSETUP_CONFIGURATION_MANAGER,
     // Amazon SageMaker AI
     "AWS::SageMaker::Domain",
     "AWS::SageMaker::Endpoint",

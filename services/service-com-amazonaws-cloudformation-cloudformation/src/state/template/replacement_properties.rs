@@ -115,6 +115,17 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A Quick Setup configuration manager keeps the DEFINITIONS it was created with:
+        // `UpdateConfigurationDefinition` addresses ONE definition by the `Id` Quick Setup
+        // minted for it — a value no template states — and takes neither the definition's
+        // `Type` nor the list itself, so that service publishes no call that adds a
+        // definition, removes one or re-types one. A declaration restating the list therefore
+        // asks for a DIFFERENT manager, which CloudFormation replaces. (Its `Name` and
+        // `Description` are `UpdateConfigurationManager`'s own members, so a change to either
+        // reaches the manager in place — the `Name` through [`name_is_create_only`], which
+        // excludes this type — and its `Tags` reach it through that service's own
+        // `TagResource`/`UntagResource`.)
+        SSM_QUICKSETUP_CONFIGURATION_MANAGER => &["ConfigurationDefinitions"],
         // A Direct Connect gateway keeps the Amazon-side ASN it was created with:
         // `amazonSideAsn` is a member of `CreateDirectConnectGateway` and of no member of
         // `UpdateDirectConnectGateway`, which "updates the NAME of a current Direct Connect

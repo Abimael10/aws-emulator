@@ -548,7 +548,8 @@ use super::template::{
     SNS_SUBSCRIPTION,
     SNS_TOPIC, SNS_TOPIC_INLINE_POLICY, SNS_TOPIC_POLICY, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY,
     SQS_QUEUE_POLICY,
-    SSM_ASSOCIATION, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
+    SSM_ASSOCIATION, SSM_PARAMETER, SSM_QUICKSETUP_CONFIGURATION_MANAGER,
+    STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
     WAFV2_WEB_ACL_ASSOCIATION, WAF_REGIONAL_IP_SET, XRAY_GROUP, XRAY_SAMPLING_RULE,
 };
@@ -1288,6 +1289,16 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::SSMQuickSetup::ConfigurationManager`: the Quick Setup configuration manager
+    /// `CreateConfigurationManager` makes — "a collection of desired state configurations for
+    /// multiple configuration definitions" — which `UpdateConfigurationManager` renames and
+    /// re-describes and `DeleteConfigurationManager` removes. That service MINTS the
+    /// `ManagerArn` the type publishes — the handle every call on a manager takes — so it is
+    /// read off that create's own answer and is the identity a `Ref` resolves to. The create
+    /// leaves the manager's deployment still rolling out, and the delete leaves it being torn
+    /// down, so the resource's creation and its deletion are each held open on that service's
+    /// own report of the manager ([`ssm_quicksetup_configuration_managers`]).
+    SsmQuickSetupConfigurationManager,
     /// `AWS::DirectConnect::DirectConnectGateway`: the "intermediate object that enables
     /// you to connect a set of virtual interfaces and virtual private gateways" AWS Direct
     /// Connect's own `CreateDirectConnectGateway` makes. Its arms are
@@ -1740,6 +1751,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        SSM_QUICKSETUP_CONFIGURATION_MANAGER => {
+            Some(Provisioner::SsmQuickSetupConfigurationManager)
+        }
         DIRECT_CONNECT_GATEWAY => Some(Provisioner::DirectConnectGateway),
         DIRECT_CONNECT_RESILIENCY_GROUP => Some(Provisioner::DirectConnectResiliencyGroup),
         IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
@@ -2679,6 +2693,13 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
             }
+            // `AWS::SSMQuickSetup::ConfigurationManager` publishes `Tags` as a MAP, which is
+            // the shape `CreateConfigurationManager`'s own `Tags` member takes, so a manager a
+            // stack creates carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for.
+            Self::SsmQuickSetupConfigurationManager => {
+                create_configuration_manager(ctx, region, resource, propagated).await
+            }
             // Both `AWS::DirectConnect::*` types publish `Tags`, and each of their creates
             // takes a `TagList` of its own, so a gateway and a resiliency group a stack
             // creates each carry the tags CloudFormation gives them beside the ones their
@@ -3032,6 +3053,11 @@ impl Provisioner {
                 // stack's own tags without the three.
                 | Self::BcmDashboard
                 | Self::BcmScheduledReport
+                // Quick Setup refuses a tag key in the reserved namespace on every call that
+                // takes tags — `CreateConfigurationManager`'s own `Tags` map and `TagResource`
+                // alike, in the one check its own crate's tag validation makes — so a
+                // configuration manager carries the stack's own tags without the three.
+                | Self::SsmQuickSetupConfigurationManager
         );
         // ...and a type whose registry SCHEMA states that it does not take CloudFormation's own
         // system tags is in the same position for a different reason: a resource type's schema
@@ -3887,6 +3913,11 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the manager by the `ManagerArn` Quick Setup minted for it,
+            // which is this resource's physical id.
+            Self::SsmQuickSetupConfigurationManager => {
+                delete_configuration_manager(ctx, region, physical_resource_id).await
+            }
             // Each delete addresses its resource by the identifier AWS Direct Connect minted
             // for it, which the ARN that is this resource's physical id carries.
             Self::DirectConnectGateway => {
@@ -4095,6 +4126,11 @@ mod bedrock_sessions;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The AWS Systems Manager Quick Setup CONFIGURATION MANAGER arms: the manager an
+/// `AWS::SSMQuickSetup::ConfigurationManager` declares, created in the service that owns it so
+/// a client's own `GetConfigurationManager` and `ListConfigurationManagers` resolve the ARN the
+/// stack publishes and the definitions it declared are really deployed.
+mod ssm_quicksetup_configuration_managers;
 /// The AWS IoT Core Device Advisor SUITE DEFINITION arms: the test suite an
 /// `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` declares, recorded in the service that owns it
 /// so a client's own reads — and a suite run started against it — resolve the id the stack
@@ -4354,6 +4390,7 @@ use sagemaker_resources::*;
 mod directconnect_resources;
 use directconnect_resources::*;
 use braket_spending_limits::*;
+use ssm_quicksetup_configuration_managers::*;
 use iot_core_device_advisor_suite_definitions::*;
 use bcm_dashboards::*;
 use application_signals::*;

@@ -891,6 +891,43 @@ pub(super) const CUSTOMER_PROFILES_DOMAIN_ATTRIBUTES: &[&str] = &[
     "Stats.TotalSize",
 ];
 
+/// The `AWS::<Namespace>::<Resource>` type of a QUICK SETUP CONFIGURATION MANAGER: "a
+/// collection of desired state configurations for multiple configuration definitions and
+/// summaries describing the deployments of those definitions"
+/// (`CreateConfigurationManager`), which that service's own create makes.
+///
+/// The namespace is `SSMQuickSetup`, as the "AWS resource and property types reference"
+/// publishes it — that model's own `awsService.sdkId` is `SSM QuickSetup`.
+///
+/// "Ref returns the ManagerArn" — the type's primary identifier — and `Fn::GetAtt` reads
+/// [`SSM_QUICKSETUP_CONFIGURATION_MANAGER_ARN_ATTRIBUTE`] beside the two instants and the
+/// status summaries that service keeps for the manager. Quick Setup MINTS that ARN:
+/// `CreateConfigurationManager` takes no identifier for the manager — the declaration states
+/// its name, its description and the definitions it deploys — and answers the `ManagerArn` it
+/// assigned, whose resource path carries a uuid of its own
+/// (`^arn:aws:ssm-quicksetup:([^:]+):(\d{12}):configuration-manager/[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$`),
+/// so it cannot be computed from the template — that is what [`identity_is_service_assigned`]
+/// names this type for, and it is the handle `GetConfigurationManager`,
+/// `UpdateConfigurationManager` and `DeleteConfigurationManager` each address a manager by.
+pub const SSM_QUICKSETUP_CONFIGURATION_MANAGER: &str = "AWS::SSMQuickSetup::ConfigurationManager";
+
+/// Quick Setup's ARN namespace, which is the namespace a configuration manager's ARN carries
+/// (that same pattern), and the resource path such an ARN carries before the uuid that service
+/// minted.
+pub const SSM_QUICKSETUP_ARN_NAMESPACE: &str = "ssm-quicksetup";
+pub(super) const SSM_QUICKSETUP_CONFIGURATION_MANAGER_PATH: &str = "configuration-manager";
+
+/// The one `Fn::GetAtt` attribute an [`SSM_QUICKSETUP_CONFIGURATION_MANAGER`] publishes that
+/// these naming rules can compute a stand-in for: the ARN Quick Setup minted, which is also
+/// what the type's `Ref` returns.
+///
+/// The manager's `CreatedAt`, `LastModifiedAt` and `StatusSummaries` are that service's own to
+/// report — its clock and its deployment's state — and reach the resource off its report of
+/// the created manager
+/// ([`crate::state::provisioner::Provisioner::SsmQuickSetupConfigurationManager`]), exactly as
+/// an `AWS::Braket::SpendingLimit`'s `CreatedAt` does.
+pub const SSM_QUICKSETUP_CONFIGURATION_MANAGER_ARN_ATTRIBUTE: &str = "ManagerArn";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a RECYCLE BIN retention rule: the
 /// account-wide guardrail that keeps a deleted resource recoverable for a period, which that
 /// service's own `CreateRule` makes. The middle segment is that model's own `awsService.sdkId`

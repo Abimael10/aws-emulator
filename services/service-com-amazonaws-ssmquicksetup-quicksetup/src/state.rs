@@ -2499,6 +2499,25 @@ pub fn to_hash_map(map: &BTreeMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+/// Now, as this service RECORDS an instant on a resource: the current time truncated to the
+/// millisecond.
+///
+/// The instants this service keeps are reported through members whose `@timestampFormat` is
+/// `date-time`, and the form that renders carries milliseconds — so an instant recorded more
+/// finely than it can ever be reported is one no reader of it can see. Truncating where it is
+/// RECORDED, rather than where it is rendered, is what makes every reader see the SAME instant:
+/// this service's own reads of a manager and of a configuration, and a CloudFormation stack
+/// that publishes a manager's `CreatedAt` as one of the resource's return values, which
+/// CloudFormation publishes at that same precision.
+///
+/// A clock before the epoch is left as it is: there is nothing to truncate towards.
+pub fn recorded_now() -> SystemTime {
+    let Ok(since_epoch) = SystemTime::now().duration_since(::std::time::UNIX_EPOCH) else {
+        return SystemTime::now();
+    };
+    ::std::time::UNIX_EPOCH + Duration::from_millis(since_epoch.as_millis() as u64)
+}
+
 /// Now, in nanoseconds since the Unix epoch — only a uuid-generator seed.
 fn now_nanos() -> u64 {
     SystemTime::now()

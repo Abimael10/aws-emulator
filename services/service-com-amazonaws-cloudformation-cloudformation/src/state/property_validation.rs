@@ -349,6 +349,14 @@ pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: crate::state::template::MEDIACONVERT_CERTIFICATE_ASSOCIATION,
         required: &["Arn"],
     },
+    // `AWS::SSMQuickSetup::ConfigurationManager`: a configuration manager IS the deployment
+    // of its definitions — `CreateConfigurationManager` declares `ConfigurationDefinitions`
+    // required, and the name it also takes is the one CloudFormation may generate — so a
+    // declaration stating no definition describes nothing to deploy.
+    RequiredProperties {
+        resource_type: crate::state::template::SSM_QUICKSETUP_CONFIGURATION_MANAGER,
+        required: &["ConfigurationDefinitions"],
+    },
 ];
 
 /// One group of properties a resource type's schema admits AT MOST ONE of: the `oneOf` that

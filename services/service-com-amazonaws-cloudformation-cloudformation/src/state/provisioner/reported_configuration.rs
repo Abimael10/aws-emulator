@@ -856,6 +856,11 @@ impl Provisioner {
             Self::RekognitionDataset => {
                 describe_rekognition_dataset(ctx, region, physical_resource_id).await
             }
+            // Quick Setup's own read of the configuration manager, by the `ManagerArn` it
+            // minted for it.
+            Self::SsmQuickSetupConfigurationManager => {
+                describe_configuration_manager(ctx, region, physical_resource_id).await
+            }
         }
     }
 }

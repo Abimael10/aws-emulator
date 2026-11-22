@@ -300,7 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
-        let now = ::std::time::SystemTime::now();
+        // The instant this update RECORDS on the manager, at the precision every reader of
+        // one sees it at (`crate::state::recorded_now`).
+        let now = crate::state::recorded_now();
         let mut store = state.lock();
         // So a manager whose teardown has come due is gone before this request looks
         // for it, rather than being updated on its way out of the store.

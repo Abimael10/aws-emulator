@@ -340,6 +340,14 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // the created dataset rather than from here, exactly as a spending limit's `CreatedAt`
         // does.
         CLEANROOMSML_TRAINING_DATASET => &[CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE],
+        // A Quick Setup configuration manager publishes the ARN that service minted for it,
+        // which is the one return value these naming rules compute a stand-in for before it
+        // exists; its `CreatedAt`, `LastModifiedAt` and `StatusSummaries` are that service's
+        // own to report and reach the resource off its report of the created manager rather
+        // than from here, exactly as a spending limit's `CreatedAt` does.
+        SSM_QUICKSETUP_CONFIGURATION_MANAGER => {
+            &[SSM_QUICKSETUP_CONFIGURATION_MANAGER_ARN_ATTRIBUTE]
+        }
         // A CloudHSM cluster publishes the ARN its `Ref` also returns and the five read-only
         // values CloudHSM reports for it; only the ARN and the id inside it are values these
         // naming rules compute a stand-in for, the rest reaching the resource off that
@@ -1038,6 +1046,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // and `DeleteTrainingDataset` each address a dataset by, and no name CloudFormation
         // decides is such an ARN, so the identity in force is the one that service answered.
         || resource_type == CLEANROOMSML_TRAINING_DATASET
+        // A QUICK SETUP configuration manager is one more: `CreateConfigurationManager` takes
+        // no identifier for the manager — the declaration states its name, its description and
+        // the definitions it deploys — and answers the `ManagerArn` that service minted, whose
+        // resource path carries a uuid of its own. That ARN is what "Ref returns the
+        // ManagerArn" publishes and what `GetConfigurationManager`,
+        // `UpdateConfigurationManager` and `DeleteConfigurationManager` each address a manager
+        // by, and no name CloudFormation decides is such an ARN, so the identity in force is
+        // the one that service answered.
+        || resource_type == SSM_QUICKSETUP_CONFIGURATION_MANAGER
         // A CLOUDHSM cluster is one more: `CreateCluster` takes no identifier for the cluster —
         // the declaration states the subnets it goes in, the HSM type it will hold and the mode
         // it runs in — and answers the `ClusterId` that service minted

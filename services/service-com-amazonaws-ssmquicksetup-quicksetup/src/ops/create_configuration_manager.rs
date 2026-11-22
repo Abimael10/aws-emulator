@@ -419,7 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let created_at = ::std::time::SystemTime::now();
+        // The instant this create RECORDS for the manager, at the precision every reader of
+        // one sees it at (`crate::state::recorded_now`).
+        let created_at = crate::state::recorded_now();
 
         let mut store = state.lock();
         // So a manager whose teardown has already come due — and every configuration it

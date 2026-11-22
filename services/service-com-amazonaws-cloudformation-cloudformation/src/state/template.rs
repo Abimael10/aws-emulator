@@ -2891,6 +2891,11 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             // what it is called — so renaming one is a modification of it, not a recreation.
             | BCM_DASHBOARD
             | BCM_SCHEDULED_REPORT
+            // A QUICK SETUP configuration manager is in that same position:
+            // `UpdateConfigurationManager` takes the `ManagerArn` that service minted together
+            // with a new `Name`, the manager being identified by that ARN rather than by what
+            // it is called — so renaming one is a modification of it, not a recreation.
+            | SSM_QUICKSETUP_CONFIGURATION_MANAGER
     )
 }
 
@@ -3190,6 +3195,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The patch baseline `provisioning::ssm_patch_baseline` creates, publishing the id
     // Systems Manager minted for it.
     crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE,
+    // The Quick Setup configuration manager, publishing the ARN that service mints for it
+    // beside the instants of its clock and the summaries of its deployment.
+    SSM_QUICKSETUP_CONFIGURATION_MANAGER,
     STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER,
     "AWS::Transfer::Workflow",

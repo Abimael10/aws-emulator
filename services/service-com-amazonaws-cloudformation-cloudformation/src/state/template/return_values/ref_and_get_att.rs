@@ -2160,6 +2160,30 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // Quick Setup's own control plane: the configuration manager an
+        // `AWS::SSMQuickSetup::ConfigurationManager` declares. "Ref returns the ManagerArn"
+        // (the type's primary identifier); Fn::GetAtt reads `ManagerArn` beside the two
+        // instants and the status summaries that service keeps. Quick Setup MINTS the ARN —
+        // `CreateConfigurationManager` takes no identifier for the manager and answers the
+        // `ManagerArn` it assigned, whose resource path carries a uuid of its own — so the
+        // value here is a STAND-IN of that form, which `super::provisioning` re-points at the
+        // ARN the create really answered
+        // ([`super::provisioner::Provisioner::SsmQuickSetupConfigurationManager`]).
+        SSM_QUICKSETUP_CONFIGURATION_MANAGER => {
+            let arn = ::emulator_server::emulator_arn(
+                SSM_QUICKSETUP_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{SSM_QUICKSETUP_CONFIGURATION_MANAGER_PATH}/{}",
+                    generated_uuid(resource_type, name)
+                ),
+            );
+            attributes.insert(
+                SSM_QUICKSETUP_CONFIGURATION_MANAGER_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
         // CloudHSM's own control plane: the cluster an `AWS::CloudHSM::Cluster` declares. "Ref
         // returns the cluster ARN" (the type's primary identifier); Fn::GetAtt reads
         // [`CLOUDHSM_CLUSTER_ATTRIBUTES`]. That service MINTS the identity — `CreateCluster`

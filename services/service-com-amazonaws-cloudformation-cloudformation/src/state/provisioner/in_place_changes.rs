@@ -733,6 +733,18 @@ impl Provisioner {
             // ([`update_repository`]). Its tags travel separately
             // ([`Self::retag`]).
             Self::EcrRepository => update_repository(ctx, region, resource, declared).await,
+            // `UpdateConfigurationManager` takes the `ManagerArn` Quick Setup minted together
+            // with a new name and description — everything that call can change on a manager
+            // that exists — so a changed declaration of either reaches the manager the stack
+            // created rather than replacing it. Its DEFINITIONS are not members of that call at
+            // all, which is why a declaration restating them replaces the resource
+            // ([`super::template::replacement_properties`]); its tags travel separately
+            // ([`Self::retag`]).
+            Self::SsmQuickSetupConfigurationManager => {
+                update_configuration_manager(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -927,6 +939,13 @@ impl Provisioner {
             // where the set a suite is to end up carrying is reconciled.
             Self::IotCoreDeviceAdvisorSuiteDefinition => {
                 retag_suite_definition(ctx, region, resource, declared, propagated).await
+            }
+            // A configuration manager's tags are Quick Setup's own `TagResource` and
+            // `UntagResource`: `CreateConfigurationManager`'s `Tags` map applies to the manager
+            // that call creates, and `UpdateConfigurationManager` carries no tags at all, so
+            // this is where the set a manager is to end up carrying is reconciled.
+            Self::SsmQuickSetupConfigurationManager => {
+                retag_configuration_manager(ctx, region, resource, declared, propagated).await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the

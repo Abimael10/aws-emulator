@@ -356,6 +356,15 @@ impl Provisioner {
             Self::RekognitionDataset => {
                 rekognition_dataset_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateConfigurationManager` answers the manager with its deployment still
+            // walking the phases Quick Setup publishes for one (`INITIALIZING`, `DEPLOYING`,
+            // `SUCCEEDED`) — a configuration manager IS the deployment of its definitions, and
+            // no configuration of it is in place until that work has succeeded — so the
+            // resource's creation is finished once that service reports the deployment
+            // `SUCCEEDED` ([`ssm_quicksetup_configuration_managers`]).
+            Self::SsmQuickSetupConfigurationManager => {
+                configuration_manager_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -677,6 +686,14 @@ impl Provisioner {
             // under, which is its physical id, and a dataset by the ARN that service minted.
             Self::RekognitionProject => {
                 rekognition_project_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteConfigurationManager` leaves the manager reported while Quick Setup tears
+            // the configurations it deployed down — its deployment summary moves to `DELETING`
+            // — so it is still there when the delete answers and the deletion is finished once
+            // that service no longer holds it
+            // ([`ssm_quicksetup_configuration_managers`]).
+            Self::SsmQuickSetupConfigurationManager => {
+                configuration_manager_removal(ctx, region, physical_resource_id).await
             }
             Self::RekognitionDataset => {
                 rekognition_dataset_removal(ctx, region, physical_resource_id).await

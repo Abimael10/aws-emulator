@@ -193,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let now = ::std::time::SystemTime::now();
+        // The instant this delete RECORDS on the manager it is tearing down, at the
+        // precision every reader of one sees it at (`crate::state::recorded_now`).
+        let now = crate::state::recorded_now();
         let mut store = state.lock();
         // So a manager whose teardown has already come due is gone before this
         // request looks for it, rather than being deleted a second time.

@@ -101,6 +101,22 @@ pub const PATTERNED_PROPERTIES: &[PatternedProperty] = &[
         property: "HsmType",
         pattern: r"^((p|)hsm[0-9][a-z.]*\.[a-zA-Z]+)$",
     },
+    // `AWS::SSMQuickSetup::ConfigurationManager`'s `Name` is "a name for the configuration
+    // manager", which the type's own schema states over the alphabet Quick Setup publishes for
+    // `CreateConfigurationManager$Name` (`^[ A-Za-z0-9._-]{0,120}$`) and the SHORTER bound that
+    // schema puts on a templated name — the form the resource reference publishes for the
+    // property, which is what a declaration is held to and told about.
+    // `AWS::SSMQuickSetup::ConfigurationManager`'s `Name` is "a name for the configuration
+    // manager", which the type's own schema states as the row below: a narrower form than the
+    // one Quick Setup publishes for `CreateConfigurationManager$Name`
+    // (`^[ A-Za-z0-9._-]{0,120}$`) — the alphabet without the dot, at least one character and
+    // at most fifty — which is what the resource reference publishes for the property, and so
+    // what a declaration is held to and told about.
+    PatternedProperty {
+        resource_type: crate::state::template::SSM_QUICKSETUP_CONFIGURATION_MANAGER,
+        property: "Name",
+        pattern: r"^[ A-Za-z0-9_-]{1,50}$",
+    },
 ];
 
 /// `Some(failure)` for a resource carrying a property value outside the pattern its type's
