@@ -325,6 +325,10 @@ pub async fn run_auto_ml_job_v2(
             &name,
             source.s3_data_source.s3_data_type.as_str(),
             source.s3_data_source.s3_uri.as_str(),
+            // `AutoMLS3DataSource` carries no `AttributeNames`, so a channel of this job that
+            // names an augmented manifest takes every attribute its JSON lines hold
+            // ([`super::augmented_manifest`]).
+            &[],
             &mut remaining_bytes,
         )
         .await

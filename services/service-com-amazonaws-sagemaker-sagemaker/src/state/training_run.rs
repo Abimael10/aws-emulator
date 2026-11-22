@@ -153,6 +153,10 @@ pub const OUTPUT_ARCHIVE_OBJECT: &str = "output.tar.gz";
 /// the run reads it.
 pub const MANIFEST_FILE: &str = "ManifestFile";
 
+// The `S3DataType` whose `S3Uri` identifies an augmented manifest — the object the records
+// themselves live in — and the reading of those records live in [`super::augmented_manifest`],
+// reached here through `use super::*`.
+
 // The IAM actions an Amazon S3 read or write is authorized under, the partition an Amazon S3
 // ARN carries and the location an `s3://` URI names are this service's ONE reading of an
 // Amazon S3 location ([`super::s3_access`]), reached here through `use super::*`.
@@ -559,6 +563,10 @@ pub async fn run_training_job(
             channel.channel_name.as_str(),
             source.s3_data_type.as_str(),
             source.s3_uri.as_str(),
+            // "A list of one or more attribute names to use that are found in a specified
+            // augmented manifest file" (`S3DataSource$AttributeNames`): which attributes of
+            // that manifest's JSON lines this channel's records are built from.
+            source.attribute_names.as_deref().unwrap_or_default(),
             &mut remaining_bytes,
         )
         .await
@@ -895,6 +903,12 @@ fn artifact_location(output: &S3Location, job_name: &str) -> S3Location {
 
 /// Read one channel's records out of its Amazon S3 location.
 ///
+/// The FORM the records are read in follows the channel's own `S3DataType`: an augmented
+/// manifest carries the records inside the object itself, as the JSON lines the attributes
+/// `attribute_names` names are taken out of ([`super::augmented_manifest`]), and every other
+/// data type names objects of the comma-separated form the built-in algorithms document
+/// ([`read_records`]).
+///
 /// `Err` is the job's `FailureReason`: the download leg failed, which is the job's own
 /// failure rather than the request's.
 #[allow(clippy::too_many_arguments)]
@@ -907,6 +921,7 @@ pub async fn read_channel(
     name: &str,
     s3_data_type: &str,
     s3_uri: &str,
+    attribute_names: &[String],
     remaining_bytes: &mut usize,
 ) -> Result<ChannelData, String> {
     let Some(location) = S3Location::parse(s3_uri) else {
@@ -961,7 +976,11 @@ pub async fn read_channel(
             read.files
                 .push((file, String::from_utf8_lossy(&bytes).to_string()));
         }
-        read_records(&bytes, &mut read);
+        if s3_data_type == AUGMENTED_MANIFEST_FILE {
+            read_augmented_records(&bytes, attribute_names, &mut read);
+        } else {
+            read_records(&bytes, &mut read);
+        }
         if read.records.len() >= MAX_RECORDS {
             break;
         }
@@ -974,9 +993,12 @@ pub async fn read_channel(
 /// A location whose `S3DataType` is [`MANIFEST_FILE`] names a manifest, whose first element
 /// is a prefix and whose remaining elements are suffixes of it (`S3DataSource$S3Uri`) — the
 /// prefix element is an `s3://` URI, so the objects it names are objects of ITS bucket, which
-/// is carried alongside each key rather than assumed to be the manifest's own. Every other
-/// value names a key name prefix, so the objects are the ones Amazon S3 lists under it — which
-/// is the object itself when the prefix names one.
+/// is carried alongside each key rather than assumed to be the manifest's own. A location whose
+/// data type is [`AUGMENTED_MANIFEST_FILE`] "identifies an object that is an augmented manifest
+/// file in JSON lines format" holding "the data you want to use for model training"
+/// (`S3DataSource$S3DataType`), so the one object the channel reads is that object itself.
+/// Every other value names a key name prefix, so the objects are the ones Amazon S3 lists under
+/// it — which is the object itself when the prefix names one.
 #[allow(clippy::too_many_arguments)]
 async fn channel_objects(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -988,6 +1010,9 @@ async fn channel_objects(
     s3_data_type: &str,
     location: &S3Location,
 ) -> Result<Vec<S3Location>, String> {
+    if s3_data_type == AUGMENTED_MANIFEST_FILE {
+        return Ok(vec![location.clone()]);
+    }
     if s3_data_type == MANIFEST_FILE {
         if object_read_is_unauthorized(ctx, client, region, role_arn, partition, location).await {
             return Err(data_download_failed(

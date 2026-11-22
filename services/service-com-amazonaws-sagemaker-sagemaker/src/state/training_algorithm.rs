@@ -23,20 +23,23 @@
 //! `AlgorithmSpecification` names and what that choice implies; the measuring itself is the
 //! run's ([`super::training_run`]).
 //!
-//! # The built-in algorithm this reading knows
+//! # The built-in algorithms this reading knows
 //!
 //! SageMaker publishes each built-in algorithm as an image whose repository is
 //! `sagemaker-<algorithm>` ("Docker registry paths for SageMaker built-in algorithms"), so the
 //! algorithm a job runs is read off the repository the image path names rather than guessed
-//! from anything else. The one built-in algorithm named here is the gradient-boosted tree
-//! algorithm, which is also the one whose serialized model this emulator can SERVE
-//! ([`super::boosted_model`]), so the pair stays consistent: it writes its model as
-//! `xgboost-model` and emits `<channel>:<eval_metric>` per channel.
+//! from anything else ([`BuiltInAlgorithm`]). One is the gradient-boosted tree algorithm, which
+//! is also the one whose serialized model this emulator can SERVE ([`super::boosted_model`]),
+//! so the pair stays consistent: it writes its model as `xgboost-model` and emits
+//! `<channel>:<eval_metric>` per channel. The other is the text algorithm, whose supervised mode
+//! is a classification: it writes its model as `model.bin` and is evaluated by the share of the
+//! labels it predicts right, so a job of that mode emits `<channel>:accuracy`.
 //!
-//! Which metric that is comes from the learning task the job asked for: XGBoost's
-//! `eval_metric` parameter is documented as defaulting "according to objective", and a request
-//! may also name it outright. Both are hyperparameters of the job, so both are read from the
-//! `HyperParameters` the request carried.
+//! Which metric a job emits therefore comes from the learning task its own hyperparameters
+//! declare: XGBoost's `eval_metric` parameter is documented as defaulting "according to
+//! objective", the text algorithm's `mode` states whether its run is a supervised
+//! classification, and a request may name the metric outright. All are hyperparameters of the
+//! job, so all are read from the `HyperParameters` the request carried.
 
 use super::*;
 
@@ -59,6 +62,23 @@ pub const BOOSTED_TREES_REPOSITORY: &str = "xgboost";
 /// The file that algorithm's container writes the trained model into, inside
 /// [`MODEL_DIRECTORY`].
 pub const BOOSTED_TREES_MODEL_FILE: &str = "xgboost-model";
+
+/// The repository segment SageMaker's built-in text algorithm is published under ("Docker
+/// registry paths and example code" lists it as `sagemaker-blazingtext`), which is how a job's
+/// `TrainingImage` names that algorithm.
+pub const TEXT_CLASSIFICATION_REPOSITORY: &str = "blazingtext";
+
+/// The file that algorithm's container writes the trained model into, inside
+/// [`MODEL_DIRECTORY`]: the model archive of a text job holds `model.bin`.
+pub const TEXT_CLASSIFICATION_MODEL_FILE: &str = "model.bin";
+
+/// The hyperparameter naming the TRAINING MODE of the text algorithm, which is what decides
+/// whether its run is a supervised classification or a word-vector one.
+pub const MODE_HYPER_PARAMETER: &str = "mode";
+
+/// The [`MODE_HYPER_PARAMETER`] value whose run is a supervised text classification — the mode
+/// whose container is evaluated by how many of the labels it predicts are right.
+pub const SUPERVISED_MODE: &str = "supervised";
 
 /// The hyperparameter naming the learning task the job asked for, which is what the default
 /// evaluation metric follows ("`eval_metric` [default according to objective]").
@@ -84,6 +104,9 @@ pub enum ChannelMetric {
     MultiClassError,
     /// Mean absolute error — XGBoost's `mae`.
     MeanAbsoluteError,
+    /// The share of the records whose class the model predicts right — the metric a supervised
+    /// text classification run is evaluated by.
+    Accuracy,
 }
 
 impl ChannelMetric {
@@ -95,6 +118,7 @@ impl ChannelMetric {
             Self::ClassificationError => "error",
             Self::MultiClassError => "merror",
             Self::MeanAbsoluteError => "mae",
+            Self::Accuracy => "accuracy",
         }
     }
 
@@ -106,6 +130,7 @@ impl ChannelMetric {
             Self::ClassificationError,
             Self::MultiClassError,
             Self::MeanAbsoluteError,
+            Self::Accuracy,
         ]
         .into_iter()
         .find(|metric| metric.label() == label)
@@ -114,8 +139,9 @@ impl ChannelMetric {
     /// This metric MEASURED over `records` with `model`'s own predictions.
     ///
     /// Every value is a measurement over real predictions, so a caller that gates on it reads a
-    /// number the run produced from the data the request named. An empty channel measures zero
-    /// error, because there is no case the model got wrong.
+    /// number the run produced from the data the request named. A channel the run read no record
+    /// from measures zero, and no metric is emitted for it at all
+    /// ([`super::training_run::run_training_job`]).
     #[must_use]
     pub fn measure(self, model: &LinearModel, records: &[Record]) -> f64 {
         if records.is_empty() {
@@ -153,6 +179,18 @@ impl ChannelMetric {
                     .sum::<f64>()
                     / count
             }
+            // The share of the records the model got RIGHT, over the class a prediction names —
+            // the nearest class label, the same reading the multiclass error rate takes of a
+            // numeric target.
+            Self::Accuracy => {
+                let right = records
+                    .iter()
+                    .filter(|record| {
+                        model.predict(&record.features).round() == record.target.round()
+                    })
+                    .count();
+                right as f64 / count
+            }
         }
     }
 }
@@ -177,11 +215,74 @@ pub fn default_metric_for_objective(objective: Option<&str>) -> ChannelMetric {
     }
 }
 
+/// A SageMaker BUILT-IN algorithm, as far as a job's observable outputs go: which file its
+/// container writes the trained model into, and which metric it emits per input channel.
+///
+/// Every entry is an algorithm whose outputs this emulator can really produce: the run measures
+/// that algorithm's own metric over the records it read, so an algorithm no entry names is
+/// reported with what the default train instructions measured rather than with a name this run
+/// has no measurement for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltInAlgorithm {
+    /// The gradient-boosted tree algorithm ([`BOOSTED_TREES_REPOSITORY`]), whose evaluation
+    /// metric follows the learning task its hyperparameters declare.
+    BoostedTrees,
+    /// The text algorithm ([`TEXT_CLASSIFICATION_REPOSITORY`]), whose supervised mode is a text
+    /// classification evaluated by the share of the labels it predicts right.
+    TextClassification,
+}
+
+impl BuiltInAlgorithm {
+    /// The built-in algorithm the image path (or registered algorithm reference) `value` names,
+    /// and `None` for one naming a container of the caller's own.
+    #[must_use]
+    pub fn named_by(value: &str) -> Option<Self> {
+        if names_repository(value, BOOSTED_TREES_REPOSITORY) {
+            Some(Self::BoostedTrees)
+        } else if names_repository(value, TEXT_CLASSIFICATION_REPOSITORY) {
+            Some(Self::TextClassification)
+        } else {
+            None
+        }
+    }
+
+    /// The file this algorithm's container writes the trained model into, inside
+    /// [`MODEL_DIRECTORY`].
+    #[must_use]
+    pub fn model_file(self) -> &'static str {
+        match self {
+            Self::BoostedTrees => BOOSTED_TREES_MODEL_FILE,
+            Self::TextClassification => TEXT_CLASSIFICATION_MODEL_FILE,
+        }
+    }
+
+    /// The metric this algorithm's container emits per channel when the request names none
+    /// outright: the one the LEARNING TASK its own hyperparameters declare is evaluated by.
+    ///
+    /// `None` is an algorithm whose task this run measures nothing for — the word-vector modes
+    /// of the text algorithm, which are evaluated over a vocabulary rather than over the
+    /// records — so such a job reports no final metric rather than a number nothing measured.
+    #[must_use]
+    pub fn default_metric(
+        self,
+        mode: Option<&str>,
+        objective: Option<&str>,
+    ) -> Option<ChannelMetric> {
+        match self {
+            Self::BoostedTrees => Some(default_metric_for_objective(objective)),
+            Self::TextClassification => {
+                (mode == Some(SUPERVISED_MODE)).then_some(ChannelMetric::Accuracy)
+            }
+        }
+    }
+}
+
 /// What the algorithm a job names decides about the job's observable outputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrainingAlgorithm {
-    /// Whether the job names SageMaker's built-in gradient-boosted tree algorithm.
-    pub boosted_trees: bool,
+    /// The built-in algorithm the job names, and `None` for a job running a container of the
+    /// caller's own.
+    pub built_in: Option<BuiltInAlgorithm>,
     /// The metric its container emits per input channel, and `None` for a job whose requested
     /// metric this run can measure nothing for — such a job reports no final metric at all,
     /// because a name with no measurement behind it is not a metric the run emitted.
@@ -209,9 +310,9 @@ impl TrainingAlgorithm {
                     .chain(spec.algorithm_name.as_deref())
             })
             .collect();
-        let boosted_trees = named
+        let built_in = named
             .iter()
-            .any(|value| names_repository(value, BOOSTED_TREES_REPOSITORY));
+            .find_map(|value| BuiltInAlgorithm::named_by(value));
         let hyper_parameters = request.hyper_parameters.as_ref();
         let read = |name: &str| {
             hyper_parameters
@@ -219,13 +320,22 @@ impl TrainingAlgorithm {
                 .map(String::as_str)
         };
         // A request that names the metric outright is reported with THAT metric, and otherwise
-        // with the one its learning task implies. A name nothing here can measure a value for
-        // leaves the job reporting NO metric: reporting another metric's name instead would be
-        // a plausible wrong answer, and reporting that name with a number nothing measured
-        // would be a value with no run behind it.
+        // with the one the ALGORITHM it names emits for the learning task its hyperparameters
+        // declare. A name nothing here can measure a value for leaves the job reporting NO
+        // metric: reporting another metric's name instead would be a plausible wrong answer, and
+        // reporting that name with a number nothing measured would be a value with no run behind
+        // it.
         let metric = match read(EVAL_METRIC_HYPER_PARAMETER) {
             Some(named) => ChannelMetric::named(named),
-            None => Some(default_metric_for_objective(read(OBJECTIVE_HYPER_PARAMETER))),
+            None => match built_in {
+                Some(algorithm) => algorithm.default_metric(
+                    read(MODE_HYPER_PARAMETER),
+                    read(OBJECTIVE_HYPER_PARAMETER),
+                ),
+                // A container of the caller's own is reported with what this emulator's own
+                // default train instructions measured over its data.
+                None => Some(default_metric_for_objective(read(OBJECTIVE_HYPER_PARAMETER))),
+            },
         };
         // The learning task itself decides what the trained model ANSWERS, which is a
         // different question from how it is evaluated: the task is read off the same
@@ -235,7 +345,7 @@ impl TrainingAlgorithm {
         let link = read(OBJECTIVE_HYPER_PARAMETER)
             .map_or(ObjectiveLink::Identity, ObjectiveLink::of_objective);
         Self {
-            boosted_trees,
+            built_in,
             metric,
             link,
         }
@@ -249,10 +359,9 @@ impl TrainingAlgorithm {
     /// parameters the fit measured.
     #[must_use]
     pub fn model_file(self) -> &'static str {
-        if self.boosted_trees {
-            BOOSTED_TREES_MODEL_FILE
-        } else {
-            super::MODEL_ARCHIVE_ENTRY
+        match self.built_in {
+            Some(algorithm) => algorithm.model_file(),
+            None => super::MODEL_ARCHIVE_ENTRY,
         }
     }
 
@@ -313,8 +422,9 @@ mod tests {
     ///
     /// The rows differ along how the algorithm is named (a built-in image, a registered
     /// algorithm, a caller's own image, none at all), along the objective (regression, binary,
-    /// multiclass, one no catalog entry names, none) and along whether the request names the
-    /// metric outright. `multi:softprob` is an entry no report cited.
+    /// multiclass, one no catalog entry names, none), along the text algorithm's training mode
+    /// (supervised, a word-vector one) and along whether the request names the metric outright.
+    /// `multi:softprob` is an entry no report cited.
     #[test]
     fn the_metric_name_follows_the_algorithm_and_the_objective() {
         /// One row: the case, the image, the algorithm name, the hyperparameters, and the
@@ -385,6 +495,36 @@ mod tests {
                 model_file: BOOSTED_TREES_MODEL_FILE,
             },
             Row {
+                case: "the built-in text image in its supervised mode",
+                image: Some(
+                    "811284229777.dkr.ecr.us-east-1.amazonaws.com/blazingtext:1",
+                ),
+                algorithm: None,
+                parameters: &[("mode", "supervised"), ("epochs", "5")],
+                metric: Some("train:accuracy"),
+                model_file: TEXT_CLASSIFICATION_MODEL_FILE,
+            },
+            Row {
+                case: "the same image in a word-vector mode, which this run measures nothing for",
+                image: Some(
+                    "811284229777.dkr.ecr.us-east-1.amazonaws.com/sagemaker-blazingtext:latest",
+                ),
+                algorithm: None,
+                parameters: &[("mode", "skipgram")],
+                metric: None,
+                model_file: TEXT_CLASSIFICATION_MODEL_FILE,
+            },
+            Row {
+                case: "the text image with the metric named outright",
+                image: Some(
+                    "811284229777.dkr.ecr.us-east-1.amazonaws.com/blazingtext:1",
+                ),
+                algorithm: None,
+                parameters: &[("mode", "supervised"), ("eval_metric", "mae")],
+                metric: Some("train:mae"),
+                model_file: TEXT_CLASSIFICATION_MODEL_FILE,
+            },
+            Row {
                 case: "a container of the caller's own",
                 image: Some("000000000000.dkr.ecr.us-east-1.amazonaws.com/my-trainer:1"),
                 algorithm: None,
@@ -436,7 +576,7 @@ mod tests {
     fn each_metric_is_measured_from_the_predictions() {
         let model = identity_model();
         // (case, metric, records, the value its definition gives)
-        let rows: [(&str, ChannelMetric, Vec<Record>, f64); 6] = [
+        let rows: [(&str, ChannelMetric, Vec<Record>, f64); 7] = [
             (
                 "no error at all",
                 ChannelMetric::RootMeanSquareError,
@@ -473,6 +613,12 @@ mod tests {
                 records(&[(2.0, 1.0), (2.0, 4.0)]),
                 1.5,
             ),
+            (
+                "three classes out of four predicted right",
+                ChannelMetric::Accuracy,
+                records(&[(0.0, 0.1), (1.0, 1.1), (2.0, 1.9), (2.0, 0.0)]),
+                0.75,
+            ),
         ];
         for (case, metric, rows, expected) in rows {
             let measured = metric.measure(&model, &rows);
@@ -486,6 +632,7 @@ mod tests {
             ChannelMetric::ClassificationError,
             ChannelMetric::MultiClassError,
             ChannelMetric::MeanAbsoluteError,
+            ChannelMetric::Accuracy,
         ] {
             let measured = metric.measure(&model, &[]);
             assert!(
@@ -605,6 +752,38 @@ mod tests {
             assert_eq!(
                 read, expected,
                 "case {case:?}: expected {expected}, got {read}"
+            );
+        }
+
+        // And the same reading decides WHICH built-in algorithm a value names: each
+        // repository its own, and nothing for a container of the caller's own.
+        let named: [(&str, &str, Option<BuiltInAlgorithm>); 4] = [
+            (
+                "the boosted-trees repository",
+                "1.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1",
+                Some(BuiltInAlgorithm::BoostedTrees),
+            ),
+            (
+                "the text repository",
+                "811284229777.dkr.ecr.us-east-1.amazonaws.com/blazingtext:1",
+                Some(BuiltInAlgorithm::TextClassification),
+            ),
+            (
+                "the same text repository as the framework image path",
+                "811284229777.dkr.ecr.us-east-1.amazonaws.com/sagemaker-blazingtext@sha256:abc",
+                Some(BuiltInAlgorithm::TextClassification),
+            ),
+            (
+                "a container of the caller's own",
+                "1.dkr.ecr.us-east-1.amazonaws.com/trainer:1",
+                None,
+            ),
+        ];
+        for (case, value, expected) in named {
+            let read = BuiltInAlgorithm::named_by(value);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
     }

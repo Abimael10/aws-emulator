@@ -1190,6 +1190,11 @@ pub use jobs::*;
 pub mod training_run;
 pub use training_run::*;
 
+/// The AUGMENTED MANIFEST a training channel can carry its own data in — the JSON lines it
+/// holds and the attributes a channel takes out of them: see `state/augmented_manifest.rs`.
+pub mod augmented_manifest;
+pub use augmented_manifest::*;
+
 /// What the ALGORITHM a training job names decides about the job's observable outputs — the
 /// file its container writes the model into, and the metric it emits per input channel: see
 /// `state/training_algorithm.rs`.
