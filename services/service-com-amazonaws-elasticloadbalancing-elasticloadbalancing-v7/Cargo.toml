@@ -44,9 +44,10 @@ hex = { workspace = true }
 # `src/service/api_version.rs`). Reaching its operations needs its routing table, which
 # only its crate carries.
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { path = "../service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10" }
-# The EC2 store, which OWNS instances: a health check of a registered instance observes
-# whether EC2 reports that instance running, so the inventory a check reads is EC2's own
-# (`src/state/instance_checks.rs`).
+# The EC2 store, which OWNS instances: a health check of a registered instance connects to
+# the port its load balancer's `HealthCheck$Target` names, and what answers on a port of
+# such an instance is the server its own guest runs, so the inventory a check reads is
+# EC2's own (`src/state/instance_checks.rs`).
 service-com-amazonaws-ec2-amazonec2 = { path = "../service-com-amazonaws-ec2-amazonec2" }
 # `query_error_envelope`: the `<RequestId>` element an awsQuery `<ErrorResponse>` carries
 # beside its `<Error>`, which no model declares and the framework's error renderers do not
@@ -56,6 +57,11 @@ service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# `RunInstances$UserData` is base64, and a suite whose backend must ANSWER a health check
+# launches it with the program that starts its server (`tests/all/wire.rs`).
+base64 = "0.22"
 
 [lints]
 workspace = true

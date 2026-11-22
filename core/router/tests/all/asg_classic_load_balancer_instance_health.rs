@@ -30,9 +30,11 @@
 //! and — in the second test — the `HealthCheckGracePeriod` the derivation waits out before it
 //! marks an instance on a failed check at all.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use service_com_amazonaws_ec2_amazonec2::state as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The ONE percent-encoder and element readers this test crate keeps for awsQuery suites
@@ -52,6 +54,17 @@ const ASG_VERSION: &str = "2011-01-01";
 /// The AMI and instance type every launch template here names.
 const IMAGE_ID: &str = "ami-0abcdef1234567890";
 const INSTANCE_TYPE: &str = "t3.micro";
+
+/// The port every backend of this suite serves, which is the port its load balancer's
+/// listener forwards traffic to and its health check connects to, and the directory that
+/// server serves.
+///
+/// A Classic Load Balancer health check is the check its `HealthCheck$Target` describes — "a
+/// HTTP GET request is issued to the instance on the given port and path" — so a registration
+/// whose checks are answered is one whose instance runs a server holding the document at that
+/// path ([`start_server_in_guest`]).
+const SERVED_PORT: i32 = 80;
+const SERVED_ROOT: &str = "/srv/site";
 
 /// The thresholds every load balancer of this suite is configured with: the fewest
 /// consecutive checks a verdict can take either way, because a verdict about a registration is
@@ -86,13 +99,15 @@ const ELB_IN_SERVICE: &str = "InService";
 const ELB_OUT_OF_SERVICE: &str = "OutOfService";
 const ELB_REASON_INSTANCE: &str = "Instance";
 
-/// The whole emulator over one engine, exactly as the binary assembles it.
-fn router() -> MultiServiceRouter {
+/// The whole emulator over one engine, exactly as the binary assembles it — answered beside
+/// that engine, which is the handle this suite starts a server in an instance's guest
+/// through ([`start_server_in_guest`]).
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = aws_emulator_router::new_engine();
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     // Signature verification is the front door's concern, not this suite's.
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// One form body: the action, the version and the parameters.
@@ -183,7 +198,8 @@ async fn asg(
 }
 
 /// Create the launch template a group launches from: an AMI and an instance type, and no user
-/// data at all, so the instance runs whatever its image runs and nothing else.
+/// data at all — what each instance then RUNS is started in its guest once it is up
+/// ([`start_server_in_guest`]), the way an application reaches a machine a group launched.
 async fn launch_template(router: &MultiServiceRouter, case: &str, name: &str) {
     ec2(
         router,
@@ -196,6 +212,32 @@ async fn launch_template(router: &MultiServiceRouter, case: &str, name: &str) {
         ],
     )
     .await;
+}
+
+/// Start a web server in the guest of `instance_id`, through Amazon EC2's own seam for
+/// running a program in a running guest — answering whether there was a booted guest that ran
+/// it.
+///
+/// A Classic Load Balancer health check connects to the port its `HealthCheck$Target` names
+/// and asks for that target's ping path there, so a registration whose checks are ANSWERED is
+/// one whose instance runs a server holding that document. Nothing of an instance answers
+/// before something starts one, so the application is installed on the machine the group
+/// launched — which is what a client does with one.
+fn start_server_in_guest(engine: &Arc<engine::InMemoryEngine>, instance_id: &str) -> bool {
+    let Some(state) = ec2::service_state(&**engine) else {
+        return false;
+    };
+    let mut store = state.lock();
+    store
+        .run_in_instance_guest(
+            instance_id,
+            &[
+                format!("mkdir -p {SERVED_ROOT}"),
+                format!("echo ok > {SERVED_ROOT}/index.html"),
+                format!("python3 -m http.server {SERVED_PORT} --directory {SERVED_ROOT}"),
+            ],
+        )
+        .is_some_and(|run| run.status == 0)
 }
 
 /// Create one Classic Load Balancer with an HTTP listener and a health check that reaches a
@@ -211,7 +253,7 @@ async fn load_balancer(router: &MultiServiceRouter, case: &str, name: &str) {
             ("Listeners.member.1.Protocol", "HTTP"),
             ("Listeners.member.1.LoadBalancerPort", "80"),
             ("Listeners.member.1.InstanceProtocol", "HTTP"),
-            ("Listeners.member.1.InstancePort", "80"),
+            ("Listeners.member.1.InstancePort", &SERVED_PORT.to_string()),
         ],
     )
     .await;
@@ -221,7 +263,7 @@ async fn load_balancer(router: &MultiServiceRouter, case: &str, name: &str) {
         "ConfigureHealthCheck",
         &[
             ("LoadBalancerName", name),
-            ("HealthCheck.Target", "HTTP:80/"),
+            ("HealthCheck.Target", &format!("HTTP:{SERVED_PORT}/")),
             ("HealthCheck.Interval", "5"),
             ("HealthCheck.Timeout", "2"),
             ("HealthCheck.HealthyThreshold", HEALTHY_THRESHOLD),
@@ -300,15 +342,17 @@ async fn registration_health(
     (state, reason)
 }
 
-/// The one instance the group `group` holds, once the group has brought it into service and
-/// the load balancer `name` reports its registration `InService` — the state a client waits
-/// for before it sends the load balancer traffic.
+/// The one instance the group `group` holds, once the group has brought it into service, a
+/// server is running in its guest and the load balancer `name` reports its registration
+/// `InService` — the state a client waits for before it sends the load balancer traffic.
 ///
-/// Both moves are owed to the clock (the launch, the registration, and the threshold of
+/// Every move is owed to the clock (the launch, the registration, and the threshold of
 /// answered checks behind the verdict), so this waits for the CONDITION rather than for a
-/// span.
+/// span, and it starts the server on whichever instance the group has brought up — including
+/// a replacement — because nothing of a machine answers a check before something runs on it.
 async fn serving_instance(
     router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
     case: &str,
     group: &str,
     name: &str,
@@ -322,7 +366,10 @@ async fn serving_instance(
             .map(|(_, id)| id.clone())
             .collect();
         let reported = match in_service.first() {
-            Some(id) => registration_health(router, case, name, id).await,
+            Some(id) => {
+                start_server_in_guest(engine, id);
+                registration_health(router, case, name, id).await
+            }
             None => (String::new(), String::new()),
         };
         if reported.0 == ELB_IN_SERVICE {
@@ -529,13 +576,14 @@ async fn an_elb_health_checked_group_reports_the_verdict_of_its_classic_load_bal
     for row in &ROWS {
         // Each row runs on its own emulator, so one row's load balancer cannot decide
         // another's instance.
-        let router = router();
+        let (router, engine) = emulator();
         seed_group(&router, row, "0").await;
 
         // The instance is in service and its registration is one the load balancer routes
         // traffic to, so the group reports it healthy: a verdict that found nothing wrong is
         // not a failed check.
-        let instance = serving_instance(&router, row.case, row.group, row.load_balancer).await;
+        let instance =
+            serving_instance(&router, &engine, row.case, row.group, row.load_balancer).await;
         health_held(&router, row.case, row.group, &instance, HEALTHY).await;
 
         // Nothing on the instance answers the load balancer's checks any more. Stopping it
@@ -572,12 +620,13 @@ async fn an_instance_inside_the_grace_period_is_not_marked_on_a_failed_check() {
         health_check_type: "ELB",
         attached_after_create: false,
     };
-    let router = router();
+    let (router, engine) = emulator();
     // An hour of grace, which no leg of this test waits out: the window is what the
     // derivation must respect, not a span anything here sleeps for.
     seed_group(&router, row, "3600").await;
 
-    let instance = serving_instance(&router, row.case, row.group, row.load_balancer).await;
+    let instance =
+        serving_instance(&router, &engine, row.case, row.group, row.load_balancer).await;
     ec2(
         &router,
         row.case,

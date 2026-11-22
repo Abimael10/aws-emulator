@@ -152,7 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 HEALTH_CHECK_TIMEOUT_RELATION,
             ));
         }
-        if let Err(why) = target_rejection(&requested.target) {
+        // The target's grammar is read where the CHECK it describes is read
+        // (`crate::state::health_check_target`), so a target this handler accepts is one the
+        // periodic check of a registered instance knows how to perform.
+        if let Err(why) = crate::state::health_check_target::rejection(&requested.target) {
             return Err(crate::scaffolded::Scaffolded::validation_error(why));
         }
 
@@ -201,22 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The protocols a health-check target may name, from `HealthCheck$Target`: "The protocol
-/// is either TCP, HTTP, HTTPS, or SSL." Listed in the order this service's own refusal
-/// names them, which is what [`target_protocol_refusal`] states.
-const TARGET_PROTOCOLS: &[&str] = &["HTTP", "TCP", "HTTPS", "SSL"];
-
-/// The refusal a target that does not begin with one of [`TARGET_PROTOCOLS`] earns: a
-/// target is "a protocol:port pair", so a value that names no protocol at all and one that
-/// names something else both break the same rule, and the sentence states that rule with
-/// the protocols a target may begin with.
-fn target_protocol_refusal() -> String {
-    format!(
-        "HealthCheck Target must begin with one of {}",
-        TARGET_PROTOCOLS.join(", ")
-    )
-}
-
 /// The refusal a health check whose timeout is not below its interval earns, stated over
 /// the RELATION the two members have to each other rather than over the two values the
 /// request carried: the rule is what the caller has to satisfy, and it is the same rule
@@ -227,66 +214,3 @@ fn target_protocol_refusal() -> String {
 /// character is a different message to a client matching on it.
 const HEALTH_CHECK_TIMEOUT_RELATION: &str = "HealthCheck timeout must be less than interval. ";
 
-/// The ports a health-check target may name, from the same paragraph: "The range of valid
-/// ports is one (1) through 65535."
-const TARGET_PORTS: (i32, i32) = (1, 65535);
-
-/// The longest HTTP/HTTPS target: "The total length of the HTTP ping target must be 1024
-/// 16-bit Unicode characters or less."
-const MAX_HTTP_TARGET_CHARS: usize = 1024;
-
-/// Why `target` is not a health-check target, or `Ok(())` when it is one.
-///
-/// `HealthCheckTarget` is a plain string in the model, so its grammar is documented
-/// rather than modelled and nothing has refused a malformed one before this handler runs:
-/// "TCP is the default, specified as a TCP: port pair, for example \"TCP:5000\"… SSL is
-/// also specified as SSL: port pair… For HTTP/HTTPS, you must include a ping path in the
-/// string… for example \"HTTP:80/weather/us/wa/seattle\"". The message names the member
-/// and the rule it broke, which is what a caller fixes the request from.
-fn target_rejection(target: &str) -> Result<(), String> {
-    let Some((protocol, rest)) = target.split_once(':') else {
-        return Err(target_protocol_refusal());
-    };
-    let protocol = protocol.to_ascii_uppercase();
-    if !TARGET_PROTOCOLS.contains(&protocol.as_str()) {
-        return Err(target_protocol_refusal());
-    }
-
-    // An HTTP or HTTPS target carries a ping path after the port; a TCP or SSL target is
-    // the port alone, so a '/' in it is not a path but a malformed port.
-    let is_http = matches!(protocol.as_str(), "HTTP" | "HTTPS");
-    let (port, path) = match rest.split_once('/') {
-        Some((port, path)) => (port, Some(path)),
-        None => (rest, None),
-    };
-    match (is_http, path) {
-        (true, None) => {
-            return Err(format!(
-                "HealthCheck.Target must include a ping path for {protocol}, as in \
-                 '{protocol}:80/index.html'; got '{target}'"
-            ))
-        }
-        (false, Some(_)) => {
-            return Err(format!(
-                "HealthCheck.Target must be '{protocol}:<port>' with no ping path; got \
-                 '{target}'"
-            ))
-        }
-        _ => {}
-    }
-    if is_http && target.chars().count() > MAX_HTTP_TARGET_CHARS {
-        return Err(format!(
-            "HealthCheck.Target must be at most {MAX_HTTP_TARGET_CHARS} characters; got {}",
-            target.chars().count()
-        ));
-    }
-
-    let (low, high) = TARGET_PORTS;
-    match port.parse::<i32>() {
-        Ok(port) if (low..=high).contains(&port) => Ok(()),
-        _ => Err(format!(
-            "HealthCheck.Target port must be a number from {low} through {high}; got \
-             '{port}'"
-        )),
-    }
-}

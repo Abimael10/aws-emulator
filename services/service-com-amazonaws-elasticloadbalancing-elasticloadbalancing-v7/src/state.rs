@@ -186,6 +186,11 @@ pub const MAX_INSTANCES_PER_REQUEST: usize = MAX_INSTANCES_PER_LOAD_BALANCER;
 /// partitions. A create that would open one region past it is refused.
 pub const MAX_REGIONS: usize = 64;
 
+/// The check ONE `HealthCheck$Target` describes — the port a check connects to and what it
+/// asks for there — read both where a target is accepted and where a check is performed.
+pub mod health_check_target;
+pub use health_check_target::{HealthCheckTarget, HEALTH_CHECK_METHOD, HEALTH_CHECK_OK_STATUS};
+
 /// The periodic health check of one registered instance, which is what
 /// `DescribeInstanceHealth` reports the outcome of.
 mod instance_checks;
@@ -614,6 +619,16 @@ pub struct HealthCheckConfig {
     pub healthy_threshold: i32,
 }
 
+/// The bounds BOTH health-check thresholds are modelled with:
+/// `HealthCheck$HealthyThreshold` and `HealthCheck$UnhealthyThreshold` are
+/// `@range(min: 2, max: 10)`, so the framework refuses a request setting either outside
+/// them.
+///
+/// The number of consecutive checks a verdict takes is read inside this range
+/// ([`HealthThresholds`]), so the run of checks one settle folds is bounded by what the
+/// service accepts rather than by a stored number.
+pub const HEALTH_CHECK_THRESHOLDS: (i32, i32) = (2, 10);
+
 impl HealthCheckConfig {
     /// The default health check of a newly created load balancer: a TCP check against
     /// the instance port of its first listener.
@@ -925,19 +940,28 @@ impl LoadBalancer {
     /// made due at `now`, folding what each one observed ([`observe_instances`]) into the
     /// verdict it moves.
     ///
+    /// The check that ran is the one THIS load balancer's own `HealthCheck$Target`
+    /// describes, so each registration's observation is read for that target
+    /// ([`InstanceBackend::observation`]): two load balancers checking one instance with
+    /// different targets reach their own verdicts about it.
+    ///
     /// Materialises only what the clock already owed: the checks were due at `now`
     /// whether or not anybody called, and `observed` says what each of them saw, so the
     /// verdict a caller reads does not depend on who read it. An id `observed` carries no
-    /// entry for is one no check was run for.
+    /// entry for is one no check was run for, and so is every registration of a load
+    /// balancer whose stored target describes no check at all.
     pub fn settle_instance_health(
         &mut self,
-        observed: &BTreeMap<String, Option<InstanceObservation>>,
+        observed: &BTreeMap<String, InstanceBackend>,
         now: SystemTime,
     ) {
         let thresholds = HealthThresholds::of(&self.health_check);
-        for (instance_id, observation) in observed {
+        let Some(target) = HealthCheckTarget::of(&self.health_check.target) else {
+            return;
+        };
+        for (instance_id, backend) in observed {
             if let Some(probe) = self.instances.probe_mut(instance_id) {
-                probe.settle(*observation, thresholds, now);
+                probe.settle(backend.observation(&target), thresholds, now);
             }
         }
     }

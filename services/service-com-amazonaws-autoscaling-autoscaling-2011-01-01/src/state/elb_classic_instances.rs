@@ -237,7 +237,14 @@ pub fn attachment_states<Eng: Send + Sync + 'static>(
         .active_instances()
         .map(|instance| instance.instance_id.clone())
         .collect();
-    let observed = elb::observe_instances(engine, &instance_ids);
+    // What those load balancers CHECK with — their own `HealthCheck$Target`s, read under
+    // that service's lock and released before anything is observed, so each check of an
+    // instance is the one the load balancer performing it is configured for.
+    let targets = elb::health_check_targets(
+        engine,
+        names.iter().map(|name| (group.region.as_str(), name.as_str())),
+    );
+    let observed = elb::observe_instances(engine, &instance_ids, &targets);
     let Some(state) = elb::service_state(engine) else {
         return names.iter().map(|_| unregistered).collect();
     };
@@ -342,7 +349,24 @@ where
         .flat_map(|group| group.active_instances())
         .map(|instance| instance.instance_id.clone())
         .collect();
-    let observed = elb::observe_instances(engine, &instance_ids);
+    // What the load balancers checking them check WITH, read under that service's lock and
+    // released before anything is observed: a check of an instance is the one the load
+    // balancer performing it is configured for.
+    let placed: Vec<(String, String)> = deriving
+        .iter()
+        .flat_map(|group| {
+            attached_names(group)
+                .into_iter()
+                .map(|name| (group.region.clone(), name.to_string()))
+        })
+        .collect();
+    let targets = elb::health_check_targets(
+        engine,
+        placed
+            .iter()
+            .map(|(region, name)| (region.as_str(), name.as_str())),
+    );
+    let observed = elb::observe_instances(engine, &instance_ids, &targets);
     let mut store = state.lock();
     deriving
         .into_iter()

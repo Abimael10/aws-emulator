@@ -19,10 +19,12 @@
 //! Declared in `tests/all.rs` alongside the suites that use it, so there is ONE request
 //! builder and ONE envelope reader rather than a copy per suite.
 
+use base64::Engine as _;
 use bytes::Bytes;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY;
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::ComAmazonawsElasticloadbalancingElasticloadbalancingV7State as ElbState;
+use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::HEALTH_CHECK_SPAN;
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -108,8 +110,40 @@ pub(crate) async fn ec2_call(
 }
 
 /// The AMI a launch below names. Any well-formed image id: what a health check turns on is
-/// the state EC2 reports for the instance, not the image it came from.
+/// the state EC2 reports for the instance and the server its own guest runs, not the image it
+/// came from.
 pub(crate) const AMI: &str = "ami-0123456789abcdef0";
+
+/// The directory a backend launched by [`serving_user_data`] serves, and the body each
+/// document it holds carries.
+const SERVED_ROOT: &str = "/srv/site";
+const SERVED_BODY: &str = "ok";
+
+/// The user data a launch carries to leave its instance SERVING HTTP on `port`, with a
+/// document at each path of `paths`.
+///
+/// A load balancer's health check connects to the port its `HealthCheck$Target` names and —
+/// for an HTTP or HTTPS target — asks for that target's ping path there, so a backend that
+/// ANSWERS its checks is an instance whose own program started a server on that port holding
+/// that document. The program is a cloud-config `bootcmd`, the commands the init system runs
+/// on EVERY boot, so an instance that is stopped and started again serves again: a user-data
+/// SCRIPT would run on the first boot only, as cloud-init runs one
+/// (`service_com_amazonaws_ec2_amazonec2::state::guest_user_data`). What it starts is the
+/// interpreter's own HTTP server module over the directory holding those documents
+/// (`…::state::guest_services`).
+pub(crate) fn serving_user_data(port: i32, paths: &[&str]) -> String {
+    let mut program = format!("#cloud-config\nbootcmd:\n  - mkdir -p {SERVED_ROOT}\n");
+    for path in paths {
+        let document = path.trim_start_matches('/');
+        program.push_str(&format!(
+            "  - echo {SERVED_BODY} > {SERVED_ROOT}/{document}\n"
+        ));
+    }
+    program.push_str(&format!(
+        "  - python3 -m http.server {port} --directory {SERVED_ROOT}\n"
+    ));
+    program
+}
 
 /// Launch ONE instance in `region` through EC2's OWN API and answer the id EC2 minted for
 /// it, so a backend a suite registers is a real EC2 resource rather than an id made up here.
@@ -118,20 +152,30 @@ pub(crate) async fn launch_instance(
     region: &str,
     label: &str,
 ) -> String {
-    launch_instance_in_zone(router, region, None, label).await
+    launch_backend(router, region, None, label, None).await
 }
 
-/// [`launch_instance`], into the Availability Zone `zone` names — the placement a launch
-/// asks for through `Placement.AvailabilityZone`.
-///
-/// Which zone an instance is in is EC2's to say, and it is what decides whether a load
-/// balancer node may send it a request while cross-zone load balancing is off, so a suite
-/// that drives that attribute launches its backends into zones of its own choosing.
-pub(crate) async fn launch_instance_in_zone(
+/// [`launch_instance`], carrying `user_data` — the program its guest runs when it comes up,
+/// which is what leaves a backend serving ([`serving_user_data`]).
+pub(crate) async fn launch_serving_instance(
+    router: &MultiServiceRouter,
+    region: &str,
+    label: &str,
+    user_data: &str,
+) -> String {
+    launch_backend(router, region, None, label, Some(user_data)).await
+}
+
+/// The ONE launch every helper above goes through: an instance of [`AMI`], optionally placed
+/// in the Availability Zone `zone` names — the placement a launch asks for through
+/// `Placement.AvailabilityZone`, which is what decides whether a load balancer node may send
+/// it a request while cross-zone load balancing is off — and optionally carrying `user_data`.
+pub(crate) async fn launch_backend(
     router: &MultiServiceRouter,
     region: &str,
     zone: Option<&str>,
     label: &str,
+    user_data: Option<&str>,
 ) -> String {
     let mut params = vec![
         param("ImageId", AMI),
@@ -140,6 +184,13 @@ pub(crate) async fn launch_instance_in_zone(
     ];
     if let Some(zone) = zone {
         params.push(param("Placement.AvailabilityZone", zone));
+    }
+    if let Some(user_data) = user_data {
+        // `RunInstances$UserData` is base64, as an SDK sends it.
+        params.push(param(
+            "UserData",
+            &::base64::engine::general_purpose::STANDARD.encode(user_data),
+        ));
     }
     let launched = ec2_call(router, region, "RunInstances", &params).await;
     assert_eq!(
@@ -151,6 +202,43 @@ pub(crate) async fn launch_instance_in_zone(
         .and_then(Element::text)
         .unwrap_or_else(|| panic!("case {label:?}: RunInstances reported no instance"))
         .to_string()
+}
+
+/// Place the stored registration of `instance_id` with `load_balancer_name` so that exactly
+/// `checks` of the health checks it owes have fallen due NOW, with half a cadence of margin
+/// either side.
+///
+/// ABSOLUTE, where [`age_registration`] is relative: the instant is computed from the clock
+/// at the moment of the call, so how many checks a following read settles does not depend on
+/// how long the suite itself took to get here. That is what a suite asserting a verdict has
+/// NOT been reached yet needs — one extra check of the same observation can reach it — and
+/// nothing is slept for either way.
+pub(crate) fn place_registration(
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    load_balancer_name: &str,
+    instance_id: &str,
+    checks: u32,
+) {
+    let state = engine.state::<ElbState>();
+    let mut guard = state.lock();
+    let record = guard
+        .load_balancers_in_mut(region)
+        .and_then(|records| records.get_mut(load_balancer_name))
+        .unwrap_or_else(|| panic!("case {load_balancer_name:?}: no stored load balancer"));
+    // A check falls due one cadence after the registration and one per cadence after that,
+    // so `checks` of them are due for a registration made `checks` cadences and half of one
+    // ago — and the half cadence is the margin on either side of that count.
+    let behind = HEALTH_CHECK_SPAN
+        .saturating_mul(checks)
+        .saturating_add(HEALTH_CHECK_SPAN / 2);
+    let at = std::time::SystemTime::now()
+        .checked_sub(behind)
+        .unwrap_or_else(|| panic!("case {load_balancer_name:?}: cannot place {instance_id}"));
+    assert!(
+        record.instances.restamp(instance_id, at),
+        "case {load_balancer_name:?}: {instance_id} must still be registered"
+    );
 }
 
 /// Move the stored registration of `instance_id` with `load_balancer_name` `back` into the

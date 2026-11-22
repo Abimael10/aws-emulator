@@ -192,10 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // Three steps, so this service's guard is never held while EC2's store is read:
-        // which instances the answer is about, then one check of each of them against the
-        // inventory that stands behind a registration, then the verdicts those checks
-        // moved.
-        let (described, to_check) = {
+        // which instances the answer is about and what this load balancer checks them with,
+        // then one check of each of them against what stands behind a registration, then
+        // the verdicts those checks moved.
+        let (described, to_check, target) = {
             let guard = state.lock();
             let Some(record) = guard
                 .load_balancers_in(&region)
@@ -219,9 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|instance_id| record.has_instance(instance_id))
                 .cloned()
                 .collect();
-            (described, to_check)
+            (
+                described,
+                to_check,
+                crate::state::HealthCheckTarget::of(&record.health_check.target),
+            )
         };
-        let observed = crate::state::observe_instances(&*self.engine, &to_check);
+        // The check THIS load balancer performs, which is what its registrations are
+        // observed against.
+        let targets: ::std::collections::BTreeSet<crate::state::HealthCheckTarget> =
+            target.into_iter().collect();
+        let observed = crate::state::observe_instances(&*self.engine, &to_check, &targets);
 
         let mut guard = state.lock();
         let Some(record) = guard

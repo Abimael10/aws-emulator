@@ -61,12 +61,12 @@
 //! bumps no counter.
 //!
 //! What it does NOT do is invent the instance's own answer. A registered instance is an EC2
-//! instance id, and no instance of this emulator runs a server on a port, so the connection
-//! the load balancer makes to the instance it selected cannot be established — which is a
-//! condition Elastic Load Balancing itself words a status for
-//! ([`INSTANCE_UNREACHABLE_STATUS`]), as is having no instance to send the request to at all
-//! ([`NO_IN_SERVICE_INSTANCE_STATUS`]). Neither a body nor a status is invented for a
-//! backend that never ran.
+//! instance id, and this plane does not read what the server behind such an instance serves,
+//! so the connection the load balancer makes to the instance it selected is reported as one
+//! that could not be established — which is a condition Elastic Load Balancing itself words a
+//! status for ([`INSTANCE_UNREACHABLE_STATUS`]), as is having no instance to send the request
+//! to at all ([`NO_IN_SERVICE_INSTANCE_STATUS`]). Neither a body nor a status is invented for
+//! a backend that never answered.
 
 use ::std::time::SystemTime;
 
@@ -479,9 +479,10 @@ async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtR
         CLEARTEXT_PROTOCOLS
     };
 
-    // Which instances this load balancer checks, read and RELEASED before EC2 is asked:
-    // this service's guard is never held while another service's store is read.
-    let registered: ::std::collections::BTreeSet<String> = {
+    // Which instances this load balancer checks and what it checks them WITH, read and
+    // RELEASED before EC2 is asked: this service's guard is never held while another
+    // service's store is read.
+    let (registered, target) = {
         let guard = state.lock();
         let Some(record) = guard
             .load_balancers_in(&resolved.region)
@@ -489,11 +490,18 @@ async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtR
         else {
             return rendered(NOT_SERVED_STATUS, None);
         };
-        record.instances.iter().cloned().collect()
+        let registered: ::std::collections::BTreeSet<String> =
+            record.instances.iter().cloned().collect();
+        (
+            registered,
+            crate::state::HealthCheckTarget::of(&record.health_check.target),
+        )
     };
     // What one check of each of them observes, and which zone EC2 reports each of them in:
     // both are facts EC2 owns.
-    let observed = crate::state::observe_instances(engine, &registered);
+    let targets: ::std::collections::BTreeSet<crate::state::HealthCheckTarget> =
+        target.into_iter().collect();
+    let observed = crate::state::observe_instances(engine, &registered, &targets);
     let zones = crate::state::observe_instance_zones(engine, &registered);
 
     let now = SystemTime::now();

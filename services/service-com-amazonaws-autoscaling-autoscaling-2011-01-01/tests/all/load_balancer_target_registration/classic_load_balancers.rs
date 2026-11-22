@@ -30,19 +30,67 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7 as elb_service;
 
-use crate::support::{
-    borrowed, form_encode, p, query, seed_launch_templates, tag_value, tag_values, REGION,
-};
+use crate::support::{borrowed, form_encode, p, query, tag_value, tag_values, REGION};
 
 /// The launch template every group in this suite launches from, seeded into the account's own
-/// Amazon EC2 store by the harness.
+/// Amazon EC2 store by [`seed_serving_launch_template`].
 const LAUNCH_TEMPLATE: &str = "lt-classic-elb";
+
+/// The directory each instance of this suite serves, the document it holds at the health
+/// check's ping path, and the port its server listens on — the port the load balancers here
+/// forward traffic to and check.
+const SERVED_ROOT: &str = "/srv/site";
+const SERVED_PORT: i32 = 80;
+
+/// The program every instance of this suite's groups runs when its guest comes up.
+///
+/// A Classic Load Balancer health check connects to the port its `HealthCheck$Target` names
+/// and asks for that target's ping path there, so a registration the checks ANSWER is one
+/// whose instance runs a server holding that document. The commands are a cloud-config
+/// `bootcmd` — the ones the init system runs on every boot — and what they start is the
+/// interpreter's own HTTP server module
+/// (`service_com_amazonaws_ec2_amazonec2::state::guest_services`).
+fn serving_program() -> String {
+    format!(
+        "#cloud-config\nbootcmd:\n  - mkdir -p {SERVED_ROOT}\n  - echo ok > \
+         {SERVED_ROOT}/index.html\n  - python3 -m http.server {SERVED_PORT} --directory \
+         {SERVED_ROOT}\n"
+    )
+}
+
+/// Put the launch template this suite's groups launch from into the account's own Amazon EC2
+/// store, through EC2's own writer, carrying [`serving_program`] as its user data — which the
+/// launch of a group's instance passes on to that instance.
+///
+/// The shared seam seeds a template with no launch parameters at all; this suite cares what
+/// its instances are launched WITH, because what answers a load balancer's health check is
+/// the server the instance's own program starts.
+fn seed_serving_launch_template(engine: &Arc<engine::InMemoryEngine>) {
+    let state = ec2_service::state::service_state(&**engine)
+        .expect("the EC2 store is mounted on this engine");
+    let mut store = state.lock();
+    store.insert_launch_template(ec2_service::state::LaunchTemplateSpec {
+        name: LAUNCH_TEMPLATE.to_string(),
+        created_by: engine::emulator_arn("iam", "", "root"),
+        create_time: std::time::SystemTime::now(),
+        tags: Vec::new(),
+        operator: None,
+        version_description: None,
+        data: ec2_service::ops::types::RequestLaunchTemplateData {
+            user_data: Some(
+                ::base64::engine::general_purpose::STANDARD.encode(serving_program()),
+            ),
+            ..Default::default()
+        },
+    });
+}
 
 /// The Availability Zone every group places its instances in and every load balancer in this
 /// suite is enabled for.
@@ -69,15 +117,17 @@ const HEALTH_IN_SERVICE: &str = "InService";
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long a poll keeps trying before it gives up: the spans the three services owe a
-/// transition — this service's lifecycle span, Amazon EC2's, and the cadence of an Elastic
-/// Load Balancing health check times the threshold the load balancers here are configured
-/// with — with ample margin for a loaded test machine. Read from the services' own spans
-/// rather than written out, so they cannot drift apart.
+/// transition — this service's lifecycle span, Amazon EC2's (twice: an instance reaches
+/// `running` and its guest then BOOTS, which is what starts the server a health check is
+/// answered by), and the cadence of an Elastic Load Balancing health check times the
+/// threshold the load balancers here are configured with — with ample margin for a loaded
+/// test machine. Read from the services' own spans rather than written out, so they cannot
+/// drift apart.
 fn poll_budget() -> Duration {
     autoscaling::state::LIFECYCLE_TRANSITION
-        + ::service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY
+        + ::service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY * 2
         + elb_service::state::HEALTH_CHECK_SPAN * (HEALTHY_THRESHOLD as u32 + 2)
-        + Duration::from_secs(30)
+        + Duration::from_secs(120)
 }
 
 /// The `HealthCheck$HealthyThreshold` every load balancer in this suite is configured with:
@@ -91,7 +141,7 @@ const HEALTHY_THRESHOLD: i32 = 2;
 /// views one account.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed_launch_templates(&engine, &[LAUNCH_TEMPLATE]);
+    seed_serving_launch_template(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
@@ -145,7 +195,7 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str) {
             p("Listeners.member.1.Protocol", "HTTP"),
             p("Listeners.member.1.LoadBalancerPort", "80"),
             p("Listeners.member.1.InstanceProtocol", "HTTP"),
-            p("Listeners.member.1.InstancePort", "80"),
+            p("Listeners.member.1.InstancePort", SERVED_PORT.to_string()),
         ],
     )
     .await;
@@ -158,7 +208,7 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str) {
         "ConfigureHealthCheck",
         &[
             p("LoadBalancerName", name),
-            p("HealthCheck.Target", "HTTP:80/"),
+            p("HealthCheck.Target", format!("HTTP:{SERVED_PORT}/")),
             p("HealthCheck.Interval", "5"),
             p("HealthCheck.Timeout", "2"),
             p("HealthCheck.HealthyThreshold", HEALTHY_THRESHOLD.to_string()),

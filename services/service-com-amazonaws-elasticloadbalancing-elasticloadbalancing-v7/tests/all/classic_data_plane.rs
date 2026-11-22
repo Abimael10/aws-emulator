@@ -16,9 +16,14 @@
 //!    to**: one its own health checks report `InService` and — while
 //!    `CrossZoneLoadBalancing` is off — one in the zone of the node that took the request.
 //!    With no such instance the load balancer answers the status it answers for having no
-//!    capacity to serve the request; with one, it selects it, and the connection this
-//!    emulator cannot make to a backend nothing runs is the status a load balancer answers
-//!    for a registered instance it could not connect to.
+//!    capacity to serve the request; with one, it selects it, and the connection this plane
+//!    cannot make to the instance it selected is the status a load balancer answers for a
+//!    registered instance it could not connect to.
+//!
+//! A backend here therefore SERVES the port its load balancer's health check names
+//! ([`SERVED_PORT`], through the program its own user data runs) and serves nothing on the
+//! port the listener forwards traffic to ([`INSTANCE_PORT`]), which is what makes it one the
+//! checks report `InService` and one no connection to the listener's own port reaches.
 //! 3. **a listener carrying a duration-based stickiness policy pins a client to the
 //!    instance that was selected for it**: the answer to a cookie-less request carries the
 //!    `AWSELB` cookie naming that instance, a request carrying it is served by that same
@@ -56,8 +61,8 @@ use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::H
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::wire::{
-    age_registrations, call, emulator_with_ec2, kid_text, launch_instance_in_zone, members,
-    move_instance, param, parse, settle_ec2_transition,
+    age_registrations, call, emulator_with_ec2, kid_text, launch_backend, members, move_instance,
+    param, parse, serving_user_data, settle_ec2_transition,
 };
 
 /// The region every call below is signed for, unless a row names another.
@@ -78,6 +83,32 @@ const INSTANCE_UNREACHABLE: u16 = 504;
 /// The listener every load balancer below carries, and the backend port behind it.
 const LISTENER_PORT: i32 = 80;
 const INSTANCE_PORT: i32 = 8080;
+
+/// The port each backend's OWN server listens on, and the ping path it holds a document at:
+/// what the health check of every load balancer below connects to, so a registered backend
+/// is one whose checks are answered. It is NOT [`INSTANCE_PORT`] — nothing of these backends
+/// serves the port the listener forwards traffic to, so a request the load balancer sends
+/// one is a connection that cannot be established.
+const SERVED_PORT: i32 = 9000;
+const CHECK_PATH: &str = "/ping";
+
+/// Launch one backend in `zone` whose own user-data program serves [`CHECK_PATH`] on
+/// [`SERVED_PORT`], through EC2's own API on the shared engine.
+async fn launch_serving_backend(
+    router: &MultiServiceRouter,
+    region: &str,
+    zone: &str,
+    label: &str,
+) -> String {
+    launch_backend(
+        router,
+        region,
+        Some(zone),
+        label,
+        Some(&serving_user_data(SERVED_PORT, &[CHECK_PATH])),
+    )
+    .await
+}
 
 /// The thresholds every health check below is configured with: two checks either way, so a
 /// registration reaches a verdict after two checks have fallen due.
@@ -182,7 +213,10 @@ async fn configure_health_check(router: &MultiServiceRouter, region: &str, name:
         "ConfigureHealthCheck",
         &[
             param("LoadBalancerName", name),
-            param("HealthCheck.Target", &format!("HTTP:{INSTANCE_PORT}/ping")),
+            param(
+                "HealthCheck.Target",
+                &format!("HTTP:{SERVED_PORT}{CHECK_PATH}"),
+            ),
             param("HealthCheck.Interval", "5"),
             param("HealthCheck.Timeout", "2"),
             param(
@@ -393,9 +427,8 @@ async fn fixture(name: &'static str, cross_zone: bool) -> (Fixture, Arc<engine::
     if cross_zone {
         set_cross_zone(&router, REGION, name, true).await;
     }
-    let in_node_zone = launch_instance_in_zone(&router, REGION, Some(NODE_ZONE), "node zone").await;
-    let in_other_zone =
-        launch_instance_in_zone(&router, REGION, Some(OTHER_ZONE), "other zone").await;
+    let in_node_zone = launch_serving_backend(&router, REGION, NODE_ZONE, "node zone").await;
+    let in_other_zone = launch_serving_backend(&router, REGION, OTHER_ZONE, "other zone").await;
     settle_ec2_transition().await;
     register(&router, REGION, name, &[&in_node_zone, &in_other_zone]).await;
     // The checks both registrations owe, placed in the past so each has reached its
@@ -583,7 +616,7 @@ async fn only_an_in_service_registered_instance_takes_a_request() {
         empty.status
     );
 
-    let serving = launch_instance_in_zone(&router, REGION, Some(NODE_ZONE), "serving").await;
+    let serving = launch_serving_backend(&router, REGION, NODE_ZONE, "serving").await;
     settle_ec2_transition().await;
     register(&router, REGION, NAME, &[&serving]).await;
 
@@ -596,8 +629,9 @@ async fn only_an_in_service_registered_instance_takes_a_request() {
         coming_up.status
     );
 
-    // Its healthy threshold reached: the load balancer selects it, and the connection to a
-    // backend this emulator runs no server for cannot be established.
+    // Its healthy threshold reached: the load balancer selects it, and the connection to the
+    // listener's own backend port — which nothing of that instance serves — cannot be
+    // established.
     let healthy_run =
         HEALTH_CHECK_SPAN.saturating_mul(u32::try_from(HEALTHY_THRESHOLD).expect("a threshold"));
     age_registrations(&engine, REGION, NAME, healthy_run);
@@ -993,7 +1027,7 @@ async fn a_client_that_dials_the_published_address_reaches_that_load_balancer() 
     for (region, zone) in [(REGION, NODE_ZONE), (OTHER_REGION, "us-west-2a")] {
         let dns = create_load_balancer(&router, region, NAME, None, "HTTP", &[zone]).await;
         configure_health_check(&router, region, NAME).await;
-        let backend = launch_instance_in_zone(&router, region, Some(zone), region).await;
+        let backend = launch_serving_backend(&router, region, zone, region).await;
         settle_ec2_transition().await;
         register(&router, region, NAME, &[&backend]).await;
         age_registrations(

@@ -15,29 +15,44 @@
 //!
 //! # What one check observes
 //!
-//! A real check opens a connection to the instance on the load balancer's configured
-//! `Target`, and this emulator makes no outbound connection — so what a check can observe
-//! is whether the emulator holds something that stands behind the registration. An
-//! instance is EC2's resource, so EC2 is asked ([`observe_instances`]):
+//! A check is the one `HealthCheck$Target` describes ([`super::health_check_target`]): a
+//! connection to the instance on the port that target names, and for an HTTP or HTTPS target
+//! a `GET` of its ping path on that port, where "any answer other than \"200 OK\" … is
+//! considered unhealthy". So a check is answered only where something behind the
+//! registration is LISTENING on that port and answers what the target asks for. An instance
+//! is EC2's resource, and what an instance of this account runs is the server its own user
+//! data installed and started, so EC2 is asked ([`observe_instances`]):
 //!
-//! * an instance EC2 reports `running` is one with a backend behind it, so the check is
-//!   answered;
-//! * an instance EC2 reports in a state that serves nothing answers no check, and the
+//! * an instance EC2 reports `running` whose guest is listening on the target's port answers
+//!   a `TCP` or `SSL` check, and answers an `HTTP`/`HTTPS` check when that server answers the
+//!   ping path with [`super::HEALTH_CHECK_OK_STATUS`];
+//! * a `running` instance that is listening on no such port, or whose server answers the
+//!   ping path with anything else, answers no check — a connection that cannot be made and an
+//!   answer that is not "200 OK" are both a failed check, as the instance's own doing;
+//! * an instance EC2 reports in a state that serves nothing answers no check either, and the
 //!   condition reported for it is the sentence `InstanceState$Description` words for that
 //!   state ([`DESCRIPTION_INSTANCE_PENDING`] and the two beside it);
-//! * an id EC2 holds no instance for has nothing behind it either, so its checks fail as
-//!   the instance's own doing;
+//! * an id EC2 holds no instance for has nothing behind it, so its checks fail as the
+//!   instance's own doing;
 //! * with no EC2 to ask at all, NOTHING is observed: no check ran, so the registration
 //!   keeps the health it has rather than being failed on silence.
+//!
+//! What one pass observes ([`InstanceBackend`]) is therefore read per instance AND per
+//! target: one load balancer's check of an instance is a different check to another's when
+//! the two are configured with different targets, so a caller that settles several load
+//! balancers at once reads what they all check with ([`health_check_targets`]) and observes
+//! every one of those targets in the same pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
+use super::health_check_target::{HealthCheckTarget, HEALTH_CHECK_METHOD, HEALTH_CHECK_OK_STATUS};
 use super::{
-    HealthCheckConfig, InstanceHealth, HEALTH_CHECK_SPAN, HEALTH_FAILED_HEALTH_CHECKS,
-    HEALTH_REGISTRATION_IN_PROGRESS, REASON_CODE_INSTANCE, STATE_OUT_OF_SERVICE,
+    HealthCheckConfig, InstanceHealth, HEALTH_CHECK_SPAN, HEALTH_CHECK_THRESHOLDS,
+    HEALTH_FAILED_HEALTH_CHECKS, HEALTH_REGISTRATION_IN_PROGRESS, REASON_CODE_INSTANCE,
+    STATE_OUT_OF_SERVICE,
 };
 
 /// `InstanceState$State`, from that member's documented valid values
@@ -87,8 +102,10 @@ pub enum InstanceObservation {
 /// The two thresholds the verdict of one load balancer's checks moves on: how many
 /// consecutive checks have to agree before the verdict follows them.
 ///
-/// A threshold the load balancer reports as less than one still takes one check, so no
-/// verdict is ever reached by no check at all.
+/// Both are read INSIDE the range the model fixes for them ([`HEALTH_CHECK_THRESHOLDS`]):
+/// a value the model would refuse is a value the load balancer never performs that many
+/// checks for, which is what keeps the run of checks one settle folds bounded by the
+/// service's own configuration rather than by a number a caller wrote.
 #[derive(Debug, Clone, Copy)]
 pub struct HealthThresholds {
     pub healthy: u32,
@@ -99,13 +116,24 @@ impl HealthThresholds {
     /// The thresholds `health_check` configures.
     pub fn of(health_check: &HealthCheckConfig) -> Self {
         Self {
-            healthy: Self::at_least_one(health_check.healthy_threshold),
-            unhealthy: Self::at_least_one(health_check.unhealthy_threshold),
+            healthy: Self::checks_for(health_check.healthy_threshold),
+            unhealthy: Self::checks_for(health_check.unhealthy_threshold),
         }
     }
 
-    fn at_least_one(configured: i32) -> u32 {
-        configured.max(1).unsigned_abs()
+    /// How many consecutive checks the threshold `configured` asks for, inside the range
+    /// the model fixes.
+    ///
+    /// A threshold below the range still takes ONE check, so no verdict is ever reached by
+    /// no check at all; one above it takes no more than the most the model admits. The
+    /// range is enforced where a caller sets it — `HealthCheck$HealthyThreshold` and
+    /// `$UnhealthyThreshold` are modelled `@range(min: 2, max: 10)`, so the framework
+    /// refuses a request outside it before this module sees it — and again here, because
+    /// this number is the trip count of the fold a settle performs
+    /// ([`HealthProbe::settle`]) and that count may not be one a stored value can grow.
+    fn checks_for(configured: i32) -> u32 {
+        let (_, most) = HEALTH_CHECK_THRESHOLDS;
+        configured.clamp(1, most).unsigned_abs()
     }
 
     /// The longest run of agreeing checks either threshold can ask for: folding more
@@ -255,24 +283,121 @@ impl HealthProbe {
     }
 }
 
-/// What one check of each of `instance_ids` observes, keyed by instance id — see the
-/// module docs for what a check can observe at all.
+/// What the backend behind ONE registration answers, as one pass of checks found it: the
+/// condition EC2 reports for the instance, and — for an instance that is up — what a check
+/// of each PROBED target observed about it.
+///
+/// A check is the one its load balancer's own `Target` describes, so the answer is read per
+/// target rather than per instance: [`InstanceBackend::observation`] is what one load
+/// balancer's check of this instance observed, given the target that load balancer checks
+/// with.
+#[derive(Debug, Clone, Default)]
+pub struct InstanceBackend {
+    /// The condition EC2 reports, and `None` when NOTHING could be observed — no EC2 to ask
+    /// at all, which is silence rather than a failed check.
+    reported: Option<BackendCondition>,
+}
+
+/// What the account's EC2 inventory says stands behind one registration.
+#[derive(Debug, Clone)]
+enum BackendCondition {
+    /// The instance is up, so a check of it connects: the ports its guest is LISTENING on,
+    /// and the status its own server answered each probed ping path with.
+    Up {
+        /// The ports the instance's guest is listening on.
+        listening: Vec<i32>,
+        /// What that guest answered for each probed target that asks for a document, keyed
+        /// by that target — absent for a target nothing is listening on, which is a
+        /// connection that could not be made.
+        answered: BTreeMap<HealthCheckTarget, u16>,
+    },
+    /// Nothing behind the registration answers any check at all, with the sentence
+    /// `InstanceState$Description` words for the condition the check ran into.
+    Unreachable { description: &'static str },
+}
+
+impl InstanceBackend {
+    /// Nothing could be observed about this registration: no check ran.
+    fn unobserved() -> Self {
+        Self { reported: None }
+    }
+
+    /// Nothing behind this registration answers a check, for the condition `description`
+    /// words.
+    fn unreachable(description: &'static str) -> Self {
+        Self {
+            reported: Some(BackendCondition::Unreachable { description }),
+        }
+    }
+
+    /// What ONE check performed against `target` observed about this registration — `None`
+    /// when nothing was observed at all, which fails no check.
+    ///
+    /// A check of an instance that is up is answered where that instance's guest is
+    /// listening on the target's port, and for an HTTP or HTTPS target only where its server
+    /// answers the ping path with [`HEALTH_CHECK_OK_STATUS`]: "any answer other than
+    /// \"200 OK\" … is considered unhealthy". Everything else is a check the instance did
+    /// not answer, which is the instance's own doing.
+    pub fn observation(&self, target: &HealthCheckTarget) -> Option<InstanceObservation> {
+        let failed = InstanceObservation::Unanswered {
+            description: HEALTH_FAILED_HEALTH_CHECKS.description,
+        };
+        match self.reported.as_ref()? {
+            BackendCondition::Unreachable { description } => {
+                Some(InstanceObservation::Unanswered { description })
+            }
+            BackendCondition::Up {
+                listening,
+                answered,
+            } => {
+                if !listening.contains(&target.port()) {
+                    // "A health check simply attempts to open a TCP connection to the
+                    // instance on the specified port": nothing is listening there, so the
+                    // connection cannot be made, whatever else the instance is running.
+                    return Some(failed);
+                }
+                match target {
+                    HealthCheckTarget::Connect { .. } => Some(InstanceObservation::Answered),
+                    HealthCheckTarget::Request { .. } => {
+                        if answered.get(target) == Some(&HEALTH_CHECK_OK_STATUS) {
+                            Some(InstanceObservation::Answered)
+                        } else {
+                            Some(failed)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What one check of each of `instance_ids` against each of `targets` observes, keyed by
+/// instance id — see the module docs for what a check can observe at all.
 ///
 /// The account's EC2 inventory is read ONCE for the whole batch, so the cost does not grow
-/// with the number of registrations times the size of the inventory. EC2's own clock-owed
-/// moves are materialised through EC2's own settle before it is read: an instance whose
-/// move to `running` has already fallen due is running whether or not anybody described
-/// it, so a check does not fail an instance that EC2's own reader reports as up.
+/// with the number of registrations times the size of the inventory, and each target's ping
+/// path is asked for once per instance, which bounds the work by the registrations times the
+/// targets the caller named. EC2's own clock-owed moves are materialised through EC2's own
+/// settle before it is read: an instance whose move to `running` has already fallen due is
+/// running whether or not anybody described it, and the guest of one whose boot has fallen
+/// due has run its own program, so a check reads what EC2's own reader reports.
+///
+/// Every read here is a READ: asking EC2 what an instance is running, and asking that
+/// instance's own server for a document, moves nothing of either.
 pub fn observe_instances<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_ids: &BTreeSet<String>,
-) -> BTreeMap<String, Option<InstanceObservation>> {
+    targets: &BTreeSet<HealthCheckTarget>,
+) -> BTreeMap<String, InstanceBackend> {
     if instance_ids.is_empty() {
         return BTreeMap::new();
     }
     let Some(inventory) = ec2::service_state(engine) else {
         // Nothing to ask, so nothing is observed about any of them.
-        return instance_ids.iter().map(|id| (id.clone(), None)).collect();
+        return instance_ids
+            .iter()
+            .map(|id| (id.clone(), InstanceBackend::unobserved()))
+            .collect();
     };
     let mut store = inventory.lock();
     store.materialize_due_transitions();
@@ -280,34 +405,93 @@ pub fn observe_instances<Eng: Send + Sync + 'static>(
         .iter()
         .map(|instance_id| {
             let observed = match store.instances.get(instance_id) {
-                Some(instance) => observation_of(instance.state),
+                Some(instance) => match unreachable_state(instance.state) {
+                    Some(description) => InstanceBackend::unreachable(description),
+                    None => probed(&store, instance_id, targets),
+                },
                 // The account holds no such instance, so nothing stands behind the
                 // registration: its checks fail as the instance's own doing.
-                None => InstanceObservation::Unanswered {
-                    description: HEALTH_FAILED_HEALTH_CHECKS.description,
-                },
+                None => InstanceBackend::unreachable(HEALTH_FAILED_HEALTH_CHECKS.description),
             };
-            (instance_id.clone(), Some(observed))
+            (instance_id.clone(), observed)
         })
         .collect()
 }
 
-/// What a check observes about an instance EC2 reports in `state`.
+/// What the checks of `targets` find on the instance `instance_id` names: the ports its own
+/// guest is listening on, and what it answered each probed ping path with.
+fn probed(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    targets: &BTreeSet<HealthCheckTarget>,
+) -> InstanceBackend {
+    let listening = store.instance_guest_server_ports(instance_id);
+    let answered = targets
+        .iter()
+        .filter_map(|target| {
+            let HealthCheckTarget::Request { port, path } = target else {
+                // A `TCP` or `SSL` check asks for no document: the connection is the whole
+                // of it.
+                return None;
+            };
+            let answered =
+                store.serve_instance_guest_http(instance_id, *port, HEALTH_CHECK_METHOD, path)?;
+            Some((target.clone(), answered.status))
+        })
+        .collect();
+    InstanceBackend {
+        reported: Some(BackendCondition::Up {
+            listening,
+            answered,
+        }),
+    }
+}
+
+/// The sentence a check of an instance EC2 reports in `state` ran into, or `None` for a
+/// state in which the instance is up and a check of it connects.
 ///
-/// Only a `running` instance has a backend behind it. Each other state that
-/// `InstanceState$Description` words a sentence for reports that sentence; one it words
-/// none for — an instance on its way out — is simply an instance that answers no check.
-fn observation_of(state: ec2::InstanceStateName) -> InstanceObservation {
-    let description = match state {
-        ec2::InstanceStateName::Running => return InstanceObservation::Answered,
+/// Only a `running` instance has an operating system to answer on a port at all. Each other
+/// state that `InstanceState$Description` words a sentence for reports that sentence; one it
+/// words none for — an instance on its way out — is simply an instance that answers no
+/// check.
+fn unreachable_state(state: ec2::InstanceStateName) -> Option<&'static str> {
+    Some(match state {
+        ec2::InstanceStateName::Running => return None,
         ec2::InstanceStateName::Pending => DESCRIPTION_INSTANCE_PENDING,
         ec2::InstanceStateName::Stopped => DESCRIPTION_INSTANCE_STOPPED,
         ec2::InstanceStateName::Terminated => DESCRIPTION_INSTANCE_TERMINATED,
         ec2::InstanceStateName::Stopping | ec2::InstanceStateName::ShuttingDown => {
             HEALTH_FAILED_HEALTH_CHECKS.description
         }
+    })
+}
+
+/// The checks the load balancers `placed` names — `(region, load balancer name)` pairs —
+/// perform, deduplicated: what a caller passes to [`observe_instances`] so that one read of
+/// the EC2 store answers every target those load balancers check with.
+///
+/// For a caller of ANOTHER service that settles several load balancers at once: the targets
+/// are read under this store's own guard, which is released before the answer is used, so
+/// the two stores are never held at once. A name this store holds no load balancer for
+/// contributes no target, and with no store at all there is nothing to check with.
+pub fn health_check_targets<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    placed: I,
+) -> BTreeSet<HealthCheckTarget>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let Some(state) = super::service_state(engine) else {
+        return BTreeSet::new();
     };
-    InstanceObservation::Unanswered { description }
+    let guard = state.lock();
+    placed
+        .into_iter()
+        .filter_map(|(region, name)| {
+            let record = guard.load_balancers_in(region)?.get(name)?;
+            HealthCheckTarget::of(&record.health_check.target)
+        })
+        .collect()
 }
 
 #[cfg(test)]

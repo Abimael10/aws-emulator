@@ -3,37 +3,49 @@
 //! What `DescribeInstanceHealth` reports for a registered instance, driven over the wire
 //! against the BACKEND the registration names.
 //!
-//! The rule asserted here: **the state of a registered instance is the outcome of the load
-//! balancer's health checks of it — `InService` with `ReasonCode` and `Description` of
-//! `N/A` once `HealthyThreshold` consecutive checks were answered, `OutOfService` with
-//! `ReasonCode` `Instance` and the condition the checks ran into once `UnhealthyThreshold`
-//! consecutive checks were not, and the registration's own checks still in progress until
-//! one of those thresholds is reached.** A check is answered while something stands behind
-//! the registration, which for an instance means EC2 — the service that owns instances —
-//! reporting it running.
+//! The rule asserted here: **the state of a registered instance is the outcome of the check
+//! the load balancer's own `HealthCheck$Target` describes** — "a health check simply attempts
+//! to open a TCP connection to the instance on the specified port" for a `TCP` or `SSL`
+//! target, and for an `HTTP`/`HTTPS` target "a HTTP GET request is issued to the instance on
+//! the given port and path", where "any answer other than \"200 OK\" … is considered
+//! unhealthy" (`smithy_query(query="doc",shape="HealthCheck",member="Target")`). So the
+//! member reads `InService` with `ReasonCode` and `Description` of `N/A` once
+//! `HealthyThreshold` consecutive checks were answered, `OutOfService` with `ReasonCode`
+//! `Instance` and the condition the checks ran into once `UnhealthyThreshold` consecutive
+//! checks were not, and the registration's own checks are still in progress until one of
+//! those thresholds is reached.
 //!
-//! The rows differ along what the rule generalises over: what the backend is doing
-//! (running, stopped, terminated, an id the account holds no instance for) and what the
-//! load balancer's two thresholds are configured to, including both bounds
+//! What can answer such a check is the server the instance's own user data installed and
+//! started, which EC2 — the service that owns instances — holds for it, so a backend that
+//! answers is launched with the program that starts one and a backend that answers nothing is
+//! launched bare.
+//!
+//! The rows differ along what the rule generalises over: the target's protocol (all four),
+//! the port it names (the one the backend serves and one it does not), its ping path (one the
+//! backend holds a document at and one it does not), what the backend is doing (serving,
+//! running no server at all, stopped, terminated, an id the account holds no instance for)
+//! and what the load balancer's two thresholds are configured to, including both bounds
 //! `HealthyThreshold`/`UnhealthyThreshold` are modelled with (`@range(min: 2, max: 10)`).
-//! The instance is launched, stopped and terminated through EC2's OWN API on the same
+//! Every backend is launched, stopped and terminated through EC2's OWN API on the same
 //! engine, so what a row asserts rests on what EC2's own reader reports rather than on a
 //! value this suite made up.
 //!
-//! Where a row stands on its load balancer's timeline is placed by moving the stored
-//! registration back ([`crate::state::InstanceSet::restamp`], the seam the sibling
-//! timeline suite uses), never by sleeping for the checks.
+//! Where a row stands on its load balancer's timeline is PLACED: the stored registration is
+//! stamped so that exactly as many checks as the row is about have fallen due
+//! ([`crate::state::InstanceSet::restamp`], through the harness's `place_registration`), so
+//! what a read settles does not depend on how long the suite took to get there and nothing is
+//! slept for.
 
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::{
-    DESCRIPTION_INSTANCE_STOPPED, DESCRIPTION_INSTANCE_TERMINATED, HEALTH_CHECK_SPAN,
-    HEALTH_FAILED_HEALTH_CHECKS, HEALTH_IN_SERVICE, HEALTH_REGISTRATION_IN_PROGRESS,
-    InstanceHealth, REASON_CODE_INSTANCE, STATE_OUT_OF_SERVICE,
+    DESCRIPTION_INSTANCE_STOPPED, DESCRIPTION_INSTANCE_TERMINATED, HEALTH_FAILED_HEALTH_CHECKS,
+    HEALTH_IN_SERVICE, HEALTH_REGISTRATION_IN_PROGRESS, InstanceHealth, REASON_CODE_INSTANCE,
+    STATE_OUT_OF_SERVICE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::wire::{
-    age_registration, call, emulator_with_ec2, kid_text, launch_instance, members, param, parse,
-    settle_ec2_transition,
+    call, emulator_with_ec2, kid_text, launch_backend, members, param, parse, place_registration,
+    serving_user_data, settle_ec2_transition,
 };
 
 /// The region every call here is signed for.
@@ -69,40 +81,60 @@ fn out_of_service(description: &str) -> Triple {
     )
 }
 
-/// What the backend behind a registration is doing — what one health check of it observes.
+/// What the backend behind a registration is doing — what a check of it can find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
-    /// An instance EC2 launched and nothing has moved since: EC2 reports it running.
-    Running,
-    /// A launched instance that was then stopped through EC2.
+    /// An instance whose own user data started a server on `port`, holding a document at
+    /// each path of `paths`.
+    Serving {
+        port: i32,
+        paths: &'static [&'static str],
+    },
+    /// An instance EC2 launched and nothing else: it is running, and no program of its guest
+    /// started a server, so nothing of it is listening on any port.
+    Idle,
+    /// A serving instance that was then stopped through EC2.
     Stopped,
-    /// A launched instance that was then terminated through EC2.
+    /// A serving instance that was then terminated through EC2.
     Terminated,
     /// An id the account holds no instance for at all.
     Absent,
 }
 
-/// One row: a load balancer, the thresholds its health check is configured with, and the
-/// backend its one registered instance names.
+/// One row: a load balancer, the target and thresholds its health check is configured with,
+/// and the backend its one registered instance names.
 #[derive(Debug, Clone, Copy)]
 struct Case {
     /// Also the load balancer's name.
     name: &'static str,
+    /// The `HealthCheck$Target` the load balancer checks with.
+    target: &'static str,
     healthy_threshold: i32,
     unhealthy_threshold: i32,
     backend: Backend,
+    /// The health the row's instance ends up reporting.
+    expected: Reported,
+}
+
+/// What a row's checks decide — named rather than written out, so the expectation is the
+/// service's own constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// The checks were answered: in service, with no cause to report.
+    InService,
+    /// The checks were not answered, as the instance's own doing.
+    FailedChecks,
+    /// They were not answered because the instance is stopped.
+    Stopped,
+    /// … or terminated.
+    Terminated,
 }
 
 impl Case {
-    /// Whether a check of this row's backend is answered.
-    fn answered(self) -> bool {
-        self.backend == Backend::Running
-    }
-
     /// The threshold this row's verdict is reached on: the healthy one for a backend that
     /// answers its checks, the unhealthy one for a backend that answers none.
     fn deciding_threshold(self) -> u32 {
-        let configured = if self.answered() {
+        let configured = if self.expected == Reported::InService {
             self.healthy_threshold
         } else {
             self.unhealthy_threshold
@@ -110,56 +142,167 @@ impl Case {
         u32::try_from(configured).expect("a configured threshold")
     }
 
-    /// The health this row's instance ends up reporting.
+    /// The triple this row's instance ends up reporting.
     fn expected(self) -> Triple {
-        match self.backend {
-            Backend::Running => triple(HEALTH_IN_SERVICE),
-            Backend::Stopped => out_of_service(DESCRIPTION_INSTANCE_STOPPED),
-            Backend::Terminated => out_of_service(DESCRIPTION_INSTANCE_TERMINATED),
-            // Nothing stands behind the registration, so its checks fail as the
-            // instance's own doing.
-            Backend::Absent => triple(HEALTH_FAILED_HEALTH_CHECKS),
+        match self.expected {
+            Reported::InService => triple(HEALTH_IN_SERVICE),
+            Reported::FailedChecks => triple(HEALTH_FAILED_HEALTH_CHECKS),
+            Reported::Stopped => out_of_service(DESCRIPTION_INSTANCE_STOPPED),
+            Reported::Terminated => out_of_service(DESCRIPTION_INSTANCE_TERMINATED),
         }
     }
 }
 
-/// The rows: every backend state a check can observe, against thresholds at both modelled
+/// The rows: every protocol a target may name, a port and a ping path the backend serves and
+/// ones it does not, every backend state a check can find, and thresholds at both modelled
 /// bounds and between them.
 fn health_cases() -> Vec<Case> {
     vec![
         Case {
-            name: "backend-running-low-thresholds",
+            name: "an-http-target-the-backend-answers",
+            target: "HTTP:80/ping",
             healthy_threshold: 2,
             unhealthy_threshold: 2,
-            backend: Backend::Running,
+            backend: Backend::Serving {
+                port: 80,
+                paths: &["/ping"],
+            },
+            expected: Reported::InService,
         },
         Case {
             // `HealthyThreshold` at the maximum the member is modelled with: the run of
             // answered checks the verdict waits for is the caller's configuration.
-            name: "backend-running-high-healthy",
+            name: "an-http-target-answered-on-another-port",
+            target: "HTTP:8080/health",
             healthy_threshold: 10,
             unhealthy_threshold: 2,
-            backend: Backend::Running,
+            backend: Backend::Serving {
+                port: 8080,
+                paths: &["/health"],
+            },
+            expected: Reported::InService,
         },
         Case {
-            name: "backend-stopped",
+            name: "an-https-target-the-backend-answers",
+            target: "HTTPS:8443/ok",
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            backend: Backend::Serving {
+                port: 8443,
+                paths: &["/ok"],
+            },
+            expected: Reported::InService,
+        },
+        Case {
+            // "A health check simply attempts to open a TCP connection to the instance on
+            // the specified port": the backend holds no document at all, and the connection
+            // is the whole of the check.
+            name: "a-tcp-target-on-a-port-the-backend-listens-on",
+            target: "TCP:8080",
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            backend: Backend::Serving {
+                port: 8080,
+                paths: &[],
+            },
+            expected: Reported::InService,
+        },
+        Case {
+            name: "an-ssl-target-on-a-port-nothing-listens-on",
+            target: "SSL:7001",
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            backend: Backend::Serving {
+                port: 8080,
+                paths: &[],
+            },
+            expected: Reported::FailedChecks,
+        },
+        Case {
+            // The server answers, with its own not-found status for a path its document root
+            // holds nothing at: "any answer other than \"200 OK\" … is considered unhealthy".
+            name: "an-http-target-whose-ping-path-is-not-held",
+            target: "HTTP:8080/missing",
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+            backend: Backend::Serving {
+                port: 8080,
+                paths: &["/health"],
+            },
+            expected: Reported::FailedChecks,
+        },
+        Case {
+            name: "an-http-target-on-a-port-the-backend-does-not-serve",
+            target: "HTTP:9090/ping",
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            backend: Backend::Serving {
+                port: 8080,
+                paths: &["/ping"],
+            },
+            expected: Reported::FailedChecks,
+        },
+        Case {
+            // A bare instance: it is running, and nothing on it answers the check.
+            name: "a-backend-running-no-server-at-all",
+            target: "HTTP:80/index.html",
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            backend: Backend::Idle,
+            expected: Reported::FailedChecks,
+        },
+        Case {
+            name: "a-backend-that-was-stopped",
+            target: "HTTP:80/ping",
             healthy_threshold: 2,
             unhealthy_threshold: 2,
             backend: Backend::Stopped,
+            expected: Reported::Stopped,
         },
         Case {
-            name: "backend-terminated",
+            name: "a-backend-that-was-terminated",
+            target: "HTTP:80/ping",
             healthy_threshold: 10,
             unhealthy_threshold: 3,
             backend: Backend::Terminated,
+            expected: Reported::Terminated,
         },
         Case {
-            name: "backend-absent",
+            // `UnhealthyThreshold` at the maximum the member is modelled with.
+            name: "an-id-the-account-holds-no-instance-for",
+            target: "HTTP:80/ping",
             healthy_threshold: 2,
             unhealthy_threshold: 10,
             backend: Backend::Absent,
+            expected: Reported::FailedChecks,
         },
     ]
+}
+
+/// The backend of `case`, launched through EC2's own API and moved to the state the row
+/// names: its instance id.
+async fn seed_backend(router: &MultiServiceRouter, case: &Case) -> String {
+    let user_data = match case.backend {
+        // An id of the right form that EC2 holds no instance for: nothing was launched for
+        // this row.
+        Backend::Absent => return "i-00000000000000bad".to_string(),
+        Backend::Serving { port, paths } => Some(serving_user_data(port, paths)),
+        // Stopped and terminated backends DID serve while they were up, so what the row
+        // asserts is the condition the instance's own state puts it in rather than a server
+        // that was never started.
+        Backend::Stopped | Backend::Terminated => Some(serving_user_data(80, &["/ping"])),
+        Backend::Idle => None,
+    };
+    let launched = launch_backend(router, REGION, None, case.name, user_data.as_deref()).await;
+    settle_ec2_transition().await;
+    match case.backend {
+        Backend::Stopped => move_instance(router, case.name, "StopInstances", &launched).await,
+        Backend::Terminated => {
+            move_instance(router, case.name, "TerminateInstances", &launched).await
+        }
+        _ => {}
+    }
+    launched
 }
 
 /// Create one load balancer named `name` with an HTTP:80 listener.
@@ -184,8 +327,7 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str) {
     );
 }
 
-/// Configure the health check of `case`'s load balancer: an HTTP target on the listener's
-/// instance port, with the row's own thresholds.
+/// Configure the health check of `case`'s load balancer: the row's own target and thresholds.
 async fn configure_health_check(router: &MultiServiceRouter, case: &Case) {
     let configured = call(
         router,
@@ -193,7 +335,7 @@ async fn configure_health_check(router: &MultiServiceRouter, case: &Case) {
         "ConfigureHealthCheck",
         &[
             param("LoadBalancerName", case.name),
-            param("HealthCheck.Target", "HTTP:80/ping"),
+            param("HealthCheck.Target", case.target),
             param("HealthCheck.Interval", "5"),
             param("HealthCheck.Timeout", "2"),
             param(
@@ -272,32 +414,14 @@ async fn health(router: &MultiServiceRouter, name: &str, instance_id: &str) -> T
     )
 }
 
-/// The reported state of a registered instance is the outcome of the checks against its
-/// backend, decided by the load balancer's own thresholds.
+/// The reported state of a registered instance is the outcome of the check its load
+/// balancer's own target describes, decided by that load balancer's own thresholds.
 #[tokio::test]
-async fn instance_health_is_the_outcome_of_checking_the_registered_backend() {
+async fn instance_health_is_the_outcome_of_the_configured_check_of_the_backend() {
     let (router, engine) = emulator_with_ec2();
 
     for case in health_cases() {
-        let instance_id = match case.backend {
-            // An id of the right form that EC2 holds no instance for: nothing was
-            // launched for this row.
-            Backend::Absent => "i-00000000000000bad".to_string(),
-            _ => {
-                let launched = launch_instance(&router, REGION, case.name).await;
-                settle_ec2_transition().await;
-                match case.backend {
-                    Backend::Stopped => {
-                        move_instance(&router, case.name, "StopInstances", &launched).await;
-                    }
-                    Backend::Terminated => {
-                        move_instance(&router, case.name, "TerminateInstances", &launched).await;
-                    }
-                    _ => {}
-                }
-                launched
-            }
-        };
+        let instance_id = seed_backend(&router, &case).await;
 
         create_load_balancer(&router, case.name).await;
         configure_health_check(&router, &case).await;
@@ -305,6 +429,7 @@ async fn instance_health_is_the_outcome_of_checking_the_registered_backend() {
 
         // No check has fallen due yet, whatever the backend is doing: the registration's
         // own checks are still running.
+        place_registration(&engine, REGION, case.name, &instance_id, 0);
         let fresh = health(&router, case.name, &instance_id).await;
         assert_eq!(
             fresh,
@@ -315,12 +440,12 @@ async fn instance_health_is_the_outcome_of_checking_the_registered_backend() {
 
         // One check short of the threshold that decides this row: no verdict yet.
         let deciding = case.deciding_threshold();
-        age_registration(
+        place_registration(
             &engine,
             REGION,
             case.name,
             &instance_id,
-            HEALTH_CHECK_SPAN.saturating_mul(deciding.saturating_sub(1)),
+            deciding.saturating_sub(1),
         );
         let short = health(&router, case.name, &instance_id).await;
         assert_eq!(
@@ -333,14 +458,15 @@ async fn instance_health_is_the_outcome_of_checking_the_registered_backend() {
 
         // The check that reaches the threshold: the verdict follows what the checks
         // observed about the backend.
-        age_registration(&engine, REGION, case.name, &instance_id, HEALTH_CHECK_SPAN);
+        place_registration(&engine, REGION, case.name, &instance_id, deciding);
         let settled = health(&router, case.name, &instance_id).await;
         assert_eq!(
             settled,
             case.expected(),
-            "case {:?}: after {deciding} checks of a {:?} backend, got {settled:?}",
+            "case {:?}: after {deciding} checks of {:?} with target {:?}, got {settled:?}",
             case.name,
-            case.backend
+            case.backend,
+            case.target
         );
 
         // The verdict is read, not re-decided: polling again answers the same thing, and
@@ -382,37 +508,41 @@ async fn a_verdict_moves_only_once_the_threshold_of_checks_disagrees_with_it() {
     let name = "backend-stops-serving";
     let case = Case {
         name,
+        target: "HTTP:80/ping",
         healthy_threshold: 2,
         unhealthy_threshold: 3,
-        backend: Backend::Running,
+        backend: Backend::Serving {
+            port: 80,
+            paths: &["/ping"],
+        },
+        expected: Reported::InService,
     };
 
-    let instance_id = launch_instance(&router, REGION, name).await;
-    settle_ec2_transition().await;
+    let instance_id = seed_backend(&router, &case).await;
     create_load_balancer(&router, name).await;
     configure_health_check(&router, &case).await;
     register(&router, name, &instance_id).await;
 
+    // How many checks this registration has owed in all: each step below places it one
+    // further along, so exactly one more check falls due for the read that follows.
+    let mut checks = u32::try_from(case.healthy_threshold).expect("a threshold");
+
     // The answered checks put it in service.
-    age_registration(
-        &engine,
-        REGION,
-        name,
-        &instance_id,
-        HEALTH_CHECK_SPAN.saturating_mul(2),
-    );
+    place_registration(&engine, REGION, name, &instance_id, checks);
     let in_service = health(&router, name, &instance_id).await;
     assert_eq!(
         in_service,
         triple(HEALTH_IN_SERVICE),
-        "a running backend must reach InService, got {in_service:?}"
+        "a backend that answers the configured check must reach InService, got \
+         {in_service:?}"
     );
 
     // The backend stops. Each check from now on fails, but the verdict holds until the
     // configured run of them has.
     move_instance(&router, name, "StopInstances", &instance_id).await;
     for failed in 1..case.unhealthy_threshold {
-        age_registration(&engine, REGION, name, &instance_id, HEALTH_CHECK_SPAN);
+        checks = checks.saturating_add(1);
+        place_registration(&engine, REGION, name, &instance_id, checks);
         let holding = health(&router, name, &instance_id).await;
         assert_eq!(
             holding,
@@ -421,7 +551,8 @@ async fn a_verdict_moves_only_once_the_threshold_of_checks_disagrees_with_it() {
             case.unhealthy_threshold
         );
     }
-    age_registration(&engine, REGION, name, &instance_id, HEALTH_CHECK_SPAN);
+    checks = checks.saturating_add(1);
+    place_registration(&engine, REGION, name, &instance_id, checks);
     let moved = health(&router, name, &instance_id).await;
     assert_eq!(
         moved,
@@ -430,16 +561,12 @@ async fn a_verdict_moves_only_once_the_threshold_of_checks_disagrees_with_it() {
         case.unhealthy_threshold
     );
 
-    // And back: the stopped backend is started again, and the healthy threshold's worth of
-    // answered checks returns it to service.
+    // And back: the stopped backend is started again, its guest runs its own program again,
+    // and the healthy threshold's worth of answered checks returns it to service.
     move_instance(&router, name, "StartInstances", &instance_id).await;
-    age_registration(
-        &engine,
-        REGION,
-        name,
-        &instance_id,
-        HEALTH_CHECK_SPAN.saturating_mul(u32::try_from(case.healthy_threshold).expect("a threshold")),
-    );
+    checks = checks
+        .saturating_add(u32::try_from(case.healthy_threshold).expect("a threshold"));
+    place_registration(&engine, REGION, name, &instance_id, checks);
     let recovered = health(&router, name, &instance_id).await;
     assert_eq!(
         recovered,
