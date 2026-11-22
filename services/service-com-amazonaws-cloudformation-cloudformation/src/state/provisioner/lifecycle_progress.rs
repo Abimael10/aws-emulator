@@ -129,6 +129,38 @@ impl Provisioner {
                 ))
                 .await
             }
+            // Either snapshot create answers the snapshot `creating`, in which "percent
+            // progress" is 0 and nothing can be restored from it, so the resource's creation
+            // is finished once Amazon RDS reports it `available`.
+            Self::RdsDbSnapshot => {
+                Box::pin(rds_snapshots::snapshot_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            Self::RdsClusterSnapshot => {
+                Box::pin(rds_snapshots::snapshot_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_CLUSTER_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            // `CreateDBClusterEndpoint` answers the endpoint `creating`, in which it resolves
+            // to nothing and serves no connection, so the resource's creation is finished once
+            // Amazon RDS reports it `available`.
+            Self::RdsDbClusterEndpoint => {
+                Box::pin(rds_cluster_endpoints::cluster_endpoint_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             // "When you create a new cluster, the Amazon EKS API server endpoint is private
             // to your VPC" only once the control plane is up: a created cluster is reported
             // `CREATING` and "you must wait for the cluster status to become ACTIVE before

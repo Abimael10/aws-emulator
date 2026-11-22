@@ -287,6 +287,45 @@ impl Provisioner {
                 )
                 .await
             }
+            // Amazon RDS's own read of either snapshot, by the identifier it was taken under.
+            Self::RdsDbSnapshot => {
+                Box::pin(rds_snapshots::read_snapshot(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            Self::RdsClusterSnapshot => {
+                Box::pin(rds_snapshots::read_snapshot(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_CLUSTER_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            // Amazon RDS's own read of the custom endpoint, by the identifier it was created
+            // under.
+            Self::RdsDbClusterEndpoint => {
+                Box::pin(rds_cluster_endpoints::read_cluster_endpoint(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
+            // Amazon RDS's own read of the global database, by the identifier it was created
+            // under.
+            Self::RdsGlobalCluster => {
+                Box::pin(rds_global_clusters::read_global_cluster(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             // Amazon RDS's own read of the proxy, by the name it was created under.
             Self::RdsDbProxy => read_db_proxy(ctx, region, physical_resource_id).await,
             // Read back by the same proxy-and-group pair the delete addresses the

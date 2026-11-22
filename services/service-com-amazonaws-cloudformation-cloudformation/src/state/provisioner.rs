@@ -582,7 +582,7 @@ const IAM_MANAGED_POLICY: &str = "AWS::IAM::ManagedPolicy";
 
 /// `AWS::RDS::DBInstance`: "Ref returns the DBInstanceIdentifier", so a resource of this
 /// type is a DB instance of Amazon RDS addressed by its physical resource id.
-const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
+pub(crate) const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
 /// `AWS::RDS::DBSubnetGroup`: "Ref returns the DBSubnetGroupName" — the group a DB
 /// instance's `DBSubnetGroupName` names, which Amazon RDS resolves before it will create
 /// an instance in it.
@@ -956,6 +956,29 @@ pub(super) enum Provisioner {
     RdsOptionGroup,
     RdsDbParameterGroup,
     RdsDbClusterParameterGroup,
+    /// `AWS::RDS::DBSnapshot`: a snapshot of a DB instance, which `CreateDBSnapshot` takes
+    /// under the identifier the declaration states — the identifier this type's `Ref` returns
+    /// — `DescribeDBSnapshots` reports and `DeleteDBSnapshot` deletes. That create answers the
+    /// snapshot `creating`, in which it holds no restorable copy, so the resource's creation is
+    /// held open until Amazon RDS reports it `available`.
+    RdsDbSnapshot,
+    /// `AWS::RDS::ClusterSnapshot`: the cluster-scoped sibling, taken by
+    /// `CreateDBClusterSnapshot` and reported by `DescribeDBClusterSnapshots`.
+    RdsClusterSnapshot,
+    /// `AWS::RDS::DBClusterEndpoint`: a CUSTOM endpoint of a DB cluster, which
+    /// `CreateDBClusterEndpoint` creates under the identifier the declaration states,
+    /// `DescribeDBClusterEndpoints` reports and `DeleteDBClusterEndpoint` deletes. The ADDRESS
+    /// it serves on is Amazon RDS's to assign, so the endpoint a stack publishes is the one
+    /// that service really holds, and the create answers it `creating` — in which it resolves
+    /// to nothing — so the resource's creation is held open until RDS reports it `available`.
+    RdsDbClusterEndpoint,
+    /// `AWS::RDS::GlobalCluster`: an Aurora global database, which `CreateGlobalCluster`
+    /// creates under the identifier the declaration states — the identifier this type's `Ref`
+    /// returns — `DescribeGlobalClusters` reports and `DeleteGlobalCluster` deletes. A DB
+    /// cluster joins a global database by naming it, and a client's own read of that service
+    /// reports the one a completed stack declared, so a stack declaring one has to create it
+    /// there for real.
+    RdsGlobalCluster,
     /// `AWS::RDS::DBProxy`: an RDS proxy, which `CreateDBProxy` creates under the name the
     /// template states and `DeleteDBProxy` deletes. The create answers the proxy
     /// `creating`, so its creation is held open until Amazon RDS reports it `available`.
@@ -1591,6 +1614,12 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         rds_option_groups::RDS_OPTION_GROUP => Some(Provisioner::RdsOptionGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
         RDS_DB_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RdsDbClusterParameterGroup),
+        rds_snapshots::RDS_DB_SNAPSHOT => Some(Provisioner::RdsDbSnapshot),
+        rds_snapshots::RDS_CLUSTER_SNAPSHOT => Some(Provisioner::RdsClusterSnapshot),
+        rds_cluster_endpoints::RDS_DB_CLUSTER_ENDPOINT => {
+            Some(Provisioner::RdsDbClusterEndpoint)
+        }
+        rds_global_clusters::RDS_GLOBAL_CLUSTER => Some(Provisioner::RdsGlobalCluster),
         RDS_DB_PROXY => Some(Provisioner::RdsDbProxy),
         RDS_DB_PROXY_TARGET_GROUP => Some(Provisioner::RdsDbProxyTargetGroup),
         REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
@@ -2178,6 +2207,51 @@ impl Provisioner {
                     propagated,
                     DB_CLUSTER_PARAMETER_GROUP_CALLS,
                 )
+                .await
+            }
+            // Either RDS snapshot type publishes `Tags` as the `{Key, Value}` list its own
+            // create takes, so a snapshot a stack takes carries the tags CloudFormation gives
+            // it beside the declared ones.
+            Self::RdsDbSnapshot => {
+                Box::pin(rds_snapshots::create_snapshot(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    rds_snapshots::DB_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            Self::RdsClusterSnapshot => {
+                Box::pin(rds_snapshots::create_snapshot(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    rds_snapshots::DB_CLUSTER_SNAPSHOT_CALLS,
+                ))
+                .await
+            }
+            // `AWS::RDS::DBClusterEndpoint` publishes `Tags` as that same list, which
+            // `CreateDBClusterEndpoint` takes as its own `Tags` member.
+            Self::RdsDbClusterEndpoint => {
+                Box::pin(rds_cluster_endpoints::create_cluster_endpoint(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                ))
+                .await
+            }
+            // `AWS::RDS::GlobalCluster` publishes `Tags` as that same list too, which
+            // `CreateGlobalCluster` takes as its own `Tags` member.
+            Self::RdsGlobalCluster => {
+                Box::pin(rds_global_clusters::create_global_cluster(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                ))
                 .await
             }
             Self::RdsDbProxy => create_db_proxy(ctx, region, resource, propagated).await,
@@ -3362,6 +3436,37 @@ impl Provisioner {
                 )
                 .await
             }
+            // Either snapshot type is addressed by the identifier it was taken under, which
+            // is this resource's physical id.
+            Self::RdsDbSnapshot => {
+                rds_snapshots::delete_snapshot(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_SNAPSHOT_CALLS,
+                )
+                .await
+            }
+            Self::RdsClusterSnapshot => {
+                rds_snapshots::delete_snapshot(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    rds_snapshots::DB_CLUSTER_SNAPSHOT_CALLS,
+                )
+                .await
+            }
+            // The endpoint is addressed by the identifier it was created under, which is this
+            // resource's physical id.
+            Self::RdsDbClusterEndpoint => {
+                rds_cluster_endpoints::delete_cluster_endpoint(ctx, region, physical_resource_id)
+                    .await
+            }
+            // The global database is addressed by the identifier it was created under, which
+            // is this resource's physical id.
+            Self::RdsGlobalCluster => {
+                rds_global_clusters::delete_global_cluster(ctx, region, physical_resource_id).await
+            }
             // The proxy is addressed by the name it was created under, which is this
             // resource's physical id.
             Self::RdsDbProxy => delete_db_proxy(ctx, region, physical_resource_id).await,
@@ -4062,6 +4167,21 @@ mod rds_published_endpoints;
 /// the service that owns it so a DB instance's `OptionGroupName` and a client's own read of
 /// that service resolve the name the stack publishes.
 pub(super) mod rds_option_groups;
+/// The Amazon RDS SNAPSHOT arms: the snapshot an `AWS::RDS::DBSnapshot` takes of a DB instance
+/// and the one an `AWS::RDS::ClusterSnapshot` takes of a DB cluster, taken in the service that
+/// owns them so a client's own read of that service reports the snapshot the stack declared.
+/// Visible to the rest of this service's state because the two types' own NAMES live here,
+/// beside the arms that provision them.
+pub(in crate::state) mod rds_snapshots;
+/// The Amazon RDS CUSTOM CLUSTER ENDPOINT arm: the endpoint an `AWS::RDS::DBClusterEndpoint`
+/// declares on a DB cluster, created in the service that owns it so the address the stack
+/// publishes is the one that service assigned. Visible to the rest of this service's state for
+/// the reason the snapshots' module is.
+pub(in crate::state) mod rds_cluster_endpoints;
+/// The Amazon RDS GLOBAL DATABASE arm: the global cluster an `AWS::RDS::GlobalCluster`
+/// declares, created in the service that owns it so a DB cluster that joins it and a client's
+/// own read of that service resolve the one the stack publishes.
+pub(in crate::state) mod rds_global_clusters;
 pub(super) mod redshift_parameter_groups;
 /// The Amazon Redshift SNAPSHOT COPY GRANT arm: the grant an
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a

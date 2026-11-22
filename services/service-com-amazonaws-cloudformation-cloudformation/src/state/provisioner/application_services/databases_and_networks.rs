@@ -1344,11 +1344,11 @@ pub(crate) async fn create_db_instance(
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) = xml_element(&answered, "DBInstanceArn").filter(|arn| !arn.is_empty()) {
-        // The type publishes one ARN, so the conventional `Arn` attribute every type
-        // answers is that same value ([`super::template::conventional_attributes`]): both
-        // are re-pointed at the ARN the instance really carries.
-        attributes.insert("Arn".to_string(), arn.clone());
-        attributes.insert("DBInstanceArn".to_string(), arn);
+        // The type publishes one ARN, so every name a resource's ARN is published under is
+        // that same value ([`super::template::arn_attributes`]): all of them are re-pointed at
+        // the ARN the instance really carries, since a name left holding the ARN
+        // CloudFormation minted would report an identifier Amazon RDS does not know.
+        attributes.extend(super::template::arn_attributes(RDS_DB_INSTANCE, &arn));
     }
     if let Some(resource_id) =
         xml_element(&answered, "DbiResourceId").filter(|id| !id.is_empty())
@@ -2382,9 +2382,10 @@ pub(crate) async fn create_db_subnet_group(
     let mut attributes = BTreeMap::new();
     if let Some(arn) = xml_element(&answered, "DBSubnetGroupArn").filter(|arn| !arn.is_empty())
     {
-        // The group's own ARN, which is the resource's: the conventional `Arn` attribute
-        // the type answers is re-pointed at the one Amazon RDS reports.
-        attributes.insert("Arn".to_string(), arn);
+        // The group's own ARN, which is the resource's: every name the type publishes its ARN
+        // under is re-pointed at the one Amazon RDS reports
+        // ([`super::template::arn_attributes`]).
+        attributes.extend(super::template::arn_attributes(RDS_DB_SUBNET_GROUP, &arn));
     }
     Ok(Created::attributes(attributes))
 }
@@ -2508,9 +2509,11 @@ pub(crate) async fn create_parameter_group(
     if let Some(arn) =
         xml_element(&answered, &format!("{}Arn", calls.record)).filter(|arn| !arn.is_empty())
     {
-        // The group's own ARN, which is the resource's: the conventional `Arn` attribute the
-        // type answers is re-pointed at the one Amazon RDS reports.
-        attributes.insert("Arn".to_string(), arn);
+        // The group's own ARN, which is the resource's: every name the type publishes its ARN
+        // under is re-pointed at the one Amazon RDS reports
+        // ([`super::template::arn_attributes`]), so none is left holding the ARN
+        // CloudFormation minted — an identifier that service does not know.
+        attributes.extend(super::template::arn_attributes(calls.resource_type, &arn));
     }
     Ok(Created::attributes(attributes))
 }
@@ -2861,11 +2864,10 @@ pub(crate) async fn create_db_proxy(
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) = xml_element(&answered, "DBProxyArn").filter(|arn| !arn.is_empty()) {
-        // The type publishes one ARN, so the conventional `Arn` attribute every type
-        // answers is that same value ([`super::template::conventional_attributes`]): both
-        // are re-pointed at the ARN the proxy really carries.
-        attributes.insert("Arn".to_string(), arn.clone());
-        attributes.insert("DBProxyArn".to_string(), arn);
+        // The type publishes one ARN, so every name a resource's ARN is published under is
+        // that same value ([`super::template::arn_attributes`]): all of them are re-pointed at
+        // the ARN the proxy really carries.
+        attributes.extend(super::template::arn_attributes(RDS_DB_PROXY, &arn));
     }
     if let Some(endpoint) = xml_element(&answered, "Endpoint").filter(|host| !host.is_empty())
     {

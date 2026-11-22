@@ -6,8 +6,9 @@
 //! or a deployment no longer declares the resource — what becomes of the PHYSICAL resource
 //! is that resource's `DeletionPolicy`: `Retain` leaves it in the service that owns it and
 //! reports its deletion `DELETE_SKIPPED`, `Snapshot` has that service take a final snapshot
-//! of it before deleting it, and `Delete` — the default a declaration stating no policy gets
-//! — deletes it.**
+//! of it before deleting it, and `Delete` deletes it. A declaration that states no policy gets
+//! the default its TYPE documents, which is `Delete` for every type but the ones AWS documents
+//! another default for.**
 //!
 //! That is the attribute's own documentation ("with the `DeletionPolicy` attribute you can
 //! preserve, and in some cases, backup a resource when its stack is deleted"), and the
@@ -15,7 +16,9 @@
 //! (`smithy_query(query="shape", shape="ResourceStatus")`).
 //!
 //! The rows differ along what the rule generalises over: the POLICY (`Retain`, `Snapshot`,
-//! `Delete` stated outright, and a declaration stating none), the resource TYPE it is
+//! `Delete` stated outright, and a declaration stating none, which takes its type's own
+//! documented default — the TYPE defaults are a table of their own in
+//! [`crate::rds_default_deletion_policy`]), the resource TYPE it is
 //! declared on (an `AWS::RDS::DBInstance`, the `AWS::RDS::DBParameterGroup` an instance of
 //! the same stack uses, and an `AWS::SNS::Topic` — a type whose owning service takes no
 //! snapshot on the way out), and where the resource sits in the teardown order, so a
@@ -171,7 +174,7 @@ const POLICY_CASES: &[PolicyCase] = &[
         gone: &[],
     },
     PolicyCase {
-        case: "no policy at all on a DB instance, which is the Delete default",
+        case: "no policy at all on a DB instance, whose documented default is Snapshot",
         stack: "policy-default-db",
         template: concat!(
             "Resources:\n",
@@ -184,7 +187,7 @@ const POLICY_CASES: &[PolicyCase] = &[
         ),
         logical_id: "Db",
         subject: Subject::DbInstance("policy-default-db-instance"),
-        expected: Fate::Deleted,
+        expected: Fate::Snapshotted,
         gone: &[],
     },
     PolicyCase {
@@ -266,7 +269,11 @@ async fn still_there(router: &MultiServiceRouter, subject: Subject) -> (bool, St
 }
 
 /// The `(identifier, status)` of every MANUAL snapshot Amazon RDS holds of `instance`.
-async fn manual_snapshots_of(
+///
+/// Shared with the suite that tables each TYPE's documented `DeletionPolicy` DEFAULT
+/// ([`crate::rds_default_deletion_policy`]), so both read that service's snapshots the same
+/// way.
+pub(crate) async fn manual_snapshots_of(
     router: &MultiServiceRouter,
     instance: &str,
 ) -> Vec<(String, String)> {

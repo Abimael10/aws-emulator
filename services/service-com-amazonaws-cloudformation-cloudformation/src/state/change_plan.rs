@@ -1377,22 +1377,26 @@ fn replace_action(resource: &template::DeclaredResource) -> &'static str {
 
 /// What taking a resource OUT of the stack does to the physical resource: its
 /// `DeletionPolicy`, which "specif[ies] how CloudFormation handles the resource" when the
-/// stack stops managing it and defaults to deleting it.
+/// stack stops managing it and defaults to deleting it — except for the types AWS documents
+/// another default for ([`super::deletion_policy::default_for`]).
 ///
 /// `RetainExceptOnCreate` keeps the resource exactly as `Retain` does for everything but a
 /// create that fails — "retain the resource only if the resource creation fails" — and a
 /// change that removes a resource the stack HAS is not that case, so it is reported as the
 /// retention it is.
 fn delete_action(resource: &template::DeclaredResource) -> &'static str {
-    match resource
+    let stated = resource
         .declaration
         .get("DeletionPolicy")
         .and_then(Value::as_str)
-    {
-        Some(deletion_policy::RETAIN | deletion_policy::RETAIN_EXCEPT_ON_CREATE) => {
+        .unwrap_or_else(|| {
+            deletion_policy::default_for(&resource.resource_type, &resource.properties)
+        });
+    match stated {
+        deletion_policy::RETAIN | deletion_policy::RETAIN_EXCEPT_ON_CREATE => {
             policy_action::RETAIN
         }
-        Some(deletion_policy::SNAPSHOT) => policy_action::SNAPSHOT,
+        deletion_policy::SNAPSHOT => policy_action::SNAPSHOT,
         _ => policy_action::DELETE,
     }
 }

@@ -865,13 +865,16 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // AWS Resource Access Manager
     "AWS::RAM::ResourceShare",
     // Amazon RDS
+    "AWS::RDS::ClusterSnapshot",
     "AWS::RDS::DBCluster",
+    "AWS::RDS::DBClusterEndpoint",
     "AWS::RDS::DBClusterParameterGroup",
     "AWS::RDS::DBInstance",
     "AWS::RDS::DBParameterGroup",
     "AWS::RDS::DBProxy",
     "AWS::RDS::DBProxyTargetGroup",
     "AWS::RDS::DBSecurityGroup",
+    "AWS::RDS::DBSnapshot",
     "AWS::RDS::DBSubnetGroup",
     "AWS::RDS::EventSubscription",
     "AWS::RDS::GlobalCluster",

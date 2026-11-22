@@ -306,6 +306,28 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | "AWS::RDS::DBClusterParameterGroup"
         | crate::state::provisioner::rds_option_groups::RDS_OPTION_GROUP
         | "AWS::RDS::DBSubnetGroup" => rules(255, Characters::LowercaseAlphanumeric),
+        // Amazon RDS `CreateDBSnapshot.DBSnapshotIdentifier`: "must contain from 1 to 255
+        // letters, numbers, or hyphens", "first character must be a letter" and "can't end
+        // with a hyphen or contain two consecutive hyphens" (that member's own doc) — RDS's
+        // model carries no `@length` for it. The identifier is stored as the caller spelled
+        // it, unlike the lower-cased identifiers around it, so a generated name for this one
+        // only has its LENGTH held.
+        crate::state::provisioner::rds_snapshots::RDS_DB_SNAPSHOT => {
+            rules(255, Characters::AsGenerated)
+        }
+        // `CreateDBClusterSnapshot.DBClusterSnapshotIdentifier`,
+        // `CreateDBClusterEndpoint.DBClusterEndpointIdentifier` and
+        // `CreateGlobalCluster.GlobalClusterIdentifier`: each "must contain from 1 to 63
+        // letters, numbers, or hyphens", "first character must be a letter" and "can't end
+        // with a hyphen or contain two consecutive hyphens" (those members' own docs), and
+        // each states "this parameter is stored as a lowercase string" — so a name carrying
+        // upper case names a resource that service does not hold under it, the position the
+        // group names above are in.
+        crate::state::provisioner::rds_snapshots::RDS_CLUSTER_SNAPSHOT
+        | crate::state::provisioner::rds_cluster_endpoints::RDS_DB_CLUSTER_ENDPOINT
+        | crate::state::provisioner::rds_global_clusters::RDS_GLOBAL_CLUSTER => {
+            rules(63, Characters::LowercaseAlphanumeric)
+        }
         // Amazon RDS `CreateDBProxy.DBProxyName`: `@length(min: 1, max: 63)` with pattern
         // `^[a-zA-Z](?:-?[a-zA-Z0-9]+)*$` (`smithy_query(query="operation",
         // operation="CreateDBProxy")`) — which, unlike the identifiers above, is NOT folded
@@ -860,6 +882,14 @@ pub(super) fn database_port(
 pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        // Amazon RDS takes a cluster snapshot's own identifier as
+        // `CreateDBClusterSnapshot.DBClusterSnapshotIdentifier` — the identifier this type's
+        // `Ref` returns and every call on the snapshot takes — where the type's last segment
+        // is `ClusterSnapshot`, so neither `ClusterSnapshotName`, `Name` nor
+        // `ClusterSnapshotIdentifier` finds it.
+        crate::state::provisioner::rds_snapshots::RDS_CLUSTER_SNAPSHOT => {
+            Some("DBClusterSnapshotIdentifier")
+        }
         // AWS IoT's `CreateProvisioningTemplate` takes a `templateName` — "Ref returns the
         // provisioning template name" — so the type publishes `TemplateName`; the type's last
         // segment is `ProvisioningTemplate`, so neither `ProvisioningTemplateName` nor `Name`

@@ -7,8 +7,10 @@
 //! raised — the owning service's own sentence followed by that SDK's diagnostic of the call,
 //! naming the service as its SDK names it and the HTTP status that service answered beside
 //! the id of the call — so the failure is attributed to the service that refused it, whatever
-//! type of that service failed and whichever of its calls was refused. A service whose
-//! reported wording this emulator has no record of has no diagnostic invented for it.**
+//! type of that service failed and whichever of its calls was refused. What FOLLOWS that
+//! envelope belongs to the PROVIDER that made the call rather than to the service, so two
+//! types of one service can report two shapes. A service whose reported wording this emulator
+//! has no record of has no diagnostic invented for it.**
 //!
 //! Why it matters: a client reading a rolled-back deployment diagnoses it from the failed
 //! resource's `ResourceStatusReason`. Without the attribution it cannot tell a refusal the
@@ -18,7 +20,8 @@
 //! and a refusal-taxonomy check that keys on the originating service cannot see it at all.
 //!
 //! The rows differ along what the rule generalises over: WHICH type of the owning service
-//! failed (a DB subnet group and a DB instance), which call of it was refused, and the HTTP
+//! failed (a DB subnet group and a DB instance), which call of it was refused, the SHAPE that
+//! type's provider words past the envelope, and the HTTP
 //! STATUS that service answered (400 for a declaration it will not take, 404 for a resource
 //! it does not hold — each from the fault's own `httpError` in RDS's model,
 //! `smithy_query(query="operation",operation="CreateDBSubnetGroup,CreateDBInstance")`:
@@ -47,6 +50,10 @@ struct Row {
     /// whose owning service has no recorded SDK wording — which must then carry no
     /// diagnostic at all.
     diagnostic: Option<(&'static str, u16)>,
+    /// Whether this type's provider words the attempt count the SDK appends past the
+    /// envelope's closing parenthesis, which is the shape its DB instance's provider words
+    /// where the DB subnet group's words the bare envelope.
+    attempts: bool,
     /// A fragment of the owning service's OWN sentence the quoted message must open with, or
     /// `None` for a row whose only subject is the diagnostic FORM: the sentence that service
     /// words for the refusal is then not what this suite is about, so it is not frozen here.
@@ -117,6 +124,7 @@ const ROWS: &[Row] = &[
         template: SINGLE_ZONE_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
+        attempts: false,
         sentence: Some("Availability Zone (AZ) coverage requirement"),
         class: INVALID_REQUEST,
     },
@@ -126,6 +134,7 @@ const ROWS: &[Row] = &[
         template: ABSENT_SUBNETS_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
+        attempts: false,
         sentence: Some("are invalid."),
         class: INVALID_REQUEST,
     },
@@ -135,6 +144,7 @@ const ROWS: &[Row] = &[
         template: MALFORMED_SUBNETS_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
+        attempts: false,
         // Only the diagnostic: how the owning service words a refusal of the id's FORM is
         // that service's own concern, and not something this suite should pin.
         sentence: None,
@@ -146,6 +156,9 @@ const ROWS: &[Row] = &[
         template: ABSENT_GROUP_TEMPLATE,
         logical_id: "Database",
         diagnostic: Some((RDS_SERVICE, 404)),
+        // This type's provider words the attempt count, where the subnet group's above does
+        // not: the shape is the provider's, not the service's.
+        attempts: true,
         sentence: Some("rds-diag-no-such-group"),
         class: NOT_FOUND,
     },
@@ -155,6 +168,7 @@ const ROWS: &[Row] = &[
         template: REFUSED_REPOSITORY_TEMPLATE,
         logical_id: "Registry",
         diagnostic: None,
+        attempts: false,
         // That service's own sentence names the MEMBER the declaration got wrong, which is
         // what reaches the reason when no diagnostic is appended to it.
         sentence: Some("at 'repositoryName' failed to satisfy constraint"),
@@ -201,7 +215,12 @@ async fn a_refused_resource_is_attributed_to_the_service_that_refused_it() {
         );
         match row.diagnostic {
             Some((service, status)) => {
-                assert_sdk_diagnostic(row.case, &quoted, service, status);
+                let envelope = if row.attempts {
+                    attempts_stripped(row.case, &quoted)
+                } else {
+                    quoted.clone()
+                };
+                assert_sdk_diagnostic(row.case, &envelope, service, status);
             }
             None => assert!(
                 !quoted.contains("(Service:"),
@@ -211,6 +230,23 @@ async fn a_refused_resource_is_attributed_to_the_service_that_refused_it() {
             ),
         }
     }
+}
+
+/// The quoted message with the SDK's attempt count taken off the end, held to the FORM that
+/// count carries — at least one attempt, as a refusal the SDK saw took one.
+fn attempts_stripped(case: &str, quoted: &str) -> String {
+    const ATTEMPTS: &str = ") (SDK Attempt Count: ";
+    let (envelope, attempts) = quoted.rsplit_once(ATTEMPTS).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the attempts the SDK made, got {quoted:?}")
+    });
+    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
+    });
+    assert!(
+        attempts.parse::<u32>().is_ok_and(|made| made >= 1),
+        "case {case:?}: expected the attempts the SDK made, got {attempts:?}"
+    );
+    format!("{envelope})")
 }
 
 #[tokio::test]

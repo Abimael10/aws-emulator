@@ -270,7 +270,9 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // `cloudformation__ec2__rds.cfn-rds-db-subnet-group-single-az-rejected-negative`, whose
     // reason reads `Resource handler returned message: "<the service's sentence> (Service:
     // Rds, Status Code: 400, Request ID: …)" (RequestToken: …, HandlerErrorCode:
-    // InvalidRequest)`).
+    // InvalidRequest)`). Its DB instance and its two parameter-group types are provisioned by
+    // providers that word the ATTEMPT-counting shape, which is recorded per provider
+    // ([`SDK_PROVIDER_SHAPES`]).
     ("rds", "Rds", SdkDiagnostic::Envelope),
     // Recycle Bin's SDK names it `Rbin` — that model's own `sdkId` (`rbin`) with the initial
     // capitalised, exactly as Amazon RDS's above is — and words the ATTEMPT-counting shape, as
@@ -606,6 +608,59 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "elasticloadbalancing",
         "DescribeListenerCertificates",
         SdkDiagnostic::Proxied,
+    ),
+    // The Amazon RDS DB INSTANCE and the two PARAMETER-GROUP types are provisioned by
+    // providers that word the ATTEMPT-counting shape, where that service's entry above carries
+    // the bare envelope its DB subnet group's provider words. Read from the recorded
+    // `ResourceStatusReason` of an `AWS::RDS::DBInstance` declaring an engine version that
+    // service publishes no such version for, and of a parameter group of either level whose
+    // declared family is none it publishes (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, checks
+    // `cloudformation__rds.cfn-rds-instance-invalid-engine-version-rejected-and-rolled-back`,
+    // `cloudformation__rds.deploy-cfn-rds-db-parameter-group-invalid-family-rejected-and-\
+    // rolled-back` and `cloudformation__rds.deploy-rds-db-cluster-parameter-group-invalid-\
+    // family-rejected`, whose reasons read `<the service's sentence> (Service: Rds, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)`). Those are the reasons RECORDED for
+    // these providers; the rows beside each create are the same provider's other calls, which
+    // word the shape it words — a recording of one of them is what would correct them.
+    ("rds", "CreateDBInstance", SdkDiagnostic::Attempts),
+    ("rds", "ModifyDBInstance", SdkDiagnostic::Attempts),
+    ("rds", "DeleteDBInstance", SdkDiagnostic::Attempts),
+    ("rds", "DescribeDBInstances", SdkDiagnostic::Attempts),
+    ("rds", "AddRoleToDBInstance", SdkDiagnostic::Attempts),
+    ("rds", "CreateDBParameterGroup", SdkDiagnostic::Attempts),
+    ("rds", "ModifyDBParameterGroup", SdkDiagnostic::Attempts),
+    ("rds", "DeleteDBParameterGroup", SdkDiagnostic::Attempts),
+    (
+        "rds",
+        "DescribeDBParameterGroups",
+        SdkDiagnostic::Attempts,
+    ),
+    ("rds", "DescribeDBParameters", SdkDiagnostic::Attempts),
+    (
+        "rds",
+        "CreateDBClusterParameterGroup",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "rds",
+        "ModifyDBClusterParameterGroup",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "rds",
+        "DeleteDBClusterParameterGroup",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "rds",
+        "DescribeDBClusterParameterGroups",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "rds",
+        "DescribeDBClusterParameters",
+        SdkDiagnostic::Attempts,
     ),
 ];
 

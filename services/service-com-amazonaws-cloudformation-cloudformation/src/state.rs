@@ -1417,6 +1417,36 @@ pub mod deletion_policy {
     /// "For resources that support snapshots, CloudFormation creates a snapshot for the
     /// resource before deleting it."
     pub const SNAPSHOT: &str = "Snapshot";
+
+    /// The policy a declaration of `resource_type` that states NONE gets.
+    ///
+    /// [`DELETE`] for almost every type — "the default policy is Delete" — and the exceptions
+    /// are the types whose own documentation states another default: "for `AWS::RDS::DBCluster`
+    /// resources, the default policy is Snapshot. For `AWS::RDS::DBInstance` resources that
+    /// don't specify the `DBClusterIdentifier` property, the default policy is Snapshot." A DB
+    /// instance that names the cluster it is a member of holds no data to snapshot of its own
+    /// — the cluster's volume does — so that one takes the general default, which is what the
+    /// property named here tells apart.
+    ///
+    /// `properties` is the resource's evaluated declaration, so a membership stated through a
+    /// `Ref` counts as stated.
+    pub fn default_for(resource_type: &str, properties: &::serde_json::Value) -> &'static str {
+        match resource_type {
+            super::provisioner::rds_db_clusters::RDS_DB_CLUSTER => SNAPSHOT,
+            super::provisioner::RDS_DB_INSTANCE
+                if properties
+                    .get(CLUSTER_MEMBERSHIP_PROPERTY)
+                    .is_none_or(::serde_json::Value::is_null) =>
+            {
+                SNAPSHOT
+            }
+            _ => DELETE,
+        }
+    }
+
+    /// The property an `AWS::RDS::DBInstance` names the DB cluster it belongs to in, which is
+    /// the one the documented default above turns on.
+    const CLUSTER_MEMBERSHIP_PROPERTY: &str = "DBClusterIdentifier";
 }
 
 /// `DeletionMode` values (the model's `DeletionMode` enum): "specifies the deletion mode for

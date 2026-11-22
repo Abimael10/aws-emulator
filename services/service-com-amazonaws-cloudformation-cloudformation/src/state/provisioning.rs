@@ -4305,9 +4305,8 @@ pub enum Policies {
 }
 
 /// What this walk does with one resource: the attribute the walk reads for it, and the
-/// documented default ([`super::deletion_policy::DELETE`]) otherwise — which is also what a
-/// declaration naming no policy, and one naming a value that is none of the documented ones,
-/// gets.
+/// documented default otherwise ([`super::deletion_policy::default_for`]) — which is also what
+/// a declaration naming a value that is none of the documented ones gets.
 ///
 /// `RetainExceptOnCreate` is `DeletionPolicy`'s fourth value, and the one whose answer depends
 /// on the walk: "retain the resource only if the resource creation fails", so it keeps the
@@ -4328,7 +4327,9 @@ fn policy_of(resource: &StoredResource, policies: Policies) -> &str {
         }
         Policies::Honoured | Policies::RolledBack => resource.deletion_policy.as_deref(),
     };
-    match stated.unwrap_or(super::deletion_policy::DELETE) {
+    match stated.unwrap_or_else(|| {
+        super::deletion_policy::default_for(&resource.resource_type, &resource.properties)
+    }) {
         super::deletion_policy::RETAIN_EXCEPT_ON_CREATE => match policies {
             Policies::RolledBack => super::deletion_policy::DELETE,
             _ => super::deletion_policy::RETAIN,

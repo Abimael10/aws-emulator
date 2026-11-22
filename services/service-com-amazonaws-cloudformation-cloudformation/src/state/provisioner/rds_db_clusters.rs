@@ -234,11 +234,10 @@ pub(crate) async fn create_db_cluster(
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) = xml_element(&answered, "DBClusterArn").filter(|arn| !arn.is_empty()) {
-        // The type publishes one ARN, so the conventional `Arn` attribute every type
-        // answers is that same value ([`super::template::conventional_attributes`]): both
-        // are re-pointed at the ARN the cluster really carries.
-        attributes.insert("Arn".to_string(), arn.clone());
-        attributes.insert("DBClusterArn".to_string(), arn);
+        // The type publishes one ARN, so every name a resource's ARN is published under is
+        // that same value ([`super::template::arn_attributes`]): all of them are re-pointed at
+        // the ARN the cluster really carries.
+        attributes.extend(super::template::arn_attributes(RDS_DB_CLUSTER, &arn));
     }
     if let Some(resource_id) =
         xml_element(&answered, "DbClusterResourceId").filter(|id| !id.is_empty())

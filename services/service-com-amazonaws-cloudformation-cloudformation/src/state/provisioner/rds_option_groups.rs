@@ -110,9 +110,10 @@ pub(crate) async fn create_option_group(
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) = xml_element(&answered, "OptionGroupArn").filter(|arn| !arn.is_empty()) {
-        // The group's own ARN, which is the resource's: the conventional `Arn` attribute the
-        // type answers is re-pointed at the one Amazon RDS reports.
-        attributes.insert("Arn".to_string(), arn);
+        // The group's own ARN, which is the resource's: every name the type publishes its ARN
+        // under is re-pointed at the one Amazon RDS reports
+        // ([`super::template::arn_attributes`]).
+        attributes.extend(super::template::arn_attributes(RDS_OPTION_GROUP, &arn));
     }
     Ok(Created::attributes(attributes))
 }
