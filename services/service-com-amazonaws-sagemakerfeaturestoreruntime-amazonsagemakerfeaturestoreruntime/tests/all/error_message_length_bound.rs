@@ -13,7 +13,10 @@
 //!
 //! The rule asserted here: whatever the operation and whichever of its messages it
 //! chooses, the text a client reads is cut to the modelled maximum, at a character
-//! boundary, and a message already inside the bound is answered verbatim.
+//! boundary, and a message already inside the bound is answered verbatim. It holds for
+//! the message an operation takes from the shared record preparation and for one its own
+//! handler words (`DeleteRecord`'s `EventTime`, `UpdateRecord`'s record identifier)
+//! alike, and the bound's own edges are driven by padding the value a refusal quotes.
 //!
 //! Every case goes through the real front door — the multi-service router, the restJson1
 //! protocol, the modelled constraint validation — so what is asserted is the wire
@@ -174,6 +177,33 @@ fn no_such_record(identifier: &str) -> String {
     format!("Record Not Found: Record not found with record identifier [{identifier}].")
 }
 
+/// How `DeleteRecord` states an `EventTime` that is no timestamp, unbounded.
+///
+/// That operation carries the instant in its OWN `EventTime` member — a `@httpQuery`
+/// `ValueAsString`, modelled `len 0..358400` — rather than among a record's feature
+/// values, so it words this refusal itself.
+fn unreadable_delete_event_time(value: &str) -> String {
+    format!("EventTime: expected an ISO-8601 timestamp or seconds since the epoch, not '{value}'")
+}
+
+/// How `UpdateRecord` states a posted record-identifier feature whose value is not the
+/// one of the record being updated, unbounded: the value it quotes is the request's own
+/// `RecordIdentifierValueAsString`, a `ValueAsString`.
+fn identifier_feature_mismatch(identifier: &str) -> String {
+    format!(
+        "Features: the record identifier feature '{IDENTIFIER_FEATURE}' must carry the \
+         RecordIdentifierValueAsString of the record being updated ('{identifier}')"
+    )
+}
+
+/// `value`, percent-encoded for the query string of a URI.
+///
+/// A `ValueAsString` admits any character (`pattern .*`), and a `@httpQuery` member
+/// travels in the query string, where a byte outside the unreserved set is escaped.
+fn query_encoded(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 /// `answered` must be `expected` cut to the modelled bound: a prefix of it, no longer
 /// than the bound, and as long as the bound admits — so nothing is dropped that fits.
 fn assert_cut_to_bound(case: &str, answered: &str, expected: &str) {
@@ -206,6 +236,15 @@ fn assert_cut_to_bound(case: &str, answered: &str, expected: &str) {
          {MAX_MESSAGE_BYTES} bytes, got {} bytes, {shortfall} short of the bound",
         answered.len()
     );
+}
+
+/// One wording of the refusal an unreadable event time is answered with: the operation
+/// that answers it, how it states the value it quotes, and whether that value travels in
+/// the query string rather than in the request body.
+struct Wording {
+    operation: &'static str,
+    word: fn(&str) -> String,
+    in_query: bool,
 }
 
 /// One case: the call to make, and the failure its answer must state.
@@ -581,5 +620,216 @@ async fn a_refusal_inside_the_bound_is_answered_verbatim() {
             row.code,
             row.expected
         );
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_an_operation_words_itself_is_cut_to_the_bound_too() {
+    // The rule holds for the message an operation words in its OWN handler as much as for
+    // the one it takes from the shared record preparation: `DeleteRecord` reads its
+    // `EventTime` from a `@httpQuery` member of its own, and `UpdateRecord` quotes the
+    // `RecordIdentifierValueAsString` of the record it was asked to update. Both members
+    // are `ValueAsString`, modelled `len 0..358400`, so both refusals are BUILT past the
+    // `Message` the operation answers them in. The rows span those two wordings, the
+    // query string and the body as the place the quoted value travels in, ASCII and
+    // multi-byte values, and the deletion modes the model declares.
+    let long_ascii = "x".repeat(5_000);
+    let long_other_ascii = "7".repeat(2_600);
+    // Each character is three bytes, so the byte bound does not fall on a boundary
+    // between them.
+    let long_multibyte = "字".repeat(1_500);
+    let rows = vec![
+        Row {
+            case: "DeleteRecord quoting an unreadable ASCII event time",
+            region: REGION.to_owned(),
+            method: "DELETE",
+            uri: format!(
+                "/FeatureGroup/{GROUP}?RecordIdentifierValueAsString=R1&EventTime={}",
+                query_encoded(&long_ascii)
+            ),
+            body: None,
+            status: 400,
+            code: "ValidationError",
+            expected: unreadable_delete_event_time(&long_ascii),
+            per_element: false,
+        },
+        Row {
+            case: "DeleteRecord quoting an unreadable multi-byte event time",
+            region: REGION.to_owned(),
+            method: "DELETE",
+            uri: format!(
+                "/FeatureGroup/{GROUP}?RecordIdentifierValueAsString=R1&EventTime={}",
+                query_encoded(&long_multibyte)
+            ),
+            body: None,
+            status: 400,
+            code: "ValidationError",
+            expected: unreadable_delete_event_time(&long_multibyte),
+            per_element: false,
+        },
+        Row {
+            case: "a HardDelete quoting an unreadable event time just past the bound",
+            region: REGION.to_owned(),
+            method: "DELETE",
+            uri: format!(
+                "/FeatureGroup/{GROUP}?RecordIdentifierValueAsString=R1&DeletionMode=HardDelete\
+                 &EventTime={}",
+                query_encoded(&long_other_ascii)
+            ),
+            body: None,
+            status: 400,
+            code: "ValidationError",
+            expected: unreadable_delete_event_time(&long_other_ascii),
+            per_element: false,
+        },
+        Row {
+            case: "UpdateRecord quoting the record identifier a posted feature disagrees with",
+            region: REGION.to_owned(),
+            method: "POST",
+            uri: format!("/FeatureGroup/{GROUP}/Record"),
+            body: Some(json!({
+                "RecordIdentifierValueAsString": &long_ascii,
+                "Features": [feature(IDENTIFIER_FEATURE, "another-record")]
+            })),
+            status: 400,
+            code: "ValidationError",
+            expected: identifier_feature_mismatch(&long_ascii),
+            per_element: false,
+        },
+    ];
+
+    for row in rows {
+        let emulator = Emulator::new();
+        emulator.create_feature_group(GROUP);
+        let (status, answered) = emulator
+            .send_in(&row.region, row.method, &row.uri, row.body)
+            .await;
+        let code = error_code(&answered);
+        let stated = message(&answered);
+        assert_eq!(
+            (status, code.as_str()),
+            (row.status, row.code),
+            "case {:?}: expected HTTP {} {}, got {status} {code:?} with {:?}…",
+            row.case,
+            row.status,
+            row.code,
+            stated.chars().take(120).collect::<String>()
+        );
+        assert_cut_to_bound(row.case, &stated, &row.expected);
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_is_answered_whole_up_to_the_bound_and_cut_only_past_it() {
+    // The bound's own edges, reached by PADDING the value a refusal quotes so the
+    // unbounded message lands just below the modelled maximum, exactly on it, and just
+    // past it: a message the bound admits is answered whole, and only one past it is cut,
+    // and then to the maximum itself. Both wordings are driven — the one the shared record
+    // preparation builds (`PutRecord`) and the one a handler builds itself
+    // (`DeleteRecord`) — so the edge is the member's, not one operation's.
+    //
+    // (how long the UNBOUNDED message is)
+    let lengths = [
+        MAX_MESSAGE_BYTES - 1,
+        MAX_MESSAGE_BYTES,
+        MAX_MESSAGE_BYTES + 1,
+        MAX_MESSAGE_BYTES + 2,
+    ];
+
+    for length in lengths {
+        let wordings = vec![
+            Wording {
+                operation: "PutRecord",
+                word: unreadable_event_time,
+                in_query: false,
+            },
+            Wording {
+                operation: "DeleteRecord",
+                word: unreadable_delete_event_time,
+                in_query: true,
+            },
+        ];
+        for Wording {
+            operation,
+            word: wording,
+            in_query,
+        } in wordings
+        {
+            let case = format!("{operation} stating a {length}-byte refusal");
+            let padding = length.checked_sub(wording("").len()).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the {operation} wording is already longer than {length} bytes"
+                )
+            });
+            // No padding of this value reads as a timestamp, so the refusal is reached
+            // whatever its length.
+            let value = "x".repeat(padding);
+            let expected = wording(&value);
+            assert_eq!(
+                expected.len(),
+                length,
+                "case {case:?}: expected a {length}-byte message to state the row, got {} bytes",
+                expected.len()
+            );
+
+            let emulator = Emulator::new();
+            emulator.create_feature_group(GROUP);
+            let (status, answered) = if in_query {
+                emulator
+                    .send_in(
+                        REGION,
+                        "DELETE",
+                        &format!(
+                            "/FeatureGroup/{GROUP}?RecordIdentifierValueAsString=R1&EventTime={}",
+                            query_encoded(&value)
+                        ),
+                        None,
+                    )
+                    .await
+            } else {
+                emulator
+                    .send_in(
+                        REGION,
+                        "PUT",
+                        &format!("/FeatureGroup/{GROUP}"),
+                        Some(json!({ "Record": [
+                            feature(IDENTIFIER_FEATURE, "R1"),
+                            feature(EVENT_TIME_FEATURE, &value)
+                        ] })),
+                    )
+                    .await
+            };
+            let code = error_code(&answered);
+            let stated = message(&answered);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ValidationError"),
+                "case {case:?}: expected HTTP 400 ValidationError, got {status} {code:?} with \
+                 {:?}…",
+                stated.chars().take(120).collect::<String>()
+            );
+            if length <= MAX_MESSAGE_BYTES {
+                assert_eq!(
+                    stated, expected,
+                    "case {case:?}: expected the message the bound admits answered whole, got \
+                     {} bytes",
+                    stated.len()
+                );
+            } else {
+                assert_eq!(
+                    stated.len(),
+                    MAX_MESSAGE_BYTES,
+                    "case {case:?}: expected a message past the bound cut to exactly \
+                     {MAX_MESSAGE_BYTES} bytes, got {} bytes",
+                    stated.len()
+                );
+                assert!(
+                    expected.starts_with(&stated),
+                    "case {case:?}: expected the answered message to be a prefix of the \
+                     {length}-byte refusal, got {:?}…",
+                    stated.chars().take(120).collect::<String>()
+                );
+            }
+        }
     }
 }
