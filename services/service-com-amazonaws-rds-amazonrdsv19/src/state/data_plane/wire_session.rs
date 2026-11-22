@@ -1494,7 +1494,7 @@ pub const MYSQL_MASTER_HOST_PATTERN: &str = "%";
 
 /// The settings the SERVER itself answers for, by name — the ones that are not
 /// parameter-group parameters at all. See [`server_setting`], which answers each of them.
-pub const SERVER_SETTING_NAMES: [&str; 28] = [
+pub const SERVER_SETTING_NAMES: [&str; 29] = [
     "ssl",
     "server_version",
     "version",
@@ -1521,6 +1521,7 @@ pub const SERVER_SETTING_NAMES: [&str; 28] = [
     "ssl_version",
     "read_only",
     "super_read_only",
+    "innodb_read_only",
     "transaction_read_only",
     "default_transaction_read_only",
 ];
@@ -1594,8 +1595,20 @@ fn server_setting(facts: &SessionFacts, lowered: &str) -> Option<String> {
         // `super_read_only`, which is on whenever `read_only` is on a replica this emulator
         // serves no SUPER-privileged user on) and PostgreSQL's transaction read-only mode,
         // which a session on a standby is in and cannot leave.
-        "read_only" | "super_read_only" => match facts.wire {
-            EngineWire::MySql => Some(if facts.read_only { "1" } else { "0" }.to_string()),
+        //
+        // `innodb_read_only` is the same state as the STORAGE ENGINE reports it — "whether
+        // the MySQL instance opens InnoDB in read-only mode", which is on for every endpoint
+        // of this family that serves no writes (an Aurora replica, a read replica, the
+        // reader endpoint of a cluster) and off for one that does. It is a real server
+        // variable on every MySQL-family engine, so it reports the state it is in and never
+        // NULL: it is the variable a client reads to tell a writer connection from a reader
+        // one, so a value that stands for neither would leave it unable to route at all.
+        //
+        // One value for all three, written as `SHOW VARIABLES` renders a boolean variable of
+        // this family; a `@@`-reference to any of them answers the 1 or 0 that same state is
+        // ([`super::dialect`]).
+        "read_only" | "super_read_only" | "innodb_read_only" => match facts.wire {
+            EngineWire::MySql => Some(if facts.read_only { "ON" } else { "OFF" }.to_string()),
             EngineWire::Postgres => None,
         },
         "transaction_read_only" | "default_transaction_read_only" => match facts.wire {
@@ -2788,6 +2801,12 @@ fn session_variables(facts: &SessionFacts) -> Vec<(String, String)> {
         "require_secure_transport",
         "transaction_isolation",
         "time_zone",
+        // The variables that report whether this endpoint serves writes, which `SHOW
+        // VARIABLES` reports with the same value a `@@` reference to each of them answers
+        // ([`server_setting`]) — one reading of that state, so the two cannot drift.
+        "read_only",
+        "super_read_only",
+        "innodb_read_only",
     ]
     .iter()
     .filter_map(|name| {
