@@ -4390,12 +4390,12 @@ pub fn derive_association_external_id(association_arn: &str) -> String {
 /// clock advances rather than ageing into a table where every row is unsupported.
 ///
 /// The table is the WHOLE published calendar, not only the part a new cluster can
-/// be created at: `DescribeClusterVersions` "Lists available Kubernetes versions
-/// for Amazon EKS clusters" and reports each row's lifecycle state on the row
-/// itself (`versionStatus`), so a version whose support has ended is still a row
-/// of the calendar — the version a caller may still be running, or reading the
-/// dates of — reported to a caller that asks for it with `includeAll` or with a
-/// status filter naming the unsupported state. The OLDEST row is the oldest
+/// be created at: a version whose support has ended is still a row of the
+/// calendar — the version a caller may still be running, or reading the dates of
+/// — reached by a caller that asks for it with `includeAll` or with a status
+/// filter naming the unsupported state, while the listing a caller reads unasked
+/// names the versions the service still offers
+/// (`ComAmazonawsEksAwswesleyfrontendState::listed_cluster_versions`). The OLDEST row is the oldest
 /// Kubernetes version this API carries at all, and every minor version released
 /// since has a row: a caller walking the whole catalogue reads one unbroken run
 /// of minor versions, which is what lets it tell a version it has never heard of

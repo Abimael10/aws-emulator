@@ -33,12 +33,15 @@
 //!   member in the `ClusterVersionStatus` spelling (`standard-support`), while the
 //!   reported `ClusterVersionInformation$status` carries the `VersionStatus`
 //!   spelling its replacement does (see `crate::state`).
-//! * `includeAll` — "Include all available versions in the response". This listing
-//!   already reports every version the calendar publishes, each carrying its own
-//!   lifecycle state (`versionStatus`), so a caller asking for all of them is asking
-//!   for what it is already served: the flag narrows nothing and widens nothing. A
-//!   caller that wants only part of the calendar names a `status`/`versionStatus`,
-//!   a `clusterVersions` or a `clusterType` filter.
+//! * `includeAll` — "Include all available versions in the response": the flag that
+//!   WIDENS the listing to the whole calendar. Unasked, the listing names the
+//!   versions this service still offers — the ones a caller may create a cluster at
+//!   — so a row the clock has carried past its own end of extended support is
+//!   reported only to a caller that asks for it, with this flag or with a
+//!   `status`/`versionStatus` filter naming the unsupported state
+//!   (`crate::state`'s `listed_cluster_versions`). A caller that wants only part of
+//!   the listing names a `status`/`versionStatus`, a `clusterVersions` or a
+//!   `clusterType` filter.
 //! * `maxResults` / `nextToken` — pagination over the filtered rows.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -194,15 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "Include all available versions in the response": every released row of
-        // the calendar is reported whatever this says, so the flag is read and
-        // changes nothing. A version whose support has ended is still a version
-        // this API carries — the row a caller still running it reads its dates
-        // from — and the lifecycle state is reported ON the row, which is how a
-        // caller tells the versions it may still create a cluster at from the
-        // rest. Narrowing by that state is what the `status`/`versionStatus`
-        // filters do, on the caller's say-so.
-        let _ = input.include_all;
+        // "Include all available versions in the response": the ask that widens
+        // this listing to the whole released calendar. Unasked, the listing names
+        // the versions the service still offers, so a row past its own end of
+        // extended support is reported only when the caller asks for it — with
+        // this flag, or with a status filter naming the unsupported state, which
+        // is a request for those very rows. Narrowing is what the other filters
+        // do, on the caller's say-so.
+        let include_unsupported = input.include_all.unwrap_or(false)
+            || status_filters.contains(&SupportStatus::Unsupported);
 
         let requested_versions = match input.cluster_versions.as_deref() {
             None => Vec::new(),
@@ -241,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = store.lock();
         let matching: Vec<&ClusterVersionRecord> = guard
-            .released_cluster_versions(now)
+            .listed_cluster_versions(now, include_unsupported)
             .filter(|entry| {
                 requested_versions.is_empty()
                     || requested_versions.contains(&entry.cluster_version)

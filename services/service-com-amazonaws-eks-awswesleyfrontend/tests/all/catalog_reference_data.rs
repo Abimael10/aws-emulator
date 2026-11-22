@@ -313,8 +313,9 @@ async fn marketplace_addons_are_published_with_their_listing_and_builds() {
 // Amazon EKS has released — an unbroken run from the oldest version it carries to
 // the newest — each row reporting its own published release and end-of-support
 // dates and the lifecycle state those dates give at the clock. A version whose
-// support has ended is PUBLISHED, not hidden; it is simply not one a cluster can
-// be created on.
+// support has ended is still a row of the calendar, reached by a caller that asks
+// for it (`includeAll`, or a status filter naming the unsupported state); the
+// listing a caller reads unasked names the versions a cluster can be created on.
 // ---------------------------------------------------------------------------
 
 /// The calendar rows this case names, as `(version, release, end of standard
@@ -362,7 +363,9 @@ const UNPUBLISHED_VERSIONS: &[&str] = &["1.22", "1.38"];
 async fn the_version_calendar_publishes_every_released_minor_version() {
     let router = emulator();
 
-    let published = version_rows(&describe_cluster_versions(&router, "").await);
+    // The WHOLE calendar, which is what `includeAll` asks for: this case is about
+    // every minor version the calendar carries, out-of-support rows included.
+    let published = version_rows(&describe_cluster_versions(&router, "includeAll=true").await);
     let versions: Vec<String> = published
         .iter()
         .map(|row| text(row, "clusterVersion"))
@@ -440,9 +443,15 @@ async fn the_version_calendar_publishes_every_released_minor_version() {
                 "case {version}/{name}: expected the tier's capabilities, got {tier:?}"
             );
         }
-        // And a filter naming it answers exactly that row.
-        let narrowed =
-            version_rows(&describe_cluster_versions(&router, &format!("clusterVersions={version}")).await);
+        // And a filter naming it answers exactly that row, out of the same whole
+        // calendar.
+        let narrowed = version_rows(
+            &describe_cluster_versions(
+                &router,
+                &format!("includeAll=true&clusterVersions={version}"),
+            )
+            .await,
+        );
         let reported: Vec<String> = narrowed
             .iter()
             .map(|row| text(row, "clusterVersion"))
@@ -470,9 +479,9 @@ async fn the_version_calendar_publishes_every_released_minor_version() {
         );
     }
 
-    // The versions whose support has ended are PART of the published listing —
-    // the rule the newest minors and the oldest rows share — and `includeAll`
-    // asks for exactly what is already published.
+    // The versions whose support has ended are rows of the calendar a caller
+    // ASKS for — the rule the newest minors and the oldest rows share — and the
+    // listing read unasked is the calendar without them.
     let out_of_support: Vec<String> =
         version_rows(&describe_cluster_versions(&router, "versionStatus=UNSUPPORTED").await)
             .iter()
@@ -486,17 +495,23 @@ async fn the_version_calendar_publishes_every_released_minor_version() {
     for version in &out_of_support {
         assert!(
             versions.contains(version),
-            "case {version}: an out-of-support row is published, not hidden, got {versions:?}"
+            "case {version}: an out-of-support row is one the whole calendar carries, got \
+             {versions:?}"
         );
     }
-    let widened: Vec<String> =
-        version_rows(&describe_cluster_versions(&router, "includeAll=true").await)
-            .iter()
-            .map(|row| text(row, "clusterVersion"))
-            .collect();
+    let unasked: Vec<String> = version_rows(&describe_cluster_versions(&router, "").await)
+        .iter()
+        .map(|row| text(row, "clusterVersion"))
+        .collect();
+    let expected_unasked: Vec<String> = versions
+        .iter()
+        .filter(|version| !out_of_support.contains(version))
+        .cloned()
+        .collect();
     assert_eq!(
-        widened, versions,
-        "case includeAll: expected the same published calendar, got {widened:?}"
+        unasked, expected_unasked,
+        "case the listing read unasked: expected the calendar without the rows past extended \
+         support, got {unasked:?}"
     );
 
     // Published is not the same as offered: a cluster is created only on a

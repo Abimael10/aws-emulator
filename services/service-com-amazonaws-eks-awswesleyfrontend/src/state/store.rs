@@ -203,16 +203,34 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// extended support has not ended.
     ///
     /// "A version whose extended support has ended is no longer one Amazon EKS
-    /// offers", so a new cluster is not created at one — while
-    /// `DescribeClusterVersions` still PUBLISHES its row, with the lifecycle state
-    /// on the row. One reading of "offered", so the catalog and `CreateCluster`
-    /// cannot disagree about which versions a cluster can run.
+    /// offers", so a new cluster is not created at one, and it is not a row of
+    /// the listing a caller reads unasked either ([`Self::listed_cluster_versions`]).
+    /// One reading of "offered", so the catalog and `CreateCluster` cannot
+    /// disagree about which versions a cluster can run.
     pub fn offered_cluster_versions(
         &self,
         now: SystemTime,
     ) -> impl Iterator<Item = &ClusterVersionRecord> + '_ {
-        self.released_cluster_versions(now)
-            .filter(move |entry| entry.support_status(now) != SupportStatus::Unsupported)
+        self.listed_cluster_versions(now, false)
+    }
+
+    /// The calendar rows `DescribeClusterVersions` LISTS at `now`.
+    ///
+    /// The versions the listing names are the versions a caller may still create
+    /// a cluster at ([`Self::offered_cluster_versions`]): a released row the
+    /// clock has carried past its own end of extended support is one the service
+    /// no longer offers, so it is reached only when the caller ASKS for it —
+    /// which is what `include_unsupported` carries — and never in the listing a
+    /// caller reads unasked. Each reported row still states its own lifecycle
+    /// state, so a caller that asks for the wider listing tells the two apart.
+    pub fn listed_cluster_versions(
+        &self,
+        now: SystemTime,
+        include_unsupported: bool,
+    ) -> impl Iterator<Item = &ClusterVersionRecord> + '_ {
+        self.released_cluster_versions(now).filter(move |entry| {
+            include_unsupported || entry.support_status(now) != SupportStatus::Unsupported
+        })
     }
 
     /// Materialise every clock-owed status move across the store.

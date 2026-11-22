@@ -830,8 +830,9 @@ pub(crate) async fn catalog_default_version(
 /// The Kubernetes versions `DescribeClusterVersions` publishes for a cluster to be
 /// created on, newest first: the published rows the clock has not carried past
 /// their own end of extended support, which is the set `CreateCluster` accepts —
-/// the listing publishes the whole calendar, out-of-support rows included, and
-/// each row's `versionStatus` is what says which of them a cluster can run.
+/// read out of the WIDENED listing and narrowed by each row's own
+/// `versionStatus`, so what this names is proven by the state on the row rather
+/// than taken on trust from which rows a listing carries.
 pub(crate) async fn published_cluster_versions(router: &MultiServiceRouter) -> Vec<String> {
     published_calendar_rows(router)
         .await
@@ -847,14 +848,22 @@ pub(crate) async fn published_cluster_versions(router: &MultiServiceRouter) -> V
 }
 
 /// EVERY row the published Kubernetes version calendar carries, newest first —
-/// the out-of-support rows included, which is what a suite needs when it asks
-/// about the versions the add-on catalog's compatibilities name rather than about
-/// the versions a cluster can be created on ([`published_cluster_versions`] is
-/// that narrower reading of this same listing).
+/// the out-of-support rows included, which is what `includeAll` widens the
+/// listing to, and what a suite needs when it asks about the versions the add-on
+/// catalog's compatibilities name rather than about the versions a cluster can be
+/// created on ([`published_cluster_versions`] is that narrower reading of this
+/// same listing).
 pub(crate) async fn published_calendar_rows(
     router: &MultiServiceRouter,
 ) -> Vec<serde_json::Value> {
-    let answer = call(router, REGION, "GET", "/cluster-versions?maxResults=100", "").await;
+    let answer = call(
+        router,
+        REGION,
+        "GET",
+        "/cluster-versions?maxResults=100&includeAll=true",
+        "",
+    )
+    .await;
     assert_eq!(
         answer.status, 200,
         "setup DescribeClusterVersions: got {answer:?}"
