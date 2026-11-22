@@ -446,7 +446,15 @@ struct FleetRow {
 ///
 /// The walk is bounded by the fleet it is reading, so a cursor that failed to advance ends
 /// the test rather than looping.
-async fn whole_listing(emulator: &Emulator, page_size: Option<i64>, fleet: usize) -> Vec<Value> {
+///
+/// `pub(crate)` beside [`epoch_millis`] and [`millis_of`]: another suite that reads a whole
+/// listing page by page reads it the same way rather than growing a second copy of this
+/// walk.
+pub(crate) async fn whole_listing(
+    emulator: &Emulator,
+    page_size: Option<i64>,
+    fleet: usize,
+) -> Vec<Value> {
     let mut summaries = Vec::new();
     let mut next_token: Option<String> = None;
     for _ in 0..=fleet {
