@@ -23,8 +23,8 @@
 //!   (`CreateIntegration$IntegrationSubtype`) and the integration's `RequestParameters` are
 //!   that action's own arguments, so a mapping that does not define every argument the
 //!   action requires configures a call that could never be made and is refused at the write
-//!   — on the create and on the update alike — naming the subtype and its whole required
-//!   set.
+//!   — on the create, the update and the IMPORT of a definition alike — naming the subtype
+//!   and its whole required set in the order AWS publishes for that subtype.
 //!
 //! The rows span what each rule generalises over: the integration type, whether the
 //! request carries a subtype, a URI, or both, the parent api's protocol, the payload
@@ -43,7 +43,9 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::integration_subtype:
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::api_import::{import, stored_integrations, stored_routes};
 use crate::api_lifecycle::{as_str, call, emulator, error_code};
+use crate::api_reimport::reimport;
 
 /// The subtypes AWS names for first-class service integrations, as a request spells
 /// them (`<Service>-<Action>`). `IntegrationSubtype` is an unconstrained string in the
@@ -994,6 +996,260 @@ fn the_listed_order_is_the_published_one_and_not_a_sorted_one() {
             rendered, if_sorted,
             "case {subtype:?}: expected the published order rather than a sorted one, got \
              {rendered:?}"
+        );
+    }
+}
+
+/// The method and path every definition below declares its one operation under, and the
+/// method the route key — and the warning — names that operation by.
+const IMPORTED_METHOD: &str = "post";
+const IMPORTED_ROUTE_METHOD: &str = "POST";
+const IMPORTED_PATH: &str = "/action";
+
+/// An OpenAPI definition declaring ONE `AWS_PROXY` operation that names `subtype`, mapped
+/// with `request_parameters` — the shape of definition an `ImportApi`/`ReimportApi` caller
+/// configures a first-class service integration with.
+fn subtype_definition(name: &str, subtype: &str, request_parameters: Value) -> String {
+    json!({
+        "openapi": "3.0.1",
+        "info": { "title": name, "version": "1.0" },
+        "paths": {
+            IMPORTED_PATH: {
+                IMPORTED_METHOD: {
+                    "x-amazon-apigateway-integration": {
+                        "type": "aws_proxy",
+                        "integrationSubtype": subtype,
+                        "payloadFormatVersion": "1.0",
+                        "credentials": "arn:aws:iam::000000000000:role/apigw",
+                        "requestParameters": request_parameters
+                    }
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// The warning an import reports for the one integration of such a definition it could not
+/// create: the import's own frame around the reason the integration was not created.
+fn unable_to_create_integration(reason: &str) -> String {
+    format!(
+        "Unable to create integration for resource at path \
+         '{IMPORTED_ROUTE_METHOD} {IMPORTED_PATH}': {reason}. Ignoring."
+    )
+}
+
+/// The refusal `FailOnWarnings` turns an import's warnings into: the fixed sentence, then
+/// every warning on its own indented line.
+fn warnings_found(reported: &[String]) -> String {
+    let mut message = String::from("Warnings found during import:");
+    for warning in reported {
+        message.push_str("\n\t");
+        message.push_str(warning);
+    }
+    message
+}
+
+/// Every warning an import's answer reports, in order.
+fn reported_warnings(answer: &Value) -> Vec<String> {
+    answer["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToString::to_string))
+        .collect()
+}
+
+/// How many apis the store holds, through `GetApis`.
+async fn stored_api_count(emulator: &MultiServiceRouter) -> usize {
+    let (status, body) = call(emulator, "GET", "/v2/apis", None).await;
+    assert_eq!(status, 200, "expected 200 from GetApis, got {status} {body}");
+    body["items"].as_array().map(Vec::len).unwrap_or_default()
+}
+
+/// The route key the operation these definitions declare makes.
+fn imported_route_key() -> String {
+    format!("{IMPORTED_ROUTE_METHOD} {IMPORTED_PATH}")
+}
+
+/// RULE: the same gate the create and the update hold a first-class subtype integration to
+/// reads an IMPORTED definition, and states the same sentence — the subtype the definition
+/// named and that subtype's WHOLE required set in the order AWS publishes for THAT subtype,
+/// never a sorted one — inside the per-path warning an import reports, and inside the
+/// refusal `FailOnWarnings` turns that warning into.
+#[tokio::test]
+async fn an_imported_subtype_integration_states_its_required_set_in_that_subtype_s_own_order() {
+    let emulator = emulator();
+
+    // Rows differ along the SUBTYPE, which is what the order is a fact about: every subtype
+    // the service states a required set for, from a one-parameter action to a four-parameter
+    // one, including two actions of one service whose two parameters are published the
+    // opposite way round, and four whose published order is not the alphabetical one.
+    for (index, (subtype, published)) in PUBLISHED_PARAMETER_ORDER.iter().enumerate() {
+        // The sentence, rendered from the order written out in this suite rather than read
+        // off the catalog under test, so what is asserted is AWS's order.
+        let sentence = format!(
+            "Operation: {subtype} requires enabling passthrough, or defining all of the \
+             following parameters in the parameter mapping: [{}]",
+            published.join(", ")
+        );
+        let expected = unable_to_create_integration(&sentence);
+        let dropped = published[0];
+        let case = format!("{subtype} imported without {dropped}");
+
+        // The definition maps every argument the action requires BUT the first, with an
+        // optional argument of the same action in its place, so the warning is about the
+        // required parameter and not about a mapping that defines nothing at all.
+        let mut entries: Vec<(&str, &str)> = published
+            .iter()
+            .skip(1)
+            .map(|parameter| (*parameter, "$request.body.value"))
+            .collect();
+        entries.push(("Region", "eu-west-1"));
+        let definition = subtype_definition(&case, subtype, mapping(&entries));
+
+        let (status, imported) = import(&emulator, "", &definition).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from ImportApi, got {status} {imported}"
+        );
+        assert_eq!(
+            reported_warnings(&imported),
+            vec![expected.clone()],
+            "case {case:?}: expected the warning stating the published order, got {imported}"
+        );
+
+        // The api and its route are read back through this service's own readers: the route
+        // is imported with no target, and the integration the definition could not configure
+        // is not stored.
+        let api_id = as_str(&imported, "apiId");
+        let routes = stored_routes(&emulator, &api_id).await;
+        assert!(
+            routes.len() == 1 && routes.get(&imported_route_key()).is_some_and(Option::is_none),
+            "case {case:?}: expected the route imported with no target, got {routes:?}"
+        );
+        let integrations = stored_integrations(&emulator, &api_id).await;
+        assert!(
+            integrations.is_empty(),
+            "case {case:?}: the skipped integration must not be stored, got {integrations:?}"
+        );
+
+        // A REIMPORT of the same definition reads it the same way, so the wording does not
+        // depend on which of the two operations put the definition.
+        let (status, reimported) = reimport(&emulator, &api_id, "", &definition).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from ReimportApi, got {status} {reimported}"
+        );
+        assert_eq!(
+            reported_warnings(&reimported),
+            vec![expected.clone()],
+            "case {case:?}: a reimport must word it the same way, got {reimported}"
+        );
+
+        // `FailOnWarnings` turns that warning into the refusal, carrying the list exactly as
+        // the warning stated it, and persists nothing.
+        let before = stored_api_count(&emulator).await;
+        let (status, refused) = import(&emulator, "?failOnWarnings=true", &definition).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: FailOnWarnings must refuse the import, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {refused}"
+        );
+        assert_eq!(
+            as_str(&refused, "message"),
+            warnings_found(std::slice::from_ref(&expected)),
+            "case {case:?}: wrong refusal sentence, got {refused}"
+        );
+        assert_eq!(
+            stored_api_count(&emulator).await,
+            before,
+            "case {case:?}: a refused import must persist nothing"
+        );
+
+        // And for a subtype whose published order is not the alphabetical one, the warning
+        // differs from the one a sorted list would state — the difference a client sees.
+        let mut sorted: Vec<&str> = published.to_vec();
+        sorted.sort_unstable();
+        if sorted != published.to_vec() {
+            let if_sorted = unable_to_create_integration(&format!(
+                "Operation: {subtype} requires enabling passthrough, or defining all of the \
+                 following parameters in the parameter mapping: [{}]",
+                sorted.join(", ")
+            ));
+            assert_ne!(
+                expected, if_sorted,
+                "case {case:?}: expected the published order rather than a sorted one"
+            );
+            assert_eq!(
+                reported_warnings(&imported),
+                vec![expected],
+                "case {case:?} (row {index}): the warning must not state the sorted order \
+                 {sorted:?}"
+            );
+        }
+    }
+}
+
+/// RULE (the other half of the same gate): a definition whose mapping DOES define every
+/// argument the action requires is imported, and the integration it configures is stored
+/// carrying that subtype and that mapping — so the warnings above are about the required set
+/// and not about importing a subtype integration at all.
+#[tokio::test]
+async fn an_imported_subtype_integration_whose_mapping_is_complete_is_created() {
+    let emulator = emulator();
+
+    for (subtype, published) in PUBLISHED_PARAMETER_ORDER {
+        let case = format!("{subtype} imported with every required parameter");
+        let complete = mapping(
+            &published
+                .iter()
+                .map(|parameter| (*parameter, "$request.body.value"))
+                .collect::<Vec<(&str, &str)>>(),
+        );
+        let definition = subtype_definition(&case, subtype, complete.clone());
+
+        let (status, imported) = import(&emulator, "", &definition).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from ImportApi, got {status} {imported}"
+        );
+        assert_eq!(
+            reported_warnings(&imported),
+            Vec::<String>::new(),
+            "case {case:?}: a complete mapping must be warned about nothing, got {imported}"
+        );
+
+        // Read the integration back through `GetIntegrations`, so what is asserted is the
+        // record the import stored and not the answer it echoed.
+        let api_id = as_str(&imported, "apiId");
+        let integrations = stored_integrations(&emulator, &api_id).await;
+        let stored = integrations
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            as_str(&stored, "integrationSubtype"),
+            *subtype,
+            "case {case:?}: expected the stored integration to carry the subtype, got {stored}"
+        );
+        assert_eq!(
+            stored["requestParameters"], complete,
+            "case {case:?}: expected the stored mapping to be the one imported, got {stored}"
+        );
+        let routes = stored_routes(&emulator, &api_id).await;
+        assert!(
+            routes
+                .get(&imported_route_key())
+                .is_some_and(|target| target.is_some()),
+            "case {case:?}: expected the route to target the imported integration, got \
+             {routes:?}"
         );
     }
 }
