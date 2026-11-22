@@ -31,10 +31,9 @@
 use serde_json::{json, Value};
 
 use super::registered_managed_resources::register;
+use super::unmanaged_configuration_target::not_a_managed_resource_message;
 use super::zonal_shift_lifecycle::{call, emulator, encoded, error_code, seeded};
-use service_com_amazonaws_arczonalshift_percdataplane::state::{
-    PRACTICE_CONFIGURATION_EXISTS_MESSAGE, TARGET_UNAVAILABLE_MESSAGE,
-};
+use service_com_amazonaws_arczonalshift_percdataplane::state::PRACTICE_CONFIGURATION_EXISTS_MESSAGE;
 
 /// A resource an owning service registers with ARC, so the rule is asserted for a
 /// resource ARC did not create as well as for the ones this store was seeded with.
@@ -426,14 +425,13 @@ async fn a_configuration_for_a_target_arc_holds_nothing_for_is_refused_403() {
             answered, "AccessDeniedException",
             "case {case}: expected AccessDeniedException, got {body}"
         );
+        // The denial a call on a resource's practice run configuration answers names its
+        // subject; the table spanning that rule is `unmanaged_configuration_target.rs`.
+        let expected = not_a_managed_resource_message(target);
         assert_eq!(
             body["Message"].as_str(),
-            Some(TARGET_UNAVAILABLE_MESSAGE),
-            "case {case}: expected the non-disclosing refusal message, got {body}"
-        );
-        assert!(
-            !body.to_string().contains(target.as_str()),
-            "case {case}: the refusal must not disclose the target, got {body}"
+            Some(expected.as_str()),
+            "case {case}: expected {expected:?}, got {body}"
         );
     }
 }

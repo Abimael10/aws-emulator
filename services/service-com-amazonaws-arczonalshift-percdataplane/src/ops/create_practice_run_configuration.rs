@@ -222,11 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The caller's authorization on the named target is decided BEFORE the target is
-        // resolved: a resourceIdentifier ARC holds nothing for is refused 403
-        // AccessDeniedException, disclosing nothing about what exists. One helper takes
-        // this branch for every operation that acts on a target.
+        // resolved: a resourceIdentifier that is not a managed resource of this account is
+        // refused 403 AccessDeniedException. The denial a call on a resource's practice run
+        // configuration answers names its subject — the identifier the request carried and
+        // the account the call was made in — so one helper words it for all three.
         let resource = store
-            .authorized_resource(&published, &input.resource_identifier)
+            .authorized_configuration_resource(&published, &input.resource_identifier)
             .map_err(CreatePracticeRunConfigurationErrorModeled::AccessDeniedException)?;
 
         // The configuration the request asks ARC to hold, read the ONE way every

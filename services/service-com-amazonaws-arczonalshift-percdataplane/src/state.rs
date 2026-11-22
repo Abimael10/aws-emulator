@@ -110,12 +110,14 @@ pub const MAX_COMPLETED_SHIFTS_RETAINED: usize = 1_000;
 /// what does or does not exist.
 pub const TARGET_UNAVAILABLE_MESSAGE: &str = "Requested resource is not available.";
 
-/// The ONE refusal every zonal-shift mutation keyed by a `resourceIdentifier` answers
-/// when the resource it names is not one this account's ARC holds for the caller.
+/// The refusal a TRAFFIC-SHIFT mutation keyed by a `resourceIdentifier` answers when the
+/// resource it names is not one this account's ARC holds for the caller.
 ///
 /// A mutation keyed by a `zonalShiftId` states no reason at all
 /// ([`identifier_not_attributable`]): this message is about the RESOURCE a call named, so
-/// it is answered only where a call named one.
+/// it is answered only where a call named one. A call on a resource's PRACTICE RUN
+/// CONFIGURATION names its subject instead ([`not_a_managed_resource`]) — what a denial
+/// of this service states is per operation, not one sentence for the whole class.
 ///
 /// ARC decides the caller's authorization ON THE TARGET before the target is
 /// resolved, so an identifier it cannot attribute to the caller is answered
@@ -128,6 +130,33 @@ pub const TARGET_UNAVAILABLE_MESSAGE: &str = "Requested resource is not availabl
 pub fn target_unavailable() -> AccessDeniedException {
     AccessDeniedException {
         message: Some(TARGET_UNAVAILABLE_MESSAGE.to_string()),
+    }
+}
+
+/// The refusal ARC answers a call on a resource's PRACTICE RUN CONFIGURATION with when
+/// the identifier it named is not a managed resource of the caller's account.
+///
+/// The operations that act on that configuration — `POST /configuration`, and `PATCH` and
+/// `DELETE /configuration/{resourceIdentifier}` — state the SUBJECT of the refusal rather
+/// than the non-disclosing sentence a traffic-shift mutation answers
+/// ([`TARGET_UNAVAILABLE_MESSAGE`]): the identifier the request carried and the account the
+/// call was made in. Both parts are read rather than written — the identifier off the
+/// request, the account id from the one place this emulator states its account — so the
+/// sentence below is the template and nothing in it is one call's value.
+#[must_use]
+pub fn not_a_managed_resource_message(resource_identifier: &str) -> String {
+    format!(
+        "Resource {resource_identifier} is not a managed resource for account ID {}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The denial [`not_a_managed_resource_message`] states, built here so every operation that
+/// acts on a practice run configuration takes one and the same branch.
+#[must_use]
+pub fn not_a_managed_resource(resource_identifier: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(not_a_managed_resource_message(resource_identifier)),
     }
 }
 
@@ -494,7 +523,7 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
         }
     }
 
-    /// The managed resource a zonal-shift mutation may act on, or the refusal it
+    /// The managed resource a TRAFFIC-SHIFT mutation may act on, or the refusal it
     /// answers instead.
     ///
     /// This is the ordering every such operation shares: the authorization
@@ -505,6 +534,9 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
     /// `published` is what the services that own their resources have registered
     /// ([`published_resources`]), so a resource registered through one of them is as
     /// much a target of a mutation as one this store was seeded with.
+    ///
+    /// A call on a resource's practice run configuration takes the same ordering with a
+    /// denial that names its subject ([`Self::authorized_configuration_resource`]).
     pub fn authorized_resource(
         &self,
         published: &[::service_common::arc_managed_resources::RegisteredResource],
@@ -512,6 +544,24 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
     ) -> Result<ManagedResource, AccessDeniedException> {
         self.managed_resource(published, resource_identifier)
             .ok_or_else(target_unavailable)
+    }
+
+    /// The managed resource a call on a resource's PRACTICE RUN CONFIGURATION may act
+    /// on, or the refusal it answers instead.
+    ///
+    /// The same ordering as [`Self::authorized_resource`] — the authorization decision on
+    /// the named target is taken before the target is resolved — and the same resolution;
+    /// what differs is what the denial STATES. ARC answers a call on a resource's practice
+    /// run configuration by naming its subject ([`not_a_managed_resource`]): the
+    /// identifier the request carried and the account the call was made in, rather than
+    /// the non-disclosing sentence a traffic-shift mutation answers.
+    pub fn authorized_configuration_resource(
+        &self,
+        published: &[::service_common::arc_managed_resources::RegisteredResource],
+        resource_identifier: &str,
+    ) -> Result<ManagedResource, AccessDeniedException> {
+        self.managed_resource(published, resource_identifier)
+            .ok_or_else(|| not_a_managed_resource(resource_identifier))
     }
 
     /// The stored zonal shift a mutation keyed by `zonalShiftId` may act on, or

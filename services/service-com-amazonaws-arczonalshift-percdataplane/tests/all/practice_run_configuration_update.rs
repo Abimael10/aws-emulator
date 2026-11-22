@@ -37,10 +37,10 @@ use super::practice_run_configuration::{
     REGISTERED_ARN, REGISTERED_ZONES, ROWS, UNHELD_TARGETS,
 };
 use super::registered_managed_resources::register;
+use super::unmanaged_configuration_target::not_a_managed_resource_message;
 use super::zonal_shift_lifecycle::{call, emulator, encoded, error_code, seeded};
 use service_com_amazonaws_arczonalshift_percdataplane::state::{
     PRACTICE_CONFIGURATION_MISSING_MESSAGE, PRACTICE_CONFIGURATION_MISSING_REASON,
-    TARGET_UNAVAILABLE_MESSAGE,
 };
 
 /// `UpdatePracticeRunConfiguration` over the wire: `PATCH
@@ -340,14 +340,13 @@ async fn a_change_for_a_target_arc_holds_nothing_for_is_refused_403() {
             answered, "AccessDeniedException",
             "case {case}: expected AccessDeniedException, got {body}"
         );
+        // The denial a call on a resource's practice run configuration answers names its
+        // subject; the table spanning that rule is `unmanaged_configuration_target.rs`.
+        let expected = not_a_managed_resource_message(target);
         assert_eq!(
             body["Message"].as_str(),
-            Some(TARGET_UNAVAILABLE_MESSAGE),
-            "case {case}: expected the non-disclosing refusal message, got {body}"
-        );
-        assert!(
-            !body.to_string().contains(target.as_str()),
-            "case {case}: the refusal must not disclose the target, got {body}"
+            Some(expected.as_str()),
+            "case {case}: expected {expected:?}, got {body}"
         );
     }
 }

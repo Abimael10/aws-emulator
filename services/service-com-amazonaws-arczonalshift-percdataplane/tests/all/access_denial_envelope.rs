@@ -13,12 +13,14 @@
 //!
 //! The rows below span the whole class rather than one recorded call: every operation
 //! that declares `AccessDeniedException` and can be denied over the wire, each of the
-//! five HTTP methods this service binds, and both documents the rule produces — the one
-//! that states ARC's reason about a RESOURCE the caller named
-//! (`crate::state::target_unavailable`), and the empty one for a denial taken on an
-//! identifier no target was resolved from (`crate::state::identifier_not_attributable`).
-//! Which of the two a given call gets is `access_denied_precedence.rs`'s and
-//! `refusal_disclosure.rs`'s subject; here it is one row's expected document.
+//! five HTTP methods this service binds, and every document the rule produces — the one
+//! that states the non-disclosing reason about a RESOURCE a traffic-shift mutation named
+//! (`crate::state::target_unavailable`), the one that names its subject for a call on a
+//! resource's practice run configuration (`crate::state::not_a_managed_resource`), and the
+//! empty one for a denial taken on an identifier no target was resolved from
+//! (`crate::state::identifier_not_attributable`). Which of them a given call gets is
+//! `access_denied_precedence.rs`'s, `refusal_disclosure.rs`'s and
+//! `unmanaged_configuration_target.rs`'s subject; here it is one row's expected document.
 //!
 //! The BOUNDARY is asserted too: an error the OPERATION answers — a modelled refusal and
 //! a framework-level one — keeps the protocol's own envelope, `__type` and the modelled
@@ -27,6 +29,7 @@
 
 use serde_json::{json, Value};
 
+use super::unmanaged_configuration_target::not_a_managed_resource_message;
 use super::zonal_shift_lifecycle::{emulator, encoded, error_code, refused, seeded, start_body};
 use service_com_amazonaws_arczonalshift_percdataplane::state::TARGET_UNAVAILABLE_MESSAGE;
 
@@ -64,7 +67,7 @@ struct Row {
     uri: String,
     body: String,
     /// The text the denial states, or `None` for a denial that states no reason.
-    reason: Option<&'static str>,
+    reason: Option<String>,
 }
 
 /// Every operation of this service that can be driven to a denial over the wire, with the
@@ -78,7 +81,7 @@ fn rows() -> Vec<Row> {
             method: "POST",
             uri: "/zonalshifts".to_string(),
             body: start_body(UNREGISTERED_ARN, "use1-az1", "1h", "a denied shift"),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(TARGET_UNAVAILABLE_MESSAGE.to_string()),
         },
         Row {
             case: "CancelZonalShift on an id ARC holds no shift for",
@@ -118,35 +121,35 @@ fn rows() -> Vec<Row> {
                 "comment": "a denied practice run",
             })
             .to_string(),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(TARGET_UNAVAILABLE_MESSAGE.to_string()),
         },
         Row {
             case: "CreatePracticeRunConfiguration for a resource ARC holds nothing for",
             method: "POST",
             uri: "/configuration".to_string(),
             body: practice_run_configuration(UNREGISTERED_ARN),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(not_a_managed_resource_message(UNREGISTERED_ARN)),
         },
         Row {
             case: "UpdatePracticeRunConfiguration for a resource ARC holds nothing for",
             method: "PATCH",
             uri: configuration_uri.clone(),
             body: json!({ "blockedDates": ["2026-01-01"] }).to_string(),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(not_a_managed_resource_message(UNREGISTERED_ARN)),
         },
         Row {
             case: "DeletePracticeRunConfiguration for a resource ARC holds nothing for",
             method: "DELETE",
             uri: configuration_uri,
             body: String::new(),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(not_a_managed_resource_message(UNREGISTERED_ARN)),
         },
         Row {
             case: "UpdateZonalAutoshiftConfiguration for a resource ARC holds nothing for",
             method: "PUT",
             uri: format!("/managedresources/{}", encoded(UNREGISTERED_ARN)),
             body: json!({ "zonalAutoshiftStatus": "ENABLED" }).to_string(),
-            reason: Some(TARGET_UNAVAILABLE_MESSAGE),
+            reason: Some(TARGET_UNAVAILABLE_MESSAGE.to_string()),
         },
     ]
 }
@@ -192,11 +195,11 @@ async fn every_denial_states_its_text_under_the_member_the_denial_envelope_names
             "case {:?}: a denial answers a JSON document, got {body}",
             row.case
         );
-        match row.reason {
+        match &row.reason {
             Some(expected) => {
                 assert_eq!(
                     body["Message"].as_str(),
-                    Some(expected),
+                    Some(expected.as_str()),
                     "case {:?}: expected the denial text at Message, got {body}",
                     row.case
                 );
