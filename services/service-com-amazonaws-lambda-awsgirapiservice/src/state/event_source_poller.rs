@@ -1382,6 +1382,7 @@ async fn move_batches(
                 &mut work.clients,
                 &stores.policies,
                 &failure_destination::FailedBatch {
+                    uuid,
                     run,
                     shard,
                     // The batch the mapping gave up on is the one it HANDED OVER: a record
@@ -2055,11 +2056,16 @@ pub(crate) struct Clients {
     kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
     dynamodbstreams: Option<(String, ::aws_sdk_dynamodbstreams::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
-    /// The two destination services the record of a discarded batch is written through
+    /// The destination services the record of a discarded batch is written through
     /// ([`failure_destination`]).
     sqs: Option<(String, ::aws_sdk_sqs::Client)>,
     /// See [`Self::sqs`].
     sns: Option<(String, ::aws_sdk_sns::Client)>,
+    /// See [`Self::sqs`]. Built by the workspace's one construction of the Amazon S3 client
+    /// an emulated service writes an object through rather than by the macro below, since an
+    /// object store takes a configuration of its own: it is addressed path-style, and the
+    /// object it stores carries the properties the write set and no others.
+    s3: Option<(String, ::aws_sdk_s3::Client)>,
 }
 
 /// Build each client the same way: over the in-process callback into this same emulator,
@@ -2111,6 +2117,26 @@ macro_rules! callback_client {
 }
 
 impl Clients {
+    /// The Amazon S3 client the record of a discarded batch is written as an object through,
+    /// remembering the Region it was built for exactly as every slot above does.
+    pub(crate) fn s3(
+        &mut self,
+        callback: &smithy_server_runtime::EmbeddedEmulator,
+        region: &str,
+    ) -> &::aws_sdk_s3::Client {
+        if self.s3.as_ref().is_none_or(|(held, _)| held != region) {
+            self.s3 = Some((
+                region.to_string(),
+                ::service_common::s3_client::s3_client(callback, region),
+            ));
+        }
+        &self
+            .s3
+            .as_ref()
+            .expect("the client for this region was just built")
+            .1
+    }
+
     callback_client!(kinesis, aws_sdk_kinesis, "kinesis");
     callback_client!(dynamodbstreams, aws_sdk_dynamodbstreams, "streams.dynamodb");
     callback_client!(lambda, aws_sdk_lambda, "lambda");

@@ -21,7 +21,11 @@
 //! * WHERE IT GOES IS WHAT THE MAPPING NAMES. `DestinationConfig$OnFailure` is "the
 //!   destination configuration for failed invocations", whose `Destination` is "the Amazon
 //!   Resource Name (ARN) of the destination resource", and a mapping naming none has nowhere
-//!   to record a discarded batch, so nothing is written for it.
+//!   to record a discarded batch, so nothing is written for it. HOW it goes there is the
+//!   destination service's own write ([`deliver`]): a message of the record for a queue or a
+//!   topic, and one OBJECT holding it for a bucket — under the prefix that destination names,
+//!   at a key of the batch's own coordinates ([`record_object_key_suffix`]), so one discarded
+//!   batch is one object and a reader lists them under that prefix.
 //! * A HEALTHY BATCH RECORDS NOTHING. The record exists for the batch Lambda gave up on, so
 //!   a batch that was processed — or one that is still being attempted — writes nothing to
 //!   the destination at all.
@@ -75,6 +79,9 @@ pub fn on_failure_destination(destination_config: Option<&DestinationConfig>) ->
 
 /// One batch a mapping has given up on: everything the record written for it is built from.
 pub(super) struct FailedBatch<'batch> {
+    /// The mapping's own `UUID`, which the KEY of the object a batch recorded in a bucket is
+    /// written under names ([`record_object_key_suffix`]).
+    pub(super) uuid: &'batch str,
     /// The mapping that read the batch, which names the function, the stream and the
     /// destination.
     pub(super) run: &'batch ShardSourcedMapping,
@@ -120,15 +127,9 @@ pub(super) async fn discard_batch(
         );
         return;
     }
-    let record = batch_record(batch, SystemTime::now());
-    let delivered = deliver(
-        callback,
-        clients,
-        &batch.run.region,
-        destination,
-        &record.to_string(),
-    )
-    .await;
+    let at = SystemTime::now();
+    let record = batch_record(batch, at);
+    let delivered = deliver(callback, clients, destination, &record.to_string(), batch, at).await;
     if let Err(detail) = delivered {
         // The write is not part of what any caller was told — no client asked for this batch
         // to be read — so a failure is reported here and nothing is retried.
@@ -283,29 +284,52 @@ fn stamped(record: &ShardRecord) -> Option<String> {
 /// Which call is made follows from the SERVICE the destination's ARN names, because a
 /// destination is a resource Lambda writes to with that service's own write. The kinds
 /// `OnFailure$Destination` enumerates for a shard source are "an Amazon SNS topic, Amazon SQS
-/// queue, or Amazon S3 bucket"; the two whose write is one message of the record travel here,
-/// and a destination of any other kind is reported as a record that was not written rather
-/// than counted as written.
+/// queue, or Amazon S3 bucket" — a message of the record for the first two, and ONE OBJECT
+/// holding it for the third ([`put_record_object`]) — and a destination of any other kind is
+/// reported as a record that was not written rather than counted as written.
 async fn deliver(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    stream_region: &str,
     destination: &str,
     body: &str,
+    batch: &FailedBatch<'_>,
+    at: SystemTime,
 ) -> Result<(), String> {
     let Some(parsed) = ::service_common::arn::parse(destination) else {
         return Err(format!("{destination} is no resource of any service"));
     };
-    // A resource is reached in the Region its OWN ARN names; an ARN that names none is
-    // reached where the stream is.
+    // A resource is reached in the Region its OWN ARN names; an ARN that names NONE — the
+    // partition-global form an Amazon S3 bucket's ARN takes — is reached where the stream
+    // is. A Region the ARN does state is held to the Region LABEL grammar every model's ARN
+    // pattern states for the field ([`::service_common::arn::region_label`]), because this
+    // is the one part of the destination that reaches the ADDRESS of the hop the write
+    // travels over: a value carrying a separator would re-point or truncate that address, so
+    // it names no Region any endpoint has and the record is reported as one that was not
+    // written rather than written to a Region the destination does not name.
     let region = if parsed.region.is_empty() {
-        stream_region
+        batch.run.region.as_str()
     } else {
-        parsed.region
+        let Some(stated) = ::service_common::arn::region_label(parsed.region) else {
+            return Err(format!(
+                "{destination} names no Region any endpoint has, so nothing was written to it"
+            ));
+        };
+        stated
     };
     match parsed.vendor {
         "sqs" => send_to_queue(callback, clients, region, parsed.resource, body).await,
         "sns" => publish_to_topic(callback, clients, region, destination, body).await,
+        "s3" => {
+            put_record_object(
+                callback,
+                clients,
+                region,
+                parsed.resource,
+                &record_object_key_suffix(batch, at),
+                body,
+            )
+            .await
+        }
         other => Err(format!(
             "this emulator writes no record to {other} for a failure destination, so nothing \
              was written to {destination}"
@@ -341,6 +365,98 @@ async fn send_to_queue(
             )
         })
         .map(|_accepted| ())
+}
+
+/// The bucket an Amazon S3 destination names, and the KEY PREFIX inside it that every record
+/// written to that destination sits under.
+///
+/// An S3 bucket's ARN has the bucket name as its whole resource field
+/// (`arn:aws:s3:::<bucket>`), so anything a caller writes after a `/` is a PLACE INSIDE the
+/// bucket rather than part of its name: `arn:aws:s3:::<bucket>/<prefix>` names the bucket and
+/// the prefix records of it are written under, and an ARN naming the bucket alone writes them
+/// at its root.
+///
+/// The prefix comes back ready for a key to be appended to it, with exactly one separator
+/// between every segment it names and one at its end, so two spellings of the same place name
+/// the same prefix and no key carries an empty segment.
+fn bucket_and_prefix(resource: &str) -> (&str, String) {
+    let (bucket, prefix) = resource.split_once('/').unwrap_or((resource, ""));
+    let segments: Vec<&str> = prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let prefix = if segments.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", segments.join("/"))
+    };
+    (bucket, prefix)
+}
+
+/// What the key of the object recording ONE discarded batch carries BELOW the prefix its
+/// destination names ([`bucket_and_prefix`]).
+///
+/// A bucket destination takes one object per discarded batch, so the key below the prefix has
+/// to tell two discarded batches apart, and everything that does so is already known about
+/// the batch: the instant the record was made, written as the date path a prefix is read in
+/// so a reader can ask for a day or an hour of records alone; then the mapping that gave up
+/// on the batch, the shard the batch was read from, and the window of sequence numbers it
+/// covered — the same window the record itself reports ([`batch_info`]). Nothing of it is
+/// drawn: the key of an object says WHICH batch it is about, so the same batch recorded again
+/// within that hour is the same object rather than a second one.
+fn record_object_key_suffix(batch: &FailedBatch<'_>, at: SystemTime) -> String {
+    let partition = ::chrono::DateTime::<::chrono::Utc>::from(at).format("%Y/%m/%d/%H");
+    let sequence_number = |record: Option<&ShardRecord>| {
+        record.map_or_else(String::new, |record| record.sequence_number.clone())
+    };
+    format!(
+        "{partition}/{uuid}/{shard}/{start}-{end}",
+        uuid = batch.uuid,
+        shard = batch.shard,
+        start = sequence_number(batch.records.first()),
+        end = sequence_number(batch.records.last()),
+    )
+}
+
+/// The media type the record of a discarded batch is stored under, which is what a later read
+/// of the object reports: the record is a JSON document.
+const RECORD_MEDIA_TYPE: &str = "application/json";
+
+/// `PutObject` the record as one object of the bucket the destination names, under the prefix
+/// that destination states ([`bucket_and_prefix`]) and at the key this batch takes
+/// ([`record_object_key_suffix`]).
+///
+/// The write travels over the same in-process hop every other call of this poller does, built
+/// by the workspace's one construction of the Amazon S3 client an emulated service writes an
+/// object through ([`::service_common::s3_client`]).
+async fn put_record_object(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    region: &str,
+    resource: &str,
+    key_suffix: &str,
+    body: &str,
+) -> Result<(), String> {
+    let (bucket, prefix) = bucket_and_prefix(resource);
+    let key = format!("{prefix}{key_suffix}");
+    clients
+        .s3(callback, region)
+        .put_object()
+        .bucket(bucket)
+        .key(&key)
+        .content_type(RECORD_MEDIA_TYPE)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            body.as_bytes().to_vec(),
+        ))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "s3:PutObject of {key} was not accepted ({})",
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })
+        .map(|_stored| ())
 }
 
 /// `Publish` the record to the topic the destination names.
@@ -491,6 +607,7 @@ mod tests {
             } = row;
             let run = run(source);
             let batch = FailedBatch {
+                uuid: MAPPING_UUID,
                 run: &run,
                 shard: "shardId-000000000000",
                 records: &records,
@@ -585,6 +702,162 @@ mod tests {
                      context, got {written}"
                 ),
             }
+        }
+    }
+
+    /// The `UUID` of the mapping whose discarded batches the rows above record — a well-formed
+    /// mapping id, which the key of a bucket destination's object carries.
+    const MAPPING_UUID: &str = "6c9a0e3b-9f3d-4a1e-8f27-1b2c3d4e5f60";
+
+    /// RULE: an Amazon S3 destination's ARN names the bucket in its resource field, and
+    /// everything after a `/` is the key PREFIX inside that bucket records are written under.
+    ///
+    /// The rows differ along what the rule generalises over: whether the ARN states a prefix at
+    /// all, how deep that prefix is, and how its separators are spelled.
+    #[test]
+    fn a_bucket_destination_names_a_bucket_and_the_prefix_inside_it() {
+        // (case, the ARN's resource field, the bucket, the prefix a key is written under)
+        let rows: [(&str, &str, &str, &str); 7] = [
+            ("the-bucket-alone", "failed-batches", "failed-batches", ""),
+            (
+                "a-one-segment-prefix",
+                "failed-batches/esm",
+                "failed-batches",
+                "esm/",
+            ),
+            (
+                "a-nested-prefix",
+                "failed-batches/esm/orders",
+                "failed-batches",
+                "esm/orders/",
+            ),
+            (
+                "a-prefix-spelled-with-a-trailing-separator",
+                "failed-batches/esm/",
+                "failed-batches",
+                "esm/",
+            ),
+            (
+                "a-prefix-spelled-with-doubled-separators",
+                "failed-batches//esm//",
+                "failed-batches",
+                "esm/",
+            ),
+            (
+                "a-nested-prefix-with-a-doubled-separator-inside-it",
+                "failed-batches/esm//orders",
+                "failed-batches",
+                "esm/orders/",
+            ),
+            (
+                "a-bucket-written-with-a-trailing-separator",
+                "failed-batches/",
+                "failed-batches",
+                "",
+            ),
+        ];
+        for (case, resource, bucket, prefix) in rows {
+            let (named, under) = bucket_and_prefix(resource);
+            assert_eq!(
+                (named, under.as_str()),
+                (bucket, prefix),
+                "case {case:?}: expected {bucket:?} under {prefix:?}, got {named:?} under \
+                 {under:?}"
+            );
+        }
+    }
+
+    /// RULE: a bucket destination takes ONE OBJECT per discarded batch, keyed below the
+    /// destination's prefix by the batch's own coordinates — the hour the record was made, the
+    /// mapping, the shard and the sequence-number window — so two discarded batches are two
+    /// objects and the same batch is the same object.
+    #[test]
+    fn each_discarded_batch_takes_its_own_key_under_the_prefix() {
+        let at: SystemTime = ::chrono::DateTime::parse_from_rfc3339("2026-10-26T07:44:05Z")
+            .expect("the fixture instant is a well-formed timestamp")
+            .into();
+        let run = run(ShardSource::Kinesis);
+        let first = record("49590338271490256608559692538361571095921575989136588898", None);
+        let second = record("49590338271490256608559692538361571095921575989136588899", None);
+
+        // The hour the instant above falls in, as the date path the key carries.
+        let partition = "2026/10/26/07";
+        let one = [first.clone()];
+        let both = [first.clone(), second.clone()];
+        let last = [second.clone()];
+        // (case, the batch, the key below the destination's prefix)
+        let rows: [(&str, FailedBatch<'_>, String); 4] = [
+            (
+                "a-batch-of-one-record",
+                discarded(&run, "shardId-000000000000", &one),
+                format!(
+                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
+                    first.sequence_number, first.sequence_number
+                ),
+            ),
+            (
+                "a-batch-spanning-a-window",
+                discarded(&run, "shardId-000000000000", &both),
+                format!(
+                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
+                    first.sequence_number, second.sequence_number
+                ),
+            ),
+            (
+                "the-next-batch-of-the-same-shard",
+                discarded(&run, "shardId-000000000000", &last),
+                format!(
+                    "{partition}/{MAPPING_UUID}/shardId-000000000000/{}-{}",
+                    second.sequence_number, second.sequence_number
+                ),
+            ),
+            (
+                "the-same-window-of-another-shard",
+                discarded(&run, "shardId-000000000001", &one),
+                format!(
+                    "{partition}/{MAPPING_UUID}/shardId-000000000001/{}-{}",
+                    first.sequence_number, first.sequence_number
+                ),
+            ),
+        ];
+        let mut keys: Vec<String> = Vec::new();
+        for (case, batch, expected) in rows {
+            let key = record_object_key_suffix(&batch, at);
+            assert_eq!(
+                key, expected,
+                "case {case:?}: expected the key {expected:?}, got {key:?}"
+            );
+            // The same batch recorded again is the same object, and no other batch shares it.
+            let again = record_object_key_suffix(&batch, at);
+            assert_eq!(
+                again, key,
+                "case {case:?}: the key of one batch must not change between writes, got \
+                 {again:?} after {key:?}"
+            );
+            assert!(
+                !keys.contains(&key),
+                "case {case:?}: every discarded batch must take its own key, but {key:?} is \
+                 already taken among {keys:?}"
+            );
+            keys.push(key);
+        }
+    }
+
+    /// One batch the mapping `run` names gave up on: the `records` it handed over, read from
+    /// `shard`, with the attempts and the answer left at one row's worth — the key of its
+    /// object is decided by the mapping, the shard and the records alone.
+    fn discarded<'batch>(
+        run: &'batch ShardSourcedMapping,
+        shard: &'batch str,
+        records: &'batch [ShardRecord],
+    ) -> FailedBatch<'batch> {
+        FailedBatch {
+            uuid: MAPPING_UUID,
+            run,
+            shard,
+            records,
+            attempts: 1,
+            answered: None,
         }
     }
 

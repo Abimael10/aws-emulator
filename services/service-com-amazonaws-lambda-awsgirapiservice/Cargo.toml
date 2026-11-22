@@ -167,7 +167,10 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # rather than carrying an input document in the body, so a handler's `boto3.client("s3")`
 # call cannot be built by the AWS JSON path the other reachable services share: this is the
 # client that builds, signs and parses it (`state::execution::aws_s3`), over the same
-# in-process callback.
+# in-process callback. It is also the client the record of a batch an event source mapping
+# gave up on is written through when its `DestinationConfig$OnFailure` names a BUCKET
+# (`state::event_source_poller::failure_destination`): that write is Amazon S3's own
+# `PutObject`.
 aws-sdk-s3 = { version = "1", default-features = false }
 # CloudFront binds every operation to a method, a path and an XML body of its own
 # (`restXml`) rather than carrying an input document in a JSON body, so a handler's
