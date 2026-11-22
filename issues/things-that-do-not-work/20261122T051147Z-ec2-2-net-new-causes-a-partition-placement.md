@@ -1,0 +1,42 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ec2.placement-partition-group-serves-distinct-partition-numbers-to-the-guests ec2.placement-partition-number-above-the-group-count-rejected
+Issue-Shape-Id: com.amazonaws.ec2#AmazonEC2
+Issue-Key: ec2.placement-partition-group-serves-distinct-partition-numbers-to-the-guests|run#26|AssertionError|assert recs[0].get("id") == iid, (
+Issue-Key: ec2.placement-partition-number-above-the-group-count-rejected|run#19|AssertionError|assert (code, message) == expected, (
+Issue-Commit: 4528b778465addf20721967dea781c4ddd900890
+
+# ec2: 2 net-new causes — a partition placement group's facts never reach the guest (IMDS answers 200 with an empty body for instance-id), and RunInstances' out-of-range PartitionNumber refusal Message is emulator-authored
+
+> _Note: this issue was identified against the code base at commit `4528b778465addf20721967dea781c4ddd900890`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+RunInstances
+
+## Description
+Two net-new root causes on EC2 partition placement groups. They are separate causes: one is a missing guest-side (IMDS) surface, the other is the wording of a control-plane refusal; a fix for either does not close the other.
+
+Cause 1 of 2: an instance launched into a partition placement group cannot read its own identity or placement from IMDS inside the guest — the metadata read succeeds with HTTP 200 but an EMPTY body, so instance-id (and with it placement/group-name and placement/partition-number) comes back as the empty string.
+AWS: a running instance serves IMDS on 169.254.169.254; after a PUT to /latest/api/token, GET /latest/meta-data/instance-id returns the reading instance's own id, /latest/meta-data/placement/availability-zone its zone, /latest/meta-data/placement/group-name the placement group it was launched into, and /latest/meta-data/placement/partition-number the partition it was placed in (served only for an instance that really is in a partition group). Smithy: RunInstances input member Placement -> Placement.PartitionNumber — "The number of the partition that the instance is in. Valid only if the placement group strategy is set to partition." The IMDS wire surface itself is not modelled, so for the guest-side behaviour this is recorded behavior only.
+Emulator: the guest runs the probe successfully (SSM Run Command invocation Status Success, exit 0, one parseable output line), but the IMDS reads return 200 with no body, so the probe prints instance-id as empty: "the guest that answered for <instance-id> reports instance-id ''; the measurement would be about a different machine". The instance id in the message is the per-run id of the instance the check launched; the requirement is that IMDS echoes whichever instance is reading it, never an empty body on a 200. Because the body is empty rather than a non-200, the guest cannot even distinguish "not served" from "served as nothing". The open issue 20261115T003554Z-ec2-guests-observe-nothing-in-guest-commands-exit.md describes this same family (its Cause 3 covers the empty instance-id read, and its sibling check ec2.placement-cluster-group-members-read-one-shared-zone-and-their-group-in-guest), but it does not carry this check's replay key, so this cause is filed with it named.
+Why: a client that spreads instances across partitions to survive correlated hardware failure has no way to confirm the placement reached the machine rather than only the instance record; and more broadly cloud-init, the SSM agent and every in-guest credential provider key off /latest/meta-data/instance-id, so an empty answer silently unattributes every in-guest measurement.
+Fix: the guest-facing IMDS endpoint and the per-instance metadata state behind it — specifically the placement category (group-name, partition-number, availability-zone) and instance-id must be materialised from the instance's own record at launch.
+Traces: ec2.placement-partition-group-serves-distinct-partition-numbers-to-the-guests.
+
+Cause 2 of 2: RunInstances refuses a PartitionNumber above the group's PartitionCount with the right error code but the wrong Message — the text is emulator-authored instead of AWS's.
+AWS: HTTP 400, Error Code InvalidParameterValue, Message "Value '<requested PartitionNumber>' is not a valid value for PartitionNumber. Use a value between 1 and <the group's PartitionCount>." The fixed text is "Value '" ... "' is not a valid value for PartitionNumber. Use a value between 1 and " ... "."; the two variable parts are the PartitionNumber taken from the request and the PartitionCount of the placement group named in the request (state). Smithy: Placement.PartitionNumber as quoted above; EC2 models no dedicated error shape for this, so the status/code/message are recorded behavior only.
+Emulator: same HTTP 400 and same code InvalidParameterValue, but Message 'Value (3) for parameter partitionNumber is invalid. Expecting 1-2.' — different fixed text, a different quoting convention for the value, and the lower-camel member name 'partitionNumber' instead of the modelled 'PartitionNumber'.
+Why: clients and operators match on refusal text (log scrapers, retry/branch logic, user-facing error surfacing); a re-worded message makes a correctly refused launch look like a different failure, and the lower-camel member name points the reader at a parameter the API does not document.
+Fix: the RunInstances handler's placement validation — the message template for the out-of-range PartitionNumber refusal.
+Traces: ec2.placement-partition-number-above-the-group-count-rejected.
+
+## Evidence
+Cause 1 — Expected: with the instance launched into partition 1 and 3 of a 3-partition group, each guest's IMDS read returns its own instance-id, its placement group name, its partition number and its zone. Actual: AssertionError: the guest that answered for i-00000000000000001 reports instance-id ''; the measurement would be about a different machine. The probe shell script (`TOK=$(curl -X PUT .../latest/api/token)`, then `curl -w "%{http_code}" -H "X-aws-ec2-metadata-token: $TOK" .../latest/meta-data/instance-id`) prints `__http<code>` on any non-200 and the body on 200; it printed neither a code nor an id, i.e. the emulator answered 200 with an empty body. SSM reported the invocation Status 'Success' with ResponseCode 0, so the guest itself executed — only the metadata service is empty. (check ec2.placement-partition-group-serves-distinct-partition-numbers-to-the-guests)
+
+Cause 2 — Expected: ('InvalidParameterValue', "Value '3' is not a valid value for PartitionNumber. Use a value between 1 and 2."). Actual: ('InvalidParameterValue', 'Value (3) for parameter partitionNumber is invalid. Expecting 1-2.'). HTTP status and error code agree; only the Message diverges. The 3 and the 1-2 range are the request's PartitionNumber and the created group's PartitionCount (the check builds a 2-partition group and asks for PartitionCount+1), not AWS constants. (check ec2.placement-partition-number-above-the-group-count-rejected)
+
+## Steps to Reproduce
+Cause 1: CreatePlacementGroup(GroupName=<g>, Strategy='partition', PartitionCount=3); RunInstances a t3.micro from the current Amazon Linux AMI into a subnet with egress and an SSM-capable instance profile, with Placement={GroupName:<g>, PartitionNumber:1}, and a second one with PartitionNumber:3; wait for both 'running'. DescribeInstances already reports the right GroupName/PartitionNumber. Then inside each guest (e.g. via SSM AWS-RunShellScript) PUT /latest/api/token and GET http://169.254.169.254/latest/meta-data/instance-id, .../placement/availability-zone, .../placement/group-name and .../placement/partition-number: AWS returns the instance's own id, zone, group name and partition number; the emulator answers 200 with an empty body for each, so the guest prints empty values.
+
+Cause 2: CreatePlacementGroup(GroupName=<g>, Strategy='partition', PartitionCount=2), then RunInstances(..., Placement={GroupName:<g>, PartitionNumber:3}): AWS refuses with HTTP 400 InvalidParameterValue and Message "Value '3' is not a valid value for PartitionNumber. Use a value between 1 and 2."; the emulator refuses with the same code but Message 'Value (3) for parameter partitionNumber is invalid. Expecting 1-2.'
