@@ -1600,13 +1600,21 @@ fn gateway_tags(properties: &Value, propagated: &[(String, String)]) -> Map<Stri
 ///
 /// Every member of these types is the property with its initial letter lower-cased, all the
 /// way down ([`lower_camel_members`]), with two exceptions this reading carries: a property
-/// whose value is a map KEYED BY THE CALLER's own data ([`DATA_KEYED`]) travels exactly as
-/// the declaration spells it, since those keys are a stage variable's name, a mapping
-/// expression or a content type and not modelled member names; and a canary setting is
+/// whose value is a map KEYED BY THE CALLER's own data ([`CALLER_KEYED`]) keeps its keys
+/// exactly as the declaration spells them, since those keys are a stage variable's name, a
+/// mapping expression or a content type and not modelled member names; and a canary setting is
 /// mapped member by member ([`canary_settings`]), because one of ITS members is such a map.
 fn member_value(property: &str, value: &Value) -> Result<Value, Refusal> {
-    if DATA_KEYED.contains(&property) {
-        return Ok(value.clone());
+    if let Some((_, values)) = CALLER_KEYED
+        .iter()
+        .find(|(keyed, _)| *keyed == property)
+    {
+        return Ok(match values {
+            // The crate's one reading of a declaration whose member the owning model types as
+            // a collection of text, shared with every other provisioning arm that reaches one.
+            KeyedValues::Text => super::modelled_declaration::text_throughout(value),
+            KeyedValues::AsWritten => value.clone(),
+        });
     }
     if CANARY_PROPERTIES.contains(&property) {
         return canary_settings(value);
@@ -1614,19 +1622,42 @@ fn member_value(property: &str, value: &Value) -> Result<Value, Refusal> {
     lower_camel_members(value, 0)
 }
 
-/// The properties whose value is a MAP the caller keys: a stage variable by its name, a
+/// What API Gateway takes the VALUES of one caller-keyed map as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedValues {
+    /// A map of string to STRING. A template may state a NUMBER or a BOOLEAN literal where a
+    /// property takes a string — "all property values in a template are strings" — so what
+    /// travels for one of these is the TEXT that literal spells, the same rendering every
+    /// other member whose value a declaration may spell as a literal travels as.
+    Text,
+    /// A map whose values are of some other modelled type, which travel exactly as the
+    /// declaration spells them.
+    AsWritten,
+}
+
+/// The properties whose value is a MAP the caller keys — a stage variable by its name, a
 /// request or response parameter by its mapping expression, a template or a model by the
-/// content type it is for. Re-casing one of those keys would change what the declaration
-/// asked for, so such a map travels as written.
-const DATA_KEYED: &[&str] = &[
-    "RequestModels",
-    "RequestParameters",
-    "RequestTemplates",
-    "ResponseModels",
-    "ResponseParameters",
-    "ResponseTemplates",
-    "StageVariableOverrides",
-    "Variables",
+/// content type it is for — each beside what API Gateway takes that map's values as.
+///
+/// Re-casing one of those keys would change what the declaration asked for, so the keys of
+/// every one of them travel as written. The VALUES are per entry, which is why they are
+/// carried here rather than in a second list: a stage variable's value, a mapping template and
+/// the name of the model a content type is read with are strings (`Stage$variables`,
+/// `Integration$requestTemplates`, `IntegrationResponse$responseTemplates`,
+/// `Method$requestModels`, `MethodResponse$responseModels` and
+/// `CanarySettings$stageVariableOverrides` are each `MapOfStringToString`), while the two
+/// PARAMETER maps say whether a parameter is required and are taken as booleans
+/// (`Method$requestParameters`, `MethodResponse$responseParameters` are each
+/// `MapOfStringToBoolean`).
+const CALLER_KEYED: &[(&str, KeyedValues)] = &[
+    ("RequestModels", KeyedValues::Text),
+    ("RequestParameters", KeyedValues::AsWritten),
+    ("RequestTemplates", KeyedValues::Text),
+    ("ResponseModels", KeyedValues::Text),
+    ("ResponseParameters", KeyedValues::AsWritten),
+    ("ResponseTemplates", KeyedValues::Text),
+    ("StageVariableOverrides", KeyedValues::Text),
+    ("Variables", KeyedValues::Text),
 ];
 
 /// The properties carrying a canary setting: a deployment's own, and the one a stage (or a
@@ -1643,7 +1674,7 @@ const CANARY_MEMBERS: &[(&str, &str)] = &[
 ];
 
 /// One declared canary setting as the member it travels as, mapped member by member rather
-/// than walked: its `StageVariableOverrides` is a map the caller keys ([`DATA_KEYED`]).
+/// than walked: its `StageVariableOverrides` is a map the caller keys ([`CALLER_KEYED`]).
 fn canary_settings(declared: &Value) -> Result<Value, Refusal> {
     let mut mapped = Map::new();
     for (property, member) in CANARY_MEMBERS {

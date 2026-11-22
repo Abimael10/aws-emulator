@@ -96,6 +96,10 @@
 use std::collections::BTreeMap;
 
 use ::serde_json::{json, Map, Value};
+// IAM's own catalogue of the managed policies AWS publishes: WHICH names AWS publishes a
+// policy under, and WHERE it files each one, which is part of the ARN a policy a `Policies`
+// entry names BY NAME is attached under ([`managed_policy_arn`]).
+use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::aws_managed_policy_named;
 
 use super::template::{declared_transforms, MAX_TEMPLATE_DEPTH, PARTITION};
 
@@ -280,6 +284,10 @@ const CREATED_BY_TAG: (&str, &str) = ("lambda:createdBy", "SAM");
 /// Spelled with the partition rather than `${AWS::Partition}`, which is how the recorded
 /// expansion spells every ARN it writes: the transform runs in one partition and names it.
 const BASIC_EXECUTION_POLICY: &str = "iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
+
+/// What an ARN begins with, which is what tells an ARN from a NAME in the one `Policies`
+/// entry that can be either ([`managed_policy_arn`]).
+const ARN_PREFIX: &str = "arn:";
 
 /// The managed policy the role a function executes as needs for one EVENT SOURCE TYPE:
 /// an event source the Lambda service READS FROM on the function's behalf is polled with
@@ -1297,7 +1305,9 @@ fn declared_policies(policies: Option<&Value>) -> Vec<Value> {
 /// order:
 ///
 /// * "a list of … AWS managed policy names, or … policy ARNs" — a string names a policy to
-///   attach, which is a `ManagedPolicyArns` entry and no inline policy at all;
+///   attach, which is a `ManagedPolicyArns` entry and no inline policy at all, under the ARN
+///   AWS publishes that policy at where the entry names it by NAME
+///   ([`managed_policy_arn`]);
 /// * an IAM policy document, which `Statement` is what makes a value one — embedded as it
 ///   is stated;
 /// * "a list of AWS SAM policy templates" — a single-member object naming a published
@@ -1315,8 +1325,8 @@ fn role_policies(logical_id: &str, properties: &Value) -> (Vec<Value>, Vec<Value
         .enumerate()
     {
         let document = match policy {
-            Value::String(_) => {
-                managed.push(policy.clone());
+            Value::String(declared) => {
+                managed.push(json!(managed_policy_arn(declared)));
                 continue;
             }
             Value::Object(_) if policy.get("Statement").is_some() => Some(policy.clone()),
@@ -1332,6 +1342,37 @@ fn role_policies(logical_id: &str, properties: &Value) -> (Vec<Value>, Vec<Value
         }
     }
     (managed, inline)
+}
+
+/// The ARN the managed policy a `Policies` STRING entry names is attached under.
+///
+/// "Each value can be the name of an AWS managed policy" or that policy's ARN, so an entry
+/// that is already an ARN is attached exactly as the declaration spells it, and a bare NAME
+/// is resolved to the ARN AWS publishes that policy under:
+/// `arn:<partition>:iam::aws:policy<path><name>`, which is the value `ManagedPolicyArns`
+/// takes — a name is not one, so a role declared with one is a role IAM refuses.
+///
+/// WHERE AWS files a published policy is part of that ARN (`/service-role/` for the ones it
+/// files there, `/` for the rest), so a name is resolved through IAM's own catalogue of the
+/// policies AWS publishes ([`aws_managed_policy_named`]) — the one reading of where a policy
+/// lives, so the name and the ARN of one policy never name two different policies.
+///
+/// A name that catalogue publishes NO policy under resolves to nothing, and is left exactly as
+/// the declaration spelled it: `ManagedPolicyArns` takes ARNs, so the role IAM is then asked to
+/// create is one it refuses, and the stack rolls back — which is what becomes of a template
+/// naming a managed policy that does not exist.
+fn managed_policy_arn(declared: &str) -> String {
+    if declared.is_empty() || declared.starts_with(ARN_PREFIX) {
+        return declared.to_string();
+    }
+    match aws_managed_policy_named(declared) {
+        // The catalogue's own spelling of the policy, which is the identity the ARN names.
+        Some(entry) => arn(&format!(
+            "iam::aws:policy{}{}",
+            entry.path, entry.policy_name
+        )),
+        None => declared.to_string(),
+    }
 }
 
 /// The template a policy-template entry names and the parameters it states for it: a

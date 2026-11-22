@@ -19,6 +19,10 @@
 //! own validation is what judges it. A member whose keys are the REQUESTER's rather than the
 //! model's — a function's environment variables, a tag set, a weight per version — is classified
 //! as the whole subtree it is, because no name inside it says anything about a modelled type.
+//!
+//! The reading goes BOTH ways, because the mismatch does: a member the model types as a string
+//! takes the TEXT a number or a boolean literal spells, since a template may state one there and
+//! "all property values in a template are strings".
 
 use ::serde_json::Value;
 
@@ -35,10 +39,12 @@ pub(in crate::state) enum ModelledScalar {
     /// A boolean, written `true` or `false` in either case.
     Boolean,
     /// A member the owning model types as a collection of TEXT whose keys are the
-    /// requester's own (a function's environment variables, a tag set): the member and
-    /// everything under it travels exactly as the declaration wrote it, because a value that
-    /// merely LOOKS like a number is still text there — and the names inside it are the
-    /// requester's, so none of them says anything about a modelled type.
+    /// requester's own (a function's environment variables, a tag set): every scalar under
+    /// the member is the TEXT it spells, so text travels as the declaration wrote it — a
+    /// value that merely LOOKS like a number is still text there — and a number or a boolean
+    /// literal travels as the text that literal spells, which is the value such a member
+    /// takes. The names inside it are the requester's, so none of them says anything about a
+    /// modelled type.
     TextThroughout,
     /// A member the owning model types as a collection of NUMBERS whose keys are the
     /// requester's own (a weight per function version): every scalar under it is read as a
@@ -82,7 +88,7 @@ fn modelled_at(
         // The two classifications that are about the whole SUBTREE under a member rather than
         // about one scalar: a collection the model types as text, and one it types as numbers,
         // both keyed by names of the requester's own.
-        (ModelledScalar::TextThroughout, _) => value.clone(),
+        (ModelledScalar::TextThroughout, _) => text_at(value, depth),
         (ModelledScalar::NumberThroughout, _) => numbers_throughout(value, depth),
         (ModelledScalar::Number, Value::String(text)) => {
             as_number(text).unwrap_or_else(|| value.clone())
@@ -102,6 +108,45 @@ fn modelled_at(
             entries
                 .iter()
                 .map(|entry| modelled_at(member, entry, depth + 1, modelled_as))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// [`ModelledScalar::TextThroughout`] over one value, for a caller that knows the member it
+/// holds takes a collection of TEXT without classifying a member name for it: the caller-keyed
+/// maps an API Gateway call takes as maps of string to string are read this way.
+pub(in crate::state) fn text_throughout(value: &Value) -> Value {
+    text_at(value, 0)
+}
+
+/// [`ModelledScalar::TextThroughout`] over one value: every scalar under it as the TEXT it
+/// spells, at the same bound the rest of the walk keeps.
+///
+/// The rendering is the crate's one reading of a declared value as the text a member takes
+/// ([`crate::state::provisioner::attribute_text`]), so a number, a boolean and a string spell
+/// here exactly what they spell for every other member whose value travels as text. A `null`
+/// states nothing and is left as it stands, which is what every caller of this layer reads it
+/// as.
+fn text_at(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_MODELLED_NESTING {
+        return value.clone();
+    }
+    match value {
+        Value::Number(_) | Value::Bool(_) => {
+            Value::String(crate::state::provisioner::attribute_text(value))
+        }
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, held)| (name.clone(), text_at(held, depth + 1)))
+                .collect(),
+        ),
+        Value::Array(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|entry| text_at(entry, depth + 1))
                 .collect(),
         ),
         _ => value.clone(),
@@ -206,6 +251,23 @@ mod tests {
                 "a collection of text, whose own keys name modelled members",
                 serde_json::json!({"Variables": {"TTL": "60", "DisableScaleIn": "true"}}),
                 serde_json::json!({"Variables": {"TTL": "60", "DisableScaleIn": "true"}}),
+            ),
+            (
+                "number and boolean literals inside a collection of text",
+                serde_json::json!({"Variables": {
+                    "RETRIES": 3,
+                    "RATIO": 1.5,
+                    "DEBUG": true,
+                    "QUIET": false,
+                    "NAME": "reader"
+                }}),
+                serde_json::json!({"Variables": {
+                    "RETRIES": "3",
+                    "RATIO": "1.5",
+                    "DEBUG": "true",
+                    "QUIET": "false",
+                    "NAME": "reader"
+                }}),
             ),
             (
                 "a collection of numbers, keyed by names of the requester's own",
