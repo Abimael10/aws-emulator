@@ -11,15 +11,19 @@
 //! `UPDATED`, with the new version as its active one, once the clock has made the build
 //! due. An image whose own lifecycle work is still in flight has no settled record to
 //! build the next version from, so the update is refused with HTTP 400
-//! `ValidationException`; a request whose build inputs cannot resolve is refused the
-//! same way; a well-formed identifier naming no image of this account is HTTP 404, a
-//! value that is no identifier of this API is HTTP 400, and an identifier of the
-//! AWS-owned namespace is HTTP 403 before any lookup.
+//! `ValidationException`, while an image whose own build has SETTLED admits one whether
+//! that build succeeded or FAILED — which is how a failed build is repaired; a request
+//! whose build inputs cannot resolve is refused the same way; a well-formed identifier
+//! naming no image of this account is HTTP 404, a value that is no identifier of this API
+//! is HTTP 400, and an identifier of the AWS-owned namespace is HTTP 403 before any
+//! lookup.
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
-//! (`emulator`, `call`, `image_body`, …) is the one `microvm_lifecycle` owns, and the
-//! version listing is the read-back path `image_version_listing` owns.
+//! (`emulator`, `call`, `image_body`, …) is the one `microvm_lifecycle` owns, the version
+//! listing is the read-back path `image_version_listing` owns, and the router with the
+//! object store a build resolves its `codeArtifact` against — what decides the branch a
+//! build settles on — is `image_build_outcome`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
@@ -27,8 +31,9 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_not_updatable_message, invalid_arn_format_message, latest_managed_base_image_version,
     managed_base_image_arn, managed_network_connector_arn, next_image_version, service_state,
     too_many_image_versions_message, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
-    DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB, MANAGED_BASE_IMAGE_IDS,
-    MAX_MICROVM_IMAGE_VERSIONS,
+    DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB, IMAGE_STATE_CREATED,
+    IMAGE_STATE_CREATE_FAILED, IMAGE_STATE_UPDATED, IMAGE_STATE_UPDATING, MANAGED_BASE_IMAGE_IDS,
+    MAX_MICROVM_IMAGE_VERSIONS, VERSION_STATUS_ACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -904,4 +909,203 @@ async fn a_retried_update_replays_the_version_its_client_token_minted() {
         Some("3.0"),
         "a different token mints the next version, got {next}"
     );
+}
+
+/// The bucket this suite's repair rows stage their artifact in, and the key of the one
+/// object a build that must SUCCEED resolves.
+const REPAIR_BUCKET: &str = "repair-artifacts";
+/// The key of that staged object, so a corrected `codeArtifact` addresses something the
+/// object store really serves.
+const REPAIR_KEY: &str = "app.zip";
+
+/// The `codeArtifact$uri` of the staged object — the address a build settles the SUCCESS
+/// branch on.
+fn repair_uri() -> String {
+    format!("s3://{REPAIR_BUCKET}/{REPAIR_KEY}")
+}
+
+/// Every `imageVersion` the image `identifier` holds, as its own listing reports them.
+async fn held_versions(router: &MultiServiceRouter, identifier: &str, case: &str) -> Vec<String> {
+    let (status, body) = list_versions(router, identifier, "").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: listing the versions of {identifier:?} got {status} {body}"
+    );
+    body["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: items is a list, got {body}"))
+        .iter()
+        .map(|item| item["imageVersion"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The state the store holds for the image `identifier`, as the image's own read reports
+/// it.
+async fn settled_state(router: &MultiServiceRouter, identifier: &str, case: &str) -> String {
+    let (status, body) = get_image(router, identifier).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: reading {identifier:?} got {status} {body}"
+    );
+    body["state"].as_str().unwrap_or_default().to_string()
+}
+
+/// RULE: the update carries the whole configuration, so it starts the next version's build
+/// from any image whose own create-or-update lifecycle has SETTLED — on the success branch
+/// or on the failure branch alike: the call is accepted with HTTP 200 reporting `UPDATING`
+/// and a newly minted `<n>.0` version, the image's listing then reports that version beside
+/// the ones it already held, and the build the update started settles the image on its own
+/// clock with that version active. A build that failed is therefore repaired by re-stating
+/// a corrected configuration, not only by deleting the image (the states that admit no
+/// update at all are `image_refusal_paths`').
+#[tokio::test]
+async fn an_update_is_accepted_whichever_branch_the_images_build_settled_on() {
+    // The router carrying the object store a build resolves its `codeArtifact` against, so
+    // each row's first build settles on the branch its own artifact address leads to.
+    let router = crate::image_build_outcome::emulator();
+    crate::image_build_outcome::stage_object(&router, REPAIR_BUCKET, REPAIR_KEY).await;
+
+    // Rows differ in the branch the FIRST build settled on and in why it settled there: an
+    // artifact the object store serves, one whose bucket it does not serve, and one whose
+    // key the served bucket does not hold.
+    let rows: Vec<(&str, &str, String, &str)> = vec![
+        (
+            "an artifact the object store serves",
+            "settled-built",
+            repair_uri(),
+            IMAGE_STATE_CREATED,
+        ),
+        (
+            "a bucket the object store does not serve",
+            "settled-absent-bucket",
+            "s3://no-such-bucket/app.zip".to_string(),
+            IMAGE_STATE_CREATE_FAILED,
+        ),
+        (
+            "a key the served bucket does not hold",
+            "settled-absent-key",
+            format!("s3://{REPAIR_BUCKET}/no-such-key.zip"),
+            IMAGE_STATE_CREATE_FAILED,
+        ),
+    ];
+
+    for (case, name, create_uri, expected_state) in rows {
+        let created = create_image(
+            &router,
+            name,
+            json!({"codeArtifact": {"uri": create_uri}, "description": "first"}),
+        )
+        .await;
+        let image_arn = created["imageArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the create mints an ARN, got {created}"))
+            .to_string();
+
+        // The settle set a client's own poll waits for: both branches of the create
+        // lifecycle, reached on the emulator's clock rather than after a fixed wait.
+        poll_until(case, "the creation's build has settled", || async {
+            let state = settled_state(&router, &image_arn, case).await;
+            state == IMAGE_STATE_CREATED || state == IMAGE_STATE_CREATE_FAILED
+        })
+        .await;
+        let settled = settled_state(&router, &image_arn, case).await;
+        assert_eq!(
+            settled, expected_state,
+            "case {case:?}: the creation's build must settle on {expected_state}, got {settled:?}"
+        );
+
+        let built = held_versions(&router, &image_arn, case).await;
+        assert_eq!(
+            built.len(),
+            1,
+            "case {case:?}: the create built exactly one version, got {built:?}"
+        );
+
+        // The repair: the same call, carrying a corrected artifact.
+        let request = update_body(json!({
+            "codeArtifact": {"uri": repair_uri()},
+            "description": "second",
+        }));
+        let (status, updated) = update_image(&router, &image_arn, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a settled image admits an update, got {status} {updated}"
+        );
+        assert_eq!(
+            updated["state"].as_str(),
+            Some(IMAGE_STATE_UPDATING),
+            "case {case:?}: the accepted update puts the image's build in flight, got {updated}"
+        );
+        // The label is the crate's own next `major.minor` after the versions the image
+        // held, taken from the mint rather than written as a literal.
+        let minted = next_image_version(built.iter().map(String::as_str));
+        assert_eq!(
+            updated["imageVersion"].as_str(),
+            Some(minted.as_str()),
+            "case {case:?}: expected the next version {minted:?}, got {updated}"
+        );
+        assert!(
+            !built.contains(&minted),
+            "case {case:?}: the update mints a version the image did not hold, got {minted:?} \
+             among {built:?}"
+        );
+
+        // The version history the update grew: the version the create built and the one
+        // this call minted, both reported by the image's own listing.
+        let after = held_versions(&router, &image_arn, case).await;
+        assert_eq!(
+            after.len(),
+            built.len() + 1,
+            "case {case:?}: expected {} versions, got {after:?}",
+            built.len() + 1
+        );
+        for version in built.iter().chain(std::iter::once(&minted)) {
+            assert!(
+                after.contains(version),
+                "case {case:?}: the listing reports {version:?}, got {after:?}"
+            );
+        }
+
+        // The build the update started settles on the clock, so an image whose first build
+        // failed ends up serving the version this call minted: the record was repairable.
+        poll_until(case, "the update's build has settled", || async {
+            settled_state(&router, &image_arn, case).await == IMAGE_STATE_UPDATED
+        })
+        .await;
+        let (status, repaired) = get_image(&router, &image_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: re-reading the image got {status} {repaired}"
+        );
+        assert_eq!(
+            repaired["latestActiveImageVersion"].as_str(),
+            Some(minted.as_str()),
+            "case {case:?}: the version the update built becomes the active one, got {repaired}"
+        );
+        let entry = version_entry(&router, &image_arn, &minted, case).await;
+        assert_eq!(
+            entry["status"].as_str(),
+            Some(VERSION_STATUS_ACTIVE),
+            "case {case:?}: the version the update built is the launchable one, got {entry}"
+        );
+
+        // And the settled UPDATE branch admits the next update in turn: the rule is about a
+        // settled lifecycle, not about the first one.
+        let (status, again) = update_image(
+            &router,
+            &image_arn,
+            update_body(json!({"codeArtifact": {"uri": repair_uri()}})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a settled update admits a further one, got {status} {again}"
+        );
+        let third = next_image_version(after.iter().map(String::as_str));
+        assert_eq!(
+            again["imageVersion"].as_str(),
+            Some(third.as_str()),
+            "case {case:?}: expected the next version {third:?}, got {again}"
+        );
+    }
 }

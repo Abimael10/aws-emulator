@@ -17,10 +17,10 @@
 //!   account's own image namespace holds no children at gets a TERMINAL EMPTY PAGE, while
 //!   an identifier of ANOTHER namespace is still denied (403) and a value that is no
 //!   identifier of this API at all is still a bad request (400);
-//! * `UpdateMicrovmImage` starts from the image's CURRENT state, so only a record whose
-//!   own lifecycle work has settled on a version it built admits an update — every other
-//!   `MicrovmImageState` value is refused with the modelled `ValidationException`
-//!   (HTTP 400) and leaves the record exactly as it was.
+//! * `UpdateMicrovmImage` starts from the image's CURRENT state, so a record whose own
+//!   lifecycle work has SETTLED admits an update, whether that work succeeded or failed —
+//!   while an in-flight value and the values of a deletion are refused with the modelled
+//!   `ValidationException` (HTTP 400) and leave the record exactly as it was.
 //!
 //! Each test states its rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -34,8 +34,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::ops::types::MICROVM_IMA
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_not_updatable_message, invalid_arn_format_message,
     managed_base_image_arn, service_state, version_address_image_not_found_message,
-    FIRST_IMAGE_VERSION, IMAGE_STATE_CREATE_FAILED, MANAGED_BASE_IMAGE_IDS,
-    VERSION_STATUS_INACTIVE,
+    FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, VERSION_STATUS_INACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -47,7 +46,7 @@ use crate::image_version_status_publication::publish_status;
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
     as_uri_value, call, emulator, emulator_with_engine, expected_image_arn, image_body, poll_until,
-    run_microvm, ACCOUNT, PAST_THE_SPAN, REGION,
+    run_microvm, ACCOUNT, REGION,
 };
 
 /// A build role ARN: `RoleArn`, pattern
@@ -548,20 +547,21 @@ async fn an_address_holding_no_children_gets_a_terminal_empty_page() {
     }
 }
 
-/// RULE: `UpdateMicrovmImage` builds the next version from the image's CURRENT record, so
-/// only a state whose lifecycle settled on a version it built admits one — `CREATED`,
-/// `UPDATED` and `UPDATE_FAILED` of the nine `MicrovmImageState` values
-/// (`smithy_query(query="shape",shape="MicrovmImageState")`). Every other value is
-/// refused with HTTP 400 `ValidationException` naming the image's own ARN, and the
-/// refused call leaves the record in the state it found it in.
+/// RULE: `UpdateMicrovmImage` starts the next build from the image's CURRENT record, so
+/// every state in which that record's own create-or-update lifecycle has SETTLED admits one
+/// — `CREATED`, `CREATE_FAILED`, `UPDATED` and `UPDATE_FAILED` of the nine
+/// `MicrovmImageState` values (`smithy_query(query="shape",shape="MicrovmImageState")`).
+/// Every other value — an in-flight lifecycle, and the one-way values of a deletion — is
+/// refused with HTTP 400 `ValidationException` naming the image's own ARN, and the refused
+/// call leaves the record in the state it found it in.
 #[tokio::test]
 async fn an_update_is_refused_for_every_state_that_admits_none() {
     let (router, engine) = emulator_with_engine();
 
     // Rows span the WHOLE published enum, so the table is the state dimension itself
     // rather than a sample of it; the states an update may start from are the settled
-    // values of the lifecycles that built a version.
-    let admits_update = ["CREATED", "UPDATED", "UPDATE_FAILED"];
+    // values of the create and update lifecycles, whichever branch they settled on.
+    let admits_update = ["CREATED", "CREATE_FAILED", "UPDATED", "UPDATE_FAILED"];
     assert_eq!(
         MICROVM_IMAGE_STATE_VALUES.len(),
         9,
@@ -574,15 +574,13 @@ async fn an_update_is_refused_for_every_state_that_admits_none() {
         // row is answered.
         let name = format!("state-{row}");
         let image_arn = create_image(&router, &name, json!({})).await;
-        tokio::time::sleep(PAST_THE_SPAN).await;
-        // The create's build settles on the next call that reads the store, so the image
-        // is read back FIRST: what this row then writes is the state of a settled record
-        // rather than one the next call's clock is about to overwrite.
-        assert_eq!(
-            image_state(&router, &name).await,
-            "CREATED",
-            "case {state:?}: the create's build must have settled before the row writes a state"
-        );
+        // The create's build settles on the next call that reads the store, so the row
+        // looks at the image until that has happened: what it then writes is the state of
+        // a settled record rather than one the next call's clock is about to overwrite.
+        poll_until(state, "the create's build has settled on CREATED", || async {
+            image_state(&router, &name).await == "CREATED"
+        })
+        .await;
         seed_image_state(&engine, &name, state);
 
         let (status, body) = update_image(&router, &name).await;
@@ -621,71 +619,6 @@ async fn an_update_is_refused_for_every_state_that_admits_none() {
     }
 }
 
-/// RULE: the same guard holds for a state this service's own clock settles an image in —
-/// an image whose creation build FAILED has no version to carry forward, so the update is
-/// refused and the record stays in the terminal state its creation settled in, which is
-/// what lets a client's poll for a terminal creation state converge.
-#[tokio::test]
-async fn an_update_of_an_image_whose_creation_failed_is_refused() {
-    let router = crate::image_build_outcome::emulator();
-
-    // Rows differ in WHICH half of the object address the store does not serve, so the
-    // failed creation is reached through the build's own resolution rather than seeded.
-    let rows: Vec<(&str, &str, String)> = vec![
-        (
-            "a bucket the object store does not serve",
-            "absent-bucket",
-            "s3://no-such-bucket/app.zip".to_string(),
-        ),
-        (
-            "a key the served bucket does not hold",
-            "absent-key",
-            "s3://staged-artifacts/no-such-key.zip".to_string(),
-        ),
-    ];
-    crate::image_build_outcome::stage_object(&router, "staged-artifacts", "app.zip").await;
-
-    for (case, name, uri) in rows {
-        let image_arn = crate::image_build_outcome::create_image(&router, name, &uri).await;
-        tokio::time::sleep(PAST_THE_SPAN).await;
-        let (status, image) = crate::image_build_outcome::get_image(&router, name).await;
-        assert_eq!(status, 200, "case {case:?}: reading got {status} {image}");
-        assert_eq!(
-            image["state"].as_str(),
-            Some(IMAGE_STATE_CREATE_FAILED),
-            "case {case:?}: the creation's build must have failed, got {image}"
-        );
-
-        let (status, body) = update_image(&router, &image_arn).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected 400, got {status} {body}"
-        );
-        assert_eq!(
-            body["__type"].as_str(),
-            Some("ValidationException"),
-            "case {case:?}: expected ValidationException, got {body}"
-        );
-        assert_eq!(
-            body["message"].as_str(),
-            Some(image_not_updatable_message(&image_arn).as_str()),
-            "case {case:?}: the refusal names the image's own ARN, got {:?}",
-            body["message"]
-        );
-
-        // The refused update wrote nothing: the record is still the one the failed
-        // creation settled, so a poll for a terminal creation state converges.
-        let (status, after) = crate::image_build_outcome::get_image(&router, name).await;
-        assert_eq!(status, 200, "case {case:?}: re-reading got {status} {after}");
-        assert_eq!(
-            after["state"].as_str(),
-            Some(IMAGE_STATE_CREATE_FAILED),
-            "case {case:?}: a refused update leaves the terminal state as it was, got {after}"
-        );
-        assert_eq!(
-            after["latestActiveImageVersion"],
-            Value::Null,
-            "case {case:?}: a creation that built nothing has no active version, got {after}"
-        );
-    }
-}
+// What an image whose own build has SETTLED — on either branch — is answered by a further
+// `UpdateMicrovmImage` is the rule `image_configuration_update` owns, reached there through
+// the build's own artifact resolution rather than through a seeded state.

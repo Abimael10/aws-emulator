@@ -316,20 +316,26 @@ pub fn is_image_lifecycle_in_flight(state: &str) -> bool {
 /// of.
 ///
 /// `UpdateMicrovmImage` "updates the configuration of a MicroVM image and triggers a new
-/// version build", so it needs a record whose own lifecycle work has SETTLED and that has
-/// a built configuration to carry the change forward from. Each lifecycle of an image is
-/// named by a pair of `MicrovmImageState` values — the progressive value this service
-/// reports while the work runs and the settled value that work reaches — and only the
-/// lifecycles that produced a version leave a record an update may start from: the
-/// settled values of the CREATE and UPDATE lifecycles that built one. Every other value
-/// is a record nothing can be built from — one this service is still writing
-/// ([`is_image_lifecycle_in_flight`]), one whose creation never produced a version
-/// ([`IMAGE_STATE_CREATE_FAILED`]), and the values of a deletion, which is one-way —
-/// so the update is refused with the modelled 400 ([`image_not_updatable_message`]).
+/// version build" and "uses PUT semantics — all required fields … must be provided with
+/// every request", so the call carries the WHOLE configuration and needs only a record
+/// whose own lifecycle work has SETTLED: nothing of the configuration already stored has to
+/// be carried forward, and whether that work succeeded or FAILED does not change what the
+/// next build starts from. Each lifecycle of an image is named by a pair of
+/// `MicrovmImageState` values — the progressive value this service reports while the work
+/// runs and the settled value that work reaches — so both settled values of the CREATE and
+/// UPDATE lifecycles admit an update, which is how a client repairs an image whose build
+/// failed (by re-stating a corrected configuration) rather than being left with deletion as
+/// its only move. The values that admit none are a record this service is still writing
+/// ([`is_image_lifecycle_in_flight`]) and the values of a deletion, which is one-way — for
+/// those the update is refused with the modelled 400
+/// ([`image_not_updatable_message`]).
 pub fn image_state_admits_update(state: &str) -> bool {
     matches!(
         state,
-        IMAGE_STATE_CREATED | IMAGE_STATE_UPDATED | IMAGE_STATE_UPDATE_FAILED
+        IMAGE_STATE_CREATED
+            | IMAGE_STATE_CREATE_FAILED
+            | IMAGE_STATE_UPDATED
+            | IMAGE_STATE_UPDATE_FAILED
     )
 }
 

@@ -9,11 +9,12 @@
 //! with that version's build in flight. A later read materialises `UPDATED`, and the
 //! new version becomes the image's active one, once the clock has made the build due.
 //!
-//! The call starts from the image's CURRENT state: only a record whose own lifecycle
-//! work has settled on a version it built admits an update
-//! ([`crate::state::image_state_admits_update`]), so an image still being written, one
-//! whose creation never produced a version, and one being deleted are refused with the
-//! modelled `ValidationException` before anything is written.
+//! The call starts from the image's CURRENT state: a record whose own lifecycle work has
+//! SETTLED admits an update, whether that work succeeded or failed
+//! ([`crate::state::image_state_admits_update`]) — the request carries the whole
+//! configuration, so a failed build is repaired by re-stating a corrected one. An image
+//! still being written, and one being deleted, are refused with the modelled
+//! `ValidationException` before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -330,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An image whose CURRENT state admits no update is not a record this call can
-        // build the next version from (`crate::state::image_state_admits_update`), and
+        // start the next build from (`crate::state::image_state_admits_update`), and
         // the guard runs BEFORE anything is written: the record stays exactly as the
         // lifecycle that settled it left it, so a client polling for a terminal state
         // still sees that state rather than one this refused call moved it to.
