@@ -306,6 +306,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .iter()
         .map(|volume| volume.to_analysed_resource(&volume_look_back_period))
         .collect();
+        // The Lambda function versions the account holds an analysis for, by the crate's one
+        // rule for it ([`crate::state::analysed_functions`]): a summary of the account's
+        // functions counts exactly the functions `GetLambdaFunctionRecommendations` reports at
+        // this endpoint, at the findings it reports for them, so the two cannot disagree about
+        // how many there are or about any one's finding, risk or cost. The look-back period in
+        // force is the one that reader analyses them under, so the two agree on each
+        // function's figures as well. A function version the analysis reached no finding for
+        // is no row at all: `Summary$name` cannot carry `Unavailable`.
+        let function_look_back_period = guard.effective_look_back_period(
+            crate::state::SOURCE_TYPE_LAMBDA_FUNCTION,
+            &account_id,
+        );
+        let functions: Vec<crate::state::AnalysedResource> = crate::state::analysed_functions(
+            &*self.engine,
+            &guard,
+            &crate::state::request_region(ctx),
+            &account_id,
+            crate::state::now_secs(),
+        )
+        .iter()
+        .filter_map(|function| function.to_analysed_resource(&function_look_back_period))
+        .collect();
         // The records a caller can read, grouped by resource type: the rightsizing catalog
         // and the idle analysis. A caller sees either only once the analysis its enrollment
         // started is due
@@ -324,6 +346,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         analysed.insert(
             crate::state::SOURCE_TYPE_EBS_VOLUME,
             volumes.iter().collect(),
+        );
+        // The Lambda function rows are the analysed functions above, for the same reason: a
+        // function is one AWS Lambda holds for the account, so the catalog records none.
+        analysed.insert(
+            crate::state::SOURCE_TYPE_LAMBDA_FUNCTION,
+            functions.iter().collect(),
         );
         let idle = guard.idle_analyses_by_source_type(&account_id);
         // One summary per resource type this service TRACKS — every value of the

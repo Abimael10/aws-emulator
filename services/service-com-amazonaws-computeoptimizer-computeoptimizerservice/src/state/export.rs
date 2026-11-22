@@ -216,6 +216,12 @@ pub struct ExportPlan {
     /// exactly the volumes `GetEBSVolumeRecommendations` reported at that moment. Empty for
     /// every other resource type's export, which no volume row belongs to.
     pub analysed_volumes: Vec<AnalysedResource>,
+    /// The Lambda function versions the account held an analysis for when the export was
+    /// created ([`super::analysed_functions`]): the versions of its own AWS Lambda inventory.
+    /// They are resolved with the plan, for the same reason the databases are, so an exported
+    /// file holds exactly the functions `GetLambdaFunctionRecommendations` reported at that
+    /// moment. Empty for every other resource type's export, which no function row belongs to.
+    pub analysed_functions: Vec<AnalysedResource>,
 }
 
 /// The two objects an export job has computed but not yet written: the export file and its
@@ -632,6 +638,29 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
             )
             .iter()
             .map(|volume| volume.to_analysed_resource(&look_back_period))
+            .collect()
+        } else {
+            Vec::new()
+        },
+        // The Lambda function versions the account holds an analysis for, resolved through the
+        // ONE rule every Lambda function surface of this service reads them by, under the
+        // look-back period in force for them — so an export and a read of the same moment
+        // cannot differ on which functions the account has or on what each one's analysis
+        // found.
+        analysed_functions: if request.resource_type == RESOURCE_TYPE_LAMBDA_FUNCTION {
+            let look_back_period = guard.effective_look_back_period(
+                RESOURCE_TYPE_LAMBDA_FUNCTION,
+                ::engine::emulator_account_id(),
+            );
+            super::analysed_functions(
+                &**engine,
+                &guard,
+                &region,
+                ::engine::emulator_account_id(),
+                now,
+            )
+            .iter()
+            .filter_map(|function| function.to_analysed_resource(&look_back_period))
             .collect()
         } else {
             Vec::new()
@@ -1060,6 +1089,15 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             RESOURCE_TYPE_EBS_VOLUME => self.rows_of_analysed_resources(
                 &plan.analysed_volumes.iter().collect::<Vec<_>>(),
                 RESOURCE_TYPE_EBS_VOLUME,
+                &plan.region,
+                last_refresh,
+            ),
+            // The account's analysed function versions, which the plan resolved: a function
+            // row carries the columns the findings-catalog row records, exactly as a row of a
+            // resource type the catalog does hold rows for does.
+            RESOURCE_TYPE_LAMBDA_FUNCTION => self.rows_of_analysed_resources(
+                &plan.analysed_functions.iter().collect::<Vec<_>>(),
+                RESOURCE_TYPE_LAMBDA_FUNCTION,
                 &plan.region,
                 last_refresh,
             ),

@@ -39,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     call, create_bucket, csv_rows, emulator_with_engine, error_code, export_destination,
-    get_object, make_analysis_due, opt_in, ACCOUNT,
+    get_object, make_analysis_due, opt_in, register_analysed_functions, ACCOUNT,
 };
 
 /// The refusal every operation answers a caller that asks for member accounts while managing
@@ -118,6 +118,7 @@ fn request(surface: &Surface, include_member_accounts: Option<bool>) -> Value {
 /// row can record an organization the way AWS Organizations would.
 async fn enrolled_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
     create_bucket(&router, BUCKET).await;
     opt_in(&router).await;
     (router, engine)

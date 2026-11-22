@@ -28,14 +28,16 @@
 //! ([`AnalysedResource::arn_in`], [`request_region`]). Idle resource recommendations have their own store
 //! ([`IdleRecommendationStore`]): no operation of this API creates one — Compute Optimizer's
 //! own analysis of an observed workload does — so that analysis is part of the store's INITIAL
-//! VALUE ([`seed_idle_resource_analyses`]), exactly as the volume, group, function and license
-//! observations are, and `GetIdleRecommendations` filters, orders and pages over it. Every
+//! VALUE ([`seed_idle_resource_analyses`]), exactly as the group and license observations
+//! are, and `GetIdleRecommendations` filters, orders and pages over it. Every
 //! member of a reported recommendation is DERIVED from the stored analysis
 //! ([`IdleResourceAnalysis::to_recommendation`]), and the rules a reader applies to it (the
 //! filter vocabulary, the sort dimensions, the ARN -> resource-type catalog) are stated once,
-//! here. The Lambda functions the service observes are their own inventory too
-//! ([`ObservedFunction`]), from which `GetLambdaFunctionRecommendations` DERIVES every
-//! recommendation it reports, and so are the licensed Amazon EC2 instances
+//! here. The Lambda function versions the account holds are analysed from AWS Lambda's own
+//! inventory, the utilization published for them and the run reports their invocations left
+//! ([`analysed_functions`], [`ObservedFunction`]), from which
+//! `GetLambdaFunctionRecommendations` DERIVES every recommendation it reports, and so are the
+//! licensed Amazon EC2 instances
 //! ([`ObservedLicensedInstance`]), from which `GetLicenseRecommendations` DERIVES every
 //! license recommendation it reports, and the Amazon EC2 instances it analyses
 //! ([`ObservedInstance`]), from which `GetEC2InstanceRecommendations` DERIVES every instance
@@ -66,6 +68,9 @@ mod rds_inventory;
 // The Amazon EBS volumes the account OWNS, analysed from the Amazon EC2 inventory that holds
 // them and the utilization published for them.
 mod ebs_inventory;
+// The Lambda function versions the account HOLDS, analysed from the AWS Lambda inventory that
+// holds them, the utilization published for them and the run reports their invocations left.
+mod lambda_inventory;
 // How a preferred-resource preference's include and exclude lists resolve into the effective
 // set of recommendation candidates, and the instance-type catalog they resolve against.
 mod preferred_resources;
@@ -73,6 +78,7 @@ pub use preferred_resources::*;
 pub use auto_scaling_groups::*;
 pub use rds_inventory::*;
 pub use ebs_inventory::*;
+pub use lambda_inventory::*;
 pub use idle::*;
 pub use functions::*;
 pub use licenses::*;
@@ -3581,14 +3587,6 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// it, and `GetEC2RecommendationProjectedMetrics` projects its observed utilization onto
     /// the instance types the analysis recommends.
     pub instances: BTreeMap<String, ObservedInstance>,
-    /// The Lambda function versions Compute Optimizer observes, by the resource part of
-    /// their ARN, so a page boundary is stable across calls and the iteration order is the
-    /// order a reader reports them in. Part of the store's initial value rather than
-    /// something a reader writes on first use: `GetLambdaFunctionRecommendations` REPORTS
-    /// this observation and must not mutate the store (see [`observed_functions`]). It is
-    /// the SINGLE source for a function: the Lambda function rows of
-    /// [`Self::analysed_resources`] are projected from it.
-    pub functions: BTreeMap<String, ObservedFunction>,
     /// Every Auto Scaling group Compute Optimizer has analysed, in analysis order, so a
     /// page boundary is stable across calls. Part of the store's initial value rather than
     /// something a reader writes on first use: `GetAutoScalingGroupRecommendations` REPORTS
@@ -3599,10 +3597,10 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The resources Compute Optimizer has analysed, in catalog order. Part of the
     /// store's initial value rather than something a reader writes on first use, so every
     /// findings reader serves the same rows and none of them mutates the store. The Auto
-    /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`], the
-    /// Amazon EC2 instance rows from [`Self::instances`] and the Lambda function rows from
-    /// [`Self::functions`] ([`seed_analysed_resources`]), so the two readers of one resource
-    /// cannot disagree about its finding, its risk or what it costs.
+    /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`] and the
+    /// Amazon EC2 instance rows from [`Self::instances`] ([`seed_analysed_resources`]), so the
+    /// two readers of one resource cannot disagree about its finding, its risk or what it
+    /// costs.
     pub analysed_resources: Vec<AnalysedResource>,
     /// The resources Compute Optimizer's analysis found IDLE, which
     /// `GetIdleRecommendations` reports. Part of the store's initial value rather than
@@ -3639,10 +3637,6 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             instances: observed_instances()
                 .into_iter()
                 .map(|instance| (instance.instance_id.clone(), instance))
-                .collect(),
-            functions: observed_functions()
-                .into_iter()
-                .map(|function| (function.arn_resource(), function))
                 .collect(),
             auto_scaling_group_analyses: seed_auto_scaling_group_analyses(),
             analysed_resources: seed_analysed_resources(),
@@ -3751,17 +3745,10 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
     // The Amazon EBS volume rows are not here either: a volume is one the account OWNS, so
     // those rows are projected from the Amazon EC2 inventory that holds it and the utilization
     // published for it when a read asks for them ([`ebs_inventory::analysed_volumes`]).
-    // The Lambda function rows are the SAME observation
-    // `GetLambdaFunctionRecommendations` reports, projected the same way
-    // ([`ObservedFunction::to_analysed_resource`]) under the look-back period in force when
-    // no preference sets one, so a summary of the account's functions counts exactly the
-    // functions that reader reports and agrees with it on each one's finding, risk and
-    // cost. A function the analysis reached no finding for is no row at all.
-    .chain(
-        observed_functions()
-            .iter()
-            .filter_map(|function| function.to_analysed_resource(DEFAULT_LOOK_BACK_PERIOD)),
-    )
+    // The Lambda function rows are not here for the same reason: a function is one AWS Lambda
+    // holds for the account, so those rows are projected from that inventory, the utilization
+    // published for it and the run reports its invocations left
+    // ([`lambda_inventory::analysed_functions`]).
     // The commercial software license rows are the SAME observation
     // `GetLicenseRecommendations` reports, projected the same way
     // ([`ObservedLicensedInstance::to_analysed_resource`]), so a summary of the account's
@@ -3888,20 +3875,6 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .into_iter()
             .find_map(|record| record.look_back_period.clone())
             .unwrap_or_else(|| DEFAULT_LOOK_BACK_PERIOD.to_string())
-    }
-
-    /// The Lambda functions whose observation a caller can read, in ARN order.
-    ///
-    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer reports recommendations
-    /// for an ENROLLED account only, and only once the analysis that enrollment starts is
-    /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
-    /// one that has just opted in all read the empty set rather than an analysis nothing has
-    /// produced yet.
-    ///
-    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
-    pub fn visible_functions(&self) -> impl Iterator<Item = &ObservedFunction> {
-        let visible = self.enrollment.analysis_visible();
-        self.functions.values().filter(move |_| visible)
     }
 
     /// The licensed Amazon EC2 instances whose observation a caller can read, in instance-id

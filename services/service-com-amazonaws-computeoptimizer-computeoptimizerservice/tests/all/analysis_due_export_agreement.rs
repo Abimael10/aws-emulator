@@ -27,14 +27,14 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    service_state, AnalysedResource, RdsDatabaseDetail, EXPORT_JOB_STEP,
     SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     call, cell, create_bucket, csv_rows, emulator_with_engine, export_destination, get_object,
-    opt_in, ACCOUNT,
+    make_analysis_due, opt_in, register_analysed_functions, ACCOUNT,
 };
 
 /// The destination bucket these fixtures export to.
@@ -262,6 +262,7 @@ async fn the_reader_and_the_export_of_one_analysis_agree_about_whether_it_exists
         // A fresh emulator per row: only one export job of a resource type is in progress per
         // Region at a time, and each row creates two.
         let (router, engine) = emulator_with_engine();
+        register_analysed_functions(&router, &engine).await;
         record_analysed_database(&engine);
         create_bucket(&router, BUCKET).await;
         opt_in(&router).await;
@@ -280,9 +281,9 @@ async fn the_reader_and_the_export_of_one_analysis_agree_about_whether_it_exists
              alone, got {exported:?}"
         );
 
-        // The analysis comes due one span after the enrollment record was written
-        // (`ANALYSIS_DELAY`); the extra margin covers scheduler jitter.
-        tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
+        // The analysis is due because its stored instant is already past
+        // ([`make_analysis_due`]), not because this test waited for the clock to reach it.
+        make_analysis_due(&engine);
         let case = format!("the analysis is due/{}", surface.reader);
         let (reported, body) = reported_arns(&router, &case, surface).await;
         assert!(

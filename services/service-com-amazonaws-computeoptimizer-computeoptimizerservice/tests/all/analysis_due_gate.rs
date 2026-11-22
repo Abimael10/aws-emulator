@@ -27,7 +27,10 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator_with_engine, error_code, opt_in, REGION};
+use crate::harness::{
+    call, emulator_with_engine, error_code, make_analysis_due, opt_in, register_analysed_functions,
+    REGION,
+};
 
 /// The first data point the projected-metrics rows ask for, in epoch seconds, and the
 /// granularity and length of their window: one hourly data point.
@@ -264,6 +267,7 @@ fn analysed_resources(engine: &Arc<engine::InMemoryEngine>) -> (String, String) 
 #[tokio::test]
 async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis() {
     let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
     let (instance_arn, database_arn) = analysed_resources(&engine);
     let readers = readers(&instance_arn, &database_arn);
 
@@ -319,9 +323,9 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
         }
     }
 
-    // The analysis comes due one span after the enrollment record was written
-    // (`ANALYSIS_DELAY`); the extra margin covers scheduler jitter.
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    // The analysis is due because its stored instant is already past
+    // ([`make_analysis_due`]), not because this test waited for the clock to reach it.
+    make_analysis_due(&engine);
     for reader in &readers {
         let case = format!("the analysis is due/{}", reader.operation);
         let (status, body) = call(&router, reader.operation, reader.request.clone()).await;

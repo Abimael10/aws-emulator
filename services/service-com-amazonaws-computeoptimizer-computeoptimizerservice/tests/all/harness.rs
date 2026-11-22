@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_smithy_types::DateTime;
 use bytes::Bytes;
@@ -82,6 +83,11 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    // AWS Lambda, so a suite can create the functions a Lambda function recommendation is
+    // computed over the way a client does ([`register_analysed_functions`]).
+    router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 
@@ -492,6 +498,11 @@ pub(crate) fn emulator_with_analysed_services_and_engine(
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    // AWS Lambda, for the same reason: a Lambda function recommendation is computed over the
+    // functions that service holds ([`register_analysed_functions`]).
+    router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 
@@ -1264,4 +1275,472 @@ pub(crate) fn narrowed_group_options(
             (arn.clone(), left)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The account's own AWS Lambda functions, and what was observed of their runs.
+//
+// A Lambda function recommendation is computed over the function versions AWS LAMBDA holds
+// for the account, the `AWS/Lambda` utilization published for each and the memory its run
+// reports stated — so a suite that reads one holds all three: the functions are created over
+// Lambda's OWN wire ([`create_lambda_function`]), the series go into the CloudWatch metric
+// store and the reports into the log group Lambda delivers a function's logs to
+// ([`publish_function_runs`]), exactly as the analysed ECS services, DB instances and EBS
+// volumes of this crate's other suites are held by the services that own them.
+// ---------------------------------------------------------------------------
+
+/// A deployment package as `Code.ZipFile` carries it: base64 in a `restJson1` JSON body. What
+/// it holds is irrelevant to these suites — only that Lambda accepts it and stores a function
+/// — so it is a fixed, valid base64 constant rather than a built archive.
+const FUNCTION_ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
+
+/// A role ARN inside `CreateFunction$Role`'s pattern.
+const FUNCTION_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/analysed";
+
+/// The `LogFormat` values `LoggingConfig` declares: a function's run reports are delivered in
+/// the runtime's plain-text framing or as structured JSON records, and the memory a run used
+/// is stated in either form.
+const LOG_FORMAT_TEXT: &str = "Text";
+/// See [`LOG_FORMAT_TEXT`].
+const LOG_FORMAT_JSON: &str = "JSON";
+
+/// The unpublished version of a function, which an unqualified ARN names.
+pub(crate) const LATEST_VERSION: &str = "$LATEST";
+
+/// What was observed of one interval of a function version's runs: when, how many invocations
+/// AWS Lambda counted, how long each of them took and how much memory each of them reported
+/// using.
+pub(crate) struct ObservedRuns<'a> {
+    /// How long before now the interval was observed.
+    pub days_ago: f64,
+    /// How many invocations the interval's `Invocations` datapoint counted.
+    pub invocations: f64,
+    /// The durations the interval's `Duration` series carried, in milliseconds.
+    pub durations_ms: &'a [f64],
+    /// The memory each run of the interval reported using, in MB — one run report each.
+    pub memory_used_mb: &'a [f64],
+}
+
+/// One Lambda function of the account's own inventory, and what was observed of its runs.
+struct AnalysedFunction {
+    name: &'static str,
+    memory_mb: i32,
+    tags: &'static [(&'static str, &'static str)],
+    /// The `LogFormat` its run reports are delivered in.
+    log_format: &'static str,
+    observed: &'static [ObservedRuns<'static>],
+}
+
+/// The Lambda functions the account holds while these suites run.
+///
+/// The set spans the cases a function recommendation distinguishes: an over-provisioned
+/// function whose heaviest day falls OUTSIDE the default look-back period, an
+/// under-provisioned one, one already sized for its workload, one invoked too rarely to
+/// analyse, and one whose memory utilization was never observed — and it is delivered in both
+/// log formats, since a run report states the memory it used in either.
+fn analysed_functions() -> Vec<AnalysedFunction> {
+    vec![
+        // 1 GB configured for a workload that peaks at 420 MB inside the analysed window: the
+        // recommendation sizes the memory down. Its heaviest day (780 MB) is 40 days old, so
+        // the default look-back period does not analyse it.
+        AnalysedFunction {
+            name: "invoice-renderer",
+            memory_mb: 1_024,
+            tags: &[("Owner", "TeamA")],
+            log_format: LOG_FORMAT_TEXT,
+            observed: &[
+                ObservedRuns {
+                    days_ago: 0.0,
+                    invocations: 42_000.0,
+                    durations_ms: &[180.0, 310.0, 900.0],
+                    memory_used_mb: &[350.0, 400.0],
+                },
+                ObservedRuns {
+                    days_ago: 6.0,
+                    invocations: 58_000.0,
+                    durations_ms: &[200.0, 328.0, 1_100.0],
+                    memory_used_mb: &[362.0, 420.0],
+                },
+                ObservedRuns {
+                    days_ago: 40.0,
+                    invocations: 30_000.0,
+                    durations_ms: &[240.0, 520.0, 1_800.0],
+                    memory_used_mb: &[610.0, 780.0],
+                },
+            ],
+        },
+        // 128 MB for a workload that peaks at 120 MB, which leaves no headroom — the
+        // recommendation sizes the memory UP, and an under-provisioned function saves nothing
+        // by taking it.
+        AnalysedFunction {
+            name: "thumbnail-resizer",
+            memory_mb: 128,
+            tags: &[("Owner", "TeamB"), ("Environment", "production")],
+            log_format: LOG_FORMAT_TEXT,
+            observed: &[ObservedRuns {
+                days_ago: 1.0,
+                invocations: 8_400.0,
+                durations_ms: &[420.0, 850.0, 2_400.0],
+                memory_used_mb: &[104.0, 120.0],
+            }],
+        },
+        // 128 MB — Lambda's smallest — for a workload whose peak plus headroom still fits
+        // inside it, so there is no other memory size to move to: optimized. Its logs are
+        // delivered as structured records.
+        AnalysedFunction {
+            name: "order-dispatcher",
+            memory_mb: 128,
+            tags: &[],
+            log_format: LOG_FORMAT_JSON,
+            observed: &[ObservedRuns {
+                days_ago: 0.0,
+                invocations: 15_000.0,
+                durations_ms: &[40.0, 95.0, 260.0],
+                memory_used_mb: &[88.0, 100.0],
+            }],
+        },
+        // Invoked a handful of times in the analysed period — below what the service needs to
+        // reach a finding — so the analysis has insufficient data for it.
+        AnalysedFunction {
+            name: "log-forwarder",
+            memory_mb: 512,
+            tags: &[],
+            log_format: LOG_FORMAT_TEXT,
+            observed: &[ObservedRuns {
+                days_ago: 2.0,
+                invocations: 12.0,
+                durations_ms: &[60.0, 140.0, 300.0],
+                memory_used_mb: &[180.0, 240.0],
+            }],
+        },
+        // Invoked often enough, but no run of it reported the memory it used, so the analysis
+        // has no demand to size its memory from and cannot conclude anything.
+        AnalysedFunction {
+            name: "nightly-reconciler",
+            memory_mb: 256,
+            tags: &[("Owner", "TeamA")],
+            log_format: LOG_FORMAT_TEXT,
+            observed: &[ObservedRuns {
+                days_ago: 1.0,
+                invocations: 2_000.0,
+                durations_ms: &[500.0, 1_200.0, 4_000.0],
+                memory_used_mb: &[],
+            }],
+        },
+    ]
+}
+
+/// Put [`analysed_functions`] into the stores that OWN them: each function into AWS Lambda's
+/// own inventory over its wire, the invocations and durations observed on it into the
+/// CloudWatch metric store as the `AWS/Lambda` series Lambda publishes for an invoked
+/// resource, and the memory its runs used into the log group Lambda delivers its reports to.
+pub(crate) async fn register_analysed_functions(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+) {
+    for function in analysed_functions() {
+        create_lambda_function(
+            router,
+            REGION,
+            function.name,
+            function.memory_mb,
+            function.tags,
+            function.log_format,
+        )
+        .await;
+        publish_function_runs(
+            engine,
+            function.name,
+            LATEST_VERSION,
+            function.log_format,
+            function.observed,
+        );
+    }
+}
+
+/// Create one Lambda function over Lambda's OWN wire, then read it back through
+/// `GetFunction` — which proves the service that owns a function holds the function the
+/// analysis is about.
+pub(crate) async fn create_lambda_function(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    memory_mb: i32,
+    tags: &[(&str, &str)],
+    log_format: &str,
+) -> String {
+    let tags: serde_json::Map<String, Value> = tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), json!(value)))
+        .collect();
+    let (status, created) = call_lambda(
+        router,
+        region,
+        "POST",
+        "/2015-03-31/functions",
+        Some(json!({
+            "FunctionName": name,
+            "Role": FUNCTION_ROLE_ARN,
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Code": {"ZipFile": FUNCTION_ZIP_FILE},
+            "MemorySize": memory_mb,
+            "LoggingConfig": {"LogFormat": log_format},
+            "Tags": Value::Object(tags),
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: creating the function must succeed, got {status}: {created}"
+    );
+    let (status, read) = call_lambda(
+        router,
+        region,
+        "GET",
+        &format!("/2015-03-31/functions/{name}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: AWS Lambda must hold the function it created, got {status}: {read}"
+    );
+    let arn = read["Configuration"]["FunctionArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        arn,
+        format!("arn:aws:lambda:{region}:{ACCOUNT}:function:{name}"),
+        "case {name:?}: AWS Lambda must report the function's own ARN, got {read}"
+    );
+    arn
+}
+
+/// Publish one version of a function over Lambda's own wire, answering the version number
+/// Lambda minted. The function has to be `Active` first, which the suite waits for by POLLING
+/// the state Lambda reports rather than by sleeping a span.
+pub(crate) async fn publish_function_version(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, read) = call_lambda(
+            router,
+            region,
+            "GET",
+            &format!("/2015-03-31/functions/{name}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: AWS Lambda must hold the function, got {status}: {read}"
+        );
+        if read["Configuration"]["State"] == json!("Active") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {name:?}: the function must become Active, last read {read}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, published) = call_lambda(
+        router,
+        region,
+        "POST",
+        &format!("/2015-03-31/functions/{name}/versions"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: publishing a version must succeed, got {status}: {published}"
+    );
+    published["Version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One AWS Lambda call at the endpoint of `region`: a `restJson1` request as an SDK sends
+/// one, whose SigV4 credential scope routes it to Lambda.
+pub(crate) async fn call_lambda(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let payload = body.map_or_else(Bytes::new, |body| Bytes::from(body.to_string()));
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", format!("lambda.{region}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/lambda/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .body(payload)
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = serde_json::from_slice::<Value>(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// Record one log event that is NOT a run report in a function version's log stream, the way
+/// a handler's own output arrives there: what a function writes to its standard streams lands
+/// in the same stream as the report that closes the run.
+pub(crate) fn publish_log_line(
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+    version: &str,
+    days_ago: f64,
+    message: &str,
+) {
+    use service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
+    use service_com_amazonaws_lambda_awsgirapiservice::state as lambda;
+
+    let now = ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::now_secs();
+    let at_ms = ((now - days_ago * 86_400.0) * 1_000.0) as i64;
+    let group_name = lambda::default_log_group(name);
+    let stream_name = format!("2026/01/01/[{version}]{days_ago}");
+    let state = engine.state::<logs::ComAmazonawsCloudwatchlogsLogs20140328State>();
+    let mut store = state.lock();
+    let group = store
+        .log_groups
+        .entry(group_name.clone())
+        .or_insert_with(|| logs::LogGroupRecord::new(REGION, &group_name, at_ms));
+    let stream = group
+        .streams
+        .entry(stream_name.clone())
+        .or_insert_with(|| logs::LogStreamRecord::new(REGION, &group_name, &stream_name, at_ms));
+    let sequence = stream.events.len() as u64;
+    stream.events.push(logs::StoredEvent {
+        timestamp: at_ms,
+        message: message.to_string(),
+        masked_message: None,
+        ingestion_time: at_ms,
+        ingestion_seq: sequence,
+        ingest_kms_key_id: None,
+        transformed_message: None,
+    });
+    stream.refresh_event_times();
+}
+
+/// Record what was observed of one function VERSION's runs where the services that own those
+/// observations hold them: the invocations and durations as the `AWS/Lambda` series of the
+/// invoked resource, and the memory each run used as the report that closes it, in the log
+/// stream of the execution environment that served it.
+///
+/// Neither series can be written by a client — `PutMetricData` refuses the AWS-reserved
+/// namespace space, and a function's run reports are AWS Lambda's own output — so a suite
+/// that needs observed runs records them here and reads the recommendation computed from them
+/// over the wire, like any client.
+pub(crate) fn publish_function_runs(
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+    version: &str,
+    log_format: &str,
+    observed: &[ObservedRuns<'_>],
+) {
+    use service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
+    use service_com_amazonaws_lambda_awsgirapiservice::state as lambda;
+
+    let now = ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::now_secs();
+    // The dimension set AWS Lambda publishes an invoked resource's series under: the function,
+    // and the resource the invocation addressed — the function itself for the unpublished
+    // version, `name:version` for a published one.
+    let resource = if version == LATEST_VERSION {
+        name.to_string()
+    } else {
+        format!("{name}:{version}")
+    };
+    for interval in observed {
+        let at = now - interval.days_ago * 86_400.0;
+        seed_cloudwatch_series(
+            engine,
+            LAMBDA_NAMESPACE,
+            "Invocations",
+            &[("FunctionName", name), ("Resource", resource.as_str())],
+            Some("Count"),
+            at,
+            // A count over the datapoint's period: how many times the function ran in it.
+            &[interval.invocations],
+        );
+        seed_cloudwatch_series(
+            engine,
+            LAMBDA_NAMESPACE,
+            "Duration",
+            &[("FunctionName", name), ("Resource", resource.as_str())],
+            Some("Milliseconds"),
+            at,
+            interval.durations_ms,
+        );
+        if interval.memory_used_mb.is_empty() {
+            continue;
+        }
+        let group_name = lambda::default_log_group(name);
+        // The stream of the execution environment that served the runs, whose name states the
+        // version that ran them between square brackets, as AWS Lambda names it.
+        let stream_name = format!("2026/01/01/[{version}]{}", interval.days_ago);
+        let at_ms = (at * 1_000.0) as i64;
+        let state = engine.state::<logs::ComAmazonawsCloudwatchlogsLogs20140328State>();
+        let mut store = state.lock();
+        let group = store
+            .log_groups
+            .entry(group_name.clone())
+            .or_insert_with(|| logs::LogGroupRecord::new(REGION, &group_name, at_ms));
+        let stream = group
+            .streams
+            .entry(stream_name.clone())
+            .or_insert_with(|| logs::LogStreamRecord::new(REGION, &group_name, &stream_name, at_ms));
+        for (run, used_mb) in interval.memory_used_mb.iter().enumerate() {
+            stream.events.push(logs::StoredEvent {
+                timestamp: at_ms,
+                message: run_report(log_format, run, *used_mb),
+                masked_message: None,
+                ingestion_time: at_ms,
+                ingestion_seq: run as u64,
+                ingest_kms_key_id: None,
+                transformed_message: None,
+            });
+        }
+        stream.refresh_event_times();
+    }
+}
+
+/// The CloudWatch namespace AWS Lambda publishes a function's metrics in.
+const LAMBDA_NAMESPACE: &str = "AWS/Lambda";
+
+/// The report that closes one run, as AWS Lambda writes it in the format the function's logs
+/// are delivered in: the plain-text `REPORT` line the runtime frames, or the structured
+/// `platform.report` record. Both state the memory the run used at its peak.
+fn run_report(log_format: &str, run: usize, used_mb: f64) -> String {
+    if log_format == LOG_FORMAT_JSON {
+        return json!({
+            "time": "2026-01-01T00:00:00.000Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": format!("00000000-0000-4000-8000-00000000000{run}"),
+                "metrics": {"durationMs": 1.0, "billedDurationMs": 1, "maxMemoryUsedMB": used_mb},
+                "status": "success",
+            },
+        })
+        .to_string();
+    }
+    format!(
+        "REPORT RequestId: 00000000-0000-4000-8000-00000000000{run}\tDuration: 1.00 ms\tBilled \
+         Duration: 1 ms\tMemory Size: 128 MB\tMax Memory Used: {used_mb} MB\t"
+    )
 }

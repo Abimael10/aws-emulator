@@ -1,21 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `GetLambdaFunctionRecommendations` over the wire: the recommendation this service derives
-//! from each observed Lambda function, and how a request narrows, pages and refuses.
+//! for the Lambda functions THE ACCOUNT REALLY HOLDS, and how a request narrows, pages and
+//! refuses.
 //!
-//! Every assertion here is on the RULE, checked over a set of functions that differ in
-//! configured memory, demand shape, invocation rate, version (published and `$LATEST`) and
-//! how long they have been observed — the response itself carries the analysed metrics, so
-//! an option can be checked against the demand it has to carry without this suite restating
-//! the handler's arithmetic.
+//! Compute Optimizer "generates recommendations for Lambda functions that meet a specific set
+//! of requirements", so the rule this suite asserts is that a recommendation exists for
+//! exactly the function versions the AWS Lambda emulator holds for this account in this
+//! Region — cross-checked against Lambda's own `ListFunctions` — and that every member of one
+//! is computed from that version's own configured memory, the `AWS/Lambda` series published
+//! for it and the memory its run reports stated. A function Lambda does not hold has no
+//! recommendation at all, and a function a client creates has one from the moment Lambda
+//! holds it.
+//!
+//! Compute Optimizer, AWS Lambda and CloudWatch are mounted on ONE engine, exactly as
+//! `core/router` mounts them, and every call goes through the front door a client uses: the
+//! Compute Optimizer calls as awsJson `POST /` with `X-Amz-Target`, the Lambda calls as the
+//! `restJson1` requests an SDK sends. Each function is created over Lambda's own wire and read
+//! back through `GetFunction` before it is analysed, so what the analysis reads is a resource
+//! the owning service itself reports.
+//!
+//! Every assertion is on the RULE, checked over a set of functions that differ in configured
+//! memory, demand shape, invocation rate, version (published and `$LATEST`), Region and log
+//! format — the response itself carries the analysed metrics, so an option can be checked
+//! against the demand it has to carry without this suite restating the handler's arithmetic.
 
-use std::time::Duration;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, emulator, error_code, opt_in};
+use crate::harness::{
+    call, call_in_region, call_lambda, create_lambda_function, emulator_with_engine, error_code,
+    make_analysis_due, opt_in, publish_function_runs, publish_function_version, publish_log_line,
+    register_analysed_functions, ObservedRuns, LATEST_VERSION, REGION,
+};
 
 /// The memory a Lambda function can be configured with, from the AWS Lambda quotas: "128 MB
 /// to 10,240 MB, in 1-MB increments". No memory size a recommendation names may fall outside
@@ -33,6 +53,10 @@ const HEADROOM: f64 = 0.20;
 /// `InsufficientData` reason code links: at least 50 invocations over the look-back period).
 const MIN_ANALYSED_INVOCATIONS: f64 = 50.0;
 
+/// The look-back period in force for a Lambda function: the service's own default, which no
+/// preference can move for this resource type.
+const LOOK_BACK_DAYS: f64 = 14.0;
+
 /// The `LambdaFunctionRecommendationFinding` values
 /// (`crate::ops::types::LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES`).
 const FINDINGS: &[&str] = &["Optimized", "NotOptimized", "Unavailable"];
@@ -46,30 +70,51 @@ const FINDING_REASON_CODES: &[&str] = &[
     "Inconclusive",
 ];
 
-/// The seeded functions, by name — one per case a function recommendation distinguishes.
+/// The functions the account holds while this suite runs ([`register_analysed_functions`]),
+/// by name — one per case a function recommendation distinguishes.
 const OVER_PROVISIONED: &str = "invoice-renderer";
-const UNDER_PROVISIONED_VERSION: &str = "thumbnail-resizer";
+const UNDER_PROVISIONED: &str = "thumbnail-resizer";
 const ALREADY_RIGHT_SIZED: &str = "order-dispatcher";
 const TOO_FEW_INVOCATIONS: &str = "log-forwarder";
 const NO_MEMORY_OBSERVED: &str = "nightly-reconciler";
 
-/// Opt the account in and let the analysis its enrollment starts come due — the gate every
-/// recommendation reader of this service applies. The span is the service's own
-/// ([`ANALYSIS_DELAY`]); the extra margin covers scheduler jitter.
-async fn analysed(router: &MultiServiceRouter) {
-    opt_in(router).await;
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+/// An enrolled account whose analysis is already due, holding NO function at all: the
+/// emulator a case needs to drive the whole path from "the account holds no function" to "it
+/// holds this one".
+///
+/// The analysis becomes readable because its stored instant is already past
+/// ([`make_analysis_due`]), not because the suite waited for the clock to reach it, so
+/// nothing here depends on how fast the host runs.
+async fn enrolled_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = emulator_with_engine();
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    (router, engine)
 }
 
-/// The unqualified ARN of one seeded function, in `us-east-1`.
-fn function_arn(name: &str) -> String {
+/// The same emulator, holding the account's own analysed functions.
+async fn analysed_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    (router, engine)
+}
+
+/// The unqualified ARN of one function of this account, in `region`.
+fn function_arn_in(region: &str, name: &str) -> String {
     format!(
-        "arn:aws:lambda:us-east-1:{}:function:{name}",
+        "arn:aws:lambda:{region}:{}:function:{name}",
         ::engine::emulator_account_id()
     )
 }
 
-/// The qualified ARN of one version of a seeded function.
+/// The unqualified ARN of one function, at the Region these suites sign for.
+fn function_arn(name: &str) -> String {
+    function_arn_in(REGION, name)
+}
+
+/// The qualified ARN of one version of a function.
 fn qualified_arn(name: &str, version: &str) -> String {
     format!("{}:{version}", function_arn(name))
 }
@@ -84,13 +129,21 @@ async fn recommendations(router: &MultiServiceRouter, request: Value) -> Value {
     body
 }
 
+/// Every recommendation of the account, unavailable findings included — the whole analysed
+/// population, which the model withholds the unavailable part of unless a request asks for it.
+async fn whole_population(router: &MultiServiceRouter) -> Value {
+    recommendations(
+        router,
+        json!({"filters": [{"name": "Finding", "values": FINDINGS}], "maxResults": 1000}),
+    )
+    .await
+}
+
 /// The recommendations of one response, in the order it reports them.
 fn reported(body: &Value) -> Vec<Value> {
     body["lambdaFunctionRecommendations"]
         .as_array()
-        .unwrap_or_else(|| {
-            panic!("lambdaFunctionRecommendations must be a list, got {body}")
-        })
+        .unwrap_or_else(|| panic!("lambdaFunctionRecommendations must be a list, got {body}"))
         .clone()
 }
 
@@ -107,7 +160,7 @@ fn reported_arns(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The recommendation a response carries for one seeded function, by name.
+/// The recommendation a response carries for one function, by name.
 fn recommendation_for(body: &Value, name: &str) -> Value {
     reported(body)
         .into_iter()
@@ -115,7 +168,7 @@ fn recommendation_for(body: &Value, name: &str) -> Value {
             recommendation["functionArn"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(&format!(":function:{name}"))
+                .ends_with(&format!(":function:{name}"))
         })
         .unwrap_or_else(|| panic!("case {name:?}: no recommendation for it: {body}"))
 }
@@ -149,7 +202,7 @@ fn only_option(recommendation: &Value) -> Value {
         1,
         "case {}: expected one memory size option, got {}: {recommendation}",
         recommendation["functionArn"],
-        options.len(),
+        options.len()
     );
     options[0].clone()
 }
@@ -160,20 +213,59 @@ fn reason_codes(recommendation: &Value) -> Vec<String> {
         .as_array()
         .cloned()
         .unwrap_or_default()
-        .iter()
+        .into_iter()
         .map(|code| code.as_str().unwrap_or_default().to_string())
         .collect()
 }
 
-/// Every invariant a function recommendation satisfies, whatever function it is for and
-/// whatever look-back period it was generated under.
+/// The function ARNs AWS LAMBDA holds for the account at the endpoint of `region`, as its own
+/// `ListFunctions` reports them — what the recommendations are cross-checked against.
+async fn functions_lambda_holds(router: &MultiServiceRouter, region: &str) -> BTreeSet<String> {
+    let (status, listed) = call_lambda(router, region, "GET", "/2015-03-31/functions/", None).await;
+    assert_eq!(
+        status, 200,
+        "listing the account's functions must succeed, got {status}: {listed}"
+    );
+    listed["Functions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|function| {
+            function["FunctionArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The memory AWS Lambda holds one function configured with, as its own
+/// `GetFunctionConfiguration` reports it.
+async fn configured_memory(router: &MultiServiceRouter, name: &str) -> f64 {
+    let (status, read) = call_lambda(
+        router,
+        REGION,
+        "GET",
+        &format!("/2015-03-31/functions/{name}/configuration"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: reading the function's configuration must succeed, got {status}: {read}"
+    );
+    number(&read, "MemorySize")
+}
+
+/// Every invariant a function recommendation satisfies, whatever function it is for.
 ///
 /// The rule: a recommendation is the function's OBSERVATION read three ways — the memory
 /// size it names is the smallest whole MB inside Lambda's range that carries the reported
 /// memory peak with headroom; the finding and its reason code say which side of the
 /// configured memory that lands on; and the saving is what the move is worth, never negative
 /// and never claimed where the move costs the same or more.
-fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64) {
+fn assert_recommendation_invariants(recommendation: &Value) {
     let case = recommendation["functionArn"]
         .as_str()
         .unwrap_or_default()
@@ -192,7 +284,7 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
     let qualified = case.ends_with(&format!(":{version}"));
     assert_eq!(
         qualified,
-        version != "$LATEST",
+        version != LATEST_VERSION,
         "case {case:?}: a published version is named by a qualified ARN and $LATEST by an \
          unqualified one, got version {version:?}"
     );
@@ -213,11 +305,11 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
         );
     }
 
-    let analysed = number(recommendation, "lookbackPeriodInDays");
-    assert!(
-        analysed > 0.0 && analysed <= look_back_days,
-        "case {case:?}: the analysed period is at most the {look_back_days} days the \
-         look-back period in force covers, got {analysed}"
+    assert_eq!(
+        number(recommendation, "lookbackPeriodInDays"),
+        LOOK_BACK_DAYS,
+        "case {case:?}: the period analysed is the look-back period in force, got \
+         {recommendation}"
     );
     let invocations = number(recommendation, "numberOfInvocations");
     assert!(
@@ -269,9 +361,18 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
         );
         let codes = reason_codes(recommendation);
         assert!(
-            codes.iter().all(|code| code == "InsufficientData" || code == "Inconclusive"),
+            codes
+                .iter()
+                .all(|code| code == "InsufficientData" || code == "Inconclusive"),
             "case {case:?}: an unavailable finding is explained by InsufficientData or \
              Inconclusive, got {codes:?}"
+        );
+        // One of the two inputs the analysis needs was missing: too few invocations in the
+        // period, or no memory utilization observed at all.
+        assert!(
+            invocations < MIN_ANALYSED_INVOCATIONS || peak_memory <= 0.0,
+            "case {case:?}: a function with {invocations} invocations peaking at {peak_memory} \
+             MB has what the analysis needs, got {recommendation}"
         );
         return;
     }
@@ -339,7 +440,9 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
     }
 
     // The projected duration: one range, on the one metric `LambdaFunctionMemoryMetricName`
-    // declares, bounding the value expected inside it.
+    // declares, bounding the value expected inside it. The analysis observed the function at
+    // the memory it is configured with and at no other size, so what it projects is the
+    // duration it observed.
     let projected = option["projectedUtilizationMetrics"]
         .as_array()
         .cloned()
@@ -368,13 +471,10 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
         "case {case:?}: the expected duration lies inside the projected {lower}..={upper} \
          range, got {expected}"
     );
-    if memory_size == current_memory {
-        assert_eq!(
-            expected, average_duration,
-            "case {case:?}: at the memory it already runs on, the projected duration is the \
-             duration observed, got {expected}"
-        );
-    }
+    assert_eq!(
+        expected, average_duration,
+        "case {case:?}: the projected duration is the duration observed, got {expected}"
+    );
 
     // The saving: never negative, in a currency the model names, a percentage of monthly
     // cost that is zero exactly when the amount is, and the same before and after discounts
@@ -414,22 +514,294 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_days: f64)
     }
 }
 
+/// The recommendations reported are exactly the functions AWS LAMBDA holds for the account:
+/// every reported ARN is one `ListFunctions` reports, every function it reports has a
+/// recommendation, and an ARN naming a function Lambda does not hold selects nothing.
+#[tokio::test]
+async fn the_recommendations_reported_are_the_functions_aws_lambda_holds() {
+    let (router, _engine) = analysed_emulator().await;
+
+    let held = functions_lambda_holds(&router, REGION).await;
+    assert!(
+        !held.is_empty(),
+        "the account must hold functions for this to prove anything, got {held:?}"
+    );
+    let body = whole_population(&router).await;
+    let reported: BTreeSet<String> = reported_arns(&body).into_iter().collect();
+    assert_eq!(
+        reported, held,
+        "the analysed functions are the ones AWS Lambda holds for the account: expected \
+         {held:?}, got {body}"
+    );
+
+    // Rows: well-formed ARNs of functions no account holds — a name nothing created, the
+    // plural of one that exists, and one differing from a held function by a single
+    // character. Each selects nothing rather than a recommendation of a function that does
+    // not exist.
+    for name in ["my-worker", "invoice-renderers", "invoice-render"] {
+        let arn = function_arn(name);
+        assert!(
+            !held.contains(&arn),
+            "case {name:?}: this case needs a function the account does NOT hold, got {held:?}"
+        );
+        let body = recommendations(&router, json!({"functionArns": [arn]})).await;
+        assert_eq!(
+            reported_arns(&body),
+            Vec::<String>::new(),
+            "case {name:?}: a function AWS Lambda does not hold has no recommendation, got \
+             {body}"
+        );
+    }
+}
+
+/// A function a CLIENT creates is analysed: from the moment AWS Lambda holds it, Compute
+/// Optimizer reports it — with the memory Lambda holds it configured with — and what the
+/// analysis finds for it follows from the runs observed on it.
+///
+/// Rows: the three ways an observed peak can land against a function's configured memory,
+/// each a different configured size, plus a function nothing has run yet. A function with no
+/// finding is reported only when a request asks for `Unavailable`, as the model states.
+#[tokio::test]
+async fn a_function_the_client_creates_is_analysed_from_its_own_runs() {
+    let (router, engine) = enrolled_emulator().await;
+
+    // (the function, the memory it is created with, the memory peak its runs report, the
+    // finding the analysis must reach, its reason code)
+    let rows: [(&str, i32, f64, &str, Option<&str>); 4] = [
+        ("my-worker", 1_024, 300.0, "NotOptimized", Some("MemoryOverprovisioned")),
+        ("thumbnailer", 128, 200.0, "NotOptimized", Some("MemoryUnderprovisioned")),
+        // 426 MB with 20% headroom is 511.2 MB, which rounds up to the 512 MB it already
+        // runs on: there is no other memory size to move it to.
+        ("resizer", 512, 426.0, "Optimized", None),
+        ("idler", 256, 0.0, "Unavailable", Some("InsufficientData")),
+    ];
+
+    // Before any of them exists, the account has no function recommendation at all.
+    assert_eq!(
+        reported_arns(&whole_population(&router).await),
+        Vec::<String>::new(),
+        "an account holding no function reads the empty list"
+    );
+
+    for (name, memory_mb, peak_mb, _, _) in rows {
+        create_lambda_function(&router, REGION, name, memory_mb, &[("Owner", name)], "Text").await;
+        if peak_mb <= 0.0 {
+            continue;
+        }
+        publish_function_runs(
+            &engine,
+            name,
+            LATEST_VERSION,
+            "Text",
+            &[ObservedRuns {
+                days_ago: 1.0,
+                invocations: 60.0,
+                durations_ms: &[10.0, 20.0, 30.0],
+                memory_used_mb: &[peak_mb / 2.0, peak_mb],
+            }],
+        );
+        // What the function itself wrote lands in the same stream as the report that closes
+        // the run. None of it is an observation of the memory a run used, so none of it may
+        // move what the analysis reads out of the group — whichever form it takes.
+        for line in [
+            "START RequestId: 00000000-0000-4000-8000-000000000000 Version: $LATEST",
+            "hello from the handler",
+            "{\"level\":\"INFO\",\"message\":\"Max Memory Used: 9001 MB\"}",
+            "{\"type\":\"platform.start\",\"record\":{\"requestId\":\"r\"}}",
+            "{ not json after all",
+        ] {
+            publish_log_line(&engine, name, LATEST_VERSION, 1.0, line);
+        }
+    }
+
+    let body = whole_population(&router).await;
+    for (name, memory_mb, peak_mb, finding, code) in rows {
+        let reported = recommendation_for(&body, name);
+        assert_recommendation_invariants(&reported);
+        assert_eq!(
+            reported["functionArn"],
+            json!(function_arn(name)),
+            "case {name:?}: the recommendation names the function's own ARN, got {reported}"
+        );
+        assert_eq!(
+            number(&reported, "currentMemorySize"),
+            configured_memory(&router, name).await,
+            "case {name:?}: the memory reported is the memory AWS Lambda holds the function \
+             configured with, got {reported}"
+        );
+        assert_eq!(
+            number(&reported, "currentMemorySize"),
+            f64::from(memory_mb),
+            "case {name:?}: expected the {memory_mb} MB it was created with, got {reported}"
+        );
+        assert_eq!(
+            metric(&reported, "Memory", "Maximum"),
+            peak_mb,
+            "case {name:?}: the peak analysed is the peak its runs reported, and nothing the \
+             function logged beside those reports moves it, got {reported}"
+        );
+        assert_eq!(
+            reported["finding"],
+            json!(finding),
+            "case {name:?}: a {memory_mb} MB function peaking at {peak_mb} MB is {finding}, \
+             got {reported}"
+        );
+        assert_eq!(
+            reason_codes(&reported),
+            code.map(|code| vec![code.to_string()]).unwrap_or_default(),
+            "case {name:?}: expected the reason code {code:?}, got {reported}"
+        );
+        assert_eq!(
+            reported["tags"],
+            json!([{"key": "Owner", "value": name}]),
+            "case {name:?}: a recommendation reports the function's own tags, got {reported}"
+        );
+    }
+
+    // "Functions with a finding of unavailable are not returned unless you specify the filter
+    // parameter with a value of Unavailable": the function nothing has run yet is the one the
+    // default answer withholds.
+    let default_answer = reported_arns(&recommendations(&router, json!({})).await);
+    assert_eq!(
+        default_answer,
+        rows.iter()
+            .filter(|(_, _, peak, _, _)| *peak > 0.0)
+            .map(|(name, _, _, _, _)| function_arn(name))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect::<Vec<String>>(),
+        "a request naming no filter reports the functions the analysis reached a finding for"
+    );
+}
+
+/// A PUBLISHED version is its own analysed resource: the qualified ARN selects it, it reports
+/// the version number and the memory that version is configured with, and the unpublished
+/// version stays the unqualified ARN's own.
+#[tokio::test]
+async fn a_published_version_is_analysed_as_its_own_function_version() {
+    let (router, engine) = enrolled_emulator().await;
+
+    let name = "publisher";
+    create_lambda_function(&router, REGION, name, 512, &[], "Text").await;
+    let version = publish_function_version(&router, REGION, name).await;
+    assert_ne!(
+        version, LATEST_VERSION,
+        "publishing must mint a version number, got {version:?}"
+    );
+    // Each version has its OWN observed runs, published against the resource an invocation of
+    // that version addresses.
+    publish_function_runs(
+        &engine,
+        name,
+        LATEST_VERSION,
+        "Text",
+        &[ObservedRuns {
+            days_ago: 1.0,
+            invocations: 60.0,
+            durations_ms: &[10.0, 20.0, 30.0],
+            memory_used_mb: &[100.0, 200.0],
+        }],
+    );
+    publish_function_runs(
+        &engine,
+        name,
+        &version,
+        "Text",
+        &[ObservedRuns {
+            days_ago: 1.0,
+            invocations: 90.0,
+            durations_ms: &[40.0, 50.0, 60.0],
+            memory_used_mb: &[300.0, 400.0],
+        }],
+    );
+
+    let body = whole_population(&router).await;
+    assert_eq!(
+        reported_arns(&body),
+        vec![function_arn(name), qualified_arn(name, &version)],
+        "both versions of the function are analysed resources, got {body}"
+    );
+    for recommendation in reported(&body) {
+        assert_recommendation_invariants(&recommendation);
+    }
+
+    // Rows: the unqualified ARN, the qualified one, both, and a version the function has not
+    // published.
+    let cases: [(&str, Vec<String>, Vec<String>); 4] = [
+        (
+            "an unqualified ARN selects $LATEST",
+            vec![function_arn(name)],
+            vec![function_arn(name)],
+        ),
+        (
+            "a qualified ARN selects that version",
+            vec![qualified_arn(name, &version)],
+            vec![qualified_arn(name, &version)],
+        ),
+        (
+            "both",
+            vec![qualified_arn(name, &version), function_arn(name)],
+            vec![function_arn(name), qualified_arn(name, &version)],
+        ),
+        (
+            "a version the function has not published",
+            vec![qualified_arn(name, "7")],
+            Vec::new(),
+        ),
+    ];
+    for (case, arns, expected) in cases {
+        let body = recommendations(&router, json!({"functionArns": arns})).await;
+        assert_eq!(
+            reported_arns(&body),
+            expected,
+            "case {case:?}: expected exactly {expected:?}, got {body}"
+        );
+    }
+
+    // Each version's own analysis: the version number it reports, and the peak its own runs
+    // observed.
+    let latest = recommendation_for(&body, name);
+    assert_eq!(
+        latest["functionVersion"],
+        json!(LATEST_VERSION),
+        "the unqualified ARN is the unpublished version, got {latest}"
+    );
+    assert_eq!(
+        metric(&latest, "Memory", "Maximum"),
+        200.0,
+        "the unpublished version is analysed over ITS runs, got {latest}"
+    );
+    let published = reported(&body)
+        .into_iter()
+        .find(|recommendation| recommendation["functionVersion"] == json!(version))
+        .unwrap_or_else(|| panic!("no recommendation for version {version}: {body}"));
+    assert_eq!(
+        metric(&published, "Memory", "Maximum"),
+        400.0,
+        "the published version is analysed over ITS runs, got {published}"
+    );
+    assert_eq!(
+        number(&published, "numberOfInvocations"),
+        90.0,
+        "the published version counts ITS invocations, got {published}"
+    );
+}
+
 /// Every recommendation the account's inventory yields satisfies the rule, across functions
-/// that differ in configured memory, demand, invocation rate, version and observed days —
-/// and the over-provisioned one is the case that actually saves money.
+/// that differ in configured memory, demand, invocation rate and log format — and the
+/// over-provisioned one is the case that actually saves money.
 #[tokio::test]
 async fn every_recommendation_is_its_function_s_observation_derived() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
-    let body = recommendations(&router, json!({})).await;
+    let body = whole_population(&router).await;
     let all = reported(&body);
     assert!(
         all.len() > 2,
         "the inventory must span several functions for this to prove anything, got {body}"
     );
     for recommendation in &all {
-        assert_recommendation_invariants(recommendation, 14.0);
+        assert_recommendation_invariants(recommendation);
     }
 
     // The three cases a finding distinguishes, each reached from a different observation.
@@ -450,20 +822,16 @@ async fn every_recommendation_is_its_function_s_observation_derived() {
          got {saved}"
     );
 
-    let under = recommendation_for(&body, UNDER_PROVISIONED_VERSION);
-    assert_eq!(
-        under["functionVersion"],
-        json!("3"),
-        "case {UNDER_PROVISIONED_VERSION:?}: a published version reports its own version \
-         number, got {under}"
-    );
+    let under = recommendation_for(&body, UNDER_PROVISIONED);
     assert_eq!(
         reason_codes(&under),
         vec!["MemoryUnderprovisioned".to_string()],
-        "case {UNDER_PROVISIONED_VERSION:?}: a function peaking at its memory limit is \
+        "case {UNDER_PROVISIONED:?}: a function peaking at its memory limit is \
          under-provisioned, got {under}"
     );
 
+    // Its logs are delivered as structured records rather than the runtime's plain-text
+    // framing, and the memory a run used is observed in either form.
     let optimized = recommendation_for(&body, ALREADY_RIGHT_SIZED);
     assert_eq!(
         optimized["finding"],
@@ -471,6 +839,24 @@ async fn every_recommendation_is_its_function_s_observation_derived() {
         "case {ALREADY_RIGHT_SIZED:?}: a function whose peak plus headroom fits its memory \
          is optimized, got {optimized}"
     );
+    assert_eq!(
+        metric(&optimized, "Memory", "Maximum"),
+        100.0,
+        "case {ALREADY_RIGHT_SIZED:?}: a structured run report states the memory it used, \
+         got {optimized}"
+    );
+
+    // The memory each recommendation reports is the memory AWS Lambda holds for the function.
+    for recommendation in &all {
+        let arn = recommendation["functionArn"].as_str().unwrap_or_default();
+        let name = arn.rsplit(':').next().unwrap_or_default().to_string();
+        assert_eq!(
+            number(recommendation, "currentMemorySize"),
+            configured_memory(&router, &name).await,
+            "case {name:?}: the memory reported is the memory AWS Lambda holds, got \
+             {recommendation}"
+        );
+    }
 
     // Tags are the function's own: reported where it carries any, absent where it does not.
     assert_eq!(
@@ -490,8 +876,7 @@ async fn every_recommendation_is_its_function_s_observation_derived() {
 /// what the analysis was missing.
 #[tokio::test]
 async fn unavailable_functions_are_withheld_unless_a_filter_asks_for_them() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     // Rows: the member absent, an empty filter list, a filter that names other findings, and
     // a reason-code filter that names an unavailable function's own reason code — none of
@@ -533,7 +918,7 @@ async fn unavailable_functions_are_withheld_unless_a_filter_asks_for_them() {
          finding for, got {body}"
     );
     for recommendation in &asked {
-        assert_recommendation_invariants(recommendation, 14.0);
+        assert_recommendation_invariants(recommendation);
         assert_eq!(
             recommendation["finding"],
             json!("Unavailable"),
@@ -561,26 +946,18 @@ async fn unavailable_functions_are_withheld_unless_a_filter_asks_for_them() {
 /// finding (or reason code) is among its values, and several filters are ANDed.
 #[tokio::test]
 async fn filters_select_on_the_derived_finding_and_reason_code() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     // The whole population, unavailable functions included, so each row below can be checked
     // against the set it should pick out of it.
-    let population = reported(
-        &recommendations(
-            &router,
-            json!({"filters": [{"name": "Finding", "values": FINDINGS}]}),
-        )
-        .await,
-    );
+    let population = reported(&whole_population(&router).await);
     assert_eq!(
         population.len(),
         5,
         "a Finding filter naming every finding reports the whole inventory, got {population:?}"
     );
 
-    // Rows: each `Finding` value alone, each `FindingReasonCode` value alone, a filter naming
-    // several values, and a filter whose values select nothing.
+    // Rows: each `Finding` value alone, and a filter naming several values.
     let mut rows: Vec<(String, Value, Vec<String>)> = Vec::new();
     for finding in FINDINGS {
         rows.push((
@@ -599,7 +976,12 @@ async fn filters_select_on_the_derived_finding_and_reason_code() {
         let expected: Vec<String> = population
             .iter()
             .filter(|recommendation| {
-                wanted.contains(&recommendation["finding"].as_str().unwrap_or_default().to_string())
+                wanted.contains(
+                    &recommendation["finding"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
             })
             .map(|recommendation| {
                 recommendation["functionArn"]
@@ -667,136 +1049,88 @@ async fn filters_select_on_the_derived_finding_and_reason_code() {
     );
 }
 
-/// `functionArns` narrows to the function VERSIONS it names: an unqualified ARN is the
-/// `$LATEST` version, a qualified one is the version its suffix carries, and an ARN this
-/// regional endpoint observes no function for selects nothing.
-#[tokio::test]
-async fn function_arns_select_the_version_they_name() {
-    let router = emulator();
-    analysed(&router).await;
-
-    let unqualified_latest = function_arn(OVER_PROVISIONED);
-    let published = qualified_arn(UNDER_PROVISIONED_VERSION, "3");
-
-    // Rows: one unqualified ARN, one qualified ARN, both together, the qualified form of a
-    // function that has only a `$LATEST` version, the unqualified form of one that has only
-    // a published version, a function this service does not observe, and an ARN of another
-    // Region.
-    let cases: [(&str, Vec<String>, Vec<String>); 7] = [
-        (
-            "an unqualified ARN selects $LATEST",
-            vec![unqualified_latest.clone()],
-            vec![unqualified_latest.clone()],
-        ),
-        (
-            "a qualified ARN selects that version",
-            vec![published.clone()],
-            vec![published.clone()],
-        ),
-        (
-            "both",
-            vec![unqualified_latest.clone(), published.clone()],
-            vec![unqualified_latest.clone(), published.clone()],
-        ),
-        (
-            "a version of a function that has none",
-            vec![qualified_arn(OVER_PROVISIONED, "7")],
-            Vec::new(),
-        ),
-        (
-            "the $LATEST version of a function that has only a published one",
-            vec![function_arn(UNDER_PROVISIONED_VERSION)],
-            Vec::new(),
-        ),
-        (
-            "a function this service does not observe",
-            vec![function_arn("no-such-function")],
-            Vec::new(),
-        ),
-        (
-            "a function of another Region",
-            vec![format!(
-                "arn:aws:lambda:eu-west-1:{}:function:{OVER_PROVISIONED}",
-                ::engine::emulator_account_id()
-            )],
-            Vec::new(),
-        ),
-    ];
-    for (case, arns, expected) in cases {
-        let body = recommendations(&router, json!({"functionArns": arns})).await;
-        assert_eq!(
-            reported_arns(&body),
-            expected,
-            "case {case:?}: expected exactly {expected:?}, got {body}"
-        );
-    }
-}
-
-/// A regional endpoint answers for ITS Region: the ARNs it reports name the Region the
-/// request was signed for, and the recommendations are otherwise identical.
+/// A regional endpoint answers for ITS Region: a function created at one Region's endpoint is
+/// analysed there and nowhere else, and the ARNs an endpoint reports name its own Region.
 #[tokio::test]
 async fn the_arns_reported_name_the_region_the_request_addressed() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, engine) = enrolled_emulator().await;
 
-    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+    // The Lambda inventory keys a function by its NAME, so each Region's endpoint creates its
+    // own function: what tells the two apart is the endpoint the request addressed.
+    let functions = [(REGION, "regional-worker"), ("eu-west-1", "eu-worker")];
+    for (region, name) in functions {
+        create_lambda_function(&router, region, name, 1_024, &[], "Text").await;
+        publish_function_runs(
+            &engine,
+            name,
+            LATEST_VERSION,
+            "Text",
+            &[ObservedRuns {
+                days_ago: 1.0,
+                invocations: 6_000.0,
+                durations_ms: &[10.0, 20.0, 30.0],
+                memory_used_mb: &[100.0, 300.0],
+            }],
+        );
+    }
+
+    // Rows: each Region that holds one of them, and a Region that holds no function at all.
+    for (region, expected) in [
+        (REGION, vec![function_arn_in(REGION, "regional-worker")]),
+        ("eu-west-1", vec![function_arn_in("eu-west-1", "eu-worker")]),
+        ("ap-southeast-2", Vec::new()),
+    ] {
         let (status, body) = call_in_region(
             &router,
             region,
             "GetLambdaFunctionRecommendations",
-            json!({}),
+            json!({"filters": [{"name": "Finding", "values": FINDINGS}]}),
         )
         .await;
         assert_eq!(
             status, 200,
             "case {region:?}: expected 200, got {status}: {body}"
         );
-        let arns = reported_arns(&body);
-        assert!(
-            !arns.is_empty(),
-            "case {region:?}: every Region's endpoint reports this account's functions, got \
-             {body}"
+        assert_eq!(
+            reported_arns(&body),
+            expected,
+            "case {region:?}: an endpoint reports the functions of ITS Region, got {body}"
         );
-        for arn in arns {
-            assert!(
-                arn.starts_with(&format!("arn:aws:lambda:{region}:")),
-                "case {region:?}: a reported ARN names the Region of the endpoint addressed, \
-                 got {arn}"
-            );
-        }
     }
+
+    // The function of the other Region is held by AWS Lambda there, and only that endpoint's
+    // analysis reports it.
+    let held = functions_lambda_holds(&router, "eu-west-1").await;
+    assert!(
+        held.contains(&function_arn_in("eu-west-1", "eu-worker")),
+        "AWS Lambda must hold the function created at the other endpoint, got {held:?}"
+    );
 }
 
-/// The period analysed is the service's own 14 days for every function — Compute Optimizer
-/// does not let a `lookBackPeriod` preference be set for the `LambdaFunction` resource type
-/// — a function observed for less than that is analysed over the days it has, and only the
-/// samples INSIDE the period count towards what a function is recommended.
+/// Only what was observed INSIDE the look-back period is analysed: the heavier day this
+/// function saw 40 days back is outside the service's own 14-day period, so neither the
+/// invocations counted, nor the peak reported, nor the memory size asked for carries it. No
+/// preference can move that period for a Lambda function.
 #[tokio::test]
-async fn the_period_analysed_is_the_service_default_and_only_its_samples_count() {
-    let router = emulator();
-    analysed(&router).await;
+async fn only_the_runs_inside_the_look_back_period_are_analysed() {
+    let (router, _engine) = analysed_emulator().await;
 
     let body = recommendations(&router, json!({})).await;
     let over = recommendation_for(&body, OVER_PROVISIONED);
     assert_eq!(
         number(&over, "lookbackPeriodInDays"),
-        14.0,
-        "a function observed for longer than the period is analysed over the service's \
-         default 14 days, got {over}"
+        LOOK_BACK_DAYS,
+        "the period analysed is the service's own default, got {over}"
     );
-    // A function observed for only a week is analysed over that week.
-    let short = recommendation_for(&body, ALREADY_RIGHT_SIZED);
     assert_eq!(
-        number(&short, "lookbackPeriodInDays"),
-        7.0,
-        "a function observed for 7 days is analysed over 7 days, got {short}"
+        number(&over, "numberOfInvocations"),
+        100_000.0,
+        "only the invocations inside the period are counted, got {over}"
     );
-    // The heavier day this function saw 40 days back is OUTSIDE the analysed period, so
-    // neither the reported peak nor the memory size asked for carries it.
     assert_eq!(
         metric(&over, "Memory", "Maximum"),
         420.0,
-        "the analysed peak is the peak of the samples inside the period, got {over}"
+        "the analysed peak is the peak of the runs inside the period, got {over}"
     );
     assert_eq!(
         number(&only_option(&over), "memorySize"),
@@ -836,11 +1170,10 @@ async fn the_period_analysed_is_the_service_default_and_only_its_samples_count()
 
 /// Paging never changes WHAT is reported: walking the recommendations `maxResults` at a time
 /// yields exactly the unpaged list, in the same order, with a `nextToken` on every page but
-/// the last. A token this service did not issue is refused.
+/// the last.
 #[tokio::test]
 async fn paging_walks_the_same_recommendations_in_the_same_order() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     let unpaged = reported_arns(&recommendations(&router, json!({})).await);
     assert!(
@@ -914,8 +1247,7 @@ async fn paging_walks_the_same_recommendations_in_the_same_order() {
 /// rejects never reaches the handler.
 #[tokio::test]
 async fn a_request_that_is_not_valid_is_refused_with_the_modelled_error() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     let own = ::engine::emulator_account_id().to_string();
     let cases: [(&str, Value, &str); 10] = [
@@ -990,7 +1322,10 @@ async fn a_request_that_is_not_valid_is_refused_with_the_modelled_error() {
             "a filter name the model does not declare",
             json!({"filters": [{"name": "tag:Owner", "values": ["TeamA"]}]}),
         ),
-        ("a maxResults above the modelled range", json!({"maxResults": 1001})),
+        (
+            "a maxResults above the modelled range",
+            json!({"maxResults": 1001}),
+        ),
     ] {
         let (status, body) = call(&router, "GetLambdaFunctionRecommendations", request).await;
         assert_eq!(
@@ -1010,7 +1345,8 @@ async fn a_request_that_is_not_valid_is_refused_with_the_modelled_error() {
 /// answer identically, and reading moves neither the enrollment record nor the preferences.
 #[tokio::test]
 async fn recommendations_need_an_enrolled_account_and_reading_changes_nothing() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
 
     let (status, body) = call(&router, "GetLambdaFunctionRecommendations", json!({})).await;
     assert_eq!(
@@ -1033,7 +1369,9 @@ async fn recommendations_need_an_enrolled_account_and_reading_changes_nothing() 
         "straight after opting in there is no analysis to report, got {body}"
     );
 
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    // The analysis is due because its stored instant is already past, not because the suite
+    // waited for the clock to reach it.
+    make_analysis_due(&engine);
     let before = call(&router, "GetEnrollmentStatus", json!({})).await.1;
     let first = recommendations(&router, json!({})).await;
     let second = recommendations(&router, json!({})).await;
@@ -1062,6 +1400,13 @@ async fn recommendations_need_an_enrolled_account_and_reading_changes_nothing() 
         json!([]),
         "reading recommendations must not write a preference, got {preferences}"
     );
+    // The functions AWS Lambda holds are untouched by the read, too: a reporting operation
+    // writes to no store.
+    assert_eq!(
+        functions_lambda_holds(&router, REGION).await.len(),
+        5,
+        "reading recommendations must not touch the account's functions"
+    );
 
     // Opting back out takes the recommendations away again: the gate is the stored
     // enrollment, not whether the account ever enrolled.
@@ -1088,8 +1433,7 @@ async fn recommendations_need_an_enrolled_account_and_reading_changes_nothing() 
 /// reads the caller's, and both answer identically.
 #[tokio::test]
 async fn account_ids_selects_the_caller_s_own_account() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     let own = ::engine::emulator_account_id().to_string();
     let absent = recommendations(&router, json!({})).await;
@@ -1107,8 +1451,7 @@ async fn account_ids_selects_the_caller_s_own_account() {
 /// reports at each finding.
 #[tokio::test]
 async fn the_summary_of_lambda_functions_counts_what_this_reader_reports() {
-    let router = emulator();
-    analysed(&router).await;
+    let (router, _engine) = analysed_emulator().await;
 
     let reported_functions = reported(&recommendations(&router, json!({})).await);
     let (status, summaries) = call(&router, "GetRecommendationSummaries", json!({})).await;

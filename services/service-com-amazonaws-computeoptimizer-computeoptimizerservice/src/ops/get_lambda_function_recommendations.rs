@@ -3,9 +3,11 @@
 //! @op GetLambdaFunctionRecommendations
 //!
 //! IMPLEMENTED: reports the Lambda function recommendations Compute Optimizer holds for an
-//! account — for every observed function version the request selects, the recommendation
-//! [`crate::state::ObservedFunction::to_recommendation`] derives from that function's stored
-//! configuration and metric samples, one page at a time. REPORTING only: Compute Optimizer
+//! account — for every function version the request selects out of the account's own AWS
+//! Lambda inventory ([`crate::state::analysed_functions`]), the recommendation
+//! [`crate::state::ObservedFunction::to_recommendation`] derives from that version's
+//! configured memory, the `AWS/Lambda` series published for it and the memory its run reports
+//! stated, one page at a time. REPORTING only: Compute Optimizer
 //! has no API that creates a recommendation, so this call writes nothing.
 //!
 //! A request narrows the answer three ways, each applied before the page is cut:
@@ -281,14 +283,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::Enrollment::last_analysis_refresh`]).
         let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
-        // The functions this request asks about: the account's whole observed inventory in
-        // this Region — which a caller sees only once the analysis its enrollment started is
-        // due — or exactly the ones the named ARNs pick out of it. A well-formed function
-        // ARN this service observes no function for selects nothing: this operation models
-        // no per-resource error list, so an ARN it holds no recommendation for is simply
-        // ABSENT from the answer.
-        let selected: Vec<&crate::state::ObservedFunction> = guard
-            .visible_functions()
+        // The functions this request asks about: the account's whole analysed inventory in
+        // this Region — the function versions AWS Lambda holds for it, each with the
+        // utilization published for it and the memory its run reports stated, resolved through
+        // the ONE rule every Lambda function surface of this service reads them by
+        // ([`crate::state::analysed_functions`]) — or exactly the ones the named ARNs pick out
+        // of it. A caller sees them only once the analysis its enrollment started is due, the
+        // same gate that rule applies for every reader. A well-formed function ARN this
+        // service holds no function for selects nothing: this operation models no per-resource
+        // error list, so an ARN it holds no recommendation for is simply ABSENT from the
+        // answer.
+        let analysed = crate::state::analysed_functions(
+            &*self.engine,
+            &guard,
+            &region,
+            &account_id,
+            crate::state::now_secs(),
+        );
+        let selected: Vec<&crate::state::ObservedFunction> = analysed
+            .iter()
             .filter(|function| function.account_id == account_id)
             .filter(|function| {
                 requested_functions

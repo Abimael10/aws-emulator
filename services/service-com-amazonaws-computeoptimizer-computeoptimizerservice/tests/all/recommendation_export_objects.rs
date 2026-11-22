@@ -42,7 +42,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{
     call, call_ecs, cell, create_bucket, csv_rows, delete_bucket, emulator,
     emulator_with_analysed_services_and_engine, error_code, export_destination, get_object,
-    make_analysis_due, opt_in, seed_cloudwatch_series, ACCOUNT, ANALYSED_SUBNET,
+    make_analysis_due, opt_in, register_analysed_functions, seed_cloudwatch_series, ACCOUNT,
+    ANALYSED_SUBNET,
 };
 
 /// The destination bucket these fixtures export to.
@@ -109,6 +110,7 @@ const EXPORTS: &[(&str, &str, &[&str])] = &[
 /// that service holds one.
 async fn analysed_emulator() -> MultiServiceRouter {
     let (router, engine) = emulator_with_analysed_services_and_engine();
+    register_analysed_functions(&router, &engine).await;
     record_analysed_database(&engine);
     create_analysed_ecs_service(&router, &engine).await;
     create_bucket(&router, BUCKET).await;

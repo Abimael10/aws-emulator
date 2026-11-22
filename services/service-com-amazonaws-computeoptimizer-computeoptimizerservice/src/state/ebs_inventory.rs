@@ -152,7 +152,10 @@ fn volume_region(record: &ec2::state::VolumeRecord) -> Option<&str> {
 /// `LookBackPeriodPreference` values the model declares
 /// ([`LOOK_BACK_PERIOD_PREFERENCE_VALUES`]), so the samples this analysis keeps cover every
 /// period a preference could put in force and no shorter range is hard-coded beside them.
-fn longest_look_back_days() -> f64 {
+///
+/// The crate's ONE reading of it, shared by every inventory analysis of this service, so two
+/// of them cannot keep different histories.
+pub fn longest_look_back_days() -> f64 {
     LOOK_BACK_PERIOD_PREFERENCE_VALUES
         .iter()
         .map(|preference| look_back_period_in_days(preference))

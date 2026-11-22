@@ -33,11 +33,11 @@
 //! at all (`tests/all/summary_block_sets.rs` states that rule).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, MemberAccountEnrollment, ANALYSIS_DELAY, DEFAULT_PAGE_SIZE,
+    service_state, AnalysedResource, MemberAccountEnrollment, DEFAULT_PAGE_SIZE,
     ENROLLMENT_STATUSES_MAX_PAGE_SIZE, IDLE_MAX_PAGE_SIZE, MAX_PAGE_SIZE, RESOURCE_TYPE_EBS_VOLUME,
     SCOPE_ACCOUNT_ID, SCOPE_ORGANIZATION, SCOPE_RESOURCE_ARN, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
@@ -45,7 +45,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     call, call_ecs, create_bucket, emulator_with_analysed_services_and_engine, error_code,
-    instance_arn, opt_in, put_preference, seed_cloudwatch_series, ACCOUNT,
+    instance_arn, make_analysis_due, opt_in, put_preference, register_analysed_functions,
+    seed_cloudwatch_series, ACCOUNT,
 };
 
 /// The destination bucket the export jobs below are created against. Compute Optimizer does
@@ -603,15 +604,17 @@ async fn read(
 /// An emulator every reader in [`readers`] has at least two items to report from: the
 /// account is enrolled, the organization holds member accounts, preference records are
 /// written at four distinct scopes, export jobs exist for three resource types, two analysed
-/// databases are recorded, and two Amazon ECS services have the analysis inputs a
-/// recommendation is computed from.
+/// databases are recorded, the account's own Lambda functions are held with the utilization
+/// published for them, and two Amazon ECS services have the analysis inputs a recommendation
+/// is computed from.
 async fn paged_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_analysed_services_and_engine();
+    register_analysed_functions(&router, &engine).await;
     opt_in(&router).await;
     // The analysis an enrollment starts is the gate every recommendation reader of this
-    // service applies, so the fixture lets it come due; the span is the service's own
-    // ([`ANALYSIS_DELAY`]) and the margin covers scheduler jitter.
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    // service applies, so the fixture makes it due by moving the stored enrollment instant
+    // back ([`make_analysis_due`]) rather than by waiting for the clock to reach it.
+    make_analysis_due(&engine);
     record_organization(&engine);
     record_analysed_databases(&engine);
     write_preference_records(&router).await;

@@ -28,7 +28,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator_with_analysed_services, error_code, opt_in};
+use crate::harness::{
+    call, emulator_with_analysed_services, emulator_with_analysed_services_and_engine, error_code,
+    opt_in, register_analysed_functions,
+};
 
 /// Every operation of this service that takes `accountIds`, the member of its response
 /// that carries what it reports, and whether the store this emulator starts with holds an
@@ -117,7 +120,8 @@ async fn refused(
 /// analysis; naming ANY other account is refused rather than answered with an empty list.
 #[tokio::test]
 async fn account_ids_reads_only_the_caller_s_own_account() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    register_analysed_functions(&router, &engine).await;
     analysed(&router).await;
     let own = ::engine::emulator_account_id().to_string();
 

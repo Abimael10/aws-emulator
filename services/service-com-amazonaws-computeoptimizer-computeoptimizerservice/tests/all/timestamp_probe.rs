@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, opt_in};
+use crate::harness::{call, emulator_with_engine, opt_in, register_analysed_functions};
 
 /// The readers that report an instant for the analysis of the store this emulator starts
 /// with, and the member of the response carrying their recommendations.
@@ -87,7 +87,8 @@ async fn enrollment_written(router: &MultiServiceRouter) -> f64 {
 /// enrollment record was written.
 #[tokio::test]
 async fn one_analysis_has_one_refresh_instant_across_every_reader() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
     analysed(&router).await;
     let written = enrollment_written(&router).await;
 
@@ -130,12 +131,14 @@ async fn one_analysis_has_one_refresh_instant_across_every_reader() {
 /// clock.
 #[tokio::test]
 async fn re_reading_an_analysis_reports_the_instant_it_reported_before() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    register_analysed_functions(&router, &engine).await;
     analysed(&router).await;
 
     for (operation, member) in READERS {
         let before = reported_instants(&router, operation, member).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // No wait between the two reads: the instant is derived from the stored enrollment
+        // record, so what the second read reports cannot depend on how much time passed.
         let again = reported_instants(&router, operation, member).await;
         let bits = |instants: &[f64]| instants.iter().map(|at| at.to_bits()).collect::<Vec<u64>>();
         assert_eq!(

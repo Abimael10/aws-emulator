@@ -142,12 +142,13 @@ pub fn parse_function_arn(arn: &str) -> Option<ParsedFunctionArn<'_>> {
 }
 
 /// One interval of the period Compute Optimizer analyses a function over, as CloudWatch
-/// aggregates it: how often the function ran in that interval, how long an invocation took
-/// (shortest, mean and longest) and how much memory it used (mean and peak).
+/// aggregates the `AWS/Lambda` series AWS Lambda publishes for the function version: how
+/// often it ran in that interval, and how long an invocation took (shortest, mean and
+/// longest).
 ///
-/// A sample whose memory utilization was not observed records `0.0` for both memory
-/// measurements — the analysis then has no memory demand to size the function from, which
-/// is what [`ObservedFunction::finding`] reports `Inconclusive` for.
+/// Read out of the metric store by [`super::lambda_inventory`], which is the only thing that
+/// builds one: every figure here is an observation AWS Lambda published, never a value this
+/// service chose.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FunctionSample {
     /// How many days before the recommendation's last refresh this interval was observed,
@@ -162,16 +163,33 @@ pub struct FunctionSample {
     pub duration_ms_average: f64,
     /// The longest invocation of the interval, in milliseconds.
     pub duration_ms_maximum: f64,
-    /// The mean memory an invocation of the interval used, in MB.
-    pub memory_used_mb_average: f64,
-    /// The most memory an invocation of the interval used, in MB.
-    pub memory_used_mb_maximum: f64,
+}
+
+/// What ONE invocation's run report states it used: the memory the run peaked at, in MB.
+///
+/// AWS Lambda publishes no memory metric for a function — the memory an invocation really
+/// used is stated by the report that closes the run, in the function's own log group — so the
+/// memory side of a function's analysis is a list of these, one per run observed, read out of
+/// the log store by [`super::lambda_inventory`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryReport {
+    /// How many days before the recommendation's last refresh the run was reported, so the
+    /// look-back period in force decides whether it is analysed at all.
+    pub days_ago: f64,
+    /// The memory the run used at its peak, in MB — the report's own `Max Memory Used`.
+    pub used_mb: f64,
 }
 
 /// One Lambda function version Compute Optimizer observes: how it is configured, its tags,
-/// and the metric samples a recommendation for it is computed from. This is the
-/// OBSERVATION; everything a `LambdaFunctionRecommendation` reports is derived from it, so
-/// no two readers of the same function can disagree.
+/// and the observations a recommendation for it is computed from. This is the OBSERVATION;
+/// everything a `LambdaFunctionRecommendation` reports is derived from it, so no two readers
+/// of the same function can disagree.
+///
+/// It is built from the account's OWN inventory — the function AWS Lambda holds, the
+/// `AWS/Lambda` series published for it and the run reports in its log group
+/// ([`super::lambda_inventory::analysed_functions`], the one selection every Lambda function
+/// surface of this service reads) — so a function this service reports is a function the
+/// account really has.
 #[derive(Debug, Clone)]
 pub struct ObservedFunction {
     /// The function's name, which with [`Self::function_version`] is its key in the
@@ -186,24 +204,15 @@ pub struct ObservedFunction {
     /// The account that owns the function.
     pub account_id: String,
     /// "The amount of memory, in MB, that's allocated to the current function"
-    /// (`LambdaFunctionRecommendation$currentMemorySize`).
+    /// (`LambdaFunctionRecommendation$currentMemorySize`) — the memory AWS Lambda holds this
+    /// version configured with.
     pub configured_memory_mb: i32,
-    /// How much of an invocation's duration scales with the memory the function is
-    /// configured with, as a fraction of it: "Lambda allocates CPU power in proportion to
-    /// the amount of memory configured", so the compute-bound part of an invocation gets
-    /// faster on more memory and slower on less, while the part spent waiting on another
-    /// service does not move at all. An OBSERVED property of the workload, which is what
-    /// lets [`Self::projected_duration_ms`] state the duration a different memory size
-    /// would run at.
-    pub cpu_bound_duration_share: f64,
     /// The function's tags, as key/value pairs, in the order Lambda reports them.
     pub tags: Vec<(String, String)>,
-    /// How many days Compute Optimizer has been observing this function. A look-back
-    /// preference longer than this cannot be honoured, so the analysed period is the
-    /// shorter of the two.
-    pub days_observed: f64,
-    /// The metric samples observed, most recent first.
+    /// The `AWS/Lambda` samples observed for this version, oldest first.
     pub samples: Vec<FunctionSample>,
+    /// The memory the version's observed runs reported using, one entry per run.
+    pub memory_reports: Vec<MemoryReport>,
 }
 
 impl ObservedFunction {
@@ -242,10 +251,21 @@ impl ObservedFunction {
     }
 
     /// "The number of days for which utilization metrics were analyzed for the function":
-    /// the preferred look-back period ([`look_back_period_in_days`]), or however long this
-    /// function has been observed when that is shorter.
+    /// the look-back period in force for it ([`look_back_period_in_days`]), which is the
+    /// window the samples and run reports analysed are taken from.
     pub fn analysed_days(&self, look_back_period: &str) -> f64 {
-        look_back_period_in_days(look_back_period).min(self.days_observed)
+        look_back_period_in_days(look_back_period)
+    }
+
+    /// The run reports the look-back period in force analyses: those reported within
+    /// `look_back_days` of the last refresh.
+    pub(super) fn analysed_memory_reports(
+        &self,
+        look_back_days: f64,
+    ) -> impl Iterator<Item = &MemoryReport> {
+        self.memory_reports
+            .iter()
+            .filter(move |report| report.days_ago <= look_back_days)
     }
 
     /// "The number of times your function code was applied during the look-back period"
@@ -297,9 +317,28 @@ impl ObservedFunction {
     }
 
     /// The memory an invocation used at its peak over the analysed period, in MB — the
-    /// demand the function's configured memory has to carry.
+    /// demand the function's configured memory has to carry. `0.0` for a period whose runs
+    /// reported none, which is the `Inconclusive` case [`Self::finding`] reports.
     pub fn peak_memory_mb(&self, look_back_days: f64) -> f64 {
-        self.peak(look_back_days, |sample| sample.memory_used_mb_maximum)
+        self.analysed_memory_reports(look_back_days)
+            .map(|report| report.used_mb)
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// The memory an invocation used on average over the analysed period, in MB. Each report
+    /// is ONE run, so the mean over the reports is the mean per invocation.
+    pub fn average_memory_mb(&self, look_back_days: f64) -> f64 {
+        let mut runs = 0.0_f64;
+        let mut total = 0.0_f64;
+        for report in self.analysed_memory_reports(look_back_days) {
+            runs += 1.0;
+            total += report.used_mb;
+        }
+        if runs > 0.0 {
+            total / runs
+        } else {
+            0.0
+        }
     }
 
     /// The mean duration of an invocation over the analysed period, in milliseconds.
@@ -333,7 +372,7 @@ impl ObservedFunction {
             metric(
                 LAMBDA_METRIC_MEMORY,
                 METRIC_STATISTIC_AVERAGE,
-                self.mean_per_invocation(look_back_days, |sample| sample.memory_used_mb_average),
+                self.average_memory_mb(look_back_days),
             ),
             metric(
                 LAMBDA_METRIC_MEMORY,
@@ -404,38 +443,29 @@ impl ObservedFunction {
         ))
     }
 
-    /// The duration an invocation that took `observed_ms` at the configured memory would
-    /// take at `memory_mb`.
+    /// The duration an invocation that took `observed_ms` would take at the memory size a
+    /// recommendation option names.
     ///
-    /// Lambda "allocates CPU power in proportion to the amount of memory configured", so
-    /// the compute-bound share of the invocation ([`Self::cpu_bound_duration_share`]) scales
-    /// with the ratio of the two memory sizes and the rest of it does not move: a function
-    /// that spends its time waiting on another service gets no faster on more memory.
-    pub fn projected_duration_ms(&self, observed_ms: f64, memory_mb: i32) -> f64 {
-        let share = self.cpu_bound_duration_share.clamp(0.0, 1.0);
-        let ratio = demand_ratio(
-            f64::from(self.configured_memory_mb.max(0)),
-            f64::from(memory_mb.max(0)),
-        );
-        if !ratio.is_finite() {
-            return observed_ms.max(0.0);
-        }
-        round_hundredths(observed_ms.max(0.0) * (share * ratio + (1.0 - share)))
+    /// The analysis observes this function at ONE memory size — the one it is configured with
+    /// — so a duration at another size is not something it has observed: the projection is
+    /// the duration observed, rather than a speed-up or a slow-down computed from no
+    /// observation of the function at that size.
+    pub fn projected_duration_ms(&self, observed_ms: f64) -> f64 {
+        round_hundredths(observed_ms.max(0.0))
     }
 
     /// The projected metrics a recommendation option carries: the duration range the
-    /// function would run in at `memory_mb`, projected from the shortest, the mean and the
-    /// longest invocation the analysed period observed. `LambdaFunctionMemoryMetricName`
-    /// declares one metric — `Duration` — so each statistic is reported for it.
+    /// function runs in, from the shortest, the mean and the longest invocation the analysed
+    /// period observed. `LambdaFunctionMemoryMetricName` declares one metric — `Duration` —
+    /// so each statistic is reported for it.
     pub fn projected_utilization_metrics(
         &self,
         look_back_days: f64,
-        memory_mb: i32,
     ) -> Vec<LambdaFunctionMemoryProjectedMetric> {
         let metric = |statistic: &str, observed_ms: f64| LambdaFunctionMemoryProjectedMetric {
             name: Some(LAMBDA_METRIC_DURATION.to_string()),
             statistic: Some(statistic.to_string()),
-            value: self.projected_duration_ms(observed_ms, memory_mb),
+            value: self.projected_duration_ms(observed_ms),
         };
         vec![
             metric(
@@ -484,13 +514,13 @@ impl ObservedFunction {
     }
 
     /// What the function would cost per month at the recommended memory size: the same
-    /// invocations at the projected duration that memory size runs them in, so a saving is
-    /// never claimed from a memory cut the duration pays back.
+    /// invocations, at the duration the analysis projects for them
+    /// ([`Self::projected_duration_ms`]), billed over that memory size.
     pub fn recommended_monthly_cost(&self, look_back_days: f64) -> f64 {
         let memory_mb = self.recommended_memory_mb(look_back_days);
         self.monthly_cost(
             memory_mb,
-            self.projected_duration_ms(self.average_duration_ms(look_back_days), memory_mb),
+            self.projected_duration_ms(self.average_duration_ms(look_back_days)),
             look_back_days,
         )
     }
@@ -542,7 +572,7 @@ impl ObservedFunction {
                     rank: 1,
                     memory_size: memory_mb,
                     projected_utilization_metrics: Some(
-                        self.projected_utilization_metrics(look_back_days, memory_mb),
+                        self.projected_utilization_metrics(look_back_days),
                     ),
                     savings_opportunity: Some(SavingsOpportunity {
                         savings_opportunity_percentage: percentage,
@@ -729,154 +759,4 @@ pub fn lambda_filters_ask_for_unavailable(filters: &[LambdaFunctionRecommendatio
                 .flatten()
                 .any(|value| value == LAMBDA_FINDING_UNAVAILABLE)
     })
-}
-
-/// The Lambda functions this emulator observes, generated once when the store is created.
-///
-/// The emulator watches no real workload, so the functions and their metric samples are a
-/// fixed observation rather than something derived from traffic. Everything a recommendation
-/// reports is nevertheless computed from what is stored here — the analysed invocations,
-/// durations and memory peaks come from these samples, the recommended memory size from
-/// those peaks, and every cost from [`LAMBDA_PRICE_PER_GB_SECOND`] — so a reader cannot
-/// report a figure the observation does not support.
-///
-/// The set spans the cases a function recommendation distinguishes: an over-provisioned
-/// function whose heaviest day falls OUTSIDE the default look-back period, an
-/// under-provisioned PUBLISHED version (a qualified ARN), one already sized for its
-/// workload, one invoked too rarely to analyse, and one whose memory utilization was never
-/// observed.
-pub(super) fn observed_functions() -> Vec<ObservedFunction> {
-    let account_id = ::engine::emulator_account_id().to_string();
-
-    vec![
-        // 1 GB configured for a workload that peaks at 420 MB on its analysed days: the
-        // recommendation sizes the memory down, and half of each invocation is spent
-        // waiting on another service, so the smaller memory does not give the saving back
-        // in duration. Its heaviest day (780 MB) is 40 days old, so a longer look-back
-        // preference changes the memory size this function is recommended.
-        ObservedFunction {
-            function_name: "invoice-renderer".to_string(),
-            function_version: LATEST_FUNCTION_VERSION.to_string(),
-            account_id: account_id.clone(),
-            configured_memory_mb: 1_024,
-            cpu_bound_duration_share: 0.5,
-            tags: vec![("Owner".to_string(), "TeamA".to_string())],
-            days_observed: 93.0,
-            samples: vec![
-                FunctionSample {
-                    days_ago: 0.0,
-                    invocations: 42_000,
-                    duration_ms_minimum: 180.0,
-                    duration_ms_average: 310.0,
-                    duration_ms_maximum: 900.0,
-                    memory_used_mb_average: 350.0,
-                    memory_used_mb_maximum: 400.0,
-                },
-                FunctionSample {
-                    days_ago: 6.0,
-                    invocations: 58_000,
-                    duration_ms_minimum: 200.0,
-                    duration_ms_average: 328.0,
-                    duration_ms_maximum: 1_100.0,
-                    memory_used_mb_average: 362.0,
-                    memory_used_mb_maximum: 420.0,
-                },
-                FunctionSample {
-                    days_ago: 40.0,
-                    invocations: 30_000,
-                    duration_ms_minimum: 240.0,
-                    duration_ms_average: 520.0,
-                    duration_ms_maximum: 1_800.0,
-                    memory_used_mb_average: 610.0,
-                    memory_used_mb_maximum: 780.0,
-                },
-            ],
-        },
-        // A PUBLISHED version, so a qualified ARN names it: 128 MB for a workload that
-        // peaks at 120 MB, which leaves no headroom — the recommendation sizes the memory
-        // UP, and an under-provisioned function saves nothing by taking it.
-        ObservedFunction {
-            function_name: "thumbnail-resizer".to_string(),
-            function_version: "3".to_string(),
-            account_id: account_id.clone(),
-            configured_memory_mb: 128,
-            cpu_bound_duration_share: 0.8,
-            tags: vec![
-                ("Owner".to_string(), "TeamB".to_string()),
-                ("Environment".to_string(), "production".to_string()),
-            ],
-            days_observed: 93.0,
-            samples: vec![FunctionSample {
-                days_ago: 1.0,
-                invocations: 8_400,
-                duration_ms_minimum: 420.0,
-                duration_ms_average: 850.0,
-                duration_ms_maximum: 2_400.0,
-                memory_used_mb_average: 104.0,
-                memory_used_mb_maximum: 120.0,
-            }],
-        },
-        // 128 MB — Lambda's smallest — for a workload whose peak plus headroom still fits
-        // inside it, so there is no other memory size to move to: optimized, and observed
-        // for only a week, so the period analysed is that week however long a look-back
-        // period the account prefers.
-        ObservedFunction {
-            function_name: "order-dispatcher".to_string(),
-            function_version: LATEST_FUNCTION_VERSION.to_string(),
-            account_id: account_id.clone(),
-            configured_memory_mb: 128,
-            cpu_bound_duration_share: 0.6,
-            tags: Vec::new(),
-            days_observed: 7.0,
-            samples: vec![FunctionSample {
-                days_ago: 0.0,
-                invocations: 15_000,
-                duration_ms_minimum: 40.0,
-                duration_ms_average: 95.0,
-                duration_ms_maximum: 260.0,
-                memory_used_mb_average: 88.0,
-                memory_used_mb_maximum: 100.0,
-            }],
-        },
-        // Invoked a handful of times in the analysed period — below what the service needs
-        // to reach a finding — so the analysis has insufficient data for it.
-        ObservedFunction {
-            function_name: "log-forwarder".to_string(),
-            function_version: LATEST_FUNCTION_VERSION.to_string(),
-            account_id: account_id.clone(),
-            configured_memory_mb: 512,
-            cpu_bound_duration_share: 0.4,
-            tags: Vec::new(),
-            days_observed: 93.0,
-            samples: vec![FunctionSample {
-                days_ago: 2.0,
-                invocations: 12,
-                duration_ms_minimum: 60.0,
-                duration_ms_average: 140.0,
-                duration_ms_maximum: 300.0,
-                memory_used_mb_average: 180.0,
-                memory_used_mb_maximum: 240.0,
-            }],
-        },
-        // Invoked often enough, but no memory utilization was ever observed for it, so the
-        // analysis has no demand to size its memory from and cannot conclude anything.
-        ObservedFunction {
-            function_name: "nightly-reconciler".to_string(),
-            function_version: LATEST_FUNCTION_VERSION.to_string(),
-            account_id,
-            configured_memory_mb: 256,
-            cpu_bound_duration_share: 0.3,
-            tags: vec![("Owner".to_string(), "TeamA".to_string())],
-            days_observed: 93.0,
-            samples: vec![FunctionSample {
-                days_ago: 1.0,
-                invocations: 2_000,
-                duration_ms_minimum: 500.0,
-                duration_ms_average: 1_200.0,
-                duration_ms_maximum: 4_000.0,
-                memory_used_mb_average: 0.0,
-                memory_used_mb_maximum: 0.0,
-            }],
-        },
-    ]
 }

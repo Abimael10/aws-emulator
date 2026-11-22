@@ -35,6 +35,12 @@ service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # The observed utilization an ECS service recommendation is computed from: the
 # `AWS/ECS` `CPUUtilization` / `MemoryUtilization` datapoints published for the service.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The AWS Lambda inventory a Lambda function recommendation is computed over: the functions
+# the account holds, their published versions and the memory each is configured with.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# The run reports a Lambda function's invocations leave in its log group, which is where the
+# memory one invocation used is observed.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The object store a recommendations export writes its .csv export file and .json metadata
 # file into: "to an existing Amazon Simple Storage Service (Amazon S3) bucket that you
 # specify".
