@@ -210,7 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    `inputList`'s length is a fact about the REQUEST — "If you are including
         //    metadata in recommendations, the maximum is 50. Otherwise, the maximum is
         //    500." — so it is checked BEFORE the campaign is resolved: a list past the
-        //    bound is refused whatever the campaign turns out to be.
+        //    bound is refused whatever the campaign turns out to be. Which of the two
+        //    maxima applies is the `metadataColumns` map read as the model states it
+        //    ("The map key is `ITEMS`"), so a map that names no column of the Items
+        //    dataset includes no metadata and gets the "Otherwise" maximum — the lower
+        //    bound is never taken from a map this handler is about to refuse.
         let max_input_list = registry::metadata_bounded_max(registry::asks_for_metadata(
             input.metadata_columns.as_ref(),
         ));

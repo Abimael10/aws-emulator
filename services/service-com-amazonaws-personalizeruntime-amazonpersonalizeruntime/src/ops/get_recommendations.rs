@@ -244,7 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    satisfy — "If you are including metadata in recommendations, the maximum
         //    is 50. Otherwise, the maximum is 500." — are facts about the REQUEST: the
         //    bound is keyed off the same predicate `GetPersonalizedRanking` bounds
-        //    `inputList` with, so one request means one bound in both operations.
+        //    `inputList` with, so one request means one bound in both operations, and a
+        //    `metadataColumns` map that names no column of the Items dataset includes no
+        //    metadata, so it gets the "Otherwise" maximum rather than lowering the bound
+        //    with a map the handler is about to refuse.
         let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
             input.metadata_columns.as_ref(),
         ));

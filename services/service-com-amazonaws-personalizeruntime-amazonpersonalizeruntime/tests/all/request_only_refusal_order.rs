@@ -23,6 +23,14 @@
 //! A member the model leaves OPTIONAL is not such a refusal: it is an input of the
 //! resolved resource, so it is answered after resolution — see
 //! `optional_input_refusal_order.rs`.
+//!
+//! WHICH bound a request-only refusal measures against is part of the same rule: the
+//! lower maximum belongs to a request that includes metadata in recommendations, which
+//! is a `metadataColumns` map read as the model states it ("The map key is `ITEMS` and
+//! the value is a list of column names from your Items dataset"). A map naming no column
+//! of the Items dataset asks for no metadata, so such a request is measured against the
+//! "Otherwise" maximum and earns the clause naming the member that IS wrong — the map
+//! key — instead of one carrying a bound taken from the map the service refuses.
 
 use serde_json::{json, Value};
 
@@ -32,7 +40,7 @@ use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state::{
 };
 
 use crate::support::{
-    actions, items, Emulator, ACTION_RECOMMENDATIONS, COLUMN_GENRE, PERSONALIZE_RANKING,
+    actions, entries, items, Emulator, ACTION_RECOMMENDATIONS, COLUMN_GENRE, PERSONALIZE_RANKING,
     RECOMMENDATIONS,
 };
 
@@ -397,6 +405,194 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
 
 /// Every operation's route, so the rule is asserted over all three.
 const ROUTES: [&str; 3] = [RECOMMENDATIONS, ACTION_RECOMMENDATIONS, PERSONALIZE_RANKING];
+
+/// The routes whose maximum is the one the request's own `metadataColumns` fixes ("If
+/// you are including metadata in recommendations, the maximum is 50. Otherwise, the
+/// maximum is 500."): `GetRecommendations` measures `numResults` against it and
+/// `GetPersonalizedRanking` the length of `inputList`. `GetActionRecommendations` models
+/// no `metadataColumns`, so it has one fixed maximum.
+const METADATA_BOUNDED_ROUTES: [&str; 2] = [RECOMMENDATIONS, PERSONALIZE_RANKING];
+
+/// `metadataColumns` map keys that name no column of the Items dataset.
+///
+/// The documented key is the only one metadata in recommendations is served from ("The
+/// map key is `ITEMS` and the value is a list of column names from your Items dataset" —
+/// `smithy_query(query="doc",shape="GetRecommendationsRequest",member="metadataColumns")`),
+/// and the map key targets a free-form `DatasetType` string, so any other word — another
+/// dataset type of a Personalize dataset group, or the documented word in another case —
+/// reaches the handler.
+const KEYS_NAMING_NO_ITEMS_COLUMN: [&str; 4] =
+    ["USERS", "ACTIONS", "ACTION_INTERACTIONS", "Items"];
+
+/// Sizes past the maximum a request that includes metadata gets, and within the
+/// "Otherwise" one — the span over which the two maxima disagree.
+const PAST_THE_METADATA_MAXIMUM: [usize; 3] = [
+    MAX_NUM_RESULTS_WITH_METADATA + 1,
+    MAX_NUM_RESULTS_WITH_METADATA * 2,
+    MAX_NUM_RESULTS,
+];
+
+/// A request body naming the campaign the route's operation SERVES, so the only thing
+/// that can be wrong with it is what a row puts in it.
+fn served_base(route: &str) -> Value {
+    match route {
+        RECOMMENDATIONS => json!({ "campaignArn": CAMPAIGN_USER, "userId": "user-1" }),
+        PERSONALIZE_RANKING => json!({ "campaignArn": CAMPAIGN_RANKING, "userId": "user-1" }),
+        other => panic!("case {other}: no served campaign for this route"),
+    }
+}
+
+/// The member the route's operation measures against the maximum the same request fixes,
+/// carrying `size`.
+fn metadata_bounded_member(route: &str, size: usize) -> Value {
+    match route {
+        RECOMMENDATIONS => json!({ "numResults": size }),
+        PERSONALIZE_RANKING => json!({ "inputList": input_list(size) }),
+        other => panic!("case {other}: no metadata-bounded member for this route"),
+    }
+}
+
+/// The refusal that member earns at `size`, past the maximum `max`.
+fn past_the_bound(route: &str, size: usize, max: usize) -> String {
+    match route {
+        RECOMMENDATIONS => num_results_past(size, max),
+        PERSONALIZE_RANKING => format!("Length of 'inputList' cannot be greater than {max}"),
+        other => panic!("case {other}: no metadata-bounded member for this route"),
+    }
+}
+
+/// The output list member the route's operation reports its entries in, and how many
+/// entries a request carrying `size` is served: the recommendation operations report at
+/// most the seeded catalog, while `GetPersonalizedRanking` reranks every entry
+/// `inputList` names.
+fn reported_list(route: &str, size: usize) -> (&'static str, usize) {
+    match route {
+        RECOMMENDATIONS => ("itemList", CATALOG_SIZE),
+        PERSONALIZE_RANKING => ("personalizedRanking", size),
+        other => panic!("case {other}: no reported list for this route"),
+    }
+}
+
+/// `metadataColumns` maps that break no rule and ask for no metadata either: the empty
+/// map the modelled `length 0..1` admits, and the documented key naming no column.
+fn maps_naming_no_column() -> [(&'static str, Value); 2] {
+    [
+        ("an empty metadataColumns map", json!({})),
+        (
+            "the documented key naming no column",
+            json!({ METADATA_DATASET_ITEMS: [] }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_metadata_columns_key_naming_no_items_column_is_refused_for_that_key() {
+    // A map that names no column of the Items dataset includes no metadata in
+    // recommendations, so the maximum such a request is measured against is the
+    // "Otherwise" one: a `numResults` / `inputList` inside it breaks no bound, and the
+    // refusal the request earns names the member the caller DID get wrong — the map key
+    // — rather than one measured against a bound taken from the very map the service is
+    // about to refuse.
+    let emulator = seeded();
+
+    for route in METADATA_BOUNDED_ROUTES {
+        for key in KEYS_NAMING_NO_ITEMS_COLUMN {
+            for size in PAST_THE_METADATA_MAXIMUM {
+                let body = merged(
+                    &merged(&served_base(route), &metadata_bounded_member(route, size)),
+                    &json!({ "metadataColumns": { key: [COLUMN_GENRE] } }),
+                );
+                let case =
+                    format!("{route}: metadataColumns key {key:?} with a bounded member of {size}");
+                let refusal = emulator.refusal(route, body).await;
+                assert_eq!(
+                    (
+                        refusal.status,
+                        refusal.code.as_str(),
+                        refusal.errortype.as_str()
+                    ),
+                    (400, "InvalidInputException", "InvalidInputException"),
+                    "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.message,
+                    metadata_key_past(key),
+                    "case {case}: expected the map-key refusal {:?}, got {:?}",
+                    metadata_key_past(key),
+                    refusal.message
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_metadata_columns_key_naming_no_items_column_bounds_by_the_otherwise_maximum() {
+    // The complement, which pins WHICH maximum such a request is measured against: past
+    // the "Otherwise" maximum the member is genuinely too large, and the refusal names
+    // that maximum — never the lower one a request including metadata gets.
+    let emulator = seeded();
+    let size = MAX_NUM_RESULTS + 1;
+
+    for route in METADATA_BOUNDED_ROUTES {
+        for key in KEYS_NAMING_NO_ITEMS_COLUMN {
+            let body = merged(
+                &merged(&served_base(route), &metadata_bounded_member(route, size)),
+                &json!({ "metadataColumns": { key: [COLUMN_GENRE] } }),
+            );
+            let case = format!("{route}: metadataColumns key {key:?} with a bounded member of {size}");
+            let refusal = emulator.refusal(route, body).await;
+            assert_eq!(
+                (refusal.status, refusal.code.as_str()),
+                (400, "InvalidInputException"),
+                "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+            );
+            assert_eq!(
+                refusal.message,
+                past_the_bound(route, size, MAX_NUM_RESULTS),
+                "case {case}: expected the bound a request including no metadata gets, {:?}, \
+                 got {:?}",
+                past_the_bound(route, size, MAX_NUM_RESULTS),
+                refusal.message
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_metadata_columns_map_naming_no_column_is_served_past_the_metadata_maximum() {
+    // The same rule where the map breaks nothing at all: a map naming no column of the
+    // Items dataset asks for no metadata, so the request is served up to the "Otherwise"
+    // maximum and no reported entry carries the `metadata` member.
+    let emulator = seeded();
+    let size = MAX_NUM_RESULTS_WITH_METADATA + 1;
+
+    for route in METADATA_BOUNDED_ROUTES {
+        for (described, map) in maps_naming_no_column() {
+            let body = merged(
+                &merged(&served_base(route), &metadata_bounded_member(route, size)),
+                &json!({ "metadataColumns": map }),
+            );
+            let case = format!("{route}: {described} with a bounded member of {size}");
+            let response = emulator.ok(route, body).await;
+            let (member, expected) = reported_list(route, size);
+            let reported = entries(&response, member);
+            assert_eq!(
+                reported.len(),
+                expected,
+                "case {case}: expected {expected} entries in {member}, got {}",
+                reported.len()
+            );
+            for entry in &reported {
+                assert!(
+                    entry.get("metadata").is_none(),
+                    "case {case}: a request asking for no column must report no metadata \
+                     member, got {entry}"
+                );
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn a_request_only_refusal_is_answered_before_the_resource_is_resolved() {

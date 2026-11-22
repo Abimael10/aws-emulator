@@ -790,20 +790,44 @@ pub fn catalog_columns(items: &[Item]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The columns a `metadataColumns` map asks to include in recommendations: the value of
+/// its `ITEMS` key, when that key names any column.
+///
+/// The ONE reading of the map, which both the bound a metadata request is measured
+/// against and the columns the response serves are taken from, so the two cannot
+/// disagree about whether a given map asks for metadata. The model states the map as
+/// "The map key is `ITEMS` and the value is a list of column names from your Items
+/// dataset", so a key naming another dataset type asks for no column of the Items
+/// dataset, and an `ITEMS` key whose list is empty names none either.
+fn items_metadata_columns(
+    metadata_columns: Option<&HashMap<String, Vec<String>>>,
+) -> Option<&[String]> {
+    metadata_columns?
+        .get(METADATA_DATASET_ITEMS)
+        .map(Vec::as_slice)
+        .filter(|columns| !columns.is_empty())
+}
+
 /// Whether the request asks for metadata in recommendations at all.
 ///
 /// This reads the REQUEST only — it is the condition in "If you are including metadata
 /// in recommendations, the maximum is 50. Otherwise, the maximum is 500."
 /// (`GetPersonalizedRankingRequest$inputList` / `GetRecommendationsRequest$numResults`
-/// docs), which decides a bound before any resource is resolved. A map that names no
-/// column asks for nothing, exactly as [`requested_metadata_columns`] reports it.
+/// docs), which decides a bound before any resource is resolved. It is the map read
+/// through [`items_metadata_columns`], the reader [`requested_metadata_columns`] takes
+/// its admitted columns from: a map that names no column of the Items dataset — because
+/// its list is empty, or because its key is not the `ITEMS` the model states — includes
+/// no metadata in recommendations, so the "Otherwise" maximum is the one such a request
+/// is measured against.
 pub fn asks_for_metadata(metadata_columns: Option<&HashMap<String, Vec<String>>>) -> bool {
-    metadata_columns.is_some_and(|columns| columns.values().any(|names| !names.is_empty()))
+    items_metadata_columns(metadata_columns).is_some()
 }
 
 /// The maximum a request's result or input list may carry, from the one doc sentence
 /// that states both: [`MAX_NUM_RESULTS_WITH_METADATA`] when the request includes
-/// metadata, [`MAX_NUM_RESULTS`] otherwise.
+/// metadata, [`MAX_NUM_RESULTS`] otherwise. Which request those are is
+/// [`asks_for_metadata`]'s reading of `metadataColumns`, so a map the service does not
+/// serve metadata from is bounded by the "Otherwise" maximum.
 pub fn metadata_bounded_max(asks_for_metadata: bool) -> usize {
     if asks_for_metadata {
         MAX_NUM_RESULTS_WITH_METADATA
@@ -834,30 +858,28 @@ pub fn too_long(member: &str, max: usize) -> Denied {
 /// [`metadata_columns_in_catalog`]'s.
 ///
 /// `Ok(None)` means the request asked for no metadata at all, in which case
-/// `PredictedItem` must carry no `metadata` member — a map naming no column asks for
-/// nothing, exactly as [`asks_for_metadata`] reports it.
+/// `PredictedItem` must carry no `metadata` member — a map naming no column of the Items
+/// dataset asks for nothing, which it reads through the same
+/// [`items_metadata_columns`] the bound in [`asks_for_metadata`] is taken from.
 pub fn requested_metadata_columns(
     metadata_columns: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<Option<&[String]>, Denied> {
-    let Some(metadata_columns) = metadata_columns else {
-        return Ok(None);
-    };
-    let mut requested: Option<&Vec<String>> = None;
-    // The map is modelled `len 0..1`, so one key is the ordinary case; a request that
-    // sent several is walked in key order, so the key the refusal names is the same on
-    // every run rather than whichever one the hash order visited first.
-    let mut entries: Vec<(&String, &Vec<String>)> = metadata_columns.iter().collect();
-    entries.sort_by_key(|(dataset, _)| *dataset);
-    for (dataset, columns) in entries {
-        if dataset != METADATA_DATASET_ITEMS {
-            return Err(Denied::invalid(format!(
-                "Value '{dataset}' at 'metadataColumns' failed to satisfy constraint: the map key \
-                 must be {METADATA_DATASET_ITEMS}"
-            )));
+    if let Some(metadata_columns) = metadata_columns {
+        // The map is modelled `len 0..1`, so one key is the ordinary case; a request that
+        // sent several is walked in key order, so the key the refusal names is the same on
+        // every run rather than whichever one the hash order visited first.
+        let mut datasets: Vec<&String> = metadata_columns.keys().collect();
+        datasets.sort();
+        for dataset in datasets {
+            if dataset != METADATA_DATASET_ITEMS {
+                return Err(Denied::invalid(format!(
+                    "Value '{dataset}' at 'metadataColumns' failed to satisfy constraint: the map \
+                     key must be {METADATA_DATASET_ITEMS}"
+                )));
+            }
         }
-        requested = Some(columns);
     }
-    let Some(requested) = requested.filter(|columns| !columns.is_empty()) else {
+    let Some(requested) = items_metadata_columns(metadata_columns) else {
         return Ok(None);
     };
     if requested.len() > MAX_METADATA_COLUMNS {
@@ -867,7 +889,7 @@ pub fn requested_metadata_columns(
             requested.len()
         )));
     }
-    Ok(Some(requested.as_slice()))
+    Ok(Some(requested))
 }
 
 /// The columns [`requested_metadata_columns`] admitted, validated against the RESOLVED
