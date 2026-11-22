@@ -412,7 +412,18 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         // group it describes, and an absent member would make "attached to nothing"
         // indistinguishable from a group whose attachments this service does not report.
         load_balancer_names: Some(group.load_balancer_names.clone().unwrap_or_default()),
-        target_group_ar_ns: Some(group.attached_target_groups().to_vec()),
+        // Every Elastic Load Balancing v2 target group the group is attached to, through the
+        // one projection of that association
+        // ([`crate::state::elbv2_targets::attached_arns`]): an association is ONE attachment
+        // whichever call recorded it, so this member reports the ones named as traffic
+        // sources beside the ones named under the legacy member, exactly as the group's
+        // `TrafficSources` reports both.
+        target_group_ar_ns: Some(
+            crate::state::elbv2_targets::attached_arns(group)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
         health_check_type: group.health_check_type.clone(),
         health_check_grace_period: group.health_check_grace_period,
         instances,

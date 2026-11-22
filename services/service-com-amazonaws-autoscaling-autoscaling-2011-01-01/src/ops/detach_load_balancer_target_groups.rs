@@ -7,12 +7,13 @@
 //! not detaches none of them, so the group's attachments are either all the request
 //! asked for or exactly what they were.
 //!
-//! AWS reports a target group a detach removed as `Removing` through
-//! `DescribeLoadBalancerTargetGroups` while the group's instances deregister from it.
-//! That reader is still a scaffold stub, owned by its own issue, so this handler drops
-//! the attachment from the group's own `TargetGroupARNs` — the collection
-//! `DescribeAutoScalingGroups` reports — rather than storing a transient state no
-//! implemented operation could report. The instances themselves do deregister: the
+//! An Elastic Load Balancing v2 target group associated with an Auto Scaling group is ONE
+//! attachment however the client stated it, so a request names an attachment of the group
+//! when it names a target group the group reports
+//! ([`crate::state::elbv2_targets::attached_arns`]), and the removal takes that attachment
+//! out of both members that carry it — the group's own `TargetGroupARNs` and its `elbv2`
+//! traffic sources — exactly as `DetachTrafficSources` removes the one association from
+//! both. The instances themselves do deregister: the
 //! group's Elastic Load Balancing v2 registrations are brought in line with what it is
 //! still attached to ([`crate::state::elbv2_targets`]), so a detached target group drains
 //! them exactly as `DeregisterTargets` does.
@@ -202,12 +203,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // What the group HOLDS is the one set its readers report
+        // ([`crate::state::elbv2_targets::attached_arns`]): the attach of an `elbv2` traffic
+        // source records the same attachment the legacy member carries, so a group that
+        // REPORTS a target group cannot refuse the call that removes it.
+        let held: Vec<String> = crate::state::elbv2_targets::attached_arns(group)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         // Checked for EVERY named target group before any of them is removed: the
         // request is one unit of work, so one ARN this group never held refuses the
         // whole call and leaves the attachments it does hold in place.
         let unattached: Vec<String> = requested
             .iter()
-            .filter(|arn| !group.attached_target_groups().contains(arn))
+            .filter(|arn| !held.contains(arn))
             .cloned()
             .collect();
         if !unattached.is_empty() {
@@ -222,7 +231,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|arn| !requested.contains(arn))
             .cloned()
             .collect();
+        // The same attachment under its traffic-source spelling goes with it: one attachment
+        // is removed once, whichever member the client wrote it in, so the group's views of
+        // it stay the one set the detach left behind — exactly as the detach of a traffic
+        // source takes the legacy member's entry with it.
+        let kept_traffic_sources: Vec<TrafficSourceIdentifier> = group
+            .traffic_sources
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|source| !requested.contains(&source.identifier))
+            .collect();
         group.target_group_arns = Some(remaining);
+        group.traffic_sources = Some(kept_traffic_sources);
 
         crate::state::audit(
             ctx.parts(),

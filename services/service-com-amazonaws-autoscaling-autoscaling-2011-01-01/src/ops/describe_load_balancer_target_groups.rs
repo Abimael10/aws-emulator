@@ -199,14 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The target groups attached THROUGH THIS API — the group's own `TargetGroupARNs`,
-        // which `CreateAutoScalingGroup` and `AttachLoadBalancerTargetGroups` write: "you can
-        // use this operation to describe target groups that were attached by using
-        // AttachLoadBalancerTargetGroups, but not for target groups that were attached by
-        // using AttachTrafficSources" (this operation's own documentation). Each is held once
-        // and in attachment order by the write that put it there, so this read neither
-        // reorders nor de-duplicates them.
-        let attached = group.attached_target_groups().to_vec();
+        // Every Elastic Load Balancing v2 target group the group is ATTACHED to, through the
+        // one projection of that association
+        // ([`crate::state::elbv2_targets::attached_arns`]): the legacy call and the attach of
+        // an `elbv2` traffic source record the same attachment, so this read reports the ones
+        // stated either way — the same set the traffic-source read reports, each held once and
+        // in the order the group came to hold it, so this read neither reorders nor
+        // de-duplicates them.
+        let attached: Vec<String> = crate::state::elbv2_targets::attached_arns(group)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let states =
             crate::state::elbv2_targets::attachment_states(&*self.engine, group, &attached, now);
         let reported: Vec<LoadBalancerTargetGroupState> = attached
