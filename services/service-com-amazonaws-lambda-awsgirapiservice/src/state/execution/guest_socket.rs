@@ -568,8 +568,7 @@ impl Sockets {
         // plane of this emulator is published at an address of THIS MACHINE, so the transport
         // is a pipe inside the process — but the client is the FUNCTION, which reaches the
         // VPC the plane was placed in through the interfaces Lambda stood up for it, and the
-        // address its traffic carries there is the private address of one of them. A function
-        // attached to no VPC has no such address and the plane is told none.
+        // address its traffic carries there is the private address of one of them.
         //
         // So the two readings of ONE socket differ on purpose, and each is right about its
         // own side: `sourceHost` below is where the GUEST's traffic toward this destination
@@ -577,14 +576,26 @@ impl Sockets {
         // what the plane is told is where the function sits in the VPC the plane belongs to,
         // which is the address its protocol would state for this client. The PORT is the one
         // the socket was lent, so both readings name the same socket.
-        let from = inside.and_then(VpcAttachment::private_address).map(|address| {
-            ::std::net::SocketAddr::new(
-                ::std::net::IpAddr::V4(address),
-                source
-                    .as_ref()
-                    .map_or_else(|| self.lent_port(), |(_address, port)| *port),
-            )
-        });
+        //
+        // A function attached to NO VPC has no address there, and the connection still leaves
+        // from somewhere: the interface of this machine the route lookup answered with, which
+        // is the address the socket's own `getsockname` reports to the guest. That is what the
+        // plane is told then — so every connection this seam opens states where it came from,
+        // and no plane that names its client has to invent one.
+        let from = inside
+            .and_then(VpcAttachment::private_address)
+            .map(|address| {
+                ::std::net::SocketAddr::new(
+                    ::std::net::IpAddr::V4(address),
+                    source
+                        .as_ref()
+                        .map_or_else(|| self.lent_port(), |(_address, port)| *port),
+                )
+            })
+            .or_else(|| {
+                let (address, port) = source.as_ref()?;
+                Some(::std::net::SocketAddr::new(address.parse().ok()?, *port))
+            });
         let (authority, wire, answering) = match dialed {
             Some(Dialed { authority, plane, .. }) => {
                 let wire = runtime.block_on(async {
@@ -1727,6 +1738,110 @@ mod tests {
             sockets.open(),
             0,
             "expected no connection to have been opened at all"
+        );
+    }
+
+    /// RULE: a connection this seam opens STATES the address it leaves from, so the plane
+    /// serving it can name the client it is serving — the private address of the function's own
+    /// interface in the VPC it is attached to, and, for a function attached to NO VPC, the
+    /// interface of this machine the route lookup answered with on the port the socket was
+    /// lent. Never nothing, so no plane that states its client has to invent one.
+    ///
+    /// This is the row the seam resolves with no inventory to read: a function attached to no
+    /// VPC. The in-VPC row is asserted end to end, against the address Amazon EC2 holds for the
+    /// interface Lambda stood up, by
+    /// `core/router/tests/all/elasticache_slow_log_client_for_every_attachment.rs`.
+    #[tokio::test]
+    async fn a_connection_states_the_address_it_leaves_from() {
+        /// A plane that answers every connection with the address its client stated, which is
+        /// what a protocol that names its client reads off the connection.
+        struct Stating;
+
+        impl ::emulator_server::NativeHandler for Stating {
+            fn serve(
+                &self,
+                conn: ListenerConn,
+            ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ()> + Send>> {
+                let stated = ::service_common::dialable_data_planes::connected_from()
+                    .map_or_else(|| "nothing was stated".to_string(), |from| from.to_string());
+                Box::pin(async move {
+                    let mut conn = conn;
+                    let _written = conn.write_all(stated.as_bytes()).await;
+                    let _flushed = conn.flush().await;
+                })
+            }
+        }
+
+        let engine = ::engine::InMemoryEngine::new();
+        let planes = DialablePlanes::of(&engine).expect("the engine vends the records");
+        let port = 37_017_u16;
+        let plane = ::service_common::dialable_data_planes::served_in_process(
+            ::std::sync::Arc::new(Stating),
+            None,
+        );
+        let _open = planes.opening([format!("127.0.0.1:{port}")], "elasticache", &plane);
+        let sockets = Sockets::default();
+        let runtime = Handle::current();
+        // The seam is the host half of a BLOCKING guest call — it drives the plane's own task
+        // on the runtime while the guest's thread waits — so it is called the way a running
+        // handler calls it: off the runtime's own threads.
+        let (opened, received) = ::tokio::task::spawn_blocking(move || {
+            let opened = sockets.answered(
+                Some(&planes),
+                None,
+                &runtime,
+                "connect",
+                &json!({ "host": "127.0.0.1", "port": port, "timeout": 5.0 }).to_string(),
+                Duration::from_secs(5),
+            );
+            let handle = ::serde_json::from_str::<Value>(&opened)
+                .ok()
+                .and_then(|answer| answer.get("handle").and_then(Value::as_u64))
+                .unwrap_or_default();
+            let received = sockets.answered(
+                Some(&planes),
+                None,
+                &runtime,
+                "recv",
+                &json!({ "handle": handle, "size": 64, "timeout": 5.0 }).to_string(),
+                Duration::from_secs(5),
+            );
+            (opened, received)
+        })
+        .await
+        .expect("the guest's calls ran");
+        let opened: Value = ::serde_json::from_str(&opened).expect("an answer document");
+        assert!(
+            opened.get("handle").and_then(Value::as_u64).is_some(),
+            "the connection must be opened, got {opened}"
+        );
+        let received: Value = ::serde_json::from_str(&received).expect("an answer document");
+        let carried = received
+            .get("data")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let read = ::base64::engine::general_purpose::STANDARD
+            .decode(carried)
+            .unwrap_or_else(|error| panic!("the bytes read back ({error}): {received}"));
+        let stated = String::from_utf8(read)
+            .unwrap_or_else(|error| panic!("the address the plane was told ({error})"));
+        let addressed: ::std::net::SocketAddr = stated.parse().unwrap_or_else(|error| {
+            panic!("the plane must be told an address:port, got {stated:?} ({error})")
+        });
+        assert!(
+            addressed.ip().is_loopback(),
+            "a connection to a plane served in this process leaves from this machine's own \
+             interface, got {stated:?}"
+        );
+        assert!(
+            (EPHEMERAL_PORT_FIRST..=EPHEMERAL_PORT_LAST).contains(&addressed.port()),
+            "the connection must state the port it was lent, got {stated:?}"
+        );
+        let source = addressed.ip().to_string();
+        assert_eq!(
+            opened.get("sourceHost").and_then(Value::as_str),
+            Some(source.as_str()),
+            "the guest's own reading of the socket names the same interface, got {opened}"
         );
     }
 }
