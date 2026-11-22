@@ -35,16 +35,21 @@ use crate::list_extensions::walk;
 use crate::resource_tags::arn;
 
 /// One entry of AppConfig's published AWS-authored extension catalogue.
-struct PublishedExtension {
+///
+/// `pub(crate)` because the suite that asserts this published text is the SAME text
+/// whatever the request and whatever the account holds
+/// (`crate::authored_catalogue_fixed_text`) reads these rows rather than hand-copying them
+/// a third time.
+pub(crate) struct PublishedExtension {
     /// The published identifier: what a caller passes as an `ExtensionIdentifier`, and the
     /// tail of the ARN each of the extension's versions is reported under.
-    id: &'static str,
+    pub(crate) id: &'static str,
     /// The prose name published beside the id.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The published sentence describing what the extension does, verbatim.
-    description: &'static str,
+    pub(crate) description: &'static str,
     /// The parameter names an association of this extension supplies values for.
-    parameters: &'static [&'static str],
+    pub(crate) parameters: &'static [&'static str],
 }
 
 /// `Description` is `@length 0..1024`
@@ -62,7 +67,7 @@ const DESCRIPTION_MAX: usize = 1024;
 /// EventBridge entry sends events to EventBridge, the Amazon SNS entry events to the
 /// configured topic and the Amazon SQS entry messages to the configured queue, so no row's
 /// sentence can be read off a sibling's.
-const PUBLISHED_CATALOGUE: &[PublishedExtension] = &[
+pub(crate) const PUBLISHED_CATALOGUE: &[PublishedExtension] = &[
     PublishedExtension {
         id: "AWS.AppConfig.FeatureFlags",
         name: "AppConfig Feature Flags Helper",
