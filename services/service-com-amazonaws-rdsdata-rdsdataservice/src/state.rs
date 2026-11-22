@@ -147,7 +147,7 @@ pub mod preconditions;
 /// another cluster: what a DB cluster snapshot of that cluster carries, and what a restore
 /// of that snapshot serves.
 pub mod cluster_copies;
-pub use cluster_copies::CapturedClusterData;
+pub use cluster_copies::{CapturedClusterData, ClusterPlacement};
 
 use postgres::{PgType, Plan, TypeClass};
 

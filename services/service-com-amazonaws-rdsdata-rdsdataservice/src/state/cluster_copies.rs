@@ -10,8 +10,8 @@
 //! pair of operations that control plane needs: take a private copy of a cluster's
 //! databases, and install such a copy as the databases another cluster holds.
 //!
-//! Both are COPIES made by the engine itself ([`Database::snapshot`], SQLite's own backup
-//! API), so:
+//! Both are COPIES made by the engine itself ([`Database::snapshot`] taking one,
+//! [`Database::absorb`] installing one, over SQLite's own backup API), so:
 //!
 //! * a copy is byte-identical to the database it was taken from, with the same schema, the
 //!   same rows and the same sequence marks — nothing is re-rendered as SQL text and nothing
@@ -26,6 +26,12 @@
 //!
 //! A cluster this service holds nothing for yields no copy at all (`None`), which is what a
 //! snapshot of a cluster nobody ran a Data API statement on holds: nothing.
+//!
+//! A copy is installed WHERE the cluster's databases live — the cluster's own volume
+//! ([`ClusterPlacement`]), the storage every surface of that cluster opens a connection onto
+//! — and not in a database private to this service: the data a restore brings back belongs to
+//! the cluster, so a session on the cluster's engine endpoint reads it exactly as a statement
+//! here does.
 
 use std::sync::Mutex;
 
@@ -72,6 +78,29 @@ impl CapturedClusterData {
     }
 }
 
+/// WHERE the databases a copy is installed on a cluster belong: the cluster's own volume and
+/// the database a call that names none addresses, as the control plane that owns the cluster
+/// names them (the same two facts the precondition chain resolves for every call,
+/// [`super::preconditions::Admitted`]).
+///
+/// A DB cluster's databases are held one backing per database, which every SURFACE of that
+/// cluster opens a connection onto ([`::service_common::cluster_sql_volumes`]), so a copy
+/// installed on a cluster is installed THERE: a copy kept private to this service would be
+/// data the cluster's engine endpoints could not read, and a client that wrote its rows
+/// through one door and reads them through another would find none.
+///
+/// `volume` is `None` for a cluster whose storage this service does not share — one no
+/// control plane answered about, and an emulator whose engine vends no such naming — whose
+/// databases are then this service's own, exactly as a statement that opens one leaves them.
+#[derive(Debug, Default, Clone)]
+pub struct ClusterPlacement {
+    /// The cluster's volume, by the cluster's own immutable resource id.
+    pub volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
+    /// `DatabaseName`: the database the cluster was created with, which is the name the
+    /// default database's rows belong to on the cluster.
+    pub default_database: Option<String>,
+}
+
 impl ComAmazonawsRdsdataRdsdataserviceState {
     /// A private copy of every database this service holds for `resource_arn`, or `None`
     /// when it holds none at all.
@@ -106,6 +135,14 @@ impl ComAmazonawsRdsdataRdsdataserviceState {
     /// nothing serves nothing. The copy itself is left intact, so the same snapshot can be
     /// restored again.
     ///
+    /// Each database is installed in the cluster's OWN STORAGE (`placement`): the backing
+    /// every surface of that cluster opens a connection onto is written INTO
+    /// ([`Database::absorb`], exactly as a commit of this service's own installs a
+    /// transaction's writes), so the rows the restore brings back are rows a session on the
+    /// restored cluster's engine endpoint reads and not a copy only this service can see. A
+    /// cluster whose storage this service does not share holds them as its own, which is all
+    /// the storage such a cluster has.
+    ///
     /// The transactions open on the cluster are not touched: a transaction belongs to the
     /// cluster it was opened on, and the cluster this installs onto is one the control plane
     /// has just created.
@@ -113,6 +150,7 @@ impl ComAmazonawsRdsdataRdsdataserviceState {
         &mut self,
         resource_arn: &str,
         captured: Option<&CapturedClusterData>,
+        placement: &ClusterPlacement,
     ) -> Result<(), SqlError> {
         let databases = match captured {
             Some(captured) => &captured.databases[..],
@@ -132,19 +170,24 @@ impl ComAmazonawsRdsdataRdsdataserviceState {
         if databases.is_empty() && !self.clusters.contains_key(resource_arn) {
             return Ok(());
         }
-        let mut restored = Vec::with_capacity(databases.len());
-        for (name, database) in databases {
-            let copy = copy_of(
-                &database
-                    .lock()
-                    .unwrap_or_else(::std::sync::PoisonError::into_inner),
-            )?;
-            restored.push((name.clone(), copy));
-        }
         let cluster: &mut Cluster = self.cluster_mut(resource_arn)?;
+        // WHERE the databases below are opened, recorded before any of them is: the cluster's
+        // own volume, so each one is opened on the backing every surface of the cluster
+        // addresses rather than as a database of this service's own.
+        cluster.serves_volume(placement.volume.clone(), placement.default_database.clone());
         cluster.databases.clear();
-        for (name, database) in restored {
-            cluster.databases.insert(name, database);
+        for (name, captured) in databases {
+            let captured = captured
+                .lock()
+                .unwrap_or_else(::std::sync::PoisonError::into_inner);
+            let database = cluster.database_mut(name)?;
+            database.absorb(&captured)?;
+            // The one fact the page copy does not carry: whether a `CREATE DATABASE` brought
+            // the database into being, which is what makes a database the cluster HAS even
+            // while it holds nothing.
+            if captured.declared {
+                database.declare();
+            }
         }
         Ok(())
     }

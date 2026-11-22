@@ -19,6 +19,13 @@
 //! across is the opaque copy that service hands back. This service neither reads nor writes
 //! a database of it.
 //!
+//! What this side DOES say is WHERE a copy is installed ([`DataApiClusterPlacement`]): a DB
+//! cluster's databases are held in the cluster's own volume, which every surface of that
+//! cluster opens a connection onto, and this service's control plane is what knows the
+//! restored cluster's resource id and `DatabaseName` — the two facts that name it. That is
+//! what makes the restored rows rows every door of the restored cluster serves, the Data API's
+//! HTTP endpoint and the cluster's own engine endpoints alike.
+//!
 //! Both calls are AWAITED on a blocking task, exactly as the capture of a cluster's own
 //! storage is ([`super::data_plane::capture_cluster_storage`]): copying a database is engine
 //! work, so it belongs off the runtime's worker threads — and neither may be called with
@@ -36,6 +43,18 @@ use std::sync::Arc;
 /// kept on the snapshot record that holds it ([`super::DbClusterSnapshotRecord`]).
 pub type DataApiClusterData =
     ::service_com_amazonaws_rdsdata_rdsdataservice::state::CapturedClusterData;
+
+/// WHERE such a copy is installed: the volume of the cluster it is installed ON, and the
+/// database that cluster was created with.
+///
+/// A DB cluster's databases are held in one backing per database that every surface of the
+/// cluster opens a connection onto ([`::service_common::cluster_sql_volumes`]) — this
+/// service's own engine endpoints and the Data API's HTTP endpoint alike — so a restore
+/// installs the snapshot's databases THERE. That is what makes the restored rows rows every
+/// door of the restored cluster serves, exactly as the cluster's own wire storage is loaded
+/// into the volume its endpoint was opened on ([`super::data_plane::sql_engine::InstanceDatabase::load_from`]).
+pub type DataApiClusterPlacement =
+    ::service_com_amazonaws_rdsdata_rdsdataservice::state::ClusterPlacement;
 
 /// A COPY of every database the Data API holds for the DB cluster `cluster_arn` names,
 /// right now — what a DB cluster snapshot of that cluster carries.
@@ -73,9 +92,16 @@ pub async fn capture_data_api_cluster_data<Eng: Send + Sync + 'static>(
 /// databases, and one restored from a snapshot that carries none serves none. `captured` is
 /// left intact, so the same snapshot restores again. Call it with this service's store
 /// unlocked.
+///
+/// `resource_id` is the restored cluster's own `DbClusterResourceId` and `default_database`
+/// its `DatabaseName`: together they name the storage the copy is installed in
+/// ([`DataApiClusterPlacement`]), so the restored rows are rows every surface of that
+/// cluster reads — the Data API's HTTP endpoint and the cluster's engine endpoints.
 pub async fn install_data_api_cluster_data<Eng: Send + Sync + 'static>(
     engine: &Eng,
     cluster_arn: &str,
+    resource_id: &str,
+    default_database: Option<&str>,
     captured: Option<Arc<DataApiClusterData>>,
 ) -> Result<(), String> {
     let Some(store) = ::service_com_amazonaws_rdsdata_rdsdataservice::state::service_state(engine)
@@ -84,11 +110,19 @@ pub async fn install_data_api_cluster_data<Eng: Send + Sync + 'static>(
         // them on — and a snapshot that carries none asks for nothing either way.
         return Ok(());
     };
+    // The cluster's own volume, named by the resource id of the cluster the copy is installed
+    // on — the same naming its engine endpoint's databases are opened under, so the two
+    // surfaces address one storage.
+    let placement = DataApiClusterPlacement {
+        volume: ::service_common::cluster_sql_volumes::ClusterVolumes::of(engine)
+            .map(|volumes| volumes.cluster(resource_id)),
+        default_database: default_database.map(ToString::to_string),
+    };
     let cluster_arn = cluster_arn.to_string();
     let installed = ::tokio::task::spawn_blocking(move || {
         store
             .lock()
-            .install_cluster_data(&cluster_arn, captured.as_deref())
+            .install_cluster_data(&cluster_arn, captured.as_deref(), &placement)
     })
     .await
     .map_err(|error| {

@@ -1227,6 +1227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
         }
 
+        // The database the restored cluster was created with, read off its record before the
+        // store takes it: it is the name the default database of the snapshot's Data API
+        // copy belongs to on the restored cluster.
+        let default_database = record.database_name.clone();
+
         // Another request may have taken this identifier while this one was binding, so the
         // conflict is answered again here rather than overwriting a stored cluster. Deciding
         // it and admitting the record happen under ONE guard, so no third request can take
@@ -1291,9 +1296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // THE OTHER HALF OF THE RESTORE: the databases the snapshot's cluster served through
         // the RDS Data API are installed as the restored cluster's own, under the ARN a Data
-        // API call addresses it by — so a client that wrote its rows through that surface
-        // finds them on the restored cluster, and a cluster restored from a snapshot that
-        // carried none serves none. Installed by the service that OWNS those databases
+        // API call addresses it by and IN THE VOLUME that cluster's databases live in — the
+        // storage every surface of it opens a connection onto, the same one the wire storage
+        // above was loaded into. So a client that wrote its rows through that surface finds
+        // them on the restored cluster through EVERY door of it, a native session included,
+        // and a cluster restored from a snapshot that carried none serves none. Installed by
+        // the service that OWNS those databases
         // ([`crate::state::install_data_api_cluster_data`]), with this service's store
         // unlocked, and only once THIS call is the one that created the cluster: a restore
         // another request's cluster was already holding the identifier for is refused above
@@ -1309,6 +1317,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::install_data_api_cluster_data(
             &*self.engine,
             &crate::state::db_cluster_arn(&region, &identifier),
+            &resource_id,
+            default_database.as_deref(),
             data_api_storage,
         )
         .await
