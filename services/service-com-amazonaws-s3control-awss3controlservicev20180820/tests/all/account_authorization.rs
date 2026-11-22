@@ -24,8 +24,8 @@
 //! that exist beside names that do not.
 
 use crate::access_point_lifecycle::{
-    assert_foreign_account_refused, Emulator, Reply, ACCOUNT, FOREIGN_ACCOUNT_STATUS,
-    OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_at_authority, Emulator, Reply, ACCOUNT,
+    FOREIGN_ACCOUNT_STATUS, OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 /// The status S3 Control refuses such a request with, named here because the
@@ -209,11 +209,12 @@ async fn send_from(
 /// Send one request to `authority` — the host it states it was sent to — naming
 /// `header_account` in the header every operation binds its `AccountId` to.
 ///
-/// The one request builder of this suite: the rows above vary the account, and
-/// the rows below the AUTHORITY the prefix sits ahead of, which is the whole
-/// difference between the public endpoint and an endpoint a client is configured
-/// with.
-async fn send_to(
+/// Delegates to the crate's one request builder
+/// ([`crate::access_point_lifecycle::call_at_authority`]): the rows above vary
+/// the account, and the rows below the AUTHORITY the prefix sits ahead of, which
+/// is the whole difference between the public endpoint and an endpoint a client
+/// is configured with.
+pub(crate) async fn send_to(
     emulator: &Emulator,
     authority: &str,
     header_account: Option<&str>,
@@ -221,43 +222,17 @@ async fn send_to(
     uri: &str,
     body: &str,
 ) -> Reply {
-    let mut request = ::http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", authority)
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/s3/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/xml");
-    if let Some(account) = header_account {
-        request = request.header("x-amz-account-id", account);
-    }
-    let response = emulator
-        .router
-        .dispatch(
-            request
-                .body(::bytes::Bytes::from(body.to_owned()))
-                .expect("build the request"),
-        )
-        .await;
-    Reply {
-        status: response.status().as_u16(),
-        headers: response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_ascii_lowercase(),
-                    String::from_utf8_lossy(value.as_bytes()).to_string(),
-                )
-            })
-            .collect(),
-        body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body"),
-    }
+    call_at_authority(
+        &emulator.router,
+        REGION,
+        authority,
+        false,
+        method,
+        uri,
+        header_account,
+        body,
+    )
+    .await
 }
 
 /// The foreign accounts above that the `AccountId` pattern (`^\d{12}$`) admits.
@@ -281,7 +256,7 @@ fn foreign_accounts_the_pattern_admits() -> Vec<(&'static str, String)> {
 /// port, and a named host. A client prepends the modelled `{AccountId}.` prefix
 /// to whatever endpoint it resolved, so the account travels the same way in all
 /// four.
-fn prefixed_authorities(account: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn prefixed_authorities(account: &str) -> Vec<(&'static str, String)> {
     vec![
         (
             "the public endpoint",

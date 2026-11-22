@@ -420,13 +420,49 @@ pub(crate) async fn call_in_region(
     account_id: &str,
     body: &str,
 ) -> Reply {
-    let request = ::http::Request::builder()
+    call_at_authority(
+        router,
+        region,
+        &format!("{account_id}.s3-control.{region}.amazonaws.com"),
+        false,
+        method,
+        uri,
+        Some(account_id),
+        body,
+    )
+    .await
+}
+
+/// The ONE request builder every suite in `tests/all/` sends through, stating
+/// `authority` as the endpoint the request was sent to, naming `account_id` in
+/// the `x-amz-account-id` header every operation binds its `AccountId` member to
+/// (`None` sends no such header), and writing the request URI in absolute form
+/// when `absolute` is set.
+///
+/// The authority and the header are parameters because a client builds the host
+/// it sends to by prepending the `{AccountId}.` host prefix to WHATEVER endpoint
+/// authority it resolved, so the endpoint a request states, and whether the
+/// account travels in the header as well, vary independently of what the request
+/// asks for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_at_authority(
+    router: &MultiServiceRouter,
+    region: &str,
+    authority: &str,
+    absolute: bool,
+    method: &str,
+    uri: &str,
+    account_id: Option<&str>,
+    body: &str,
+) -> Reply {
+    let request_uri = match absolute {
+        true => format!("https://{authority}{uri}"),
+        false => uri.to_string(),
+    };
+    let mut builder = ::http::Request::builder()
         .method(method)
-        .uri(uri)
-        .header(
-            "host",
-            format!("{account_id}.s3-control.{region}.amazonaws.com"),
-        )
+        .uri(&request_uri)
+        .header("host", authority)
         .header(
             "authorization",
             format!(
@@ -434,8 +470,11 @@ pub(crate) async fn call_in_region(
                  SignedHeaders=host, Signature=abc"
             ),
         )
-        .header("x-amz-account-id", account_id)
-        .header("content-type", "application/xml")
+        .header("content-type", "application/xml");
+    if let Some(account_id) = account_id {
+        builder = builder.header("x-amz-account-id", account_id);
+    }
+    let request = builder
         .body(::bytes::Bytes::from(body.to_owned()))
         .expect("build the request");
     let response = router.dispatch(request).await;
