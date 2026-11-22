@@ -158,7 +158,8 @@ use crate::ops::types::{
     Action, AuthorizerDescription, AwsJobExecutionsRolloutConfig, AwsJobPresignedUrlConfig,
     CodeSigning, CommandParameter, CommandParameterValue, CommandPayload, CommandPreprocessor,
     CommandSummary, GetCommandExecutionOutput, GetCommandOutput, Job, JobExecution,
-    JobExecutionStatusDetails, JobExecutionSummary, JobExecutionSummaryForThing, JobProcessDetails,
+    JobExecutionStatusDetails, JobExecutionSummary, JobExecutionSummaryForJob,
+    JobExecutionSummaryForThing, JobProcessDetails,
     Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo,
     PackageVersionArtifact, PropagatingAttribute, S3Location, Sbom,
     ThingGroupIndexingConfiguration, ThingIndexingConfiguration, ThingTypeMetadata,
@@ -3872,6 +3873,27 @@ pub fn to_job_execution_summary_for_thing(
 ) -> JobExecutionSummaryForThing {
     JobExecutionSummaryForThing {
         job_id: Some(record.job_id.clone()),
+        job_execution_summary: Some(to_job_execution_summary(record)),
+    }
+}
+
+/// A stored job execution as the modeled `JobExecutionSummaryForJob` — "a summary of
+/// information about job executions for a specific job" — one entry of what a listing of
+/// ONE job's executions reports.
+///
+/// The entry names the THING the execution runs on, because the job is the one the request
+/// addressed: `thingArn` is "The ARN of the thing on which the job execution is running",
+/// built from the thing NAME the execution is keyed by and the region the request is signed
+/// for ([`thing_arn`]) — the same ARN [`to_job_execution`] reports for the same record, so
+/// a job that targeted a thing the registry does not hold still names it. The execution
+/// itself is [`to_job_execution_summary`], so a per-job listing, a per-thing listing and a
+/// single-execution read of one record cannot disagree about a member they share.
+pub fn to_job_execution_summary_for_job(
+    record: &JobExecutionRecord,
+    region: &str,
+) -> JobExecutionSummaryForJob {
+    JobExecutionSummaryForJob {
+        thing_arn: Some(thing_arn(region, &record.thing_name)),
         job_execution_summary: Some(to_job_execution_summary(record)),
     }
 }
