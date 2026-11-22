@@ -138,8 +138,9 @@ const UNDERFLOW_CLAUSE: &str =
 
 /// The documented exponent range of a DynamoDB number: "Number: ... can have up to 38
 /// digits of precision. Exponent range is 10^-130 to 10^125" ("Service, Account, and Table
-/// Quotas"). The two limits of the integer a decimal exponent is held in are the 32-bit
-/// ones, which is the width that decides whether a text states a number at all.
+/// Quotas"). The two limits of the integer the STATEMENT surface reads an exponent into are
+/// the 32-bit ones, which is the width that decides whether this surface can convert a
+/// parameter to a number at all.
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 const MAX_SIGNED_32: &str = "2147483647";
@@ -150,11 +151,11 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
     let router = seeded().await;
 
     // Each row: the case, the `N` text the parameter carries, and the whole sentence the
-    // refusal must state. The rows walk the two sides of the width the exponent is held
-    // in — one past each of its limits, far past it both ways, and far past any integer —
-    // beside AT each of its limits, one past each end of the documented range, a text that
-    // is no number at all, and a mantissa that normalises to zero under an exponent outside
-    // the documented range.
+    // refusal must state. The rows walk the two sides of the width this surface reads an
+    // exponent into — one past each of its limits, far past it both ways, and far past any
+    // integer — beside AT each of its limits, one past each end of the documented range, a
+    // text that is no number at all, and a mantissa that normalises to zero under an exponent
+    // outside the documented range.
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an exponent far past the width of any integer",
@@ -172,7 +173,7 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
             conversion_clause("1e99999999999999999999999"),
         ),
         (
-            "an exponent one past the top of the integer it is held in",
+            "an exponent one past the top of the integer it is read into",
             "1e2147483648".to_string(),
             conversion_clause("1e2147483648"),
         ),

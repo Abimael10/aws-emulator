@@ -39,12 +39,12 @@ impl NumberKey {
             return Err(NumberFault::NotNumeric);
         }
         // WHETHER a text denotes a number at all is told apart from WHAT magnitude it
-        // states: an exponent is read as the signed 32-bit integer a decimal exponent is
-        // held in, and only a magnitude that integer CAN state is held to the documented
-        // range as the over- or underflow it is. A text whose exponent is no signed
-        // decimal integer, or states one wider than that integer reaches, denotes no
-        // decimal value at all and is refused as a text this service cannot convert to a
-        // number.
+        // states: the exponent is read as the signed 64-bit integer a decimal exponent is
+        // carried in ([`signed_exponent`]), and a magnitude that integer CAN state is then
+        // held to the documented range as the over- or underflow its sign names — however
+        // many digits the exponent is written with. Only a text whose exponent that integer
+        // cannot state at all, or which is no signed run of digits, denotes no decimal value
+        // and is refused as a text this service cannot convert to a number.
         let exponent = match exponent_text {
             Some(text) => signed_exponent(text)?,
             None => 0,
@@ -228,15 +228,15 @@ impl NumberKey {
 ///
 /// `NotNumeric` whenever the text states no exponent a decimal value can carry: nothing
 /// after the exponent marker, a sign with no digits behind it, a character that is not a
-/// digit, or a run of digits stating a magnitude outside the signed 32-bit integer a
-/// decimal exponent is held in ([`MAX_EXPONENT_TEXT_DIGITS`] is the width that integer's
-/// widest magnitude is written at). Each of those leaves a text that denotes no decimal
-/// number, which is a different answer from a number whose magnitude a decimal CAN state
-/// and the documented range excludes: that one is the over- or underflow its sign names.
+/// digit, or a run of digits stating a magnitude outside the signed 64-bit integer a decimal
+/// exponent is carried in. Each of those leaves a text that denotes no decimal number, which
+/// is a different answer from a number whose magnitude that integer CAN state and the
+/// documented range excludes: that one is the over- or underflow its sign names, whatever
+/// WIDTH the exponent is written at — ten digits or twenty, padded or not.
 ///
-/// Leading zeros denote nothing, so the WIDTH of the run decides neither question on its
-/// own — only the value its digits spell, read as the SIGNED integer the text states, so
-/// the bottom of that integer's range is representable too.
+/// Leading zeros denote nothing, so the width of the run decides neither question on its
+/// own — only the value its digits spell, read as the SIGNED integer the text states, so the
+/// bottom of that integer's range is representable too.
 fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -251,19 +251,71 @@ fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     if significant.is_empty() {
         return Ok(0);
     }
-    if significant.len() > MAX_EXPONENT_TEXT_DIGITS {
-        return Err(NumberFault::NotNumeric);
-    }
     // Read as the SIGNED integer the text spells, so the bottom of that integer's range is
-    // representable too.
+    // representable too. A magnitude that integer cannot state is a text this service cannot
+    // convert to a number at all.
     let signed = if negative {
         format!("-{significant}")
     } else {
         significant.to_string()
     };
-    let exponent = signed.parse::<i64>().map_err(|_| NumberFault::NotNumeric)?;
-    // Inside the width of the integer a decimal exponent is held in, which is what makes
-    // this a number whose magnitude the documented range is then read against.
-    i32::try_from(exponent).map_err(|_| NumberFault::NotNumeric)?;
-    Ok(exponent)
+    signed.parse::<i64>().map_err(|_| NumberFault::NotNumeric)
+}
+
+/// The exponent bounds a value a STATEMENT carries is read against: the signed 32-bit
+/// integer the statement surface reads a `Parameters` entry's exponent into, which is
+/// NARROWER than the one the item API reads the same text into ([`signed_exponent`]).
+///
+/// The two surfaces coerce a number with two different readers, so one text can be a
+/// magnitude to one and no number at all to the other: an exponent of eleven digits is a
+/// magnitude the item API holds to the documented range, and a parameter the statement
+/// surface cannot convert to a numeric value. Nothing below the exponent differs — the
+/// documented precision and exponent range, the set rules and every other value rule are the
+/// same for both ([`check_statement_value`]).
+const MAX_STATEMENT_EXPONENT: i64 = i32::MAX as i64;
+const MIN_STATEMENT_EXPONENT: i64 = i32::MIN as i64;
+
+/// Hold every number inside `value` to the exponent width the STATEMENT surface reads one
+/// into ([`MAX_STATEMENT_EXPONENT`]), reporting a text outside it as the parameter this
+/// surface cannot convert to a numeric value, echoing the text as the request wrote it.
+///
+/// Reaches the `N` of a scalar, every member of an `NS`, and every number nested in an `L`
+/// or an `M` at any depth, because the reader belongs to the value's TYPE and not to where
+/// the value sits. The walk is ITERATIVE, over an explicit stack, for the reason
+/// [`attribute_value_size`]'s is: how deeply a value nests is the caller's choice, so
+/// recursing on it would make stack use a function of the request.
+pub fn check_statement_number_width(value: &AttributeValue) -> Result<(), RequestError> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            AttributeValue::N(text) => check_statement_exponent(text)?,
+            AttributeValue::Ns(members) => {
+                for member in members {
+                    check_statement_exponent(member)?;
+                }
+            }
+            AttributeValue::L(members) => pending.extend(members.iter()),
+            AttributeValue::M(entries) => pending.extend(entries.values()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// One number text held to the statement surface's exponent width.
+fn check_statement_exponent(text: &str) -> Result<(), RequestError> {
+    let exponent = match text.find(['e', 'E']) {
+        Some(at) => &text[at + 1..],
+        // A text that states no exponent at all states none outside this width; whether it
+        // is a number is the shared reader's question.
+        None => return Ok(()),
+    };
+    match signed_exponent(exponent) {
+        Ok(exponent) if (MIN_STATEMENT_EXPONENT..=MAX_STATEMENT_EXPONENT).contains(&exponent) => {
+            Ok(())
+        }
+        // An exponent this surface cannot read, either because it is no signed run of digits
+        // or because it states a magnitude outside the integer this surface reads one into.
+        _ => Err(number_rejection(text, NumberFault::NotNumeric)),
+    }
 }

@@ -1,27 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What an `N` text whose EXPONENT is wider than a decimal exponent can be earns, on every
-//! surface a number arrives through.
+//! What an `N` text whose EXPONENT is written at a great WIDTH earns, on every surface a
+//! number arrives through.
 //!
-//! RULE under test: a decimal's exponent is held in a signed 32-bit integer, so a text whose
-//! exponent states a magnitude outside that integer states no decimal number at all and is
-//! refused as a parameter that cannot be converted to a numeric value, echoing the text; a
-//! text whose exponent that integer CAN state does name a number, and only then is its
-//! magnitude held to the documented range ("Number: ... can have up to 38 digits of
-//! precision. Exponent range is 10^-130 to 10^125" — "Service, Account, and Table Quotas" in
-//! the Amazon DynamoDB Developer Guide) as the over- or underflow it is.
+//! RULE under test: an exponent is read as the signed integer a decimal exponent is carried
+//! in, and a magnitude that integer CAN state is then held to the documented range ("Number:
+//! ... can have up to 38 digits of precision. Exponent range is 10^-130 to 10^125" —
+//! "Service, Account, and Table Quotas" in the Amazon DynamoDB Developer Guide) and refused
+//! as the over- or underflow the direction it left that range in names; only a text whose
+//! exponent that integer cannot state — or which is no signed run of digits at all — cannot
+//! be converted to a numeric value. The WIDTH of that integer is the surface's own: the item
+//! API reads an exponent into a 64-bit one, and the STATEMENT surface coerces a `Parameters`
+//! entry through a narrower 32-bit reader, so one text can be a magnitude to the first and no
+//! number at all to the second.
 //!
 //! The rows differ along what the rule generalises over:
 //!
-//! * the WIDTH the exponent is written at — one past each limit of that integer, far past it
-//!   either way, far past it with an explicit sign, and (the controls) exactly at each limit,
-//!   just outside the documented range, and inside it;
-//! * the SIGN of the exponent, which decides nothing about this refusal and everything about
-//!   the magnitude ones;
+//! * the WIDTH the exponent is written at — one past each limit of the 32-bit reader, far past
+//!   it either way, far past it with an explicit sign, wider than any integer, and (the
+//!   controls) exactly at each 32-bit limit, just outside the documented range, and inside
+//!   it;
+//! * the SIGN of the exponent, which is what decides which sentence a magnitude earns;
 //! * the SURFACE the text arrives through: an item attribute of a write, a key of a read, an
 //!   expression value, a PartiQL parameter of the single-statement surface, of a transaction
-//!   and of a batch — because the rule belongs to the numeric domain and not to one
-//!   operation.
+//!   and of a batch — which is what decides WHICH reader the text is read with.
 //!
 //! Each surface states a clause about a value a request carried in its own envelope, so each
 //! assertion is of the WHOLE message that surface states, and the batch slot's own
@@ -46,7 +48,8 @@ const OVERFLOW_CLAUSE: &str =
 const UNDERFLOW_CLAUSE: &str =
     "Number underflow. Attempting to store a number with magnitude smaller than supported range";
 
-/// The sentence a text that states no decimal number earns, echoing the text as sent.
+/// The sentence a text whose exponent is no run of digits at all earns, echoing the text as
+/// sent.
 fn conversion_clause(text: &str) -> String {
     format!("The parameter cannot be converted to a numeric value: {text}")
 }
@@ -77,92 +80,131 @@ async fn emulator_with_table() -> MultiServiceRouter {
     router
 }
 
-/// One row: the case, the `N` text, and the whole clause it earns.
+/// One row: the case, the `N` text, the clause an ITEM-API surface earns for it and the
+/// clause a STATEMENT surface earns for it. The two differ only where the text's exponent
+/// lies between the two readers' widths.
 struct Row {
     case: &'static str,
     text: String,
     clause: String,
+    statement_clause: String,
 }
 
-/// The texts whose exponent is wider than a decimal exponent can be, and the controls just
-/// inside that width.
+/// The texts whose exponent is written wider than the 32-bit reader of the statement surface,
+/// the controls just inside that width, and the texts whose exponent is no run of digits at
+/// all.
 fn rows() -> Vec<Row> {
+    /// One row whose text is past the STATEMENT reader's width: a magnitude to the item API,
+    /// and a parameter the statement surface cannot convert.
+    fn past_the_statement_reader(case: &'static str, text: String, clause: &str) -> Row {
+        Row {
+            case,
+            statement_clause: conversion_clause(&text),
+            text,
+            clause: clause.to_string(),
+        }
+    }
+    /// One row both readers answer the same way.
+    fn read_alike(case: &'static str, text: String, clause: String) -> Row {
+        Row {
+            case,
+            text,
+            clause: clause.clone(),
+            statement_clause: clause,
+        }
+    }
     let mut rows = vec![
-        Row {
-            case: "one past the top of the integer the exponent is held in",
-            text: format!("1e{}", MAX_SIGNED_32 + 1),
-            clause: conversion_clause(&format!("1e{}", MAX_SIGNED_32 + 1)),
-        },
-        Row {
-            case: "one past the bottom of that integer",
-            text: format!("1e{}", MIN_SIGNED_32 - 1),
-            clause: conversion_clause(&format!("1e{}", MIN_SIGNED_32 - 1)),
-        },
-        Row {
-            case: "far past the top of that integer",
-            text: "1e99999999999".to_string(),
-            clause: conversion_clause("1e99999999999"),
-        },
-        Row {
-            case: "far past the bottom of that integer",
-            text: "1e-99999999999".to_string(),
-            clause: conversion_clause("1e-99999999999"),
-        },
-        Row {
-            case: "far past it with an explicit plus sign on the exponent",
-            text: "1E+99999999999".to_string(),
-            clause: conversion_clause("1E+99999999999"),
-        },
-        Row {
-            case: "an exponent far wider than any integer, written out",
-            text: "1E99999999999999999999999999999999999999999".to_string(),
-            clause: conversion_clause("1E99999999999999999999999999999999999999999"),
-        },
-        Row {
-            case: "a fractional mantissa under an exponent past that width",
-            text: "-1.5e99999999999".to_string(),
-            clause: conversion_clause("-1.5e99999999999"),
-        },
-        // The controls: AT each limit of that integer the text DOES name a number, whose
-        // magnitude the documented range then excludes.
-        Row {
-            case: "at the top of that integer, which names a magnitude",
-            text: format!("1e{MAX_SIGNED_32}"),
-            clause: OVERFLOW_CLAUSE.to_string(),
-        },
-        Row {
-            case: "at the bottom of that integer, which names a magnitude",
-            text: format!("1e{MIN_SIGNED_32}"),
-            clause: UNDERFLOW_CLAUSE.to_string(),
-        },
-        Row {
-            case: "one past the documented maximum",
-            text: format!("1e{}", MAX_EXPONENT + 1),
-            clause: OVERFLOW_CLAUSE.to_string(),
-        },
-        Row {
-            case: "one past the documented minimum",
-            text: format!("1e{}", MIN_EXPONENT - 1),
-            clause: UNDERFLOW_CLAUSE.to_string(),
-        },
+        past_the_statement_reader(
+            "one past the top of the 32-bit reader",
+            format!("1e{}", MAX_SIGNED_32 + 1),
+            OVERFLOW_CLAUSE,
+        ),
+        past_the_statement_reader(
+            "one past the bottom of that reader",
+            format!("1e{}", MIN_SIGNED_32 - 1),
+            UNDERFLOW_CLAUSE,
+        ),
+        past_the_statement_reader(
+            "far past the top of that reader",
+            "1e99999999999".to_string(),
+            OVERFLOW_CLAUSE,
+        ),
+        past_the_statement_reader(
+            "far past the bottom of that reader",
+            "1e-99999999999".to_string(),
+            UNDERFLOW_CLAUSE,
+        ),
+        past_the_statement_reader(
+            "far past it with an explicit plus sign on the exponent",
+            "1E+99999999999".to_string(),
+            OVERFLOW_CLAUSE,
+        ),
+        past_the_statement_reader(
+            "a fractional mantissa under an exponent past that width",
+            "-1.5e99999999999".to_string(),
+            OVERFLOW_CLAUSE,
+        ),
+        // Wider than EITHER reader, so neither can state the magnitude and both answer the
+        // text they cannot convert.
+        read_alike(
+            "an exponent far wider than any integer, written out",
+            "1E99999999999999999999999999999999999999999".to_string(),
+            conversion_clause("1E99999999999999999999999999999999999999999"),
+        ),
+        // The controls: AT each limit of the narrower reader both read a magnitude, and so
+        // they do just outside the documented range.
+        read_alike(
+            "at the top of that reader, which names a magnitude",
+            format!("1e{MAX_SIGNED_32}"),
+            OVERFLOW_CLAUSE.to_string(),
+        ),
+        read_alike(
+            "at the bottom of that reader, which names a magnitude",
+            format!("1e{MIN_SIGNED_32}"),
+            UNDERFLOW_CLAUSE.to_string(),
+        ),
+        read_alike(
+            "one past the documented maximum",
+            format!("1e{}", MAX_EXPONENT + 1),
+            OVERFLOW_CLAUSE.to_string(),
+        ),
+        read_alike(
+            "one past the documented minimum",
+            format!("1e{}", MIN_EXPONENT - 1),
+            UNDERFLOW_CLAUSE.to_string(),
+        ),
+        // The control for the OTHER refusal: an exponent marker with no run of digits behind
+        // it states no exponent to either reader.
+        read_alike(
+            "an exponent marker with no digits behind it",
+            "1e".to_string(),
+            conversion_clause("1e"),
+        ),
+        read_alike(
+            "an exponent that is not digits at all",
+            "1e4x".to_string(),
+            conversion_clause("1e4x"),
+        ),
     ];
     // Leading zeros denote nothing, so a padded exponent is judged by the magnitude behind
-    // the padding: this one is inside the width and outside the documented range.
-    rows.push(Row {
-        case: "past the documented maximum behind a long run of leading zeros",
-        text: format!("1e{}{}", "0".repeat(30), MAX_EXPONENT + 1),
-        clause: OVERFLOW_CLAUSE.to_string(),
-    });
+    // the padding: this one is inside both readers' widths and outside the documented range.
+    rows.push(read_alike(
+        "past the documented maximum behind a long run of leading zeros",
+        format!("1e{}{}", "0".repeat(30), MAX_EXPONENT + 1),
+        OVERFLOW_CLAUSE.to_string(),
+    ));
     rows
 }
 
 /// One surface a number arrives through: the operation, the request built around the text,
-/// and whether that surface states its clause inside the per-member validation envelope.
+/// whether that surface states its clause inside the per-member validation envelope, and
+/// whether it coerces the text through the STATEMENT reader.
 struct Surface {
     case: &'static str,
     operation: &'static str,
     request: fn(&str) -> Value,
     enveloped: bool,
+    statement: bool,
 }
 
 /// The surfaces: the item API, the expression surface and the three PartiQL ones.
@@ -177,6 +219,7 @@ fn surfaces() -> Vec<Surface> {
                 }})
             },
             enveloped: true,
+            statement: false,
         },
         Surface {
             case: "a key of GetItem",
@@ -185,6 +228,7 @@ fn surfaces() -> Vec<Surface> {
                 json!({"TableName": TABLE, "Key": {"pk": {"S": "exp"}, "sk": {"N": text}}})
             },
             enveloped: false,
+            statement: false,
         },
         Surface {
             case: "an expression value of a Query key condition",
@@ -197,6 +241,7 @@ fn surfaces() -> Vec<Surface> {
                 })
             },
             enveloped: false,
+            statement: false,
         },
         Surface {
             case: "a parameter of ExecuteStatement",
@@ -208,6 +253,7 @@ fn surfaces() -> Vec<Surface> {
                 })
             },
             enveloped: false,
+            statement: true,
         },
         Surface {
             case: "a parameter of ExecuteTransaction",
@@ -219,12 +265,13 @@ fn surfaces() -> Vec<Surface> {
                 }]})
             },
             enveloped: false,
+            statement: true,
         },
     ]
 }
 
 #[tokio::test]
-async fn an_exponent_wider_than_a_decimal_carries_cannot_be_converted_on_every_surface() {
+async fn which_reader_a_surface_uses_decides_which_defect_a_wide_exponent_is() {
     let router = seeded().await;
 
     for surface in surfaces() {
@@ -237,10 +284,15 @@ async fn an_exponent_wider_than_a_decimal_carries_cannot_be_converted_on_every_s
                 (400, "ValidationException"),
                 "case {case:?}: the text is refused, got {status} with {answered}"
             );
-            let expected = if surface.enveloped {
-                format!("{ENVELOPE}{}", row.clause)
+            let clause = if surface.statement {
+                &row.statement_clause
             } else {
-                row.clause.clone()
+                &row.clause
+            };
+            let expected = if surface.enveloped {
+                format!("{ENVELOPE}{clause}")
+            } else {
+                clause.clone()
             };
             let stated = message(&answered);
             assert_eq!(
@@ -257,7 +309,8 @@ async fn a_batch_slot_states_the_same_clause_in_its_own_error() {
 
     // "The Error output member represents the error, if any, that was encountered while
     // processing the request" (`BatchStatementResponse$Error`): the batch serves the call and
-    // states the clause behind the slot that carried the parameter.
+    // states the clause behind the slot that carried the parameter — the STATEMENT reader's,
+    // since a batch slot carries a `Parameters` entry.
     for row in rows() {
         let answered = ok(
             &router,
@@ -275,10 +328,10 @@ async fn a_batch_slot_states_the_same_clause_in_its_own_error() {
                 answered["Responses"][1]["Error"]["Code"].as_str(),
                 answered["Responses"][1]["Error"]["Message"].as_str(),
             ),
-            (Some("ValidationError"), Some(row.clause.as_str())),
+            (Some("ValidationError"), Some(row.statement_clause.as_str())),
             "case {:?}: the slot states {:?}, got {answered}",
             row.case,
-            row.clause
+            row.statement_clause
         );
         // The slot that carried a well-formed parameter is served, so the batch reports the
         // refusal of one statement and not of the request.

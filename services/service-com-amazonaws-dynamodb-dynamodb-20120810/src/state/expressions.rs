@@ -2029,8 +2029,15 @@ pub fn check_bare_attribute_value(name: &str, value: &AttributeValue) -> Result<
 /// other rule is the same ([`check_attribute_value`]), and so is the FORM: the statement
 /// surface answers the clause on its own, the way it answers every other refusal about a
 /// statement, and states no separator for a value it has nothing to echo after it.
+///
+/// One rule is this surface's own: the statement surface COERCES a number through a
+/// narrower reader than the item API does, so an exponent outside the integer that reader
+/// uses is a parameter it cannot convert to a numeric value rather than a magnitude outside
+/// the documented range ([`check_statement_number_width`]). It is asked FIRST, because a
+/// text this surface cannot read is not a magnitude it can then range-check.
 pub fn check_statement_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
-    check_value_within_the_item_limits(name, value)
+    check_statement_number_width(value)
+        .and_then(|()| check_value_within_the_item_limits(name, value))
         .map_err(without_envelope)
         .map_err(without_empty_echo)
 }

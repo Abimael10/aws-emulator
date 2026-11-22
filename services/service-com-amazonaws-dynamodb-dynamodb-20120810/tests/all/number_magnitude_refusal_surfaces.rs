@@ -2,13 +2,14 @@
 
 //! The refusals a NUMBER's magnitude earns, on every surface a number arrives through.
 //!
-//! The rule: a magnitude a decimal CAN state and the documented exponent range excludes is
-//! refused as the over- or underflow it is, by the sign of the exponent ("Number: ... can
+//! The rule: a magnitude the documented exponent range excludes is refused as the over- or
+//! underflow it is, by the sign of the exponent ("Number: ... can
 //! have up to 38 digits of precision. Exponent range is 10^-130 to 10^125" — "Service,
-//! Account, and Table Quotas" in the Amazon DynamoDB Developer Guide), while a text whose
-//! exponent states a magnitude wider than the signed 32-bit integer a decimal exponent is
-//! held in denotes no decimal number at all and is refused as a text that cannot be
-//! converted to a numeric value, echoing the text.
+//! Account, and Table Quotas" in the Amazon DynamoDB Developer Guide), however many digits
+//! that exponent is written with: an exponent is read as the signed 64-bit integer a decimal
+//! exponent is carried in, so every width below states a magnitude, and only a text whose
+//! exponent is no such signed run of digits is refused as a text that cannot be converted
+//! to a numeric value.
 //!
 //! The rows differ along what the rule generalises over:
 //!
@@ -47,7 +48,7 @@ const OVERFLOW_CLAUSE: &str =
 const UNDERFLOW_CLAUSE: &str =
     "Number underflow. Attempting to store a number with magnitude smaller than supported range";
 
-/// The sentence a text that states no decimal number at all earns, echoing the text.
+/// The sentence a text whose exponent is no run of digits at all earns, echoing the text.
 fn conversion_clause(text: &str) -> String {
     format!("The parameter cannot be converted to a numeric value: {text}")
 }
@@ -114,32 +115,40 @@ fn magnitudes() -> Vec<Magnitude> {
             text: format!("1e{MIN_SIGNED_32}"),
             clause: UNDERFLOW_CLAUSE.to_string(),
         },
-        // Past the width of that integer the text states no decimal number at all, so it
-        // is refused as one that cannot be converted, echoed as the request wrote it.
+        // Past the width of that integer the text still states a magnitude, so it earns the
+        // sentence the direction it left the range in names.
         Magnitude {
             case: "one past the top of that integer",
             text: "1e2147483648".to_string(),
-            clause: conversion_clause("1e2147483648"),
+            clause: OVERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "one past the bottom of that integer",
             text: "1e-2147483649".to_string(),
-            clause: conversion_clause("1e-2147483649"),
+            clause: UNDERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "far past the width of that integer",
             text: "1e99999999999".to_string(),
-            clause: conversion_clause("1e99999999999"),
+            clause: OVERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "far past that width, the other way",
             text: "1e-99999999999".to_string(),
-            clause: conversion_clause("1e-99999999999"),
+            clause: UNDERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "far past that width with an explicit plus sign",
             text: "+1e99999999999".to_string(),
-            clause: conversion_clause("+1e99999999999"),
+            clause: OVERFLOW_CLAUSE.to_string(),
+        },
+        // The exponent marker with no run of digits behind it states no exponent at all, so
+        // this one text IS refused as a text that cannot be converted — the control that
+        // keeps the two refusals apart.
+        Magnitude {
+            case: "an exponent marker with no digits behind it",
+            text: "1e".to_string(),
+            clause: conversion_clause("1e"),
         },
     ];
     // The padding denotes nothing, so what decides the refusal is the magnitude behind it.

@@ -499,16 +499,6 @@ const MAX_EXPONENT: i32 = 125;
 const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
-/// The most SIGNIFICANT DIGITS one `N` value's EXPONENT text may carry, leading zeros
-/// dropped, and still state an exponent a decimal value can hold at all.
-///
-/// A decimal's exponent is held in a signed 32-bit integer, whose widest magnitude is ten
-/// digits long, so a run of more than ten digits states no exponent such a value carries:
-/// the text denotes no decimal number and is refused as one that cannot be converted to a
-/// number, not as a magnitude outside the documented range. Telling those two apart is
-/// [`NumberKey::try_parse`]'s job, and this is the width it decides on.
-const MAX_EXPONENT_TEXT_DIGITS: usize = 10;
-
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.
 ///
@@ -4819,8 +4809,10 @@ mod index_declarations;
 pub use index_declarations::*;
 
 /// What an `N` attribute value's order-preserving encoding does, in its own file: it is
-/// about ONE value's numeric domain rather than about what the store holds.
+/// about ONE value's numeric domain rather than about what the store holds. Re-exported
+/// below, so every caller still names what it holds `crate::state::…`.
 mod numbers;
+pub use numbers::*;
 
 /// What a request CONSUMED, as `ConsumedCapacity` reports it: the capacity units a read
 /// and a write of a given size take, and the per-index breakdown a write reports.

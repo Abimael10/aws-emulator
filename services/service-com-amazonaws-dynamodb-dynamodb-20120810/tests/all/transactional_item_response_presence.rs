@@ -3,12 +3,13 @@
 //! What ONE element of a transactional read reports, driven end to end.
 //!
 //! RULE under test: an `ItemResponse` carries the PROJECTED ATTRIBUTES of the item its `Get`
-//! addressed, so it carries an `Item` only where that get has projected attributes to report
-//! — "if a requested item could not be retrieved, the corresponding ItemResponse object is
-//! Null, or if the requested item has no projected attributes, the corresponding ItemResponse
-//! object is an empty Map" (`TransactGetItems$Responses`). A key that holds no item and a
-//! projection that named no location of the item it found therefore answer alike: the empty
-//! `ItemResponse`, with no `Item` member in it.
+//! FOUND, so whether it carries an `Item` at all is decided by whether that get retrieved an
+//! item — "if a requested item could not be retrieved, the corresponding ItemResponse object
+//! is Null, or if the requested item has no projected attributes, the corresponding
+//! ItemResponse object is an empty Map" (`TransactGetItems$Responses`). A key that holds no
+//! item answers the empty `ItemResponse`, with no `Item` member in it, while a projection
+//! that named no location of the item it FOUND answers the `Item` it projected to, which is
+//! the empty map.
 //!
 //! The rows differ along what the rule generalises over:
 //!
@@ -82,7 +83,7 @@ fn get(partition: &str, expression: &str, names: Value) -> Value {
 }
 
 /// One row: the case, the element, and the `Item` the element must report — `None` where the
-/// `ItemResponse` must be the empty object.
+/// `ItemResponse` must be the empty object, which is only where the get retrieved no item.
 struct Row {
     case: &'static str,
     element: Value,
@@ -95,32 +96,32 @@ fn rows() -> Vec<Row> {
         Row {
             case: "an attribute the item does not hold",
             element: get("seed", "absent", Value::Null),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "that attribute behind an alias",
             element: get("seed", "#a", json!({"#a": "absent"})),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path into a map that holds nothing there",
             element: get("seed", "doc.gap", Value::Null),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path past the end of a stored list",
             element: get("seed", "parts[9]", Value::Null),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path through a scalar, which holds no member",
             element: get("seed", "note.gap", Value::Null),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "several paths that all name nothing",
             element: get("seed", "absent, doc.gap, parts[9]", Value::Null),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a key that holds no item",
@@ -161,7 +162,7 @@ fn response_at(answered: &Value, at: usize) -> Value {
 }
 
 #[tokio::test]
-async fn an_item_response_carries_an_item_only_where_the_get_projected_one() {
+async fn an_item_response_carries_an_item_for_every_get_that_retrieved_one() {
     let router = seeded().await;
 
     for row in rows() {
@@ -185,8 +186,8 @@ async fn an_item_response_carries_an_item_only_where_the_get_projected_one() {
             row.case,
             row.reported
         );
-        // A get with nothing to report answers the EMPTY ItemResponse: no member at all,
-        // rather than an `Item` with nothing in it.
+        // Only a get that retrieved NO item answers the empty ItemResponse; a get whose
+        // projection matched nothing answers the `Item` it projected to.
         let expected_members = usize::from(row.reported.is_some());
         assert_eq!(
             response.as_object().map(serde_json::Map::len),

@@ -10,12 +10,12 @@
 //! holding no item reports no member at all.
 //!
 //! A TRANSACTIONAL read answers the same two facts in its own envelope: what it reports is
-//! the `ItemResponse` object, which carries an `Item` only where there were projected
-//! attributes to carry — "if a requested item could not be retrieved, the corresponding
-//! ItemResponse object is Null, or if the requested item has no projected attributes, the
-//! corresponding ItemResponse object is an empty Map" (`TransactGetItems$Responses`) — so a
-//! get whose projection matched nothing answers the empty `ItemResponse`, exactly as a get
-//! that retrieved no item does.
+//! the `ItemResponse` object, which carries an `Item` for every item its get FOUND — "if a
+//! requested item could not be retrieved, the corresponding ItemResponse object is Null, or
+//! if the requested item has no projected attributes, the corresponding ItemResponse object
+//! is an empty Map" (`TransactGetItems$Responses`) — so a get whose projection matched
+//! nothing answers the `Item` it projected to, which is the empty map, and only a get that
+//! retrieved no item answers the `ItemResponse` with no member in it.
 //!
 //! The rows span what the rule generalises over: the FORM of the projection that matched
 //! nothing (an attribute the item does not hold, that attribute reached through an alias, a
@@ -288,13 +288,11 @@ async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
             row.case
         );
         let reported = read["Responses"][0].get("Item").cloned();
-        // The `ItemResponse` carries the PROJECTED ATTRIBUTES, so the member is there only
-        // where the get had some: the map the single-item reader reports with nothing in
-        // it is the empty `ItemResponse` object here.
-        let expected = row
-            .reported
-            .clone()
-            .filter(|item| item.as_object().is_some_and(|pairs| !pairs.is_empty()));
+        // The `ItemResponse` carries the item its get FOUND, so the member is there for
+        // every such get: the map the single-item reader reports with nothing in it is the
+        // `Item` of the empty map here, and only a get that retrieved no item answers an
+        // `ItemResponse` with no member in it.
+        let expected = row.reported.clone();
         assert_eq!(
             reported, expected,
             "case {:?} (TransactGetItems): expected {expected:?}, got {read}",
@@ -303,7 +301,7 @@ async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
         assert_eq!(
             read["Responses"][0].as_object().map(serde_json::Map::len),
             Some(usize::from(expected.is_some())),
-            "case {:?} (TransactGetItems): a get with no projected attributes answers the \
+            "case {:?} (TransactGetItems): only a get that retrieved no item answers the \
              empty ItemResponse, got {read}",
             row.case
         );
