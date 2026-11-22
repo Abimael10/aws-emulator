@@ -59,9 +59,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    create_cluster, ec2, ec2_element, ecr, emulator_with_ec2, emulator_with_ecr_and_iam, iam,
-    identity_document, identity_document_signature, list, ok, register_capacity,
-    register_definition, service, string, ACCOUNT, AWSVPC_SUBNET, SIGNED_REGION,
+    assert_millisecond_resolution, create_cluster, ec2, ec2_element, ecr, emulator_with_ec2,
+    emulator_with_ecr_and_iam, iam, identity_document, identity_document_signature, list, ok,
+    register_capacity, register_definition, service, string, ACCOUNT, AWSVPC_SUBNET,
+    SIGNED_REGION,
 };
 
 /// The cluster every placement below is made in.
@@ -1181,19 +1182,6 @@ async fn a_task_reports_the_size_of_the_capacity_amazon_ecs_provisioned_for_it()
             }
         }
     }
-}
-
-/// Assert `reported` is an epoch-seconds timestamp of at most millisecond resolution: the
-/// milliseconds it carries are whole, so nothing finer than a millisecond reaches the wire.
-fn assert_millisecond_resolution(case: &str, member: &str, reported: &Value) {
-    let Some(seconds) = reported.as_f64() else {
-        panic!("case {case:?}: expected an epoch timestamp for {member}, got {reported:?}");
-    };
-    let millis = seconds * 1_000.0;
-    assert!(
-        (millis - millis.round()).abs() < 1e-3,
-        "case {case:?}: expected {member} at at most millisecond resolution, got {reported}"
-    );
 }
 
 /// The cluster the records read for their reported instants are created in.

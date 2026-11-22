@@ -500,6 +500,25 @@ pub(crate) fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
     }
 }
 
+/// Assert `reported` is an epoch-seconds instant encoded no finer than the MILLISECOND: the
+/// milliseconds it names are whole, so nothing below a millisecond reaches the wire.
+///
+/// The ONE reader of that resolution for this binary's suites, beside the wire they read it
+/// off: the rule holds of every instant this API reports, so a suite asserting it for the
+/// members of its own records shares this check rather than keeping a copy that could come
+/// to disagree with it.
+pub(crate) fn assert_millisecond_resolution(case: &str, member: &str, reported: &Value) {
+    let Some(seconds) = reported.as_f64() else {
+        panic!("case {case:?}: expected an epoch instant for {member}, got {reported}");
+    };
+    let millis = seconds * 1_000.0;
+    assert!(
+        (millis - millis.round()).abs() < 1e-3,
+        "case {case:?}: expected {member} at no finer than millisecond resolution, got \
+         {reported}"
+    );
+}
+
 /// An EC2 instance identity document, as the agent reads it from
 /// `http://169.254.169.254/latest/dynamic/instance-identity/document/`. It carries the
 /// `accountId` and the `instanceId` a registration must supply.

@@ -24,6 +24,12 @@
 //!    named none), and for a service whose tasks come from a task set the concrete version
 //!    those tasks RUN. The ARN a task set names its service by follows which of the two
 //!    created it.
+//! 5. The members Amazon ECS materialises into a service are resolved once, when the record
+//!    is written, so EVERY operation that answers with a `Service` renders that one record:
+//!    `availabilityZoneRebalancing` (`ENABLED` where the create named none, kept by an
+//!    update that names none), the resolved `platformVersion`, the long-ARN form the task
+//!    set Amazon ECS mints names its service by, and every instant the record carries,
+//!    encoded at no finer than millisecond resolution.
 //!
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so nothing reaches into the state struct and a response that is
@@ -35,8 +41,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, caller_principal, count, list, ok, refused,
-    register_capacity, register_definition, service, string, ACCOUNT, SIGNED_REGION,
+    assert_millisecond_resolution, awsvpc_network_configuration, caller_principal, count, list,
+    ok, refused, register_capacity, register_definition, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -1068,4 +1075,267 @@ async fn a_service_deploying_through_a_task_set_reports_the_version_its_tasks_ru
         !controller_task_set_id.is_empty(),
         "case {case:?}: the created task set carries an id, got {created}"
     );
+}
+
+/// One row of the stored-record table: how the service is created, and what every operation
+/// that answers with that service must then report for the members Amazon ECS materialises
+/// into it.
+struct ServiceRecordRow {
+    case: &'static str,
+    /// The service's name, which is also the family of the revision registered for it.
+    name: &'static str,
+    /// `deploymentController.type`: `ECS`, whose own scheduler places the service's tasks,
+    /// or `CODE_DEPLOY`, which deploys them through the task set Amazon ECS mints.
+    controller: &'static str,
+    /// The `RuntimePlatform$operatingSystemFamily` the revision declares.
+    os_family: &'static str,
+    /// The `platformVersion` the create names, or `None` when it names none.
+    requested_version: Option<&'static str>,
+    /// The `availabilityZoneRebalancing` the create names, or `None` when it names none.
+    requested_rebalancing: Option<&'static str>,
+    /// The `platformVersion` every answer must report.
+    expect_version: &'static str,
+    /// The `availabilityZoneRebalancing` every answer must report.
+    expect_rebalancing: &'static str,
+}
+
+/// Every instant a service record carries, as `(member, value)` pairs: the service's own
+/// `createdAt`, and the `createdAt` and `updatedAt` of each deployment and each task set it
+/// reports.
+fn reported_instants(service_view: &Value, case: &str) -> Vec<(String, Value)> {
+    let mut instants = vec![("createdAt".to_string(), service_view["createdAt"].clone())];
+    for member in ["deployments", "taskSets"] {
+        for (index, child) in list(service_view, member, case).iter().enumerate() {
+            for instant in ["createdAt", "updatedAt"] {
+                instants.push((
+                    format!("{member}[{index}].{instant}"),
+                    child[instant].clone(),
+                ));
+            }
+        }
+    }
+    instants
+}
+
+/// One service record, read through every operation that answers with one.
+///
+/// The members Amazon ECS materialises into a service are resolved ONCE, when the record is
+/// written, and every operation that answers with a `Service` renders that one record — so
+/// `CreateService`, `DescribeServices`, `UpdateService` (which, naming none of them, keeps
+/// what the service was set to) and `DeleteService` report the same values:
+///
+/// * `availabilityZoneRebalancing` — "For create service requests, when no value is
+///   specified for AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED",
+///   and an update that names none keeps the value the service carries;
+/// * `platformVersion` — the version the service's tasks are placed with, which for a
+///   service whose tasks come from a task set is the concrete version the `LATEST` alias
+///   resolves to for the revision's operating system, never the alias;
+/// * `taskSets[].serviceArn` — the ARN of the owning service, which for the task set Amazon
+///   ECS mints is the service's own long-ARN form, cluster segment included, so it parses
+///   back into the (cluster, service) pair every operation addressing a service by ARN takes;
+/// * every instant in the record — `Service$createdAt` and each deployment's and task set's
+///   `createdAt`/`updatedAt` — encoded at no finer than millisecond resolution, which is
+///   what this API's epoch-second timestamps carry.
+///
+/// The rows span the deployment controller (and so whether the service holds task sets at
+/// all), the operating system family the revision declares, what the create asks for as a
+/// platform version (nothing, the alias outright, a published version by name) and each
+/// value of `AvailabilityZoneRebalancing`
+/// (`smithy_query(query="shape", shape="AvailabilityZoneRebalancing")` = [ENABLED,
+/// DISABLED]) beside a create that names none.
+#[tokio::test]
+async fn every_operation_that_answers_with_a_service_renders_the_one_stored_record() {
+    // BOTH stores: a CodeDeploy-controlled service requires a load-balancer binding, and a
+    // binding names a target group the Elastic Load Balancing v2 service has to hold.
+    let router = crate::load_balancer_target_groups::emulator();
+    let cluster = "servicerecords";
+    ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": cluster }),
+        "setup",
+    )
+    .await;
+
+    let rows: [ServiceRecordRow; 4] = [
+        ServiceRecordRow {
+            case: "an ECS-controlled service that named neither member",
+            name: "recordnone",
+            controller: "ECS",
+            os_family: "LINUX",
+            requested_version: None,
+            requested_rebalancing: None,
+            expect_version: "LATEST",
+            expect_rebalancing: "ENABLED",
+        },
+        ServiceRecordRow {
+            case: "an ECS-controlled service that pinned a version and disabled rebalancing",
+            name: "recordpinned",
+            controller: "ECS",
+            os_family: "LINUX",
+            requested_version: Some("1.4.0"),
+            requested_rebalancing: Some("DISABLED"),
+            expect_version: "1.4.0",
+            expect_rebalancing: "DISABLED",
+        },
+        ServiceRecordRow {
+            case: "a CodeDeploy-controlled service that named neither member",
+            name: "recordset",
+            controller: "CODE_DEPLOY",
+            os_family: "LINUX",
+            requested_version: None,
+            requested_rebalancing: None,
+            expect_version: "1.4.0",
+            expect_rebalancing: "ENABLED",
+        },
+        ServiceRecordRow {
+            case: "a CodeDeploy-controlled Windows service that named the alias",
+            name: "recordwindows",
+            controller: "CODE_DEPLOY",
+            os_family: "WINDOWS_SERVER_2019_CORE",
+            requested_version: Some("LATEST"),
+            requested_rebalancing: Some("ENABLED"),
+            expect_version: "1.0.0",
+            expect_rebalancing: "ENABLED",
+        },
+    ];
+
+    for row in &rows {
+        let setup = row.case;
+        register_bound_fargate_definition(&router, row.name, row.os_family, setup).await;
+        let mut request = json!({
+            "cluster": cluster,
+            "serviceName": row.name,
+            "taskDefinition": row.name,
+            // The record is what these rows are about, so no row asks for a task: a service
+            // that wants none is deleted without forcing and places nothing.
+            "desiredCount": 0,
+            "launchType": "FARGATE",
+            "deploymentController": { "type": row.controller },
+            "networkConfiguration": awsvpc_network_configuration(),
+        });
+        if let Some(version) = row.requested_version {
+            request["platformVersion"] = json!(version);
+        }
+        if let Some(requested) = row.requested_rebalancing {
+            request["availabilityZoneRebalancing"] = json!(requested);
+        }
+        let deploys_through_a_task_set = row.controller != "ECS";
+        if deploys_through_a_task_set {
+            // CodeDeploy drives the deployment by shifting traffic between two target
+            // groups, so the service it controls has to be behind a load balancer. An
+            // `awsvpc` revision's tasks register by their own network interface, so the
+            // group is an `ip` one — one per row, since a group serves one service.
+            let target_group = crate::load_balancer_target_groups::create_target_group(
+                &router,
+                &format!("{}-record", row.name),
+                "ip",
+                setup,
+            )
+            .await;
+            request["loadBalancers"] = json!([{
+                "targetGroupArn": target_group,
+                "containerName": "web",
+                "containerPort": 80,
+            }]);
+        }
+
+        // The four operations that answer with a `Service`, in the order one client walks
+        // them: the create that wrote the record, a read of it, an update that names none of
+        // the members under test, the read after that update, and the delete.
+        let created = ok(&router, "CreateService", request, setup).await;
+        let created = created["service"].clone();
+        let read = describe(&router, cluster, row.name, setup).await;
+        let updated = ok(
+            &router,
+            "UpdateService",
+            json!({ "cluster": cluster, "service": row.name }),
+            setup,
+        )
+        .await;
+        let updated = updated["service"].clone();
+        let reread = describe(&router, cluster, row.name, setup).await;
+        let deleted = ok(
+            &router,
+            "DeleteService",
+            json!({ "cluster": cluster, "service": row.name }),
+            setup,
+        )
+        .await;
+        let deleted = deleted["service"].clone();
+
+        let service_arn = format!(
+            "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:service/{cluster}/{}",
+            row.name
+        );
+        let created_at = created["createdAt"].clone();
+        for (source, reported) in [
+            ("CreateService", &created),
+            ("DescribeServices", &read),
+            ("UpdateService", &updated),
+            ("DescribeServices after the update", &reread),
+            ("DeleteService", &deleted),
+        ] {
+            let case = format!("{} through {source}", row.case);
+            let case = case.as_str();
+            assert_eq!(
+                string(reported, "serviceArn", case),
+                service_arn,
+                "case {case:?}: every answer is about the one service, got {reported}"
+            );
+            assert_eq!(
+                string(reported, "availabilityZoneRebalancing", case),
+                row.expect_rebalancing,
+                "case {case:?}: expected availabilityZoneRebalancing {:?}, got {reported}",
+                row.expect_rebalancing
+            );
+            assert_eq!(
+                string(reported, "platformVersion", case),
+                row.expect_version,
+                "case {case:?}: expected platformVersion {:?}, got {reported}",
+                row.expect_version
+            );
+            assert_eq!(
+                reported["createdAt"],
+                created_at,
+                "case {case:?}: one record carries one creation instant, got {reported}"
+            );
+
+            let task_sets = task_set_views(reported, case);
+            if deploys_through_a_task_set {
+                assert_eq!(
+                    task_sets.len(),
+                    1,
+                    "case {case:?}: expected the task set Amazon ECS minted for the \
+                     service, got {reported}"
+                );
+                assert_eq!(
+                    task_sets[0].1,
+                    row.expect_version,
+                    "case {case:?}: the task set runs the version the service reports, got \
+                     {reported}"
+                );
+                assert_eq!(
+                    task_sets[0].2,
+                    service_arn,
+                    "case {case:?}: the task set Amazon ECS minted names its service by \
+                     that service's own ARN, cluster segment included, got {reported}"
+                );
+            } else {
+                assert!(
+                    task_sets.is_empty(),
+                    "case {case:?}: a service its own scheduler places holds no task set, \
+                     got {reported}"
+                );
+            }
+
+            for (member, instant) in reported_instants(reported, case) {
+                assert!(
+                    !instant.is_null(),
+                    "case {case:?}: expected {member} on the record, got {reported}"
+                );
+                assert_millisecond_resolution(case, &member, &instant);
+            }
+        }
+    }
 }
