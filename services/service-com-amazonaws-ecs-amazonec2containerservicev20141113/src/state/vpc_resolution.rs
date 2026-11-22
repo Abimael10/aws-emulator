@@ -164,20 +164,29 @@ pub fn unresolved_subnet_refusal<Eng: Send + Sync + 'static>(
     missing.map(|missing| subnet_lookup_message(&requested, &missing))
 }
 
-/// `InvalidParameterException$message` for a placement whose `awsvpcConfiguration` names
-/// resources of two networks — a security group outside the VPC its subnets are in, or subnets
-/// of more than one VPC.
+/// `InvalidParameterException$message` for a placement whose `awsvpcConfiguration` pairs a
+/// security group with subnets of another network.
 ///
-/// The interface is created by Amazon EC2, which answers ONE sentence whenever a request
-/// combines resources of two networks — "You have specified two resources that belong to
-/// different networks." — and Amazon ECS reports that answer, the way it reports Amazon EC2's
-/// sentence for a subnet that resolves to nothing ([`subnet_lookup_message`]). The member docs
-/// state the rule the sentence reports: "All specified subnets must be from the same VPC"
-/// (`AwsVpcConfiguration$subnets`) and "All specified security groups must be from the same
-/// VPC" (`$securityGroups`) — one VPC for the one interface the placement configures. The whole
+/// The interface is created by Amazon EC2, which answers this sentence when a request pairs
+/// resources of two networks, and Amazon ECS reports that answer, the way it reports Amazon
+/// EC2's sentence for a subnet that resolves to nothing ([`subnet_lookup_message`]).
+/// `AwsVpcConfiguration$securityGroups` states the rule the sentence reports: "All specified
+/// security groups must be from the same VPC" — and a group governs the one interface the
+/// placement's subnets create, so it has to be of that interface's network too. The whole
 /// sentence is fixed text, naming nothing of the request.
 pub const AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE: &str =
     "You have specified two resources that belong to different networks.";
+
+/// `InvalidParameterException$message` for a placement whose `awsvpcConfiguration` names
+/// `subnets` of more than one VPC.
+///
+/// Amazon ECS resolves the subnets itself before any interface is created, so it answers its
+/// OWN sentence for this one rather than Amazon EC2's pairing sentence
+/// ([`AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE`]): the rule the member states
+/// (`AwsVpcConfiguration$subnets`: "All specified subnets must be from the same VPC"), worded
+/// for the input it refuses. The whole sentence is fixed text, naming nothing of the request.
+pub const AWSVPC_SUBNETS_OF_DIFFERENT_VPCS_MESSAGE: &str =
+    "All input subnets must be from the same VPC.";
 
 /// The refusal a placement earns when the subnets and security groups its
 /// `awsvpcConfiguration` names are not all in ONE VPC, or `None` when they are.
@@ -189,6 +198,14 @@ pub const AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE: &str =
 /// to exactly one VPC (`SecurityGroup$vpcId`), so a group outside the subnets' VPC could never
 /// be applied to that interface. A placement spread across two networks describes an interface
 /// that could not be created, so it is refused and nothing of it is stored.
+///
+/// The two faults are reported by different sentences, because they are answered by different
+/// steps: Amazon ECS resolves the SUBNETS of the request itself and states the member's own
+/// rule for a list that spans two of them ([`AWSVPC_SUBNETS_OF_DIFFERENT_VPCS_MESSAGE`]),
+/// while a group paired with subnets of another network is a pairing only Amazon EC2 rejects,
+/// so Amazon ECS reports that service's sentence
+/// ([`AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE`]). The subnets are judged first, since
+/// where the interface goes is decided before what governs it.
 ///
 /// Which VPC each named resource is in is Amazon EC2's record, so both are read out of that
 /// service's own store: a subnet or a group Amazon VPC holds no VPC id for places the interface
@@ -222,10 +239,13 @@ pub fn misplaced_network_resource_refusal<Eng: Send + Sync + 'static>(
             .and_then(|held| held.vpc_id.clone())
     });
     let vpc_id = named_networks.next()?;
-    // Subnets of two VPCs leave no ONE network for the interface, and a group outside the
-    // network the subnets name could never govern it: both are the same fault, so both carry
-    // the one sentence AWS answers for it.
-    let subnets_of_two_networks = named_networks.any(|other| other != vpc_id);
+    // Subnets of two VPCs leave no ONE network for the interface: the list itself is the bad
+    // parameter, so the refusal states what that member requires.
+    if named_networks.any(|other| other != vpc_id) {
+        return Some(AWSVPC_SUBNETS_OF_DIFFERENT_VPCS_MESSAGE.to_string());
+    }
+    // And a group outside the network the subnets name could never govern the interface
+    // Amazon EC2 would create in one of them, which is the pairing that service refuses.
     let group_of_another_network = groups.iter().any(|group| {
         store
             .security_groups
@@ -233,8 +253,7 @@ pub fn misplaced_network_resource_refusal<Eng: Send + Sync + 'static>(
             .and_then(|held| held.vpc_id.as_deref())
             .is_some_and(|held| held != vpc_id)
     });
-    (subnets_of_two_networks || group_of_another_network)
-        .then(|| AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE.to_string())
+    group_of_another_network.then(|| AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE.to_string())
 }
 
 /// Where ONE subnet of the account is, as Amazon VPC holds it: what a placement into that

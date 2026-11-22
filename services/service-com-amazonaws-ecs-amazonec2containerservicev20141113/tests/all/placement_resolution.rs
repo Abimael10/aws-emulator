@@ -56,9 +56,15 @@ const BRIDGE_FAMILY: &str = "placementbridgefamily";
 /// The one error code every refusal below carries.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
-/// The sentence a placement whose named resources are not all in ONE VPC earns.
+/// The sentence a placement that pairs a security group with subnets of another network
+/// earns: the pairing is Amazon EC2's to reject, so Amazon ECS reports that service's answer.
 const DIFFERENT_NETWORKS: &str = "You have specified two resources that belong to different \
                                   networks.";
+
+/// The sentence a placement whose `subnets` span two VPCs earns: Amazon ECS resolves that
+/// list itself, so it states the rule the member carries (`AwsVpcConfiguration$subnets`:
+/// "All specified subnets must be from the same VPC").
+const SUBNETS_OF_ONE_VPC: &str = "All input subnets must be from the same VPC.";
 
 /// The image every container starts from; irrelevant to every rule here, so one value.
 const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
@@ -613,6 +619,10 @@ async fn ec2_network(router: &MultiServiceRouter, label: &str, block: u8, case: 
     (subnet, group)
 }
 
+/// One row of the one-network table: the case, the subnets and the security groups the
+/// placement names, and the sentence it earns — `None` when ONE VPC holds all of them.
+type NetworkRow<'a> = (&'a str, Vec<&'a str>, Vec<&'a str>, Option<&'a str>);
+
 /// A `networkConfiguration` naming `subnets` and `groups`.
 fn placement_in(subnets: &[&str], groups: &[&str]) -> Value {
     json!({
@@ -650,36 +660,37 @@ async fn a_task_set_is_refused_unless_its_subnets_and_security_groups_are_in_one
     let (here_subnet, here_group) = ec2_network(&router, "here", 70, case).await;
     let (there_subnet, there_group) = ec2_network(&router, "there", 71, case).await;
 
-    // (case, the subnets named, the groups named, whether ONE VPC holds all of them)
-    let rows: [(&str, Vec<&str>, Vec<&str>, bool); 4] = [
+    // (case, the subnets named, the groups named, the refusal it earns — `None` when ONE VPC
+    // holds all of them, so the placement is made)
+    let rows: [NetworkRow<'_>; 4] = [
         (
             "a subnet and a group of one VPC",
             vec![&here_subnet],
             vec![&here_group],
-            true,
+            None,
         ),
         (
             "a group of another VPC",
             vec![&here_subnet],
             vec![&there_group],
-            false,
+            Some(DIFFERENT_NETWORKS),
         ),
         (
             "a group of this VPC beside one of another",
             vec![&here_subnet],
             vec![&here_group, &there_group],
-            false,
+            Some(DIFFERENT_NETWORKS),
         ),
         (
             "subnets of two VPCs",
             vec![&here_subnet, &there_subnet],
             vec![&here_group],
-            false,
+            Some(SUBNETS_OF_ONE_VPC),
         ),
     ];
 
     let mut created = 0usize;
-    for (case, subnets, groups, one_network) in rows.iter() {
+    for (case, subnets, groups, refused_with) in rows.iter() {
         let (status, body) = answered(
             &router,
             "CreateTaskSet",
@@ -692,7 +703,7 @@ async fn a_task_set_is_refused_unless_its_subnets_and_security_groups_are_in_one
             }),
         )
         .await;
-        if *one_network {
+        if refused_with.is_none() {
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected the task set to be created, got {status} with {body}"
@@ -726,7 +737,10 @@ async fn a_task_set_is_refused_unless_its_subnets_and_security_groups_are_in_one
         let message = body["message"].as_str().unwrap_or_default();
         assert_eq!(
             (code, message),
-            (INVALID_PARAMETER, DIFFERENT_NETWORKS),
+            (
+                INVALID_PARAMETER,
+                refused_with.expect("a refused row carries its sentence"),
+            ),
             "case {case:?}: expected the cross-network refusal, got {body}"
         );
     }

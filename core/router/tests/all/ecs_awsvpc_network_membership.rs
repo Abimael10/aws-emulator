@@ -24,6 +24,11 @@
 //! asserted on `RunTask` and on `UpdateService`, the other calls that name a configuration for
 //! the same interface.
 //!
+//! The two halves are reported by different sentences, because different steps answer them:
+//! Amazon ECS resolves the SUBNETS of the request itself and states what that member requires,
+//! while a security group paired with subnets of another network is a pairing only Amazon EC2
+//! rejects, so Amazon ECS reports that service's own sentence.
+//!
 //! Sources: `smithy_query(query="doc", shape="AwsVpcConfiguration", member="subnets")` and
 //! `member="securityGroups"` on the ecs model for the two sentences above;
 //! `smithy_query(query="operation", operation="CreateService,RunTask,UpdateService")` for the
@@ -58,9 +63,15 @@ const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 /// The error code every refusal of this rule carries.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
-/// The sentence a placement spread across two networks earns.
+/// The sentence a placement that pairs a security group with subnets of another network earns:
+/// the pairing is Amazon EC2's to reject, so Amazon ECS reports that service's answer.
 const DIFFERENT_NETWORKS: &str = "You have specified two resources that belong to different \
                                   networks.";
+
+/// The sentence a placement whose `subnets` span two VPCs earns: Amazon ECS resolves that list
+/// itself, so it states the rule the member carries ("All specified subnets must be from the
+/// same VPC").
+const SUBNETS_OF_ONE_VPC: &str = "All input subnets must be from the same VPC.";
 
 /// One emulator carrying Amazon EC2 and Amazon ECS over ONE shared engine, as the production
 /// router mounts them.
@@ -262,6 +273,10 @@ async fn fixture() -> (MultiServiceRouter, Network, Network) {
     (router, here, elsewhere)
 }
 
+/// One row of the one-network table: the case, the subnets and the security groups the
+/// placement names, and the sentence it earns — `None` when ONE VPC holds all of them.
+type NetworkRow<'a> = (&'a str, Vec<&'a String>, Vec<&'a String>, Option<&'a str>);
+
 /// A `networkConfiguration` naming exactly `subnets` and `groups`, with `securityGroups` left
 /// out of the request entirely when the row names none.
 fn configuration(subnets: &[&String], groups: &[&String]) -> Value {
@@ -307,59 +322,60 @@ async fn read_back(router: &MultiServiceRouter, name: &str, case: &str) -> Optio
 async fn a_service_is_refused_unless_its_subnets_and_security_groups_are_in_one_vpc() {
     let (router, here, elsewhere) = fixture().await;
 
-    // (case, the subnets named, the groups named, whether ONE VPC holds all of them)
-    let rows: [(&str, Vec<&String>, Vec<&String>, bool); 8] = [
+    // (case, the subnets named, the groups named, the sentence it earns — `None` when ONE VPC
+    // holds all of them, so the placement is made)
+    let rows: [NetworkRow<'_>; 8] = [
         (
             "one subnet and one group of its own VPC",
             vec![&here.subnets[0]],
             vec![&here.groups[0]],
-            true,
+            None,
         ),
         (
             "two subnets and two groups of one VPC",
             vec![&here.subnets[0], &here.subnets[1]],
             vec![&here.groups[0], &here.groups[1]],
-            true,
+            None,
         ),
         (
             "a subnet of one VPC and no group at all",
             vec![&here.subnets[1]],
             vec![],
-            true,
+            None,
         ),
         (
             "a group of another VPC",
             vec![&here.subnets[0]],
             vec![&elsewhere.groups[0]],
-            false,
+            Some(DIFFERENT_NETWORKS),
         ),
         (
             "a group of this VPC followed by one of another",
             vec![&here.subnets[0]],
             vec![&here.groups[0], &elsewhere.groups[1]],
-            false,
+            Some(DIFFERENT_NETWORKS),
         ),
         (
             "a group of another VPC followed by one of this",
             vec![&here.subnets[1]],
             vec![&elsewhere.groups[1], &here.groups[1]],
-            false,
+            Some(DIFFERENT_NETWORKS),
         ),
         (
             "subnets of two VPCs",
             vec![&here.subnets[0], &elsewhere.subnets[0]],
             vec![&here.groups[0]],
-            false,
+            Some(SUBNETS_OF_ONE_VPC),
         ),
         (
             "a second subnet and a group both of another VPC",
             vec![&here.subnets[0], &elsewhere.subnets[1]],
             vec![&elsewhere.groups[0]],
-            false,
+            Some(SUBNETS_OF_ONE_VPC),
         ),
     ];
 
-    for (index, (case, subnets, groups, one_network)) in rows.iter().enumerate() {
+    for (index, (case, subnets, groups, refused_with)) in rows.iter().enumerate() {
         let name = format!("membershipsvc{index}");
         let reply = ecs(
             &router,
@@ -374,7 +390,7 @@ async fn a_service_is_refused_unless_its_subnets_and_security_groups_are_in_one_
             }),
         )
         .await;
-        if *one_network {
+        let Some(expected) = refused_with else {
             assert_eq!(
                 reply.status, 200,
                 "case {case:?}: expected the service to be created, got {} with {}",
@@ -402,7 +418,7 @@ async fn a_service_is_refused_unless_its_subnets_and_security_groups_are_in_one_
                  got {configured}"
             );
             continue;
-        }
+        };
         assert_eq!(
             reply.status, 400,
             "case {case:?}: expected a placement across two networks to be refused, got {} \
@@ -411,7 +427,7 @@ async fn a_service_is_refused_unless_its_subnets_and_security_groups_are_in_one_
         );
         assert_eq!(
             (reply.error_code().as_str(), reply.message()),
-            (INVALID_PARAMETER, DIFFERENT_NETWORKS),
+            (INVALID_PARAMETER, *expected),
             "case {case:?}: expected the cross-network refusal, got {}",
             reply.body
         );
