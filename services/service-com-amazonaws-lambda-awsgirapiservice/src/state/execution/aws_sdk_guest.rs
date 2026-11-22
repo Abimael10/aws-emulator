@@ -17,7 +17,12 @@
 //!   `SendMessage`) and its keyword arguments ARE the operation's input document, which is
 //!   what an AWS JSON protocol puts on the wire; the host builds, signs and dispatches the
 //!   request ([`super::aws_api`]) and the answer's document is what the method returns,
-//!   with the `ResponseMetadata` the answer itself carried.
+//!   with the `ResponseMetadata` the answer itself carried. WHICH operation of the called
+//!   service that name is, and how the service itself spells it, is the called service's own
+//!   MODEL's to say ([`super::sdk_model::operation_named`]) — a name carrying an acronym
+//!   (`GetOTelEnrichment`) is not recoverable from a method name word by word — and a method
+//!   naming no operation that model declares does not exist on the client at all, which is
+//!   the missing attribute an SDK reports for it.
 //! * A refusal is raised as `botocore.exceptions.ClientError`, carrying the service's own
 //!   error code and message under the `response` member and rendering the sentence botocore
 //!   renders, so a handler that catches one and reports `response["Error"]["Code"]` reads
@@ -144,8 +149,9 @@ pub fn runtime_modules() -> Vec<PackageModule> {
 /// through.
 #[must_use]
 pub fn pagination_config(service: &str, operation: &str) -> String {
+    let operation = modelled_operation(service, operation);
     let held = super::sdk_model::client_exports(service);
-    let Some(paged) = held.pagination.get(operation) else {
+    let Some(paged) = held.pagination.get(operation.as_str()) else {
         return "{}".to_string();
     };
     ::serde_json::json!({
@@ -183,7 +189,29 @@ pub fn error_shapes(service: &str, operation: Option<&str>) -> String {
     let Some(operation) = operation else {
         return ::serde_json::json!(held.errors).to_string();
     };
-    ::serde_json::json!(held.operation_errors.get(operation).cloned().unwrap_or_default())
+    let operation = modelled_operation(service, operation);
+    ::serde_json::json!(held
+        .operation_errors
+        .get(operation.as_str())
+        .cloned()
+        .unwrap_or_default())
+    .to_string()
+}
+
+/// The operation `asked` names, under the spelling the service `service` names states for it
+/// ([`super::sdk_model::operation_named`]).
+///
+/// Every question answered out of a called service's model is a question about ONE of its
+/// operations, and the name asking it arrives from an SDK CLIENT, which derived it from the
+/// method a handler called: an operation whose name carries an acronym is asked about under
+/// that SDK's own casing of the method name rather than under the service's. So the name is
+/// resolved to the model's spelling first, and a name that model declares no operation of is
+/// asked exactly as it arrived — a question about an operation the service does not have,
+/// which its model answers nothing for.
+fn modelled_operation(service: &str, asked: &str) -> String {
+    super::sdk_model::operation_named(service, asked)
+        .modelled()
+        .unwrap_or(asked)
         .to_string()
 }
 
@@ -703,6 +731,7 @@ const BOTOCORE_CLIENT_SOURCE: &str = r##"
 import base64
 import json
 
+from botocore import xform_name
 from botocore.config import Config
 from botocore.exceptions import (
     ClientError,
@@ -740,7 +769,14 @@ _BLOB_PARAMETERS = {
 
 
 def _operation_name(method):
-    """The operation a client method names: `send_message` -> `SendMessage`."""
+    """The operation a client method names: `send_message` -> `SendMessage`.
+
+    WHICH operation of the called service a name is, and how that service spells it, is that
+    service's own model's to say: the runtime resolves this name against the model before it
+    builds the request, so an operation whose name carries an acronym (`GetOTelEnrichment`) is
+    reached under the spelling the service itself gives it rather than under the one a method
+    name's words give.
+    """
     return "".join(part[:1].upper() + part[1:] for part in method.split("_") if part)
 
 
@@ -1256,9 +1292,13 @@ class Client:
                 service_name=self._service_name, known_service_names=detail
             )
         if refused == "unknown_operation":
+            # An SDK carries a method per operation its service's model declares and no other,
+            # so a method naming no operation of that service does not exist on the client at
+            # all: the attribute is missing, which is what the SDK says, and the name it names
+            # is the one the caller asked for.
             raise AttributeError(
                 "'%s' object has no attribute '%s'"
-                % (self._service_name, operation_name)
+                % (self._service_name, xform_name(operation_name))
             )
         if refused == "timed_out":
             raise ReadTimeoutError(endpoint_url=self._endpoint_url)

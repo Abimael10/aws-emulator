@@ -2131,6 +2131,18 @@ impl AwsAccess {
         if !well_formed_operation(operation) {
             return Err(Refusal::UnknownOperation);
         }
+        // WHICH operation of that service the name names, under the spelling its own model
+        // gives it ([`super::sdk_model::operation_named`]): the name arrives from an SDK
+        // CLIENT, which derived it from the method the handler called, so a name whose
+        // operation carries an acronym arrives cased as that SDK's naming rule cased it and
+        // not as the service spells it. The model's spelling is what the request carries, and
+        // a name that service's model declares no operation of is one it does not have.
+        let named = super::sdk_model::operation_named(api.sdk_token, operation);
+        let operation = match &named {
+            super::sdk_model::Named::Operation(modelled) => modelled.as_str(),
+            super::sdk_model::Named::Unbound => return Err(Refusal::UnknownOperation),
+            super::sdk_model::Named::Unheld => operation,
+        };
         if body.len() > MAX_REQUEST_BYTES {
             return Err(Refusal::RequestTooLarge);
         }
@@ -2364,6 +2376,13 @@ impl AwsAccess {
         if !well_formed_operation(operation) {
             return Err(Refusal::UnknownOperation);
         }
+        // The operation under the spelling the called service's own model gives it, for the
+        // reason a dispatched call carries that spelling ([`Self::call_within`]): the name
+        // arrives from an SDK client's own naming rule. A service whose model this emulator
+        // holds none of, or a name its model declares no operation of, is left as it arrived
+        // for the client below to report on.
+        let named = super::sdk_model::operation_named(api.sdk_token, operation);
+        let operation = named.modelled().unwrap_or(operation);
         if body.len() > MAX_REQUEST_BYTES {
             return Err(Refusal::RequestTooLarge);
         }

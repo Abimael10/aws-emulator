@@ -13,7 +13,9 @@
 //! The rows differ along what the rule generalises over: WHICH operation of the service is
 //! called (a write, a batch write, a read, a delete, a read of the queue's own attributes),
 //! whether the call succeeds or is refused, the service token the client is built with, and
-//! whether the operation named exists at all. Each row asserts both halves of the rule — what
+//! whether the method names an operation the service's model declares at all — one that does
+//! not is a method the client does not have, which is the missing attribute an SDK reports
+//! and not a refusal of any call. Each row asserts both halves of the rule — what
 //! the handler read back, which is what it returns as the invocation's payload, and what the
 //! QUEUE itself holds afterwards, read through its own API — so a call that answered without
 //! doing the work, or did the work without answering, fails here.
@@ -209,6 +211,8 @@ def lambda_handler(event, context):
         return {"ok": False, "attribute_error": str(error)}
     try:
         answered = method(**event["parameters"])
+    except AttributeError as error:
+        return {"ok": False, "attribute_error": str(error)}
     except botocore.exceptions.ClientError as error:
         return {
             "ok": False,
@@ -239,6 +243,9 @@ struct Row {
     method: &'static str,
     /// The operation that method names, which is what the call must address.
     operation: &'static str,
+    /// Whether that method names an operation the service's model declares at all — a method
+    /// that names none is one the client does not have.
+    exists: bool,
     /// Whether the call must succeed.
     expect_ok: bool,
 }
@@ -250,6 +257,7 @@ fn rows() -> Vec<Row> {
             service: "sqs",
             method: "send_message",
             operation: "SendMessage",
+            exists: true,
             expect_ok: true,
         },
         Row {
@@ -257,6 +265,7 @@ fn rows() -> Vec<Row> {
             service: "sqs",
             method: "send_message_batch",
             operation: "SendMessageBatch",
+            exists: true,
             expect_ok: true,
         },
         Row {
@@ -264,6 +273,7 @@ fn rows() -> Vec<Row> {
             service: "sqs",
             method: "get_queue_attributes",
             operation: "GetQueueAttributes",
+            exists: true,
             expect_ok: true,
         },
         Row {
@@ -271,6 +281,7 @@ fn rows() -> Vec<Row> {
             service: "sqs",
             method: "get_queue_url",
             operation: "GetQueueUrl",
+            exists: true,
             expect_ok: true,
         },
         Row {
@@ -278,16 +289,18 @@ fn rows() -> Vec<Row> {
             service: "sqs",
             method: "send_message",
             operation: "SendMessage",
+            exists: true,
             expect_ok: false,
         },
         Row {
-            // The method name is turned into the operation it names and the call is
-            // addressed to it, so what the handler reads is the SERVICE's answer about
-            // that operation rather than a verdict this runtime reached on its own.
-            case: "a method naming an operation the service does not serve",
+            // A client carries a method per operation its service's model declares and no
+            // other, so this names nothing on the client: the attribute is missing, which is
+            // what the SDK says, rather than a call made under a name the service never named.
+            case: "a method naming no operation the service's model declares",
             service: "sqs",
             method: "frobnicate_queue",
             operation: "FrobnicateQueue",
+            exists: false,
             expect_ok: false,
         },
     ]
@@ -375,7 +388,23 @@ async fn a_handler_calls_another_service_through_the_sdk_the_runtime_supplies() 
             row.expect_ok
         );
 
-        if row.expect_ok {
+        if !row.exists {
+            // A method naming no operation the service's model declares is a method the
+            // client does not have: the SDK reports the missing attribute, under the name the
+            // caller asked for, and NO call is made, so there is no service refusal to read.
+            let reported = payload["attribute_error"].as_str().unwrap_or_default();
+            let expected = format!("has no attribute '{}'", row.method);
+            assert!(
+                reported.contains(&expected),
+                "case {case:?}: expected the SDK's own missing attribute naming {expected:?}, \
+                 got {payload}"
+            );
+            assert!(
+                payload["code"].is_null(),
+                "case {case:?}: expected no service refusal for a method the service declares \
+                 no operation for, got {payload}"
+            );
+        } else if row.expect_ok {
             assert_eq!(
                 payload["status"],
                 json!(200),

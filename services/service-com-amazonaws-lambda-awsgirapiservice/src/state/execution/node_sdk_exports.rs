@@ -105,6 +105,60 @@ pub fn client_exports(token: &str) -> Arc<ClientExports> {
     Arc::clone(cell.get_or_init(|| Arc::new(exports_of(model))))
 }
 
+/// WHICH operation of one service a name an SDK client arrived with names ([`operation_named`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    /// That operation, spelled as the service's own model spells it — the spelling the wire
+    /// carries.
+    Operation(String),
+    /// The service's model is held here and declares no operation of that name, however the
+    /// name is cased: the client named something that service does not have.
+    Unbound,
+    /// This emulator holds no model for the service, so which operations it has is not known
+    /// here and the name the client arrived with is the only spelling there is.
+    Unheld,
+}
+
+impl Named {
+    /// The spelling the service's own model gives the name, where its model declares an
+    /// operation of that name at all.
+    #[must_use]
+    pub fn modelled(&self) -> Option<&str> {
+        match self {
+            Self::Operation(name) => Some(name.as_str()),
+            Self::Unbound | Self::Unheld => None,
+        }
+    }
+}
+
+/// Which operation of the service `token` names the name `asked` names.
+///
+/// An SDK client's method name is the operation's own name under that SDK's naming rule
+/// (`send_message` for `SendMessage`), and that rule does not round-trip: where an operation's
+/// name carries an ACRONYM — `GetOTelEnrichment`, `DescribeDBInstances`, every `ARN`-style name
+/// — no word-by-word recasing of the method name reproduces the service's own spelling. So the
+/// name is matched against the operations the called service's model declares, ignoring case,
+/// and what comes back is the MODEL's spelling, which is the one the wire carries. A name no
+/// operation of that model answers to is [`Named::Unbound`]: an operation the service does not
+/// have, rather than one to send under a name it never named.
+///
+/// Answered from the same one reading of that model every other question about the service is
+/// ([`client_exports`]).
+#[must_use]
+pub fn operation_named(token: &str, asked: &str) -> Named {
+    let held = client_exports(token);
+    if held.operations.is_empty() {
+        return Named::Unheld;
+    }
+    if held.operations.iter().any(|name| name == asked) {
+        return Named::Operation(asked.to_string());
+    }
+    held.operations
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(asked))
+        .map_or(Named::Unbound, |name| Named::Operation(name.clone()))
+}
+
 /// What `model` states: every operation shape it declares, every shape it marks as an error,
 /// the idempotency-token members of each operation's input, and how each operation it marks as
 /// paginated is paged through.
@@ -326,6 +380,82 @@ fn has_trait(shape: &Value, trait_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name an SDK client arrived with names the operation the service's own model declares
+    /// under it, in the MODEL's spelling, whatever case the client derived it in.
+    ///
+    /// The rows differ along the spelling the name arrives in: the service's own; the one a
+    /// client method's words give it where the operation's name carries an acronym (`OTel`,
+    /// `DB`, `MFA`, `SMS`) and where it carries none; a lower-cased one; a name no operation of
+    /// that model answers to; and a name of a service this emulator holds no model for, whose
+    /// operations are not known here at all.
+    #[test]
+    fn a_clients_name_for_an_operation_is_the_models_own_whatever_case_it_arrives_in() {
+        // Each row: the service token, the name as it arrives, and what it names.
+        let cases: &[(&str, &str, Named)] = &[
+            (
+                "cloudwatch",
+                "GetOTelEnrichment",
+                Named::Operation("GetOTelEnrichment".to_string()),
+            ),
+            // `get_otel_enrichment`, recased word by word by a client.
+            (
+                "cloudwatch",
+                "GetOtelEnrichment",
+                Named::Operation("GetOTelEnrichment".to_string()),
+            ),
+            (
+                "cloudwatch",
+                "StartOtelEnrichment",
+                Named::Operation("StartOTelEnrichment".to_string()),
+            ),
+            (
+                "cloudwatch",
+                "PutMetricData",
+                Named::Operation("PutMetricData".to_string()),
+            ),
+            // The same acronym problem in two other services' names.
+            (
+                "sts",
+                "AssumeRoleWithSaml",
+                Named::Operation("AssumeRoleWithSAML".to_string()),
+            ),
+            (
+                "iam",
+                "ListMfaDevices",
+                Named::Operation("ListMFADevices".to_string()),
+            ),
+            (
+                "sns",
+                "getsmsattributes",
+                Named::Operation("GetSMSAttributes".to_string()),
+            ),
+            ("cloudwatch", "GetOTelEnrichmentConfiguration", Named::Unbound),
+            ("sqs", "SendMessages", Named::Unbound),
+            ("cloudwatch", "", Named::Unbound),
+            // A service this emulator holds no model for: which operations it has is not known
+            // here, so the name arrives as the only spelling there is.
+            ("not-a-service", "ListThings", Named::Unheld),
+        ];
+        for (token, asked, expected) in cases {
+            let named = operation_named(token, asked);
+            assert_eq!(
+                named, *expected,
+                "case {token:?}/{asked:?}: expected {expected:?}, got {named:?}"
+            );
+        }
+        // Every operation a model declares names itself.
+        for token in ["cloudwatch", "sqs", "dynamodb"] {
+            for operation in &client_exports(token).operations {
+                let named = operation_named(token, operation);
+                assert_eq!(
+                    named.modelled(),
+                    Some(operation.as_str()),
+                    "case {token:?}/{operation:?}: an operation's own name names it, got {named:?}"
+                );
+            }
+        }
+    }
 
     /// The names a client package exports are the service's own model's: one row per service
     /// a call may be made to, each asserted on an operation and an error shape of that
