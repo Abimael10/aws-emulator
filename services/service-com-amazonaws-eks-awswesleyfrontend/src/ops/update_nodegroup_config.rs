@@ -104,7 +104,8 @@
 use super::types::*;
 use crate::state::{
     self, PendingNodegroupConfig, UpdateRecord, UpdateScope, DEFAULT_SCALING_DESIRED_SIZE,
-    DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, STATUS_ACTIVE, STATUS_UPDATING,
+    DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, MAX_TAINTS_PER_NODEGROUP, STATUS_ACTIVE,
+    STATUS_UPDATING,
     UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_DESIRED_SIZE,
     UPDATE_PARAM_LABELS_TO_ADD, UPDATE_PARAM_LABELS_TO_REMOVE, UPDATE_PARAM_MAX_SIZE,
     UPDATE_PARAM_MAX_UNAVAILABLE, UPDATE_PARAM_MAX_UNAVAILABLE_PERCENTAGE, UPDATE_PARAM_MIN_SIZE,
@@ -266,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let nodegroup_status = nodegroup.status.clone();
         let stored_scaling = nodegroup.scaling_config.clone();
+        let stored_taints = nodegroup.taints.clone();
 
         // An update of a node group is an update OF THAT NODE GROUP: it is what selects
         // the update in a listing (`ListUpdates$nodegroupName`) and what makes a second
@@ -359,10 +361,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_default();
         let remove_taints = requested_taints.remove_taints.clone().unwrap_or_default();
+
+        // Amazon EKS's own quota for the taints of one node group
+        // ([`state::MAX_TAINTS_PER_NODEGROUP`]) bounds what each half of one change
+        // may NAME as well as what the node group may carry: a node group holds at
+        // most that many taints, so neither half can name more and still describe a
+        // node group. Refused HERE, before the two halves are read against each
+        // other and before the resulting list is counted, so reading one request is
+        // never the product of two lists a caller chose.
+        for named in [&add_or_update_taints, &remove_taints] {
+            if named.len() > MAX_TAINTS_PER_NODEGROUP {
+                return Err(invalid_parameter(state::too_many_taints_message(
+                    named.len(),
+                )));
+            }
+        }
         if let Some(taint) = remove_taints.iter().find(|removed| {
             add_or_update_taints
                 .iter()
-                .any(|added| added.key == removed.key && added.effect == removed.effect)
+                .any(|added| state::same_taint(added, removed))
         }) {
             return Err(invalid_parameter(format!(
                 "taints names the taint with key {:?} and effect {:?} in both \
@@ -370,6 +387,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 taint.key.clone().unwrap_or_default(),
                 taint.effect.clone().unwrap_or_default()
             )));
+        }
+
+        // Amazon EKS's own quota for the taints of one node group
+        // ([`state::MAX_TAINTS_PER_NODEGROUP`]) holds for the list the node group
+        // would carry AFTER this change — a taint added for a `(key, effect)` pair
+        // the node group already carries replaces that one rather than adding to
+        // it, and one this request removes is gone.
+        let carried = stored_taints
+            .iter()
+            .filter(|stored| {
+                !remove_taints
+                    .iter()
+                    .any(|removed| state::same_taint(removed, stored))
+            })
+            .count()
+            + add_or_update_taints
+                .iter()
+                .filter(|added| {
+                    !stored_taints
+                        .iter()
+                        .any(|stored| state::same_taint(added, stored))
+                })
+                .count();
+        if carried > MAX_TAINTS_PER_NODEGROUP {
+            return Err(invalid_parameter(state::too_many_taints_message(carried)));
         }
 
         // "When updating a node group, you can specify any or none of the properties"

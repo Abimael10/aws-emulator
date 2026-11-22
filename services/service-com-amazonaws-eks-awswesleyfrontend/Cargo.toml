@@ -66,6 +66,13 @@ service-common = { path = "../common" }
 # whether a body parses as YAML at all. yaml-rust2 is the pure-Rust YAML 1.2
 # implementation the other services that read caller-supplied YAML already use.
 yaml-rust2 = { version = "0.10", default-features = false }
+# A Kubernetes client may write the object it sends in the Kubernetes protobuf
+# encoding rather than in JSON, so the served cluster API reads that encoding
+# (`src/state/kubernetes_protobuf.rs`). `k8s-pb` carries the generated Kubernetes
+# protobuf schema and `prost` is the codec behind it, so the field numbers and
+# message shapes come from the schema rather than from this emulator.
+k8s-pb = "0.9"
+prost = "0.14"
 # `ipnet`: the reading of an IPv4/IPv6 CIDR block and of whether one block contains
 # another — the form of a `publicAccessCidrs` entry
 # (`src/state/cluster_parameters.rs`) and the private range, netmask bounds and
@@ -138,6 +145,12 @@ x509-cert = "0.2"
 tokio-rustls = "0.26"
 rustls = { workspace = true }
 rustls-pemfile = "2"
+# The suite that drives the served cluster API in the Kubernetes protobuf
+# encoding writes its bodies the way a client configured for that encoding does:
+# the object encoded against the generated Kubernetes schema (`k8s-pb`) inside the
+# envelope that names its kind, both encoded with `prost`.
+k8s-pb = "0.9"
+prost = "0.14"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

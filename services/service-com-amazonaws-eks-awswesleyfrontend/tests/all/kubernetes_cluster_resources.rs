@@ -77,7 +77,7 @@ pub(crate) async fn published_cluster(
 
 /// Register `nodes` instances on the node group `nodegroup` of `cluster`, the way
 /// the Amazon EC2 services report the instances its Auto Scaling group launched.
-fn register_nodes(
+pub(crate) fn register_nodes(
     engine: &engine::InMemoryEngine,
     cluster: &str,
     nodegroup: &str,
@@ -99,7 +99,7 @@ fn register_nodes(
 
 /// One instance of a node group, as the Auto Scaling group and Amazon EC2 report
 /// one.
-fn instance(id: &str, zone: &str, instance_type: &str, address: &str) -> NodeInstance {
+pub(crate) fn instance(id: &str, zone: &str, instance_type: &str, address: &str) -> NodeInstance {
     NodeInstance {
         instance_id: id.to_string(),
         private_dns_name: format!("ip-{}.{REGION}.compute.internal", address.replace('.', "-")),
@@ -763,7 +763,9 @@ async fn a_pod_is_scheduled_onto_a_node_of_the_cluster_and_reaches_a_terminal_ph
 }
 
 /// A body in a media type this API server does not read is refused as one,
-/// whichever resource it is addressed to.
+/// whichever resource it is addressed to — and the one it does read is
+/// unaffected. Which media types it DOES read, and that each of them is really
+/// read, is the rule `kubernetes_manifest_encodings.rs` drives.
 #[tokio::test]
 async fn a_body_in_a_media_type_the_server_does_not_read_is_refused() {
     let (_router, _engine, config) = published_cluster("media-type-cluster").await;
@@ -774,8 +776,8 @@ async fn a_body_in_a_media_type_the_server_does_not_read_is_refused() {
     // resource a client writes, and the one it does read is unaffected.
     let cases = [
         (
-            "the Kubernetes protobuf media type",
-            "application/vnd.kubernetes.protobuf",
+            "a media type that is not a form an object is written in at all",
+            "text/plain",
             "/api/v1/namespaces",
             415,
         ),

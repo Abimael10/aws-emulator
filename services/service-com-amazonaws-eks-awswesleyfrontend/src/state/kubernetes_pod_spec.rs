@@ -41,6 +41,18 @@ use super::kubernetes_objects::ApiRefusal;
 /// its limit with rather than stored in part.
 pub const MAX_CONTAINERS_PER_POD: usize = 64;
 
+/// How many TOLERATIONS one pod may declare.
+///
+/// CHOSEN, not published: the Kubernetes API puts no limit on a pod's toleration
+/// list, and every toleration of an admitted pod is matched against every taint of
+/// every node the cluster could place it on
+/// ([`super::kubernetes_nodes::ClusterNode::admits`]) — work one caller would
+/// otherwise choose for the cluster. It is far above the handful a pod of this
+/// emulator is driven with, and a manifest past it is refused with the validation
+/// `Status` apimachinery refuses a list past its limit with rather than stored in
+/// part.
+pub const MAX_TOLERATIONS_PER_POD: usize = 64;
+
 /// The `PodSpec.restartPolicy` values Kubernetes accepts: "restart policy for all
 /// containers within the pod. One of Always, OnFailure, Never. ... Default to
 /// Always." The policy is what says whether a pod's containers are started again
@@ -85,6 +97,7 @@ pub fn admitted_pod_spec(
         }
     };
     validate_containers(name, spec.get("containers"))?;
+    validate_tolerations(name, spec.get("tolerations"))?;
     let restart_policy = admitted_restart_policy(name, &spec)?;
     spec["restartPolicy"] = ::serde_json::json!(restart_policy);
     spec["serviceAccountName"] = ::serde_json::json!(service_account_name);
@@ -159,6 +172,33 @@ fn validate_containers(
                  \"{container_name}\""
             )));
         }
+    }
+    Ok(())
+}
+
+/// Refuse a toleration list no pod can be scheduled against: one that is not a
+/// list at all, and one past [`MAX_TOLERATIONS_PER_POD`] — every entry of it is
+/// matched against the taints of every node the cluster could place the pod on, so
+/// the list is held to a length before the pod is stored.
+fn validate_tolerations(
+    name: &str,
+    submitted: Option<&::serde_json::Value>,
+) -> Result<(), ApiRefusal> {
+    let Some(submitted) = submitted.filter(|submitted| !submitted.is_null()) else {
+        return Ok(());
+    };
+    let entries = submitted.as_array().ok_or_else(|| {
+        ApiRefusal::invalid(format!(
+            "Pod \"{name}\" is invalid: spec.tolerations: Invalid value: the pod's tolerations \
+             must be a list"
+        ))
+    })?;
+    if entries.len() > MAX_TOLERATIONS_PER_POD {
+        return Err(ApiRefusal::invalid(format!(
+            "Pod \"{name}\" is invalid: spec.tolerations: Too many: {}: must have at most \
+             {MAX_TOLERATIONS_PER_POD} items",
+            entries.len()
+        )));
     }
     Ok(())
 }

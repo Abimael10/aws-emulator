@@ -2905,7 +2905,7 @@ pub(super) fn references_an_anchor(text: &str) -> bool {
 /// as an explicitly null one. A node past `depth` reads as the empty value of its
 /// own kind, which states the same type at that level
 /// ([`MAX_CONFIGURATION_DEPTH`]).
-fn yaml_as_json(node: &::yaml_rust2::Yaml, depth: usize) -> ::serde_json::Value {
+pub(super) fn yaml_as_json(node: &::yaml_rust2::Yaml, depth: usize) -> ::serde_json::Value {
     use ::yaml_rust2::Yaml;
     let Some(depth) = depth.checked_sub(1) else {
         return match node {

@@ -17,7 +17,194 @@
 //! Zone the instance really launched with, the capacity type the node group was
 //! created with, and the labels and taints the node group applies to its nodes.
 
+use ::std::collections::BTreeSet;
+
 use super::*;
+
+/// The taints the nodes of `nodegroup` carry, as KUBERNETES spells them.
+///
+/// One projection, read by the `Node` document a client reads and by the
+/// scheduler that places a pod, so what a client sees on a node and what the
+/// scheduler holds a pod to cannot disagree.
+fn node_taints(nodegroup: &NodegroupRecord) -> Vec<NodeTaint> {
+    nodegroup
+        .taints
+        .iter()
+        .map(|taint| NodeTaint {
+            key: taint.key.clone().unwrap_or_default(),
+            value: taint.value.clone().unwrap_or_default(),
+            effect: kubernetes_taint_effect(taint.effect.as_deref().unwrap_or_default()),
+        })
+        .collect()
+}
+
+/// One taint a node carries, in the vocabulary Kubernetes carries one in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeTaint {
+    pub key: String,
+    pub value: String,
+    /// The effect, spelled as `Node.spec.taints[].effect` spells one
+    /// ([`kubernetes_taint_effect`]).
+    pub effect: String,
+}
+
+/// The Kubernetes taint effect `NoSchedule` and the two others Kubernetes has, in
+/// the only spelling `Node.spec.taints[].effect` takes.
+pub const KUBERNETES_TAINT_EFFECT_NO_SCHEDULE: &str = "NoSchedule";
+/// See [`KUBERNETES_TAINT_EFFECT_NO_SCHEDULE`].
+pub const KUBERNETES_TAINT_EFFECT_NO_EXECUTE: &str = "NoExecute";
+/// See [`KUBERNETES_TAINT_EFFECT_NO_SCHEDULE`].
+pub const KUBERNETES_TAINT_EFFECT_PREFER_NO_SCHEDULE: &str = "PreferNoSchedule";
+
+/// One `TaintEffect` of the EKS API, spelled as the KUBERNETES taint effect it is.
+///
+/// The two APIs name the same three effects in their own vocabularies: the EKS API
+/// takes `NO_SCHEDULE`, `NO_EXECUTE` and `PREFER_NO_SCHEDULE`
+/// (`com.amazonaws.eks#TaintEffect`, the enum `Taint$effect` targets), and
+/// Kubernetes takes `NoSchedule`, `NoExecute` and `PreferNoSchedule` and nothing
+/// else — so a node group's taint reaches the node it is applied to spelled the
+/// way the node's own API spells it. The translation is the one that carries each
+/// of those enum values onto its Kubernetes spelling: the words of the enum value,
+/// each capitalised.
+#[must_use]
+pub fn kubernetes_taint_effect(effect: &str) -> String {
+    effect
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut letters = word.chars();
+            match letters.next() {
+                Some(first) => {
+                    format!(
+                        "{}{}",
+                        first.to_ascii_uppercase(),
+                        letters.as_str().to_ascii_lowercase()
+                    )
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+impl NodeTaint {
+    /// Whether this taint KEEPS a pod that does not tolerate it off the node: the
+    /// two effects that do ("`NoSchedule`: pods that do not tolerate this taint
+    /// are not scheduled on the node", and `NoExecute`, which also evicts one
+    /// already there), as against `PreferNoSchedule`, which only makes the node a
+    /// worse choice than an untainted one.
+    #[must_use]
+    pub fn repels_untolerating_pods(&self) -> bool {
+        self.effect == KUBERNETES_TAINT_EFFECT_NO_SCHEDULE
+            || self.effect == KUBERNETES_TAINT_EFFECT_NO_EXECUTE
+    }
+}
+
+/// The `Toleration$operator` that tolerates a taint whatever value it carries, as
+/// against the default `Equal`, which tolerates it only at one value.
+pub const TOLERATION_OPERATOR_EXISTS: &str = "Exists";
+
+/// What a pod TOLERATES, read once out of its `spec.tolerations` and indexed by
+/// the key each entry names.
+///
+/// Read once per pod rather than per node: the scheduler asks the same question of
+/// every node it could place the pod on, so the cost of one placement is the
+/// pod's toleration list once plus a lookup per taint of the node — never the
+/// product of the two lists. The list itself is held to
+/// [`super::kubernetes_pod_spec::MAX_TOLERATIONS_PER_POD`] entries when the pod is
+/// admitted, before anything is stored.
+#[derive(Debug, Clone, Default)]
+pub struct PodTolerations {
+    /// The effects of the tolerations that name NO key: with operator `Exists`
+    /// such a toleration tolerates every taint the node carries, under the effect
+    /// it names — the empty string for one that names none, which tolerates a
+    /// taint whatever its effect.
+    keyless: BTreeSet<String>,
+    /// The tolerations that name a key, by that key.
+    by_key: BTreeMap<String, KeyTolerations>,
+}
+
+/// What a pod tolerates for ONE taint key: the effects it tolerates whatever the
+/// taint's value (operator `Exists`), and the effects it tolerates at one value
+/// (the default operator `Equal`), by that value.
+///
+/// Both are keyed so that a taint is answered by lookup: the empty string stands
+/// for "whatever the effect", which is what a toleration naming no effect means.
+#[derive(Debug, Clone, Default)]
+struct KeyTolerations {
+    exists: BTreeSet<String>,
+    equal: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl KeyTolerations {
+    /// Whether this key's tolerations tolerate a taint of `effect` carrying
+    /// `value`.
+    fn tolerates(&self, effect: &str, value: &str) -> bool {
+        if self.exists.contains("") || self.exists.contains(effect) {
+            return true;
+        }
+        self.equal
+            .get(value)
+            .is_some_and(|effects| effects.contains("") || effects.contains(effect))
+    }
+}
+
+impl PodTolerations {
+    /// The tolerations the pod `spec` declares. A spec that declares none
+    /// tolerates nothing, which is what a pod without the member does.
+    #[must_use]
+    pub fn of(spec: &::serde_json::Value) -> Self {
+        let mut tolerations = Self::default();
+        let declared = spec
+            .get("tolerations")
+            .and_then(::serde_json::Value::as_array)
+            .map(|declared| declared.as_slice())
+            .unwrap_or_default();
+        for toleration in declared {
+            let member = |name: &str| {
+                toleration
+                    .get(name)
+                    .and_then(::serde_json::Value::as_str)
+                    .unwrap_or_default()
+            };
+            // An absent `effect` tolerates the taint whatever its effect, which is
+            // what the empty string stands for in both indexes.
+            let effect = member("effect").to_string();
+            let key = member("key");
+            let exists = member("operator") == TOLERATION_OPERATOR_EXISTS;
+            if key.is_empty() {
+                // A toleration that names no key tolerates every taint — but only
+                // with operator `Exists`; naming no key and no operator tolerates
+                // nothing, as Kubernetes reads it.
+                if exists {
+                    tolerations.keyless.insert(effect);
+                }
+                continue;
+            }
+            let held = tolerations.by_key.entry(key.to_string()).or_default();
+            if exists {
+                held.exists.insert(effect);
+            } else {
+                held.equal
+                    .entry(member("value").to_string())
+                    .or_default()
+                    .insert(effect);
+            }
+        }
+        tolerations
+    }
+
+    /// Whether the pod tolerates `taint`.
+    #[must_use]
+    pub fn tolerate(&self, taint: &NodeTaint) -> bool {
+        if self.keyless.contains("") || self.keyless.contains(taint.effect.as_str()) {
+            return true;
+        }
+        self.by_key
+            .get(taint.key.as_str())
+            .is_some_and(|held| held.tolerates(&taint.effect, &taint.value))
+    }
+}
 
 /// One node of a cluster: the Amazon EC2 instance a managed node group launched,
 /// as the services that own it reported it.
@@ -159,8 +346,7 @@ fn node_json(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
     );
-    let taints: Vec<::serde_json::Value> = nodegroup
-        .taints
+    let taints: Vec<::serde_json::Value> = node_taints(nodegroup)
         .iter()
         .map(|taint| {
             ::serde_json::json!({
@@ -254,6 +440,28 @@ pub struct ClusterNode {
     /// ([`super::kubernetes_image_pull`]). Empty for a node group that states
     /// none.
     pub node_role: String,
+    /// The taints the node group applied to this node, as Kubernetes spells them
+    /// ([`node_taints`]) — what the scheduler holds a pod's tolerations against
+    /// before it places the pod here.
+    pub taints: Vec<NodeTaint>,
+}
+
+impl ClusterNode {
+    /// Whether this node TAKES a pod with these tolerations: a node repels a pod
+    /// that does not tolerate each of its taints that repels untolerating pods
+    /// ([`NodeTaint::repels_untolerating_pods`]), which is what a taint on a node
+    /// does to the scheduler's choice.
+    ///
+    /// `tolerations` is read off the pod ONCE ([`PodTolerations::of`]) and asked of
+    /// every node, so placing one pod costs its toleration list once plus a lookup
+    /// per taint of each node.
+    #[must_use]
+    pub fn admits(&self, tolerations: &PodTolerations) -> bool {
+        self.taints
+            .iter()
+            .filter(|taint| taint.repels_untolerating_pods())
+            .all(|taint| tolerations.tolerate(taint))
+    }
 }
 
 impl ComAmazonawsEksAwswesleyfrontendState {
@@ -319,6 +527,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                     // The role the node group launched its instances under, which
                     // is what the node's kubelet acts as.
                     node_role: nodegroup.node_role.clone(),
+                    // The taints the node group applies to its nodes, which is
+                    // what the scheduler holds a pod's tolerations against.
+                    taints: node_taints(nodegroup),
                 })
             })
             .collect();

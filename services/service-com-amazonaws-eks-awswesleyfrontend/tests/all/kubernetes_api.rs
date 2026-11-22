@@ -220,6 +220,31 @@ pub(crate) async fn dial_with(
     authorization: Option<&str>,
     body: Option<&serde_json::Value>,
 ) -> ApiAnswer {
+    let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
+    dial_bytes(
+        config,
+        case,
+        method,
+        path,
+        content_type,
+        authorization,
+        payload.as_bytes(),
+    )
+    .await
+}
+
+/// The same request once more, with the body written as the BYTES the client
+/// encoded it to — what a client that writes its object in an encoding other than
+/// a JSON document sends.
+pub(crate) async fn dial_bytes(
+    config: &Kubeconfig,
+    case: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    authorization: Option<&str>,
+    payload: &[u8],
+) -> ApiAnswer {
     let authority = config
         .endpoint
         .strip_prefix("https://")
@@ -281,16 +306,17 @@ pub(crate) async fn dial_with(
             )
         });
 
-    let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
     let credential = authorization
         .map(|header| format!("Authorization: {header}\r\n"))
         .unwrap_or_default();
-    let request = format!(
+    let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{credential}Content-Type: \
-         {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+         {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    tls.write_all(request.as_bytes())
+    let mut request = head.into_bytes();
+    request.extend_from_slice(payload);
+    tls.write_all(&request)
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the request must be written: {error}"));
     let mut raw = Vec::new();

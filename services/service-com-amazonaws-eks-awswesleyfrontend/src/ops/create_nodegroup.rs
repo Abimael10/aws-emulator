@@ -200,8 +200,8 @@ use crate::state::{
     self, NodegroupRecord, CUSTOM_AMI_TYPE, DEFAULT_AMI_TYPE, DEFAULT_CAPACITY_TYPE,
     DEFAULT_INSTANCE_TYPE, DEFAULT_MAX_UNAVAILABLE, DEFAULT_SCALING_DESIRED_SIZE,
     DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, MAX_INSTANCE_TYPES,
-    MAX_NODEGROUPS_PER_CLUSTER, MAX_STORED_NODEGROUPS, MIN_DISK_SIZE_GIB,
-    NODEGROUP_ACTIVATION_DELAY, STATUS_CREATING,
+    MAX_NODEGROUPS_PER_CLUSTER, MAX_STORED_NODEGROUPS, MAX_TAINTS_PER_NODEGROUP,
+    MIN_DISK_SIZE_GIB, NODEGROUP_ACTIVATION_DELAY, STATUS_CREATING,
 };
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -503,6 +503,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "instanceTypes must name at most {MAX_INSTANCE_TYPES} instance types, got \
                      {instance_type_count}"
                 ),
+            ));
+        }
+
+        // Amazon EKS's own quota for the taints of one managed node group
+        // ([`state::MAX_TAINTS_PER_NODEGROUP`]): every taint is applied to every
+        // node the group registers, so a list past the quota is refused rather
+        // than stored.
+        let taint_count = input.taints.as_ref().map_or(0, Vec::len);
+        if taint_count > MAX_TAINTS_PER_NODEGROUP {
+            return Err(invalid_parameter(
+                cluster_name,
+                nodegroup_name,
+                state::too_many_taints_message(taint_count),
             ));
         }
 

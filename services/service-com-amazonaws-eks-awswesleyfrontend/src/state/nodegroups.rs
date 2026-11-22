@@ -128,7 +128,14 @@ pub struct PendingNodegroupConfig {
 /// taint" and "the effect of the taint" are what a node group's scheduler keys
 /// on, so a taint added for a `(key, effect)` pair replaces the one already
 /// there and the `value` is what the change carries.
-pub(super) fn same_taint(left: &Taint, right: &Taint) -> bool {
+///
+/// The ONE reading of that identity: the change that writes a taint onto a node
+/// group ([`PendingNodegroupConfig::apply`]) and the operations that judge a
+/// requested change against it (`UpdateNodegroupConfig`'s conflicting-member
+/// refusal and its quota count) ask it here, so what a request is held to and what
+/// the record ends up carrying cannot disagree.
+#[must_use]
+pub fn same_taint(left: &Taint, right: &Taint) -> bool {
     left.key == right.key && left.effect == right.effect
 }
 

@@ -100,6 +100,7 @@ use super::kubernetes_objects::{
 };
 use super::kubernetes_objects::{ApiRefusal, ClusterObjects};
 use super::kubernetes_openapi;
+use super::kubernetes_protobuf;
 use super::kubernetes_rbac::{self as rbac, RbacResource};
 use super::kubernetes_self_subject_review as self_review;
 use super::pod_identity_plane::AuthPlane;
@@ -1267,48 +1268,122 @@ fn plane_mut<'store>(
         .ok_or_else(|| ApiRefusal::not_found("clusters", &key.1))
 }
 
-/// The media types this API server reads a manifest in. A client states the one
-/// it wrote the body in on `Content-Type`, and a body in any other media type is
-/// one this server cannot read — the Kubernetes protobuf media type among them,
-/// whose objects are encoded against the generated schema of each kind rather
-/// than as a document.
-pub const READ_MEDIA_TYPES: [&str; 1] = ["application/json"];
+/// The media type a client states when it wrote the body as a JSON document,
+/// which is also the one a request that states none is read as.
+pub const JSON_MEDIA_TYPE: &str = "application/json";
 
-/// The manifest a write request carries, read as the JSON document a Kubernetes
-/// client sends.
+/// The media type a client states when it wrote the body as a YAML document.
+pub const YAML_MEDIA_TYPE: &str = "application/yaml";
+
+/// The media types this API server reads a manifest in: a client states the one it
+/// wrote the body in on `Content-Type`, and a body in any other media type is one
+/// this server cannot read.
+///
+/// The three encodings a Kubernetes object travels in — the JSON document, the
+/// YAML document that is the same object written as YAML, and the Kubernetes
+/// protobuf encoding, in which the object is the bytes of its own generated
+/// message behind the envelope that names its kind
+/// ([`super::kubernetes_protobuf`]).
+pub const READ_MEDIA_TYPES: [&str; 3] = [
+    JSON_MEDIA_TYPE,
+    YAML_MEDIA_TYPE,
+    kubernetes_protobuf::PROTOBUF_MEDIA_TYPE,
+];
+
+/// How deeply a manifest written in YAML may nest before this server stops
+/// reading it.
+///
+/// CHOSEN, not published: the bound is on the loader rather than on the object,
+/// because a YAML loader builds the whole tree before anything inspects it. It is
+/// far above what any Kubernetes manifest nests, and it is the one pre-parse
+/// nesting bound this tree states
+/// ([`::service_common::yaml_nesting::nesting_depth_bound`]), the same reading the
+/// other YAML a caller hands this service is bounded by.
+const MAX_MANIFEST_DEPTH: usize = 64;
+
+/// The manifest a write request carries, read out of the encoding the client
+/// stated it wrote the body in.
 ///
 /// An empty body is the empty object, which is what a request that carries no
-/// manifest sends. A body in a media type this server does not read is the API
-/// server's own `415`, naming the media types it does; one in a media type it
-/// does read but cannot parse is its `400`, reporting that the kind could not be
-/// read out of it — as opposed to a manifest it read and found invalid, which is
-/// the `422` above.
+/// manifest sends. A client that states no media type at all is read as the JSON
+/// one, which is the encoding a Kubernetes client writes by default. A body in a
+/// media type this server does not read is the API server's own `415`, naming the
+/// media types it does; one in a media type it does read but cannot decode an
+/// object out of is its `400`, reporting that the kind could not be read out of it
+/// — as opposed to a manifest it read and found invalid, which is the `422` above.
 fn read_manifest(content_type: &str, body: &[u8]) -> Result<::serde_json::Value, ApiRefusal> {
     // A media type carries parameters (`application/json; charset=utf-8`); the
     // type itself is what says how the body is encoded.
-    let media_type = content_type
+    let stated = content_type
         .split(';')
         .next()
         .unwrap_or_default()
         .trim();
-    if !media_type.is_empty()
-        && !READ_MEDIA_TYPES
-            .iter()
-            .any(|read| media_type.eq_ignore_ascii_case(read))
-    {
+    let media_type = if stated.is_empty() {
+        JSON_MEDIA_TYPE
+    } else {
+        stated
+    };
+    let Some(read_as) = READ_MEDIA_TYPES
+        .into_iter()
+        .find(|read| media_type.eq_ignore_ascii_case(read))
+    else {
         return Err(ApiRefusal::unsupported_media_type(&READ_MEDIA_TYPES));
-    }
+    };
     if body.is_empty() {
         return Ok(::serde_json::json!({}));
     }
-    match ::serde_json::from_slice::<::serde_json::Value>(body) {
-        Ok(document @ ::serde_json::Value::Object(_)) => Ok(document),
-        Ok(_) => Err(ApiRefusal::bad_request(
-            "couldn't get version/kind; json parse error: the body is not a JSON object",
-        )),
-        Err(error) => Err(ApiRefusal::bad_request(format!(
-            "couldn't get version/kind; json parse error: {error}"
-        ))),
+    match read_as {
+        kubernetes_protobuf::PROTOBUF_MEDIA_TYPE => kubernetes_protobuf::read_object(body),
+        YAML_MEDIA_TYPE => read_yaml_manifest(body),
+        _ => match ::serde_json::from_slice::<::serde_json::Value>(body) {
+            Ok(document @ ::serde_json::Value::Object(_)) => Ok(document),
+            Ok(_) => Err(ApiRefusal::bad_request(
+                "couldn't get version/kind; json parse error: the body is not a JSON object",
+            )),
+            Err(error) => Err(ApiRefusal::bad_request(format!(
+                "couldn't get version/kind; json parse error: {error}"
+            ))),
+        },
+    }
+}
+
+/// The manifest a body written as a YAML document carries, as the same object
+/// document the JSON form of it reads as — YAML's scalars, mappings and sequences
+/// are JSON's ([`super::addon_catalog::yaml_as_json`], the one reading of
+/// caller-supplied YAML this service has).
+///
+/// BOUNDED before the loader is handed the text, as every other reading of
+/// caller-supplied YAML here is: a document past [`MAX_MANIFEST_DEPTH`] and one
+/// that references a YAML anchor — which a loader resolves by COPYING the anchored
+/// node into every alias position, so a shallow document can expand
+/// multiplicatively while it is being loaded — are bodies this server does not
+/// read at all.
+fn read_yaml_manifest(body: &[u8]) -> Result<::serde_json::Value, ApiRefusal> {
+    let unreadable = |detail: &str| {
+        ApiRefusal::bad_request(format!(
+            "couldn't get version/kind; yaml parse error: {detail}"
+        ))
+    };
+    let text = ::std::str::from_utf8(body).map_err(|_| unreadable("the body is not text"))?;
+    if ::service_common::yaml_nesting::nesting_depth_bound(text, MAX_MANIFEST_DEPTH)
+        > MAX_MANIFEST_DEPTH
+    {
+        return Err(unreadable("the document nests deeper than the server reads"));
+    }
+    if super::addon_catalog::references_an_anchor(text) {
+        return Err(unreadable("the document references a YAML anchor"));
+    }
+    let documents = ::yaml_rust2::YamlLoader::load_from_str(text)
+        .map_err(|error| unreadable(&error.to_string()))?;
+    // A stream with nothing in it (comments alone) carries no manifest, which is
+    // what a body that carries none is.
+    let Some(first) = documents.first() else {
+        return Ok(::serde_json::json!({}));
+    };
+    match super::addon_catalog::yaml_as_json(first, MAX_MANIFEST_DEPTH) {
+        document @ ::serde_json::Value::Object(_) => Ok(document),
+        _ => Err(unreadable("the document is not a mapping")),
     }
 }
 

@@ -586,9 +586,14 @@ impl ClusterObjects {
                     Some(true) => {}
                     // Bound to a node that is gone.
                     Some(false) => pod.unbind(),
-                    // Not bound at all: bound now, if there is a node for it.
+                    // Not bound at all: bound now, if there is a node for it. The
+                    // pod's tolerations are read once and asked of each node.
                     None => {
-                        if let Some(node) = nodes.first() {
+                        let tolerations =
+                            super::kubernetes_nodes::PodTolerations::of(&pod.spec);
+                        if let Some(node) =
+                            nodes.iter().find(|node| node.admits(&tolerations))
+                        {
                             pod.bind_to(node);
                         }
                     }
@@ -839,8 +844,10 @@ impl ClusterObjects {
         // one is how a client bypasses the scheduler — but only when the cluster
         // holds it: a name no node of the cluster carries is nothing to bind to,
         // so the pod stays unscheduled, as it does on a cluster with no node at
-        // all. Either way an unbound pod is bound by the first call after a node
-        // it can run on is there.
+        // all. A node whose taints the pod does not tolerate takes no pod either
+        // ([`super::kubernetes_nodes::ClusterNode::admits`]), which is what a
+        // taint does to the scheduler's choice. Either way an unbound pod is bound
+        // by the first call after a node it can run on is there.
         let requested_node = manifest
             .get("spec")
             .and_then(|requested| requested.get("nodeName"))
@@ -848,7 +855,10 @@ impl ClusterObjects {
             .filter(|requested| !requested.is_empty());
         let bound = match requested_node {
             Some(named) => nodes.iter().find(|node| node.name == named),
-            None => nodes.first(),
+            None => held.pods.get(&name).and_then(|pod| {
+                let tolerations = super::kubernetes_nodes::PodTolerations::of(&pod.spec);
+                nodes.iter().find(|node| node.admits(&tolerations))
+            }),
         };
         if let (Some(node), Some(pod)) = (bound, held.pods.get_mut(&name)) {
             pod.bind_to(node);

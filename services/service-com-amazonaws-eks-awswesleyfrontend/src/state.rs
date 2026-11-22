@@ -793,6 +793,26 @@ pub const DEFAULT_INSTANCE_TYPE: &str = "t3.medium";
 /// instance types for `instanceTypes`" (`CreateNodegroupRequest$instanceTypes`).
 pub const MAX_INSTANCE_TYPES: usize = 20;
 
+/// The number of `taints` one managed node group may carry: Amazon EKS's own
+/// quota for them ("the maximum number of taints per managed node group" is 50),
+/// which is what `taintsList` carrying no modelled length means the API itself
+/// holds a node group to. Every taint is applied to every node the group
+/// registers and is matched against the tolerations of every pod the cluster
+/// schedules ([`kubernetes_nodes::ClusterNode::admits`]), so a list past the quota
+/// is refused rather than stored.
+pub const MAX_TAINTS_PER_NODEGROUP: usize = 50;
+
+/// The sentence `CreateNodegroup` and `UpdateNodegroupConfig` refuse a taint list
+/// past [`MAX_TAINTS_PER_NODEGROUP`] with, naming the bound and the count the
+/// request would leave the node group carrying — in the wording this API states
+/// an over-long list in (see `instanceTypes` above).
+#[must_use]
+pub fn too_many_taints_message(carried: usize) -> String {
+    format!(
+        "taints must name at most {MAX_TAINTS_PER_NODEGROUP} taints, got {carried}"
+    )
+}
+
 /// The root device disk size a Linux or Bottlerocket node group gets when
 /// `diskSize` is absent: "The default disk size is 20 GiB for Linux and
 /// Bottlerocket" (`CreateNodegroupRequest$diskSize`).
@@ -4912,6 +4932,7 @@ pub mod kubernetes_nodes;
 pub mod kubernetes_objects;
 pub mod kubernetes_openapi;
 pub mod kubernetes_pod_spec;
+pub mod kubernetes_protobuf;
 pub mod kubernetes_rbac;
 pub mod kubernetes_self_subject_review;
 mod nodegroup_ami_releases;
@@ -4919,6 +4940,9 @@ mod nodegroup_capacity;
 mod nodegroups;
 mod pass_role;
 mod peers;
+/// The health probes a pod's container declares, as the protobuf projection reads
+/// them ([`kubernetes_protobuf`]).
+mod probe;
 pub mod pod_identity_plane;
 mod reported_timestamps;
 mod store;
