@@ -152,7 +152,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for which to stop replicating automate backups", read through the one reading of
         // that member this service has, so the start and the stop resolve a source the same
         // way.
-        let Some(source) = crate::state::source_db_instance_of(&input.source_db_instance_arn)
+        let Some(source) =
+            crate::state::source_db_instance_of(&input.source_db_instance_arn, &destination)
         else {
             return Err(
                 StopDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value(
@@ -188,13 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StopDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceNotFoundFault(
                     DBInstanceNotFoundFault {
-                        // The value the REQUEST named the source instance by, as the start's
-                        // own refusal names it: the identifier the source ARN carries.
-                        message: Some(format!(
-                            "DBInstance {} not found.",
-                            crate::state::db_instance_identifier_of(
-                                &input.source_db_instance_arn
-                            )
+                        // The source is addressed by an ARN that carries its own Region, as
+                        // the start's own refusal reads it: one Region-qualified sentence for
+                        // both, naming the identifier the ARN carries and the Region it
+                        // points at.
+                        message: Some(crate::state::source_db_instance_not_found_message(
+                            &input.source_db_instance_arn,
+                            &source.region,
                         )),
                     },
                 )

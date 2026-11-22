@@ -485,12 +485,13 @@ pub fn inherited_snapshot_tags(
 /// for in the request's own region.
 ///
 /// The one wording for both copies, the DB snapshot's and the DB cluster snapshot's: the
-/// sentence names the resource it could not find rather than the operation.
+/// sentence names the resource it could not find rather than the operation, through the one
+/// region-qualified template this crate has (`cross_region_source_not_found_message`).
 pub fn snapshot_copy_source_not_found_message(requested: &str, request_region: &str) -> String {
     let source_region = arn_region(requested)
         .filter(|region| !region.is_empty())
         .unwrap_or(request_region);
-    format!("Requested snapshot {requested} not found in source region {source_region}")
+    cross_region_source_not_found_message(&format!("snapshot {requested}"), source_region)
 }
 
 /// How Amazon RDS words the DB-snapshot not-found fault: the `<type> not found: <name>`

@@ -327,6 +327,47 @@ pub const AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE: &str =
     "Automated backups are not enabled for this database instance. To enable automated \
      backups, use ModifyDBInstance to set the backup retention period to a non-zero value.";
 
+/// How Amazon RDS words a not-found fault for a SOURCE resource a request addressed in
+/// ANOTHER region than the call: the sentence names the resource that was asked for and the
+/// region it was looked for in.
+///
+/// A cross-region operation names its source by an ARN, and an ARN carries the region its
+/// resource is in, so the region a lookup went to is part of the request rather than of the
+/// caller's endpoint — and so it is part of the refusal: a caller cannot otherwise tell a
+/// source that does not exist from one its ARN pointed at the wrong region for. `subject`
+/// is the resource as the sentence names it (its type as Amazon RDS spells it in this
+/// sentence, then the identifier the request carried), and `source_region` is the region the
+/// source was looked for in. There is no terminal period.
+///
+/// The ONE template for every such refusal of this service — the copies' source snapshot
+/// (`snapshot_copy_source_not_found_message`) and the automated-backup replications' source
+/// DB instance ([`source_db_instance_not_found_message`]) — so the two cannot drift.
+pub fn cross_region_source_not_found_message(subject: &str, source_region: &str) -> String {
+    format!("Requested {subject} not found in source region {source_region}")
+}
+
+/// How Amazon RDS words the `DBInstanceNotFoundFault` of a cross-region operation whose
+/// SOURCE DB instance — the one its `SourceDBInstanceArn` names — the store cannot resolve.
+///
+/// `StartDBInstanceAutomatedBackupsReplication$SourceDBInstanceArn` is "the Amazon Resource
+/// Name (ARN) of the source DB instance ..., for example,
+/// arn:aws:rds:us-west-2:123456789012:db:mydatabase", so the request names the source by an
+/// ARN that carries its region: the refusal is the region-qualified one
+/// ([`cross_region_source_not_found_message`]), with the identifier the ARN carries and the
+/// region the source was looked up in as its two variable parts, rather than the region-less
+/// `DBInstance <id> not found.` sentence the calls that address an instance in the region of
+/// the call answer.
+///
+/// `source_region` is the region of the source the request resolved to
+/// (`source_db_instance_of`), so the sentence names the region the lookup actually consulted
+/// and cannot disagree with it.
+pub fn source_db_instance_not_found_message(source_arn: &str, source_region: &str) -> String {
+    cross_region_source_not_found_message(
+        &format!("DB Instance {}", db_instance_identifier_of(source_arn)),
+        source_region,
+    )
+}
+
 /// How Amazon RDS refuses a read replica of a DB instance that is a member of a DB
 /// cluster: ONE fixed sentence, which is why it is a constant — it names neither the
 /// instance nor the cluster, so the same text answers every such request.

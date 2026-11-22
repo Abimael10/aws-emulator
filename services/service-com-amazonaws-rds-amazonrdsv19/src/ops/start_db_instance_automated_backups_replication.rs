@@ -184,7 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for the replicated automated backups", so it names BOTH the instance and the Region
         // it is in — a value that is not a DB instance ARN names no source at all, which is a
         // bad parameter rather than a resource that is missing.
-        let Some(source) = crate::state::source_db_instance_of(&input.source_db_instance_arn)
+        let Some(source) =
+            crate::state::source_db_instance_of(&input.source_db_instance_arn, &destination)
         else {
             return Err(
                 StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value(
@@ -247,17 +248,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceNotFoundFault(
                     DBInstanceNotFoundFault {
-                        // The sentence this front door words a missing DB instance with in the
-                        // operations that ADDRESS one — the `StartDBInstance` /
-                        // `StopDBInstance` pair this operation is the backup-replication
-                        // counterpart of word it the same way — and its one variable part is
-                        // the instance the request named: the identifier its source ARN
-                        // carries.
-                        message: Some(format!(
-                            "DBInstance {} not found.",
-                            crate::state::db_instance_identifier_of(
-                                &input.source_db_instance_arn
-                            )
+                        // The source is addressed by an ARN that carries its own Region, so
+                        // the refusal is the Region-qualified one this service words a
+                        // cross-Region source it cannot find with: the identifier the ARN
+                        // carries and the Region that ARN points at.
+                        message: Some(crate::state::source_db_instance_not_found_message(
+                            &input.source_db_instance_arn,
+                            &source.region,
                         )),
                     },
                 )

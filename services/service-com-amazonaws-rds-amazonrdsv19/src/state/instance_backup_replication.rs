@@ -52,17 +52,27 @@ pub struct SourceDbInstance {
     pub identifier: String,
 }
 
-/// The source DB instance `named` names, or `None` when `named` is not the ARN of a DB
-/// instance at all — read through the ONE RDS ARN reading this crate has
-/// ([`parse_rds_resource_arn`]), so a value this service would not mint an ARN of names no
-/// source here either.
-pub fn source_db_instance_of(named: &str) -> Option<SourceDbInstance> {
+/// The source DB instance `named` names, looked for from a request signed for
+/// `request_region`, or `None` when `named` is not the ARN of a DB instance at all — read
+/// through the ONE RDS ARN reading this crate has ([`parse_rds_resource_arn`]), so a value
+/// this service would not mint an ARN of names no source here either.
+///
+/// The region is the ARN's own, which is the whole point of naming a cross-region source by
+/// ARN; an ARN whose region segment is EMPTY names no region other than the one the request
+/// was signed for, so that is where its source is looked for — the rule the copies' source
+/// snapshot is resolved by (`snapshot_copy_source_not_found_message`).
+pub fn source_db_instance_of(named: &str, request_region: &str) -> Option<SourceDbInstance> {
     let parsed = parse_rds_resource_arn(named)?;
     if parsed.resource_type != DB_INSTANCE_ARN_RESOURCE_TYPE {
         return None;
     }
+    let region = if parsed.region.is_empty() {
+        request_region
+    } else {
+        parsed.region
+    };
     Some(SourceDbInstance {
-        region: parsed.region.to_string(),
+        region: region.to_string(),
         identifier: parsed.identifier.to_ascii_lowercase(),
     })
 }

@@ -913,9 +913,9 @@ async fn a_source_that_cannot_be_replicated_is_refused() {
         let refused = expect_error(case, response, 404, NOT_FOUND);
         assert_eq!(
             text(&refused, "Message"),
-            format!("DBInstance {missing_identifier} not found."),
-            "case {case:?}: the refusal must name the instance the source ARN carries, got \
-             {refused}"
+            format!("Requested DB Instance {missing_identifier} not found in source region {region}"),
+            "case {case:?}: the refusal must name the instance the source ARN carries and the \
+             Region that ARN points at, got {refused}"
         );
     }
 
