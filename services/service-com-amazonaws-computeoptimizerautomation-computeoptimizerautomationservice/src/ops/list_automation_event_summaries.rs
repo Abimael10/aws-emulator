@@ -263,21 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 end_date.map(crate::state::instant_key),
             ),
         );
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(unissued_token());
-                };
-                if cursor.filter_fingerprint != query_fingerprint {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned for the same filters and dates",
-                    )));
-                }
-                cursor.offset
-            }
-        };
+        // Where this call resumes, by the one rule every paginated operation of
+        // this service enters its walk under: `crate::state::page_entry_offset`.
+        // Only the WORDING of each refusal is this operation's own, because it
+        // names what the token had to have been taken for.
+        let offset =
+            crate::state::page_entry_offset(input.next_token.as_deref(), &query_fingerprint)
+                .map_err(|refusal| match refusal {
+                    crate::state::PageEntryRefusal::Unissued => unissued_token(),
+                    crate::state::PageEntryRefusal::OtherQuery => {
+                        invalid_parameter(crate::state::constraint_report(
+                            "nextToken",
+                            "Member must be a token returned for the same filters and dates",
+                        ))
+                    }
+                })?;
 
         // `maxResults` carries a member `@range` of min 1 / max 100
         // (`smithy_query(query="shape",shape="ListAutomationEventSummariesRequest")`),

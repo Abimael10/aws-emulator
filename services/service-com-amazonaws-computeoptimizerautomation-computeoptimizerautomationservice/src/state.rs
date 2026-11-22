@@ -4157,6 +4157,57 @@ fn canonical_offset(spelling: &str) -> Option<usize> {
     (offset.to_string() == spelling).then_some(offset)
 }
 
+/// Why a `nextToken` a caller presented cannot enter a page walk: the two
+/// things a paginated operation refuses it for, each of which it words itself.
+///
+/// [`page_entry_offset`] answers one of these instead of a message, because the
+/// requirement a refusal reports names what the token had to have been taken for
+/// — the operation, and the query members that operation pages under — which is
+/// per-operation wording the handler owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageEntryRefusal {
+    /// The token is not one this service minted at all: it decodes to no cursor
+    /// ([`decode_page_token`]).
+    Unissued,
+    /// It decodes to a cursor, but one taken for a different walk than the call
+    /// resuming with it — another query of this operation, or another operation
+    /// of this service ([`page_fingerprint`]).
+    OtherQuery,
+}
+
+/// Where a paginated listing resumes, from the caller's optional `nextToken`.
+///
+/// One rule for every paginated operation of this service, beside the rules
+/// [`page_size`], [`decode_page_token`] and [`resume_page`] already state, so the
+/// decision each one makes on the way INTO its walk is made once rather than
+/// copied per operation: a request carrying no token starts at the beginning; a
+/// token that does not decode is one this service never minted
+/// ([`PageEntryRefusal::Unissued`]); a token that decodes but carries a
+/// fingerprint other than `query_fingerprint` — the one this very call would
+/// mint — was taken for another walk and cannot resume this one
+/// ([`PageEntryRefusal::OtherQuery`]), because its offset indexes a different
+/// sequence; otherwise the cursor's own offset is where the previous page
+/// stopped.
+///
+/// The fingerprint is compared AFTER the token decodes, so a token that is no
+/// cursor at all is reported as the token this service never issued rather than
+/// as one taken for another query.
+pub fn page_entry_offset(
+    next_token: Option<&str>,
+    query_fingerprint: &str,
+) -> Result<usize, PageEntryRefusal> {
+    let Some(token) = next_token else {
+        return Ok(0);
+    };
+    let Some(cursor) = decode_page_token(token) else {
+        return Err(PageEntryRefusal::Unissued);
+    };
+    if cursor.filter_fingerprint != query_fingerprint {
+        return Err(PageEntryRefusal::OtherQuery);
+    }
+    Ok(cursor.offset)
+}
+
 /// How many items one page of a paginated listing serves, from the caller's
 /// `maxResults`.
 ///

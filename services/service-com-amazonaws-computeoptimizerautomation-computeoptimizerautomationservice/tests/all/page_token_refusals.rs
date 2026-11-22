@@ -337,3 +337,215 @@ async fn a_minted_token_resumes_its_own_query_and_is_refused_by_any_other() {
         );
     }
 }
+
+/// The offsets a cursor can name, spanning the start of a walk, the first
+/// resumption, a position well into a sequence and one far past any page this
+/// service's fixtures mint.
+const CURSOR_OFFSETS: [usize; 4] = [0, 1, 7, 10_000];
+
+/// Token forms that are no cursor of this service: each satisfies the modelled
+/// `NextToken` pattern and reaches the handler, and none of them is the one
+/// spelling `state::encode_page_token` writes — text that is not hex, a single
+/// hex digit, an odd number of them, hex of bytes that are not text, hex of text
+/// without the cursor separator, and padding alone.
+const UNDECODABLE_TOKENS: [&str; 6] = [
+    "notatokenweissued",
+    "A",
+    "abc",
+    "deadbeef",
+    "30303030",
+    "==",
+];
+
+/// The member each paginated operation reports its page in, as that operation's
+/// `@paginated(items: …)` names it
+/// (`smithy_query(query="operation",operation="ListAccounts,ListAutomationEvents,ListAutomationEventSteps,ListAutomationEventSummaries,ListAutomationRules,ListAutomationRulePreview,ListAutomationRulePreviewSummaries,ListRecommendedActions,ListRecommendedActionSummaries")`).
+const PAGE_ITEMS: [(&str, &str); 9] = [
+    ("ListAccounts", "accounts"),
+    ("ListAutomationEvents", "automationEvents"),
+    ("ListAutomationEventSteps", "automationEventSteps"),
+    ("ListAutomationEventSummaries", "automationEventSummaries"),
+    ("ListAutomationRules", "automationRules"),
+    ("ListAutomationRulePreview", "previewResults"),
+    ("ListAutomationRulePreviewSummaries", "previewResultSummaries"),
+    ("ListRecommendedActions", "recommendedActions"),
+    ("ListRecommendedActionSummaries", "recommendedActionSummaries"),
+];
+
+/// The listings that report ONE aggregate row per selection, so their walk ends
+/// on its first page at any page size and mints no token: the offset arm of the
+/// rule below is driven by every OTHER paginated operation.
+const AGGREGATE_LISTINGS: [&str; 2] = [
+    "ListRecommendedActionSummaries",
+    "ListAutomationRulePreviewSummaries",
+];
+
+/// The items `body` reports under `member_name`.
+fn page_items(body: &Value, member_name: &str) -> Vec<Value> {
+    body.get(member_name)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The member the page of `operation` lands in, from the table above.
+fn page_items_member(operation: &str) -> &'static str {
+    PAGE_ITEMS
+        .iter()
+        .find(|(name, _)| *name == operation)
+        .map(|(_, member_name)| *member_name)
+        .unwrap_or_else(|| panic!("{operation:?} must have a paginated items member"))
+}
+
+/// The decision a paginated operation makes on the way INTO its walk, as the one
+/// rule every one of them enters through answers it: no token starts at the
+/// beginning, a token that is no cursor of this service is the token it never
+/// issued, a cursor taken for another walk cannot resume this one, and any other
+/// cursor names the offset the previous page stopped at.
+///
+/// Driven on the rule itself over a table of token forms and offsets, so the
+/// three outcomes are pinned where they are decided rather than only through the
+/// nine handlers that map them to their own wording.
+#[test]
+fn the_shared_page_entry_rule_answers_one_outcome_per_token_form() {
+    // Two fingerprints this service really mints, differing only in the
+    // operation that issued them, so "another query" below is a walk of this
+    // service and not an invented string.
+    let mine = state::page_fingerprint("ListAccounts", &());
+    let another = state::page_fingerprint("ListAutomationRules", &());
+
+    assert_eq!(
+        state::page_entry_offset(None, &mine),
+        Ok(0),
+        "case \"no token\": a request carrying no nextToken must start at the beginning"
+    );
+
+    for offset in CURSOR_OFFSETS {
+        let token = state::encode_page_token(&state::PageCursor {
+            offset,
+            filter_fingerprint: mine.clone(),
+        });
+        let entered = state::page_entry_offset(Some(&token), &mine);
+        assert_eq!(
+            entered,
+            Ok(offset),
+            "case \"own cursor at {offset}\": expected the cursor's offset {offset}, got \
+             {entered:?}"
+        );
+
+        let foreign = state::encode_page_token(&state::PageCursor {
+            offset,
+            filter_fingerprint: another.clone(),
+        });
+        let entered = state::page_entry_offset(Some(&foreign), &mine);
+        assert_eq!(
+            entered,
+            Err(state::PageEntryRefusal::OtherQuery),
+            "case \"cursor of another query at {offset}\": expected the other-query refusal, got \
+             {entered:?}"
+        );
+    }
+
+    for token in UNDECODABLE_TOKENS {
+        let entered = state::page_entry_offset(Some(token), &mine);
+        assert_eq!(
+            entered,
+            Err(state::PageEntryRefusal::Unissued),
+            "case {token:?}: expected the unissued-token refusal, got {entered:?}"
+        );
+    }
+}
+
+/// Every paginated operation of this service enters its walk through that one
+/// rule, each supplying only its own wording: over the wire, on all nine, a
+/// request with no token is served from the beginning, a token that does not
+/// decode is refused as one this operation never issued, a cursor taken for
+/// another query is refused with this operation's own requirement, and the
+/// cursor of a token a page really minted resumes after the items that page
+/// reported.
+#[tokio::test]
+async fn every_paginated_operation_enters_its_walk_through_the_shared_rule() {
+    let (router, event_id) = crate::shared_page_walk::emulator_with_a_fixture().await;
+    // A cursor that decodes but names a walk of no operation of this service, so
+    // every listing compares it against the fingerprint it would itself mint.
+    let foreign_query = state::encode_page_token(&state::PageCursor {
+        offset: 0,
+        filter_fingerprint: "nofingerprintofanyqueryofthisservice".to_string(),
+    });
+
+    for (operation, request, requirement) in paginated_operations(&event_id) {
+        let items_member = page_items_member(operation);
+
+        // No token: the walk starts at the beginning, and the fixture leaves
+        // every listing something to report there.
+        let case = format!("{operation}-no-token");
+        let whole = call_ok(&router, operation, &request, &case).await;
+        let served = page_items(&whole, items_member);
+        assert!(
+            !served.is_empty(),
+            "case {case:?}: a request with no nextToken must be served the first page of the \
+             walk, got {whole}"
+        );
+
+        // A token that is no cursor of this service: the refusal this operation
+        // words for a token it never issued.
+        for token in UNDECODABLE_TOKENS {
+            let case = format!("{operation}-undecodable-{token}");
+            assert_token_refused(
+                &router,
+                operation,
+                &request,
+                token,
+                &unissued_requirement(operation),
+                &case,
+            )
+            .await;
+        }
+
+        // A cursor taken for another walk: this operation's own requirement.
+        let case = format!("{operation}-cursor-of-another-query");
+        assert_token_refused(
+            &router,
+            operation,
+            &request,
+            &foreign_query,
+            requirement,
+            &case,
+        )
+        .await;
+
+        // The offset arm: a page of one item mints a cursor, and that cursor is
+        // where the walk resumes, so the resumed page reports items the first
+        // page did not.
+        let case = format!("{operation}-resumes-at-its-cursor");
+        let mut smallest_page = request.clone();
+        smallest_page["maxResults"] = json!(1);
+        let first = call_ok(&router, operation, &smallest_page, &case).await;
+        let minted = member(&first, "nextToken").as_str().map(str::to_string);
+        assert_eq!(
+            minted.is_some(),
+            !AGGREGATE_LISTINGS.contains(&operation),
+            "case {case:?}: a listing that reports more than one row must mint a token at a page \
+             of one and an aggregate listing must mint none, got {first}"
+        );
+        if let Some(token) = minted {
+            let mut resumed_request = smallest_page.clone();
+            resumed_request["nextToken"] = json!(token);
+            let (status, resumed) = call(&router, operation, &resumed_request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the query that minted the token must resume with it, got {status} \
+                 and {resumed}"
+            );
+            let (before, after) = (
+                page_items(&first, items_member),
+                page_items(&resumed, items_member),
+            );
+            assert_ne!(
+                after, before,
+                "case {case:?}: the cursor's offset is where the walk resumes, so the resumed \
+                 page must report items the first page did not; got {after:?} for both"
+            );
+        }
+    }
+}

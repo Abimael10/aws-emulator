@@ -214,21 +214,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::page_fingerprint`.
         let filter_fingerprint =
             crate::state::page_fingerprint(Self::NAME, &crate::state::canonical_filters(&filters));
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(unissued_token());
-                };
-                if cursor.filter_fingerprint != filter_fingerprint {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned for the same filters",
-                    )));
-                }
-                cursor.offset
-            }
-        };
+        // Where this call resumes, by the one rule every paginated operation of
+        // this service enters its walk under: `crate::state::page_entry_offset`.
+        // Only the WORDING of each refusal is this operation's own, because it
+        // names what the token had to have been taken for.
+        let offset =
+            crate::state::page_entry_offset(input.next_token.as_deref(), &filter_fingerprint)
+                .map_err(|refusal| match refusal {
+                    crate::state::PageEntryRefusal::Unissued => unissued_token(),
+                    crate::state::PageEntryRefusal::OtherQuery => {
+                        invalid_parameter(crate::state::constraint_report(
+                            "nextToken",
+                            "Member must be a token returned for the same filters",
+                        ))
+                    }
+                })?;
 
         // `maxResults` carries a member `@range` of min 1 / max 100
         // (`smithy_query(query="shape",shape="ListRecommendedActionSummariesRequest")`),

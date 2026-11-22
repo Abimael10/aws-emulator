@@ -178,19 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty query is what every other listing's filters and window are to
         // `crate::state::page_fingerprint` — there is nothing else to bind.
         let query_fingerprint = crate::state::page_fingerprint(Self::NAME, &());
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(token) {
-                // A token this listing never issued, whichever way it fails to be
-                // one: it decodes to no cursor at all (every spelling but the one
-                // `crate::state::encode_page_token` writes), it carries a cursor
-                // taken for another walk, or — below, where the sequence is known
-                // — it names a position no page of this listing ever stopped at.
-                // One refusal, worded once.
-                Some(cursor) if cursor.filter_fingerprint == query_fingerprint => cursor.offset,
-                _ => return Err(unissued_token()),
-            },
-        };
+        // Where this call resumes, by the one rule every paginated operation of
+        // this service enters its walk under: `crate::state::page_entry_offset`.
+        // Both refusals it answers are ONE refusal here — a token this listing
+        // never issued, whichever way it fails to be one: it decodes to no
+        // cursor at all (every spelling but the one
+        // `crate::state::encode_page_token` writes), it carries a cursor taken
+        // for another walk, or — below, where the sequence is known — it names a
+        // position no page of this listing ever stopped at. One refusal, worded
+        // once, because this listing takes no query a token could have been
+        // taken for a different value of.
+        let offset =
+            crate::state::page_entry_offset(input.next_token.as_deref(), &query_fingerprint)
+                .map_err(|_| unissued_token())?;
 
         // The model bounds this operation's `maxResults` at 1..=1000, so a
         // caller may ask for a page larger than the default this service serves
