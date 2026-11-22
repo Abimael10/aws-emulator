@@ -292,7 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ApplyGuardrailOutput {
             action: verdict.action.to_string(),
-            action_reason: verdict.action_reason,
+            // WHICH action was taken, beside the action itself: blocking and masking
+            // are both reported as an intervention, so this is the only member that
+            // tells them apart — and it is reported on the no-action verdict too.
+            action_reason: Some(verdict.action_reason.to_string()),
             // ONE assessment: this call applies one guardrail revision to one
             // submission, so there is one verdict to report.
             assessments: vec![verdict.assessment],

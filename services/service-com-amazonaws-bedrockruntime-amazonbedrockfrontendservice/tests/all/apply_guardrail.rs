@@ -1428,3 +1428,228 @@ async fn the_same_reference_is_served_once_its_revision_is_published() {
         );
     }
 }
+
+/// One verdict an apply reaches: the revision applied, the submission, and what the
+/// response must say the evaluation DID.
+struct ReasonRow {
+    case: &'static str,
+    policies: GuardrailPolicies,
+    /// `GuardrailContentSource` — which side the content is submitted as.
+    source: &'static str,
+    text: &'static str,
+    /// `outputScope`, where the row asks for one.
+    scope: Option<&'static str>,
+    expected_action: &'static str,
+    expected_reason: &'static str,
+}
+
+/// RULE: `actionReason` states WHICH of the three things an evaluation can do was
+/// done — the content was blocked, the values it matched were masked, or nothing was
+/// done — and is reported on every verdict, so a masking intervention is told from a
+/// blocking one, which `action` alone cannot do: both are reported under the one
+/// `GUARDRAIL_INTERVENED` value.
+///
+/// The rows differ along which policy reached the verdict, what the matched entry is
+/// configured to DO, the side the content is submitted on, whether anything was
+/// placed at all, and the output scope asked for.
+#[tokio::test]
+async fn the_action_reason_states_which_action_the_evaluation_took() {
+    const EMAIL_TEXT: &str = "Write to dana.reed@example.com about the order.";
+    const NOTHING_PLACED: &str = "What time does the library open?";
+    let email = |action| PiiEntry {
+        entity_type: "EMAIL".to_string(),
+        sides: Sides::both(action),
+    };
+    let word = |action| WordEntry {
+        text: "zephyrine".to_string(),
+        sides: Sides::both(action),
+    };
+    let topic = || DeniedTopic {
+        name: "Fiduciary Advice".to_string(),
+        kind: TOPIC_TYPE_DENY.to_string(),
+        definition: "Guidance on managing money that belongs to someone else.".to_string(),
+        examples: vec!["Where should I invest my savings?".to_string()],
+        sides: Sides::both(PolicyAction::Block),
+    };
+
+    let rows: Vec<ReasonRow> = vec![
+        ReasonRow {
+            case: "a word entry that blocks, on the input side",
+            policies: GuardrailPolicies {
+                words: vec![word(PolicyAction::Block)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: "please describe zephyrine for me",
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail blocked.",
+        },
+        ReasonRow {
+            case: "a denied topic that blocks, on the input side",
+            policies: GuardrailPolicies {
+                topics: vec![topic()],
+                ..revision()
+            },
+            source: "INPUT",
+            text: "Can you give me fiduciary advice?",
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail blocked.",
+        },
+        ReasonRow {
+            case: "a sensitive-information entry that blocks, on the output side",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Block)],
+                ..revision()
+            },
+            source: "OUTPUT",
+            text: EMAIL_TEXT,
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail blocked.",
+        },
+        ReasonRow {
+            case: "a sensitive-information entry that masks, on the output side",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Anonymize)],
+                ..revision()
+            },
+            source: "OUTPUT",
+            text: EMAIL_TEXT,
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail masked.",
+        },
+        ReasonRow {
+            case: "a sensitive-information entry that masks, on the input side",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Anonymize)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: EMAIL_TEXT,
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail masked.",
+        },
+        ReasonRow {
+            case: "a regular expression that masks",
+            policies: GuardrailPolicies {
+                regexes: vec![RegexEntry {
+                    name: "OrderId".to_string(),
+                    pattern: "ORD-[0-9]{4}".to_string(),
+                    sides: Sides::both(PolicyAction::Anonymize),
+                }],
+                ..revision()
+            },
+            source: "INPUT",
+            text: "Please cancel ORD-4417 today.",
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail masked.",
+        },
+        ReasonRow {
+            case: "an entry that blocks beside one that masks",
+            policies: GuardrailPolicies {
+                words: vec![word(PolicyAction::Block)],
+                pii_entities: vec![email(PolicyAction::Anonymize)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: "Write to dana.reed@example.com about zephyrine.",
+            scope: None,
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail blocked.",
+        },
+        ReasonRow {
+            case: "an entry that only reports the placement",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Detect)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: EMAIL_TEXT,
+            scope: None,
+            expected_action: "NONE",
+            expected_reason: "No action.",
+        },
+        ReasonRow {
+            case: "a blocking policy that placed nothing",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Block)],
+                words: vec![word(PolicyAction::Block)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: NOTHING_PLACED,
+            scope: None,
+            expected_action: "NONE",
+            expected_reason: "No action.",
+        },
+        ReasonRow {
+            case: "a revision configuring no policy at all",
+            policies: revision(),
+            source: "OUTPUT",
+            text: NOTHING_PLACED,
+            scope: None,
+            expected_action: "NONE",
+            expected_reason: "No action.",
+        },
+        ReasonRow {
+            case: "nothing placed, the full output scope asked for",
+            policies: GuardrailPolicies {
+                topics: vec![topic()],
+                pii_entities: vec![email(PolicyAction::Block)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: NOTHING_PLACED,
+            scope: Some("FULL"),
+            expected_action: "NONE",
+            expected_reason: "No action.",
+        },
+        ReasonRow {
+            case: "masked, the full output scope asked for",
+            policies: GuardrailPolicies {
+                pii_entities: vec![email(PolicyAction::Anonymize)],
+                ..revision()
+            },
+            source: "INPUT",
+            text: EMAIL_TEXT,
+            scope: Some("FULL"),
+            expected_action: "GUARDRAIL_INTERVENED",
+            expected_reason: "Guardrail masked.",
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let (engine, router) = emulator_with_engine();
+        publish(&engine, row.policies.clone());
+
+        let call = apply(
+            &router,
+            GUARDRAIL_ID,
+            DRAFT_VERSION,
+            &text_body(row.source, row.text, row.scope),
+        )
+        .await;
+        ok(case, &call);
+        let actual_action = action_of(&call);
+        assert_eq!(
+            actual_action, row.expected_action,
+            "case {case:?}: expected action {:?}, got {actual_action:?} in {}",
+            row.expected_action,
+            call.json()
+        );
+        let actual_reason = call.json()["actionReason"].as_str().map(str::to_string);
+        assert_eq!(
+            actual_reason.as_deref(),
+            Some(row.expected_reason),
+            "case {case:?}: expected actionReason {:?}, got {actual_reason:?} in {}",
+            row.expected_reason,
+            call.json()
+        );
+    }
+}

@@ -655,6 +655,16 @@ async fn an_input_side_denied_topic_refuses_the_turn_before_the_model_is_invoked
             "case {case:?}: expected the input assessment to carry {expected_entry:?}, got \
              {placed:?} in {input}"
         );
+        // WHICH action the guardrail took, beside the assessment it took it on: the
+        // trace reports it from the same verdict the apply surface reports it from.
+        let reason = body["trace"]["guardrail"]["actionReason"].as_str();
+        assert_eq!(
+            reason,
+            Some("Guardrail blocked."),
+            "case {case:?}: a blocked turn's trace must say the content was blocked, got \
+             {reason:?} in {}",
+            body["trace"]
+        );
         let details = &input["appliedGuardrailDetails"];
         assert_eq!(
             (
@@ -688,6 +698,14 @@ async fn an_input_side_denied_topic_refuses_the_turn_before_the_model_is_invoked
              got {output_tokens:?}"
         );
         let control_input = &control_body["trace"]["guardrail"]["inputAssessment"][GUARDRAIL_ID];
+        let control_reason = control_body["trace"]["guardrail"]["actionReason"].as_str();
+        assert_eq!(
+            control_reason,
+            Some("No action."),
+            "case {case:?}: a turn the guardrail acted on in nothing says so, got \
+             {control_reason:?} in {}",
+            control_body["trace"]
+        );
         let control_placed = assessed_topics(control_input);
         assert!(
             control_placed

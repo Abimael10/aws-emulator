@@ -112,12 +112,16 @@ pub const GUARDRAIL_ORIGIN_REQUEST: &str = "REQUEST";
 /// apply are the ones this account holds.
 pub const GUARDRAIL_OWNERSHIP_SELF: &str = "SELF";
 
-/// What `actionReason` says of content a guardrail BLOCKED.
+/// What `actionReason` says of each action an evaluation can take.
 ///
-/// Amazon Bedrock states the reason for the action it took in one sentence naming
-/// that action; a call the guardrail only masked, or only placed detections in,
-/// blocked nothing and carries no reason at all.
+/// Amazon Bedrock states the reason for the action it took in one fixed sentence
+/// naming that action, and states it on every verdict: the three actions an
+/// evaluation can reach — the content was blocked, the values it matched were masked,
+/// or nothing was done — are told apart by this member alone, since blocking and
+/// masking are both reported under the one intervened action.
 pub const ACTION_REASON_BLOCKED: &str = "Guardrail blocked.";
+pub const ACTION_REASON_MASKED: &str = "Guardrail masked.";
+pub const ACTION_REASON_NONE: &str = "No action.";
 
 /// The most entries of one policy an evaluation reports.
 ///
@@ -282,8 +286,12 @@ pub struct Verdict {
     /// Whether an entry that BLOCKS matched, which is what the blocked messaging is
     /// answered for.
     pub blocked: bool,
-    /// `actionReason` — set only for content that was blocked.
-    pub action_reason: Option<String>,
+    /// `actionReason` — which of the three actions this evaluation took, in the
+    /// service's own wording for it ([`ACTION_REASON_BLOCKED`],
+    /// [`ACTION_REASON_MASKED`], [`ACTION_REASON_NONE`]). Reported on every verdict,
+    /// so a caller tells a masking intervention from a blocking one without
+    /// re-deriving the verdict from the assessment.
+    pub action_reason: &'static str,
     /// The assessment, cut to the scope the request asked for.
     pub assessment: GuardrailAssessment,
     /// `outputs` — the text the guardrail answers with: the blocked messaging for
@@ -421,7 +429,11 @@ pub fn apply(
             ACTION_NONE
         },
         blocked,
-        action_reason: blocked.then(|| ACTION_REASON_BLOCKED.to_string()),
+        action_reason: match (blocked, anonymized) {
+            (true, _) => ACTION_REASON_BLOCKED,
+            (false, true) => ACTION_REASON_MASKED,
+            (false, false) => ACTION_REASON_NONE,
+        },
         assessment,
         outputs,
         usage,
@@ -1395,7 +1407,7 @@ pub fn guard_turn(
                 on_input.assessment.clone(),
             )])),
             output_assessments: None,
-            action_reason: on_input.action_reason.clone(),
+            action_reason: Some(on_input.action_reason.to_string()),
         });
         return (
             turn.intervened(policies.blocked_messaging(true), true),
@@ -1429,7 +1441,7 @@ pub fn guard_turn(
             applied.id.clone(),
             vec![on_output.assessment.clone()],
         )])),
-        action_reason: on_output.action_reason.clone(),
+        action_reason: Some(on_output.action_reason.to_string()),
     });
 
     if on_output.blocked {
