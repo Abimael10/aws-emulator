@@ -57,7 +57,14 @@ use crate::rds_docdb_neptune_signing_name_routing::authorization;
 
 /// The Region every request here is signed for, and so the Region the estate belongs to. It is
 /// the Region [`authorization`] signs for.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` here, and for the helpers below, because a sibling suite deploys the SAME estate
+/// over the same five services and holds it to a different rule — what each of its resources
+/// SETTLES in ([`crate::cloudformation_estate_listener_settles_on_its_create`]) rather than what
+/// its outputs resolve to. One router, one wire, one Region, called twice, rather than a second
+/// copy that can drift from this one: a suite signing for one Region and writing its subnets'
+/// Availability Zones for another asserts nothing about either.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The API versions the query protocols of the three query-wire services carry.
 const CFN_VERSION: &str = "2010-05-15";
@@ -89,7 +96,7 @@ const LOOK_AGAIN: Duration = Duration::from_millis(100);
 /// `core/router/src/lib.rs` mounts them: the stack really creates its network in Amazon EC2, its
 /// load balancer in Elastic Load Balancing, its domain in Amazon OpenSearch Service and its
 /// alarm in CloudWatch.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -167,7 +174,7 @@ async fn send(
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, &str)],
@@ -197,7 +204,7 @@ async fn ec2(
 }
 
 /// Drive one Elastic Load Balancing v2 action that must succeed, and answer its body.
-async fn elbv2(
+pub(crate) async fn elbv2(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -253,7 +260,11 @@ async fn cloudwatch(
 
 /// `DescribeDomain` on Amazon OpenSearch Service's own `restJson1` wire: the `DomainStatus` that
 /// service publishes for the domain the stack created.
-async fn describe_domain(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+pub(crate) async fn describe_domain(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Value {
     let request = http::Request::builder()
         .method("GET")
         .uri(format!("{OPENSEARCH_DOMAIN_URI}/{name}"))
@@ -293,7 +304,7 @@ fn is_settled(described: &str) -> bool {
 /// that observation. Nothing sleeps inside a handler: each poll collects what the clock already
 /// owed. The wait is for the CONDITION, bounded only so a hang is a reported failure rather than
 /// a test that never ends.
-async fn settle_stack(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
+pub(crate) async fn settle_stack(router: &MultiServiceRouter, case: &str, stack: &str) -> String {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     let mut last = String::new();
     while Instant::now() < deadline {
@@ -315,7 +326,7 @@ async fn settle_stack(router: &MultiServiceRouter, case: &str, stack: &str) -> S
 /// Every `ResourceStatusReason` the stack's events carry — where an owning service's own refusal
 /// of a resource is reported, which is what a deployment that did not complete must be quoted
 /// with.
-async fn resource_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
+pub(crate) async fn resource_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
     let (_, events) = cloudformation(router, "DescribeStackEvents", &[("StackName", stack)]).await;
     elements(&events, "ResourceStatusReason")
 }
@@ -784,7 +795,7 @@ fn tier_in_force(row: &Row) -> &str {
 
 /// One output's value, which must be there: an `OutputKey` with no `OutputValue` beside it is
 /// exactly what the standard `{o["OutputKey"]: o["OutputValue"]}` read raises on.
-fn output<'a>(outputs: &'a BTreeMap<String, String>, case: &str, key: &str) -> &'a str {
+pub(crate) fn output<'a>(outputs: &'a BTreeMap<String, String>, case: &str, key: &str) -> &'a str {
     outputs
         .get(key)
         .map(String::as_str)
