@@ -1962,3 +1962,231 @@ async fn leaving_the_capacity_status_free_admits_every_status_the_catalog_prices
         }
     }
 }
+
+/// The operating system whose hour carries no platform licence, as the published
+/// `operatingSystem` value set names it
+/// (`GetAttributeValues(AmazonEC2, operatingSystem)`) — the baseline a licensed
+/// platform's rate is compared against.
+const UNLICENSED_PLATFORM: &str = "Linux";
+
+/// The page sizes a per-group price lookup asks a `GetProducts` query for.
+///
+/// `GetProducts$MaxResults` is modelled `range 1..100`, so the rows are both published
+/// bounds, two sizes between them, and the request that names none at all — which the
+/// operation documents as the default page of 100.
+const REQUESTED_PAGE_SIZES: &[Option<i64>] = &[Some(1), Some(2), Some(50), Some(100), None];
+
+/// The whole `TERM_MATCH` filter set a price lookup sends for one on-demand compute
+/// group: the in-use shared attributes that identify the SKU, plus the `licenseModel` of
+/// an instance that brings no licence of its own.
+fn whole_on_demand_lookup<'a>(
+    instance_type: &'a str,
+    operating_system: &'a str,
+    location: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    let mut pinned = in_use_lookup(instance_type, operating_system, location);
+    pinned.push(("licenseModel", NO_LICENSE_REQUIRED));
+    pinned
+}
+
+/// The hourly USD on-demand rate of one offer document, read the way a cost-estimation
+/// client reads it: the single `OnDemand` term's single price dimension, which prices an
+/// hour of the instance.
+fn on_demand_hourly_rate(document: &Value, case: &str) -> f64 {
+    let on_demand = terms_of(document, "OnDemand");
+    assert_eq!(
+        on_demand.len(),
+        1,
+        "case {case}: an instance hour is offered on demand once, got {on_demand:?}"
+    );
+    let dimensions = dimensions_of(&on_demand[0].1);
+    assert_eq!(
+        dimensions.len(),
+        1,
+        "case {case}: the on-demand term prices one dimension, got {dimensions:?}"
+    );
+    assert_eq!(
+        dimensions[0].1.get("unit").and_then(Value::as_str),
+        Some("Hrs"),
+        "case {case}: on-demand instance usage is priced per hour, got {:?}",
+        dimensions[0].1
+    );
+    let rate = dimension_rate(&dimensions[0].1);
+    let parsed = rate
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("case {case}: expected a USD rate that parses, got {rate:?}"));
+    assert!(
+        parsed > 0.0,
+        "case {case}: expected a positive USD on-demand rate, got {parsed}"
+    );
+    parsed
+}
+
+/// One price lookup: the SKU the whole on-demand filter set resolves and its hourly USD
+/// rate, at the page size the request asks for.
+async fn priced_on_demand_group(
+    router: &MultiServiceRouter,
+    instance_type: &str,
+    operating_system: &str,
+    location: &str,
+    max_results: Option<i64>,
+) -> (String, f64) {
+    let case = format!(
+        "{location}/{instance_type}/{operating_system}/MaxResults={}",
+        max_results.map_or_else(|| "unset".to_string(), |max| max.to_string())
+    );
+    let mut body = json!({
+        "ServiceCode": "AmazonEC2",
+        "Filters": term_matches(&whole_on_demand_lookup(
+            instance_type,
+            operating_system,
+            location,
+        )),
+    });
+    if let Some(max) = max_results {
+        body["MaxResults"] = Value::from(max);
+    }
+    let response = ok(router, "GetProducts", &body).await;
+    let documents = offer_documents(&response);
+    assert_eq!(
+        documents.len(),
+        1,
+        "case {case}: the lookup must resolve exactly one priced SKU, got {:?}",
+        product_skus(&response)
+    );
+    assert!(
+        response.get("NextToken").is_none_or(Value::is_null),
+        "case {case}: a one-product answer carries no NextToken, got {response}"
+    );
+    (
+        product_sku(&documents[0]),
+        on_demand_hourly_rate(&documents[0], &case),
+    )
+}
+
+#[tokio::test]
+async fn the_requested_page_size_does_not_change_the_sku_a_price_lookup_resolves() {
+    let router = router();
+
+    let operating_systems = published_operating_systems(&router).await;
+    assert!(
+        operating_systems.contains(&UNLICENSED_PLATFORM.to_string()),
+        "the published platforms must carry the unlicensed one, got {operating_systems:?}"
+    );
+
+    // Rows: the published (Region, instance type) pairs, every operating system the
+    // catalog prices them under, and every page size a lookup asks for — a lookup whose
+    // matched set fits in one product must answer with it whatever page it requested.
+    for (location, instance_type) in COVERAGE_ROWS.iter().copied() {
+        for operating_system in &operating_systems {
+            let case = format!("{location}/{instance_type}/{operating_system}");
+            let mut resolved: BTreeSet<String> = BTreeSet::new();
+            for max_results in REQUESTED_PAGE_SIZES.iter().copied() {
+                let (sku, rate) = priced_on_demand_group(
+                    &router,
+                    instance_type,
+                    operating_system,
+                    location,
+                    max_results,
+                )
+                .await;
+                resolved.insert(format!("{sku}@{rate}"));
+            }
+            assert_eq!(
+                resolved.len(),
+                1,
+                "case {case}: every requested page size must resolve the same priced SKU, \
+                 got {resolved:?}"
+            );
+        }
+    }
+}
+
+/// The groups of a mixed-OS fleet, as a cost estimate groups running instances by
+/// (instance type, platform) with the number of instances in each group.
+///
+/// The rows differ in instance family, size, platform and count, so the estimate is read
+/// off more than one group shape, and both platforms the catalog prices carry more than
+/// one row.
+const FLEET_GROUPS: &[(&str, &str, u32)] = &[
+    ("t3.micro", "Linux", 1),
+    ("t3.micro", "Windows", 1),
+    ("t3.nano", "Linux", 2),
+    ("m5.large", "Windows", 3),
+    ("c5.large", "Linux", 7),
+    ("m5.xlarge", "Windows", 1),
+];
+
+#[tokio::test]
+async fn every_platform_group_of_a_mixed_fleet_prices_above_zero() {
+    let router = router();
+
+    // Rows: three published Regions, so the estimate is read off more than the one a
+    // client pins its pricing endpoint to.
+    for location in [
+        "US West (Oregon)",
+        "US East (N. Virginia)",
+        "Asia Pacific (Tokyo)",
+    ] {
+        let mut estimate = 0.0f64;
+        let mut unlicensed_estimate = 0.0f64;
+        let mut skus: BTreeSet<String> = BTreeSet::new();
+
+        for (instance_type, operating_system, count) in FLEET_GROUPS.iter().copied() {
+            let case = format!("{location}/{count}x {instance_type} {operating_system}");
+            // The page a per-group lookup asks for is the smallest the model admits: one
+            // product is all it needs.
+            let (sku, rate) =
+                priced_on_demand_group(&router, instance_type, operating_system, location, Some(1))
+                    .await;
+            let group_rate = rate * f64::from(count);
+            assert!(
+                group_rate > 0.0,
+                "case {case}: a priced group must contribute above zero, got {group_rate}"
+            );
+            skus.insert(sku.clone());
+            estimate += group_rate;
+
+            // The same hardware under the platform that carries no licence: the baseline
+            // the group's own rate is compared against.
+            let (unlicensed_sku, unlicensed_rate) = priced_on_demand_group(
+                &router,
+                instance_type,
+                UNLICENSED_PLATFORM,
+                location,
+                Some(1),
+            )
+            .await;
+            unlicensed_estimate += unlicensed_rate * f64::from(count);
+            if operating_system == UNLICENSED_PLATFORM {
+                assert_eq!(
+                    unlicensed_sku, sku,
+                    "case {case}: the unlicensed lookup is this group's own SKU"
+                );
+                continue;
+            }
+            // A licensed platform's hour is a product of its own, priced above the hour
+            // of the same hardware that carries no licence.
+            assert!(
+                rate > unlicensed_rate,
+                "case {case}: a licensed platform's rate must exceed the unlicensed \
+                 {unlicensed_rate}, got {rate}"
+            );
+            assert_ne!(
+                unlicensed_sku, sku,
+                "case {case}: a licensed platform publishes its own SKU"
+            );
+        }
+
+        assert_eq!(
+            skus.len(),
+            FLEET_GROUPS.len(),
+            "case {location}: each group must resolve a SKU of its own, got {skus:?}"
+        );
+        assert!(
+            estimate > unlicensed_estimate,
+            "case {location}: the licensed groups must raise the estimate above the \
+             all-unlicensed {unlicensed_estimate}, got {estimate}"
+        );
+    }
+}
