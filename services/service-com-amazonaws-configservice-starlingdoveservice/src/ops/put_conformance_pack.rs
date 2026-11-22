@@ -47,6 +47,22 @@
 //! is not read here: this handler cannot see either store, so rather than deploy a pack
 //! from a template it never read it answers the scaffold's 501 for those two legs alone.
 //!
+//! ## The values the template is deployed WITH
+//!
+//! A conformance pack is deployed as a CloudFormation stack, and the request's
+//! `ConformancePackInputParameters` are that stack's parameter values ("input parameters
+//! in the form of key-value pairs for the conformance pack",
+//! `ConformancePackInputParameter`). So every reference the template makes to one of its
+//! own parameters RESOLVES — to the value the request gave that parameter, or, where the
+//! request gave none, to the `Default` the template declares for it
+//! ([`resolve_parameter_references`]) — before the deployment reads what the template
+//! declares. A pack whose template scopes a rule to one resource through a parameter
+//! therefore deploys a rule scoped to that resource, rather than one scoped to the
+//! parameter's own name. A reference nothing resolves is left as the reference it is, so
+//! the member it stands in for carries no value rather than a made-up one. The pack's
+//! STORED template body is what was sent, byte for byte: resolving is how the declarations
+//! are READ, not a rewrite of the template.
+//!
 //! ## What a deployment here does
 //!
 //! The deployment CREATES what the template declares: each `AWS::Config::ConfigRule` is
@@ -483,8 +499,18 @@ struct DeclaredRemediation {
 /// IS one, declaring a resource of a type a conformance pack does not deploy, is refused
 /// with the errors Config's own conformance pack validation found in it
 /// ([`invalid_conformance_pack_template_message`]). Neither carries any part of the body.
-fn read_conformance_pack_template(body: &str) -> Result<Vec<DeclaredResource>, String> {
-    let Some(::serde_json::Value::Object(template)) = read_template(body) else {
+fn read_conformance_pack_template(
+    body: &str,
+    input_parameters: &[ConformancePackInputParameter],
+) -> Result<Vec<DeclaredResource>, String> {
+    let Some(mut read) = read_template(body) else {
+        return Err(INVALID_TEMPLATE_MESSAGE.to_string());
+    };
+    // The template is deployed WITH the values the request gave its parameters, so every
+    // reference to one resolves before the declarations below are read.
+    let parameters = resolved_template_parameters(&read, input_parameters);
+    resolve_parameter_references(&mut read, &parameters);
+    let ::serde_json::Value::Object(template) = read else {
         return Err(INVALID_TEMPLATE_MESSAGE.to_string());
     };
     let Some(::serde_json::Value::Object(resources)) = template.get(TEMPLATE_RESOURCES_SECTION)
@@ -724,12 +750,22 @@ fn remediation_parameter(value: &::serde_json::Value) -> RemediationParameterVal
 /// about — a resource's `Type` — is a string in every template. An ALIAS is refused rather
 /// than expanded, because an alias is how a few hundred bytes of YAML turn into gigabytes,
 /// and nothing in a conformance pack template needs one.
+/// A node a YAML template tags with an intrinsic function's SHORT form is read as the
+/// LONG form the same template written as JSON spells ([`long_form`]), so a declaration
+/// reads the same whichever of the two forms its author wrote: `!Ref Name` is the node
+/// `{"Ref": "Name"}`, which is what [`resolve_parameter_references`] resolves.
 fn read_template(body: &str) -> Option<::serde_json::Value> {
     use ::serde_json::{Map, Value};
 
     enum Frame {
-        Sequence(Vec<Value>),
+        Sequence {
+            /// The intrinsic function this node's own tag names, where it names one.
+            tag: Option<&'static str>,
+            items: Vec<Value>,
+        },
         Mapping {
+            /// See [`Frame::Sequence`].
+            tag: Option<&'static str>,
             entries: Map<String, Value>,
             pending_key: Option<String>,
         },
@@ -761,10 +797,11 @@ fn read_template(body: &str) -> Option<::serde_json::Value> {
                 return;
             };
             match frame {
-                Frame::Sequence(items) => items.push(node),
+                Frame::Sequence { items, .. } => items.push(node),
                 Frame::Mapping {
                     entries,
                     pending_key,
+                    ..
                 } => match pending_key.take() {
                     // A mapping key is a scalar; a template keys no section by a list or
                     // a map, and this reader invents no spelling for one.
@@ -792,9 +829,13 @@ fn read_template(body: &str) -> Option<::serde_json::Value> {
                 self.refused = true;
                 return;
             };
-            let node = match frame {
-                Frame::Sequence(items) => Value::Array(items),
-                Frame::Mapping { entries, .. } => Value::Object(entries),
+            let (tag, node) = match frame {
+                Frame::Sequence { tag, items } => (tag, Value::Array(items)),
+                Frame::Mapping { tag, entries, .. } => (tag, Value::Object(entries)),
+            };
+            let node = match tag {
+                Some(name) => long_form(name, node),
+                None => node,
             };
             self.place(node);
         }
@@ -807,9 +848,20 @@ fn read_template(body: &str) -> Option<::serde_json::Value> {
                 return;
             }
             match event {
-                Event::Scalar(value, _style, _anchor, _tag) => self.place(Value::String(value)),
-                Event::SequenceStart(_anchor, _tag) => self.open_frame(Frame::Sequence(Vec::new())),
-                Event::MappingStart(_anchor, _tag) => self.open_frame(Frame::Mapping {
+                Event::Scalar(value, _style, _anchor, tag) => {
+                    let node = Value::String(value);
+                    let node = match short_form_tag(tag.as_ref()) {
+                        Some(name) => long_form(name, node),
+                        None => node,
+                    };
+                    self.place(node);
+                }
+                Event::SequenceStart(_anchor, tag) => self.open_frame(Frame::Sequence {
+                    tag: short_form_tag(tag.as_ref()),
+                    items: Vec::new(),
+                }),
+                Event::MappingStart(_anchor, tag) => self.open_frame(Frame::Mapping {
+                    tag: short_form_tag(tag.as_ref()),
                     entries: Map::new(),
                     pending_key: None,
                 }),
@@ -829,6 +881,265 @@ fn read_template(body: &str) -> Option<::serde_json::Value> {
         return None;
     }
     reader.root
+}
+
+/// Every intrinsic function a YAML template may write in its SHORT form, as the name that
+/// form tags a node with.
+///
+/// Source: the CloudFormation "Intrinsic function reference" and "Condition functions",
+/// which give each function's name and its short form; a conformance pack template is a
+/// CloudFormation template, so it is written in that language. The sibling reading of
+/// CloudFormation's own templates names the same set
+/// (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs`).
+const SHORT_FORM_FUNCTIONS: [&str; 20] = [
+    "And",
+    "Base64",
+    "Cidr",
+    "Condition",
+    "Equals",
+    "FindInMap",
+    "GetAZs",
+    "GetAtt",
+    "If",
+    "ImportValue",
+    "Join",
+    "Length",
+    "Not",
+    "Or",
+    "Ref",
+    "Select",
+    "Split",
+    "Sub",
+    "ToJsonString",
+    "Transform",
+];
+
+/// The intrinsic function a YAML tag names, when it names one.
+///
+/// A short form is a LOCAL tag (handle `!`) whose suffix is the function's own name:
+/// `!Ref`, `!Sub`, `!GetAtt`, … A standard YAML tag (`!!str`, whose handle is `!!`) names
+/// no function, and neither does a local tag whose suffix is not one of
+/// [`SHORT_FORM_FUNCTIONS`] — such a node is read as the scalar or collection it is.
+fn short_form_tag(tag: Option<&::yaml_rust2::parser::Tag>) -> Option<&'static str> {
+    let tag = tag?;
+    if tag.handle != "!" {
+        return None;
+    }
+    SHORT_FORM_FUNCTIONS
+        .into_iter()
+        .find(|name| *name == tag.suffix)
+}
+
+/// One short-form intrinsic as the LONG form a template written as JSON spells: `!Ref x`
+/// is `{"Ref": "x"}`, `!Condition c` is `{"Condition": "c"}`, and every other function is
+/// `{"Fn::<Name>": …}`.
+fn long_form(name: &str, node: ::serde_json::Value) -> ::serde_json::Value {
+    let key = match name {
+        REF_FUNCTION | CONDITION_FUNCTION => name.to_string(),
+        other => format!("{FUNCTION_PREFIX}{other}"),
+    };
+    let mut wrapper = ::serde_json::Map::new();
+    wrapper.insert(key, node);
+    ::serde_json::Value::Object(wrapper)
+}
+
+/// The section of a template that declares the parameters the deployment supplies values
+/// for, and the member of one declared parameter that gives the value to use when the
+/// deployment supplies none. Both are CloudFormation's own spelling.
+const TEMPLATE_PARAMETERS_SECTION: &str = "Parameters";
+/// See [`TEMPLATE_PARAMETERS_SECTION`].
+const TEMPLATE_PARAMETER_DEFAULT_MEMBER: &str = "Default";
+
+/// The intrinsic function that stands for the value of what it names ("Ref returns the
+/// value of the specified parameter or resource"), the one that names a condition, and the
+/// prefix every other intrinsic function's long-form name carries.
+const REF_FUNCTION: &str = "Ref";
+/// See [`REF_FUNCTION`].
+const CONDITION_FUNCTION: &str = "Condition";
+/// See [`REF_FUNCTION`].
+const FUNCTION_PREFIX: &str = "Fn::";
+/// The intrinsic function that substitutes values into a string, which is the other place
+/// a template names a parameter.
+const SUB_FUNCTION: &str = "Fn::Sub";
+
+/// The value each of the deployed template's parameters stands for: the value the request
+/// gave it ("input parameters in the form of key-value pairs for the conformance pack",
+/// `ConformancePackInputParameter`), or — for a parameter the request named no value for —
+/// the `Default` the template itself declares, which is what a stack is deployed with when
+/// a parameter is not supplied.
+///
+/// A parameter the request names that the template does not declare is kept all the same:
+/// what a reference resolves to is the value given for the name it names, and this reading
+/// does not make the template's parameter section the gatekeeper of that.
+fn resolved_template_parameters(
+    template: &::serde_json::Value,
+    supplied: &[ConformancePackInputParameter],
+) -> ::std::collections::BTreeMap<String, String> {
+    let mut parameters: ::std::collections::BTreeMap<String, String> = template
+        .get(TEMPLATE_PARAMETERS_SECTION)
+        .and_then(::serde_json::Value::as_object)
+        .map(|declared| {
+            declared
+                .iter()
+                .filter_map(|(name, parameter)| {
+                    Some((
+                        name.clone(),
+                        parameter
+                            .get(TEMPLATE_PARAMETER_DEFAULT_MEMBER)?
+                            .as_str()?
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for parameter in supplied {
+        parameters.insert(
+            parameter.parameter_name.clone(),
+            parameter.parameter_value.clone(),
+        );
+    }
+    parameters
+}
+
+/// Replace every reference to a template parameter in `node` by the value that parameter
+/// stands for ([`resolved_template_parameters`]), in place and everywhere in the tree.
+///
+/// A reference is the intrinsic node CloudFormation writes it as — `{"Ref": "<name>"}`, or
+/// an `Fn::Sub` string naming parameters as `${<name>}` — so a template is resolved
+/// wherever it names a parameter rather than only in the members this deployment happens
+/// to read. A reference nothing resolves (a parameter the request gave no value for and
+/// the template declares no default for, a pseudo parameter, a reference to a resource) is
+/// LEFT AS IT IS: the declaration then carries no value for that member, which is what
+/// keeps a deployment from inventing one.
+///
+/// Both of the ways this could grow with the request are bounded. The recursion walks the
+/// tree the reader built, which nests at most [`MAX_TEMPLATE_DEPTH`] levels and carries at
+/// most [`MAX_TEMPLATE_NODES`] nodes; and what the pass SUBSTITUTES across the whole tree
+/// is capped at [`MAX_SUBSTITUTED_CHARS`], so the product of the references a body carries
+/// and the length of the values they stand for cannot grow the resolved tree without end.
+fn resolve_parameter_references(
+    node: &mut ::serde_json::Value,
+    parameters: &::std::collections::BTreeMap<String, String>,
+) {
+    let mut budget = MAX_SUBSTITUTED_CHARS;
+    resolve_references_within(node, parameters, &mut budget);
+}
+
+/// The most characters ONE resolution pass may substitute into the template it resolves,
+/// across every reference in that template.
+///
+/// A HOST bound on the amplification a request can ask for. Neither modelled length bounds
+/// the resolved tree on its own: a `TemplateBody` is at most
+/// [`TEMPLATE_BODY_MAX_CHARS`] characters, but each of the references it carries stands for
+/// a parameter value of up to [`PARAMETER_VALUE_MAX_CHARS`] of its own, so it is their
+/// PRODUCT that has to be capped. This sits at sixteen whole template bodies — orders of
+/// magnitude above what a conformance pack template substitutes, which is a handful of
+/// resource names and ARNs — and a reference the remaining budget would not cover is left
+/// unresolved, so the member carries no value exactly as one naming a parameter nothing
+/// resolves does.
+const MAX_SUBSTITUTED_CHARS: usize = 16 * TEMPLATE_BODY_MAX_CHARS;
+
+/// The longest `TemplateBody` this operation takes (`@length(1, 51200)`) and the longest
+/// value a `ConformancePackInputParameter` carries for a parameter
+/// (`ConformancePackInputParameter$ParameterValue`, `@length(0, 4096)`: "values can have a
+/// maximum length of 4096 characters"). Both are the model's, and the boundary validator
+/// enforces them before this handler runs; they are named here because
+/// [`MAX_SUBSTITUTED_CHARS`] is a bound on what the two together can produce.
+const TEMPLATE_BODY_MAX_CHARS: usize = 51_200;
+/// See [`TEMPLATE_BODY_MAX_CHARS`].
+const PARAMETER_VALUE_MAX_CHARS: usize = 4_096;
+
+/// Resolve the references in `node`, spending from `budget` for every character substituted
+/// ([`resolve_parameter_references`]).
+fn resolve_references_within(
+    node: &mut ::serde_json::Value,
+    parameters: &::std::collections::BTreeMap<String, String>,
+    budget: &mut usize,
+) {
+    match node {
+        ::serde_json::Value::Object(members) => {
+            if let Some(resolved) = resolved_reference(members, parameters, *budget) {
+                *budget = budget.saturating_sub(resolved.len());
+                *node = ::serde_json::Value::String(resolved);
+                return;
+            }
+            for member in members.values_mut() {
+                resolve_references_within(member, parameters, budget);
+            }
+        }
+        ::serde_json::Value::Array(items) => {
+            for item in items {
+                resolve_references_within(item, parameters, budget);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The text one intrinsic node stands for, or `None` for a node that is not a reference to
+/// a parameter this deployment has a value for — or whose value is longer than `budget`,
+/// the characters this pass may still substitute.
+///
+/// An intrinsic function is a single-member object whose name is the function's, so a
+/// mapping carrying anything beside it is a declaration rather than a reference.
+fn resolved_reference(
+    members: &::serde_json::Map<String, ::serde_json::Value>,
+    parameters: &::std::collections::BTreeMap<String, String>,
+    budget: usize,
+) -> Option<String> {
+    if members.len() != 1 {
+        return None;
+    }
+    let (function, argument) = members.iter().next()?;
+    let argument = argument.as_str()?;
+    match function.as_str() {
+        REF_FUNCTION => parameters
+            .get(argument)
+            .filter(|value| value.len() <= budget.min(PARAMETER_VALUE_MAX_CHARS))
+            .cloned(),
+        SUB_FUNCTION => substituted(argument, parameters, budget),
+        _ => None,
+    }
+}
+
+/// `text` with every `${<name>}` replaced by the value the parameter `<name>` stands for,
+/// or `None` when it names one this deployment has no value for — the string is then left
+/// unsubstituted rather than part-filled.
+///
+/// `${!Literal}` is how a template writes a literal `${Literal}`, so it substitutes
+/// nothing and the text keeps the braces.
+///
+/// `budget` is the characters this resolution pass may still substitute
+/// ([`MAX_SUBSTITUTED_CHARS`]): a text that would grow past it is left unsubstituted, so
+/// one `Fn::Sub` cannot turn a short request into an unbounded string.
+fn substituted(
+    text: &str,
+    parameters: &::std::collections::BTreeMap<String, String>,
+    budget: usize,
+) -> Option<String> {
+    let mut substituted = String::new();
+    let mut rest = text;
+    while let Some(opener) = rest.find("${") {
+        substituted.push_str(&rest[..opener]);
+        let named = &rest[opener + 2..];
+        // An opener with no closer is no substitution at all: the text is not the
+        // substitution template it would have to be, so nothing is substituted into it.
+        let closer = named.find('}')?;
+        let name = &named[..closer];
+        rest = &named[closer + 1..];
+        match name.strip_prefix('!') {
+            Some(literal) => substituted.push_str(&format!("${{{literal}}}")),
+            None => substituted.push_str(parameters.get(name)?),
+        }
+        // Checked as the text grows, so a body naming one parameter a great many times
+        // stops at the bound rather than being built first and judged after.
+        if substituted.len() > budget {
+            return None;
+        }
+    }
+    substituted.push_str(rest);
+    (substituted.len() <= budget).then_some(substituted)
 }
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
@@ -952,19 +1263,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let template_body = input.template_body;
+        // The values the template is deployed WITH: the request's own input parameters,
+        // read before the template is, because a reference to one resolves as the
+        // template's declarations are read.
+        let input_parameters = input.conformance_pack_input_parameters.unwrap_or_default();
         // A template that cannot be deployed is refused BEFORE anything is stored, so
         // the refusal leaves no pack behind for this name; what the template DECLARES is
         // read in the same pass, because it is what the deployment creates.
         let declared = match template_body.as_deref() {
-            Some(body) => read_conformance_pack_template(body).map_err(|message| {
-                PutConformancePackError::from(
-                    PutConformancePackErrorModeled::ConformancePackTemplateValidationException(
-                        ConformancePackTemplateValidationException {
-                            message: Some(message),
-                        },
-                    ),
-                )
-            })?,
+            Some(body) => {
+                read_conformance_pack_template(body, &input_parameters).map_err(|message| {
+                    PutConformancePackError::from(
+                        PutConformancePackErrorModeled::ConformancePackTemplateValidationException(
+                            ConformancePackTemplateValidationException {
+                                message: Some(message),
+                            },
+                        ),
+                    )
+                })?
+            }
             // The two legs that carry no body answered 501 above.
             None => Vec::new(),
         };
@@ -1228,7 +1545,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 template_body,
                 delivery_s3_bucket: input.delivery_s3_bucket,
                 delivery_s3_key_prefix: input.delivery_s3_key_prefix,
-                input_parameters: input.conformance_pack_input_parameters.unwrap_or_default(),
+                input_parameters,
                 deployed_rule_names,
                 failure_reason,
                 last_update_requested_at: now,
