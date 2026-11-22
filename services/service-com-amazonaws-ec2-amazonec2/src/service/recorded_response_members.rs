@@ -11,7 +11,8 @@
 //! answers it with `<verifiedAccessInstanceTransitGatewayAttachmentSet>` — present and
 //! empty for an instance with no transit-gateway attachment — a recorded
 //! `CreateInternetGateway` answers its gateway with `<association>`, present and empty for a
-//! gateway no association has been made for, and a recorded
+//! gateway no association has been made for, a recorded `DescribeNetworkInterfaces` answers
+//! the association of an Elastic IP address with `<natEnabled>`, and a recorded
 //! `DescribeInstanceTypes` answers every instance type with `<cpuBurstModel>` and every
 //! `networkInfo` with `<trafficMirroringSupport>`, and a recorded `DescribeSubnets` answers
 //! every subnet with the `<dhcpOptionsId>` it inherits from its VPC and the
@@ -235,6 +236,23 @@ const NETWORK_INTERFACE_ID_MEMBER: &str = "NetworkInterfaceId";
 /// one — on a reported instance, the `dnsName` the public-hostname options below name.
 const PUBLIC_DNS_NAME_MEMBER: &str = "PublicDnsName";
 
+/// The Smithy member name an allocation id is written under, which on a reported association
+/// is what says the public address bound there is an Elastic IP address the account
+/// ALLOCATED rather than one AWS assigned itself.
+const ALLOCATION_ID_MEMBER: &str = "AllocationId";
+
+/// The Smithy member name a reported association is written under. Every shape that reports
+/// one names the member after the association rather than after the shape it targets, so the
+/// DECLARING shape is what says WHICH association it is ([`recorded_writer_for`]).
+const ASSOCIATION_MEMBER: &str = "Association";
+
+/// The shapes whose `Association` member is the association of a public address with a
+/// NETWORK INTERFACE (`com.amazonaws.ec2#NetworkInterfaceAssociation`): the interface itself,
+/// and the private address of it the public one is bound to — the two places one such
+/// association is reported.
+const NETWORK_INTERFACE_ASSOCIATION_HOLDERS: &[&str] =
+    &["NetworkInterface", "NetworkInterfacePrivateIpAddress"];
+
 /// `cpuBurstModel` of a burstable performance type: its vCPUs run at a baseline rate and
 /// spend the CPU credits they earn to run above it.
 const CPU_BURST_MODEL_CREDIT: &str = "credit";
@@ -440,6 +458,21 @@ static INTERNET_GATEWAY_ASSOCIATION: Schema = Schema::new_member(
     0,
 );
 
+/// `<natEnabled>` on a reported network-interface association — a member schema for the same
+/// reason as [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#NetworkInterfaceAssociation`
+/// declares the addressing members of the association and no flag for the translation that
+/// carries traffic to the address.
+static NETWORK_INTERFACE_ASSOCIATION_NAT_ENABLED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#NetworkInterfaceAssociation$natEnabled",
+        EC2_NAMESPACE,
+        "natEnabled",
+    ),
+    ShapeType::Boolean,
+    "natEnabled",
+    0,
+);
+
 /// The content of the `association` element of a gateway no association has been made for:
 /// no member at all, which is what makes the element present and empty.
 struct NoAssociation;
@@ -567,6 +600,10 @@ struct WrittenMembers {
     /// The network interface id the structure wrote for itself, which is what says WHICH
     /// interface it is and whose public hostname is written on it.
     network_interface_id: Option<String>,
+    /// Whether the structure wrote an allocation id of its own, which on an association is
+    /// what says the public address bound there is an Elastic IP address the account
+    /// allocated.
+    allocation_id: bool,
     /// The public hostname the structure wrote for itself, which an instance's
     /// public-hostname options NAME — and whose emptiness says the instance holds no public
     /// address for them to name.
@@ -620,6 +657,18 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
         "InstanceMetadataOptions" => Some(write_metadata_options_recorded_members),
         "MetadataOptions" if declaring_shape(schema).as_deref() == Some("Instance") => {
             Some(write_metadata_options_recorded_members)
+        }
+        // The association of a PUBLIC ADDRESS with a network interface
+        // (`NetworkInterfaceAssociation`), reported under a member named after the
+        // association rather than after that shape. Other shapes declare a member of the
+        // same name targeting something else — an internet gateway's association, written
+        // below, and the instance report's own projection of this one
+        // (`InstanceNetworkInterfaceAssociation`) — so the DECLARING shape decides here too.
+        ASSOCIATION_MEMBER
+            if declaring_shape(schema)
+                .is_some_and(|shape| NETWORK_INTERFACE_ASSOCIATION_HOLDERS.contains(&shape.as_str())) =>
+        {
+            Some(write_network_interface_association_recorded_members)
         }
         // A reported volume renders every element the model declares for it, and is walked
         // for its own shape all the same: the zone it reports is the zone the attachments
@@ -828,6 +877,34 @@ fn write_network_info_recorded_members(
         TRAFFIC_MIRRORING_UNSUPPORTED
     };
     s.write_string(&NETWORK_INFO_TRAFFIC_MIRRORING_SUPPORT, mirroring)
+}
+
+/// A reported network-interface association's recorded elements: that the public address
+/// bound there is reached by network address translation.
+///
+/// An Elastic IP address is a PUBLIC address held by the network's internet gateway, which
+/// translates between it and the private address it is bound to — so the association of one
+/// is a translated binding, which is what the element says. It is derived from the ALLOCATION
+/// the association itself reported (`NetworkInterfaceAssociation$AllocationId`): an
+/// allocation is what the account holds an Elastic IP address as, so an association that
+/// reports one binds an Elastic IP address. An association that reports no allocation — a
+/// public address AWS assigned the interface itself, which this store records with the owner
+/// `amazon` and no allocation at all — has none of this to report, so the element is left out
+/// rather than claiming a translation for an address the store knows nothing of the kind
+/// about.
+///
+/// The rule is the shape's, so it reaches the association wherever one is reported: on the
+/// interface, and on the private address the public one is bound to, which is where
+/// `DescribeNetworkInterfaces` reports each.
+fn write_network_interface_association_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    if !written.allocation_id {
+        return Ok(());
+    }
+    s.write_boolean(&NETWORK_INTERFACE_ASSOCIATION_NAT_ENABLED, true)
 }
 
 /// A reported VPC's recorded elements: the scope its DHCP option set comes from.
@@ -1088,8 +1165,10 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
     /// reports, which identifies it the same way, the volume id that identifies a
     /// volume attachment, the zone a record reports for itself, which is the zone the
     /// records nested under it are in
-    /// ([`write_volume_attachment_recorded_members`]), and the instance type name and
-    /// adapter support a reported instance type and its network settings carry.
+    /// ([`write_volume_attachment_recorded_members`]), the instance type name and
+    /// adapter support a reported instance type and its network settings carry, and the
+    /// allocation id that makes a reported association an Elastic IP address's
+    /// ([`write_network_interface_association_recorded_members`]).
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
         if let Some(written) = self.written.as_deref_mut() {
             if schema.shape_id().namespace() == EC2_NAMESPACE {
@@ -1117,6 +1196,7 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
                         written.network_interface_id = Some(value.to_string());
                     }
                     PUBLIC_DNS_NAME_MEMBER => written.public_dns_name = Some(value.to_string()),
+                    ALLOCATION_ID_MEMBER => written.allocation_id = true,
                     _ => {}
                 }
             }
