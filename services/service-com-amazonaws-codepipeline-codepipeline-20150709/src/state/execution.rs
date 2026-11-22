@@ -264,6 +264,32 @@ pub fn s3_source_pin(
     pin
 }
 
+/// The revision a run RESOLVED, as the provider that holds it describes it.
+///
+/// A source action does not merely learn an id: the provider also says what that
+/// revision IS, and both facts are reported. `ArtifactRevision$revisionSummary` is
+/// "summary information about the most recent revision of the artifact … for Amazon S3
+/// buckets or actions, the user-provided content of a
+/// `codepipeline-artifact-revision-summary` key specified in the object metadata", and
+/// `ActionRevision$revisionChangeId` is "the unique identifier of the change that set
+/// the state to this revision", so each is recorded where the run resolved it rather
+/// than re-derived by a reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRevision {
+    /// The revision itself: `ArtifactRevision$revisionId` — an S3 object version, a
+    /// commit id, an image digest.
+    pub id: String,
+    /// What identifies the CHANGE that produced this revision, when the provider names
+    /// one: for an object in an Amazon S3 bucket its entity tag, which is what
+    /// `ArtifactRevision$revisionChangeIdentifier` documents ("for artifacts stored in
+    /// Amazon S3 buckets, the ETag value").
+    pub change_id: Option<String>,
+    /// The provider's own summary of this revision, when it has one: the content of the
+    /// source object's `codepipeline-artifact-revision-summary` metadata key, or the
+    /// words the provider names the revision by.
+    pub summary: Option<String>,
+}
+
 /// Where an artifact's bytes live: one object in the pipeline's artifact store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRef {
@@ -272,7 +298,7 @@ pub struct ArtifactRef {
     /// The object key the artifact's bytes were written to.
     pub key: String,
     /// The revision the artifact was produced from, when the producing action has one.
-    pub revision: Option<String>,
+    pub revision: Option<ResolvedRevision>,
     /// The customer managed key the object at this location is encrypted under, when
     /// the pipeline's artifact store declares one (`ArtifactStore$encryptionKey`: "the
     /// encryption key used to encrypt the data in the artifact store").
@@ -363,8 +389,9 @@ impl ActionRun {
     pub fn to_state(&self) -> ActionState {
         ActionState {
             action_name: Some(self.name.clone()),
-            // A revision is recorded by `PutActionRevision`, which this slice does not
-            // serve, so none is reported rather than invented.
+            // The revision an action carries is state of the PIPELINE's action rather
+            // than of this run, so it is filled in by the projection that reads the
+            // store ([`stage_states`]) rather than from the run.
             current_revision: None,
             latest_execution: self.status.as_ref().map(|status| ActionExecution {
                 action_execution_id: Some(self.action_execution_id.clone()),
@@ -802,8 +829,10 @@ pub fn stage_states(
                 // Every declared action is reported, whether or not an execution has
                 // reached it: the one that has run carries its action execution, and the
                 // one that has not carries only its name, because there is no outcome
-                // for it yet. `currentRevision` is the revision `PutActionRevision`
-                // recorded for the action, keyed by `(pipeline, stage, action)`.
+                // for it yet. `currentRevision` is the revision the store holds for the
+                // action, keyed by `(pipeline, stage, action)` — whatever recorded it:
+                // the run that resolved one ([`super::driver`]), the job worker that
+                // reported one, or `PutActionRevision`.
                 action_states: Some(
                     stage
                         .actions
@@ -1149,7 +1178,7 @@ pub enum JobOutcome {
         /// What the action did, as the action's summary.
         summary: String,
         /// The revision the artifacts were produced from, when there is one.
-        revision: Option<String>,
+        revision: Option<ResolvedRevision>,
         /// The action's output variables, keyed by bare name.
         variables: BTreeMap<String, String>,
         /// The id of the run in the external system that performed the work, when the

@@ -17,10 +17,11 @@
 //! The members the stage- and action-execution plane owns (`latestExecution`,
 //! `inboundExecution`, an action's `latestExecution`, its approval token and its error
 //! details) are reported from the execution plane this crate now runs
-//! (`crate::state::driver`). What the RULE plane owns stays ABSENT — a condition's or a
-//! rule's `latestExecution`, and an action's `currentRevision` — because no condition is
-//! evaluated and no revision recorded here, and inventing an outcome would claim work
-//! nothing ran.
+//! (`crate::state::driver`), and an action's `currentRevision` is the revision the
+//! action's run RESOLVED or a caller REPORTED for it, whichever is the latest the store
+//! holds. What the RULE plane owns stays ABSENT — a condition's or a rule's
+//! `latestExecution` and a rule's own revision — because no condition is evaluated here,
+//! and inventing an outcome would claim work nothing ran.
 //!
 //! ## Shape of an operation
 //!

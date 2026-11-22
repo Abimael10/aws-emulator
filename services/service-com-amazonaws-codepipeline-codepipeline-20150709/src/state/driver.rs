@@ -1503,11 +1503,22 @@ fn record_outcome(
     let ComAmazonawsCodepipelineCodepipeline20150709State {
         pipelines,
         executions,
+        action_revisions,
         ..
     } = store;
     let Some(record) = executions.get_mut(execution_id) else {
         return;
     };
+    // WHICH action this is, for the revision a source run resolves: the current revision
+    // is a fact about the pipeline's ACTION rather than about one execution, so it is
+    // filed under the same key a job worker's reported revision is
+    // (`super::jobs`).
+    let pipeline_name = record.pipeline_name.clone();
+    let stage_name = record
+        .stages
+        .get(stage)
+        .map(|run| run.name.clone())
+        .unwrap_or_default();
     let declared = pipelines
         .get(&record.pipeline_name)
         .and_then(|pipeline| pipeline.declaration_at(Some(record.pipeline_version)))
@@ -1583,14 +1594,37 @@ fn record_outcome(
                     .iter_mut()
                     .find(|recorded| recorded.action_name == action_name);
                 match existing {
-                    Some(recorded) => recorded.revision_id = Some(revision),
+                    Some(recorded) => {
+                        recorded.revision_id = Some(revision.id.clone());
+                        recorded.revision_summary = revision.summary.clone();
+                    }
                     None => record.source_revisions.push(SourceRevision {
-                        action_name,
-                        revision_id: Some(revision),
-                        revision_summary: None,
+                        action_name: action_name.clone(),
+                        revision_id: Some(revision.id.clone()),
+                        revision_summary: revision.summary.clone(),
                         revision_url: None,
                     }),
                 }
+                // The revision the action is now sitting on, filed where
+                // `GetPipelineState` reports an action's `currentRevision` from: a
+                // source action that RAN resolved a revision, and that revision is the
+                // one the action currently carries — the same fact a job worker reports
+                // through `PutJobSuccessResult$currentRevision` and a caller through
+                // `PutActionRevision`. `ActionRevision$revisionChangeId` is "the unique
+                // identifier of the change that set the state to this revision", which
+                // is what the provider named the change by, or the revision itself when
+                // it named none.
+                action_revisions.insert(
+                    (pipeline_name, stage_name, action_name),
+                    crate::ops::types::ActionRevision {
+                        revision_change_id: revision
+                            .change_id
+                            .clone()
+                            .unwrap_or_else(|| revision.id.clone()),
+                        revision_id: revision.id,
+                        created: super::to_date_time(now),
+                    },
+                );
             }
         }
         JobOutcome::Failed {
@@ -1866,6 +1900,24 @@ const MAX_EXECUTION_SUMMARY: usize = 2_048;
 /// (`smithy_query query="shape" shape="ErrorDetails"`).
 const MAX_ERROR_MESSAGE: usize = 5_000;
 
+/// The most characters a revision's summary carries: `ArtifactRevision$revisionSummary`
+/// and `SourceRevision$revisionSummary` target `RevisionSummary`,
+/// `@length(min: 1, max: 2048)`
+/// (`smithy_query query="shape" shape="ArtifactRevision"`). A summary a CALLER wrote —
+/// the content of a source object's revision-summary metadata key — is held to it, and
+/// the minimum is why an empty one is no summary at all.
+const MAX_REVISION_SUMMARY: usize = 2_048;
+
+/// `summary` as a revision summary is reported, or `None` where there is nothing to
+/// report: trimmed of surrounding space, held to [`MAX_REVISION_SUMMARY`], and dropped
+/// when what is left carries no characters. One helper for every provider, so a commit
+/// message and an object's metadata are held to the same rule.
+fn revision_summary(summary: Option<String>) -> Option<String> {
+    summary
+        .map(|summary| within(summary.trim().to_string(), MAX_REVISION_SUMMARY))
+        .filter(|summary| !summary.is_empty())
+}
+
 /// `text` held to the `limit` characters the member carrying it is modelled for, cut on
 /// a character boundary so what is recorded is still text.
 fn within(text: String, limit: usize) -> String {
@@ -2127,6 +2179,23 @@ async fn run_code_commit_source(
         };
     }
 
+    // What the COMMIT says it is: `ArtifactRevision$revisionSummary` is, "for GitHub and
+    // CodeCommit repositories, the commit message", so the message of the commit this
+    // source resolved is the summary of the revision it delivered. A repository that does
+    // not answer for the commit leaves the revision without a summary rather than failing
+    // the action: the revision itself is already resolved.
+    let commit_message = revision_summary(
+        code_commit
+            .get_commit()
+            .repository_name(repository)
+            .commit_id(&commit_id)
+            .send()
+            .await
+            .ok()
+            .and_then(|answer| answer.commit)
+            .and_then(|commit| commit.message),
+    );
+
     // Every file the commit holds, as the comparison against the empty tree reports it:
     // with no `beforeCommitSpecifier` "all changes before the afterCommitSpecifier value
     // are shown", so each of the commit's files is an addition. The comparison is PAGED,
@@ -2277,7 +2346,13 @@ async fn run_code_commit_source(
             "Packed {count} file(s) of the commit {commit_id} on {branch} of {repository} as \
              the output artifact"
         ),
-        revision: Some(commit_id.clone()),
+        revision: Some(super::execution::ResolvedRevision {
+            id: commit_id.clone(),
+            // A commit identifies its own change, and the repository names no separate
+            // identifier for it.
+            change_id: None,
+            summary: commit_message,
+        }),
         variables,
         external_id: Some(commit_id),
     }
@@ -2471,7 +2546,22 @@ async fn bounded_object_bytes(
 /// begins with, before the version of the object it delivered
 /// (`ActionExecutionResult$externalExecutionSummary` is "the action provider's summary for
 /// the action execution"; `ActionExecution$summary` reports the same text).
+///
+/// The provider's summary of an action execution IS its summary of the revision that run
+/// delivered, so an object stating its own revision summary
+/// ([`S3_REVISION_SUMMARY_METADATA_KEY`]) is summarised by what it states and these words
+/// are what names the version when it states none.
 const S3_SOURCE_SUMMARY_PREFIX: &str = "Amazon S3 version id: ";
+
+/// The object metadata key whose content IS the revision summary of a source object.
+///
+/// `ArtifactRevision$revisionSummary` is "summary information about the most recent
+/// revision of the artifact … for Amazon S3 buckets or actions, the user-provided content
+/// of a `codepipeline-artifact-revision-summary` key specified in the object metadata",
+/// so an object carrying that key is summarised by what the key says and nothing else.
+/// User-defined metadata keys are carried in headers, which are case insensitive, so the
+/// lookup is too.
+const S3_REVISION_SUMMARY_METADATA_KEY: &str = "codepipeline-artifact-revision-summary";
 
 /// Read the source object and write it into the artifact store.
 async fn run_source(
@@ -2503,6 +2593,15 @@ async fn run_source(
     };
     let version = object.version_id().map(str::to_string);
     let etag = object.e_tag().map(|etag| etag.trim_matches('"').to_string());
+    // What the OBJECT says its revision is, when its owner put it there: the content of
+    // the object's own `codepipeline-artifact-revision-summary` metadata key
+    // ([`S3_REVISION_SUMMARY_METADATA_KEY`]).
+    let stated_summary = object
+        .metadata()
+        .into_iter()
+        .flatten()
+        .find(|(name, _)| name.eq_ignore_ascii_case(S3_REVISION_SUMMARY_METADATA_KEY))
+        .map(|(_, content)| content.clone());
     // The object's bytes, held to what one artifact may carry
     // ([`bounded_object_bytes`]). `Bytes` is reference counted, so the clone each output
     // below is handed is a handle on this one buffer rather than a second copy of it.
@@ -2553,25 +2652,41 @@ async fn run_source(
         variables.insert("ETag".to_string(), etag.clone());
     }
     // The revision this source resolved: the object's own version, or its entity tag for
-    // an object in a bucket that holds no versions.
-    let revision = version.clone().or(etag);
+    // an object in a bucket that holds no versions. What the provider SAYS that revision
+    // is travels with it: the object's own revision-summary metadata when it carries
+    // some, and otherwise the words the S3 source provider names a version by.
+    let summary = revision_summary(stated_summary).or_else(|| {
+        version
+            .as_ref()
+            .map(|version| format!("{S3_SOURCE_SUMMARY_PREFIX}{version}"))
+    });
+    let revision = version.clone().or_else(|| etag.clone()).map(|id| {
+        super::execution::ResolvedRevision {
+            id,
+            // "For artifacts stored in Amazon S3 buckets, the ETag value"
+            // (`ArtifactRevision$revisionChangeIdentifier`).
+            change_id: etag.clone(),
+            summary: summary.clone(),
+        }
+    });
     JobOutcome::Done {
         // `ActionExecutionResult$externalExecutionSummary` is "the action provider's
-        // summary for the action execution", so the text is the S3 source provider's own:
-        // the fixed words `Amazon S3 version id: ` and the version of the object it
-        // delivered. An object in a bucket that holds no versions has none to name, and
-        // the summary then says what the run did instead.
-        summary: match &version {
-            Some(version) => format!("{S3_SOURCE_SUMMARY_PREFIX}{version}"),
-            None => format!("Source object s3://{bucket}/{key} delivered as the output artifact"),
-        },
-        revision: revision.clone(),
-        variables,
+        // summary for the action execution", so the text is the S3 source provider's own
+        // summary of the revision it delivered: the content of the object's
+        // revision-summary metadata key, or the fixed words `Amazon S3 version id: ` and
+        // the version of the object. An object in a bucket that holds no versions has
+        // neither, and the summary then says what the run did instead.
+        summary: summary
+            .unwrap_or_else(|| {
+                format!("Source object s3://{bucket}/{key} delivered as the output artifact")
+            }),
         // `ActionExecutionResult$externalExecutionId` is "the action provider's external ID
         // for the action execution": for a SOURCE action that is the id the provider names
         // the revision it delivered by, which is the revision itself — the same handle the
         // CodeCommit source reports its commit as and the Amazon ECR source its digest.
-        external_id: revision,
+        external_id: revision.as_ref().map(|revision| revision.id.clone()),
+        revision,
+        variables,
     }
 }
 

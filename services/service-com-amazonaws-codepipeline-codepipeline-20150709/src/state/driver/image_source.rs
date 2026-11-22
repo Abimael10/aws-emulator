@@ -264,8 +264,13 @@ pub(super) async fn run_ecr_source(
             "Resolved the image {repository}:{image_tag} at {digest} as the output artifact"
         ),
         // The revision a source action resolved: the image's digest, which is what the
-        // execution records as the action's source revision.
-        revision: Some(digest.clone()),
+        // execution records as the action's source revision. A digest identifies its own
+        // change and the registry states no summary for it.
+        revision: Some(super::super::execution::ResolvedRevision {
+            id: digest.clone(),
+            change_id: None,
+            summary: None,
+        }),
         variables,
         external_id: Some(digest),
     }

@@ -106,7 +106,8 @@ pub use action_type_resolution::{
 pub use driver::advance;
 pub use execution::{
     artifact_store, declared_action, declared_stage, is_terminal_status, plan_stage, plan_stages,
-    s3_source_pin, stage_states, ActionRun, ArtifactRef, S3SourcePin, StageRun, StopRequest,
+    s3_source_pin, stage_states, ActionRun, ArtifactRef, ResolvedRevision, S3SourcePin, StageRun,
+    StopRequest,
     MAX_ARCHIVE_ENTRIES,
     MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE, MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED,
     STATUS_SUCCEEDED, STATUS_SUPERSEDED, TRANSITION_INBOUND, TRANSITION_OUTBOUND,
@@ -3100,9 +3101,18 @@ impl PipelineExecutionRecord {
                     .iter()
                     .map(|(name, location)| crate::ops::types::ArtifactRevision {
                         name: Some(name.clone()),
-                        revision_id: location.revision.clone(),
+                        revision_id: location
+                            .revision
+                            .as_ref()
+                            .map(|revision| revision.id.clone()),
                         revision_change_identifier: None,
-                        revision_summary: None,
+                        // What the provider said this revision IS, recorded by the run
+                        // that resolved it ([`ResolvedRevision::summary`]) — absent only
+                        // for a revision whose provider says nothing about it.
+                        revision_summary: location
+                            .revision
+                            .as_ref()
+                            .and_then(|revision| revision.summary.clone()),
                         created: None,
                         revision_url: None,
                     })

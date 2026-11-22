@@ -447,7 +447,10 @@ pub fn already_acknowledged_message(job_id: &str) -> String {
 pub fn job_artifact(name: &str, location: &ArtifactRef) -> Artifact {
     Artifact {
         name: Some(name.to_string()),
-        revision: location.revision.clone(),
+        revision: location
+            .revision
+            .as_ref()
+            .map(|revision| revision.id.clone()),
         location: Some(ArtifactLocation {
             r#type: Some(ARTIFACT_LOCATION_TYPE_S3.to_string()),
             s3_location: Some(S3ArtifactLocation {

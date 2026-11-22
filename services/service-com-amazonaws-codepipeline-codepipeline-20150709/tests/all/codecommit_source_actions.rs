@@ -577,9 +577,20 @@ async fn a_code_commit_source_action_runs_the_tip_of_the_branch_it_names() {
             json!("Succeeded"),
             "case {case:?}: the run the creation started succeeded, got {settled}"
         );
+        // `SourceRevision$revisionSummary` is, "for GitHub and CodeCommit repositories,
+        // the commit message", so the revision the execution ran carries the message of
+        // the commit the branch's tip is at — the one the LAST write of this row made.
+        let tip_message = files
+            .last()
+            .map(|(path, _)| format!("add {path}"))
+            .unwrap_or_else(|| panic!("case {case:?}: a sourced row writes at least one file"));
         assert_eq!(
             settled["sourceRevisions"],
-            json!([{"actionName": "Src", "revisionId": tip}]),
+            json!([{
+                "actionName": "Src",
+                "revisionId": tip,
+                "revisionSummary": tip_message,
+            }]),
             "case {case:?}: the revision the execution ran is the branch tip, got {settled}"
         );
 

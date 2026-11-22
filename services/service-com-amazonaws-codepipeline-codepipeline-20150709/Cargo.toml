@@ -102,6 +102,9 @@ regex = "1.13"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` suite, so the single integration-test
+# target at `tests/all/main.rs` needs no hand-maintained list.
+automod = { workspace = true }
 # The Lambda deployment package and the CodeCommit file content a test uploads are
 # blobs, which the JSON wire form carries base64-encoded.
 base64 = "0.22"

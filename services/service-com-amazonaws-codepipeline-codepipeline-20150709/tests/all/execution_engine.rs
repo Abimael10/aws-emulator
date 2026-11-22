@@ -171,11 +171,7 @@ impl Emulator {
 
     /// Create a bucket with versioning enabled — what a CodePipeline source bucket is.
     pub(crate) async fn bucket(&self, name: &str) {
-        let (status, _, body) = self.s3("PUT", &format!("/{name}"), &[], b"").await;
-        assert_eq!(
-            status, 200,
-            "the bucket {name:?} must be created, got {status} with {body:?}"
-        );
+        self.unversioned_bucket(name).await;
         let (status, _, body) = self
             .s3(
                 "PUT",
@@ -190,19 +186,56 @@ impl Emulator {
         );
     }
 
+    /// Create a bucket and leave it as created, with no versioning status at all — so an
+    /// object written to it carries no version id.
+    pub(crate) async fn unversioned_bucket(&self, name: &str) {
+        let (status, _, body) = self.s3("PUT", &format!("/{name}"), &[], b"").await;
+        assert_eq!(
+            status, 200,
+            "the bucket {name:?} must be created, got {status} with {body:?}"
+        );
+    }
+
     /// Write an object, answering the version id the write reported.
     pub(crate) async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Option<String> {
+        self.put_object_with_metadata(bucket, key, &[], body).await.0
+    }
+
+    /// Write an object carrying `metadata` as its user-defined metadata, answering the
+    /// version id and the entity tag the write reported.
+    ///
+    /// User-defined metadata travels in `x-amz-meta-<name>` headers ("a map of metadata
+    /// to store with the object in S3", `PutObjectRequest$Metadata`), which is how a
+    /// caller puts a key such as a revision summary on a source object.
+    pub(crate) async fn put_object_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &[(&str, &str)],
+        body: &[u8],
+    ) -> (Option<String>, Option<String>) {
+        let named: Vec<(String, String)> = metadata
+            .iter()
+            .map(|(name, value)| (format!("x-amz-meta-{name}"), (*value).to_string()))
+            .collect();
+        let sent: Vec<(&str, &str)> = named
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
         let (status, headers, answer) = self
-            .s3("PUT", &format!("/{bucket}/{key}"), &[], body)
+            .s3("PUT", &format!("/{bucket}/{key}"), &sent, body)
             .await;
         assert_eq!(
             status, 200,
             "writing s3://{bucket}/{key} must succeed, got {status} with {answer:?}"
         );
-        headers
-            .get("x-amz-version-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
+        let reported = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim_matches('"').to_string())
+        };
+        (reported("x-amz-version-id"), reported("etag"))
     }
 
     /// Call one KMS operation that must succeed.
