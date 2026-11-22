@@ -39,7 +39,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::error_contract::{call, router, Answer};
 use super::functions::{ACCOUNT, REGION, RUNTIME};
 use super::resolvers::{
-    api_with_dependencies, create_resolver_body, get_resolver, DATA_SOURCE, TYPE,
+    api_with_dependencies, assert_no_such_type, create_resolver_body, get_resolver, DATA_SOURCE,
+    TYPE,
 };
 
 /// The error type a scaffolded operation answers every request with. No request below
@@ -410,11 +411,8 @@ async fn an_api_id_that_names_no_api_takes_its_modelled_error() {
         );
     }
 
-    // Nothing was written under the API that does exist either.
-    let listed = listed_fields(&router, &api_id, TYPE).await;
-    assert!(
-        listed.is_empty(),
-        "case the listing after the refused creates: expected no resolver attached, got \
-         {listed:?}"
-    );
+    // Nothing was written under the API that does exist either: no resolver is attached to
+    // its type, which the listing of a type the API holds nothing under refuses as a
+    // missing type (`ListResolvers`' `typeName` names a type OF the API).
+    assert_no_such_type(&router, &api_id, TYPE).await;
 }

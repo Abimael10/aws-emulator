@@ -98,6 +98,21 @@ impl ResolverRecord {
 }
 
 impl GraphqlApiRecord {
+    /// Whether this API holds a type under `type_name` — what an operation addressing a
+    /// type BY NAME asks before it answers for it.
+    ///
+    /// A type is one the API holds when its stored type system declares it, or when a
+    /// resolver of this API is attached to a type of that name: this service attaches a
+    /// resolver to the `typeName` the request names without waiting for a schema to declare
+    /// it, so an attachment is itself a statement that the API has that type.
+    pub fn holds_type(&self, type_name: &str) -> bool {
+        self.types.contains_key(type_name)
+            || self
+                .resolvers
+                .values()
+                .any(|resolver| resolver.type_name == type_name)
+    }
+
     /// The resolver attached to `field_name` of `type_name`, or `None` when the field
     /// carries none.
     ///

@@ -23,6 +23,8 @@ use std::sync::Arc;
 use ::emulator_server::ResourceListener;
 use ::tokio::sync::mpsc::Sender;
 
+use crate::service::graphql_api::execution::SelectedField;
+
 use super::event_data_plane::{
     authority_of, uuid_from, SubscribeRefusal, CONNECTIONS_PER_API, SUBSCRIPTIONS_PER_CONNECTION,
 };
@@ -52,18 +54,32 @@ struct ConnectionRecord {
 }
 
 /// One subscription a connection holds: the subscription FIELD of the API's schema it was
-/// started on, and the ARGUMENTS the client started it with.
+/// started on, the ARGUMENTS the client started it with, the SELECTION its document made,
+/// and the filters its field's subscribe-time handler installed.
 ///
-/// The arguments are kept because they are what a delivery to this subscription is filtered
-/// by: AppSync delivers a published mutation to a subscription only where every argument the
-/// subscription states matches the published object
-/// ([`crate::service::graphql_api::subscriptions`]).
+/// All four decide what this subscription receives
+/// ([`crate::service::graphql_api::subscriptions`]): AppSync delivers a published mutation
+/// only where every argument the subscription states matches the published object and the
+/// subscription's own filter accepts it, projects what it delivers onto the selection THIS
+/// document made, and ends the subscription when an invalidation's payload satisfies its
+/// invalidation filter.
 #[derive(Debug, Clone)]
 pub struct SubscriptionRecord {
     /// The subscription field of the API's schema this subscription is on.
     pub field: String,
     /// The arguments the `start` carried, with the client's own variables substituted.
     pub arguments: ::serde_json::Map<String, ::serde_json::Value>,
+    /// The fields this subscription's document selected OF that field, which is what a
+    /// delivery to it is projected onto.
+    pub selections: Vec<SelectedField>,
+    /// The filter the field's subscribe-time handler installed for this subscription
+    /// (`extensions.setSubscriptionFilter`), or `None` where it installed none — which is a
+    /// subscription that receives every publication its arguments match.
+    pub filter: Option<::serde_json::Value>,
+    /// The filter that says whether an invalidation a mutation raises ends this subscription
+    /// (`extensions.setSubscriptionInvalidationFilter`), or `None` where none was installed —
+    /// which is a subscription no invalidation ends.
+    pub invalidation_filter: Option<::serde_json::Value>,
 }
 
 /// The GraphQL API data plane's records: the sockets each API is served on, the
@@ -208,15 +224,13 @@ impl GraphqlDataPlane {
             .map_or(0, |connection| connection.subscriptions.len())
     }
 
-    /// Record that `connection_id` holds a subscription on the schema field `field`, started
-    /// with `arguments`, under the id the client chose.
+    /// Record that `connection_id` holds `subscription` under the id the client chose.
     pub fn start_subscription(
         &mut self,
         api_id: &str,
         connection_id: &str,
         subscription_id: &str,
-        field: &str,
-        arguments: ::serde_json::Map<String, ::serde_json::Value>,
+        subscription: SubscriptionRecord,
     ) -> Result<(), SubscribeRefusal> {
         let connection = self
             .apis
@@ -229,14 +243,29 @@ impl GraphqlDataPlane {
         if connection.subscriptions.len() >= SUBSCRIPTIONS_PER_CONNECTION {
             return Err(SubscribeRefusal::TooMany);
         }
-        connection.subscriptions.insert(
-            subscription_id.to_string(),
-            SubscriptionRecord {
-                field: field.to_string(),
-                arguments,
-            },
-        );
+        connection
+            .subscriptions
+            .insert(subscription_id.to_string(), subscription);
         Ok(())
+    }
+
+    /// Forget one subscription of `api_id` WHEREVER it is held, answering whether it was
+    /// held at all — what an invalidation does to a subscription it ends
+    /// ([`crate::service::graphql_api::subscription_filters`]).
+    ///
+    /// A subscription id is the client's own, so it is unique within the CONNECTION that
+    /// chose it; an invalidation names no connection, so every connection of the API is
+    /// asked.
+    pub fn end_subscription(&mut self, api_id: &str, subscription_id: &str) -> bool {
+        let Some(socket) = self.apis.get_mut(api_id) else {
+            return false;
+        };
+        socket
+            .connections
+            .values_mut()
+            .filter_map(|connection| connection.subscriptions.remove(subscription_id))
+            .count()
+            > 0
     }
 
     /// Forget one subscription of `connection_id`, answering the field it was on — `None`

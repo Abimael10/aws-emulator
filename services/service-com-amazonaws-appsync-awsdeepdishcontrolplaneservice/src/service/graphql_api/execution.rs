@@ -476,6 +476,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         appended: Vec::new(),
         template_spent: ::std::time::Duration::ZERO,
         engine_spent: ::std::time::Duration::ZERO,
+        extensions: Vec::new(),
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -486,6 +487,12 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     // declared on one.
     if kind == OperationKind::Mutation {
         super::subscriptions::published(context, &fields, &data).await;
+        // A mutation's response half may also END subscriptions, by raising an invalidation
+        // over the live ones of a subscription field
+        // (`extensions.invalidateSubscriptions`): the subscriptions whose own invalidation
+        // filter accepts the payload it raised are completed, which is read from the calls
+        // this execution's runs stated ([`super::subscription_filters`]).
+        super::subscription_filters::invalidated(context, &execution.extensions).await;
     }
     Answer {
         data: Some(data),
@@ -634,6 +641,11 @@ struct Execution<'a> {
     /// The same for its APPSYNC_JS evaluations: no step of a resolver is run once they have
     /// run for [`MAX_ENGINE_RUNTIME`] between them.
     engine_spent: ::std::time::Duration,
+    /// The `extensions.*` calls this request's APPSYNC_JS runs STATED, in the order they
+    /// were made: what each asks for belongs to the real-time plane
+    /// ([`super::subscription_filters`]), which reads them once the operation has been
+    /// executed.
+    extensions: Vec<appsync_js::ExtensionCall>,
 }
 
 impl Execution<'_> {
@@ -1393,7 +1405,7 @@ impl Execution<'_> {
         }
         self.engine_runs = self.engine_runs.saturating_add(1);
         let ran = ::std::time::Instant::now();
-        let returned = returned(code, function, context, stash).await;
+        let returned = returned(code, function, context, stash, &mut self.extensions).await;
         self.engine_spent = self.engine_spent.saturating_add(ran.elapsed());
         returned
     }
@@ -2934,7 +2946,7 @@ impl Evaluated {
 }
 
 /// Run `function` of `code` over `context` and answer what it returned, carrying the stash
-/// it left behind onto `stash`.
+/// it left behind onto `stash` and the `extensions` calls it stated onto `extensions`.
 ///
 /// `Err` is a step that did not return: the code raised (`util.error` is how a resolver
 /// refuses), it defines no such function, or one of the engine's bounds stopped it. The text
@@ -2945,9 +2957,11 @@ async fn returned(
     function: &str,
     context: &Json,
     stash: &mut Json,
+    extensions: &mut Vec<appsync_js::ExtensionCall>,
 ) -> Result<Evaluated, Failure> {
     let evaluation =
         appsync_js::evaluate(code.to_string(), function.to_string(), context.clone()).await;
+    extensions.extend(evaluation.extensions.iter().cloned());
     if let Some(left) = evaluation
         .stash
         .as_deref()

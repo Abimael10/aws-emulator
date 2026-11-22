@@ -15,8 +15,9 @@
 //!
 //! A FRESH engine per call, so nothing of one evaluation is reachable from the next: no
 //! global, no module instance and no value outlives the call that made it. Inside that
-//! engine the code reaches the language and three host functions of this module's own (the
-//! log, the appended error and the id mint), and a module resolver that answers with ONE
+//! engine the code reaches the language and the host functions of this module's own (the
+//! log, the appended error, the id mint, the DynamoDB marshalling and the record of the
+//! `extensions` calls it made), and a module resolver that answers with ONE
 //! specifier — the `util` helpers AppSync's own resolvers import
 //! ([`crate::service::event_api::handlers::UTILS_MODULE`]) — so an `import` of anything
 //! else fails to resolve rather than reaching a host path. Plain QuickJS registers no
@@ -117,6 +118,24 @@ pub const MAX_LOG_ENTRY_BYTES: usize = 4_096;
 /// How many errors one evaluation may append to `outErrors`.
 pub const MAX_OUT_ERRORS: usize = 100;
 
+/// How many `extensions.*` calls one evaluation's record may carry ([`ExtensionCall`]), so
+/// code calling one in a loop cannot make an unbounded answer.
+pub const MAX_EXTENSION_CALLS: usize = 16;
+
+/// The `extensions` calls this runtime records for its host, by the names the module
+/// exports them under.
+///
+/// `setSubscriptionFilter` and `setSubscriptionInvalidationFilter` are stated by a
+/// SUBSCRIPTION field's request handler, which runs when a subscriber subscribes, and
+/// `invalidateSubscriptions` by a mutation's response handler; each takes one argument, and
+/// what the host does with it is the plane's own
+/// (`crate::service::graphql_api::subscription_filters`).
+pub const SET_SUBSCRIPTION_FILTER: &str = "setSubscriptionFilter";
+/// See [`SET_SUBSCRIPTION_FILTER`].
+pub const SET_SUBSCRIPTION_INVALIDATION_FILTER: &str = "setSubscriptionInvalidationFilter";
+/// See [`SET_SUBSCRIPTION_FILTER`].
+pub const INVALIDATE_SUBSCRIPTIONS: &str = "invalidateSubscriptions";
+
 /// The `function` names a request may ask for: "The function within the code to be
 /// evaluated. If provided, the valid values are request and response"
 /// (`EvaluateCodeRequest$function`).
@@ -162,6 +181,29 @@ pub const STASH_MEMBER: &str = "stash";
 pub const ARGUMENTS_MEMBER: &str = "arguments";
 /// See [`ARGUMENTS_MEMBER`].
 pub const ARGUMENTS_SHORT_MEMBER: &str = "args";
+
+/// One `extensions.*` call the evaluated code made: which function it called, and the
+/// argument it called it with as the JSON text the engine rendered.
+///
+/// The call is RECORDED rather than acted on inside the engine: what it asks for belongs to
+/// the real-time plane, which reads the record after the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCall {
+    /// The name the module exports the called function under: one of
+    /// [`SET_SUBSCRIPTION_FILTER`], [`SET_SUBSCRIPTION_INVALIDATION_FILTER`] or
+    /// [`INVALIDATE_SUBSCRIPTIONS`].
+    pub name: String,
+    /// The argument the call carried, as JSON text.
+    pub argument: String,
+}
+
+impl ExtensionCall {
+    /// The argument as a document, or `Json::Null` for a call the engine rendered as
+    /// nothing readable.
+    pub fn argument(&self) -> Json {
+        ::serde_json::from_str(&self.argument).unwrap_or(Json::Null)
+    }
+}
 
 /// One fault found in the code itself, as a `CodeError` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +268,8 @@ pub struct Evaluation {
     /// The errors the run appended through `util.appendError`, as the JSON text of a list,
     /// or `None` where it appended none.
     pub out_errors: Option<String>,
+    /// The `extensions.*` calls the run made, in the order it made them.
+    pub extensions: Vec<ExtensionCall>,
 }
 
 /// Evaluate `function` of `code` over `context`, on a thread of its own.
@@ -466,6 +510,7 @@ fn stopped(reason: String) -> Evaluation {
         logs: Vec::new(),
         stash: None,
         out_errors: None,
+        extensions: Vec::new(),
     }
 }
 
@@ -534,6 +579,7 @@ fn finished(
         // neither: the members are there to report what the run left behind.
         stash: stash.filter(|text| !is_empty_object(text)),
         out_errors: collected.out_errors(),
+        extensions: collected.extensions.clone(),
     }
 }
 
@@ -777,6 +823,8 @@ struct Collected {
     /// The appended errors, each as the JSON text of one error, in the order the run
     /// appended them.
     appended: Vec<String>,
+    /// The `extensions.*` calls the run made, in the order it made them.
+    extensions: Vec<ExtensionCall>,
 }
 
 impl Collected {
@@ -790,6 +838,21 @@ impl Collected {
             line.truncate(boundary_at_or_below(&line, MAX_LOG_ENTRY_BYTES));
         }
         self.logs.push(line);
+    }
+
+    /// Record one `extensions.*` call, under the count and length ceilings. A call whose
+    /// argument is not a JSON document is dropped rather than recorded as one.
+    fn extension(&mut self, name: &str, argument: &str) {
+        if self.extensions.len() >= MAX_EXTENSION_CALLS
+            || argument.len() > MAX_ANSWER_BYTES
+            || ::serde_json::from_str::<Json>(argument).is_err()
+        {
+            return;
+        }
+        self.extensions.push(ExtensionCall {
+            name: name.to_string(),
+            argument: argument.to_string(),
+        });
     }
 
     /// Record one appended error, under the count ceiling. An entry that is not a JSON
@@ -824,13 +887,15 @@ fn boundary_at_or_below(text: &str, limit: usize) -> usize {
         .unwrap_or_default()
 }
 
-/// Install the host functions this sandbox carries: the log, the appended error and the id
-/// mint, each of which only writes to or reads from THIS run.
+/// Install the host functions this sandbox carries: the log, the appended error, the id
+/// mint, the DynamoDB marshalling and the record of the `extensions` calls the run made,
+/// each of which only writes to or reads from THIS run.
 ///
 /// Nothing else of the host is reachable from the engine.
 fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), String> {
     let logged = Arc::clone(collected);
     let appended = Arc::clone(collected);
+    let extended = Arc::clone(collected);
     let globals = ctx.globals();
     globals
         .set(
@@ -854,6 +919,19 @@ fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), 
             }),
         )
         .map_err(|error| format!("the sandbox error list could not be installed: {error}"))?;
+    globals
+        .set(
+            "__appsyncExtension",
+            Func::from(move |name: String, argument: String| {
+                extended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extension(&name, &argument);
+            }),
+        )
+        .map_err(|error| {
+            format!("the sandbox extensions could not be installed: {error}")
+        })?;
     globals
         .set("__appsyncAutoId", Func::from(auto_id))
         .map_err(|error| format!("the sandbox id mint could not be installed: {error}"))?;
@@ -888,7 +966,8 @@ fn dynamodb_helper(helper: String, arguments: String) -> String {
 /// How a call naming a `util.dynamodb` helper this runtime does not publish is stated.
 const NO_SUCH_DYNAMODB_HELPER: &str = "No such helper: util.dynamodb.";
 
-/// Bind the APPSYNC_JS runtime's own names in the GLOBAL scope: `util` and `runtime`.
+/// Bind the APPSYNC_JS runtime's own names in the GLOBAL scope: `util`, `runtime` and
+/// `extensions`.
 ///
 /// Code written for this runtime reaches them BOTH ways — through the import of the utilities
 /// module ("`import { util } from '@aws-appsync/utils'`") and as bare names, because the
@@ -924,7 +1003,7 @@ fn install_runtime_globals(ctx: &Ctx<'_>) -> Result<(), String> {
 
 /// The names the runtime binds for the code it runs, which are the names
 /// [`UTILS_MODULE_SOURCE`] exports.
-const RUNTIME_GLOBALS: &[&str] = &["util", "runtime"];
+const RUNTIME_GLOBALS: &[&str] = &["util", "runtime", "extensions"];
 
 /// A fresh identifier for `util.autoId`, in the UUID form AppSync's own ids take.
 ///
@@ -1069,7 +1148,9 @@ const INVOKER_SOURCE: &str = r#"
 /// `util.autoId` mints an identifier; `util.dynamodb` MARSHALS a value as the attribute value
 /// DynamoDB holds it as, through the service's one reading of that conversion
 /// ([`dynamodb_helper`]), which is what a resolver over a DynamoDB data source writes its
-/// request object with; and `util.time` reads the clock through the engine's own `Date`.
+/// request object with; `util.time` reads the clock through the engine's own `Date`; and
+/// `extensions` STATES what the real-time plane is to do about a subscription or a
+/// publication, which the host records for it.
 /// Nothing else is offered, so code reaching for a helper this emulator does not implement
 /// fails loudly rather than silently doing nothing.
 const UTILS_MODULE_SOURCE: &str = r#"
@@ -1077,6 +1158,7 @@ const hostLog = __appsyncLog;
 const hostAppendError = __appsyncAppendError;
 const hostAutoId = __appsyncAutoId;
 const hostDynamoDb = __appsyncDynamoDb;
+const hostExtension = __appsyncExtension;
 const rendered = function (value) {
     if (typeof value === "string") {
         return value;
@@ -1177,7 +1259,22 @@ export const runtime = {
         throw error;
     },
 };
-export default { util, runtime };
+// Each `extensions` call STATES something the real-time plane does with the subscription or
+// the publication it belongs to, so the call is recorded for the host that owns those: the
+// filter a subscribe-time handler installs, the invalidation filter it installs beside it,
+// and the invalidation a mutation's response handler raises. The call returns nothing, as
+// each of them does.
+const extensionCall = function (name) {
+    return function (argument) {
+        hostExtension(name, JSON.stringify(argument === undefined ? null : argument));
+    };
+};
+export const extensions = {
+    setSubscriptionFilter: extensionCall("setSubscriptionFilter"),
+    setSubscriptionInvalidationFilter: extensionCall("setSubscriptionInvalidationFilter"),
+    invalidateSubscriptions: extensionCall("invalidateSubscriptions"),
+};
+export default { util, runtime, extensions };
 "#;
 
 /// The `console` the evaluated code writes through, installed by the HOST before any of

@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::error_contract::{call, router, Answer};
-use super::resolvers::{api_with_dependencies, create_resolver_body, DATA_SOURCE, TYPE};
+use super::resolvers::{
+    api_with_dependencies, create_resolver_body, DATA_SOURCE, TYPE, TYPE_NOT_FOUND,
+};
 
 /// The APPSYNC_JS runtime a definition carrying `code` names. Source:
 /// `smithy_query(query="shape", shape="AppSyncRuntime")`.
@@ -104,6 +106,11 @@ fn resolver_body(field: Option<&str>, extra: Value) -> Value {
 }
 
 /// The entry the type's listing reports for `field`, or `None` when it reports none.
+///
+/// A listing of a type the API holds nothing under is refused as a MISSING TYPE
+/// (`ListResolvers`' `typeName` names a type OF the API), which reports no resolver on
+/// `field` exactly as an empty page does: what this suite reads is whether a refused write
+/// attached anything.
 async fn listed(router: &MultiServiceRouter, api_id: &str, field: &str) -> Option<Value> {
     let answer = call(
         router,
@@ -112,6 +119,15 @@ async fn listed(router: &MultiServiceRouter, api_id: &str, field: &str) -> Optio
         None,
     )
     .await;
+    if answer.status == 404 {
+        assert_eq!(
+            (answer.error_type.as_str(), answer.message.as_str()),
+            ("NotFoundException", TYPE_NOT_FOUND),
+            "case list the resolvers of {TYPE}: expected AppSync's missing-type refusal, got \
+             {answer:?}"
+        );
+        return None;
+    }
     assert_eq!(
         answer.status, 200,
         "case list the resolvers of {TYPE}: expected 200, got {answer:?}"

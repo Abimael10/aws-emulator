@@ -266,6 +266,11 @@ fn answer(evaluation: Evaluation, code: &str) -> Result<EvaluateCodeOutput, Eval
         logs,
         stash,
         out_errors,
+        // What an `extensions` call asks for belongs to the real-time plane of a SERVED API
+        // (`crate::service::graphql_api::subscription_filters`); this call evaluates code
+        // against no API, so the record of those calls has no subscription to act on and the
+        // response models no member for it.
+        extensions: _,
     } = evaluation;
     let mut output = EvaluateCodeOutput {
         logs: Some(logs),

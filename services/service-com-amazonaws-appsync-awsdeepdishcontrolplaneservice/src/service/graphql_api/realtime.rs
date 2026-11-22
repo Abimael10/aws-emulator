@@ -437,7 +437,8 @@ async fn contained_message(
             &body,
             &mut acked_now,
             &mut closed,
-        );
+        )
+        .await;
         let document =
             json!({ACKED_MEMBER: acked_now, CLOSED_MEMBER: closed, FRAMES_MEMBER: frames});
         ::http::Response::new(::bytes::Bytes::from(document.to_string()))
@@ -517,7 +518,7 @@ fn read_contained(
 /// `acked` is whether the connection has been acknowledged, and `closed` is set when this
 /// endpoint ENDS the connection — which the refusal of an unauthorized `connection_init`
 /// does, once that refusal has been written.
-fn served_message(
+async fn served_message(
     context: &PlaneContext,
     connection_auth: &PresentedAuth,
     connection_id: &str,
@@ -589,7 +590,7 @@ fn served_message(
             })
             .to_string()]
         }
-        START => vec![started(context, connection_auth, connection_id, &id, &message)],
+        START => vec![started(context, connection_auth, connection_id, &id, &message).await],
         STOP => vec![stopped(context, connection_id, &id)],
         other => {
             ::tracing::debug!(
@@ -611,8 +612,9 @@ fn served_message(
 
 /// Answer one `start`: the message has to name an id, carry a subscription document, be
 /// authorized by the material it presents, and name a subscription field of the API's
-/// schema; the subscription is then recorded under the id the client chose.
-fn started(
+/// schema; that field's own subscribe-time handler then decides the subscription, which is
+/// recorded under the id the client chose.
+async fn started(
     context: &PlaneContext,
     connection_auth: &PresentedAuth,
     connection_id: &str,
@@ -735,8 +737,11 @@ fn started(
             event_api::UNAUTHORIZED_MESSAGE,
         );
     }
-    let recorded = {
-        let mut store = context.state.lock();
+    // Whether the subscribe may proceed at all, and the type the API's schema binds as its
+    // subscription root — which is the type the field's own resolver is attached to. Read
+    // under ONE lock, which is released before that resolver runs.
+    let root_type = {
+        let store = context.state.lock();
         if !super::authorized(&store, &context.api_id, &auth) {
             return error_frame(
                 subscription_id,
@@ -747,26 +752,69 @@ fn started(
         // The field has to be one the API's SCHEMA declares as a subscription: a
         // subscription on a field the schema does not declare is a subscription nothing
         // can ever publish to.
-        let declared = store
-            .graphql_apis
-            .get(&context.api_id)
-            .map(|api| api.subscription_fields())
-            .unwrap_or_default();
-        if !declared.contains(&field) {
+        let Some(api) = store.graphql_apis.get(&context.api_id) else {
+            return error_frame(
+                subscription_id,
+                NOT_FOUND_ERROR_TYPE,
+                &no_such_subscription_field(&field),
+            );
+        };
+        if !api.subscription_fields().contains(&field) {
             return error_frame(
                 subscription_id,
                 NOT_FOUND_ERROR_TYPE,
                 &no_such_subscription_field(&field),
             );
         }
-        store.graphql_data_plane.start_subscription(
-            &context.api_id,
-            connection_id,
-            subscription_id,
-            &field,
-            selected.arguments.clone(),
-        )
+        api.subscription_root_type()
     };
+    // A subscription field's own resolver decides the SUBSCRIPTION: its request half runs
+    // here, before the subscription is recorded, and what it installs through `extensions`
+    // is what the deliveries to this subscription are then filtered by
+    // ([`super::subscription_filters`]). A handler that refused — or one the runtime could
+    // not run — refuses the subscribe, so no subscription is ever recorded with less
+    // filtering than its field's handler asked for.
+    let installed = match super::subscription_filters::subscribe_time(
+        context,
+        &root_type,
+        &field,
+        &selected.arguments,
+    )
+    .await
+    {
+        Ok(installed) => installed,
+        Err(refused) => {
+            ::tracing::info!(
+                api_id = %context.api_id,
+                %field,
+                reason = %refused.message,
+                "this subscription field's handler refused a subscribe"
+            );
+            return error_frame(
+                subscription_id,
+                match refused.unauthorized {
+                    true => event_api::UNAUTHORIZED_ERROR_TYPE,
+                    false => BAD_REQUEST_ERROR_TYPE,
+                },
+                &refused.message,
+            );
+        }
+    };
+    let recorded = context.state.lock().graphql_data_plane.start_subscription(
+        &context.api_id,
+        connection_id,
+        subscription_id,
+        crate::state::graphql_data_plane::SubscriptionRecord {
+            field: field.clone(),
+            arguments: selected.arguments.clone(),
+            // What this document selected OF the field, which is what a delivery to this
+            // subscriber is projected onto: a subscriber reads the result of its OWN
+            // document rather than the publisher's.
+            selections: selected.selections.clone(),
+            filter: installed.filter,
+            invalidation_filter: installed.invalidation_filter,
+        },
+    );
     match recorded {
         Ok(()) => json!({"id": subscription_id, MESSAGE_TYPE_MEMBER: START_ACK}).to_string(),
         Err(refusal) => error_frame(
@@ -792,6 +840,14 @@ fn stopped(context: &PlaneContext, connection_id: &str, subscription_id: &str) -
             NO_SUCH_SUBSCRIPTION,
         );
     }
+    complete_frame(subscription_id)
+}
+
+/// The frame a subscription that is OVER is reported to its subscriber with: the `complete`
+/// a `stop` is answered with, and the one an invalidation ends a subscription with
+/// ([`super::subscription_filters`]), so a subscriber reads one frame for a subscription
+/// that has ended however it ended.
+pub(super) fn complete_frame(subscription_id: &str) -> String {
     json!({"id": subscription_id, MESSAGE_TYPE_MEMBER: COMPLETE}).to_string()
 }
 

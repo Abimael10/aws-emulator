@@ -167,13 +167,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let guard = state.lock();
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The only write this read makes: a schema creation the CLOCK already made due
+        // installed the types its document declares, and it was owed at this instant
+        // whether or not anybody called, so the API's types are materialised before one of
+        // them is looked up rather than being left for the next caller to observe
+        // differently (`GetType` reads them the same way).
+        guard.settle_schema_creations(now);
+
         let Some(api) = guard.graphql_apis.get(&input.api_id) else {
             return Err(ListResolversErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
+
+        // `typeName` is a path LABEL naming a type of the API (`GET
+        // /v1/apis/{apiId}/types/{typeName}/resolvers`), so a name the API holds no type
+        // under addresses no collection to page: it is the modelled `NotFoundException`,
+        // with the fixed text every operation that cannot find a type states
+        // (`crate::state::TYPE_NOT_FOUND_MESSAGE`), rather than an empty page a caller
+        // cannot tell from a type that carries no resolver.
+        if !api.holds_type(&input.type_name) {
+            return Err(ListResolversErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::TYPE_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
 
         // The resolvers of ONE type of that API, in the creation order each record
         // keeps: the key a resolver is held under is the caller's own type/field pair,

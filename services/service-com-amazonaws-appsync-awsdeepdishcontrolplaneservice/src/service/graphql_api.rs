@@ -64,6 +64,7 @@ pub mod metrics;
 pub mod query;
 pub mod realtime;
 pub mod role_session;
+pub mod subscription_filters;
 pub mod subscriptions;
 pub mod user_pool;
 

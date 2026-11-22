@@ -18,9 +18,14 @@
 //!   object to a subscription only where every argument the subscription states equals the
 //!   same-named member of that object, which is what lets two subscribers on one field
 //!   receive different mutations ([`matches_arguments`]);
-//! * what the subscriber reads off its socket is the GraphQL result of its own subscription:
-//!   the published object under the subscription FIELD's name, inside the `data` member of a
-//!   `data` frame addressed by the subscription's own id ([`data_frame`]).
+//! * so does the FILTER its field's subscribe-time handler installed for it, which is
+//!   evaluated against the published object before anything is written
+//!   ([`super::subscription_filters`]);
+//! * what the subscriber reads off its socket is the GraphQL result of its OWN subscription:
+//!   the published object PROJECTED onto the selection that subscriber's document made
+//!   ([`projected`]) — so a field the subscription did not select is never delivered to it —
+//!   under the subscription FIELD's name, inside the `data` member of a `data` frame
+//!   addressed by the subscription's own id ([`data_frame`]).
 //!
 //! The delivery is a real write over that subscriber's socket, through the queue the
 //! connection's own task owns (`crate::state::GraphqlDataPlane::deliveries`), so a frame a
@@ -67,7 +72,7 @@ pub async fn published(context: &PlaneContext, fields: &[SelectedField], data: &
 }
 
 /// Deliver `published` to every subscription of this API on `subscription_field` whose own
-/// arguments match it.
+/// arguments and installed filter accept it, projected onto each subscriber's own selection.
 ///
 /// The queues are taken out of the store and written to with no lock held. The fan-out
 /// YIELDS between subscribers: how many there can be is bounded (the plane's connections per
@@ -83,7 +88,17 @@ async fn delivered(context: &PlaneContext, subscription_field: &str, published: 
         if !matches_arguments(&subscription, published) {
             continue;
         }
-        let frame = data_frame(&subscription_id, subscription_field, published);
+        // The filter this subscription's own subscribe-time handler installed, judged
+        // against the publication as it stands: what a subscriber asked not to receive is
+        // not written to it.
+        if !super::subscription_filters::accepts(subscription.filter.as_ref(), published) {
+            continue;
+        }
+        let frame = data_frame(
+            &subscription_id,
+            subscription_field,
+            &projected(published, &subscription.selections),
+        );
         if frames.try_send(frame).is_err() {
             ::tracing::warn!(
                 api_id = %context.api_id,
@@ -110,6 +125,42 @@ fn matches_arguments(subscription: &SubscriptionRecord, published: &Json) -> boo
         .all(|(name, wanted)| published.get(name) == Some(wanted))
 }
 
+/// The published object as the SUBSCRIBER's own document asked for it: the members its
+/// selection names, each under the response key that selection reports it by, and nothing
+/// else.
+///
+/// The publisher's selection set is the publisher's: AppSync resolves the published result
+/// against each subscriber's subscription document, so a member the subscription did not
+/// select is not part of what that subscriber receives — which is what makes leaving a field
+/// OUT of a subscription a boundary. A selection that names a member the publication does
+/// not carry resolves to `null`, as a field of a GraphQL result with no value does; a
+/// selection of no fields at all leaves the value as it stands, and a published LIST is
+/// projected element by element.
+fn projected(published: &Json, selections: &[SelectedField]) -> Json {
+    if selections.is_empty() {
+        return published.clone();
+    }
+    match published {
+        Json::Array(elements) => Json::Array(
+            elements
+                .iter()
+                .map(|element| projected(element, selections))
+                .collect(),
+        ),
+        Json::Object(members) => {
+            let mut selected = JsonMap::new();
+            for field in selections {
+                let value = members.get(&field.name).unwrap_or(&Json::Null);
+                selected.insert(field.key.clone(), projected(value, &field.selections));
+            }
+            Json::Object(selected)
+        }
+        // A scalar (or `null`) carries no member a selection could address, so there is
+        // nothing to project onto it.
+        other => other.clone(),
+    }
+}
+
 /// The frame a published mutation is delivered to one subscription as: the GraphQL result of
 /// that subscription — the published object under the subscription FIELD's name — addressed
 /// by the subscription's own id.
@@ -131,12 +182,24 @@ mod tests {
 
     use super::*;
 
-    /// A subscription started on `field` with `arguments`.
+    /// A subscription started on `field` with `arguments`, selecting nothing of its own.
     fn subscription(arguments: Json) -> SubscriptionRecord {
         SubscriptionRecord {
             field: "onChange".to_string(),
             arguments: arguments.as_object().cloned().unwrap_or_default(),
+            selections: Vec::new(),
+            filter: None,
+            invalidation_filter: None,
         }
+    }
+
+    /// The fields a subscription document would select, read by the plane's own reading of
+    /// one ([`super::super::execution::subscription_selection`]) so a projection is tested
+    /// against the selection a real document produces.
+    fn selection(document: &str) -> Vec<SelectedField> {
+        super::super::execution::subscription_selection(document, None, &JsonMap::new())
+            .unwrap_or_else(|| panic!("the document must be one subscription: {document}"))
+            .selections
     }
 
     /// RULE: every argument a subscription states has to equal the same-named member of the
@@ -226,5 +289,72 @@ mod tests {
             parsed, expected,
             "expected {expected}, got {parsed} for the delivered frame"
         );
+    }
+
+    /// RULE: what a subscriber receives is the publication projected onto the selection ITS
+    /// document made — the members it selected, under the keys it reported them by, and
+    /// nothing else.
+    #[test]
+    fn a_delivery_carries_only_what_the_subscription_selected() {
+        // The rows differ along which members the subscription selects, whether it aliases
+        // one, how deep the selection nests, whether the publication is a list, and whether
+        // it carries the selected member at all.
+        let rows: &[(&str, &str, Json, Json)] = &[
+            (
+                "a subset of the publication's members",
+                "subscription S { onChange { id body } }",
+                json!({"id": "a", "body": "hello", "secret": "shh"}),
+                json!({"id": "a", "body": "hello"}),
+            ),
+            (
+                "every member of the publication",
+                "subscription S { onChange { id body } }",
+                json!({"id": "a", "body": "hello"}),
+                json!({"id": "a", "body": "hello"}),
+            ),
+            (
+                "an aliased member",
+                "subscription S { onChange { identifier: id } }",
+                json!({"id": "a", "secret": "shh"}),
+                json!({"identifier": "a"}),
+            ),
+            (
+                "a member the publication does not carry",
+                "subscription S { onChange { id missing } }",
+                json!({"id": "a"}),
+                json!({"id": "a", "missing": Json::Null}),
+            ),
+            (
+                "a nested selection",
+                "subscription S { onChange { id author { name } } }",
+                json!({"id": "a", "author": {"name": "alice", "email": "a@example.com"}}),
+                json!({"id": "a", "author": {"name": "alice"}}),
+            ),
+            (
+                "a published list, projected element by element",
+                "subscription S { onChange { id } }",
+                json!([{"id": "a", "secret": "shh"}, {"id": "b", "secret": "shh"}]),
+                json!([{"id": "a"}, {"id": "b"}]),
+            ),
+            (
+                "a selection of no fields at all",
+                "subscription S { onChange }",
+                json!({"id": "a", "secret": "shh"}),
+                json!({"id": "a", "secret": "shh"}),
+            ),
+            (
+                "a publication that resolved to a scalar",
+                "subscription S { onChange { id } }",
+                json!("a"),
+                json!("a"),
+            ),
+        ];
+        for (case, document, published, expected) in rows {
+            let actual = projected(published, &selection(document));
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected {expected}, got {actual}"
+            );
+        }
     }
 }

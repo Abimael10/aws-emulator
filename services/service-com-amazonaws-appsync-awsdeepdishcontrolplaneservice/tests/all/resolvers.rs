@@ -67,6 +67,11 @@ pub(crate) const TYPE: &str = "Query";
 /// A second type of the same API, so a listing of one type is not a listing of the API.
 const OTHER_TYPE: &str = "Mutation";
 
+/// AppSync's fixed text for a `typeName` the named API holds no type under. Written out
+/// here rather than read off the service's own constant, so a change of wording is caught
+/// rather than followed.
+pub(crate) const TYPE_NOT_FOUND: &str = "Type not found.";
+
 /// The counts of resolvers a type is listed at: none, one, several, exactly one modelled
 /// page, and more than one page.
 const COUNTS: &[usize] = &[0, 1, 4, state::DEFAULT_PAGE_SIZE, state::DEFAULT_PAGE_SIZE + 7];
@@ -374,6 +379,32 @@ fn read_page(case: &str, answer: &Answer) -> ListedPage {
         next_token: answer.body["nextToken"].as_str().map(str::to_string),
         resolvers,
     }
+}
+
+/// Assert the listing of `type_name` under `api_id` is refused as a MISSING TYPE.
+///
+/// `ListResolvers`' `typeName` is a path label naming a type OF the API (`GET
+/// /v1/apis/{apiId}/types/{typeName}/resolvers`), so a name the API holds no type under —
+/// one its type system does not declare and no resolver of it is attached to — addresses no
+/// collection to page: it takes the modelled `NotFoundException` and AppSync's fixed
+/// missing-type text, which is what tells "this type does not exist" from "this type
+/// carries no resolver".
+pub(crate) async fn assert_no_such_type(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    type_name: &str,
+) {
+    let answer = list_page(router, api_id, Listing::OfType(type_name), None, None).await;
+    assert_eq!(
+        (
+            answer.status,
+            answer.error_type.as_str(),
+            answer.message.as_str()
+        ),
+        (404, "NotFoundException", TYPE_NOT_FOUND),
+        "case the listing of {type_name} under {api_id}: expected AppSync's missing-type \
+         refusal, got {answer:?}"
+    );
 }
 
 /// Page through the whole listing at `max_results` and return every entry, in the order
@@ -697,6 +728,13 @@ async fn every_page_size_walks_the_whole_type_in_one_order() {
         let mut seeded = seed(&router, &api_id, &function_id, TYPE, count).await;
         seeded.sort();
 
+        // A count of none attaches nothing, so the API holds no type of that name at all:
+        // the listing is refused as a missing type rather than paged.
+        if count == 0 {
+            assert_no_such_type(&router, &api_id, TYPE).await;
+            continue;
+        }
+
         let mut reference: Option<Vec<Value>> = None;
         for max_results in PAGE_SIZES.iter().copied() {
             let listed = walk(&router, &api_id, Listing::OfType(TYPE), max_results, count).await;
@@ -796,15 +834,11 @@ async fn a_listing_reports_only_the_type_and_api_it_names() {
         }
     }
 
-    // A type nothing is attached to carries no resolver, which is the empty listing:
-    // this operation reports what is attached to a type rather than resolving the type.
+    // A type nothing is attached to is a type this API holds nothing under — neither API
+    // declared a schema — so its listing is refused as a missing type rather than reported
+    // as an empty page.
     for type_name in ["Subscription", OTHER_TYPE] {
-        let listed = walk(&router, &second, Listing::OfType(type_name), None, 0).await;
-        assert!(
-            listed.is_empty(),
-            "case the listing of {type_name} under the second API: expected no entries, got \
-             {listed:?}"
-        );
+        assert_no_such_type(&router, &second, type_name).await;
     }
 }
 
@@ -971,11 +1005,9 @@ async fn a_field_carries_at_most_one_resolver() {
 async fn a_definition_appsync_could_not_run_is_refused() {
     let router = router();
     let (api_id, function_id) = api_with_dependencies(&router, "Api_resolver_definitions").await;
-    let before = walk(&router, &api_id, Listing::OfType(TYPE), None, 0).await;
-    assert!(
-        before.is_empty(),
-        "case the empty type: expected no resolvers before any create, got {before:?}"
-    );
+    // Nothing is attached yet and this API declares no schema, so it holds no type of that
+    // name: the listing is refused as a missing type.
+    assert_no_such_type(&router, &api_id, TYPE).await;
 
     let pipeline = json!({"functions": [function_id.clone()]});
     let cases: Vec<(&str, Value, &str)> = vec![
@@ -1069,12 +1101,8 @@ async fn a_definition_appsync_could_not_run_is_refused() {
             read.message, "No resolver found.",
             "case {label}: expected AppSync's fixed no-resolver text, got {read:?}"
         );
-        // ... and the listing still reports none.
-        let listed = walk(&router, &api_id, Listing::OfType(TYPE), None, 0).await;
-        assert!(
-            listed.is_empty(),
-            "case {label}: expected the listing to report no resolvers, got {listed:?}"
-        );
+        // ... and the type still holds none, so its listing is still refused.
+        assert_no_such_type(&router, &api_id, TYPE).await;
     }
 }
 
