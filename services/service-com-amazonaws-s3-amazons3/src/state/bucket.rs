@@ -1142,11 +1142,83 @@ impl Bucket {
     /// `account` is the Block Public Access configuration the owning ACCOUNT carries, in
     /// force on this bucket together with its own ([`settings_in_force`]), so either level's
     /// `IgnorePublicAcls` or `RestrictPublicBuckets` governs this read.
+    ///
+    /// Decided by [`Self::anonymous_read_refusal`], the one reading of that rule — the same one
+    /// a read of the BUCKET asks ([`Self::anonymous_bucket_read_refusal`]) — so the two cannot
+    /// weigh an ACL, a policy and the Block Public Access settings differently.
     pub fn anonymous_object_read_refusal(
         &self,
         bucket: &str,
         key: &str,
         object: Option<&Object>,
+        account: Option<BucketPublicAccessBlock>,
+    ) -> Option<&'static str> {
+        let granted_by_acl = object.is_some_and(|object| {
+            acl_grants_to_all_users(&self.object_acl_grants(object, account), PERMISSION_READ)
+        });
+        self.anonymous_read_refusal(
+            GET_OBJECT_ACTION,
+            &object_arn(bucket, key),
+            granted_by_acl,
+            account,
+        )
+    }
+
+    /// Why S3 refuses a read of the BUCKET named `bucket` itself — the listing of what it
+    /// holds, or the report that it is there — to a caller that presents NO credential, or
+    /// `None` when the public may perform it.
+    ///
+    /// The same rule [`Self::anonymous_object_read_refusal`] answers for an object, asked about
+    /// the bucket: what the anonymous caller may do is what this bucket's own configuration
+    /// gives to EVERYONE, which for a read of the bucket is an ACL grant to `AllUsers` carrying
+    /// `READ` — "you must have READ access to the bucket" to list its objects, and that is the
+    /// permission the bucket's ACL grants — or a bucket policy statement allowing `action` on
+    /// the bucket to every principal, each judged under the Block Public Access settings in
+    /// force at both levels.
+    ///
+    /// `action` is the IAM action the operation asking is authorized under
+    /// ([`LIST_BUCKET_ACTION`] for the listings and for the report that the bucket is there),
+    /// so a policy that grants exactly that action to everyone admits exactly the calls it
+    /// names.
+    pub fn anonymous_bucket_read_refusal(
+        &self,
+        bucket: &str,
+        action: &str,
+        account: Option<BucketPublicAccessBlock>,
+    ) -> Option<&'static str> {
+        let granted_by_acl = acl_grants_to_all_users(&self.acl_grants(account), PERMISSION_READ);
+        self.anonymous_read_refusal(action, &self.arn(bucket), granted_by_acl, account)
+    }
+
+    /// Why S3 refuses `action` on `resource` to a caller that presents NO credential, or `None`
+    /// when this bucket's own configuration gives it to everyone — the ONE reading of that
+    /// rule, which the object read and the bucket read above both ask.
+    ///
+    /// `granted_by_acl` is whether the ACL of the addressed resource carries the `READ` the
+    /// call needs for `AllUsers`, judged on the grants an ACL read REPORTS — which is where
+    /// `IgnorePublicAcls` has already dropped the public grants S3 ignores, so a grant that is
+    /// ignored admits nobody. The bucket policy is then asked about the request
+    /// ([`policy_decision_for_anonymous`], which reaches a statement whose principal element
+    /// names every principal and no other), and a grant it makes is withheld while
+    /// `RestrictPublicBuckets` is on — which "restricts access to … buckets with public
+    /// policies to only AWS service principals and authorized users within the bucket owner's
+    /// account" (`PublicAccessBlockConfiguration$RestrictPublicBuckets`), a set this caller is
+    /// in neither of. An explicit `Deny` refuses the call whatever the ACL grants, the way IAM
+    /// combines the two.
+    ///
+    /// A Requester Pays bucket refuses it ahead of all of that
+    /// ([`Self::requester_pays_anonymous_refusal`]): there is no account to charge. And a
+    /// request that came through an access point confined to a VPC is refused ahead of even
+    /// that, for the network it arrived over.
+    ///
+    /// `account` is the Block Public Access configuration the owning ACCOUNT carries, in force
+    /// on this bucket together with its own ([`settings_in_force`]), so either level's
+    /// `IgnorePublicAcls` or `RestrictPublicBuckets` governs the call.
+    fn anonymous_read_refusal(
+        &self,
+        action: &str,
+        resource: &str,
+        granted_by_acl: bool,
         account: Option<BucketPublicAccessBlock>,
     ) -> Option<&'static str> {
         // An access point confined to a VPC answers no request from outside it, whoever
@@ -1160,17 +1232,12 @@ impl Bucket {
         if let Some(message) = self.requester_pays_anonymous_refusal() {
             return Some(message);
         }
-        let granted_by_acl = object.is_some_and(|object| {
-            acl_grants_to_all_users(&self.object_acl_grants(object, account), PERMISSION_READ)
-        });
         let restricted = settings_in_force(self.public_access_block(), account)
             .restrict_public_buckets;
         let by_policy = self
             .policy
             .as_deref()
-            .map(|policy| {
-                policy_decision_for_anonymous(policy, GET_OBJECT_ACTION, &object_arn(bucket, key))
-            })
+            .map(|policy| policy_decision_for_anonymous(policy, action, resource))
             // A bucket carrying no policy has no policy to state anything, which is the
             // decision a document that says nothing about the request reaches.
             .unwrap_or_default();

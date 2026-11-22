@@ -724,7 +724,7 @@ pub(super) fn meter_behind_door<Eng, O>(
         ),
         None => Box::new(counted_behind_door(operation, engine, kind)),
     };
-    table.add_operation(O::NAME, entry);
+    table.add_operation(O::NAME, served_to_every_caller::<O>(entry));
 }
 
 /// `operation` behind this service's front door, with its answers counted — the pair
@@ -776,7 +776,24 @@ fn meter<Eng, O>(
         ),
         None => Box::new(Metered::new(operation, Arc::clone(engine), kind)),
     };
-    table.add_operation(O::NAME, entry);
+    table.add_operation(O::NAME, served_to_every_caller::<O>(entry));
+}
+
+/// `entry` wrapped so that the ANONYMOUS caller reaches it too, for the operations of this
+/// service that judge that caller themselves
+/// ([`super::unsigned_request::served_to_the_anonymous_caller`] is the catalog) — and `entry`
+/// unchanged for every other one, which keeps the refusal an unsigned request earns at the
+/// signature boundary.
+///
+/// Applied OUTSIDE the counting and the data-event record, because admitting the caller is what
+/// decides whether the request is served at all: an anonymous read that IS served is counted
+/// into the addressed bucket's request metrics and recorded as that object's data event exactly
+/// as the owner's own read is.
+fn served_to_every_caller<O: Operation>(entry: Box<dyn ErasedOperation>) -> Box<dyn ErasedOperation> {
+    if super::unsigned_request::served_to_the_anonymous_caller(O::NAME) {
+        return Box::new(super::unsigned_request::ServedUnsigned::new(entry));
+    }
+    entry
 }
 
 #[cfg(test)]

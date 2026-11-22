@@ -304,7 +304,8 @@ pub(super) struct Presented {
     /// all.
     signing: Option<Signing>,
     /// Whether the request presented a credential AT ALL — in its `Authorization` header or
-    /// in the query string of a presigned URL. `false` is the ANONYMOUS caller, which is
+    /// in the query string of a presigned URL, read by the one reading of that question
+    /// ([`crate::state::presents_no_credential`]). `false` is the ANONYMOUS caller, which is
     /// refused for what the bucket grants rather than for anything about a signature.
     carries_credential: bool,
     /// The bucket the request's address names, when it names one: what the refusal of an
@@ -338,10 +339,7 @@ impl Presented {
         let signature = field("Signature").unwrap_or_default();
         let carries_signature =
             !scope.is_empty() && !signed_headers.is_empty() && !signature.is_empty();
-        let carries_credential = authorization.is_some()
-            || crate::state::CREDENTIAL_QUERY_PARAMETERS
-                .iter()
-                .any(|parameter| query_parameter(query, parameter).is_some());
+        let carries_credential = !crate::state::presents_no_credential(authorization, query);
         Self {
             access_key_id: bounded(
                 scope

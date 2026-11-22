@@ -2721,15 +2721,28 @@ pub(crate) const CREDENTIAL_QUERY_PARAMETERS: [&str; 3] =
 /// in the `Authorization` header of a signed request or in the query string of a presigned
 /// one ([`CREDENTIAL_QUERY_PARAMETERS`]).
 pub fn request_is_anonymous(parts: &::http::request::Parts) -> bool {
-    let signed = parts
-        .headers
-        .get(::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.trim().is_empty());
-    if signed {
+    presents_no_credential(
+        parts
+            .headers
+            .get(::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        parts.uri.query().unwrap_or_default(),
+    )
+}
+
+/// Whether a request presenting `authorization` as its `Authorization` header (`None` for one
+/// sending none) and `query` as its query string presents NO credential at all.
+///
+/// The ONE reading of that question, which the routing seam asks of the request it is handed
+/// ([`crate::service::unsigned_request`]), the wording of a refusal asks of the request it
+/// answers for ([`crate::service::sigv4`]) and a handler asks through
+/// [`request_is_anonymous`] — so no two of them can disagree about which requests speak for
+/// nobody. A header that carries only whitespace states no credential either, since there is
+/// nothing in it to resolve.
+pub fn presents_no_credential(authorization: Option<&str>, query: &str) -> bool {
+    if authorization.is_some_and(|value| !value.trim().is_empty()) {
         return false;
     }
-    let query = parts.uri.query().unwrap_or_default();
     !CREDENTIAL_QUERY_PARAMETERS
         .iter()
         .any(|parameter| crate::service::query_carries(query, parameter))

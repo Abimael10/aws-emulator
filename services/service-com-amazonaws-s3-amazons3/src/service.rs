@@ -122,6 +122,10 @@ pub mod request_metrics;
 // modelled operation is bound to — see `service/select_object_content.rs`.
 pub mod select_object_content;
 pub mod sigv4;
+// How a request presenting NO credential — the ANONYMOUS caller, which Amazon S3 serves what a
+// bucket grants to everyone — is ADMITTED and then authorized, rather than refused for a
+// signature it never carried; see `service/unsigned_request.rs`.
+pub mod unsigned_request;
 // The WEBSITE ENDPOINT a bucket configured for static website hosting is served on, which is
 // a different endpoint from the REST API's — see `service/website_endpoint.rs`.
 pub mod website_endpoint;
@@ -1524,6 +1528,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// door can word — see [`front_door`] for the list and the reason. Built from the SAME
     /// shared engine, so a wrapped operation reads and writes the one store.
     door: smithy_server_runtime::OperationRoutingTable,
+    /// The EMPTY table, which is the model's own answer for a request on a surface the model
+    /// declares no operation on at all: the WEBSITE ENDPOINT. Handed to the framework in place
+    /// of the generated routing table while such a request is being served
+    /// ([`ErasedServiceDefinition::routing_table`]), so the endpoint's own operation — and not
+    /// the REST route that happens to share the request's method and path — is what states how
+    /// such a request is authenticated.
+    unmodelled_surface: smithy_server_runtime::OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -1550,6 +1561,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             door: front_door(&engine),
+            unmodelled_surface: OperationRoutingTable::new(),
             engine,
             protocol: UnwrappedXmlRestXml::new()
                 .with_buckets(addresses_a_bucket)
@@ -1612,6 +1624,20 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     fn front_door_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.door.get(key)
+    }
+
+    /// The operation the MODEL's own routing table names for `req`, read by the key the
+    /// entry's protocol resolves — the lookup the framework itself would perform if this
+    /// service's routing seam resolved nothing.
+    ///
+    /// Performed HERE, as the last step of that seam, so every request this service serves is
+    /// resolved by the seam: the table the framework falls back to is the one this service
+    /// hands it for the request's own SURFACE
+    /// ([`ErasedServiceDefinition::routing_table`]), which for a request that presents no
+    /// credential is not the generated table.
+    fn modelled_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let key = self.entry.protocol().routing_key(req).ok()?.to_string();
+        self.entry.routing_table().get(&key)
     }
 
     /// Whether `name` is an address this emulator serves a bucket's objects at — a bucket it
@@ -2246,6 +2272,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // worded from that bucket's own configuration, and the seam that words it is handed
         // no request to read it from.
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
+        // And WHICH SURFACE it reached, read once here for the same reason: the framework
+        // decides whether to authenticate this request before any handler runs, and the seam
+        // that states how an operation is authenticated is handed no request to read it from.
+        // A request presenting no credential is the ANONYMOUS principal — a caller Amazon S3
+        // serves what a bucket grants to everyone, and refuses by that decision rather than by
+        // the signature boundary — and a request on a bucket's website endpoint is on a surface
+        // the model names no operation on at all. See [`unsigned_request`].
+        unsigned_request::remember(match website_endpoint::addressed_website_of(req) {
+            Some(_) => unsigned_request::Admission::WebsiteEndpoint,
+            None if unsigned_request::presents_no_credential(req) => {
+                unsigned_request::Admission::Anonymous
+            }
+            None => unsigned_request::Admission::Credentialed,
+        });
         // The WEBSITE ENDPOINT answers the requests addressed to a bucket's website host and
         // the ones addressed to the website path this emulator serves the same surface at on
         // its own endpoint, and the model's routing table can name neither: the endpoint is
@@ -2390,20 +2430,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // For a PATH-STYLE request the generated routing table resolves it exactly as
         // before, except for the one operation served behind the front door below.
         let Some(bucket) = self.host_addressed_bucket(req, wire::request_path(req.uri())) else {
-            return self.front_door_operation(req);
+            return self
+                .front_door_operation(req)
+                .or_else(|| self.modelled_operation(req));
         };
-        let rewritten = with_path_style_address(req, &bucket)?;
+        let rewritten = match with_path_style_address(req, &bucket) {
+            Some(rewritten) => rewritten,
+            // An address this service cannot put back in path-style form resolves the way a
+            // path-style request does, rather than resolving nothing: every request this seam
+            // is asked about ends in an operation of this service.
+            None => {
+                return self
+                    .front_door_operation(req)
+                    .or_else(|| self.modelled_operation(req))
+            }
+        };
         // The ENTRY's protocol, which is the one carrying this service's model-derived
         // routes (this file's own `self.protocol` serializes and deserializes; it was built
         // with no route table, because routing is the entry's job).
-        let operation = self
-            .entry
-            .protocol()
-            .routing_key(&rewritten)
-            .ok()?
-            .to_string();
         self.front_door_operation(&rewritten)
-            .or_else(|| self.entry.routing_table().get(&operation))
+            .or_else(|| self.modelled_operation(&rewritten))
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -2505,8 +2551,36 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         self.entry.protocol()
     }
 
+    /// The table the framework resolves the request's modelled operation out of, which is what
+    /// it reads that operation's AUTH SCHEMES from — the one model-derived datum whose answer
+    /// depends on the SURFACE the request reached, which the generated entry cannot know.
+    ///
+    /// Three answers, one per surface ([`unsigned_request::Admission`], recorded for every
+    /// request by this service's routing seam before the framework authenticates it):
+    ///
+    /// * a request presenting a CREDENTIAL gets the generated table, unchanged: it is the
+    ///   caller that credential names, and the operation the model's routing key names states
+    ///   the schemes its signature is verified under;
+    /// * a request presenting NONE gets this service's own door table, where the operations
+    ///   that judge the ANONYMOUS principal themselves are served behind
+    ///   [`unsigned_request::ServedUnsigned`] — so those state no scheme and are admitted to be
+    ///   authorized by the bucket's own ACL, policy and Block Public Access settings, while
+    ///   every other operation still states the model's SigV4 and the unsigned caller is still
+    ///   refused before any handler runs;
+    /// * a request on the WEBSITE ENDPOINT gets the EMPTY table, because the model declares no
+    ///   operation on that surface at all: the same method and path mean something else there,
+    ///   so the endpoint's own operation is what states how the request is authenticated
+    ///   (nobody — a website endpoint reads no credential).
+    ///
+    /// The framework's own fallback LOOKUP through this table is never reached: every request
+    /// this service serves is resolved by [`Service::override_operation`], which ends in the
+    /// generated table itself ([`EmulatedService::modelled_operation`]).
     fn routing_table(&self) -> &OperationRoutingTable {
-        self.entry.routing_table()
+        match unsigned_request::admission() {
+            unsigned_request::Admission::Credentialed => self.entry.routing_table(),
+            unsigned_request::Admission::Anonymous => &self.door,
+            unsigned_request::Admission::WebsiteEndpoint => &self.unmodelled_surface,
+        }
     }
 
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse {

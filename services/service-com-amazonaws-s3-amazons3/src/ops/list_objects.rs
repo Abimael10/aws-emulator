@@ -334,19 +334,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::service::request_authorization`] carries IAM's order, and the listing's
         // own members travel as the condition context so a capped `max-keys` is enforced),
         // before anything about the bucket's contents is reported.
-        if let Some(message) = crate::service::request_authorization::denial(
-            &caller,
-            bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedTags::of(bucket),
-            crate::state::LIST_BUCKET_ACTION,
-            &bucket.arn(&input.bucket),
-            &crate::service::authorization::ListingContext {
-                max_keys: input.max_keys,
-                prefix: input.prefix.as_deref(),
-                delimiter: input.delimiter.as_deref(),
-            }
-            .conditions(),
-        ) {
+        //
+        // A request presenting NO credential speaks for no principal, so it is served only
+        // what the bucket grants to everyone — an ACL grant of `READ` to `AllUsers`, or a
+        // policy statement allowing this action to every principal, each under the Block
+        // Public Access settings in force ([`crate::state::Bucket::anonymous_bucket_read_refusal`]
+        // carries that rule, the same one an anonymous read of an object is answered by).
+        let refusal = match crate::state::request_is_anonymous(ctx.parts()) {
+            true => bucket
+                .anonymous_bucket_read_refusal(
+                    &input.bucket,
+                    crate::state::LIST_BUCKET_ACTION,
+                    store.owner_account_public_access_block(),
+                )
+                .map(str::to_string),
+            false => crate::service::request_authorization::denial(
+                &caller,
+                bucket.policy.as_deref(),
+                &crate::service::request_authorization::AddressedTags::of(bucket),
+                crate::state::LIST_BUCKET_ACTION,
+                &bucket.arn(&input.bucket),
+                &crate::service::authorization::ListingContext {
+                    max_keys: input.max_keys,
+                    prefix: input.prefix.as_deref(),
+                    delimiter: input.delimiter.as_deref(),
+                }
+                .conditions(),
+            ),
+        };
+        if let Some(message) = refusal {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ACCESS_DENIED_CODE,
                 crate::state::ACCESS_DENIED_STATUS,

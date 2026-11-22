@@ -25,6 +25,9 @@
 //! reached the surface by, and which of the addressable forms a stored redirect location
 //! carries.
 
+use std::sync::Arc;
+
+use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send_bytes, Answer};
@@ -907,5 +910,106 @@ async fn the_published_address_serves_no_website_for_a_bucket_that_has_none() {
         "expected the REST endpoint's own refusal, got {:?} in {:?}",
         missing.error_code(),
         text(&missing)
+    );
+}
+
+// --- the same surface at the posture the emulator RUNS in -----------------------------------
+
+/// RULE: a website endpoint authenticates nobody — "the website endpoint supports only GET and
+/// HEAD requests on objects", and what it serves is what the bucket grants to EVERYONE — so
+/// with request authentication ON, as the emulator runs it unless started otherwise, the SAME
+/// unsigned requests reach the SAME surface and are answered the same way. A browser addressing
+/// a static site sends no credential, so a surface that refused it for the credential would
+/// serve no static site at all.
+///
+/// The rows are the served-request table and the routing table above, driven at every address
+/// the surface is reached by: both published spellings of the bucket's website host and the
+/// path this emulator serves the same surface at on its own endpoint. Nothing about the
+/// expected answers changes with the posture, which is the point.
+#[tokio::test]
+async fn the_website_surface_answers_unsigned_requests_with_signatures_enforced() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut emulator = MultiServiceRouter::new();
+    // The site is stood up with enforcement off — its signed configuration calls are not the
+    // requests under test — and every website request below is dispatched with it on.
+    emulator.set_request_authentication(false);
+    emulator.register_service(EmulatedService::new(Arc::clone(&engine)));
+    let name = "website-endpoint-unsigned";
+    site(&emulator, name, "").await;
+    // A second site, carrying the routing rules: a rule conditioned on the error a request
+    // earns would redirect the rows above that answer one, so the two tables are driven
+    // against the configuration each is about.
+    let routed_name = "website-endpoint-unsigned-routed";
+    site(&emulator, routed_name, ROUTING_RULES).await;
+    emulator.set_request_authentication(true);
+
+    for row in rows() {
+        for host in [website_host(name), dotted_website_host(name)] {
+            let answered = website(&emulator, row.method, &host, row.path).await;
+            assert_eq!(
+                answered.status, row.status,
+                "case {:?} on {host:?}: expected HTTP {}, got {} with body {:?}",
+                row.case,
+                row.status,
+                answered.status,
+                text(&answered)
+            );
+            if let Some(expected) = row.body {
+                assert_eq!(
+                    text(&answered),
+                    expected,
+                    "case {:?} on {host:?}: expected the body {expected:?}, got {:?}",
+                    row.case,
+                    text(&answered)
+                );
+            }
+        }
+        // And at the address this emulator publishes on its own endpoint, which is the one a
+        // client that resolves nothing but this emulator can dial.
+        let at_published = published(&emulator, row.method, name, row.path).await;
+        assert_eq!(
+            at_published.status, row.status,
+            "case {:?} at {}: expected HTTP {}, got {} with body {:?}",
+            row.case,
+            site_path(name),
+            row.status,
+            at_published.status,
+            text(&at_published)
+        );
+    }
+
+    // The redirects the bucket's routing rules call for are served to the same caller.
+    let host = website_host(routed_name);
+    for row in routing_rows() {
+        let answered = website(&emulator, "GET", &host, row.path).await;
+        assert_eq!(
+            answered.status, row.status,
+            "case {:?}: expected HTTP {}, got {} with body {:?}",
+            row.case,
+            row.status,
+            answered.status,
+            text(&answered)
+        );
+        let expected = row
+            .location
+            .map(|target| format!("http://{host}{target}"));
+        assert_eq!(
+            answered.header("location"),
+            expected,
+            "case {:?}: expected the Location {expected:?}, got {:?}",
+            row.case,
+            answered.header("location")
+        );
+    }
+
+    // The REST endpoint of the same bucket is NOT this surface, and at this posture it still
+    // refuses the unsigned caller what the bucket grants nobody: the site's private key.
+    let private = website(&emulator, "GET", "localhost", &format!("/{name}/private.html")).await;
+    assert_eq!(
+        private.status, 403,
+        "the REST endpoint must refuse the unsigned read of a key nothing publishes, got {} \
+         with body {:?}",
+        private.status,
+        text(&private)
     );
 }

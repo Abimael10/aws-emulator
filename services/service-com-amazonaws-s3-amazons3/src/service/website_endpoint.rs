@@ -587,4 +587,15 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for WebsiteEndpoint<Eng> {
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move { self.serve(ctx) })
     }
+
+    /// Served with NO auth scheme, because a website endpoint authenticates nobody: "every
+    /// request is ANONYMOUS" there (this module's own rule), so there is no credential for the
+    /// signature boundary to resolve and none is read here — what the surface serves is what
+    /// the bucket grants to EVERYONE ([`crate::state::Bucket::anonymous_object_read_refusal`]),
+    /// and the method a request may use at all is this operation's own `405`. Nothing is waved
+    /// through: a credential presented to this surface grants nothing, exactly as it grants
+    /// nothing at the real endpoint.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
 }

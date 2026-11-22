@@ -345,19 +345,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Beyond its deserialized input this read needs only WHO is asking, which decides
         // whether the bucket's public grants are what admits it (below).
 
-        // What this read cannot answer faithfully is below ([`unserved_feature`]).
-        // Everything else is served: `Range` and `PartNumber` select a span of the object
-        // (answered 206 with a `Content-Range`), `If-Match` and `If-Unmodified-Since` are
-        // judged against the version the read resolves, `If-None-Match` and
-        // `If-Modified-Since` answer 304 for a caller whose copy is the current one,
-        // `VersionId` names one stored version of the key, and the SSE-C members carry the
-        // key an object stored under a customer-provided one is read with.
-        if let Some(unserved) = unserved_feature(&input) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "HeadObject with {unserved}"
-            )));
-        }
-
         // WHICH span of the object this HEAD asks for has to be a span a read can ask for,
         // judged over the request's own parameters and BEFORE anything about the object is
         // resolved, through the one rule `GetObject` is judged by: a `partNumber` that is not
@@ -539,6 +526,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ACCESS_DENIED_STATUS,
                 message,
             ));
+        }
+
+        // What this read cannot answer faithfully, asked AFTER the caller has been admitted:
+        // whether a caller may make this read at all is S3's own answer and does not depend on
+        // the members the request carries, so a caller the bucket refuses is refused for the
+        // caller — "requests to a Requester Pays bucket must be authenticated: you cannot make
+        // anonymous requests" holds whether or not the request acknowledges the charge — and
+        // only a request this service WOULD serve is told that one of its members is not served
+        // here.
+        //
+        // Everything else is served: `Range` and `PartNumber` select a span of the object
+        // (answered 206 with a `Content-Range`), `If-Match` and `If-Unmodified-Since` are
+        // judged against the version the read resolves, `If-None-Match` and
+        // `If-Modified-Since` answer 304 for a caller whose copy is the current one,
+        // `VersionId` names one stored version of the key, and the SSE-C members carry the
+        // key an object stored under a customer-provided one is read with.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "HeadObject with {unserved}"
+            )));
         }
         // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
         // body to tell them apart by an error document. The modelled `NotFound` cannot

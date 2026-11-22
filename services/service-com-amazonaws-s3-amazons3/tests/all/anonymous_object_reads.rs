@@ -683,9 +683,10 @@ async fn an_unsigned_read_is_refused_before_it_says_whether_the_key_is_there() {
 }
 
 /// RULE, at the other signature posture: with request authentication ON — as the emulator
-/// runs it unless started otherwise — a request presenting no credential is refused by the
-/// signature boundary before any handler sees it, and S3 words THAT refusal the same way:
-/// the `AccessDenied` of its published error list, HTTP 403, with that list's own sentence.
+/// runs it unless started otherwise — a request presenting no credential is ADMITTED as the
+/// anonymous principal and judged by the operation's own authorization, which refuses it the
+/// same way: the `AccessDenied` of S3's published error list, HTTP 403, with that list's own
+/// sentence, for a bucket that grants the public nothing.
 ///
 /// What this pins is that an unsigned caller is answered in S3's own words rather than in
 /// the framework's "sign the request" diagnostic, which no S3 client reads: a client
@@ -816,8 +817,14 @@ const REQUEST_PAYER_HEADER: (&str, &str) = ("x-amz-request-payer", "requester");
 /// ([`SETTINGS`] order).
 const PUBLIC_POLICY_ALLOWED: Flags = [true, true, false, false];
 
-/// One unsigned request against a bucket configured for a particular payer, and the sentence
-/// its refusal must carry.
+/// The status this emulator answers a request naming a member it does not serve — the
+/// `RequestPayer` a `HeadObject` refuses with its own "not served here" refusal, which is this
+/// emulator's limitation rather than an answer of S3's.
+const NOT_SERVED_HERE_STATUS: u16 = 501;
+
+/// One unsigned request against a bucket configured for a particular payer, the status it must
+/// answer, and the sentence its refusal must carry — `None` for a request the bucket's public
+/// policy has it SERVED.
 struct PayerRow {
     /// The case name every assertion of the row reports.
     case: &'static str,
@@ -831,8 +838,12 @@ struct PayerRow {
     uri: String,
     /// The headers it carries.
     headers: Vec<(&'static str, &'static str)>,
-    /// The `<Message>` the refusal must carry.
-    message: &'static str,
+    /// The HTTP status it must answer.
+    status: u16,
+    /// The `<Message>` the refusal must carry, or `None` where the request is not refused for
+    /// the caller: the CONTROL rows, which is what isolates Requester Pays as the cause of the
+    /// refusals above rather than the grant.
+    message: Option<&'static str>,
 }
 
 /// Stand up `name` holding one object every principal may read by policy, then put each
@@ -917,7 +928,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: path_style(REQUESTER_PAYS_BUCKET),
             headers: vec![],
-            message: REQUESTER_PAYS_MESSAGE,
+            status: 403,
+            message: Some(REQUESTER_PAYS_MESSAGE),
         },
         PayerRow {
             case: "a Requester Pays bucket, read WITH the acknowledgement header",
@@ -926,7 +938,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: path_style(REQUESTER_PAYS_BUCKET),
             headers: vec![REQUEST_PAYER_HEADER],
-            message: REQUESTER_PAYS_MESSAGE,
+            status: 403,
+            message: Some(REQUESTER_PAYS_MESSAGE),
         },
         PayerRow {
             case: "a Requester Pays bucket, addressed virtual-hosted-style",
@@ -935,7 +948,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: format!("{REQUESTER_PAYS_BUCKET}.s3.us-east-1.amazonaws.com"),
             uri: format!("/{KEY}"),
             headers: vec![],
-            message: REQUESTER_PAYS_MESSAGE,
+            status: 403,
+            message: Some(REQUESTER_PAYS_MESSAGE),
         },
         PayerRow {
             case: "a Requester Pays bucket, read at a key it does not hold",
@@ -944,7 +958,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: format!("/{REQUESTER_PAYS_BUCKET}/absent.csv"),
             headers: vec![],
-            message: REQUESTER_PAYS_MESSAGE,
+            status: 403,
+            message: Some(REQUESTER_PAYS_MESSAGE),
         },
         PayerRow {
             case: "a Requester Pays bucket, listed rather than read",
@@ -953,7 +968,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: format!("/{REQUESTER_PAYS_BUCKET}"),
             headers: vec![],
-            message: REQUESTER_PAYS_MESSAGE,
+            status: 403,
+            message: Some(REQUESTER_PAYS_MESSAGE),
         },
         PayerRow {
             case: "a bucket whose payer was reset to the bucket owner",
@@ -962,7 +978,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: path_style(PAYER_RESET_BUCKET),
             headers: vec![],
-            message: ACCESS_DENIED_MESSAGE,
+            status: 200,
+            message: None,
         },
         PayerRow {
             case: "a bucket whose payer was reset, read WITH the acknowledgement header",
@@ -971,7 +988,8 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: path_style(PAYER_RESET_BUCKET),
             headers: vec![REQUEST_PAYER_HEADER],
-            message: ACCESS_DENIED_MESSAGE,
+            status: 200,
+            message: None,
         },
         PayerRow {
             case: "a bucket nobody has configured a payer on",
@@ -980,11 +998,21 @@ fn payer_rows() -> Vec<PayerRow> {
             host: "localhost".to_string(),
             uri: path_style(PAYER_DEFAULT_BUCKET),
             headers: vec![],
-            message: ACCESS_DENIED_MESSAGE,
+            status: 200,
+            message: None,
         },
     ];
-    // The same requests again as HEADs, which are authorized by the same permission and
-    // carry no document to state the refusal in — so only their STATUS is read below.
+    // The same requests again as HEADs, every one of them: a HEAD of an object is authorized
+    // by the same permission its GET is — "a HEAD request has the same options as a GET
+    // operation on an object" — and carries no document to state a refusal in, so only its
+    // STATUS is read below.
+    //
+    // A HEAD the bucket REFUSES is refused for the caller, whatever members it carries: the
+    // Requester Pays refusal is about the request naming no account to charge, so it stands
+    // for a request that acknowledges the charge too. A HEAD the bucket ADMITS that names the
+    // acknowledgement header is then answered by this emulator's own "not served here"
+    // refusal of `RequestPayer` ([`NOT_SERVED_HERE_STATUS`]) — the one member `HeadObject`
+    // does not serve, which is its own business rather than this rule's.
     let heads: Vec<PayerRow> = rows
         .iter()
         .map(|row| PayerRow {
@@ -994,6 +1022,11 @@ fn payer_rows() -> Vec<PayerRow> {
             host: row.host.clone(),
             uri: row.uri.clone(),
             headers: row.headers.clone(),
+            status: match (row.message.is_some(), row.headers.is_empty()) {
+                (true, _) => 403,
+                (false, true) => 200,
+                (false, false) => NOT_SERVED_HERE_STATUS,
+            },
             message: row.message,
         })
         .collect();
@@ -1003,18 +1036,22 @@ fn payer_rows() -> Vec<PayerRow> {
 
 /// RULE: a request carrying NO credential names no account to charge, so a bucket that makes
 /// the REQUESTER pay refuses it with its own fixed sentence — nothing in it taken from the
-/// request or from state — instead of with the authorization refusal S3 answers a caller a
-/// bucket grants nothing to. Both carry HTTP 403 and the `AccessDenied` code, which is why
-/// the sentence is the whole difference between "fix the grant" and "authenticate and
-/// acknowledge the charge"; and it holds wherever the unsigned caller is refused, so with
-/// request authentication ON — as the emulator runs it unless started otherwise, which is
-/// the posture this test drives — the signature boundary words it the same way an
-/// operation's own authorization does.
+/// request or from state — while the byte-identical request against a bucket whose OWNER pays
+/// is SERVED what that bucket's public policy grants to everyone. Both refusals carry HTTP 403
+/// and the `AccessDenied` code, which is why the sentence is the whole difference between "fix
+/// the grant" and "authenticate and acknowledge the charge"; and it holds wherever the unsigned
+/// caller is judged, so with request authentication ON — as the emulator runs it unless started
+/// otherwise, which is the posture this test drives — the answer is the one the operation's own
+/// authorization gives, rather than a refusal the signature boundary makes before any handler
+/// sees the request.
 ///
 /// The rows differ along who pays (`Requester`, a payer reset to the owner, a bucket with no
 /// payer configured at all), whether the request acknowledges the charge, which method asks,
 /// whether the address is path-style or virtual-hosted-style, whether the key is one the
-/// bucket holds, and whether the request addresses an object or the bucket itself.
+/// bucket holds, and whether the request addresses an object or the bucket itself. A refusal
+/// of the CALLER is answered whatever members the request carries, which is why the rows that
+/// acknowledge the charge are refused too; the one member this emulator does not serve is told
+/// to a caller it WOULD serve ([`NOT_SERVED_HERE_STATUS`]).
 #[tokio::test]
 async fn an_unsigned_request_against_a_requester_pays_bucket_is_refused_in_its_own_words() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -1029,39 +1066,60 @@ async fn an_unsigned_request_against_a_requester_pays_bucket_is_refused_in_its_o
     enforcing.set_request_authentication(true);
 
     for row in payer_rows() {
-        let refused =
+        let answered =
             send_anonymous_with(&enforcing, row.method, &row.host, &row.uri, &row.headers).await;
         assert_eq!(
-            refused.status, 403,
-            "case {:?} ({} {}): expected HTTP 403, got {} with body {:?}",
+            answered.status,
+            row.status,
+            "case {:?} ({} {} with {:?}): expected HTTP {}, got {} with body {:?}",
             row.case,
             row.method,
             row.uri,
-            refused.status,
-            text(&refused)
+            row.headers,
+            row.status,
+            answered.status,
+            text(&answered)
         );
+        let Some(message) = row.message else {
+            // The control: the same request against a bucket whose OWNER pays is served by
+            // the public policy that grants it, which is what isolates Requester Pays as the
+            // cause of the refusals above rather than the grant.
+            if row.method == "GET" {
+                assert_eq!(
+                    answered.body.as_ref(),
+                    BODY,
+                    "case {:?} ({} {}): a granted read must serve the stored bytes, got {:?}",
+                    row.case,
+                    row.method,
+                    row.uri,
+                    text(&answered)
+                );
+            }
+            continue;
+        };
+        // A HEAD carries no body, so its status is the whole answer.
         if row.method == "HEAD" {
             continue;
         }
         assert_eq!(
-            refused.error_code(),
+            answered.error_code(),
             ACCESS_DENIED,
             "case {:?} ({} {}): expected the {ACCESS_DENIED:?} code, got {:?} with body {:?}",
             row.case,
             row.method,
             row.uri,
-            refused.error_code(),
-            text(&refused)
+            answered.error_code(),
+            text(&answered)
         );
         assert_eq!(
-            refused.error_message(),
-            row.message,
+            answered.error_message(),
+            message,
             "case {:?} ({} {}): expected {:?}, got {:?}",
             row.case,
             row.method,
             row.uri,
-            row.message,
-            refused.error_message()
+            message,
+            answered.error_message()
         );
     }
 }
@@ -1114,9 +1172,9 @@ async fn a_requester_pays_refusal_is_worded_the_same_wherever_it_is_decided() {
         )
         .await;
         // The HEAD of the same object, which the same permission authorizes — driven for a
-        // row that does NOT carry the acknowledgement header, because `HeadObject` refuses
-        // that member with its own "not served here" refusal before any authorization
-        // question, which is its own business rather than this rule's.
+        // row that does NOT carry the acknowledgement header, because a HEAD this bucket
+        // ADMITS that names that member is answered by `HeadObject`'s own "not served here"
+        // refusal of it, which is its own business rather than this rule's.
         let head = headers.is_empty().then_some(
             send_anonymous_with(&router, "HEAD", "localhost", &format!("/{bucket}/{KEY}"), &[])
                 .await,
@@ -1172,5 +1230,374 @@ async fn a_requester_pays_refusal_is_worded_the_same_wherever_it_is_decided() {
                 head.status
             );
         }
+    }
+}
+
+/// The canned ACL that grants the predefined `AllUsers` group `READ`: "owner gets
+/// FULL_CONTROL. The AllUsers group gets READ access" (`PutBucketAcl`'s own list of canned
+/// ACLs) — which on an OBJECT publishes that object's bytes and on a BUCKET publishes the
+/// listing of what it holds.
+const PUBLIC_READ: &str = "public-read";
+
+/// The Object Ownership setting a bucket must carry for its ACLs to affect permissions at all:
+/// the create's own default is `BucketOwnerEnforced`, under which "access control lists (ACLs)
+/// are disabled and no longer affect permissions" (`ObjectOwnership`'s own documentation).
+const ACLS_AFFECT_PERMISSIONS: &str = "ObjectWriter";
+
+/// `PUT /<bucket>?acl` — `PutBucketAcl` with a canned ACL.
+async fn put_bucket_acl(router: &MultiServiceRouter, bucket: &str, canned: &str) -> Answer {
+    send(
+        router,
+        "PUT",
+        &format!("/{bucket}?acl"),
+        &[("x-amz-acl", canned)],
+        "",
+    )
+    .await
+}
+
+/// WHICH of the documents S3 grants the public through carries one admission row's grant, and
+/// therefore which Block Public Access switch withholds it.
+enum Grant {
+    /// A canned ACL on the OBJECT, which `IgnorePublicAcls` makes S3 "ignore".
+    ObjectAcl,
+    /// A canned ACL on the BUCKET, ignored by the same switch — "all public ACLs on this
+    /// bucket and any objects that it contains".
+    BucketAcl,
+    /// A bucket policy statement allowing `s3:GetObject` on the object to every principal,
+    /// which `RestrictPublicBuckets` withholds from everyone outside the owner's account.
+    ObjectPolicy,
+    /// A bucket policy statement allowing `s3:ListBucket` on the bucket itself to every
+    /// principal, withheld by that same switch.
+    BucketPolicy,
+}
+
+/// What a SERVED answer's body must carry.
+enum ServedBody {
+    /// The object's own bytes, for a read of it.
+    Bytes,
+    /// The name of the key the bucket holds, for a listing of it.
+    Key,
+    /// Nothing at all, which is what a `HEAD` answers.
+    Nothing,
+}
+
+/// One ANONYMOUS call of an admission row: the method, the request URI, and what a served
+/// answer carries.
+struct Call {
+    method: &'static str,
+    uri: String,
+    body: ServedBody,
+}
+
+/// One row: a bucket published by one document, the Block Public Access configuration that
+/// withholds that grant, and the unsigned calls the grant admits.
+struct AdmissionRow {
+    /// The case name every assertion of the row reports.
+    case: &'static str,
+    /// The row's own bucket, so one row's grants cannot admit another's call.
+    bucket: &'static str,
+    /// Which document publishes it.
+    grant: Grant,
+    /// The Block Public Access configuration that must WITHHOLD the grant ([`SETTINGS`]
+    /// order).
+    blocking: Flags,
+    /// The calls the grant admits once nothing withholds it.
+    calls: Vec<Call>,
+}
+
+/// The two calls an OBJECT grant admits: the read of its bytes and the read of its metadata,
+/// which "has the same options as a `GET` operation on an object".
+fn object_calls(bucket: &str) -> Vec<Call> {
+    vec![
+        Call {
+            method: "GET",
+            uri: format!("/{bucket}/{KEY}"),
+            body: ServedBody::Bytes,
+        },
+        Call {
+            method: "HEAD",
+            uri: format!("/{bucket}/{KEY}"),
+            body: ServedBody::Nothing,
+        },
+    ]
+}
+
+/// The three calls a BUCKET grant admits, each authorized under the `s3:ListBucket` a bucket's
+/// `READ` grants: both revisions of the listing of what it holds, and the report that it is
+/// there.
+fn bucket_calls(bucket: &str) -> Vec<Call> {
+    vec![
+        Call {
+            method: "GET",
+            uri: format!("/{bucket}"),
+            body: ServedBody::Key,
+        },
+        Call {
+            method: "GET",
+            uri: format!("/{bucket}?list-type=2"),
+            body: ServedBody::Key,
+        },
+        Call {
+            method: "HEAD",
+            uri: format!("/{bucket}"),
+            body: ServedBody::Nothing,
+        },
+    ]
+}
+
+/// The table: one row per document a bucket can be published through, paired with the switch
+/// that withholds it and the calls it admits.
+fn admission_rows() -> Vec<AdmissionRow> {
+    vec![
+        AdmissionRow {
+            case: "an object published by its own public-read ACL",
+            bucket: "anon-admit-object-acl",
+            grant: Grant::ObjectAcl,
+            blocking: [false, true, false, false],
+            calls: object_calls("anon-admit-object-acl"),
+        },
+        AdmissionRow {
+            case: "a bucket published by its own public-read ACL",
+            bucket: "anon-admit-bucket-acl",
+            grant: Grant::BucketAcl,
+            blocking: [false, true, false, false],
+            calls: bucket_calls("anon-admit-bucket-acl"),
+        },
+        AdmissionRow {
+            case: "an object published by a policy naming every principal",
+            bucket: "anon-admit-object-policy",
+            grant: Grant::ObjectPolicy,
+            blocking: [false, false, false, true],
+            calls: object_calls("anon-admit-object-policy"),
+        },
+        AdmissionRow {
+            case: "a bucket listing published by a policy naming every principal",
+            bucket: "anon-admit-bucket-policy",
+            grant: Grant::BucketPolicy,
+            blocking: [false, false, false, true],
+            calls: bucket_calls("anon-admit-bucket-policy"),
+        },
+    ]
+}
+
+/// Stand up `row`'s bucket, published by its own document, with `flags` as its Block Public
+/// Access configuration. Driven with signature enforcement OFF: standing the bucket up is not
+/// what the test is about, and the signed calls that do it are not the requests under test.
+async fn published_bucket(router: &MultiServiceRouter, row: &AdmissionRow, flags: Flags) {
+    let bucket = row.bucket;
+    let created = create_bucket(router, bucket, None, None).await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: the bucket must be created first, got {} with body {:?}",
+        row.case,
+        created.status,
+        text(&created)
+    );
+    let switched = put_ownership_controls(router, bucket, &[ACLS_AFFECT_PERMISSIONS]).await;
+    assert_eq!(
+        switched.status, 200,
+        "case {:?}: the bucket must take the {ACLS_AFFECT_PERMISSIONS:?} ownership setting, \
+         got {} with body {:?}",
+        row.case,
+        switched.status,
+        text(&switched)
+    );
+    // Nothing public can be STORED on the bucket while the creation default blocks it, so the
+    // guardrail comes off, the grant goes on, and the row's own configuration goes back.
+    let lifted =
+        put_public_access_block(router, bucket, &members(PUBLIC_ACCESS_ALLOWED), &[]).await;
+    assert_eq!(
+        lifted.status, 200,
+        "case {:?}: Block Public Access must be liftable, got {} with body {:?}",
+        row.case,
+        lifted.status,
+        text(&lifted)
+    );
+    let stored = put_object(router, bucket, KEY, BODY, &[]).await;
+    assert_eq!(
+        stored.status, 200,
+        "case {:?}: the object must be written first, got {} with body {:?}",
+        row.case,
+        stored.status,
+        text(&stored)
+    );
+    match row.grant {
+        Grant::ObjectAcl => {
+            let put = put_object_acl(router, bucket, KEY, PUBLIC_READ).await;
+            assert_eq!(
+                put.status, 200,
+                "case {:?}: the object's {PUBLIC_READ:?} ACL must be stored, got {} with body \
+                 {:?}",
+                row.case,
+                put.status,
+                text(&put)
+            );
+        }
+        Grant::BucketAcl => {
+            let put = put_bucket_acl(router, bucket, PUBLIC_READ).await;
+            assert_eq!(
+                put.status, 200,
+                "case {:?}: the bucket's {PUBLIC_READ:?} ACL must be stored, got {} with body \
+                 {:?}",
+                row.case,
+                put.status,
+                text(&put)
+            );
+        }
+        Grant::ObjectPolicy | Grant::BucketPolicy => {
+            let (action, resource) = match row.grant {
+                Grant::BucketPolicy => ("s3:ListBucket", format!("arn:aws:s3:::{bucket}")),
+                _ => ("s3:GetObject", object_arn(bucket, "*")),
+            };
+            let put = put_bucket_policy(
+                router,
+                bucket,
+                &policy_document(&statement("Allow", "\"*\"", action, &resource)),
+            )
+            .await;
+            assert_eq!(
+                put.status, 204,
+                "case {:?}: the public policy must be stored, got {} with body {:?}",
+                row.case,
+                put.status,
+                text(&put)
+            );
+        }
+    }
+    let put = put_public_access_block(router, bucket, &members(flags), &[]).await;
+    assert_eq!(
+        put.status, 200,
+        "case {:?}: the Block Public Access configuration must be stored, got {} with body \
+         {:?}",
+        row.case,
+        put.status,
+        text(&put)
+    );
+}
+
+/// RULE: with request authentication ON — the posture the emulator runs in unless started
+/// otherwise — a request presenting no credential is ADMITTED as the anonymous principal and
+/// then authorized, so it is served exactly what the bucket grants to EVERYONE: the
+/// `IgnorePublicAcls` or `RestrictPublicBuckets` setting in force is what withholds that grant
+/// (HTTP 403 `AccessDenied`), and clearing it serves the same call again.
+///
+/// This is the calibration a Block Public Access setting is worth anything without: a flag
+/// that is supposed to block public access can only be shown to block something if the same
+/// call is served once the flag is cleared.
+///
+/// The rows differ along which document carries the grant (an object ACL, a bucket ACL, a
+/// policy on the object, a policy on the bucket), which switch withholds it, and which
+/// operation asks — the two object reads and the three bucket reads S3 authorizes under the
+/// permission that document grants.
+#[tokio::test]
+async fn an_unsigned_call_is_served_what_the_bucket_grants_once_nothing_withholds_it() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut emulator = MultiServiceRouter::new();
+    emulator.set_request_authentication(false);
+    emulator.register_service(EmulatedService::new(engine));
+
+    for row in admission_rows() {
+        published_bucket(&emulator, &row, row.blocking).await;
+        // Every call under test is dispatched with signature enforcement ON, which is where
+        // the request presenting no credential used to be refused before any handler saw it.
+        emulator.set_request_authentication(true);
+        for call in &row.calls {
+            let withheld =
+                send_anonymous(&emulator, call.method, "localhost", &call.uri).await;
+            assert_eq!(
+                withheld.status, 403,
+                "case {:?} ({} {}): the withheld grant must refuse the call, got {} with body \
+                 {:?}",
+                row.case,
+                call.method,
+                call.uri,
+                withheld.status,
+                text(&withheld)
+            );
+            if call.method != "HEAD" {
+                assert_eq!(
+                    withheld.error_code(),
+                    ACCESS_DENIED,
+                    "case {:?} ({} {}): expected the {ACCESS_DENIED:?} code, got {:?} with \
+                     body {:?}",
+                    row.case,
+                    call.method,
+                    call.uri,
+                    withheld.error_code(),
+                    text(&withheld)
+                );
+                assert_eq!(
+                    withheld.error_message(),
+                    ACCESS_DENIED_MESSAGE,
+                    "case {:?} ({} {}): expected {ACCESS_DENIED_MESSAGE:?}, got {:?}",
+                    row.case,
+                    call.method,
+                    call.uri,
+                    withheld.error_message()
+                );
+            }
+        }
+        // Clearing the setting is a signed call of the bucket's owner, not one of the requests
+        // under test.
+        emulator.set_request_authentication(false);
+        let cleared = put_public_access_block(
+            &emulator,
+            row.bucket,
+            &members(PUBLIC_ACCESS_ALLOWED),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            cleared.status, 200,
+            "case {:?}: the Block Public Access configuration must be clearable, got {} with \
+             body {:?}",
+            row.case,
+            cleared.status,
+            text(&cleared)
+        );
+        emulator.set_request_authentication(true);
+        for call in &row.calls {
+            let served = send_anonymous(&emulator, call.method, "localhost", &call.uri).await;
+            assert_eq!(
+                served.status, 200,
+                "case {:?} ({} {}): the grant must serve the call once nothing withholds it, \
+                 got {} with body {:?}",
+                row.case,
+                call.method,
+                call.uri,
+                served.status,
+                text(&served)
+            );
+            match call.body {
+                ServedBody::Bytes => assert_eq!(
+                    served.body.as_ref(),
+                    BODY,
+                    "case {:?} ({} {}): a served read must carry the stored bytes, got {:?}",
+                    row.case,
+                    call.method,
+                    call.uri,
+                    text(&served)
+                ),
+                ServedBody::Key => assert!(
+                    text(&served).contains(KEY),
+                    "case {:?} ({} {}): a served listing must name the key the bucket holds, \
+                     got {:?}",
+                    row.case,
+                    call.method,
+                    call.uri,
+                    text(&served)
+                ),
+                ServedBody::Nothing => assert!(
+                    served.body.is_empty(),
+                    "case {:?} ({} {}): a HEAD carries no body, got {:?}",
+                    row.case,
+                    call.method,
+                    call.uri,
+                    text(&served)
+                ),
+            }
+        }
+        emulator.set_request_authentication(false);
     }
 }

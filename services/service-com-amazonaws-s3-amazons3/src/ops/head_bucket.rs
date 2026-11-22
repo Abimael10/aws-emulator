@@ -249,16 +249,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // generic 400 Bad Request, 403 Forbidden, or 404 Not Found HTTP status code" (same
         // documentation): the permission case is the 403, and a HEAD carries no body, so the
         // status is the whole of what tells a caller which it was.
-        if crate::service::request_authorization::denial(
-            &caller,
-            bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedTags::of(bucket),
-            crate::state::LIST_BUCKET_ACTION,
-            &bucket.arn(&input.bucket),
-            &crate::service::authorization::read_conditions(),
-        )
-        .is_some()
-        {
+        //
+        // A request presenting NO credential speaks for no principal, so it is served only
+        // what the bucket grants to everyone, under the Block Public Access settings in force
+        // ([`crate::state::Bucket::anonymous_bucket_read_refusal`] carries that rule, the same
+        // one the listings of this bucket's contents are answered by).
+        let denied = match crate::state::request_is_anonymous(ctx.parts()) {
+            true => bucket
+                .anonymous_bucket_read_refusal(
+                    &input.bucket,
+                    crate::state::LIST_BUCKET_ACTION,
+                    store.owner_account_public_access_block(),
+                )
+                .is_some(),
+            false => crate::service::request_authorization::denial(
+                &caller,
+                bucket.policy.as_deref(),
+                &crate::service::request_authorization::AddressedTags::of(bucket),
+                crate::state::LIST_BUCKET_ACTION,
+                &bucket.arn(&input.bucket),
+                &crate::service::authorization::read_conditions(),
+            )
+            .is_some(),
+        };
+        if denied {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ACCESS_DENIED_CODE,
                 crate::state::ACCESS_DENIED_STATUS,
