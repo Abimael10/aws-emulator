@@ -43,7 +43,9 @@
 //!   `MatchedEventTime` the latest instant they reached, and each annotation
 //!   reported as the value it was annotated with;
 //! * a reader answers with the DOCUMENT that was submitted: its members, with
-//!   their values, in the order it named them — the one document written again
+//!   their values, in the order it named them — including the instants the
+//!   caller recorded, in the spelling it recorded them in and however far from
+//!   the service's own clock they sit — the one document written again
 //!   is a document that adopted another, and each entity of it still carries its
 //!   own members in its own order.
 
@@ -2528,6 +2530,125 @@ async fn a_document_that_adopted_nothing_is_answered_as_it_was_submitted() {
             "case {case:?}: the document must come back as it was submitted, got {answered:?}"
         );
     }
+}
+
+/// One completed segment document of the shape the segment documentation shows
+/// for a service that handled an HTTP request: its `id` and `name`, the
+/// instants the CALLER recorded, the `trace_id`, an `http` block and an
+/// annotation, named in that order. `start` and `end` are the TEXT of the two
+/// instants, so each row submits a producer's own spelling of them.
+fn client_timed_document(trace: &str, start: &str, end: &str) -> String {
+    format!(
+        r#"{{"id":"1111111111111111","name":"orders-api","start_time":{start},"trace_id":"{trace}","end_time":{end},"http":{{"request":{{"url":"http://localhost/orders/o-7","method":"GET"}},"response":{{"status":200}}}},"annotations":{{"order_id":"o-7"}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn a_reader_answers_the_instants_the_caller_recorded_not_the_service_clock() {
+    // `start_time` is documented as "time the segment or subsegment was
+    // created, in floating point seconds in epoch time" and `end_time` as the
+    // "time the segment or subsegment was closed" — the CALLER's record of when
+    // the traced work happened, which is not when the service took the document
+    // in. So the document a reader answers with is the one that was submitted,
+    // byte for byte: the instants it carried, spelled as it spelled them,
+    // however far from the service's own clock they sit, and whatever else of
+    // the document a client chose. Nothing of it is the service's.
+    //
+    // The rows differ along what the caller is free to choose and the service
+    // is not: how the pair of instants is SPELLED — both forms the
+    // documentation gives for one instant, the decimal `1480615200.010` and
+    // the exponential `1.480615200010E9`, with ONE pair of instants here
+    // written each way — and WHERE the pair sits relative to any clock the
+    // service could read (the first decade of the epoch, and decades ahead of
+    // it). Each row is seeded into an emulator of its own, under the same trace
+    // id, so the only thing that differs between two answers is the text that
+    // was submitted.
+    let rows: [(&str, &str, &str, f64, f64); 5] = [
+        (
+            "the exponential form the segment documentation shows",
+            "1.700000123E9",
+            "1.700000125E9",
+            1_700_000_123.0,
+            1_700_000_125.0,
+        ),
+        (
+            "the same two instants spelled in full",
+            "1700000123.0",
+            "1700000125.0",
+            1_700_000_123.0,
+            1_700_000_125.0,
+        ),
+        (
+            "the decimal form the segment documentation shows, to the millisecond",
+            "1480615200.010",
+            "1480615200.090",
+            1_480_615_200.010,
+            1_480_615_200.090,
+        ),
+        (
+            "instants from the first decade of the epoch",
+            "100.5",
+            "100.75",
+            100.5,
+            100.75,
+        ),
+        (
+            "instants decades ahead of any clock this service runs on",
+            "4.1024448E9",
+            "4.1024448025E9",
+            4_102_444_800.0,
+            4_102_444_802.5,
+        ),
+    ];
+
+    // Every answered document, so the rows that differ only in how they SPELL
+    // one pair of instants can be shown to answer differently: what a reader
+    // answers follows from the text that was submitted and from nothing else.
+    let mut answered_documents: BTreeSet<String> = BTreeSet::new();
+    for (case, start, end, start_value, end_value) in &rows {
+        let xray = Xray::new();
+        let trace = trace_id(58);
+        let submitted = client_timed_document(&trace, start, end);
+        let put = xray.put_segments(std::slice::from_ref(&submitted)).await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: seeding must succeed, got {put:?}"
+        );
+        assert!(
+            array(&put.body, "UnprocessedTraceSegments").is_empty(),
+            "case {case:?}: the document is well formed, got {put:?}"
+        );
+
+        let answered = documents_of(&xray, case, &trace).await;
+        let [answered] = <[String; 1]>::try_from(answered).unwrap_or_else(|got| {
+            panic!("case {case:?}: expected one answered document, got {got:?}")
+        });
+        assert_eq!(
+            answered, submitted,
+            "case {case:?}: expected the submitted document {submitted}, got {answered}"
+        );
+
+        // And the instants it carries are the ones the caller recorded, which
+        // is what every latency and ordering computation over the trace reads.
+        let document: Value = serde_json::from_str(&answered)
+            .unwrap_or_else(|_| panic!("case {case:?}: the answered document must be JSON"));
+        for (member, expected) in [("start_time", *start_value), ("end_time", *end_value)] {
+            let actual = document.get(member).and_then(Value::as_f64);
+            assert!(
+                actual.is_some_and(|actual| close(actual, expected)),
+                "case {case:?}: expected {member} {expected}, got {actual:?}"
+            );
+        }
+
+        answered_documents.insert(answered);
+    }
+
+    assert_eq!(
+        answered_documents.len(),
+        rows.len(),
+        "two documents differing only in how they spell one instant must be answered as they \
+         were each submitted, got {answered_documents:?}"
+    );
 }
 
 #[tokio::test]

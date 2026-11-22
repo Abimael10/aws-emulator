@@ -11,6 +11,42 @@ Issue-Commit: 98d9083befffa5463a97d216ae9f7eb2c391175c
 
 # xray BatchGetTraces re-serializes the stored segment document instead of returning it verbatim, overwriting submitted start_time/end_time
 
+## Resolution (cause declined: the fixture's own per-run segment document)
+
+The emulator's behaviour is correct and the one cause is DECLINED, not implemented. The
+re-encoding this report describes is no longer in the code: `PutTraceSegments` keeps the
+submitted text on the record (`src/state.rs` `parse_segment_document`, `document:
+document.to_string()`) beside the index it derives from it, and every reader of a stored
+document answers those bytes (`src/ops/batch_get_traces.rs`, `src/state/assembly.rs`,
+`src/state/segment_document.rs`). The one document a reader writes again is a document
+that ADOPTED a separately submitted subsegment, and that write preserves each entity's
+members and their order.
+
+What still differs at `$.Traces[0].Segments[0].Document` is the fixture's INPUT, not the
+echo: the probe mints its segment document per run — a fresh trace id and now-based
+`start_time`/`end_time` — while the expected string is the recording run's. The sibling
+report for this same fixture
+(`20261117T120030Z-xray-gettracesummaries-withholds-a-just-ingested-in-window.md`) records
+the instants seen at this very step in its run as 1794916490/1794916492 and states that
+"these epoch values are per-run clock values and are NOT requirements", with a trace id
+(`1-8ab6221d-...`) that is likewise neither the recorded one nor this run's. `Document` is
+echoed client input, so once the request differs the two strings cannot be equal, and the
+replay key `xray|BatchGetTraces|2xx->2xx|$.Traces[*].Segments[*].Document` stays failing by
+construction.
+
+Do NOT implement the remedy a byte comparison would need (reporting a document other than
+the one submitted, or deriving its instants from anything but the document): that is the
+very defect this report names.
+
+What the resolution added instead is the test that pins the rule:
+`tests/all/trace_data_plane_rules.rs`
+`a_reader_answers_the_instants_the_caller_recorded_not_the_service_clock` drives
+PutTraceSegments then BatchGetTraces over a five-row table of client-timed documents — both
+spellings the segment documentation gives for an instant, with one pair of instants written
+each way, and pairs sitting in the first decade of the epoch and decades ahead of any clock
+the host could read — and asserts each comes back as the exact string it was submitted as,
+with the caller's `start_time`/`end_time`, the five answers staying five distinct strings.
+
 > _Note: this issue was identified against the code base at commit `98d9083befffa5463a97d216ae9f7eb2c391175c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
