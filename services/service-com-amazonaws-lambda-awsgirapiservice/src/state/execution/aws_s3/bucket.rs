@@ -5,7 +5,8 @@
 //! holds as a SET.
 //!
 //! A handler that administers storage rather than storing through it calls these: it probes
-//! whether a bucket is there and usable at all, lists the account's buckets, reads and
+//! whether a bucket is there and usable at all, lists the account's buckets, reads the Region
+//! a bucket resides in, reads and
 //! replaces the notification container that decides where a bucket's object events are
 //! published, reads and replaces the bucket's tag set, its versioning state and its default
 //! server-side encryption, lists the versions a bucket holds and removes a set of them in
@@ -24,7 +25,8 @@
 use ::serde_json::{Map, Value};
 
 use ::aws_sdk_s3::types::{
-    BucketVersioningStatus, ChecksumAlgorithm, Delete, Event, EventBridgeConfiguration, FilterRule,
+    BucketLocationConstraint, BucketVersioningStatus, ChecksumAlgorithm, Delete, Event,
+    EventBridgeConfiguration, FilterRule,
     FilterRuleName, LambdaFunctionConfiguration, MfaDelete, MfaDeleteStatus,
     NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, Owner,
     QueueConfiguration, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
@@ -127,6 +129,48 @@ pub(super) async fn list_buckets(
         listed.continuation_token(),
     );
     insert_text(&mut document, "Prefix", listed.prefix());
+    observed.answer(document, Vec::new())
+}
+
+/// `GetBucketLocation`: the Region the bucket resides in.
+///
+/// "Returns the Region the bucket resides in. You set the bucket's Region using the
+/// LocationConstraint request parameter in a CreateBucket request" (`GetBucketLocation`'s own
+/// documentation) — the read a handler resolves a bucket's Region with before it addresses a
+/// client at it, which is why it is bound beside the probe and the listing above.
+///
+/// "Buckets in Region us-east-1 have a LocationConstraint of null"
+/// (`GetBucketLocationOutput$LocationConstraint`), so the member is reported as the NULL an
+/// answer carrying no constraint carries rather than left off the document: a handler reading
+/// it for such a bucket reads the absence of a constraint, which is what that bucket's answer
+/// says.
+pub(super) async fn get_bucket_location(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "ExpectedBucketOwner"])?;
+    let sent = client
+        .get_bucket_location()
+        .bucket(input.required_text("Bucket")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let read = match sent {
+        Ok(read) => read,
+        Err(error) => return refused(&error, observed),
+    };
+    let constraint = read
+        .location_constraint()
+        .map(BucketLocationConstraint::as_str)
+        .filter(|constraint| !constraint.is_empty());
+    let mut document = Map::new();
+    document.insert(
+        "LocationConstraint".to_string(),
+        constraint.map_or(Value::Null, |constraint| {
+            Value::String(constraint.to_string())
+        }),
+    );
     observed.answer(document, Vec::new())
 }
 

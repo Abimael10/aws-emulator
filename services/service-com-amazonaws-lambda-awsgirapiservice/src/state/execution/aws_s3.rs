@@ -81,11 +81,13 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "DeleteObjectTagging",
     // The bucket-wide half ([`bucket`]): what a handler administering a bucket calls —
     // probing whether the bucket is there and usable, listing the account's buckets,
+    // reading the Region a bucket resides in,
     // reading and replacing the bucket's own notification, tagging, versioning and default
     // encryption subresources, listing the versions it holds, and removing a set of them in
     // one call.
     "HeadBucket",
     "ListBuckets",
+    "GetBucketLocation",
     "GetBucketNotificationConfiguration",
     "PutBucketNotificationConfiguration",
     "GetBucketTagging",
@@ -130,6 +132,7 @@ pub async fn call(
         "ListObjectsV2" => list_objects_v2(&client, &input, &observed).await,
         "HeadBucket" => bucket::head_bucket(&client, &input, &observed).await,
         "ListBuckets" => bucket::list_buckets(&client, &input, &observed).await,
+        "GetBucketLocation" => bucket::get_bucket_location(&client, &input, &observed).await,
         "GetBucketNotificationConfiguration" => {
             bucket::get_bucket_notification_configuration(&client, &input, &observed).await
         }

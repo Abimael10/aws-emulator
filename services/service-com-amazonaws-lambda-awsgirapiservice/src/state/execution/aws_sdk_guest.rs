@@ -55,6 +55,10 @@
 //!   sends a request with `urllib3.PoolManager()` — which is how AWS's own documented
 //!   custom-resource response code answers CloudFormation — reaches this emulator over the
 //!   same seam the standard library's own client rides.
+//! * The SDK reports the GENERATION it implements, under the names the SDK reports its own
+//!   version under (`boto3.__version__`, `botocore.__version__`), because a handler that logs
+//!   or branches on the SDK it was given reads them. No release of the published SDK is here
+//!   to name, so what they report is the generation and nothing finer.
 //! * A state one of the service's resources reaches has the waiter the SDK's own client
 //!   answers with: `client.get_waiter(...)` polls the operation that state's own waiter
 //!   definition names until an acceptor of it decides the wait ([`waiter`]), which is how a
@@ -229,6 +233,12 @@ const BOTOCORE_SOURCE: &str = r#"
 """The AWS SDK for Python's lower half, as this runtime supplies it."""
 
 import re
+
+# The GENERATION of the SDK these modules implement, which is the one a managed `python3.x`
+# runtime ships: a handler reads it to report the SDK it was given. It is not a published
+# release of the SDK — no release of one is here to name — so it names the generation and
+# nothing finer.
+__version__ = "1.0.0"
 
 _first_cap_regex = re.compile("(.)([A-Z][a-z]+)")
 _number_cap_regex = re.compile("([a-z])([0-9]+)")
@@ -1310,6 +1320,11 @@ const BOTO3_SOURCE: &str = r#"
 """The AWS SDK for Python, as this runtime supplies it."""
 
 from boto3.session import Session
+
+# The GENERATION of the SDK these modules implement, reported the way the SDK reports its own
+# (`boto3.__version__`), and the same generation its lower half reports
+# (`botocore.__version__`).
+__version__ = "1.0.0"
 
 
 def client(*args, **kwargs):
