@@ -482,9 +482,21 @@
 //! this store carries, on the same monotonic clock and the same [`TRANSITION_DELAY`] span as
 //! a `pending` VPC's `available` move, applied by
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), and the endpoint-level
-//! policy document the create takes ([`VerifiedAccessEndpointRecord::policy_document`]),
-//! which `GetVerifiedAccessEndpointPolicy` reports and which the endpoint shape itself does
-//! not carry.
+//! policy the create takes ([`VerifiedAccessEndpointRecord::policy_document`] and whether it
+//! is in force, [`VerifiedAccessEndpointRecord::policy_enabled`]), which
+//! `GetVerifiedAccessEndpointPolicy` reports and which the endpoint shape itself does not
+//! carry.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::modify_verified_access_endpoint_policy`] is the one way
+//! that policy CHANGES, on the same terms a stored group changes: the members a
+//! `ModifyVerifiedAccessEndpointPolicy` request carried
+//! ([`VerifiedAccessEndpointPolicyModification::applied_to`]) replace the stored ones, every
+//! other member stays as it was, the endpoint's `LastUpdatedTime` is stamped with the instant
+//! the modification was applied, and the request is kept under the idempotency token it was
+//! given ([`ComAmazonawsEc2Amazonec2State::verified_access_endpoint_policy_modification_for_token`])
+//! so a repeat of it applies nothing further and the same token carrying a different request is
+//! refused. Both that call and `GetVerifiedAccessEndpointPolicy` answer through
+//! [`verified_access_endpoint_policy_reported`], the one reading of a stored policy.
 //!
 //! An endpoint LEAVES that store the way a transit gateway does rather than the way a group
 //! does: `DeleteVerifiedAccessEndpoint` leaves it in the non-terminal `deleting` status the
@@ -3117,6 +3129,13 @@ mod verified_access_trust_provider_modifications;
 /// `crate::state::VerifiedAccessGroupModification` like any primitive of this module.
 mod verified_access_group_modifications;
 mod verified_access_endpoint_deletion;
+/// The policy of a stored Verified Access endpoint: what one `ModifyVerifiedAccessEndpointPolicy`
+/// request changes about it, the record of that request its idempotency token is kept under, the
+/// one definition of what applying it leaves behind, the one writer that applies it, and the one
+/// reading of a stored policy every report of one answers with — in a file of its own rather than
+/// as more lines here. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::VerifiedAccessEndpointPolicyModification` like any primitive of this module.
+mod verified_access_endpoint_policy;
 /// Proving that the owner of an endpoint service owns the private DNS name assigned to it:
 /// the verification a start begins, and the state the clock owes that name once the
 /// verification has run. Everything it declares is re-exported below, so a handler reaches it
@@ -3215,6 +3234,7 @@ pub use verified_access_trust_provider_attachments::*;
 pub use verified_access_trust_provider_modifications::*;
 pub use verified_access_group_modifications::*;
 pub use verified_access_endpoint_deletion::*;
+pub use verified_access_endpoint_policy::*;
 pub use vpc_endpoint_service_private_dns_verification::*;
 pub use images_and_zone_facts::*;
 pub use security_group_rules_and_page_tokens::*;

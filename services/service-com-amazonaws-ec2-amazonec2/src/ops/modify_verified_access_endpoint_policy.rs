@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVerifiedAccessEndpointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVerifiedAccessEndpointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVerifiedAccessEndpointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the Verified Access endpoint the request names against the account's
+//! stored endpoints, replaces the policy members the request carried on that stored endpoint
+//! and answers the policy as it then stands, so `GetVerifiedAccessEndpointPolicy` reports what
+//! this call set — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVerifiedAccessEndpointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVerifiedAccessEndpointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVerifiedAccessEndpointPolicy"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            idempotent_parameter_mismatch, invalid_verified_access_endpoint_id_not_found,
+            require_service_state, verified_access_endpoint_limit_exceeded,
+            verified_access_endpoint_payload_bytes,
+            verified_access_endpoint_policy_modification_payload_bytes,
+            verified_access_endpoint_policy_reported, VerifiedAccessEndpointPolicyModification,
+            VerifiedAccessSseOptions, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+        };
+
+        // `ctx` carries request metadata only, and this call derives nothing from the request
+        // beyond its members: every member it answers with is a fact of the endpoint this
+        // store already holds.
+        let _ = ctx;
+
+        // Bounded the way every other client token this service accepts is, so one
+        // modification cannot retain caller-chosen text the budget was never asked about.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The modification this request asks for: the endpoint it names and the members it
+        // carries. A member it does not carry is absent here too, so applying this leaves that
+        // member of the endpoint's policy as it was.
+        let modification = VerifiedAccessEndpointPolicyModification {
+            verified_access_endpoint_id: input.verified_access_endpoint_id.clone(),
+            policy_document: input.policy_document.clone(),
+            policy_enabled: input.policy_enabled,
+            sse_specification: input
+                .sse_specification
+                .as_ref()
+                .map(|sse| VerifiedAccessSseOptions::of_requested(Some(sse))),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Materialise what the clock already owed before reading the store, so this call
+        // resolves its reference against the state a caller would have seen anyway — including
+        // the removal owed to an endpoint a delete has already taken away.
+        store.materialize_due_transitions();
+
+        // "Modifies the specified Amazon Web Services Verified Access endpoint policy": an id
+        // that names no endpoint of the account modifies nothing and is refused, whatever the
+        // id looks like.
+        let Some(current) = store
+            .verified_access_endpoints
+            .get(&modification.verified_access_endpoint_id)
+            .cloned()
+        else {
+            return Err(invalid_verified_access_endpoint_id_not_found(
+                &modification.verified_access_endpoint_id,
+            ));
+        };
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request"
+        // (`ModifyVerifiedAccessEndpointPolicyRequest$ClientToken`) — a repeat of one request
+        // applies nothing further and reports the policy as it stands, while the same token
+        // carrying a DIFFERENT request is the mismatch EC2 refuses rather than a second
+        // modification. Read here, answered below the DryRun check, because a replay writes
+        // nothing and so passes the budget a fresh modification has to clear.
+        let replayed = match input.client_token.as_deref() {
+            None => false,
+            Some(token) => {
+                match store.verified_access_endpoint_policy_modification_for_token(token) {
+                    None => false,
+                    Some(recorded) if recorded == &modification => true,
+                    Some(_) => return Err(idempotent_parameter_mismatch()),
+                }
+            }
+        };
+
+        // The budget is asked about the NET change only on the path that writes: this call
+        // stores no further endpoint, so the endpoint ceiling cannot bound it, and the members
+        // it sets are caller-chosen text — replacing a short policy document with a long one
+        // grows the store by the difference, and the token it is recorded under is retained
+        // too. The generated endpoint domain is untouched by this call, so the prefix charge is
+        // left out of both figures, exactly as the store's writer leaves it out.
+        if !replayed {
+            let refund = verified_access_endpoint_payload_bytes(&current, None, None);
+            // What this call would leave behind, computed by the store's ONE definition of what
+            // a policy modification does to an endpoint, so the figure checked here is exactly
+            // the one the write charges.
+            let charge =
+                verified_access_endpoint_payload_bytes(&modification.applied_to(&current), None, None)
+                    .saturating_add(input.client_token.as_deref().map_or(0, |token| {
+                        verified_access_endpoint_policy_modification_payload_bytes(
+                            &modification,
+                            token,
+                        )
+                    }));
+            if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+                return Err(verified_access_endpoint_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store this modification's {charge} \
+                     bytes",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the endpoint resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A replay applies nothing — not even a second `LastUpdatedTime` — and reports the
+        // policy as it stands, which is what the first call left behind. Both paths report the
+        // STORED record through the one reading of an endpoint's policy every report of one
+        // answers with.
+        let policy = if replayed {
+            verified_access_endpoint_policy_reported(&current)
+        } else {
+            // Written through the store's ONE writer of a policy modification, so what this
+            // answers is the stored policy a later read of the same endpoint reports.
+            store
+                .modify_verified_access_endpoint_policy(
+                    &modification,
+                    input.client_token.as_deref(),
+                    ::std::time::SystemTime::now(),
+                )
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the Verified Access endpoint '{}' could not be read back after its \
+                         policy modification",
+                        modification.verified_access_endpoint_id
+                    ))
+                })?
+        };
+
+        Ok(ModifyVerifiedAccessEndpointPolicyOutput {
+            policy_document: policy.policy_document,
+            policy_enabled: policy.policy_enabled,
+            sse_specification: policy.sse_specification,
+        })
     }
 }

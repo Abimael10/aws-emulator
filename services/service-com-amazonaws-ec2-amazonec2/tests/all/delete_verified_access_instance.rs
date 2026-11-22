@@ -155,6 +155,7 @@ fn seed_endpoint(engine: &engine::InMemoryEngine, instance_id: &str, group_id: &
                 },
                 pending: None,
                 policy_document: None,
+                policy_enabled: false,
             },
             None,
             REGION,

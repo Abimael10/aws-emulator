@@ -2275,6 +2275,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::verified_access_group_deletions`] holds for that resource, bounded the same way by
     /// [`MAX_REMEMBERED_VERIFIED_ACCESS_ENDPOINT_DELETIONS`].
     pub verified_access_endpoint_deletions: VecDeque<(String, VerifiedAccessEndpointRecord)>,
+    /// A `ModifyVerifiedAccessEndpointPolicy` `ClientToken` and the policy modification it
+    /// applied, so a repeat of the same request applies nothing further and the same token
+    /// carrying a different request is refused instead of rewriting the endpoint's policy
+    /// twice. Separate from [`Self::verified_access_endpoint_client_tokens`] for the reason
+    /// [`Self::verified_access_group_modification_client_tokens`] is separate from the
+    /// create's: a token names the request it was given with.
+    pub verified_access_endpoint_policy_client_tokens:
+        HashMap<String, VerifiedAccessEndpointPolicyModification>,
     /// Every AMI the account can see, by `ImageId`, as the modelled [`Image`] shape itself
     /// — the Amazon-published catalog a fresh account already has (see the module docs)
     /// plus any image a writer stores later. Ordered by id, which is the order the
@@ -3971,6 +3979,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_endpoint_client_tokens: HashMap::new(),
             verified_access_endpoint_delete_at: BTreeMap::new(),
             verified_access_endpoint_deletions: VecDeque::new(),
+            verified_access_endpoint_policy_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
             local_gateway_route_table_vpc_associations: BTreeMap::new(),
             // A local gateway route table lives on an Outpost, which no EC2 call creates.

@@ -166,7 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invalid_subnet_id_not_found, invalid_verified_access_group_id_not_found, iso8601_utc,
             request_region, require_service_state, tag_list, validate_tag_size,
             verified_access_endpoint_limit_exceeded, verified_access_endpoint_payload_bytes,
-            ClockTransition, VerifiedAccessEndpointRecord, MAX_CLIENT_TOKEN_CHARS,
+            verified_access_sse_reported, ClockTransition, VerifiedAccessEndpointRecord,
+            MAX_CLIENT_TOKEN_CHARS,
             MAX_RESOURCE_IDS, MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE,
             MAX_VERIFIED_ACCESS_ENDPOINTS, MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES,
             VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VPC,
@@ -487,19 +488,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // shape reports whether a customer managed key is in use and which one, so a
                 // request that named no specification reports the Amazon Web Services owned
                 // key: not customer managed, and no key ARN to name.
-                sse_specification: Some(VerifiedAccessSseSpecificationResponse {
-                    customer_managed_key_enabled: Some(
-                        input
-                            .sse_specification
-                            .as_ref()
-                            .and_then(|sse| sse.customer_managed_key_enabled)
-                            .unwrap_or(false),
-                    ),
-                    kms_key_arn: input
-                        .sse_specification
-                        .as_ref()
-                        .and_then(|sse| sse.kms_key_arn.clone()),
-                }),
+                sse_specification: Some(verified_access_sse_reported(
+                    input.sse_specification.as_ref(),
+                )),
                 rds_options: input.rds_options.as_ref().map(|options| {
                     VerifiedAccessEndpointRdsOptions {
                         protocol: options.protocol.clone(),
@@ -528,6 +519,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // carries no member for it, so it is kept beside the record for
             // `GetVerifiedAccessEndpointPolicy` to report.
             policy_document: input.policy_document.clone(),
+            // "The status of the Verified Access policy"
+            // (`GetVerifiedAccessEndpointPolicyResult$PolicyEnabled`): the create takes no
+            // member for it, so the document it was given is in force and an endpoint created
+            // without a document has no policy in force. `ModifyVerifiedAccessEndpointPolicy`
+            // is what turns it on or off afterwards.
+            policy_enabled: input.policy_document.is_some(),
         };
         // Both ceilings are asked only of a create that would STORE something: a replay
         // stores nothing, so it passes the ceilings a fresh create has to clear. A COUNT

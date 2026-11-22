@@ -2,8 +2,9 @@
 
 //! @op GetVerifiedAccessEndpointPolicy
 //! Implemented: reports the Verified Access policy the store holds for the endpoint the
-//! request names — the document `CreateVerifiedAccessEndpoint` accepted and whether that
-//! policy is in effect — and refuses an id the account holds no endpoint for. This is the
+//! request names — the document a create accepted or a `ModifyVerifiedAccessEndpointPolicy`
+//! set, and whether that policy is in effect — and refuses an id the account holds no endpoint
+//! for. This is the
 //! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -157,17 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // "The Verified Access policy document"
-        // (`GetVerifiedAccessEndpointPolicyResult$PolicyDocument`): the document the endpoint
-        // was created with, kept beside the stored endpoint
-        // ([`crate::state::VerifiedAccessEndpointRecord::policy_document`]) because the
-        // modelled endpoint shape carries no member for it. A document of no text is no
-        // policy at all, so it is reported as the absent member rather than as an empty one.
-        let policy_document = endpoint
-            .policy_document
-            .as_deref()
-            .filter(|document| !document.trim().is_empty())
-            .map(str::to_string);
+        // The policy as the STORE holds it, read through the ONE reading of an endpoint's
+        // policy every report of one answers with
+        // ([`crate::state::verified_access_endpoint_policy_reported`]) — the same reading
+        // `ModifyVerifiedAccessEndpointPolicy` answers through, so a read cannot report what
+        // that call set differently. "The Verified Access policy document"
+        // (`GetVerifiedAccessEndpointPolicyResult$PolicyDocument`) is kept beside the stored
+        // endpoint because the modelled endpoint shape carries no member for it, and a
+        // document of no text is no policy at all, so it reads as the absent member rather
+        // than as an empty one. This operation's output carries no `SseSpecification` member
+        // (`GetVerifiedAccessEndpointPolicyResult`), so the encryption options are reported by
+        // the modify and by a describe of the endpoints rather than here.
+        let policy = state::verified_access_endpoint_policy_reported(endpoint);
 
         // DryRun sits AFTER the named endpoint has been resolved and BEFORE anything is
         // reported: the flag asks whether the request WOULD have succeeded, so one that
@@ -178,11 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetVerifiedAccessEndpointPolicyOutput {
             // "The status of the Verified Access policy"
-            // (`GetVerifiedAccessEndpointPolicyResult$PolicyEnabled`): the endpoint enforces a
-            // policy exactly when it holds one to enforce, so the status is reported off the
-            // stored document rather than kept as a second fact that could disagree with it.
-            policy_enabled: Some(policy_document.is_some()),
-            policy_document,
+            // (`GetVerifiedAccessEndpointPolicyResult$PolicyEnabled`): whether the document the
+            // endpoint holds is in force. An endpoint holding no document enforces none, and
+            // `ModifyVerifiedAccessEndpointPolicy` is what turns the status of one it does hold
+            // on or off.
+            policy_enabled: policy.policy_enabled,
+            policy_document: policy.policy_document,
         })
     }
 }

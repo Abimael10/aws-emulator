@@ -1838,13 +1838,20 @@ pub struct VerifiedAccessEndpointRecord {
     /// "The Verified Access policy document"
     /// (`CreateVerifiedAccessEndpointRequest$PolicyDocument`), which the modelled endpoint
     /// shape carries no member for: `GetVerifiedAccessEndpointPolicy` is what reports it, and
-    /// whether the endpoint enforces a policy is read off this document rather than kept
-    /// beside it — nothing in this emulator can yet set that status on its own, because
-    /// `ModifyVerifiedAccessEndpointPolicy`, which takes `PolicyEnabled` as its own member,
-    /// is still a scaffold stub with its own open issue; implementing it means keeping the
-    /// status here as a stored fact beside the document. Kept here so the document the create
-    /// accepted is the one that reader answers with, rather than dropped on the floor.
+    /// `ModifyVerifiedAccessEndpointPolicy` the one call that replaces it. Kept here so the
+    /// document the create accepted is the one that reader will answer with, rather than
+    /// dropped on the floor. Whether that document is in force is the STATUS beside it
+    /// ([`Self::policy_enabled`]), because `ModifyVerifiedAccessEndpointPolicy` takes
+    /// `PolicyEnabled` as its own member and can turn it off while the document stays.
     pub policy_document: Option<String>,
+    /// "The status of the Verified Access policy"
+    /// (`GetVerifiedAccessEndpointPolicyResult$PolicyEnabled`), the second fact the endpoint
+    /// shape carries no member for: whether the document above is in force. A create takes no
+    /// member for it, so an endpoint the create was given a document for has its policy in
+    /// force and one created without a document has none;
+    /// `ModifyVerifiedAccessEndpointPolicy` is the one call that turns it on or off
+    /// ([`VerifiedAccessEndpointPolicyModification`]).
+    pub policy_enabled: bool,
 }
 
 /// One stored Verified Access group: the modelled shape every operation that reports one
