@@ -23,8 +23,9 @@
 //!   automatically used for delivered Amazon S3 files" — `Prefix`), or under the prefix
 //!   the enabled `DynamicPartitioningConfiguration`'s partition keys derive
 //!   ([`expand_prefix`]), and `ErrorOutputPrefix` for a record whose partition keys could
-//!   not be derived ("A prefix that Firehose evaluates and adds to failed records before
-//!   writing them to S3" — `ErrorOutputPrefix`).
+//!   not be derived — or whose partition would be one beyond the stream's active-partition
+//!   quota ([`active_partitions`]) — ("A prefix that Firehose evaluates and adds to failed
+//!   records before writing them to S3" — `ErrorOutputPrefix`).
 //! * IN WHICH ZONE — every time field of that location, and of the object's own name, is
 //!   the delivery's instant as the zone `CustomTimeZone` names reads it ("The time zone
 //!   you prefer. UTC is the default." — [`time_zone`]).
@@ -110,6 +111,9 @@ use crate::state::{
     DestinationConfigKind, StoredRecord,
 };
 
+/// The partitions a dynamically partitioned delivery may write at once, and what becomes of
+/// a record whose keys would open one beyond that quota.
+pub mod active_partitions;
 /// What one accepted record is split into before anything else reads it: the sub-records
 /// the destination's `RecordDeAggregation` processor declares.
 pub mod de_aggregation;
@@ -3012,7 +3016,11 @@ async fn grouped<'r>(
             records: records.iter().collect(),
         }]);
     };
-    let keys = partition_keys(query, records).await?;
+    // The keys each record derived, with the records whose partition would be one beyond the
+    // stream's active-partition quota moved to the error output
+    // ([`active_partitions::within_quota`]): a partition past the quota is not written under
+    // the data prefix.
+    let keys = active_partitions::within_quota(partition_keys(query, records).await?);
     // Grouped in a `BTreeMap` so the objects of one flush are built in a deterministic
     // order whatever order the records arrived in.
     let mut groups: BTreeMap<GroupKeys, Vec<&StoredRecord>> = BTreeMap::new();
@@ -3797,6 +3805,14 @@ struct Encoded {
     content_encoding: Option<String>,
 }
 
+/// The file extension a Snappy-compressed delivered object's name carries.
+///
+/// The ONE spelling for both `CompressionFormat` values that compress with Snappy: `Snappy`
+/// frames the bytes the snappy-java way and `HADOOP_SNAPPY` in Hadoop's block container, so
+/// the containers differ but the codec — and therefore the extension a consumer selects the
+/// decoder by — is the same.
+const SNAPPY_EXTENSION: &str = ".snappy";
+
 /// `body` encoded as the destination's `CompressionFormat` asks, with the file extension
 /// the delivered object's name carries and the content coding the stored object reports.
 ///
@@ -3811,13 +3827,16 @@ fn compressed(body: Vec<u8>, target: &S3Target) -> Option<Encoded> {
     let (encoded, default_extension) = match format {
         // "Specify a file extension. It will override the default file extension"
         // (`FileExtension`) — the default being the one the compression format carries:
-        // Firehose appends `.gz` to a GZIP object and `.zip` to a ZIP one, and leaves an
-        // uncompressed or Snappy object without one.
+        // Firehose names a delivered object `<prefix><stream>-<version>-<stamp>-<uuid>` plus
+        // that format's file extension, which is `.gz` for GZIP, `.zip` for ZIP, `.zst` for
+        // ZSTD and `.snappy` for BOTH Snappy and HADOOP_SNAPPY — the two share the extension
+        // and differ only in the container the bytes are framed in. An uncompressed object
+        // carries no extension at all.
         "GZIP" => (gzip(&body)?, ".gz"),
         "ZIP" => (zip(&body)?, ".zip"),
         "ZSTD" => (zstd(&body)?, ".zst"),
-        "Snappy" => (snappy(&body)?, ""),
-        "HADOOP_SNAPPY" => (hadoop_snappy(&body)?, ""),
+        "Snappy" => (snappy(&body)?, SNAPPY_EXTENSION),
+        "HADOOP_SNAPPY" => (hadoop_snappy(&body)?, SNAPPY_EXTENSION),
         UNCOMPRESSED => (body, ""),
         other => {
             ::tracing::warn!(%other, "the destination asks for a compression format this emulator cannot write");
@@ -3876,11 +3895,38 @@ fn zstd(body: &[u8]) -> Option<Vec<u8>> {
     ))
 }
 
-/// `body` in the Snappy framing format.
+/// The bytes a `Snappy` stream opens with: the magic of the framed Snappy container the
+/// snappy-java library writes, which is the framing a Firehose `Snappy` object carries.
+const SNAPPY_STREAM_MAGIC: &[u8] = b"\x82SNAPPY\x00";
+
+/// The stream format version, and the oldest version that can still read this stream: the two
+/// 32-bit big-endian counts the magic is followed by, both the first version of the container.
+const SNAPPY_STREAM_VERSION: u32 = 1;
+
+/// The uncompressed bytes one block of a `Snappy` stream holds, which is the block size that
+/// container is written in.
+const SNAPPY_STREAM_BLOCK_BYTES: usize = 32 * 1024;
+
+/// `body` in the framed Snappy container: the magic, the two version counts, and then the body
+/// in blocks, each one its compressed length as a 32-bit big-endian count followed by raw
+/// Snappy.
+///
+/// The CODEC is the maintained one ([`::snap::raw`]); what is written here is the container
+/// around its blocks, as for [`hadoop_snappy`] below — the two formats compress with the same
+/// codec and differ only in that container, which is the whole difference between the
+/// `Snappy` and `HADOOP_SNAPPY` values of `CompressionFormat`.
 fn snappy(body: &[u8]) -> Option<Vec<u8>> {
-    let mut encoder = ::snap::write::FrameEncoder::new(Vec::new());
-    encoder.write_all(body).ok()?;
-    encoder.into_inner().ok()
+    let mut framed = Vec::with_capacity(body.len() + SNAPPY_STREAM_MAGIC.len() + 8);
+    framed.extend_from_slice(SNAPPY_STREAM_MAGIC);
+    framed.extend_from_slice(&SNAPPY_STREAM_VERSION.to_be_bytes());
+    framed.extend_from_slice(&SNAPPY_STREAM_VERSION.to_be_bytes());
+    let mut encoder = ::snap::raw::Encoder::new();
+    for block in body.chunks(SNAPPY_STREAM_BLOCK_BYTES) {
+        let compressed = encoder.compress_vec(block).ok()?;
+        framed.extend_from_slice(&u32::try_from(compressed.len()).ok()?.to_be_bytes());
+        framed.extend_from_slice(&compressed);
+    }
+    Some(framed)
 }
 
 /// `body` in the Hadoop Snappy container: the uncompressed length of the stream, then one
@@ -4267,7 +4313,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        admissible_program, next_flush_at, MAX_PROGRAM_CONSTRUCTIONS, MAX_PROGRAM_ITERATIONS,
+        admissible_program, hadoop_snappy, next_flush_at, snappy, MAX_PROGRAM_CONSTRUCTIONS,
+        MAX_PROGRAM_ITERATIONS, SNAPPY_STREAM_BLOCK_BYTES, SNAPPY_STREAM_MAGIC,
     };
 
     /// RULE: the interval is the STREAM's flush cadence rather than a delay each record is
@@ -4560,5 +4607,84 @@ mod tests {
                 "case {program:?}: expected the program to be refused as {refusal:?}"
             );
         }
+    }
+
+    /// RULE: the two `CompressionFormat` values that compress with Snappy write the same
+    /// codec's blocks in different CONTAINERS — the framed stream for `Snappy`, Hadoop's
+    /// block framing for `HADOOP_SNAPPY` — so a reader of either container gets the bytes
+    /// back exactly, whatever the body's size relative to the container's block.
+    #[test]
+    fn a_snappy_object_carries_its_bodys_bytes_in_the_container_the_format_names() {
+        // (case, the body's length in bytes): empty, a body well inside one block, one
+        // exactly at the block boundary, and bodies that need a second and a third block.
+        for (case, length) in [
+            ("an empty body", 0usize),
+            ("a body inside one block", 17),
+            ("a body of exactly one block", SNAPPY_STREAM_BLOCK_BYTES),
+            (
+                "a body one byte past the block",
+                SNAPPY_STREAM_BLOCK_BYTES + 1,
+            ),
+            (
+                "a body of three blocks",
+                SNAPPY_STREAM_BLOCK_BYTES * 2 + 100,
+            ),
+        ] {
+            // Bytes that do not all compress to one run, so a block's compressed length is a
+            // value the container really has to carry.
+            let body: Vec<u8> = (0..length)
+                .map(|at| u8::try_from(at % 251).unwrap_or_default())
+                .collect();
+
+            let framed = snappy(&body).unwrap_or_else(|| panic!("case {case:?}: Snappy encodes"));
+            assert!(
+                framed.starts_with(SNAPPY_STREAM_MAGIC),
+                "case {case:?}: a Snappy stream opens with the container's magic, got {:?}",
+                &framed[..framed.len().min(SNAPPY_STREAM_MAGIC.len())]
+            );
+            assert_eq!(
+                read_snappy_stream(&framed),
+                body,
+                "case {case:?}: the framed container holds the body's own bytes"
+            );
+
+            let hadoop = hadoop_snappy(&body)
+                .unwrap_or_else(|| panic!("case {case:?}: HADOOP_SNAPPY encodes"));
+            assert_ne!(
+                hadoop.get(..SNAPPY_STREAM_MAGIC.len()),
+                Some(SNAPPY_STREAM_MAGIC),
+                "case {case:?}: the Hadoop container is not the framed one"
+            );
+            let read = ::snap::raw::Decoder::new()
+                .decompress_vec(&hadoop[8..])
+                .unwrap_or_else(|error| panic!("case {case:?}: the Hadoop block decodes: {error}"));
+            assert_eq!(
+                read, body,
+                "case {case:?}: the Hadoop container holds the body's own bytes"
+            );
+        }
+    }
+
+    /// The bytes a framed Snappy stream carries: past the magic and the two version counts,
+    /// each block is its compressed length as a 32-bit big-endian count followed by raw
+    /// Snappy, decoded with the maintained decoder.
+    fn read_snappy_stream(framed: &[u8]) -> Vec<u8> {
+        let mut rest = &framed[SNAPPY_STREAM_MAGIC.len() + 8..];
+        let mut read = Vec::new();
+        while !rest.is_empty() {
+            let (length, blocks) = rest.split_at(4);
+            let length = usize::try_from(u32::from_be_bytes(
+                length.try_into().expect("a length field is four bytes"),
+            ))
+            .expect("a block length fits this platform's addresses");
+            let (block, after) = blocks.split_at(length);
+            read.extend_from_slice(
+                &::snap::raw::Decoder::new()
+                    .decompress_vec(block)
+                    .expect("a block of the stream decodes"),
+            );
+            rest = after;
+        }
+        read
     }
 }

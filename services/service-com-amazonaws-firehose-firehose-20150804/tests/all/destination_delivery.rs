@@ -38,6 +38,12 @@ use crate::delivery_stream_lifecycle::{PAST_THE_TRANSITION, REGION, ROLE_ARN};
 #[path = "destination_delivery/record_de_aggregation.rs"]
 mod record_de_aggregation;
 
+/// How many partitions a dynamically partitioned destination writes at once, and what becomes
+/// of a record whose keys would open one beyond that quota. A child of this suite for the same
+/// reason as the module above.
+#[path = "destination_delivery/active_partition_quota.rs"]
+mod active_partition_quota;
+
 /// The endpoint every request here reaches the emulator on.
 const HOST: &str = "127.0.0.1:9297";
 
@@ -545,12 +551,16 @@ impl Compression {
     }
 
     /// The default file extension an object in this format carries.
+    ///
+    /// `Snappy` and `HADOOP_SNAPPY` share `.snappy`: the two differ in the container the
+    /// bytes are framed in, not in the codec a consumer selects by the key's suffix.
     fn extension(self) -> &'static str {
         match self {
             Self::Gzip => ".gz",
             Self::Zip => ".zip",
             Self::Zstd => ".zst",
-            Self::Uncompressed | Self::Snappy | Self::HadoopSnappy => "",
+            Self::Snappy | Self::HadoopSnappy => ".snappy",
+            Self::Uncompressed => "",
         }
     }
 
@@ -587,10 +597,32 @@ impl Compression {
                 decoded
             }
             Self::Snappy => {
+                // The framed Snappy container the snappy-java library reads: the magic and
+                // the two version counts, then the body in blocks, each one its compressed
+                // length as a 32-bit big-endian count followed by raw Snappy.
+                const MAGIC: &[u8] = b"\x82SNAPPY\x00";
+                assert!(
+                    body.starts_with(MAGIC) && body.len() >= MAGIC.len() + 8,
+                    "a Snappy object opens with the framed container's magic and its two \
+                     version counts, got {:?}",
+                    &body[..body.len().min(MAGIC.len() + 8)]
+                );
+                let mut rest = &body[MAGIC.len() + 8..];
                 let mut decoded = Vec::new();
-                snap::read::FrameDecoder::new(body)
-                    .read_to_end(&mut decoded)
-                    .expect("a Snappy object must decode");
+                while !rest.is_empty() {
+                    let (length, blocks) = rest.split_at(4);
+                    let length = usize::try_from(u32::from_be_bytes(
+                        length.try_into().expect("a length field is four bytes"),
+                    ))
+                    .expect("a block length fits this platform's addresses");
+                    let (block, after) = blocks.split_at(length);
+                    decoded.extend_from_slice(
+                        &snap::raw::Decoder::new()
+                            .decompress_vec(block)
+                            .expect("a Snappy block must decode"),
+                    );
+                    rest = after;
+                }
                 decoded
             }
             Self::HadoopSnappy => {

@@ -54,9 +54,11 @@ struct Row {
 /// The rows differ along what the rule generalises over: whether the destination names a
 /// `Prefix` at all and what form it takes (a plain folder, a nested one, one not ending in
 /// the delimiter, and one whose own `!{timestamp:...}` expression replaces the automatic
-/// segments), the `CompressionFormat` whose default extension the name takes (`UNCOMPRESSED`
-/// with none, `GZIP` with `.gz`, `ZIP` with `.zip`, and the member left out), a
-/// `FileExtension` overriding that default, and how many records the flushed buffer holds.
+/// segments), the `CompressionFormat` whose default extension the name takes (every value
+/// `smithy_query(query="shape", shape="CompressionFormat")` lists: `UNCOMPRESSED` with none,
+/// `GZIP` with `.gz`, `ZIP` with `.zip`, `ZSTD` with `.zst`, and `Snappy` and `HADOOP_SNAPPY`
+/// sharing `.snappy`, plus the member left out), a `FileExtension` overriding that default,
+/// and how many records the flushed buffer holds.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -89,6 +91,41 @@ fn rows() -> Vec<Row> {
             compression: Some("ZIP"),
             file_extension: None,
             extension: ".zip",
+            records: 1,
+        },
+        Row {
+            case: "a prefix with ZSTD, whose default extension the name takes",
+            prefix: Some("zst/"),
+            compression: Some("ZSTD"),
+            file_extension: None,
+            extension: ".zst",
+            records: 1,
+        },
+        // Both formats that compress with Snappy carry the SAME extension: the container
+        // the bytes are framed in differs, the codec a consumer selects by the suffix does
+        // not.
+        Row {
+            case: "a prefix with Snappy, whose default extension the name takes",
+            prefix: Some("snp/"),
+            compression: Some("Snappy"),
+            file_extension: None,
+            extension: ".snappy",
+            records: 2,
+        },
+        Row {
+            case: "a prefix with HADOOP_SNAPPY, which shares the Snappy extension",
+            prefix: Some("hsn/"),
+            compression: Some("HADOOP_SNAPPY"),
+            file_extension: None,
+            extension: ".snappy",
+            records: 1,
+        },
+        Row {
+            case: "a FileExtension overriding the Snappy default",
+            prefix: Some("snp-ext/"),
+            compression: Some("Snappy"),
+            file_extension: Some(".snappy.jsonl"),
+            extension: ".snappy.jsonl",
             records: 1,
         },
         Row {
