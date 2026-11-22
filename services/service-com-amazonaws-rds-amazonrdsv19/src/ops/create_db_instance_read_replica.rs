@@ -719,6 +719,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The replica is provisioned IN the group it names, so nothing is being
                 // attached to a running engine and nothing waits for a reboot.
                 db_parameter_group_attached_at: None,
+                // The option group the replica is provisioned with is applied as part of
+                // that provisioning where it HOLDS options to apply
+                // ([`crate::state::option_group_attachment_owed`]). Named explicitly so
+                // the SOURCE's attachment state is not swept in by the update below.
+                option_group_applies_at: crate::state::option_group_attachment_owed(
+                    option_group_name.as_deref(),
+                ),
                 option_group_name,
                 vpc_security_group_ids: input
                     .vpc_security_group_ids
@@ -1416,6 +1423,9 @@ fn resolve_source_cluster(
                 crate::state::default_option_group_name(&cluster.engine, entry.major_engine_version)
             })
         }),
+        // These are the SETTINGS a replica of this cluster is created from; the attachment
+        // the replica's own creation owes is recorded on the replica itself.
+        option_group_applies_at: None,
         vpc_security_group_ids: cluster.vpc_security_group_ids.clone(),
         // The legacy EC2-Classic DB security groups are not something a cluster carries, and
         // this operation has no member to name one.

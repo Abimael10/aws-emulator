@@ -156,6 +156,23 @@ fn assert_element_present(case: &str, envelope: &str, instance: &str, element: &
     );
 }
 
+/// The CA an instance created without a `CACertificateIdentifier` is issued under.
+const DEFAULT_CA_CERTIFICATE: &str = "rds-ca-rsa2048-g1";
+
+/// `CACertificateIdentifier` as `envelope` reports it for an instance created under
+/// `issued_under`.
+///
+/// The member names the CA of the certificate the instance HAS, so an envelope that
+/// answers an accepted delete reports none: the certificate goes with the instance the
+/// delete has started removing, and the member comes back empty. `CertificateDetails`
+/// still describes that certificate, which is why `CAIdentifier` is asserted separately.
+fn expected_ca_certificate_identifier<'a>(envelope: &str, issued_under: &'a str) -> &'a str {
+    match envelope {
+        "delete" => "",
+        _ => issued_under,
+    }
+}
+
 /// The year of an ISO-8601 timestamp the emulator reported.
 fn year_of(case: &str, member: &str, value: &str) -> i32 {
     value
@@ -344,7 +361,6 @@ const ALWAYS_PROJECTED: &[&str] = &[
 /// requests names any of these members. Each value is the one its member documents, or
 /// the only member of the enum that describes an instance nothing configured.
 const DEFAULTS: &[(&str, &str)] = &[
-    ("CACertificateIdentifier", "rds-ca-rsa2048-g1"),
     ("PreferredBackupWindow", "07:00-07:30"),
     ("PreferredMaintenanceWindow", "mon:08:00-mon:08:30"),
     ("MonitoringInterval", "0"),
@@ -455,6 +471,13 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
             for (member, expected) in DEFAULTS {
                 assert_member(row.case, envelope, instance, member, expected);
             }
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "CACertificateIdentifier",
+                expected_ca_certificate_identifier(envelope, DEFAULT_CA_CERTIFICATE),
+            );
 
             // The server certificate is the one the CA identifier names, and it expires
             // a year after the instance was created.
@@ -463,7 +486,7 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
                 envelope,
                 instance,
                 "CAIdentifier",
-                "rds-ca-rsa2048-g1",
+                DEFAULT_CA_CERTIFICATE,
             );
             let created_at = text(instance, "InstanceCreateTime");
             let valid_till = text(instance, "ValidTill");

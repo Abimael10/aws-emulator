@@ -878,6 +878,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A create provisions the instance IN the group it names, so nothing is being
             // attached to a running engine and nothing waits for a reboot.
             db_parameter_group_attached_at: None,
+            // The option group the instance is provisioned with is applied as part of that
+            // provisioning where it HOLDS options to apply, so the attachment is
+            // outstanding in this answer and owed from this instant
+            // ([`crate::state::option_group_attachment_owed`]).
+            option_group_applies_at: crate::state::option_group_attachment_owed(
+                option_group_name.as_deref(),
+            ),
             option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             db_security_group_names: input.db_security_groups.unwrap_or_default(),

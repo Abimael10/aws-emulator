@@ -3999,6 +3999,15 @@ const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 /// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] until a reboot applies the change.
 const PARAMETER_APPLY_STATUS_APPLYING: &str = "applying";
 
+/// The `OptionGroupMembership$Status` of an option group RDS has NOT applied to the
+/// instance yet — one of the values that member publishes ("`in-sync`, `pending-apply`,
+/// `pending-removal`, …").
+///
+/// The group is applied as part of provisioning the instance, so the attachment is
+/// outstanding at the instant the call that starts it is accepted and is applied from the
+/// next one ([`DbInstanceRecord::option_group_apply_status`]).
+const OPTION_GROUP_STATUS_PENDING_APPLY: &str = "pending-apply";
+
 /// The status RDS reports for a security-group membership that is in effect.
 const MEMBERSHIP_ACTIVE: &str = "active";
 

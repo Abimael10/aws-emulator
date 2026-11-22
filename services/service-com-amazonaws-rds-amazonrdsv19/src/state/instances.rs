@@ -26,6 +26,26 @@ pub fn standby_availability_zone(region: &str, primary: &str, multi_az: bool) ->
         .find(|zone| zone != primary)
 }
 
+/// Whether the attachment of the option group `named` is OWED to a DB instance that is
+/// being provisioned with it, and from when — which is what the membership's status reports
+/// ([`DbInstanceRecord::option_group_apply_status`],
+/// [`DbInstanceRecord::option_group_applies_at`]).
+///
+/// A group the ACCOUNT created holds the options it was given, and RDS applies those options
+/// to the instance as part of provisioning it: the attachment is outstanding when the call
+/// that provisions the instance answers, and owed from that same instant. One of the groups
+/// RDS provides ITSELF holds no option at all ([`is_default_option_group_name`]), so there
+/// is nothing to apply and its membership is in effect from the start; so is the membership
+/// of an instance that names no option group.
+///
+/// One reader for the rule, so every call that provisions a DB instance holding an option
+/// group — the create, the restores and the read replica — reports the same membership.
+pub fn option_group_attachment_owed(named: Option<&str>) -> Option<Instant> {
+    named
+        .filter(|name| !is_default_option_group_name(name))
+        .map(|_| Instant::now())
+}
+
 /// Whether a DB cluster running `engine` MANAGES its members' storage, port, master user
 /// and initial database, so that a member of it reports that cluster's values and none of
 /// its own.
@@ -222,6 +242,19 @@ pub struct DbInstanceRecord {
     /// is what keeps a group an instance uses from being deleted under it
     /// (`DeleteOptionGroup`).
     pub option_group_name: Option<String>,
+    /// When the option group [`Self::option_group_name`] names finishes being APPLIED to
+    /// this instance, for an instance whose attachment this service still owes.
+    ///
+    /// RDS applies the options of a group the ACCOUNT created to the instance as part of
+    /// PROVISIONING it, so the attachment is outstanding at the instant the call that
+    /// provisions the instance is accepted — which is what that call's own answer reports,
+    /// `pending-apply` ([`Self::option_group_apply_status`]) — and owed from that same
+    /// instant, so the next call materialises it
+    /// ([`super::ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`]) and every later
+    /// read reports the group applied. `None` for an instance whose group is applied, for
+    /// one placed in a group RDS provides itself, which holds no option to apply, and for
+    /// one in no option group at all ([`option_group_attachment_owed`]).
+    pub option_group_applies_at: Option<Instant>,
     pub vpc_security_group_ids: Vec<String>,
     /// The legacy EC2-Classic DB security groups the request named, which is normally
     /// none: "This setting applies to the legacy EC2-Classic platform, which is no
@@ -345,6 +378,16 @@ impl DbInstanceRecord {
     /// the store.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
         self.settle_deferred_modification();
+        // The option group the instance is provisioned with is attached as part of that
+        // provisioning, owed from the instant the call that started it was accepted, so it
+        // is applied here — on the first call after that one
+        // ([`Self::option_group_applies_at`]).
+        if self
+            .option_group_applies_at
+            .is_some_and(|applies_at| now >= applies_at)
+        {
+            self.option_group_applies_at = None;
+        }
         // A change of the activity stream's audit policy state settles on its own clock,
         // whatever the instance's status is doing: the policy state is not the instance's
         // status ([`ActivityStreamPolicy`]).
@@ -635,6 +678,39 @@ impl DbInstanceRecord {
             PARAMETER_APPLY_STATUS_PENDING_REBOOT
         } else {
             MEMBERSHIP_IN_SYNC
+        }
+    }
+
+    /// `OptionGroupMembership$Status`: "the status of the DB instance's option group
+    /// membership. Valid values are: `in-sync`, `pending-apply`, …".
+    ///
+    /// The membership reports the group as still waiting to be applied while this service
+    /// owes its attachment — RDS applies the options of a group the account created as part
+    /// of provisioning the instance, so the call that provisions it answers with nothing
+    /// applied yet ([`Self::option_group_applies_at`]) — and `in-sync` once it is attached,
+    /// which every read after that provisioning call reports.
+    pub fn option_group_apply_status(&self) -> &'static str {
+        match self.option_group_applies_at {
+            Some(_) => OPTION_GROUP_STATUS_PENDING_APPLY,
+            None => MEMBERSHIP_IN_SYNC,
+        }
+    }
+
+    /// `CACertificateIdentifier`: "the identifier of the CA certificate for this DB
+    /// instance" — the CA the instance's server certificate is issued under, for an instance
+    /// that HAS one.
+    ///
+    /// An instance whose delete has been accepted no longer has one: its certificate goes
+    /// with the instance that was issued it, so the member comes back EMPTY from the moment
+    /// the delete is accepted ([`Self::is_deleting`]) rather than naming a CA that certifies
+    /// nothing. `CertificateDetails` still describes the certificate the instance ran under,
+    /// which is a fact about that certificate rather than about the association this member
+    /// reports.
+    pub fn reported_ca_certificate_identifier(&self) -> &str {
+        if self.is_deleting() {
+            ""
+        } else {
+            &self.ca_certificate_identifier
         }
     }
 
@@ -1070,7 +1146,9 @@ impl DbInstanceRecord {
                     .iter()
                     .map(|name| OptionGroupMembership {
                         option_group_name: Some(name.clone()),
-                        status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                        // Whether the group is attached YET, which is what the membership
+                        // reports ([`Self::option_group_apply_status`]).
+                        status: Some(self.option_group_apply_status().to_string()),
                     })
                     .collect(),
             ),
@@ -1154,7 +1232,9 @@ impl DbInstanceRecord {
             storage_encrypted: Some(self.storage_encrypted),
             kms_key_id: self.kms_key_id.clone(),
             dbi_resource_id: Some(self.dbi_resource_id.clone()),
-            ca_certificate_identifier: Some(self.ca_certificate_identifier.clone()),
+            ca_certificate_identifier: Some(
+                self.reported_ca_certificate_identifier().to_string(),
+            ),
             certificate_details: Some(CertificateDetails {
                 ca_identifier: Some(self.ca_certificate_identifier.clone()),
                 valid_till: Some(self.certificate_valid_till()),
