@@ -16,8 +16,6 @@
 //! service's request-claiming seam, and the handlers — so what is asserted is what a
 //! SimpleDB client observes.
 
-use std::time::{Duration, Instant};
-
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -28,7 +26,9 @@ use service_com_amazonaws_simpledbv2_simpledbv2::state::simpledb_domains::{
     MAX_DOMAIN_NAME_LEN, MAX_LIST_DOMAINS, MAX_TEXT_BYTES, MIN_DOMAIN_NAME_LEN,
 };
 
-use crate::domain_export_lifecycle::{call, emulator, error_code, member, ok_call, REGION};
+use crate::domain_export_lifecycle::{
+    call, emulator, error_code, member, ok_call, poll_until_succeeded, REGION,
+};
 
 /// The XML namespace every document of this API carries.
 const SDB_NAMESPACE: &str = "http://sdb.amazonaws.com/doc/2009-04-15/";
@@ -37,15 +37,9 @@ const SDB_NAMESPACE: &str = "http://sdb.amazonaws.com/doc/2009-04-15/";
 /// admits, so no case is refused on it.
 const BUCKET: &str = "sdb-query-api-bucket";
 
-/// How long a case waits for a status move the clock owes before giving up.
-///
-/// Generous on purpose: what is asserted is that the move HAPPENS, never how fast the
-/// host is, and every wait below polls for the condition instead of sleeping a fixed
-/// time.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long one poll waits before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+// How long a case waits for a status move the clock owes, and how long one poll waits
+// before looking again, are the harness's (`domain_export_lifecycle::poll_get_export`):
+// every wait below polls for the condition instead of sleeping a fixed time.
 
 /// One call to the 2009-04-15 API: `(http status, response body)`.
 ///
@@ -783,35 +777,6 @@ async fn list_domains_pages_in_name_order() {
         None,
         "case a page that reached the end: no continuation token may be issued, got {whole}"
     );
-}
-
-/// Read `export_arn` until it reports `SUCCEEDED`, and hand back the document that first
-/// reported it.
-///
-/// Polls for the CONDITION instead of sleeping a fixed time: what a caller asserts is that
-/// the export completes, never how fast this host is.
-///
-/// The wait between two looks is a BLOCKING sleep: this crate's `tokio` dev-dependency
-/// enables only `macros`/`rt`, not the `time` feature `tokio::time::sleep` needs, and a
-/// case here owns its thread and has no other call in flight while it waits.
-async fn poll_until_succeeded(
-    router: &MultiServiceRouter,
-    case: &str,
-    export_arn: &str,
-) -> serde_json::Value {
-    let request = json!({ "exportArn": export_arn });
-    let deadline = Instant::now() + SETTLE_DEADLINE;
-    loop {
-        let reported = ok_call(router, "GetExport", &request).await;
-        if member(&reported, "exportStatus").as_deref() == Some("SUCCEEDED") {
-            return reported;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case}: the export never reached SUCCEEDED; last report {reported:?}"
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
 }
 
 /// One row of [`an_exports_item_count_is_the_exported_domains_own_item_total`]: how many

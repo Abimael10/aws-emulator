@@ -20,9 +20,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_simpledbv2_simpledbv2::state::{
-    ComAmazonawsSimpledbv2Simpledbv2State, StoredExport, IN_PROGRESS_SPAN, MANIFEST_SUMMARY_FILE,
-    MAX_EXPORTS, MAX_EXPORT_ARN_LEN, MAX_PAGE_SIZE, MIN_EXPORT_ARN_LEN, STATUS_PENDING,
-    SUCCEEDED_SPAN,
+    ComAmazonawsSimpledbv2Simpledbv2State, StoredExport, IN_PROGRESS_SPAN, MAX_EXPORTS,
+    MAX_EXPORT_ARN_LEN, MAX_PAGE_SIZE, MIN_EXPORT_ARN_LEN, STATUS_PENDING, SUCCEEDED_SPAN,
 };
 use service_com_amazonaws_simpledbv2_simpledbv2::EmulatedService;
 
@@ -31,8 +30,58 @@ pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 pub(crate) const ACCOUNT: &str = "000000000000";
 
-/// Margin added to a documented span before asserting the move it owes has happened.
-const SETTLE_MARGIN: Duration = Duration::from_millis(80);
+/// How long a case waits for a status move the clock owes before giving up.
+///
+/// Generous on purpose: what a case asserts is that the move HAPPENS, never how fast
+/// this host is, and every wait below looks again for the condition instead of sleeping
+/// a fixed time.
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long one look waits before looking again.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Read the export `export_arn` back through `GetExport` until `settled` holds of the
+/// document it answers, and hand that document back.
+///
+/// Waits for the CONDITION, never for a fixed time: what a case asserts is that the move
+/// the clock owes happens, not how fast this host runs. The wait between two looks is a
+/// BLOCKING sleep: this crate's `tokio` dev-dependency enables only `macros`/`rt`, not
+/// the `time` feature `tokio::time::sleep` needs, and a case owns its thread with no
+/// other call in flight while it waits.
+pub(crate) async fn poll_get_export(
+    router: &MultiServiceRouter,
+    case: &str,
+    export_arn: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
+    let request = json!({ "exportArn": export_arn });
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let reported = ok_call(router, "GetExport", &request).await;
+        if settled(&reported) {
+            return reported;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: the export never reached the status this case waits for; last \
+             report {reported:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Read `export_arn` until it reports `SUCCEEDED`, and hand back the document that
+/// first reported it. See [`poll_get_export`].
+pub(crate) async fn poll_until_succeeded(
+    router: &MultiServiceRouter,
+    case: &str,
+    export_arn: &str,
+) -> Value {
+    poll_get_export(router, case, export_arn, |reported| {
+        member(reported, "exportStatus").as_deref() == Some("SUCCEEDED")
+    })
+    .await
+}
 
 /// One emulator with an empty store — no exports and NO domains — mounted exactly as
 /// `build_router` mounts it.
@@ -304,7 +353,7 @@ fn start_cases() -> Vec<StartCase> {
 //
 // 850 = 17 * 50: fifty copies of a 17-character group, ten per source line. The
 // assertion in `start_then_get_reports_every_stored_member` pins the length.
-const LONGEST_KEY_PREFIX: &str = "0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
+pub(crate) const LONGEST_KEY_PREFIX: &str = "0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
      0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
      0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
      0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
@@ -998,42 +1047,42 @@ async fn export_status_advances_on_the_clock() {
         "case immediately after the start: expected PENDING, got {pending:?}"
     );
 
-    // A blocking sleep is deliberate: this test owns its thread, nothing in the
-    // handler sleeps, and this crate's tokio does not enable the `time` feature
-    // `tokio::time::sleep` needs.
-    std::thread::sleep(IN_PROGRESS_SPAN + SETTLE_MARGIN);
-    let in_progress = ok_call(&router, "GetExport", &get).await;
+    // The next status the clock owes, waited for by looking again rather than by
+    // sleeping a span: the first read past the PENDING span reports the move it owed.
+    let in_progress = poll_get_export(&router, "past the PENDING span", &export_arn, |r| {
+        member(r, "exportStatus").as_deref() != Some("PENDING")
+    })
+    .await;
     assert_eq!(
         member(&in_progress, "exportStatus").as_deref(),
         Some("IN_PROGRESS"),
-        "case past the IN_PROGRESS span: expected IN_PROGRESS, got {in_progress:?}"
+        "case past the PENDING span: expected IN_PROGRESS, got {in_progress:?}"
     );
     assert!(
         in_progress.get("exportManifest").is_none(),
-        "case past the IN_PROGRESS span: the manifest belongs to SUCCEEDED, got {in_progress:?}"
+        "case past the PENDING span: the manifest belongs to SUCCEEDED, got {in_progress:?}"
     );
 
-    std::thread::sleep(SUCCEEDED_SPAN + SETTLE_MARGIN);
-    let succeeded = ok_call(&router, "GetExport", &get).await;
+    let succeeded = poll_until_succeeded(&router, "the export completes", &export_arn).await;
     assert_eq!(
         member(&succeeded, "exportStatus").as_deref(),
         Some("SUCCEEDED"),
-        "case past the SUCCEEDED span: expected SUCCEEDED, got {succeeded:?}"
+        "case a completed export: expected SUCCEEDED, got {succeeded:?}"
     );
-    let expected_manifest = format!(
-        "snapshots/{}/{MANIFEST_SUMMARY_FILE}",
-        export_id_of(&export_arn)
-    );
+    // The manifest key, spelled out rather than built from the service's own constants:
+    // the caller's prefix verbatim, the fixed `AmazonSimpleDB` segment, the exported
+    // domain and this export's own ARN, then the fixed `manifest-summary.json`.
+    let expected_manifest =
+        format!("snapshots//AmazonSimpleDB/clocked/{export_arn}/manifest-summary.json");
     assert_eq!(
         member(&succeeded, "exportManifest").as_deref(),
         Some(expected_manifest.as_str()),
-        "case past the SUCCEEDED span: the manifest key is built from the stored prefix and \
-         the export id; expected {expected_manifest:?}, got {succeeded:?}"
+        "case a completed export: expected {expected_manifest:?}, got {succeeded:?}"
     );
     assert_eq!(
         succeeded.get("itemsCount").and_then(Value::as_i64),
         Some(0),
-        "case past the SUCCEEDED span: this service models no item-level operation, so the \
+        "case a completed export: this service models no item-level operation, so the \
          exported-item count is zero, got {succeeded:?}"
     );
     let requested_at = started
@@ -1044,11 +1093,11 @@ async fn export_status_advances_on_the_clock() {
         .get("exportDataCutoffTime")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| {
-            panic!("case past the SUCCEEDED span: expected an exportDataCutoffTime, got {succeeded:?}")
+            panic!("case a completed export: expected an exportDataCutoffTime, got {succeeded:?}")
         });
     assert!(
         cutoff >= requested_at,
-        "case past the SUCCEEDED span: the cutoff must not precede the request; requestedAt \
+        "case a completed export: the cutoff must not precede the request; requestedAt \
          {requested_at}, cutoff {cutoff}"
     );
 

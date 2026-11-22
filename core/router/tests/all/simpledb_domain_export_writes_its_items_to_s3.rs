@@ -8,10 +8,13 @@
 //! export artifacts" (`smithy_query(query="operation",operation="StartDomainExport")`), so
 //! the export IS the write: the items the domain holds — the ones a client wrote with the
 //! Amazon SimpleDB 2009-04-15 `PutAttributes` this same endpoint serves — are serialized
-//! into data objects under that prefix, beside the manifest summary the finished export
-//! reports as its `exportManifest` ("the name of the manifest summary file for the
-//! export"). An export pointed at a bucket the object store does not hold writes nothing
-//! and reaches `FAILED` carrying that refusal instead of `SUCCEEDED`.
+//! into data objects inside that one export's key space, beside the manifest summary the
+//! finished export reports as its `exportManifest` ("the name of the manifest summary file
+//! for the export"). That key space is the prefix the start named (verbatim, joined with
+//! one separator), the service's fixed `AmazonSimpleDB` segment, the exported domain name
+//! and the export's own ARN, so a client that reads the reported key back recovers both.
+//! An export pointed at a bucket the object store does not hold writes nothing and reaches
+//! `FAILED` carrying that refusal instead of `SUCCEEDED`.
 //!
 //! The write goes through the in-process callback into this emulator's own object store, so
 //! a single-service router has no Amazon S3 to write into: that is why this suite lives
@@ -401,14 +404,27 @@ async fn a_domain_export_writes_the_items_the_domain_holds_into_the_bucket() {
             "case {case:?}: the manifest the export reports ({manifest_key:?}) must be an \
              object of the bucket, got {keys:?}"
         );
+        // The key space one export's objects sit in: the prefix the start named (verbatim,
+        // joined to the fixed segment with one separator), the service's own fixed
+        // segment, the exported domain and the export's ARN.
+        let domain = row.domain;
+        let export_space = match row.prefix {
+            Some(prefix) => format!("{prefix}/AmazonSimpleDB/{domain}/{arn}/"),
+            None => format!("AmazonSimpleDB/{domain}/{arn}/"),
+        };
         let data_keys: Vec<&String> = keys
             .iter()
-            .filter(|key| key.starts_with(&format!("{prefix}{export_id}/")) && **key != manifest_key)
+            .filter(|key| key.starts_with(&export_space) && **key != manifest_key)
             .collect();
         assert!(
             !data_keys.is_empty(),
-            "case {case:?}: the export writes its data under {prefix:?}{export_id}/, got \
-             {keys:?}"
+            "case {case:?}: the export writes its data under {export_space:?}, got {keys:?}"
+        );
+        assert_eq!(
+            manifest_key,
+            format!("{export_space}manifest-summary.json"),
+            "case {case:?}: the reported manifest is the summary file of the export's own \
+             key space {export_space:?}, got {manifest_key:?}"
         );
 
         let mut exported: Vec<Value> = Vec::new();

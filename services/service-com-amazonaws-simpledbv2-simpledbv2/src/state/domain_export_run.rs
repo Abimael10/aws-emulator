@@ -148,19 +148,18 @@ impl ExportDestination {
 /// The objects the export `export` writes for `domain`: its data file, and the manifest
 /// summary the finished export reports.
 ///
-/// Both keys sit under the export's own `s3KeyPrefix`/`exportId` path, so two exports of
-/// one domain into one prefix never overwrite each other, and the manifest key is the ONE
-/// the record reports ([`StoredExport::manifest_key`]) rather than a second rendering of
-/// it.
+/// Both keys sit inside the export's own key space
+/// ([`StoredExport::export_key_prefix`]), so two exports of one domain into one prefix
+/// never overwrite each other, and the manifest key is the ONE the record reports
+/// ([`StoredExport::manifest_key`]) rather than a second rendering of it.
 pub fn export_objects(export: &StoredExport, domain: &Domain) -> Vec<ExportObject> {
     let items: Vec<::serde_json::Value> = domain
         .items()
         .map(|(name, attributes)| item_document(name, attributes))
         .collect();
     let data_key = format!(
-        "{prefix}{id}/{DATA_DIRECTORY}/{DATA_FILE}",
-        prefix = export.s3_key_prefix.as_deref().unwrap_or(""),
-        id = export.export_id,
+        "{prefix}{DATA_DIRECTORY}/{DATA_FILE}",
+        prefix = export.export_key_prefix(),
     );
     // ONE document carrying the exported items in order, so a reader parses the data file
     // whole and walks the items it holds; a domain holding none is an empty list rather
@@ -359,8 +358,7 @@ mod tests {
             let domain = store.domain("orders").expect("the seeded domain");
             let objects = export_objects(&export, domain);
             let keyed = |key: &str| objects.iter().find(|object| object.key == key).cloned();
-            let prefix = prefix.unwrap_or("");
-            let data_key = format!("{prefix}e-1/{DATA_DIRECTORY}/{DATA_FILE}");
+            let data_key = format!("{}{DATA_DIRECTORY}/{DATA_FILE}", export.export_key_prefix());
             let data = keyed(&data_key).unwrap_or_else(|| {
                 panic!("case {case:?}: the data object {data_key:?} must be written, got {objects:?}")
             });

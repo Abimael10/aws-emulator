@@ -133,6 +133,15 @@ pub const EXPORT_ARN_RESOURCE_KEYWORD: &str = "export";
 /// `exportManifest` reports once the export has succeeded.
 pub const MANIFEST_SUMMARY_FILE: &str = "manifest-summary.json";
 
+/// The service-fixed key segment every export's objects sit under, between the
+/// caller's `s3KeyPrefix` and the exported domain's own part of the key.
+///
+/// It is the service's name as the export key layout spells it, and it is the same for
+/// every export of every domain: the only variable parts of an export's key space are
+/// the prefix the request named, the domain it exported and the ARN this service minted
+/// for the export ([`StoredExport::export_key_prefix`]).
+pub const EXPORT_KEY_SERVICE_SEGMENT: &str = "AmazonSimpleDB";
+
 /// One stored export: everything `StartDomainExport` was given, what the service
 /// minted for it, and the instants the clock owes its status moves.
 #[derive(Debug, Clone)]
@@ -205,20 +214,39 @@ impl StoredExport {
         }
     }
 
-    /// The S3 key of this export's manifest summary — the key the export writes its
-    /// manifest to: the stored `s3KeyPrefix` (empty when the start named none), this
-    /// export's id, and the summary file name. Those are the only inputs the service
-    /// has for it.
+    /// The S3 key space this one export's objects are written under: the stored
+    /// `s3KeyPrefix` (absent when the start named none), then the service-fixed
+    /// [`EXPORT_KEY_SERVICE_SEGMENT`], then the exported domain's name, then this
+    /// export's own ARN — so one export's objects never collide with another's and a
+    /// client reading a key back recovers the domain and the export it belongs to.
+    ///
+    /// The caller's prefix is reproduced VERBATIM — never trimmed, never normalised —
+    /// and the fixed segment is joined to it with one separator, so a prefix that already
+    /// ends in a separator keeps it and the two separators both appear, exactly as the
+    /// caller wrote the prefix. A start that named no prefix at all has nothing to join
+    /// to, so its key space begins at the fixed segment rather than at an empty one. The
+    /// returned value ends with a separator, so a file name appended to it is an object
+    /// inside this export's space.
+    pub fn export_key_prefix(&self) -> String {
+        let space = format!(
+            "{EXPORT_KEY_SERVICE_SEGMENT}/{domain}/{arn}/",
+            domain = self.domain_name,
+            arn = self.export_arn,
+        );
+        match self.s3_key_prefix.as_deref() {
+            Some(prefix) => format!("{prefix}/{space}"),
+            None => space,
+        }
+    }
+
+    /// The S3 key of this export's manifest summary: the summary file name inside this
+    /// export's own key space ([`Self::export_key_prefix`]).
     ///
     /// It is the key the export's own run WRITES the manifest to
     /// ([`domain_export_run::export_objects`]), so an `exportManifest` a finished export
     /// reports names an object a caller of the bucket fetches.
     pub fn manifest_key(&self) -> String {
-        format!(
-            "{}{}/{MANIFEST_SUMMARY_FILE}",
-            self.s3_key_prefix.as_deref().unwrap_or(""),
-            self.export_id
-        )
+        format!("{}{MANIFEST_SUMMARY_FILE}", self.export_key_prefix())
     }
 
     /// Whether this export was started with exactly the parameters now being asked

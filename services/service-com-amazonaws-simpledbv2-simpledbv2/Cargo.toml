@@ -50,6 +50,9 @@ percent-encoding = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod`: declares one module per `tests/all/<name>.rs`, so a new suite is a new file
+# and nothing else.
+automod = { workspace = true }
 # `form_urlencoded`: the ONE encoder of the `application/x-www-form-urlencoded` body a
 # SimpleDB 2009-04-15 request carries, so the suite that drives that wire
 # (`tests/all/simpledb_query_api.rs`) sends what a client sends rather than a form it
