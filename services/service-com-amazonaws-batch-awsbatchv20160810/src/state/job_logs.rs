@@ -35,6 +35,18 @@
 //! to that other driver's destination, so there is no CloudWatch Logs stream for it at all
 //! and none is reported.
 //!
+//! # WHO creates the log group
+//!
+//! The two are not the same creation. [`DEFAULT_JOB_LOG_GROUP`] is the group AWS Batch
+//! HOLDS for its jobs' output — "the log group for Batch jobs is `/aws/batch/job`"
+//! (`AttemptContainerDetail$logStreamName`) — so this SERVICE creates it, once, before the
+//! job's container is launched ([`create_job_log_group`], called from [`super::ecs_task`]);
+//! the job's container agent is never asked to create it, and so a job's execution role
+//! needs no group-creation permission to run. A group the job's OWN configuration asked
+//! the driver to create ([`OPTION_CREATE_GROUP`]) is the driver's creation, made as that
+//! execution role, so the instruction is passed to the task the job runs as and whoever
+//! owns the launch decides it.
+//!
 //! # How it reaches the log service
 //!
 //! The creation is queued under this store's lock, where the placement happens, and drained
@@ -122,10 +134,13 @@ pub struct JobLogStream {
     pub log_group: String,
     /// The stream itself, as the placement named it ([`job_log_stream_name`]).
     pub log_stream: String,
-    /// Whether the log GROUP is created along with the stream: Batch's own default group is
-    /// the service's to hold, and a group the configuration names is created only when it
-    /// asked for that ([`OPTION_CREATE_GROUP`]).
-    pub create_group: bool,
+    /// Whether the group is the one AWS Batch HOLDS for job logs ([`DEFAULT_JOB_LOG_GROUP`]):
+    /// this service's own to create, which it does before the job's container is launched.
+    pub service_holds_group: bool,
+    /// Whether the job's own configuration asked the log DRIVER to create the group it
+    /// delivers into ([`OPTION_CREATE_GROUP`]) — a creation the container agent makes as the
+    /// job's execution role.
+    pub driver_creates_group: bool,
     /// The events the driver delivers to the stream, as `(timestamp, message)` in the order
     /// the container wrote them.
     ///
@@ -187,19 +202,62 @@ pub fn job_log_target(
         Some(_) => return None,
         None => placement_region.to_string(),
     };
-    // The group Batch itself holds for job logs is created with the stream; any other one
-    // is the caller's, and the driver creates it only when the option says so.
-    let create_group = log_group == DEFAULT_JOB_LOG_GROUP
-        || options
-            .get(OPTION_CREATE_GROUP)
-            .is_some_and(|value| value == OPTION_TRUE);
+    // WHO creates the group the delivery goes to (see the module docs): the group Batch holds
+    // for job logs is this service's own, and any other one is the caller's — created by the
+    // driver, as the job's execution role, only when the configuration asked for that.
+    let service_holds_group = log_group == DEFAULT_JOB_LOG_GROUP;
+    let driver_creates_group = options
+        .get(OPTION_CREATE_GROUP)
+        .is_some_and(|value| value == OPTION_TRUE);
     Some(JobLogStream {
         region,
         log_group,
         log_stream: log_stream.to_string(),
-        create_group,
+        service_holds_group,
+        driver_creates_group,
         events: Vec::new(),
     })
+}
+
+impl JobLogStream {
+    /// Whether the log GROUP has to exist before the stream can be created in it and nothing
+    /// has created it yet — either of the two creations the module docs set out.
+    pub fn group_is_created(&self) -> bool {
+        self.service_holds_group || self.driver_creates_group
+    }
+}
+
+/// Create the log group `log_group` in `region`'s CloudWatch Logs, as THIS SERVICE: the group
+/// AWS Batch holds for its jobs' output is Batch's own to create, so it is there before a job's
+/// container agent initialises the logger that delivers into it.
+///
+/// Best effort, like every cross-service delivery in this tree: a group that already exists is
+/// the group this call would have made, so that refusal is not a failure, and any other answer
+/// is traced and the caller's own step stands.
+pub(super) async fn create_job_log_group(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+) {
+    match logs_client(callback, region)
+        .create_log_group()
+        .log_group_name(log_group)
+        .send()
+        .await
+    {
+        Ok(_) => {}
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|service| service.is_resource_already_exists_exception()) => {}
+        Err(error) => {
+            ::tracing::warn!(
+                log_group = %log_group,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a Batch job's log group could not be created"
+            );
+        }
+    }
 }
 
 impl ComAmazonawsBatchAwsbatchv20160810State {
@@ -249,26 +307,8 @@ pub(super) async fn open_pending_log_streams(
     let streams = state.lock().take_pending_log_streams();
     for stream in streams {
         let client = logs_client(callback, &stream.region);
-        if stream.create_group {
-            match client
-                .create_log_group()
-                .log_group_name(&stream.log_group)
-                .send()
-                .await
-            {
-                Ok(_) => {}
-                Err(error)
-                    if error
-                        .as_service_error()
-                        .is_some_and(|service| service.is_resource_already_exists_exception()) => {}
-                Err(error) => {
-                    ::tracing::warn!(
-                        log_group = %stream.log_group,
-                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                        "a placed Batch job's log group could not be created"
-                    );
-                }
-            }
+        if stream.group_is_created() {
+            create_job_log_group(callback, &stream.region, &stream.log_group).await;
         }
         match client
             .create_log_stream()

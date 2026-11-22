@@ -8,13 +8,13 @@
 //!
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
-//! index covers, carrying a vector of the index's dimensions), and each result item is what
-//! the index REPORTS for it ([`crate::state::VectorIndex::reported_entry`]) — "only
+//! index covers, carrying a vector of the index's dimensions), and each result item is the
+//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) — "only
 //! attributes projected into the vector index can be retrieved"
 //! (`SearchVectors$ProjectionExpression`), so a search reports the attributes the index
-//! projects and nothing the table holds outside them; the vector the item was found by is
-//! the index's own search key, answered as the score computed from it rather than as an
-//! attribute of the entry.
+//! holds for the item and nothing the table holds outside them; the vector it was found by
+//! is one of those, reported as the index holds it — a list of 32-bit floats — beside the
+//! score computed from it.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -462,13 +462,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
-            // What a search REPORTS is the attributes the index's `Projection` projects —
-            // "only attributes projected into the vector index can be retrieved"
-            // (`SearchVectors$ProjectionExpression`) — which is narrower than what the index
-            // holds for the item: the vector it was found by is the index's own search key,
-            // reported only where the projection projects that attribute
-            // ([`crate::state::VectorIndex::reported_entry`]).
-            let entry = index.reported_entry(item, &table.key_schema);
+            // What a search REPORTS is the entry the index HOLDS for the item — "only
+            // attributes projected into the vector index can be retrieved"
+            // (`SearchVectors$ProjectionExpression`), which is the attributes its `Projection`
+            // projects together with the ones it indexes the item by — and the vector among
+            // them comes back as the index holds it, a list of 32-bit floats
+            // ([`crate::state::VectorIndex::index_entry`]).
+            let entry = index.index_entry(item, &table.key_schema);
             let projected = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,

@@ -1362,16 +1362,17 @@ impl VectorIndex {
     }
 
     /// The entry this index holds for one covered item: just the attributes it stores
-    /// ([`Self::stored_attributes`]), which is what a write of the entry meters and what the
-    /// search condition filters on.
+    /// ([`Self::stored_attributes`]), which is what a write of the entry meters, what the
+    /// search condition filters on, and what a search REPORTS for the item.
     ///
     /// An index holds "attributes that are copied (projected) from the table into the vector
     /// index" (`VectorIndex$Projection`) and, beside them, the vector attribute it finds an
     /// item by and the attributes its search schema filters on
     /// ([`Self::consumed_attributes`]) — so one entry serves every question about what the
     /// index HOLDS for an item: what a write of it meters
-    /// ([`Table::vector_write_request_bytes`]), and what a condition reads. What a search
-    /// REPORTS is the narrower [`Self::reported_entry`].
+    /// ([`Table::vector_write_request_bytes`]), what a condition reads, and what "only
+    /// attributes projected into the vector index can be retrieved"
+    /// (`SearchVectors$ProjectionExpression`) lets a search hand back.
     ///
     /// The vector itself is held as the index holds it rather than as the item does
     /// ([`stored_vector`]): "each element is a 32-bit IEEE-754 floating point number"
@@ -1399,26 +1400,6 @@ impl VectorIndex {
     /// projection.
     fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
         item_size(&self.index_entry(item, table_key_schema))
-    }
-
-    /// The entry a SEARCH through this index REPORTS for one covered item: the attributes its
-    /// `Projection` projects, and never the vector attribute it finds items by.
-    ///
-    /// "Only attributes projected into the vector index can be retrieved"
-    /// (`SearchVectors$ProjectionExpression`), and the vector is the index's own SEARCH KEY
-    /// rather than an attribute copied from the table into it
-    /// (`VectorIndex$Projection`: "attributes that are copied (projected) from the table into
-    /// the vector index") — a search answers the score it computed from that vector, so the
-    /// coordinates themselves are not part of the entry it hands back, whatever the index's
-    /// `Projection` covers. A `ProjectionExpression` naming the attribute therefore reports
-    /// nothing for it, exactly as one naming an attribute the index does not project does.
-    ///
-    /// The index HOLDS more than it reports ([`Self::index_entry`], which is what a write of
-    /// the entry meters and what the search condition filters on).
-    pub fn reported_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
-        let mut entry = self.index_entry(item, table_key_schema);
-        entry.remove(self.vector_attribute.attribute_name.as_str());
-        entry
     }
 
     /// Project this index into the `VectorIndexDescription` every table description

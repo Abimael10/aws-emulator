@@ -12,13 +12,14 @@
 //! the decimal the write carried, and `GetItem` answers it — so the two differ exactly where
 //! the rounding does.
 //!
-//! The score is what the index's held copy is observed through: a search answers "the
-//! similarity score for this item relative to the search vector" (`SearchResultItem$Score`)
-//! and the projected attributes of the item (`SearchResultItem$Item`), which never carry the
-//! vector itself (pinned in [`super::vector_search`]). Over `DOT_PRODUCT` against the
+//! The score is one of the two things the index's held copy is observed through: a search
+//! answers "the similarity score for this item relative to the search vector"
+//! (`SearchResultItem$Score`) and the attributes of the item the index holds
+//! (`SearchResultItem$Item`), the vector among them. Over `DOT_PRODUCT` against the
 //! all-ones search vector that score is the sum of the held coordinates, so a coordinate the
 //! type cannot represent and the coordinate it rounds to score IDENTICALLY while every
-//! neighbour of them scores apart — which is the rounding, observed.
+//! neighbour of them scores apart — which is the rounding, observed. The other is the vector
+//! the result carries, which is the index's held copy itself rather than the item's decimal.
 //!
 //! The rows span what the rule generalises over: a coordinate a 32-bit float holds exactly
 //! (a whole number, a power of two, a half), the first whole number it does NOT hold
@@ -155,11 +156,12 @@ fn result_for(answered: &Value, pk: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-#[tokio::test]
-async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
-    let router = emulator();
+/// Create the table and its index, wait for both, and write one item per row: the
+/// coordinate the row writes, beside a second coordinate every row shares, so the vector has
+/// the index's own `Dimensions`.
+async fn stored_rows(router: &smithy_server_runtime::MultiServiceRouter) {
     ok(
-        &router,
+        router,
         "CreateTable",
         json!({
             "TableName": TABLE,
@@ -176,13 +178,10 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
         }),
     )
     .await;
-    ready(&router).await;
-
-    // One item per row: the coordinate the row writes, beside a second coordinate every
-    // row shares, so the vector has the index's own `Dimensions`.
+    ready(router).await;
     for (at, row) in rows().iter().enumerate() {
         ok(
-            &router,
+            router,
             "PutItem",
             json!({"TableName": TABLE, "Item": {
                 "pk": {"S": key_of(at)},
@@ -191,9 +190,12 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
         )
         .await;
     }
+}
 
-    let answered = ok(
-        &router,
+/// One `SearchVectors` through [`INDEX`] for every row stored.
+async fn search_every_row(router: &smithy_server_runtime::MultiServiceRouter) -> Value {
+    ok(
+        router,
         "SearchVectors",
         json!({
             "TableName": TABLE,
@@ -202,7 +204,15 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
             "TopK": rows().len(),
         }),
     )
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
+    let router = emulator();
+    stored_rows(&router).await;
+
+    let answered = search_every_row(&router).await;
 
     for (at, row) in rows().iter().enumerate() {
         let result = result_for(&answered, &key_of(at));
@@ -249,5 +259,112 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
         score_of(6),
         "case \"the neighbour the type holds exactly\": it is held as itself, so it scores \
          apart from the rounded one, got {answered}"
+    );
+}
+
+/// The decimal the companion coordinate is HELD as: a 32-bit float, rendered as one.
+const COMPANION_HELD: &str = "1.0";
+
+#[tokio::test]
+async fn a_search_reports_the_vector_as_the_index_holds_it() {
+    let router = emulator();
+    stored_rows(&router).await;
+    let answered = search_every_row(&router).await;
+
+    // The same rows, read through the vector the result CARRIES rather than through the
+    // score: a result carries the attributes the index holds for its item
+    // (`SearchResultItem$Item`), and the vector among them is the index's own copy — "each
+    // element is a 32-bit IEEE-754 floating point number" — so every coordinate comes back
+    // as the float it is held as and not as the decimal the write spelled.
+    for (at, row) in rows().iter().enumerate() {
+        let result = result_for(&answered, &key_of(at));
+        let reported = result["Item"]["emb"]["L"][0]["N"].clone();
+        assert_eq!(
+            reported,
+            json!(row.held),
+            "case {:?}: the coordinate written as {:?} is held as {:?}, so the search reports \
+             that, got {reported} from {result} of {answered}",
+            row.case,
+            row.written,
+            row.held
+        );
+        let companion = result["Item"]["emb"]["L"][1]["N"].clone();
+        assert_eq!(
+            companion,
+            json!(COMPANION_HELD),
+            "case {:?}: every coordinate of the reported vector is the held float, got \
+             {companion} from {result}",
+            row.case
+        );
+        // Read back off the TABLE's item, the same coordinate is the decimal the write
+        // carried: the two stores hold different things, which is this suite's whole rule.
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": {"pk": {"S": key_of(at)}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"]["emb"]["L"][0]["N"],
+            json!(row.written),
+            "case {:?}: the stored item keeps the decimal it was written with, got {read}",
+            row.case
+        );
+    }
+
+    // A `ProjectionExpression` narrowing the result to the vector attribute reports it and
+    // nothing else: it is one of the attributes the index holds, so it can be retrieved
+    // ("only attributes projected into the vector index can be retrieved",
+    // `SearchVectors$ProjectionExpression`).
+    let narrowed = ok(
+        &router,
+        "SearchVectors",
+        json!({
+            "TableName": TABLE,
+            "IndexName": INDEX,
+            "SearchVector": [{"N": COMPANION}, {"N": COMPANION}],
+            "TopK": rows().len(),
+            "ProjectionExpression": "emb",
+        }),
+    )
+    .await;
+    for (at, row) in rows().iter().enumerate() {
+        let result = result_for(&narrowed, &key_of(at));
+        assert!(
+            result.is_null(),
+            "case {:?}: a result narrowed to the vector carries no pk to find it by, got \
+             {result}",
+            row.case
+        );
+    }
+    let reported: Vec<Vec<String>> = narrowed["SearchResults"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|result| {
+            let mut names: Vec<String> = result["Item"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        })
+        .collect();
+    assert_eq!(
+        reported.len(),
+        rows().len(),
+        "every stored row is still answered when the projection names the vector, got \
+         {narrowed}"
+    );
+    assert!(
+        reported
+            .iter()
+            .all(|names| names == &vec!["emb".to_string()]),
+        "case \"a projection naming the vector attribute\": each result carries that one \
+         attribute, got {reported:?} from {narrowed}"
     );
 }

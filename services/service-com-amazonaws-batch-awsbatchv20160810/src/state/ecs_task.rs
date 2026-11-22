@@ -929,10 +929,16 @@ async fn run_task(
             .options("awslogs-group", &target.log_group)
             .options("awslogs-region", &target.region)
             .options("awslogs-stream-prefix", &prefix);
-        if target.create_group {
-            // The group a Batch job's logs go to is the DRIVER's to create where this service
-            // creates it itself ([`job_logs`]), so the task's driver is given the same
-            // instruction rather than being pointed at a group nothing has made yet.
+        if target.service_holds_group {
+            // The group AWS Batch holds for its jobs' output is THIS SERVICE's to create
+            // ([`job_logs`]), so it is created here — before the task whose agent delivers
+            // into it exists — rather than left to that agent, which would make the job's
+            // execution role need a permission to create a group this service already holds.
+            create_job_log_group(callback, &target.region, &target.log_group).await;
+        }
+        if target.driver_creates_group {
+            // A group the job's own configuration asked the DRIVER to create is the driver's
+            // creation, so the task is given that same instruction and the launch decides it.
             options = options.options("awslogs-create-group", "true");
         }
         if let Ok(configuration) = options.build() {

@@ -99,10 +99,12 @@ const DEADLINE: Duration = Duration::from_secs(240);
 /// How long one look waits before the next.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// AWS Batch, Amazon ECS and Amazon EC2 over ONE shared engine, the way `core/router/src/lib.rs`
-/// mounts every service: the task a placed job runs as is Amazon ECS's resource, and the subnets
-/// and security groups its placement names are Amazon VPC's. Each service claims only requests
-/// scoped to its own signing name.
+/// AWS Batch, Amazon ECS, Amazon EC2 and CloudWatch Logs over ONE shared engine, the way
+/// `core/router/src/lib.rs` mounts every service: the task a placed job runs as is Amazon ECS's
+/// resource, the subnets and security groups its placement names are Amazon VPC's, and the log
+/// group the job's output is delivered into — the one AWS Batch holds for job logs, which that
+/// service creates before the task is launched — is CloudWatch Logs'. Each service claims only
+/// requests scoped to its own signing name.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -116,8 +118,11 @@ fn router() -> MultiServiceRouter {
         ),
     );
     router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+    );
     router
 }
 
