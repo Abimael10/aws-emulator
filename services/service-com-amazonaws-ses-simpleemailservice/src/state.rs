@@ -371,11 +371,15 @@ pub const EASY_DKIM_TOKEN_COUNT: usize = 3;
 /// label a caller publishes for it. Amazon SES's own tokens are 32 characters.
 pub const EASY_DKIM_TOKEN_LEN: usize = 32;
 
-/// Whether DKIM signing is on for an identity nobody has set it for.
+/// The signing flag an identity nobody has set it for starts at.
 ///
 /// `IdentityDkimAttributes$DkimEnabled` documents the default: "Is true if DKIM
 /// signing is enabled for email sent from the identity. It's false otherwise.
-/// The default value is true."
+/// The default value is true." So the flag starts ON and a caller only ever
+/// turns it off — which is not the same as signing being enabled for the
+/// identity, because signing also takes an Easy DKIM setup to sign with
+/// ([`ComAmazonawsSesSimpleemailserviceState::dkim_signing_enabled`], the value
+/// that attribute reports).
 pub const DKIM_SIGNING_AT_IDENTITY_START: bool = true;
 
 /// The class of an identity, as SES's `IdentityType` enum names it.
@@ -769,13 +773,15 @@ pub struct Identity {
     /// those identities recorded it: one identity, one set of tokens its owner
     /// publishes, whichever API handed them out.
     pub dkim: Option<EasyDkimSettings>,
-    /// Whether DKIM signing is on for email sent from this identity, as
-    /// `SetIdentityDkimEnabled` writes it and
-    /// `GetIdentityDkimAttributes` reports it. Starts at
+    /// Whether DKIM signing is ASKED FOR for email sent from this identity, as
+    /// `SetIdentityDkimEnabled` writes it. Starts at
     /// [`DKIM_SIGNING_AT_IDENTITY_START`].
     ///
-    /// Independent of [`Self::dkim`]: the flag says whether SES signs, the setup
-    /// says whether the tokens it would sign with have been published.
+    /// Not on its own what `GetIdentityDkimAttributes` reports as `DkimEnabled`:
+    /// signing also takes the Easy DKIM setup whose tokens it would sign with
+    /// ([`Self::dkim`], or the covering one for an address), so the attribute is
+    /// the two together
+    /// ([`ComAmazonawsSesSimpleemailserviceState::dkim_signing_enabled`]).
     pub dkim_enabled: bool,
     /// Where this identity's notifications go, as
     /// `SetIdentityNotificationTopic` writes it and
@@ -1444,6 +1450,29 @@ impl ComAmazonawsSesSimpleemailserviceState {
             }
         }
         None
+    }
+
+    /// Whether Amazon SES signs email sent from `identity`, which is what
+    /// `GetIdentityDkimAttributes` reports as that identity's `DkimEnabled`:
+    /// "true if DKIM signing is enabled for email sent from the identity. It's
+    /// false otherwise".
+    ///
+    /// Signing takes BOTH halves of the setup: the signing flag on the
+    /// identity's own record ([`Identity::dkim_enabled`], which
+    /// `SetIdentityDkimEnabled` writes and which starts at
+    /// [`DKIM_SIGNING_AT_IDENTITY_START`]), and an Easy DKIM setup covering the
+    /// identity ([`Self::easy_dkim_for`]) whose tokens are the selector a
+    /// signature names. An identity no setup covers has nothing to sign with, so
+    /// signing is not enabled for it whatever the flag says — the same pair a
+    /// message is really signed on ([`dkim::signer`]).
+    ///
+    /// `false` for an identity the account does not hold, which is reported by
+    /// leaving it out of the report altogether.
+    pub fn dkim_signing_enabled(&self, identity: &str) -> bool {
+        self.identities
+            .get(&identity_key(identity))
+            .is_some_and(|stored| stored.dkim_enabled)
+            && self.easy_dkim_for(identity).is_some()
     }
 
     /// Record `template` under its own name, replacing any template already

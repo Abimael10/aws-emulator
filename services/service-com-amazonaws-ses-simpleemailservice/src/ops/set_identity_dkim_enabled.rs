@@ -3,8 +3,9 @@
 //! @op SetIdentityDkimEnabled
 //! Turns Easy DKIM signing on or off for one identity, storing the flag on that
 //! identity's own record — the flag `GetIdentityDkimAttributes` reports as
-//! `DkimEnabled`. An email address can only be enabled once the domain above it
-//! has been set up to use Easy DKIM.
+//! `DkimEnabled` once an Easy DKIM setup covers the identity. An email address
+//! can only be enabled once the domain above it has been set up to use Easy
+//! DKIM.
 //!
 //! ## Shape of an operation
 //!

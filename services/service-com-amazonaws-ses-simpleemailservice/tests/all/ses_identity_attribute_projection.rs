@@ -163,7 +163,7 @@ async fn every_dkim_entry_reports_who_owns_the_signing_key() {
             DkimSetup::DomainWithoutDkim,
             false,
             "NotStarted",
-            "true",
+            "false",
         ),
         (
             "an address under a domain with an Easy DKIM setup",
@@ -179,7 +179,7 @@ async fn every_dkim_entry_reports_who_owns_the_signing_key() {
             DkimSetup::AddressWithoutDkim,
             false,
             "NotStarted",
-            "true",
+            "false",
         ),
         (
             "a domain with an Easy DKIM setup and signing switched off",

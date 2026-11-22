@@ -2,8 +2,9 @@
 
 //! @op GetIdentityDkimAttributes
 //! Reports the Easy DKIM state of each identity named, read from that
-//! identity's own record: whether DKIM signing is on for it, whether Amazon SES
-//! has verified the published CNAME records, the tokens of the Easy DKIM
+//! identity's own record: whether Amazon SES signs that identity's mail — its
+//! signing flag together with an Easy DKIM setup to sign with — whether Amazon
+//! SES has verified the published CNAME records, the tokens of the Easy DKIM
 //! setup that covers it — its own for a domain, its domain's for an email
 //! address — and who owns the signing key behind it. An identity this account
 //! has not verified is absent from the report.
@@ -183,7 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
             let name = identity.name.clone();
-            let dkim_enabled = identity.dkim_enabled;
+            // "Is true if DKIM signing is enabled for email sent from the
+            // identity. It's false otherwise": signing takes the identity's own
+            // signing flag AND an Easy DKIM setup to sign with, so an identity
+            // no setup covers reports false whatever its flag says
+            // (`crate::state::ComAmazonawsSesSimpleemailserviceState::dkim_signing_enabled`).
+            let dkim_enabled = state.dkim_signing_enabled(&name);
             // The setup that COVERS the identity: its own for a domain, and its
             // domain's for an email address, since "if the identity is an email
             // address, the tokens represent the domain of that address".

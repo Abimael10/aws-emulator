@@ -21,6 +21,9 @@
 //! * `SetIdentityDkimEnabled` stores the signing flag on the named identity's own
 //!   record, so one identity's flag says nothing about another's, and enabling an
 //!   identity no Easy DKIM setup covers is refused with HTTP 400;
+//! * `DkimEnabled` is whether Amazon SES signs that identity's mail — the flag on
+//!   its own record together with an Easy DKIM setup covering it to sign with — so
+//!   an identity no setup covers reports `false`;
 //! * a value that is no domain name is refused with HTTP 400 and nothing is
 //!   stored; only identities in the list are reported, and a report may name at
 //!   most 100 of them;
@@ -369,7 +372,9 @@ async fn the_setup_reported_for_an_identity_is_the_one_that_covers_it() {
         assert_eq!(
             reported,
             Some(Reported {
-                enabled: DKIM_SIGNING_AT_IDENTITY_START.to_string(),
+                // Nothing covers the identity, so there is nothing for Amazon SES
+                // to sign its mail with and signing is not enabled for it.
+                enabled: false.to_string(),
                 status: NOT_STARTED.to_string(),
                 tokens: None,
             }),
@@ -634,8 +639,10 @@ async fn one_call_reports_every_requested_identity_from_its_own_record() {
 
     // `IdentityDkimAttributes$DkimEnabled` is documented "Is true if DKIM signing
     // is enabled for email sent from the identity. It's false otherwise. The
-    // default value is true", so an identity nothing switched off reports `true` —
-    // spelled out here rather than read from the implementation's own constant.
+    // default value is true", so an identity an Easy DKIM setup covers and
+    // nothing switched off reports `true`, and one with no setup to sign with
+    // reports `false` — spelled out here rather than read from the
+    // implementation's own constant.
     let on = true.to_string();
     let off = false.to_string();
     // The rows span what one entry is resolved from: the class of identity
@@ -664,7 +671,7 @@ async fn one_call_reports_every_requested_identity_from_its_own_record() {
             case: "a domain no Easy DKIM setup covers",
             identity: plain,
             expected: Reported {
-                enabled: on.clone(),
+                enabled: off.clone(),
                 status: NOT_STARTED.to_string(),
                 tokens: None,
             },
@@ -682,7 +689,7 @@ async fn one_call_reports_every_requested_identity_from_its_own_record() {
             case: "an address under the first setup with signing off",
             identity: "off@signed.example.com",
             expected: Reported {
-                enabled: off,
+                enabled: off.clone(),
                 status: PENDING.to_string(),
                 tokens: Some(signed_tokens.clone()),
             },
@@ -709,7 +716,7 @@ async fn one_call_reports_every_requested_identity_from_its_own_record() {
             case: "an address no Easy DKIM setup covers",
             identity: "user@plain.example.org",
             expected: Reported {
-                enabled: on,
+                enabled: off,
                 status: NOT_STARTED.to_string(),
                 tokens: None,
             },
@@ -801,5 +808,181 @@ async fn naming_an_identity_more_than_once_reports_it_once() {
                 "case {case:?}: expected {key:?} reported as {expected:?}, got {reported:?}"
             );
         }
+    }
+}
+
+/// One step that puts an identity into the state a row reads back.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// `VerifyDomainIdentity`: a domain with no Easy DKIM setup.
+    Domain(&'static str),
+    /// `VerifyDomainDkim`: a domain with its Easy DKIM setup.
+    DkimDomain(&'static str),
+    /// `VerifyEmailIdentity`: an address.
+    Address(&'static str),
+    /// `SetIdentityDkimEnabled` on the row's own identity.
+    Signing(bool),
+}
+
+/// One identity, how it got into the state it is read in, and the signing flag
+/// the report must carry for it.
+struct SigningRow {
+    /// What this row is, for the assertion messages.
+    case: &'static str,
+    /// The steps that put the identity into that state, in order.
+    steps: &'static [Step],
+    /// The identity the report is read for.
+    identity: &'static str,
+    /// The `DkimEnabled` the report must carry.
+    expected: bool,
+}
+
+#[tokio::test]
+async fn dkim_enabled_reports_whether_signing_is_enabled_for_the_identity() {
+    // `IdentityDkimAttributes$DkimEnabled` is "true if DKIM signing is enabled
+    // for email sent from the identity. It's false otherwise. The default value
+    // is true", and Amazon SES signs an identity's mail only where Easy DKIM has
+    // been set up for it: the reported flag is the identity's own signing flag
+    // together with the setup that covers it, so an identity with no setup to
+    // sign with reports `false` however the flag stands.
+    let router = emulator();
+
+    // The rows span what that pair is built from: the class of identity, whether
+    // a setup covers it and whether the setup or the identity came first, how far
+    // above the identity the setup sits, and which values the flag was written
+    // with.
+    let rows: &[SigningRow] = &[
+        SigningRow {
+            case: "a domain nobody asked Easy DKIM for",
+            steps: &[Step::Domain("plain.example.com")],
+            identity: "plain.example.com",
+            expected: false,
+        },
+        SigningRow {
+            case: "a domain with no setup whose signing was switched off",
+            steps: &[Step::Domain("quiet.example.com"), Step::Signing(false)],
+            identity: "quiet.example.com",
+            expected: false,
+        },
+        SigningRow {
+            case: "a domain with its own Easy DKIM setup",
+            steps: &[Step::DkimDomain("signed.example.com")],
+            identity: "signed.example.com",
+            expected: true,
+        },
+        SigningRow {
+            case: "a domain with a setup whose signing was switched off",
+            steps: &[Step::DkimDomain("off.example.com"), Step::Signing(false)],
+            identity: "off.example.com",
+            expected: false,
+        },
+        SigningRow {
+            case: "a domain switched off and on again",
+            steps: &[
+                Step::DkimDomain("back-on.example.com"),
+                Step::Signing(false),
+                Step::Signing(true),
+            ],
+            identity: "back-on.example.com",
+            expected: true,
+        },
+        SigningRow {
+            case: "a domain switched off before it gained a setup",
+            steps: &[
+                Step::Domain("regained.example.com"),
+                Step::Signing(false),
+                Step::DkimDomain("regained.example.com"),
+            ],
+            identity: "regained.example.com",
+            expected: false,
+        },
+        SigningRow {
+            case: "an address under a domain set up before it",
+            steps: &[
+                Step::DkimDomain("covered.example.com"),
+                Step::Address("user@covered.example.com"),
+            ],
+            identity: "user@covered.example.com",
+            expected: true,
+        },
+        SigningRow {
+            case: "an address whose domain was set up after it",
+            steps: &[
+                Step::Address("user@later.example.com"),
+                Step::DkimDomain("later.example.com"),
+            ],
+            identity: "user@later.example.com",
+            expected: true,
+        },
+        SigningRow {
+            case: "an address under a subdomain of a set-up domain",
+            steps: &[
+                Step::DkimDomain("deep.example.com"),
+                Step::Address("user@mail.deep.example.com"),
+            ],
+            identity: "user@mail.deep.example.com",
+            expected: true,
+        },
+        SigningRow {
+            case: "an address whose own signing was switched off",
+            steps: &[
+                Step::DkimDomain("mixed.example.com"),
+                Step::Address("off@mixed.example.com"),
+                Step::Signing(false),
+            ],
+            identity: "off@mixed.example.com",
+            expected: false,
+        },
+        SigningRow {
+            case: "an address under a domain with no setup",
+            steps: &[
+                Step::Domain("bare.example.net"),
+                Step::Address("user@bare.example.net"),
+            ],
+            identity: "user@bare.example.net",
+            expected: false,
+        },
+    ];
+
+    for row in rows {
+        for step in row.steps {
+            match *step {
+                Step::Domain(domain) => verify_domain_identity(&router, domain).await,
+                Step::DkimDomain(domain) => {
+                    verify_domain_dkim_ok(&router, domain).await;
+                }
+                Step::Address(address) => verify_email_identity(&router, address).await,
+                Step::Signing(enabled) => {
+                    set_dkim_enabled_ok(&router, row.identity, enabled).await;
+                }
+            }
+        }
+
+        let report = reported(&router, row.identity).await;
+        assert_eq!(
+            report.as_ref().map(|report| report.enabled.clone()),
+            Some(row.expected.to_string()),
+            "case {:?}: expected DkimEnabled {}, got {report:?}",
+            row.case,
+            row.expected
+        );
+    }
+
+    // And every row's identity reads the same in one call naming them all, so the
+    // value is each identity's own and not an artefact of being asked about alone.
+    let named: Vec<&str> = rows.iter().map(|row| row.identity).collect();
+    let listed = reported_all(&router, &named).await;
+    for row in rows {
+        let found = listed
+            .iter()
+            .find(|(key, _)| key == row.identity)
+            .map(|(_, attributes)| attributes.enabled.clone());
+        assert_eq!(
+            found,
+            Some(row.expected.to_string()),
+            "case {:?} named with every other identity: expected DkimEnabled {}, got {found:?}",
+            row.case,
+            row.expected
+        );
     }
 }
