@@ -150,6 +150,27 @@ pub(crate) async fn call_signed_from(
     action: &str,
     params: &[(&str, &str)],
 ) -> (u16, String) {
+    let stated: Vec<(&str, &str)> = forwarded_for
+        .map(|address| vec![("x-forwarded-for", address)])
+        .unwrap_or_default();
+    call_signed_with_headers(router, akid, region, &stated, action, params).await
+}
+
+/// [`call_signed_from`], with the whole set of `headers` a proxy in front of this
+/// emulator states the hop it forwarded in — the client's address (`x-forwarded-for`) and
+/// the scheme that hop was made over (`x-forwarded-proto`), which is where IAM reads
+/// `aws:SourceIp` and `aws:SecureTransport` from.
+///
+/// An empty list is the request every other suite drives: nothing stated, which is a call
+/// made from the local host over this emulator's own TLS listener.
+pub(crate) async fn call_signed_with_headers(
+    router: &MultiServiceRouter,
+    akid: Option<&str>,
+    region: &str,
+    headers: &[(&str, &str)],
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -176,10 +197,10 @@ pub(crate) async fn call_signed_from(
         ),
         None => request,
     };
-    let request = match forwarded_for {
-        Some(address) => request.header("x-forwarded-for", address),
-        None => request,
-    };
+    let mut request = request;
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = router
         .dispatch(
             request

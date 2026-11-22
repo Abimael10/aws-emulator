@@ -76,8 +76,9 @@
 //!   MANAGED POLICY, the ARN of the policy it names (`iam:PolicyARN`), which those call
 //!   sites hand the gate ([`authorize_policy_attachment`]);
 //! * the CONNECTION the request arrived on — the address it was made from
-//!   (`aws:SourceIp`), which is what a network clause is decided against
-//!   ([`source_address`]);
+//!   (`aws:SourceIp`), which is what a network clause is decided against, and whether it
+//!   arrived encrypted (`aws:SecureTransport`), which is what a transport clause is decided
+//!   against ([`Connection`]);
 //! * the CLOCK, which is what a date clause is decided against (`aws:CurrentTime`, and the
 //!   same instant as epoch seconds in `aws:EpochTime`).
 //!
@@ -270,6 +271,28 @@ const POLICY_ARN_KEY: &str = "iam:PolicyARN";
 /// the requester's IP address", which is what an IP clause compares against.
 const SOURCE_IP_KEY: &str = "aws:SourceIp";
 
+/// The condition key saying whether the request arrived over a secure transport:
+/// "`aws:SecureTransport` — whether the request was sent using SSL", which is what a
+/// `Bool` clause requiring — or refusing — encryption in flight compares against.
+const SECURE_TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// The two values that key carries, as IAM's boolean literals spell them: "true" for a
+/// request that arrived over a secure transport and "false" for one that did not.
+const SECURE_TRANSPORT_TRUE: &str = "true";
+
+/// See [`SECURE_TRANSPORT_TRUE`].
+const SECURE_TRANSPORT_FALSE: &str = "false";
+
+/// The header a proxy in front of this emulator states the SCHEME it forwarded a request
+/// over in, whose FIRST entry is the hop the client itself made — the transport's
+/// counterpart of [`FORWARDED_FOR_HEADER`], read the same way.
+const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+
+/// The scheme a request made over a PLAINTEXT hop states, and the one value that makes
+/// [`SECURE_TRANSPORT_KEY`] false: every other hop this emulator is reachable over
+/// terminates TLS.
+const PLAINTEXT_SCHEME: &str = "http";
+
 /// The header a proxy in front of this emulator states the address it forwarded a request
 /// for in, whose FIRST entry is the client's own — the same reading every other service in
 /// this tree takes of a request's source address.
@@ -289,7 +312,8 @@ const CURRENT_TIME_KEY: &str = "aws:CurrentTime";
 const EPOCH_TIME_KEY: &str = "aws:EpochTime";
 
 /// The keys every request to this gate models about ITSELF: the tags it writes, the
-/// address it was made from and the instant it is decided at.
+/// address it was made from, the transport it arrived over and the instant it is decided
+/// at.
 ///
 /// Published for every call, because each is answered from the call itself — a request
 /// that writes no tag carries no `aws:RequestTag/` and no `aws:TagKeys` value, which is
@@ -299,6 +323,7 @@ const PUBLISHED_REQUEST_KEYS: &[&str] = &[
     REQUEST_TAG_PREFIX,
     TAG_KEYS_KEY,
     SOURCE_IP_KEY,
+    SECURE_TRANSPORT_KEY,
     CURRENT_TIME_KEY,
     EPOCH_TIME_KEY,
 ];
@@ -323,6 +348,77 @@ fn source_address(parts: &::http::request::Parts) -> String {
         .to_string()
 }
 
+/// Whether the request `parts` arrived over a secure transport, as `aws:SecureTransport`
+/// carries it.
+///
+/// Like the address, this is a fact of the CONNECTION and not of anything the request body
+/// says: the scheme the request itself states — on its own URI, or in
+/// [`FORWARDED_PROTO_HEADER`] where a proxy stated the hop it forwarded for — and
+/// otherwise secure, because this emulator's API listener terminates TLS, so a request
+/// that reached this gate without saying how it arrived arrived encrypted. A hop stated as
+/// [`PLAINTEXT_SCHEME`] is the one that did not, so the TLS-enforcement idiom — an
+/// unconditional `Allow` beside a `Deny` conditioned on the key being false — permits an
+/// encrypted call and refuses a plaintext one, rather than leaving both undecided.
+fn secure_transport(parts: &::http::request::Parts) -> bool {
+    let stated = parts
+        .uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            parts
+                .headers
+                .get(FORWARDED_PROTO_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(|hop| hop.trim().to_ascii_lowercase())
+        })
+        .filter(|scheme| !scheme.is_empty());
+    stated.is_none_or(|scheme| scheme != PLAINTEXT_SCHEME)
+}
+
+/// What the CONNECTION a request arrived on contributes to the condition context: the
+/// address it was made from and whether it was encrypted, the two things IAM publishes
+/// about a request's transport rather than about its parameters.
+///
+/// Read once per decision, off the request's own head ([`Self::of`]), so every decision
+/// taken about one request is decided against one reading of the connection it arrived on.
+#[derive(Debug, Clone)]
+struct Connection {
+    /// The address the request was made from, as [`SOURCE_IP_KEY`] carries it
+    /// ([`source_address`]).
+    source_ip: String,
+    /// Whether it arrived over a secure transport, as [`SECURE_TRANSPORT_KEY`] carries it
+    /// ([`secure_transport`]).
+    secure_transport: bool,
+}
+
+impl Connection {
+    /// The connection the request `parts` arrived on.
+    fn of(parts: &::http::request::Parts) -> Self {
+        Self {
+            source_ip: source_address(parts),
+            secure_transport: secure_transport(parts),
+        }
+    }
+
+    /// The `(key, value)` context entries it contributes, under the keys IAM publishes
+    /// them as.
+    fn context(&self) -> Vec<(String, String)> {
+        vec![
+            (SOURCE_IP_KEY.to_string(), self.source_ip.clone()),
+            (
+                SECURE_TRANSPORT_KEY.to_string(),
+                if self.secure_transport {
+                    SECURE_TRANSPORT_TRUE
+                } else {
+                    SECURE_TRANSPORT_FALSE
+                }
+                .to_string(),
+            ),
+        ]
+    }
+}
+
 /// The condition keys a request that reaches THIS decision structurally cannot carry, so
 /// that a clause over one of them is decided from its absence rather than left undecided.
 ///
@@ -335,8 +431,8 @@ fn source_address(parts: &::http::request::Parts) -> String {
 /// the evaluation — fail-closed in both directions — because for those absence from the
 /// context means this emulator does not model the key rather than that the request carries
 /// no value for it: a real signed request does carry `aws:PrincipalArn`,
-/// `aws:RequestedRegion`, `aws:SecureTransport` and their peers, and this gate must not
-/// decide a clause over them from their absence here.
+/// `aws:RequestedRegion` and their peers, and this gate must not decide a clause over them
+/// from their absence here.
 const PUBLISHED_ABSENT_KEYS: &[&str] = &[
     "aws:PrincipalOrgID",
     "aws:PrincipalOrgPaths",
@@ -466,7 +562,8 @@ fn principal_tags(role: &Role, session_tags: &[(String, String)]) -> Vec<(String
 ///
 /// The keys it fills are the caller's own ([`PUBLISHED_PRINCIPAL_KEYS`]), the target's
 /// ([`PUBLISHED_RESOURCE_TAG_KEYS`], both spellings of the one tag set), the request's own
-/// tags and the clock's ([`PUBLISHED_REQUEST_KEYS`]). The resource-tag families are
+/// tags, the `connection` it arrived on and the clock's ([`PUBLISHED_REQUEST_KEYS`]). The
+/// resource-tag families are
 /// DECLARED only for a resource whose tag set the account knows in full; for an ARN naming
 /// nothing it holds, a clause over one of its tags stays undecided, which is the
 /// fail-closed reading the shared evaluation gives every key this emulator cannot answer
@@ -492,7 +589,7 @@ fn request_context(
     resource: &str,
     written: WrittenTags<'_>,
     policy_arn: Option<&str>,
-    source_ip: String,
+    connection: &Connection,
 ) -> (Vec<(String, String)>, Vec<&'static str>) {
     let mut context = Vec::new();
     let mut published = Vec::new();
@@ -558,9 +655,9 @@ fn request_context(
         context.push((POLICY_ARN_KEY.to_string(), policy_arn.to_string()));
         published.push(POLICY_ARN_KEY);
     }
-    // Where the call came from, read from the connection the same way every request's
-    // source address is read here ([`source_address`]).
-    context.push((SOURCE_IP_KEY.to_string(), source_ip));
+    // Where the call came from and how it arrived, read from the connection and from
+    // nothing the request's own parameters say ([`Connection`]).
+    context.extend(connection.context());
     let now = super::now();
     // The instant the call is decided at, in the two spellings IAM publishes it under.
     if let Ok(stated) = now.fmt(::aws_smithy_types::date_time::Format::DateTime) {
@@ -691,7 +788,7 @@ fn authorize_request(
         resource,
         written,
         policy_arn,
-        source_address(ctx.parts()),
+        &Connection::of(ctx.parts()),
     );
 
     let principals = [principal.clone()];
@@ -951,6 +1048,9 @@ pub fn delegation_permission_check(
 
     let principals = [principal];
     let documents = iam::prepare_documents(&policies.documents);
+    // The connection this check's own request arrived on, read once for every ask it
+    // decides.
+    let connection = Connection::of(ctx.parts());
     let mut short_of_an_ask = false;
     for (action, resource) in &asks {
         // The same question [`authorize_written`] asks, so it is asked with the same
@@ -965,7 +1065,7 @@ pub fn delegation_permission_check(
             // An ask is an `(action, resource)` pair read out of a policy document, not a
             // call: it carries no request parameter, so no managed policy ARN either.
             None,
-            source_address(ctx.parts()),
+            &connection,
         );
         let request = iam::Request::new(action, resource, &principals)
             .with_context(&ask_context)
