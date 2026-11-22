@@ -132,10 +132,9 @@ impl MessageTemplateVersion {
             knowledge_base_arn: self.snapshot.knowledge_base_arn.clone(),
             knowledge_base_id: self.snapshot.knowledge_base_id.clone(),
             name: self.snapshot.name.clone(),
-            // `channel` is the Amazon Connect channel of the template, which no member of
-            // any message-template request carries and this store therefore holds no value
-            // for: the member is optional, so nothing is claimed under it.
-            channel: None,
+            // The channel this version applies to, which is the one the snapshot's channel
+            // subtype names ([`channel_of_subtype`]).
+            channel: Some(channel_of_subtype(&self.snapshot.channel_subtype)),
             channel_subtype: self.snapshot.channel_subtype.clone(),
             is_active: self.is_active,
             version_number: self.version_number,

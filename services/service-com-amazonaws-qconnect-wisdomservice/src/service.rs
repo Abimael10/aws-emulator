@@ -176,6 +176,32 @@ fn refuses_the_request_body(violations: &[smithy_server_runtime::Violation]) -> 
     })
 }
 
+/// Every member of this model that declares `@timestampFormat("date-time")`, by the
+/// absolute member id its generated schema carries.
+///
+/// The members are the message-template family's instants —
+/// `smithy_query(query="shape",shape="MessageTemplateData,ExtendedMessageTemplateData,MessageTemplateSummary,MessageTemplateSearchResultData,MessageTemplateAttachment")`
+/// reports `"timestampFormat": "date-time"` on each one. Every OTHER timestamp member of
+/// this model declares `epoch-seconds` (the quick-response, import-job, content and
+/// content-upload instants) or declares no format at all, and each of those keeps the form
+/// the protocol gives it — which is why the correction is named per member here instead of
+/// being applied to every format-less timestamp.
+///
+/// `tests/all/message_template_wire_form.rs` re-derives this list from the model file and
+/// fails if a member is missing from it or named wrongly.
+pub const DATE_TIME_MEMBERS: &[&str] = &[
+    "com.amazonaws.qconnect#ExtendedMessageTemplateData$createdTime",
+    "com.amazonaws.qconnect#ExtendedMessageTemplateData$lastModifiedTime",
+    "com.amazonaws.qconnect#MessageTemplateAttachment$uploadedTime",
+    "com.amazonaws.qconnect#MessageTemplateAttachment$urlExpiry",
+    "com.amazonaws.qconnect#MessageTemplateData$createdTime",
+    "com.amazonaws.qconnect#MessageTemplateData$lastModifiedTime",
+    "com.amazonaws.qconnect#MessageTemplateSearchResultData$createdTime",
+    "com.amazonaws.qconnect#MessageTemplateSearchResultData$lastModifiedTime",
+    "com.amazonaws.qconnect#MessageTemplateSummary$createdTime",
+    "com.amazonaws.qconnect#MessageTemplateSummary$lastModifiedTime",
+];
+
 /// This model's OWN sdkId-derived key (`sdkId: QConnect`,
 /// `smithy_query(query="service_info")`), beside the shared endpoint identity
 /// [`crate::ROUTE_KEY`] names.
@@ -229,6 +255,17 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `override_operation` hands back a borrowed operation, so the one it may name has
     /// to live as long as the service.
     create_session_authorization: crate::ops::create_session::CreateSessionAuthorization<Eng>,
+    /// This service's wire protocol: `restJson1`, with the timestamp members this model
+    /// declares `@timestampFormat("date-time")` on ([`DATE_TIME_MEMBERS`]) carried in that
+    /// declared form.
+    ///
+    /// The JSON codec resolves a timestamp's wire form from the member schema alone and the
+    /// generated schemas carry no member-level format, so the declared one is supplied at
+    /// this seam — the workspace's one place that correction lives
+    /// (`service_common::date_time_json`). Held here because
+    /// [`Service::override_protocol`] hands back a borrow, so the protocol is built once,
+    /// at construction, and never per request.
+    protocol: ::service_common::date_time_json::DateTimeRestJson,
     /// The SAME shared engine the generated entry threads into every operation.
     ///
     /// Held here because the content-upload plane is served from
@@ -246,6 +283,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             create_session_authorization:
                 crate::ops::create_session::CreateSessionAuthorization::new(Arc::clone(&engine)),
+            protocol: ::service_common::date_time_json::DateTimeRestJson::for_members(
+                DATE_TIME_MEMBERS,
+            ),
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
         }
@@ -598,11 +638,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         claims_endpoint_traffic(parts)
     }
 
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, with one correction: a timestamp member this model
+        // declares `@timestampFormat("date-time")` on reaches the wire as the RFC 3339
+        // STRING that format names rather than as the protocol's default epoch-seconds
+        // number. Every other timestamp member keeps the protocol's own form, which for
+        // this model's `epoch-seconds` members is the form they declare. See
+        // [`DATE_TIME_MEMBERS`] and the field this borrows.
+        Some(&self.protocol)
+    }
+
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
+    ) -> Option<&dyn ErasedOperation> {        // Return `Some(op)` to serve a request the model's routing key cannot name
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.

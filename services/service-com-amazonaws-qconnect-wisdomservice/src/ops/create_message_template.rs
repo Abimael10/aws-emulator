@@ -390,7 +390,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel_subtype: input.channel_subtype.clone(),
             content: input.content.clone(),
             description: input.description.clone(),
-            language: input.language.clone(),
+            // `language` is optional on the request while a template always HAS one: a
+            // create that names none is written in the endpoint's default language
+            // (`crate::state::DEFAULT_MESSAGE_TEMPLATE_LANGUAGE`), which is then what
+            // every read of this record reports.
+            language: Some(
+                input
+                    .language
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_MESSAGE_TEMPLATE_LANGUAGE.to_string()),
+            ),
             source_configuration: input.source_configuration.clone(),
             default_attributes: input.default_attributes.clone(),
             grouping_configuration: input.grouping_configuration.clone(),

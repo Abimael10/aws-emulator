@@ -93,6 +93,26 @@ pub fn message_source_configuration_not_applicable(channel_subtype: &str) -> Str
 /// `WHATSAPP` and `PUSH`): the one subtype whose create takes a `sourceConfiguration`.
 pub const CHANNEL_SUBTYPE_WHATSAPP: &str = "WHATSAPP";
 
+/// The `ChannelSubtype` of a template sent as an email, the one subtype of Amazon Connect's
+/// EMAIL channel ([`channel_of_subtype`]).
+pub const CHANNEL_SUBTYPE_EMAIL: &str = "EMAIL";
+
+/// The two Amazon Connect contact channels this model's channel subtypes divide into, as
+/// [`channel_of_subtype`] states the division.
+pub const CHANNEL_EMAIL: &str = "EMAIL";
+pub const CHANNEL_CHAT: &str = "CHAT";
+
+/// The language code a message template takes when the create names none.
+///
+/// `language` is optional on the create while every read reports the template's EFFECTIVE
+/// language — "the language code value for the language in which the … is written", one of
+/// the documented codes `de_DE`, `en_US`, `es_ES`, `fr_FR`, `id_ID`, `it_IT`, `ja_JP`,
+/// `ko_KR`, `pt_BR`, `zh_CN`, `zh_TW`
+/// (`smithy_query(query="doc",shape="CreateMessageTemplateRequest",member="language")`) — so
+/// a template created without one is written in the endpoint's default language, U.S.
+/// English, and reports that. A create that names a language keeps the one it named.
+pub const DEFAULT_MESSAGE_TEMPLATE_LANGUAGE: &str = "en_US";
+
 /// The managed version qualifier that names the version of a message template that is
 /// ACTIVATED, the other half of the pair `GetMessageTemplate` documents: the label's
 /// qualifier is "either an actual version number or an Amazon Q Connect managed qualifier
@@ -188,6 +208,35 @@ pub fn content_channel_subtype(content: &MessageTemplateContentProvider) -> &'st
         MessageTemplateContentProvider::whatsApp(_) => CHANNEL_SUBTYPE_WHATSAPP,
         MessageTemplateContentProvider::Push(_) => "PUSH",
     }
+}
+
+/// The Amazon Connect `channel` a template of one `ChannelSubtype` applies to.
+///
+/// A channel subtype is a subtype OF a contact channel: `MessageTemplateData.channel` is
+/// "the channel of the message template" and `channelSubtype` "the channel subtype this
+/// message template applies to" (`smithy_query(query="shape",shape="MessageTemplateData")`),
+/// so the channel a template reports is the channel its subtype belongs to rather than a
+/// second thing a request names — no message-template request carries a `channel` member at
+/// all.
+///
+/// Amazon Connect contacts reach a customer over one of its contact channels, and the
+/// message-template subtypes (`EMAIL`, `SMS`, `WHATSAPP`, `PUSH`,
+/// `smithy_query(query="shape",shape="ChannelSubtype")`) divide into two of them: an email
+/// template is sent on the EMAIL channel, while the messaging subtypes — SMS, WhatsApp
+/// Business and mobile push — are subtypes of Connect's CHAT channel, the channel a quick
+/// response's own `channels` member documents for the same endpoint ("The Connect Customer
+/// contact channels this quick response applies to. The supported contact channel types
+/// include Chat", `smithy_query(query="shape",shape="QuickResponseSummary")`). Both tokens
+/// are inside the modelled `Channel` bound (`@length 1..10`).
+///
+/// THE ONE PLACE this service decides that, so a read of the template, of one of its
+/// versions and of a listing cannot disagree about the channel it applies to.
+pub fn channel_of_subtype(channel_subtype: &str) -> String {
+    match channel_subtype {
+        CHANNEL_SUBTYPE_EMAIL => CHANNEL_EMAIL,
+        _ => CHANNEL_CHAT,
+    }
+    .to_string()
 }
 
 /// One persisted message template: the reply an agent sends on one channel subtype, held
@@ -287,17 +336,23 @@ impl MessageTemplate {
     /// A category counts as held when the template's `defaultAttributes` carries it, since
     /// that object is what "defines a variable or placeholder in the message template"
     /// (`smithy_query(query="doc",shape="MessageTemplateData",member="defaultAttributes")`)
-    /// — so the list is derived from the stored record rather than kept beside it, and a
-    /// template that declares no attribute at all reports no list.
+    /// — so the list is derived from the stored record rather than kept beside it.
+    ///
+    /// The list is ALWAYS reported, as the EMPTY list for a template that holds no attribute
+    /// of any category: the member is a modelled list whose entries this service computes, so
+    /// a client that iterates it to discover which categories a render must supply can tell
+    /// "none" from "not returned" — which it cannot when the member is absent.
     ///
     /// The three STRUCTURED categories name their attributes as members, so the category is
     /// held as soon as the structure is there. `customAttributes` is a MAP whose KEYS are
     /// the attributes — "Each key defines a variable or placeholder in the message template"
     /// — so an empty map defines none and the category is held only when it carries an
     /// entry. One rule, read off how the model carries each category.
-    pub fn attribute_types(&self) -> Option<Vec<String>> {
-        let attributes = self.default_attributes.as_ref()?;
+    pub fn attribute_types(&self) -> Vec<String> {
         let mut types = Vec::new();
+        let Some(attributes) = self.default_attributes.as_ref() else {
+            return types;
+        };
         if attributes.system_attributes.is_some() {
             types.push(MESSAGE_TEMPLATE_ATTRIBUTE_TYPE_SYSTEM.to_string());
         }
@@ -314,7 +369,7 @@ impl MessageTemplate {
         {
             types.push(MESSAGE_TEMPLATE_ATTRIBUTE_TYPE_CUSTOM.to_string());
         }
-        (!types.is_empty()).then_some(types)
+        types
     }
 
     /// The stored source configuration as the modelled
@@ -355,10 +410,9 @@ impl MessageTemplate {
             knowledge_base_arn: self.knowledge_base_arn.clone(),
             knowledge_base_id: self.knowledge_base_id.clone(),
             name: self.name.clone(),
-            // `channel` is the Amazon Connect channel of the template, which no member of
-            // any message-template request carries and this store therefore holds no value
-            // for: the member is optional, so nothing is claimed under it.
-            channel: None,
+            // The channel this template applies to, which is the one its immutable channel
+            // subtype names ([`channel_of_subtype`]).
+            channel: Some(channel_of_subtype(&self.channel_subtype)),
             channel_subtype: self.channel_subtype.clone(),
             created_time: ::aws_smithy_types::DateTime::from(self.created_at),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
@@ -369,7 +423,7 @@ impl MessageTemplate {
             source_configuration_summary: self.source_configuration_summary(),
             grouping_configuration: self.grouping_configuration.clone(),
             default_attributes: self.default_attributes.clone(),
-            attribute_types: self.attribute_types(),
+            attribute_types: Some(self.attribute_types()),
             message_template_content_sha256: self.content_sha256(),
             tags: tags_out(&self.tags),
         }
@@ -397,7 +451,7 @@ impl MessageTemplate {
             knowledge_base_id: self.knowledge_base_id.clone(),
             name: self.name.clone(),
             // See [`Self::to_message_template_data`].
-            channel: None,
+            channel: Some(channel_of_subtype(&self.channel_subtype)),
             channel_subtype: self.channel_subtype.clone(),
             created_time: ::aws_smithy_types::DateTime::from(self.created_at),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
@@ -408,7 +462,7 @@ impl MessageTemplate {
             source_configuration_summary: self.source_configuration_summary(),
             grouping_configuration: self.grouping_configuration.clone(),
             default_attributes: self.default_attributes.clone(),
-            attribute_types: self.attribute_types(),
+            attribute_types: Some(self.attribute_types()),
             attachments: self.attachments_out(),
             is_active,
             version_number,
@@ -479,6 +533,33 @@ pub fn attributes_fingerprint(attributes: Option<&MessageTemplateAttributes>) ->
             .map(tags_fingerprint)
             .unwrap_or_default(),
     ])
+}
+
+/// The metadata `UpdateMessageTemplateMetadata` writes: the three members that operation
+/// carries, each `None` when the request did not carry it — "Partial update is supported.
+/// If any field is not supplied, it will remain unchanged for the message template"
+/// (`smithy_query(query="doc",shape="UpdateMessageTemplateMetadata")`).
+#[derive(Debug, Clone, Default)]
+pub struct MessageTemplateMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub grouping_configuration: Option<GroupingConfiguration>,
+}
+
+impl MessageTemplateMetadata {
+    /// Write the members this metadata carries onto one record, leaving every member it
+    /// does not carry exactly as it was.
+    fn write_onto(&self, template: &mut MessageTemplate) {
+        if let Some(name) = self.name.clone() {
+            template.name = name;
+        }
+        if self.description.is_some() {
+            template.description = self.description.clone();
+        }
+        if self.grouping_configuration.is_some() {
+            template.grouping_configuration = self.grouping_configuration.clone();
+        }
+    }
 }
 
 impl ComAmazonawsQconnectWisdomserviceState {
@@ -556,8 +637,48 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .find(|template| template.name == name)
     }
 
-    /// Forget every message template of one knowledge base, answering with the ids it
-    /// dropped — what `remove_knowledge_base` calls so a knowledge base that is gone takes
+    /// Apply `metadata` to the message template this knowledge base holds under
+    /// `message_template_id` AND to every version that template has published, answering
+    /// whether the template was there at all.
+    ///
+    /// That reach is the operation's own documentation: "any modification to the message
+    /// template's name, description and grouping configuration will applied to the message
+    /// template pointed by the $LATEST qualifier and all available versions"
+    /// (`smithy_query(query="doc",shape="UpdateMessageTemplateMetadata")`) — so the working
+    /// copy and each published snapshot carry the same name, description and grouping
+    /// configuration once this returns, while everything else a version published (its
+    /// content, its attributes, the instants it was published with) is left as it was.
+    ///
+    /// The working copy is re-stamped with when it was written and by whom, since
+    /// `lastModifiedTime` is "the timestamp when the message template data was last
+    /// modified" (`smithy_query(query="shape",shape="MessageTemplateData")`).
+    pub fn write_message_template_metadata(
+        &mut self,
+        knowledge_base_id: &str,
+        message_template_id: &str,
+        metadata: &MessageTemplateMetadata,
+        at: SystemTime,
+        by: &str,
+    ) -> bool {
+        let Some(template) = self.message_template_mut(knowledge_base_id, message_template_id)
+        else {
+            return false;
+        };
+        metadata.write_onto(template);
+        template.last_modified_at = at;
+        template.last_modified_by = by.to_string();
+        for version in self
+            .message_template_versions
+            .get_mut(message_template_id)
+            .into_iter()
+            .flatten()
+        {
+            metadata.write_onto(&mut version.snapshot);
+        }
+        true
+    }
+
+    /// Forget every message template of one knowledge base, answering with the ids it    /// dropped — what `remove_knowledge_base` calls so a knowledge base that is gone takes
     /// its templates with it, releasing the names they held.
     ///
     /// A template takes its published versions with it

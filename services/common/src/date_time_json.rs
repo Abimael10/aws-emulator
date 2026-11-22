@@ -41,11 +41,19 @@
 //! # Which services it is correct for
 //!
 //! A service EVERY timestamp member of whose model declares `date-time` — either on one
-//! timestamp shape the whole model targets, or on each member individually. The wrappers
+//! timestamp shape the whole model targets, or on each member individually — takes
+//! [`DateTimeMembers::Every`], which the no-argument constructors select. The wrappers
 //! supply the format the codegen dropped and never override one a member DOES declare, so a
 //! model that later gains an `epoch-seconds` or `http-date` member keeps that member's own
-//! form; but a model with such a member today wants its own per-member schemas instead,
-//! because a format-less member here is read and written as `date-time`.
+//! form.
+//!
+//! A model that declares BOTH forms — some members `date-time`, others `epoch-seconds` —
+//! takes [`DateTimeMembers::Only`] through `for_members`, naming the members whose model
+//! declares `date-time` by their absolute member ids (`"ns#Shape$member"`, the id the
+//! generated member schema carries). Every other timestamp member is then read and written
+//! in the protocol's own form, which for an `epoch-seconds` member is the form the model
+//! declares. The naming is a transcription of the model, so the service that passes one
+//! re-derives it from its own model file in a test rather than trusting the list.
 //!
 //! Nothing else about either walk changes: a member's wire name, its order and its schema
 //! stay the ones the model gave it, and no other member kind is touched. The wrappers add
@@ -100,6 +108,36 @@ fn date_time_text(value: &DateTime) -> Option<String> {
     value.fmt(Format::DateTime).ok()
 }
 
+/// Which of a model's format-less timestamp members the declared `date-time` form is
+/// supplied for — the one thing that differs between a model whose every timestamp is a
+/// `date-time` one and a model that declares both forms.
+#[derive(Clone, Copy, Debug)]
+pub enum DateTimeMembers {
+    /// Every format-less timestamp member, for a model whose every timestamp member
+    /// declares `date-time`.
+    Every,
+    /// Only the members named here, by absolute member id (`"ns#Shape$member"`), for a model
+    /// that declares `date-time` on some members and another form on others.
+    Only(&'static [&'static str]),
+}
+
+impl DateTimeMembers {
+    /// Whether the member `schema` names is one this selection covers.
+    ///
+    /// A member schema carries its own absolute id — `"<namespace>#<Shape>$<member>"` — so
+    /// one member of one shape is named exactly, and two shapes that declare a member of the
+    /// same name are told apart.
+    fn covers(self, schema: &Schema) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Only(members) => {
+                let id = schema.shape_id().to_string();
+                members.contains(&id.as_str())
+            }
+        }
+    }
+}
+
 // =================================================================================
 // Request side
 // =================================================================================
@@ -143,7 +181,7 @@ impl InnerDeserializer for &mut (dyn ShapeDeserializer + '_) {
 ///
 /// A nested structure, list or map re-enters the wrapper, because the codec walks each level
 /// with its own deserializer and a timestamp is rarely the input's own member.
-struct DateTimeReader<D>(D);
+struct DateTimeReader<D>(D, DateTimeMembers);
 
 impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
     fn read_struct(
@@ -151,9 +189,10 @@ impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
         schema: &Schema,
         consumer: &mut dyn FnMut(&Schema, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        self.0
-            .get()
-            .read_struct(schema, &mut |member, d| consumer(member, &mut DateTimeReader(d)))
+        let members = self.1;
+        self.0.get().read_struct(schema, &mut |member, d| {
+            consumer(member, &mut DateTimeReader(d, members))
+        })
     }
 
     fn read_list(
@@ -161,9 +200,10 @@ impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
         schema: &Schema,
         consumer: &mut dyn FnMut(&mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        let members = self.1;
         self.0
             .get()
-            .read_list(schema, &mut |d| consumer(&mut DateTimeReader(d)))
+            .read_list(schema, &mut |d| consumer(&mut DateTimeReader(d, members)))
     }
 
     fn read_map(
@@ -171,9 +211,10 @@ impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
         schema: &Schema,
         consumer: &mut dyn FnMut(String, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        self.0
-            .get()
-            .read_map(schema, &mut |key, d| consumer(key, &mut DateTimeReader(d)))
+        let members = self.1;
+        self.0.get().read_map(schema, &mut |key, d| {
+            consumer(key, &mut DateTimeReader(d, members))
+        })
     }
 
     fn read_boolean(&mut self, schema: &Schema) -> Result<bool, SerdeError> {
@@ -220,14 +261,15 @@ impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
         self.0.get().read_blob(schema)
     }
 
-    /// The one rewrite on the way in: a member whose schema reports no timestamp format is
-    /// read with the `date-time` format its model declares instead of the protocol default.
-    /// A member that declares a format keeps it.
+    /// The one rewrite on the way in: a member this selection covers whose schema reports no
+    /// timestamp format is read with the `date-time` format its model declares instead of the
+    /// protocol default. A member that declares a format, and one outside the selection, keep
+    /// the reading the framework gives them.
     fn read_timestamp(&mut self, schema: &Schema) -> Result<DateTime, SerdeError> {
-        match schema.timestamp_format() {
-            Some(_) => self.0.get().read_timestamp(schema),
-            None => self.0.get().read_timestamp(&DATE_TIME_TIMESTAMP),
+        if schema.timestamp_format().is_some() || !self.1.covers(schema) {
+            return self.0.get().read_timestamp(schema);
         }
+        self.0.get().read_timestamp(&DATE_TIME_TIMESTAMP)
     }
 
     fn read_document(&mut self, schema: &Schema) -> Result<Document, SerdeError> {
@@ -251,12 +293,16 @@ impl<D: InnerDeserializer> ShapeDeserializer for DateTimeReader<D> {
 // Response side
 // =================================================================================
 
-/// One shape, serialized with every format-less timestamp rendered as date-time text.
-struct DateTimes<'a>(&'a dyn SerializableStruct);
+/// One shape, serialized with each format-less timestamp this selection covers rendered as
+/// date-time text.
+struct DateTimes<'a>(&'a dyn SerializableStruct, DateTimeMembers);
 
 impl SerializableStruct for DateTimes<'_> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        self.0.serialize_members(&mut DateTimeWriter { inner: s })
+        self.0.serialize_members(&mut DateTimeWriter {
+            inner: s,
+            members: self.1,
+        })
     }
 }
 
@@ -266,6 +312,8 @@ impl SerializableStruct for DateTimes<'_> {
 /// timestamp is rarely the output's own member.
 struct DateTimeWriter<'a> {
     inner: &'a mut dyn ShapeSerializer,
+    /// The members the rewrite applies to; carried down every nesting level.
+    members: DateTimeMembers,
 }
 
 impl ShapeSerializer for DateTimeWriter<'_> {
@@ -274,7 +322,8 @@ impl ShapeSerializer for DateTimeWriter<'_> {
         schema: &Schema,
         value: &dyn SerializableStruct,
     ) -> Result<(), SerdeError> {
-        self.inner.write_struct(schema, &DateTimes(value))
+        self.inner
+            .write_struct(schema, &DateTimes(value, self.members))
     }
 
     fn write_list(
@@ -282,8 +331,10 @@ impl ShapeSerializer for DateTimeWriter<'_> {
         schema: &Schema,
         write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        self.inner
-            .write_list(schema, &|inner| write_elements(&mut DateTimeWriter { inner }))
+        let members = self.members;
+        self.inner.write_list(schema, &|inner| {
+            write_elements(&mut DateTimeWriter { inner, members })
+        })
     }
 
     fn write_map(
@@ -291,8 +342,10 @@ impl ShapeSerializer for DateTimeWriter<'_> {
         schema: &Schema,
         write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
-        self.inner
-            .write_map(schema, &|inner| write_entries(&mut DateTimeWriter { inner }))
+        let members = self.members;
+        self.inner.write_map(schema, &|inner| {
+            write_entries(&mut DateTimeWriter { inner, members })
+        })
     }
 
     fn write_boolean(&mut self, schema: &Schema, value: bool) -> Result<(), SerdeError> {
@@ -340,10 +393,11 @@ impl ShapeSerializer for DateTimeWriter<'_> {
     }
 
     /// The one rewrite on the way out: the member's own schema, carrying the date-time text
-    /// of its instant. A member that declares a format, or an instant the formatter cannot
-    /// express, falls through to the codec's own rendering, so a member is never dropped.
+    /// of its instant. A member that declares a format, one outside this selection, or an
+    /// instant the formatter cannot express, falls through to the codec's own rendering, so a
+    /// member is never dropped.
     fn write_timestamp(&mut self, schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
-        if schema.timestamp_format().is_some() {
+        if schema.timestamp_format().is_some() || !self.members.covers(schema) {
             return self.inner.write_timestamp(schema, value);
         }
         match date_time_text(value) {
@@ -370,11 +424,16 @@ impl ShapeSerializer for DateTimeWriter<'_> {
 #[derive(Debug)]
 pub struct DateTimeRestJson {
     inner: RestJsonServerProtocol,
+    members: DateTimeMembers,
 }
 
 impl DateTimeRestJson {
     /// Build the protocol once, at service construction: `Service::override_protocol` hands
     /// back a borrow of it and must never build one per request.
+    ///
+    /// Every format-less timestamp member is corrected, which is what a model whose every
+    /// timestamp member declares `date-time` wants; a model that declares both forms takes
+    /// [`Self::for_members`] instead.
     ///
     /// The route table is EMPTY by design. A protocol's routes are read by
     /// [`ServerProtocol::routing_key`] alone, and the router resolves a request's operation
@@ -383,8 +442,22 @@ impl DateTimeRestJson {
     /// `deserialize_input`, `serialize_output`, `serialize_error`.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_members(DateTimeMembers::Every)
+    }
+
+    /// The same protocol, correcting ONLY the timestamp members named here — by absolute
+    /// member id (`"ns#Shape$member"`) — which is what a model that also declares
+    /// `epoch-seconds` members wants: every member outside the list keeps the form the
+    /// protocol gives it.
+    #[must_use]
+    pub fn for_members(members: &'static [&'static str]) -> Self {
+        Self::with_members(DateTimeMembers::Only(members))
+    }
+
+    fn with_members(members: DateTimeMembers) -> Self {
         Self {
             inner: RestJsonServerProtocol::new(&[]),
+            members,
         }
     }
 }
@@ -413,7 +486,7 @@ impl ServerProtocol for DateTimeRestJson {
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
         let inner = self.inner.deserialize_input(request, input_schema)?;
-        Ok(Box::new(DateTimeReader(inner)))
+        Ok(Box::new(DateTimeReader(inner, self.members)))
     }
 
     fn serialize_output(
@@ -424,7 +497,7 @@ impl ServerProtocol for DateTimeRestJson {
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
         self.inner.serialize_output(
-            &DateTimes(output),
+            &DateTimes(output, self.members),
             output_schema,
             operation_name,
             success_status,
@@ -441,8 +514,12 @@ impl ServerProtocol for DateTimeRestJson {
         // Wrapped for the same reason the success body is: the seam is uniform, so a
         // timestamp member an error shape carries cannot silently go out in the protocol's
         // default form. The wrapper is a no-op for a shape that holds no timestamp.
-        self.inner
-            .serialize_error(&DateTimes(error), error_schema, error_code, http_status)
+        self.inner.serialize_error(
+            &DateTimes(error, self.members),
+            error_schema,
+            error_code,
+            http_status,
+        )
     }
 
     fn serialize_event_stream_message(
@@ -455,7 +532,7 @@ impl ServerProtocol for DateTimeRestJson {
         self.inner.serialize_event_stream_message(
             event_type,
             is_exception,
-            &DateTimes(event),
+            &DateTimes(event, self.members),
             event_schema,
         )
     }
@@ -471,6 +548,7 @@ impl ServerProtocol for DateTimeRestJson {
 #[derive(Debug)]
 pub struct DateTimeAwsJson {
     inner: HttpRpcServerProtocol<JsonCodec>,
+    members: DateTimeMembers,
 }
 
 impl DateTimeAwsJson {
@@ -482,8 +560,20 @@ impl DateTimeAwsJson {
     /// `X-Amz-Target` suffix), the media type and the error envelope are the model's.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_members(DateTimeMembers::Every)
+    }
+
+    /// The same protocol, correcting ONLY the timestamp members named here — the selective
+    /// form [`DateTimeRestJson::for_members`] documents.
+    #[must_use]
+    pub fn for_members(members: &'static [&'static str]) -> Self {
+        Self::with_members(DateTimeMembers::Only(members))
+    }
+
+    fn with_members(members: DateTimeMembers) -> Self {
         Self {
             inner: ::aws_smithy_schema_server::AwsJson10(),
+            members,
         }
     }
 }
@@ -512,7 +602,7 @@ impl ServerProtocol for DateTimeAwsJson {
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
         let inner = self.inner.deserialize_input(request, input_schema)?;
-        Ok(Box::new(DateTimeReader(inner)))
+        Ok(Box::new(DateTimeReader(inner, self.members)))
     }
 
     fn serialize_output(
@@ -523,7 +613,7 @@ impl ServerProtocol for DateTimeAwsJson {
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
         self.inner.serialize_output(
-            &DateTimes(output),
+            &DateTimes(output, self.members),
             output_schema,
             operation_name,
             success_status,
@@ -537,8 +627,12 @@ impl ServerProtocol for DateTimeAwsJson {
         error_code: &str,
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
-        self.inner
-            .serialize_error(&DateTimes(error), error_schema, error_code, http_status)
+        self.inner.serialize_error(
+            &DateTimes(error, self.members),
+            error_schema,
+            error_code,
+            http_status,
+        )
     }
 
     fn serialize_event_stream_message(
@@ -551,7 +645,7 @@ impl ServerProtocol for DateTimeAwsJson {
         self.inner.serialize_event_stream_message(
             event_type,
             is_exception,
-            &DateTimes(event),
+            &DateTimes(event, self.members),
             event_schema,
         )
     }
@@ -559,8 +653,57 @@ impl ServerProtocol for DateTimeAwsJson {
 
 #[cfg(test)]
 mod tests {
-    use super::date_time_text;
+    use super::{date_time_text, DateTimeMembers};
+    use aws_smithy_schema::{Schema, ShapeId, ShapeType};
     use aws_smithy_types::DateTime;
+
+    /// One member schema as the codegen builds it: the absolute id is the owning shape's id
+    /// with `$<member>` appended.
+    static OWNED: Schema = Schema::new_member(
+        ShapeId::from_static("ns.example#Owner$at", "ns.example", "at"),
+        ShapeType::Timestamp,
+        "at",
+        0,
+    );
+
+    /// A member of the same NAME on another shape, which a selection by member id must tell
+    /// apart from [`OWNED`].
+    static NAMESAKE: Schema = Schema::new_member(
+        ShapeId::from_static("ns.example#Other$at", "ns.example", "at"),
+        ShapeType::Timestamp,
+        "at",
+        0,
+    );
+
+    /// RULE: `Every` covers any member; `Only` covers exactly the member ids it names, so two
+    /// shapes declaring a member of one name are told apart.
+    #[test]
+    fn a_selection_covers_the_members_it_names() {
+        let rows: [(&str, DateTimeMembers, bool, bool); 3] = [
+            ("every", DateTimeMembers::Every, true, true),
+            (
+                "only-the-owner",
+                DateTimeMembers::Only(&["ns.example#Owner$at"]),
+                true,
+                false,
+            ),
+            ("only-nothing", DateTimeMembers::Only(&[]), false, false),
+        ];
+        for (case, members, owned, namesake) in rows {
+            assert_eq!(
+                members.covers(&OWNED),
+                owned,
+                "case {case:?}: expected the owner's member covered={owned}, got {}",
+                members.covers(&OWNED)
+            );
+            assert_eq!(
+                members.covers(&NAMESAKE),
+                namesake,
+                "case {case:?}: expected the namesake member covered={namesake}, got {}",
+                members.covers(&NAMESAKE)
+            );
+        }
+    }
 
     /// RULE: an instant is reported as an RFC 3339 UTC date-time string. The rows span what
     /// the rendering generalises over: the epoch itself, a whole second, an instant carrying

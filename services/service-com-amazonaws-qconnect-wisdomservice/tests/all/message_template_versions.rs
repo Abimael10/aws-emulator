@@ -43,7 +43,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_qconnect_wisdomservice::state::MAX_MESSAGE_TEMPLATE_VERSIONS_PER_TEMPLATE;
 
-use super::message_template::{content_for, CHANNEL_SUBTYPES};
+use super::message_template::{content_for, CHANNEL_SUBTYPES, DEFAULT_LANGUAGE};
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, ABSENT_UUID, OTHER_ACCOUNT, REGION};
 
 /// The sentence a request addressed to a message-template version that was never published
@@ -914,10 +914,12 @@ async fn an_update_applies_to_the_working_copy_and_leaves_published_versions_unc
          with, got {:?}",
         version.string("/messageTemplate/messageTemplateContentSha256")
     );
-    assert!(
-        version.field("/messageTemplate/language").is_none(),
-        "case \"read the published version\": the published version carried no language, and the \
-         update that set one applies to {QUALIFIER_LATEST} alone, got {}",
+    assert_eq!(
+        version.string("/messageTemplate/language"),
+        DEFAULT_LANGUAGE,
+        "case \"read the published version\": the published version carried the language it was \
+         created with ({DEFAULT_LANGUAGE:?}), and the update that set another applies to \
+         {QUALIFIER_LATEST} alone, got {}",
         version.body
     );
 

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMessageTemplateMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMessageTemplateMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMessageTemplateMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a partial update to the message template's METADATA — its name, description and
+//! grouping configuration — and, as the operation's own documentation states, to every
+//! version the template has published as well as to the working copy `$LATEST` names. A
+//! member the request does not carry stays as it was, and the name it may claim is still the
+//! one name that has to be unique inside the knowledge base.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +89,37 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member whose label a refusal of this operation names, as a caller names it.
+const MEMBER_MESSAGE_TEMPLATE_ID: &str = "messageTemplateId";
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> UpdateMessageTemplateMetadataError {
+    UpdateMessageTemplateMetadataErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+            resource_name: Some(resource_name.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> UpdateMessageTemplateMetadataError {
+    UpdateMessageTemplateMetadataErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> UpdateMessageTemplateMetadataError {
+    UpdateMessageTemplateMetadataErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +192,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMessageTemplateMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMessageTemplateMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMessageTemplateMetadata"))
+        // Everything this operation answers with is rendered out of the stored record, so
+        // nothing here is built from request metadata. Modelled constraints (`name`'s and
+        // `description`'s length and pattern, the label patterns) are already refused
+        // BEFORE this handler runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateMessageTemplateMetadata")
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A message template is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        let (message_template_id, qualifier) =
+            crate::state::resolve_qualified_id(&input.message_template_id);
+        let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+        let message_template_id = message_template.message_template_id.clone();
+
+        // The label "cannot contain any qualifier": one that carries a qualifier is refused
+        // rather than read as naming a version to write to, since this write reaches the
+        // working copy and every published version by itself.
+        if qualifier.is_some() {
+            return Err(validation(crate::state::message_qualifier_not_accepted(
+                MEMBER_MESSAGE_TEMPLATE_ID,
+            )));
+        }
+
+        // "The name of the message template has to be unique for each knowledge base"
+        // (`smithy_query(query="doc",shape="CreateMessageTemplate")`), so a rename onto a
+        // name another live template of this knowledge base holds is the modelled conflict
+        // (HTTP 409) and writes nothing. A request that re-states this template's own name
+        // conflicts with nothing.
+        if let Some(name) = input.name.as_deref() {
+            if store
+                .message_template_with_name(&knowledge_base_id, name)
+                .is_some_and(|held| held.message_template_id != message_template_id)
+            {
+                return Err(conflict(crate::state::MESSAGE_NAME_IN_USE));
+            }
+        }
+
+        // "Partial update is supported. If any field is not supplied, it will remain
+        // unchanged for the message template", and the write reaches the working copy AND
+        // every published version — both decided by the one store seam.
+        let metadata = crate::state::MessageTemplateMetadata {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            grouping_configuration: input.grouping_configuration.clone(),
+        };
+        if !store.write_message_template_metadata(
+            &knowledge_base_id,
+            &message_template_id,
+            &metadata,
+            now,
+            &crate::state::caller_principal(),
+        ) {
+            // Unreachable: the lookup above found this record while the lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateMessageTemplateMetadata",
+            ));
+        }
+
+        // Render out of the UPDATED record rather than out of the request: what this call
+        // answers is what a later `GetMessageTemplate` answers.
+        let Some(stored) = store.message_template(&knowledge_base_id, &message_template_id) else {
+            // Unreachable for the same reason.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateMessageTemplateMetadata",
+            ));
+        };
+        Ok(UpdateMessageTemplateMetadataOutput {
+            message_template: Some(stored.to_message_template_data()),
+        })
     }
 }

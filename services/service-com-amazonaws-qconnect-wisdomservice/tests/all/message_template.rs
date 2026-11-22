@@ -22,7 +22,11 @@
 //!   templates built from the same four have the same checksum, a change to any of them
 //!   changes it, and a change to anything else does not;
 //! * `attributeTypes` reports the categories of attribute the template holds, derived from
-//!   the stored record;
+//!   the stored record, and is always reported — the empty list for a template that holds
+//!   none;
+//! * `channel` is the Amazon Connect contact channel the template's `channelSubtype` is a
+//!   subtype of, and `language` is the one the create named or the endpoint's default when
+//!   it named none;
 //! * a message template's `name` is unique INSIDE one knowledge base: a second create
 //!   claiming it is `ConflictException` (HTTP 409) and leaves the first record untouched,
 //!   while another knowledge base may hold the same name;
@@ -80,6 +84,24 @@ const LANGUAGES: [&str; 11] = [
     "de_DE", "en_US", "es_ES", "fr_FR", "id_ID", "it_IT", "ja_JP", "ko_KR", "pt_BR", "zh_CN",
     "zh_TW",
 ];
+
+/// The language code a template created without one reports: `language` is optional on the
+/// create while every read reports the template's effective language, so a create that names
+/// none is written in the endpoint's default language. Written out here rather than imported,
+/// so the assertion pins the answer a client sees.
+pub(crate) const DEFAULT_LANGUAGE: &str = "en_US";
+
+/// The Amazon Connect contact channel one `ChannelSubtype` is a subtype of, which is what
+/// `channel` reports: an email template is sent on the EMAIL channel, and the messaging
+/// subtypes (SMS, WhatsApp Business, mobile push) are subtypes of the CHAT channel — the
+/// channel a quick response's `channels` member documents for this same endpoint ("The
+/// supported contact channel types include Chat").
+pub(crate) fn expected_channel(channel_subtype: &str) -> &'static str {
+    match channel_subtype {
+        "EMAIL" => "EMAIL",
+        _ => "CHAT",
+    }
+}
 
 /// The published bounds of the members this suite varies in length
 /// (`smithy_query(query="operation",operation="CreateMessageTemplate")`: `name` is `len
@@ -491,9 +513,9 @@ fn assert_reports_case(
     );
     assert_eq!(
         field("language"),
-        case.language.map(|value| json!(value)),
+        Some(json!(case.language.unwrap_or(DEFAULT_LANGUAGE))),
         "case {case_label:?} read by {reader}: expected language {:?}, got {:?}",
-        case.language,
+        case.language.unwrap_or(DEFAULT_LANGUAGE),
         field("language")
     );
     assert_eq!(
@@ -510,11 +532,13 @@ fn assert_reports_case(
         case.grouping_configuration,
         field("groupingConfiguration")
     );
-    let expected_attribute_types = (!case.attribute_types.is_empty())
-        .then(|| json!(case.attribute_types));
+    // The list is ALWAYS reported, as the empty list for a template that holds no attribute
+    // of any category: a client that iterates it must be able to tell "none" from "not
+    // returned".
+    let expected_attribute_types = json!(case.attribute_types);
     assert_eq!(
         field("attributeTypes"),
-        expected_attribute_types,
+        Some(expected_attribute_types.clone()),
         "case {case_label:?} read by {reader}: expected attributeTypes {expected_attribute_types:?}, \
          got {:?}",
         field("attributeTypes")
@@ -559,13 +583,15 @@ fn assert_reports_case(
         "case {case_label:?} read by {reader}: expected a 64-digit hex content checksum, got \
          {checksum:?}"
     );
-    // `channel` is not a member any message-template request carries, so nothing is
-    // claimed under it.
+    // `channel` is the Amazon Connect contact channel the template's subtype is a subtype
+    // of, which no request member carries and every projection derives from the subtype.
+    let expected_channel = expected_channel(case.channel_subtype);
     assert_eq!(
         field("channel"),
-        None,
-        "case {case_label:?} read by {reader}: no request member names a channel, so none must \
-         be reported, got {:?}",
+        Some(json!(expected_channel)),
+        "case {case_label:?} read by {reader}: expected channel {expected_channel:?} for channel \
+         subtype {:?}, got {:?}",
+        case.channel_subtype,
         field("channel")
     );
 }
@@ -1628,10 +1654,19 @@ fn base64_of(bytes: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(bytes)
 }
 
-/// One instant a response reports, in the epoch seconds this endpoint's JSON carries a
-/// modelled `Timestamp` as, or `None` when the member is absent.
+/// One instant a response reports, as the number of seconds since the epoch it names.
+///
+/// `MessageTemplateAttachment`'s `uploadedTime` and `urlExpiry` carry
+/// `@timestampFormat("date-time")`, so what a response carries is an RFC 3339 STRING; this
+/// reads that string back to an instant, which is what lets a row assert the INTERVAL
+/// between two of them. `None` for an absent member and for a value that is no date-time
+/// string at all — so a member reported in the protocol's default epoch-number form fails
+/// the row rather than passing it.
 fn instant(reply: &Reply, pointer: &str) -> Option<f64> {
-    reply.field(pointer).and_then(Value::as_f64)
+    let text = reply.field(pointer)?.as_str()?.to_string();
+    ::aws_smithy_types::DateTime::from_str(&text, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|parsed| parsed.as_secs_f64())
 }
 
 /// The attachment surface of the shared harness, and the fixtures these rows need.
