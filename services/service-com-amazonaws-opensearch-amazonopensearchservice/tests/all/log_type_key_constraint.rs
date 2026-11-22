@@ -22,8 +22,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::LOG_TY
 
 use super::domain_configuration_rules::assert_refusal;
 use super::domain_lifecycle::{
-    baseline_create, create_baseline, error_code, log_group_arn, Emulator, SETTLE_WAIT,
+    baseline_create, error_code, log_group_arn, settled_domain, Emulator,
 };
+use super::log_publishing_destinations::with_audit_prerequisite;
 use super::service_software_update::message;
 
 /// The CloudWatch Logs log group the accepted rows publish to. An enabled option's
@@ -165,8 +166,21 @@ async fn every_modelled_log_type_is_accepted_and_the_lookup_still_answers() {
     emulator.created_log_group(LOG_GROUP_NAME).await;
     let log_group = log_group_arn(LOG_GROUP_NAME);
     let name = "log-key-accepted";
-    create_baseline(&emulator, name).await;
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The whole key set is driven against ONE domain, and the audit log type is the log of
+    // the decisions fine-grained access control takes — a domain publishing it is one
+    // reached through that boundary ([`with_audit_prerequisite`]) — so the domain under
+    // test carries that boundary and what the loop proves stays the KEY SET.
+    let mut body = baseline_create(name);
+    with_audit_prerequisite(&mut body);
+    let created = emulator.create(body).await;
+    assert_eq!(
+        created.status, 200,
+        "case CreateDomain({name:?}): expected 200, got {} with {:?}",
+        created.status, created.body
+    );
+    // The change the create started has to land before an update can start another: the
+    // CONDITION is polled, never slept for.
+    settled_domain(&emulator, name).await;
 
     // The key shape's whole value set, read off the generated constant rather than
     // listed here, so a value the model gains is exercised too — plus the one value the
@@ -198,7 +212,7 @@ async fn every_modelled_log_type_is_accepted_and_the_lookup_still_answers() {
             "case {log_type}: the stored option must read back, got {:?}",
             read.body["DomainConfig"]["LogPublishingOptions"]
         );
-        tokio::time::sleep(SETTLE_WAIT).await;
+        settled_domain(&emulator, name).await;
     }
 
     let absent = emulator

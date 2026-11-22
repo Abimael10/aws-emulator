@@ -26,6 +26,12 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # The fleet's home for how a boundary refusal is worded (`override_refusal`).
 service-common = { path = "../common" }
+# The OpenSearch Service surface of this SAME service (the 2021-01-01 API): a domain is one
+# resource published through two API versions, so this surface's reads resolve a domain in
+# the store that surface's own `CreateDomain` writes as well as in this one
+# (`state::opensearch_surface`) — the way every other service crate reaches a store that is
+# not its own.
+service-com-amazonaws-opensearch-amazonopensearchservice = { workspace = true }
 # Checks a value against the syntax a shape declares, for the constraints the
 # boundary walk cannot reach (a map key, a shape this model leaves unconstrained).
 regex = "1.13"
@@ -34,6 +40,9 @@ regex = "1.13"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the integration-test target needs no
+# hand-maintained list of suites.
+automod = { workspace = true }
 # `time` is a test-only need: the lifecycle suite awaits the provisioning span.
 tokio = { workspace = true, features = ["time"] }
 

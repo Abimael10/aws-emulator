@@ -150,7 +150,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // string that is no domain ARN at all, or one naming a domain that was
         // never created or has been deleted — is an invalid input, which is the
         // one refusal all three tag operations model.
-        let Some(domain) = store.domain_by_arn(&input.arn) else {
+        let held = store
+            .domain_by_arn(&input.arn)
+            .map(|domain| domain.tags.clone());
+        // A domain is ONE resource published through two API versions, so an ARN this
+        // surface's own store resolves to no domain is resolved in the OpenSearch surface's
+        // store ([`crate::state::opensearch_surface`]): the tags of a domain created there
+        // are the tags of a domain of this account, whichever API version created it.
+        // Reached once this store is released, so no call holds two service stores at once.
+        drop(store);
+        let Some(tags) = held
+            .or_else(|| crate::state::opensearch_surface::domain_tags(&*self.engine, &input.arn))
+        else {
             return Err(ListTagsErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::INVALID_TAG_ARN_MESSAGE.to_string()),
             })
@@ -161,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member is "list of Tag for the requested Elasticsearch domain", and
         // the requested domain has one, which happens to be empty.
         Ok(ListTagsOutput {
-            tag_list: Some(domain.tags.clone()),
+            tag_list: Some(tags),
         })
     }
 }

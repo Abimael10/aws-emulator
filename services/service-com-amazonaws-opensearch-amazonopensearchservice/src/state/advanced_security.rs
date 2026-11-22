@@ -32,7 +32,7 @@ use ::service_common::arn;
 
 use crate::ops::types::{
     AdvancedSecurityOptionsInput, DomainEndpointOptions, EncryptionAtRestOptions,
-    NodeToNodeEncryptionOptions, ValidationException,
+    LogPublishingOption, NodeToNodeEncryptionOptions, ValidationException,
 };
 
 /// What the service answers a request that switches fine-grained access control on for a
@@ -95,6 +95,18 @@ const MASTER_USER_CREDENTIALS_NOT_WITHOUT_INTERNAL_DATABASE: &str =
 /// the request carried.
 const MASTER_USER_ARN_NOT_A_PRINCIPAL: &str =
     "The master user ARN is not one of the allowed types: user, root user, or role.";
+
+/// What the service answers a request that would leave a domain PUBLISHING its audit log
+/// without fine-grained access control switched on.
+///
+/// A FIXED sentence: it states the condition that held — the configuration the domain would
+/// have to carry for that log type — and quotes nothing of the request back, neither the
+/// destination the option named nor the domain. The model carries no message text for
+/// `ValidationException`, so this is the sentence the service is RECORDED answering this
+/// condition with.
+const AUDIT_LOGS_REQUIRE_ADVANCED_SECURITY: &str =
+    "audit log publishing cannot be enabled as you do not have advanced security options \
+     configured.";
 
 /// What the service answers an update that asks for fine-grained access control switched
 /// off on a domain that has it switched on.
@@ -173,6 +185,41 @@ pub fn prerequisites_refusal(
         .map(|(_, message)| ValidationException {
             message: Some(message.to_string()),
         })
+}
+
+/// Whether the log types `options` publishes are ones the configuration can produce, and
+/// the refusal naming the missing prerequisite otherwise.
+///
+/// `LogType`'s `AUDIT_LOGS` is the log whose records are "user requests for access to the
+/// domain" (`smithy_query(query="shape",shape="LogType")`), and WHO may reach a domain —
+/// so what a request for access is granted or refused on — is decided by fine-grained
+/// access control ([`super::fgac`]): a domain that is not reached through that boundary
+/// takes no such decision, so the log type has nothing to publish. A request that would
+/// leave the domain publishing it anyway describes a delivery that can never happen, which
+/// is refused with the operation's `ValidationException` and nothing is stored — the same
+/// shape as the three prerequisites above, and the same rule the update path applies.
+///
+/// `advanced_security_enabled` is whether the configuration the call would leave the domain
+/// with has that boundary on: the create path passes what the REQUEST asks for, and the
+/// update path what the merged record holds, so a change that only enables the log type on
+/// a domain already reached through the boundary is admitted.
+///
+/// A DISABLED option publishes nothing, so it needs no prerequisite — it is stored as
+/// written, the way the destination rules read a disabled option
+/// ([`super::log_destinations`]).
+pub fn audit_log_publishing_refusal<'a>(
+    advanced_security_enabled: bool,
+    options: impl IntoIterator<Item = (&'a String, &'a LogPublishingOption)>,
+) -> Option<ValidationException> {
+    if advanced_security_enabled {
+        return None;
+    }
+    let publishes_audit = options.into_iter().any(|(log_type, option)| {
+        log_type == super::audit::LOG_TYPE_AUDIT && option.enabled == Some(true)
+    });
+    publishes_audit.then(|| ValidationException {
+        message: Some(AUDIT_LOGS_REQUIRE_ADVANCED_SECURITY.to_string()),
+    })
 }
 
 /// Whether the master user `options` names is a principal that can authenticate, and the

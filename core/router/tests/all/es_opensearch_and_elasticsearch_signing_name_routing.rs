@@ -364,8 +364,8 @@ fn the_es_endpoint_serves_both_api_versions() {
                 },
                 Call {
                     // `ListDomainNames` is declared by BOTH models at `/<version>/domain`,
-                    // so the two rows below also pin that each version reports its OWN
-                    // service's state rather than the other's.
+                    // so the row below also pins that the modern version reports its OWN
+                    // service's state rather than the legacy one's.
                     case: "ListDomainNames at the modern version",
                     method: "GET",
                     path: "/2021-01-01/domain",
@@ -376,14 +376,20 @@ fn the_es_endpoint_serves_both_api_versions() {
                     expected_absent: &["router-es-domain"],
                 },
                 Call {
+                    // The legacy listing reports the domains of this account and Region
+                    // whichever API version created them: a domain is ONE resource
+                    // published through two API versions, and `ListDomainNames` carries an
+                    // `EngineType` filter precisely because the listing spans both engines.
+                    // So the row that pins WHICH model served it is the one above, and this
+                    // one pins that the legacy version resolves the shared domain state.
                     case: "ListDomainNames at the legacy version",
                     method: "GET",
                     path: "/2015-01-01/domain",
                     body: None,
                     expected_status: 200,
                     expected_error: None,
-                    expected_contains: &["router-es-domain"],
-                    expected_absent: &["router-os-domain"],
+                    expected_contains: &["router-es-domain", "router-os-domain"],
+                    expected_absent: &[],
                 },
                 Call {
                     // The issue's own request. `CreateApplication` is declared only by

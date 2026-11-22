@@ -34,7 +34,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::LOG_TY
 
 use super::domain_configuration_rules::{assert_no_domain, assert_refusal};
 use super::domain_lifecycle::{
-    baseline_create, create_baseline, log_group_arn, Emulator, REGION, SETTLE_WAIT,
+    baseline_create, create_baseline, log_group_arn, settled_domain, Emulator, REGION,
 };
 use super::service_software_update::message;
 
@@ -93,6 +93,32 @@ struct Row {
 /// An enabled option publishing `log_type` to `arn`.
 fn enabled(log_type: &str, arn: &str) -> Value {
     json!({ log_type: { "Enabled": true, "CloudWatchLogsLogGroupArn": arn } })
+}
+
+/// The `LogType` whose records are the decisions fine-grained access control takes.
+pub(crate) const AUDIT_LOG_TYPE: &str = "AUDIT_LOGS";
+
+/// Put the configuration a domain publishing [`AUDIT_LOG_TYPE`] needs into `body`: that
+/// boundary switched on, its master user, and the three prerequisites the boundary itself
+/// has.
+///
+/// The audit log records the decisions fine-grained access control takes, so a domain
+/// publishing it is one reached through that boundary. A case about anything ELSE in the
+/// `LogPublishingOptions` map therefore carries this when its row names the audit log type,
+/// so what the case proves is its own rule rather than that prerequisite. The sibling
+/// suites that drive the whole `LogType` catalog reach it here rather than growing a second
+/// copy.
+pub(crate) fn with_audit_prerequisite(body: &mut Value) {
+    body["EncryptionAtRestOptions"] = json!({ "Enabled": true });
+    body["NodeToNodeEncryptionOptions"] = json!({ "Enabled": true });
+    body["DomainEndpointOptions"] = json!({ "EnforceHTTPS": true });
+    body["AdvancedSecurityOptions"] = json!({
+        "Enabled": true,
+        "InternalUserDatabaseEnabled": false,
+        "MasterUserOptions": {
+            "MasterUserARN": ::service_common::caller_principal::ambient_user_arn(),
+        },
+    });
 }
 
 /// The table: every row is the whole map a request carries.
@@ -253,7 +279,9 @@ async fn an_enabled_log_publishing_option_must_name_a_log_group_that_exists() {
     // first.
     let changed = "logs-destination-update";
     create_baseline(&emulator, changed).await;
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // Waits for the CONDITION the clock owes that create — the domain settled — rather
+    // than for a stretch of time, so the case does not depend on how fast the host runs.
+    settled_domain(&emulator, changed).await;
     let mut publishing = published(&emulator, changed).await;
 
     for (index, row) in rows().into_iter().enumerate() {
@@ -329,8 +357,9 @@ async fn an_enabled_log_publishing_option_must_name_a_log_group_that_exists() {
                     .as_object()
                     .is_some_and(|types| !types.is_empty())
                     .then(|| options.clone());
-                // An accepted change lands before the next row starts another.
-                tokio::time::sleep(SETTLE_WAIT).await;
+                // An accepted change lands before the next row starts another: the
+                // condition is polled, never slept for.
+                settled_domain(&emulator, changed).await;
                 assert_eq!(
                     published(&emulator, changed).await,
                     publishing,
@@ -364,6 +393,14 @@ async fn every_log_type_resolves_its_destination_the_same_way() {
             let name = format!("logtype-{position}-{index}");
             let mut body = baseline_create(&name);
             body["LogPublishingOptions"] = enabled(log_type, &arn);
+            // The audit log records the decisions fine-grained access control takes, so a
+            // domain publishing `AUDIT_LOGS` is one reached through that boundary: the
+            // destination rule under test is the same for every log type, and this row
+            // carries the PREREQUISITE the log type it names has, so what the row proves
+            // is the destination resolution rather than that prerequisite.
+            if log_type == AUDIT_LOG_TYPE {
+                with_audit_prerequisite(&mut body);
+            }
             let answer = emulator.create(body).await;
             let case = format!("{log_type}: {case}");
             if accepted {

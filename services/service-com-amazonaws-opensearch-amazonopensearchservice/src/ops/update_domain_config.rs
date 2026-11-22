@@ -844,6 +844,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 merged.domain_endpoint_options.as_ref(),
             ),
             crate::state::log_publishing_refusal(merged.log_publishing_options.iter()),
+            // ... and the audit log records the decisions fine-grained access control
+            // takes, so a change that would leave the domain publishing `AUDIT_LOGS`
+            // without that boundary is refused for the same reason the create path refuses
+            // it — judged on the MERGED record, so a change that only enables the log type
+            // is checked against the boundary the domain keeps, and one that only switches
+            // the boundary off against the log types it keeps.
+            crate::state::advanced_security::audit_log_publishing_refusal(
+                crate::state::fgac::enforced(&merged),
+                merged.log_publishing_options.iter(),
+            ),
             crate::state::off_peak_window_refusal(merged.off_peak_window_options.as_ref()),
             // A performance figure the volume type does not provision is refused on the
             // merged record too: a request that changes the volume TYPE is judged

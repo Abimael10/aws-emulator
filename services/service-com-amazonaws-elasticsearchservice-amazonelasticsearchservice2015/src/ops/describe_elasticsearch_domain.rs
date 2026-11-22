@@ -153,10 +153,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(&ctx.parts().headers);
         let store = state.lock();
-        let Some(domain) = store
+        let held = store
             .domains
             .get(&crate::state::domain_key(&region, &input.domain_name))
-        else {
+            .map(|domain| domain.domain_status(now));
+        // A domain is ONE resource published through two API versions, so a name this
+        // surface's own store holds nothing under is resolved in the OpenSearch surface's
+        // store before the call reports the resource as missing
+        // ([`crate::state::opensearch_surface`]): a domain created with
+        // `opensearch:CreateDomain` is described HERE too, with the configuration that
+        // create recorded. The other store is reached once this one is released, so no call
+        // holds two service stores at once.
+        drop(store);
+        let Some(domain_status) = held.or_else(|| {
+            crate::state::opensearch_surface::domain_status(
+                &*self.engine,
+                &region,
+                &input.domain_name,
+                now,
+            )
+        }) else {
             // The resource named is not there, which this API answers with HTTP 404
             // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`) and not with the
             // `@httpError(409)` the model annotates on the shape.
@@ -169,8 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        Ok(DescribeElasticsearchDomainOutput {
-            domain_status: domain.domain_status(now),
-        })
+        Ok(DescribeElasticsearchDomainOutput { domain_status })
     }
 }

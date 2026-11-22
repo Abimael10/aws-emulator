@@ -645,6 +645,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // applies.
             custom_endpoint_refused,
             crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
+            // ... and the audit log records the decisions fine-grained access control
+            // takes, so a create that would leave the domain publishing `AUDIT_LOGS`
+            // without that boundary configures a delivery that can never happen
+            // ([`crate::state::advanced_security::audit_log_publishing_refusal`]) — judged
+            // on what the REQUEST asks for, which is the whole of what a create would
+            // store, and by the same rule the update path applies.
+            crate::state::advanced_security::audit_log_publishing_refusal(
+                crate::state::advanced_security::requested_enabled(
+                    input.advanced_security_options.as_ref(),
+                ),
+                input.log_publishing_options.iter().flatten(),
+            ),
             // And the group that ARN names has to be one CloudWatch Logs holds: a
             // create that enables publishing to a group nobody created configures a
             // delivery that can never happen, so it is refused and no domain is

@@ -178,16 +178,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the status of each requested DOMAIN, so a name the request repeats
         // is still one domain and is reported once.
         let mut requested = ::std::collections::BTreeSet::new();
-        let mut domain_status_list = Vec::new();
+        let mut names = Vec::new();
         for domain_name in &input.domain_names {
-            if !requested.insert(domain_name.as_str()) {
-                continue;
+            if requested.insert(domain_name.as_str()) {
+                names.push(domain_name.as_str());
             }
-            if let Some(domain) = store
+        }
+        let mut domain_status_list = Vec::new();
+        let mut unresolved = Vec::new();
+        for domain_name in names {
+            match store
                 .domains
                 .get(&crate::state::domain_key(&region, domain_name))
             {
-                domain_status_list.push(domain.domain_status(now));
+                Some(domain) => domain_status_list.push(domain.domain_status(now)),
+                None => unresolved.push(domain_name.to_string()),
+            }
+        }
+        // A domain is ONE resource published through two API versions, so a name this
+        // surface's own store holds nothing under is resolved in the OpenSearch surface's
+        // store ([`crate::state::opensearch_surface`]) — the single describe resolves a
+        // name the same way, and the two cannot report the same batch differently. That
+        // store is reached once this one is released, so no call holds two service stores
+        // at once.
+        drop(store);
+        for domain_name in unresolved {
+            if let Some(status) = crate::state::opensearch_surface::domain_status(
+                &*self.engine,
+                &region,
+                &domain_name,
+                now,
+            ) {
+                domain_status_list.push(status);
             }
         }
 

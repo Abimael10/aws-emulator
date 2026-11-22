@@ -180,28 +180,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(&ctx.parts().headers);
         let store = state.lock();
-        let Some(domain) = store
-            .domains
-            .get(&crate::state::domain_key(&region, &domain_name))
-        else {
-            // The resource named is not there: HTTP 404
-            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
-            // `@httpError(409)` the model annotates on the shape.
-            return Err(crate::scaffolded::Scaffolded::not_found(
-                GetCompatibleElasticsearchVersionsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Domain not found: {domain_name}")),
-                    },
-                ),
-            ));
-        };
-
         // The domain's STORED version is the source of its upgrade paths. A
         // domain whose create named no version has no source version to narrow
         // on, so it is answered with the same catalog a request naming no domain
         // gets, rather than with an invented current version.
-        let compatible = match domain.config.elasticsearch_version.as_ref() {
-            Some(record) => vec![crate::state::compatible_versions_map(&record.value)],
+        let held = store
+            .domains
+            .get(&crate::state::domain_key(&region, &domain_name))
+            .map(|domain| {
+                domain
+                    .config
+                    .elasticsearch_version
+                    .as_ref()
+                    .map(|record| record.value.clone())
+            });
+        // A domain is ONE resource published through two API versions, so a name this
+        // surface's own store holds nothing under is resolved in the OpenSearch surface's
+        // store ([`crate::state::opensearch_surface`]): the upgrade paths of a domain
+        // created there are computed from the release THAT record holds. Reached once this
+        // store is released, so no call holds two service stores at once.
+        drop(store);
+        let version = match held {
+            Some(version) => version,
+            None => match crate::state::opensearch_surface::domain_engine_version(
+                &*self.engine,
+                &region,
+                &domain_name,
+                ::std::time::SystemTime::now(),
+            ) {
+                Some(version) => Some(version),
+                None => {
+                    // The resource named is not there: HTTP 404
+                    // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+                    // `@httpError(409)` the model annotates on the shape.
+                    return Err(crate::scaffolded::Scaffolded::not_found(
+                        GetCompatibleElasticsearchVersionsErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(format!("Domain not found: {domain_name}")),
+                            },
+                        ),
+                    ));
+                }
+            },
+        };
+
+        let compatible = match version.as_deref() {
+            Some(version) => vec![crate::state::compatible_versions_map(version)],
             None => crate::state::compatible_versions_catalog(),
         };
 

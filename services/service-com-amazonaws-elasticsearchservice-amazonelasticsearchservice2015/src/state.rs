@@ -53,6 +53,11 @@ pub use request_constraints::*;
 mod search_indexes;
 pub use search_indexes::*;
 
+/// The domains the 2021-01-01 OpenSearch surface of this same service holds: one resource
+/// published through two API versions, so this surface's reads resolve a domain there as
+/// well as in this store.
+pub mod opensearch_surface;
+
 /// The region an ARN or endpoint uses when the request carries no SigV4
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";

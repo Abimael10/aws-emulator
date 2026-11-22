@@ -45,7 +45,7 @@ use super::domain_lifecycle::{
     baseline_create, create_baseline, error_code, log_group_arn, Answer, Emulator, PREFIX,
     SETTLE_WAIT,
 };
-use super::log_publishing_destinations::PUBLISHED_GROUP;
+use super::log_publishing_destinations::{with_audit_prerequisite, AUDIT_LOG_TYPE, PUBLISHED_GROUP};
 use super::service_software_update::{
     message, seed, settled_domain, start, with_update_available,
 };
@@ -416,13 +416,16 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
         ];
         for (index, (case, option, accepted)) in rows.into_iter().enumerate() {
             let name = format!("logs-{}-{index}", log_type.to_lowercase().replace('_', "-"));
-            let answer = create_with(
-                &emulator,
-                &name,
-                "LogPublishingOptions",
-                json!({ log_type: option }),
-            )
-            .await;
+            let mut body = baseline_create(&name);
+            body["LogPublishingOptions"] = json!({ log_type: option });
+            // The audit log records the decisions fine-grained access control takes, so a
+            // domain publishing it is one reached through that boundary
+            // ([`with_audit_prerequisite`]): this loop is about the DESTINATION an option
+            // names, so the audit rows carry the prerequisite that log type has.
+            if log_type == AUDIT_LOG_TYPE {
+                with_audit_prerequisite(&mut body);
+            }
+            let answer = emulator.create(body).await;
             let case = format!("{log_type}: {case}");
             if accepted {
                 assert_eq!(
@@ -449,8 +452,9 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
     // and through the call that CHANGES a domain's log publishing.
     let updated = "logs-update";
     create_baseline(&emulator, updated).await;
-    // The change the create started has to land before an update can start another.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The change the create started has to land before an update can start another: the
+    // CONDITION is polled, never slept for.
+    super::domain_lifecycle::settled_domain(&emulator, updated).await;
     let maps: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "both enabled without a group",
@@ -509,8 +513,9 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
                     "case UpdateDomainConfig({case}): expected 200, got {} with {:?}",
                     answer.status, answer.body
                 );
-                // An accepted change lands before the next row starts another.
-                tokio::time::sleep(SETTLE_WAIT).await;
+                // An accepted change lands before the next row starts another: the
+                // CONDITION is polled, never slept for.
+                super::domain_lifecycle::settled_domain(&emulator, updated).await;
             }
         }
     }

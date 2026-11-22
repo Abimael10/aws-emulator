@@ -141,21 +141,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `EngineType` is a modelled enum, so a value outside it is already
-        // refused by the boundary validator before this handler runs; what is
-        // left to do here is select on the one the caller asked for.
         let region = crate::state::request_region(&ctx.parts().headers);
         let store = state.lock();
-        let domain_names: Vec<DomainInfo> = store
+        let mut domain_names: Vec<DomainInfo> = store
             .domains_in(&region)
-            .filter(|domain| {
-                input
-                    .engine_type
-                    .as_deref()
-                    .is_none_or(|wanted| domain.engine_type == wanted)
-            })
             .map(crate::state::Domain::domain_info)
             .collect();
+        // A domain is ONE resource published through two API versions, so this listing
+        // reports the domains of BOTH surfaces ([`crate::state::opensearch_surface`]): a
+        // domain created with `opensearch:CreateDomain` is one of this account's domains in
+        // this Region, whichever API version created it. A name this store already holds is
+        // one domain, reported once. The other store is reached once this one is released,
+        // so no call holds two service stores at once.
+        drop(store);
+        let held: ::std::collections::BTreeSet<String> = domain_names
+            .iter()
+            .filter_map(|domain| domain.domain_name.clone())
+            .collect();
+        domain_names.extend(
+            crate::state::opensearch_surface::domain_names(&*self.engine, &region)
+                .into_iter()
+                .filter(|domain| {
+                    domain
+                        .domain_name
+                        .as_ref()
+                        .is_none_or(|name| !held.contains(name))
+                }),
+        );
+        // `EngineType` is a modelled enum, so a value outside it is already refused by the
+        // boundary validator before this handler runs; what is left to do here is select on
+        // the one the caller asked for — applied to both surfaces' domains alike, since the
+        // engine a domain runs is read from its own release either way.
+        if let Some(wanted) = input.engine_type.as_deref() {
+            domain_names.retain(|domain| domain.engine_type.as_deref() == Some(wanted));
+        }
 
         Ok(ListDomainNamesOutput {
             domain_names: Some(domain_names),
