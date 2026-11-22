@@ -35,6 +35,7 @@
 //! admitted goes on to the lookup and earns the resource refusal instead.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_pcaconnectorad_pcaconnectorad as pcad;
 
@@ -906,6 +907,184 @@ async fn a_request_refused_for_a_constraint_persists_nothing() {
         assert_eq!(
             count, 0,
             "case {resource:?}: a refused request persists nothing, got {count} record(s)"
+        );
+    }
+}
+
+/// The directory ids `CreateDirectoryRegistration` refuses, one row per way a value can
+/// miss the expression its member declares.
+///
+/// `DirectoryId` travels in that operation's BODY
+/// (`smithy_query(query="operation",operation="CreateDirectoryRegistration")`: POST
+/// `/directoryRegistrations`, success 202, `DirectoryId` `@required` with `@pattern`
+/// [`DIRECTORY_ID_PATTERN`]), so the rule this suite states places its refusal on the body
+/// half: the whole message is the validator's bracketed finding over that expression and the
+/// submitted value, with no member path and no error count.
+///
+/// The rows differ along everything the expression constrains — the prefix, its case, how
+/// many characters follow it, the alphabet those characters come from, and whether the
+/// expression has to match the WHOLE value — so the rule is asserted over the class rather
+/// than over one value.
+fn rejected_directory_ids() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a word carrying neither the prefix nor an identifier",
+            "not-a-directory-at-all".to_string(),
+        ),
+        ("the prefix capitalised", "D-0123456789".to_string()),
+        (
+            "the identifier in upper-case hexadecimal",
+            "d-ABCDEF0123".to_string(),
+        ),
+        (
+            "one character short of the modelled count",
+            "d-012345678".to_string(),
+        ),
+        (
+            "one character past the modelled count",
+            "d-01234567890".to_string(),
+        ),
+        (
+            "letters outside the hexadecimal alphabet among the characters",
+            "d-01234567yz".to_string(),
+        ),
+        ("the prefix alone", "d-".to_string()),
+        ("the prefix without its separator", "d0123456789".to_string()),
+        ("no value at all", String::new()),
+        (
+            "an identifier the expression admits, with a trailing space",
+            format!("{WELL_FORMED_DIRECTORY_ID} "),
+        ),
+        (
+            "an identifier the expression admits inside a longer word, which the \
+             whole-value match refuses",
+            format!("prefix{WELL_FORMED_DIRECTORY_ID}suffix"),
+        ),
+        (
+            "the registration's ARN where the directory's identifier belongs",
+            well_formed_directory_registration_arn(),
+        ),
+    ]
+}
+
+/// Three directory ids the expression DOES admit, differing in the characters that follow
+/// the prefix, so the accepted half of the rule is asserted over more than one value.
+const ADMITTED_DIRECTORY_IDS: [&str; 3] =
+    [WELL_FORMED_DIRECTORY_ID, "d-abcdef0123", "d-00000000ff"];
+
+/// The ARNs `ListDirectoryRegistrations` answers with, read through the wire — which also
+/// pins that the collection key is there to read at all.
+async fn listed_registrations(router: &MultiServiceRouter) -> Vec<String> {
+    let (status, code, parsed) = call(router, "GET", "/directoryRegistrations", None).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (200, ""),
+        "ListDirectoryRegistrations must answer normally, got {status} / {code:?} / {parsed}"
+    );
+    let entries = parsed["DirectoryRegistrations"].as_array().unwrap_or_else(|| {
+        panic!("ListDirectoryRegistrations must answer its collection key, got {parsed}")
+    });
+    entries
+        .iter()
+        .filter_map(|summary| summary["Arn"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `CreateDirectoryRegistration`'s directory id is a BODY member, so a value its expression
+/// does not admit earns the validator's bracketed finding and nothing else — and the
+/// collection it would have been added to is left exactly as it was.
+#[tokio::test]
+async fn create_directory_registration_refuses_a_directory_id_with_the_bracketed_finding_alone() {
+    let router = router();
+    for (case, value) in rejected_directory_ids() {
+        let before = listed_registrations(&router).await;
+        let body = json!({ "DirectoryId": value });
+        let (status, code, parsed) =
+            call(&router, "POST", "/directoryRegistrations", Some(&body)).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a directory id outside its expression is refused with 400 \
+             ValidationException, got {status} / {code:?} / {parsed}"
+        );
+        let expected = report(&[regex_finding(DIRECTORY_ID_PATTERN, &value)]);
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected message {expected:?}, got {parsed}"
+        );
+        let after = listed_registrations(&router).await;
+        assert_eq!(
+            before, after,
+            "case {case:?}: a refused create adds no registration, got {after:?} \
+             where the collection held {before:?}"
+        );
+    }
+}
+
+/// The findings are the WHOLE message for this operation too: none of the per-member
+/// envelope's parts reach it — no error count, no `directoryId` path, no `Member must …`
+/// requirement — and the modelled expression is quoted as the model writes it, anchors
+/// included.
+#[tokio::test]
+async fn create_directory_registrations_refusal_states_no_part_of_the_per_member_envelope() {
+    let router = router();
+    for (case, value) in rejected_directory_ids() {
+        let body = json!({ "DirectoryId": value });
+        let (_, _, parsed) = call(&router, "POST", "/directoryRegistrations", Some(&body)).await;
+        let message = parsed["message"].as_str().unwrap_or_default().to_string();
+        for absent in [
+            "validation error",
+            "failed to satisfy constraint",
+            "directoryId",
+            PATTERN_REQUIREMENT,
+        ] {
+            assert!(
+                !message.contains(absent),
+                "case {case:?}: this refusal states no {absent:?}, got {message:?}"
+            );
+        }
+        assert!(
+            message.starts_with('[') && message.ends_with(']'),
+            "case {case:?}: the finding is stated in one pair of brackets, got {message:?}"
+        );
+        assert!(
+            message.contains(DIRECTORY_ID_PATTERN),
+            "case {case:?}: the finding quotes the modelled expression \
+             {DIRECTORY_ID_PATTERN:?} as the model writes it, got {message:?}"
+        );
+    }
+}
+
+/// Only the wording is the validating layer's: the CHECK is the model's own expression, so
+/// a directory id it admits is registered and read back from the collection the refusals
+/// above left alone.
+#[tokio::test]
+async fn a_directory_id_the_expression_admits_is_registered_and_listed() {
+    let router = router();
+    for directory_id in ADMITTED_DIRECTORY_IDS {
+        let before = listed_registrations(&router).await;
+        let body = json!({ "DirectoryId": directory_id });
+        let (status, code, parsed) =
+            call(&router, "POST", "/directoryRegistrations", Some(&body)).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (202, ""),
+            "case {directory_id:?}: a directory id the expression admits is accepted, \
+             got {status} / {code:?} / {parsed}"
+        );
+        let arn = parsed["DirectoryRegistrationArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {directory_id:?}: the create answered no ARN, got {parsed}")
+            })
+            .to_string();
+        let after = listed_registrations(&router).await;
+        assert!(
+            after.contains(&arn) && after.len() == before.len() + 1,
+            "case {directory_id:?}: the minted {arn:?} is the one registration added, \
+             got {after:?} where the collection held {before:?}"
         );
     }
 }
