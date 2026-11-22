@@ -36,8 +36,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, EncryptionConfiguration, InvalidInputException,
-    ResourceNotFoundException, StorageConfiguration, StorageConfigurationOutput,
+    AccessDeniedException, EncryptionConfiguration, IdempotentParameterMismatchException,
+    InvalidInputException, ResourceNotFoundException, StorageConfiguration,
+    StorageConfigurationOutput,
 };
 
 /// Region used when the request carries no SigV4 credential scope to read one
@@ -124,6 +125,29 @@ pub const MAX_STORED_EVENTS_PER_BUS: usize = 10_000;
 /// an error. It is named once here because every handler that refuses a
 /// collision must word it the same way.
 pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "Resource already exists";
+
+/// The whole `Message` of an `IdempotentParameterMismatchException`, wherever
+/// this service raises it: a create of an event bus, an event source or a
+/// subscriber whose `ClientToken` is one an earlier create already used with
+/// other parameters.
+///
+/// The message of this error class is FIXED text — it states the rule the caller
+/// broke and names neither the token, nor the resource that token minted, nor
+/// anything else of the request or of the store, so the resource that already
+/// holds the token is found with a describe or a list rather than parsed out of
+/// an error. It is named once here because every create that refuses a
+/// mismatched replay must word it the same way.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "ClientToken was used by a previous request with different parameters";
+
+/// The `IdempotentParameterMismatchException` a create answers when the token it
+/// carries was already used with other parameters
+/// ([`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`]).
+pub fn idempotent_parameter_mismatch() -> IdempotentParameterMismatchException {
+    IdempotentParameterMismatchException {
+        message: Some(IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.to_string()),
+    }
+}
 
 /// The whole `Message` of the `ResourceNotFoundException` answered for a value
 /// that addresses no resource of this service at all.

@@ -261,15 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(source) = state.event_source_by_client_token(&region, token) {
                 if !matches_stored(source, &input) {
-                    let arn = source.arn.clone();
                     return Err(
                         CreateEventSourceErrorModeled::IdempotentParameterMismatchException(
-                            IdempotentParameterMismatchException {
-                                message: Some(format!(
-                                    "ClientToken {token} was already used to create event \
-                                     source {arn} with different parameters"
-                                )),
-                            },
+                            // The wording of this error class, which names
+                            // neither the token nor the source it already
+                            // minted.
+                            crate::state::idempotent_parameter_mismatch(),
                         )
                         .into(),
                     );

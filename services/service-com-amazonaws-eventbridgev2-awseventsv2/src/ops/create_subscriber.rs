@@ -371,15 +371,11 @@ fn create(
     if let Some(token) = input.client_token.as_deref() {
         if let Some(subscriber) = state.subscriber_by_client_token(&region, token) {
             if !matches_stored(subscriber, input) {
-                let arn = subscriber.arn.clone();
                 return Err(
                     CreateSubscriberErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(format!(
-                                "ClientToken {token} was already used to create \
-                                 subscriber {arn} with different parameters"
-                            )),
-                        },
+                        // The wording of this error class, which names neither
+                        // the token nor the subscriber it already minted.
+                        crate::state::idempotent_parameter_mismatch(),
                     )
                     .into(),
                 );
@@ -394,10 +390,15 @@ fn create(
         }
     }
 
-    // A `SubscriberArn` names a subscriber by its name and a minted id
-    // alone, so a subscriber name is unique per account AND region: only a
-    // subscriber in the region of this request's bus can collide with it.
-    if state.subscriber_by_name(&region, &input.name).is_some() {
+    // A subscriber is created ON an event bus and enumerated under it
+    // (`ListSubscribers` takes the `EventBusArn` and a `NamePrefix` within it),
+    // so the bus is the scope its name is taken in: only a subscriber of THIS
+    // bus can collide with it, and the same name on another bus names another
+    // subscriber.
+    if state
+        .subscriber_on_bus_by_name(&bus_arn, &input.name)
+        .is_some()
+    {
         return Err(CreateSubscriberErrorModeled::ResourceAlreadyExistsException(
             ResourceAlreadyExistsException {
                 // The wording of this error class, which names nothing of the

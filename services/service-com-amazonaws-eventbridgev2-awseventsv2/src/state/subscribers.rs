@@ -1003,17 +1003,23 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         self.subscribers.get(arn)
     }
 
-    /// The subscriber carrying this name in this region.
+    /// The subscriber carrying this name ON this bus.
     ///
-    /// A `SubscriberArn` names a subscriber by its name and a minted id alone —
-    /// the bus is not part of it — so a subscriber name is unique per account
-    /// and region, the way a bus name is. A scan is enough at an emulator's
-    /// scale and cannot drift out of step with [`Self::subscribers`] the way a
-    /// second index could.
-    pub fn subscriber_by_name(&self, region: &str, name: &str) -> Option<&Subscriber> {
+    /// A subscriber is created on one event bus and enumerated under it —
+    /// `ListSubscribers` takes the `EventBusArn` it belongs to and matches a
+    /// `NamePrefix` within that bus — so the bus is the scope a subscriber name
+    /// is taken in: two buses may each carry a subscriber of the same name, and
+    /// the two are different subscribers with different ARNs. A scan is enough
+    /// at an emulator's scale and cannot drift out of step with
+    /// [`Self::subscribers`] the way a second index could.
+    pub fn subscriber_on_bus_by_name(
+        &self,
+        event_bus_arn: &str,
+        name: &str,
+    ) -> Option<&Subscriber> {
         self.subscribers
             .values()
-            .find(|subscriber| subscriber.region == region && subscriber.name == name)
+            .find(|subscriber| subscriber.event_bus_arn == event_bus_arn && subscriber.name == name)
     }
 
     /// The subscriber a create carrying this client token in this region

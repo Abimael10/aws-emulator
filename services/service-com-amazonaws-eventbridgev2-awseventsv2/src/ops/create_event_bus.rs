@@ -243,14 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(bus) = state.bus_by_client_token(&region, token) {
                 if !matches_stored(bus, &input) {
-                    let arn = bus.arn.clone();
                     return Err(CreateEventBusErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(format!(
-                                "ClientToken {token} was already used to create event bus \
-                                 {arn} with different parameters"
-                            )),
-                        },
+                        // The wording of this error class, which names neither
+                        // the token nor the bus it already minted.
+                        crate::state::idempotent_parameter_mismatch(),
                     )
                     .into());
                 }

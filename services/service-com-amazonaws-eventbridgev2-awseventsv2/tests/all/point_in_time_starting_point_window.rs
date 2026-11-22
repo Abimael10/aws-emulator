@@ -546,7 +546,7 @@ async fn a_point_in_time_starting_point_outside_the_window_is_refused() {
                     harness
                         .store()
                         .lock()
-                        .subscriber_by_name(REGION, row.name)
+                        .subscriber_on_bus_by_name(&bus, row.name)
                         .is_none(),
                     "case {case:?}: a refused create must leave no subscriber behind"
                 );
@@ -875,7 +875,7 @@ async fn the_wire_refuses_a_future_starting_point() {
         eventsv2::state::service_state(&*engine)
             .expect("the in-memory engine always has this service's store")
             .lock()
-            .subscriber_by_name(REGION, "wire-future")
+            .subscriber_on_bus_by_name(&bus, "wire-future")
             .is_none(),
         "case \"wire, a future point\": a refused create must mint nothing"
     );
