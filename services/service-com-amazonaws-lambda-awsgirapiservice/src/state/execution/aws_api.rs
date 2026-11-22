@@ -124,6 +124,14 @@ pub struct Api {
     /// of a called service's model is read from (`super::node_sdk_exports`). `None` for a
     /// service this crate holds no model for — those questions simply have no answer for it.
     ///
+    /// Every service a call may be made to holds one, whichever way its REQUEST is bound: the
+    /// EXCEPTION CLASS a refusal of a call to it is raised as is the class named after the
+    /// error shape its model declares for the operation called, and the class the SDK this
+    /// runtime supplies exports under that name is built from this very list
+    /// (`super::aws_sdk_guest`, `super::node_sdk_guest`) — so a service holding no model here
+    /// would have every refusal of it raised as the SDK's base error class, which is not the
+    /// class a handler catches it by.
+    ///
     /// It is held on the ENTRY rather than in a table keyed by one spelling of the service's
     /// token, so that every token that names ONE service answers with the same model: a call
     /// made as `logs` reads the model a call made as `cloudwatchlogs` reads.
@@ -566,9 +574,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "opensearch",
         signing_name: "es",
         endpoint_prefix: "es",
-        // The only question this seam answers out of OpenSearch's model is how a request to it
-        // is bound, which the protocol entry below carries ([`OPENSEARCH`]).
-        model: None,
+        model: Some(OPENSEARCH_MODEL),
         protocol: Protocol::RestJson(&OPENSEARCH),
         answer_model: Some(&OPENSEARCH_ANSWERS),
     },
@@ -578,7 +584,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "es",
         signing_name: "es",
         endpoint_prefix: "es",
-        model: None,
+        model: Some(OPENSEARCH_MODEL),
         protocol: Protocol::RestJson(&OPENSEARCH),
         answer_model: Some(&OPENSEARCH_ANSWERS),
     },
@@ -683,9 +689,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "xray",
         signing_name: "xray",
         endpoint_prefix: "xray",
-        // As OpenSearch above: the one question asked out of X-Ray's model is how a request to
-        // it is bound, which [`XRAY`] carries.
-        model: None,
+        model: Some(XRAY_MODEL),
         protocol: Protocol::RestJson(&XRAY),
         answer_model: Some(&XRAY_ANSWERS),
     },
@@ -708,10 +712,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "rds",
         signing_name: "rds",
         endpoint_prefix: "rds",
-        // As the two services above whose requests their own client binds: the one question
-        // this seam would ask of Amazon RDS's model is how a request to it is bound, and that
-        // is the client's ([`super::aws_rds`]), so the model itself is not embedded here.
-        model: None,
+        model: Some(RDS_MODEL),
         protocol: Protocol::RdsQuery,
         // The answer of such a call is read by that client out of the XML the service sent,
         // and the document this seam hands the guest is built from the output members it
@@ -893,7 +894,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "cloudfront",
         signing_name: "cloudfront",
         endpoint_prefix: "cloudfront",
-        model: None,
+        model: Some(CLOUDFRONT_MODEL),
         protocol: Protocol::CloudFrontRest,
         answer_model: None,
     },
@@ -949,15 +950,11 @@ pub const APIS: &[Api] = &[
     // registers what it wrote afterwards. A program that cannot reach this service cannot
     // perform a catalog-backed read at all, and the Lake Formation governance of such a read is
     // what this service applies to it.
-    //
-    // No model is held for it here: its requests are bound by the AWS JSON protocol above —
-    // the operation in the target header, the input document as the body — so nothing of its
-    // model is read to build one.
     Api {
         sdk_token: "glue",
         signing_name: "glue",
         endpoint_prefix: "glue",
-        model: None,
+        model: Some(GLUE_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AWSGlue",
             json_version: "1.1",
@@ -1342,6 +1339,18 @@ pub(super) const OPENSEARCH_MODEL: &str = include_str!(
 pub(super) const XRAY_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-xray-awsxray/smithy-model/\
      com-amazonaws-xray-awsxray.json"
+);
+pub(super) const CLOUDFRONT_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-cloudfront-cloudfront2020-05-31/smithy-model/\
+     com-amazonaws-cloudfront-cloudfront2020-05-31.json"
+);
+pub(super) const RDS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-rds-amazonrdsv19/smithy-model/\
+     com-amazonaws-rds-amazonrdsv19.json"
+);
+pub(super) const GLUE_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-glue-awsglue/smithy-model/\
+     com-amazonaws-glue-awsglue.json"
 );
 pub(super) const APPCONFIGDATA_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-appconfigdata-appconfigdata/smithy-model/\
@@ -2931,8 +2940,8 @@ mod tests {
     /// is read out of a model does not depend on which of its spellings a guest built its
     /// client with.
     ///
-    /// The rows are the services this table reaches under more than one token, plus a service
-    /// whose model this crate does not hold and one no entry answers to at all.
+    /// The rows are the services this table reaches under more than one token, plus a token no
+    /// entry answers to at all.
     #[test]
     fn both_tokens_of_a_service_answer_with_its_own_model() {
         // (case, two tokens of one service, whether a model is held for it)
@@ -2948,9 +2957,7 @@ mod tests {
                 true,
             ),
             ("IoT Data Plane", "iot-data", "iotdata", true),
-            // The one question asked out of OpenSearch's model is how a request to it is
-            // bound, which its protocol entry carries, so no model is held on the entry.
-            ("OpenSearch", "opensearch", "es", false),
+            ("OpenSearch", "opensearch", "es", true),
             ("no service at all", "polly", "not-a-service", false),
         ];
         for (case, one, other, held) in rows {

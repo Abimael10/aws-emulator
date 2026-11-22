@@ -482,6 +482,16 @@ mod tests {
             // same service's as `rdsdata`.
             ("rds-data", "ExecuteStatement", "HttpEndpointNotEnabledException"),
             ("rdsdata", "BeginTransaction", "AccessDeniedException"),
+            // The services whose REQUESTS their own client binds hold their model too, because
+            // the error classes an SDK of them exports are read out of it.
+            ("cloudfront", "CreateInvalidation", "NoSuchDistribution"),
+            ("cloudfront", "GetInvalidation", "NoSuchInvalidation"),
+            ("rds", "DescribeDBInstances", "DBInstanceNotFoundFault"),
+            ("glue", "GetTable", "EntityNotFoundException"),
+            ("xray", "PutTraceSegments", "InvalidRequestException"),
+            ("opensearch", "DescribeDomain", "ResourceNotFoundException"),
+            // The same service under the other token an SDK client of it is built with.
+            ("es", "DescribeDomain", "ValidationException"),
         ];
         for (token, operation, error) in cases {
             let exports = client_exports(token);
@@ -537,6 +547,16 @@ mod tests {
             // Declared by `SendMessage` and by no other operation of that service.
             ("sqs", "GetQueueAttributes", "InvalidMessageContents", false),
             ("secretsmanager", "GetSecretValue", "ResourceNotFoundException", true),
+            // `CreateInvalidation`'s own errors, and a name declared by ANOTHER operation of
+            // the same service (`smithy_query` operation=CreateInvalidation,GetInvalidation):
+            // which class a refusal of a call is raised as is the called operation's list.
+            ("cloudfront", "CreateInvalidation", "NoSuchDistribution", true),
+            ("cloudfront", "CreateInvalidation", "NoSuchInvalidation", false),
+            ("cloudfront", "GetInvalidation", "NoSuchInvalidation", true),
+            // `ListDistributions` declares `InvalidArgument` alone, so an authorization
+            // refusal of it is one that operation models no shape for.
+            ("cloudfront", "ListDistributions", "InvalidArgument", true),
+            ("cloudfront", "ListDistributions", "AccessDenied", false),
             // A service this emulator holds no model for declares nothing for any of its
             // operations.
             ("not-a-service", "ListThings", "ResourceNotFoundException", false),

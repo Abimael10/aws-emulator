@@ -404,8 +404,12 @@ async fn a_handler_reads_the_rds_catalogue_through_the_sdk_this_runtime_supplies
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // The name the refusal reports is the one Amazon RDS's own model spells the operation
+    // with (`DescribeDBSnapshots`), not the recasing of the method name the SDK derived it
+    // from (`describe_db_snapshots`), because which operation a client's name names is that
+    // model's to say.
     assert!(
-        reported.contains("DescribeDbSnapshots") && reported.contains("DescribeDBEngineVersions"),
+        reported.contains("DescribeDBSnapshots") && reported.contains("DescribeDBEngineVersions"),
         "case {case:?}: expected the refusal to name the call and what is bound, got {payload}"
     );
 }

@@ -331,8 +331,11 @@ async fn a_handler_drives_an_rds_export_through_the_sdk_this_runtime_supplies() 
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // The name the refusal reports is Amazon RDS's own model's spelling of the operation
+    // (`CreateDBSnapshot`), not the recasing of the method name the SDK derived it from
+    // (`create_db_snapshot`).
     assert!(
-        reported.contains("CreateDbSnapshot") && reported.contains("StartExportTask"),
+        reported.contains("CreateDBSnapshot") && reported.contains("StartExportTask"),
         "case {case:?}: expected the refusal to name the call and what is bound, got {payload}"
     );
 }
