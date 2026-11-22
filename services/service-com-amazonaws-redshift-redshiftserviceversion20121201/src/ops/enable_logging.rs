@@ -21,6 +21,12 @@
 //! `s3table` names no bucket to resolve, so what it configures is the destination
 //! and the log types it asked for, which the logging status then reports back.
 //!
+//! A `cloudwatch` delivery is also BACKED: the log group each exported log type
+//! is delivered to is created in Amazon CloudWatch Logs by this call, with no
+//! further client action, so a client reads those groups back under the
+//! cluster's own prefix and attaches what it needs to them
+//! ([`crate::state::publish_cloudwatch_log_groups`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -307,34 +313,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record a later `DescribeLoggingStatus` reports verbatim. The
         // cluster's precondition is asked AGAIN under this guard: it may have
         // been deleted, or put to work by another call, while the bucket was
-        // being resolved, and this call must configure neither.
-        let mut store = state.lock();
-        store.settle(::service_common::clock::now(&*self.engine));
-        let position = configurable_cluster(&store, &input.cluster_identifier)?;
-        let logging = st::ClusterLogging {
-            logging_enabled: true,
-            bucket_name: input.bucket_name.clone(),
-            s3_key_prefix: input.s3_key_prefix.clone(),
-            log_destination_type: Some(destination),
-            log_exports: input.log_exports.clone().unwrap_or_default(),
-        };
-        store.clusters[position].logging = logging.clone();
+        // being resolved, and this call must configure neither. The guard is
+        // taken in a block of its own, so it is released before the hop below.
+        let logging = {
+            let mut store = state.lock();
+            store.settle(::service_common::clock::now(&*self.engine));
+            let position = configurable_cluster(&store, &input.cluster_identifier)?;
+            let logging = st::ClusterLogging {
+                logging_enabled: true,
+                bucket_name: input.bucket_name.clone(),
+                s3_key_prefix: input.s3_key_prefix.clone(),
+                log_destination_type: Some(destination.clone()),
+                log_exports: input.log_exports.clone().unwrap_or_default(),
+            };
+            store.clusters[position].logging = logging.clone();
 
-        // Turning a cluster's audit logging on, and naming where it is
-        // delivered, is the security-relevant event of this operation, so it is
-        // attributable in the emulator's own log: which operation, the access key
-        // id the request presented, which cluster, which destination and the
-        // outcome. The same record `GetClusterCredentials` leaves for the
-        // credential it issues.
-        ::tracing::info!(
-            operation = Self::NAME,
-            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
-            cluster_identifier = %input.cluster_identifier,
-            log_destination_type = ?logging.log_destination_type,
-            bucket_name = ?logging.bucket_name,
-            outcome = "enabled",
-            "enabled audit logging for a provisioned cluster"
-        );
+            // Turning a cluster's audit logging on, and naming where it is
+            // delivered, is the security-relevant event of this operation, so it
+            // is attributable in the emulator's own log: which operation, the
+            // access key id the request presented, which cluster, which
+            // destination and the outcome. The same record
+            // `GetClusterCredentials` leaves for the credential it issues.
+            ::tracing::info!(
+                operation = Self::NAME,
+                presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+                cluster_identifier = %input.cluster_identifier,
+                log_destination_type = ?logging.log_destination_type,
+                bucket_name = ?logging.bucket_name,
+                outcome = "enabled",
+                "enabled audit logging for a provisioned cluster"
+            );
+            logging
+        };
+
+        // What a CLOUDWATCH delivery is delivered INTO is a log group per
+        // exported log type, which the service creates itself when the delivery
+        // is accepted — so the groups are brought into existence where
+        // CloudWatch Logs holds them, with the guard above released because the
+        // hop awaits ([`st::publish_cloudwatch_log_groups`]).
+        if destination == st::LOG_DESTINATION_CLOUDWATCH {
+            st::publish_cloudwatch_log_groups(
+                ctx,
+                &region,
+                &input.cluster_identifier,
+                &logging.log_exports,
+            )
+            .await;
+        }
 
         Ok(logging.enable_output())
     }

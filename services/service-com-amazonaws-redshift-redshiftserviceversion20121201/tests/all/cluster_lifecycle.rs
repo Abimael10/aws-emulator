@@ -299,6 +299,49 @@ impl Emulator {
         .await
     }
 
+    /// An emulator with Amazon CloudWatch Logs mounted beside Redshift on the
+    /// SAME engine, exactly as the assembled emulator mounts them.
+    ///
+    /// The log groups a `cloudwatch` audit-log delivery is delivered into are
+    /// resources of THAT service, created by calling it in process, so a suite
+    /// about them has to have one to reach and reads them back through its own
+    /// `DescribeLogGroups`.
+    pub(crate) fn with_logs() -> Self {
+        let mut emulator = Self::build(false);
+        emulator.router.register_service(
+            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+                &emulator.engine,
+            )),
+        );
+        emulator
+    }
+
+    /// POST one Amazon CloudWatch Logs operation with this JSON body, signed for
+    /// [`REGION`], and answer its status and parsed body.
+    ///
+    /// That service speaks awsJson1_1, so the operation travels in `x-amz-target`
+    /// rather than in a form field, and the credential scope names `logs`, which
+    /// is what routes the call to it. Panics nowhere: a call made without
+    /// [`Emulator::with_logs`] is the "CloudWatch Logs said nothing" deployment
+    /// and answers as such.
+    pub(crate) async fn call_logs(
+        &self,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        self.call_json(
+            JsonService {
+                endpoint_prefix: "logs",
+                signing_name: "logs",
+                content_type: "application/x-amz-json-1.1",
+                target_prefix: "Logs_20140328",
+            },
+            operation,
+            body,
+        )
+        .await
+    }
+
     /// An emulator with the Redshift Data API mounted beside Redshift on the
     /// SAME engine, exactly as the assembled emulator mounts them.
     ///

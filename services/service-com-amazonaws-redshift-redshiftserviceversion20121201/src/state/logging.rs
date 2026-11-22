@@ -123,6 +123,99 @@ impl ClusterLogging {
     }
 }
 
+/// Where Amazon Redshift delivers the audit logs of ONE cluster when the
+/// delivery destination is Amazon CloudWatch Logs: the root every one of that
+/// cluster's log groups lies under.
+///
+/// Source: the Amazon Redshift Cluster Management Guide's "Logging to Amazon
+/// CloudWatch Logs" — an exported log type of a cluster is delivered to the log
+/// group `/aws/redshift/cluster/<cluster name>/<log type>`, one group per
+/// exported type. The cluster identifier the request named and the log type it
+/// exported are the VARIABLE parts; the rest of the name is fixed.
+const CLOUDWATCH_LOG_GROUP_ROOT: &str = "/aws/redshift/cluster";
+
+/// The prefix every CloudWatch Logs log group of the cluster
+/// `cluster_identifier` lies under, which is what a client lists that cluster's
+/// log groups by. See [`CLOUDWATCH_LOG_GROUP_ROOT`].
+pub fn cloudwatch_log_group_prefix(cluster_identifier: &str) -> String {
+    format!("{CLOUDWATCH_LOG_GROUP_ROOT}/{cluster_identifier}/")
+}
+
+/// The CloudWatch Logs log group the exported log type `log_type` of the
+/// cluster `cluster_identifier` is delivered to. See
+/// [`CLOUDWATCH_LOG_GROUP_ROOT`].
+pub fn cloudwatch_log_group(cluster_identifier: &str, log_type: &str) -> String {
+    format!(
+        "{}{log_type}",
+        cloudwatch_log_group_prefix(cluster_identifier)
+    )
+}
+
+/// The log types Amazon Redshift exports for an `s3` or a `cloudwatch` audit-log
+/// delivery, which are the log types a CloudWatch delivery is backed by a log
+/// group for.
+///
+/// Source: `smithy_query(query="doc", shape="EnableLoggingMessage",
+/// member="LogExports")` — "when LogDestinationType is s3 or cloudwatch,
+/// possible values are connectionlog, useractivitylog, and userlog". The member
+/// is modelled as a list of bare strings (`LogTypeList`'s member carries no
+/// enum), so this catalogue is the operation's documentation rather than a
+/// constraint the framework enforces — which is also what bounds the work one
+/// request can ask for: a delivery exports at most these three types, however
+/// many entries its `LogExports` carries.
+pub const CLOUDWATCH_EXPORTED_LOG_TYPES: [&str; 3] =
+    ["connectionlog", "useractivitylog", "userlog"];
+
+/// Bring into existence, in CloudWatch Logs, the log group that backs each log
+/// type a cluster's CloudWatch delivery exports.
+///
+/// A CloudWatch delivery names no bucket: what BACKS it is a log group per
+/// exported log type, and Amazon Redshift itself creates those groups when the
+/// delivery is enabled — with no further call from the client, which then reads
+/// them back under [`cloudwatch_log_group_prefix`] to attach a retention
+/// policy, a metric filter or a subscription filter to them. So they are
+/// published here rather than when the first record is written, through the one
+/// shared vended-logs create every emulated publisher of a log group uses
+/// ([`::service_common::cloudwatch_logs::provisioned`]), which is where
+/// CloudWatch Logs holds them: this service keeps no second copy.
+///
+/// A group is published for each log type of
+/// [`CLOUDWATCH_EXPORTED_LOG_TYPES`] the delivery exports, in the catalogue's
+/// order: a value outside it is no log type this service delivers, so it backs
+/// no group however many times a request names it, and the number of groups one
+/// call can create is the catalogue's length rather than the request's.
+///
+/// Best effort, as every vended-logs write is: a group that could not be
+/// created is traced and does not fail the delivery the caller is being
+/// answered for. Call it with NO store guard held — it awaits.
+pub async fn publish_cloudwatch_log_groups(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    cluster_identifier: &str,
+    log_exports: &[String],
+) {
+    for log_type in CLOUDWATCH_EXPORTED_LOG_TYPES {
+        if !log_exports.iter().any(|exported| exported == log_type) {
+            continue;
+        }
+        let group = cloudwatch_log_group(cluster_identifier, log_type);
+        // The name is built from this service's own catalogue and from the
+        // identifier of a cluster this account holds, so it is a name CloudWatch
+        // Logs can hold — asserted against the shared reading rather than
+        // assumed, because a group it could not hold is a delivery with nothing
+        // behind it.
+        if !::service_common::cloudwatch_logs::is_log_group_name(&group) {
+            ::tracing::warn!(
+                log_type = %log_type,
+                "the log group this cluster's exported log type is delivered to is not a name \
+                 CloudWatch Logs can hold, so the delivery of that type is backed by no group"
+            );
+            continue;
+        }
+        ::service_common::cloudwatch_logs::provisioned(ctx, region, &group).await;
+    }
+}
+
 /// Why a `BucketName` outside Amazon S3's own naming rules is refused.
 ///
 /// `smithy_query(query="shape", shape="InvalidS3BucketNameFault")` — "The S3

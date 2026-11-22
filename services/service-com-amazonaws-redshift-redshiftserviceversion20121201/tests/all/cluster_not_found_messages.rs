@@ -19,23 +19,24 @@
 //! The table spans what the rule generalises over: the operation (every family
 //! that dereferences a cluster — a configuration change, a cluster-scoped
 //! create, a namespace registration change, a read, a delete, a suspension of
-//! its compute, the partner integration and custom domain association families,
+//! its compute, a failover of its primary compute unit, the partner integration
+//! and custom domain association families,
 //! including the two that name their cluster through a member other than
 //! `ClusterIdentifier`)
 //! and the identifier (its spelling, both documented length bounds, its case,
 //! one character off a stored name, and a cluster this account created and then
 //! deleted).
 
-use std::time::Duration;
-
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{Answer, Emulator};
 
-/// Wait out the span a clock-owed change falls due after, plus a margin for a
-/// loaded runner.
-async fn settle() {
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+/// Bring every clock-owed transition the seeds above recorded due, by moving
+/// the emulator's own clock rather than waiting for the span to pass: the
+/// transitions are materialised by the next reporting call, so nothing here
+/// sleeps and a loaded host cannot change the outcome.
+fn settle(emulator: &Emulator) {
+    emulator.advance_clock(state::PROVISIONING_SPAN);
 }
 
 /// The sentence an operation words its `ClusterNotFound` refusal with.
@@ -226,6 +227,11 @@ fn operations() -> Vec<OperationCase> {
         (
             "CreateUsageLimit",
             create_usage_limit as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "FailoverPrimaryCompute",
+            cluster_only as Request,
             Wording::NotFoundThenIdentifier,
         ),
         (
@@ -429,7 +435,7 @@ async fn a_cluster_this_account_holds_is_never_refused_as_missing() {
             created.status, created.body
         );
     }
-    settle().await;
+    settle(&emulator);
 
     for (index, (action, request, _)) in cases.into_iter().enumerate() {
         let identifier = format!("served-cluster-{index}");

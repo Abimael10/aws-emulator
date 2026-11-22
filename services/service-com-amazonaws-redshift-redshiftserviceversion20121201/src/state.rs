@@ -1129,7 +1129,8 @@ pub enum ClusterNotFoundWording {
     /// `Cluster not found: <ClusterIdentifier>` — what `RebootCluster`,
     /// `ModifyCluster`, `ModifyClusterIamRoles`, `EnableSnapshotCopy`,
     /// `DisableSnapshotCopy`, `ModifySnapshotCopyRetentionPeriod`,
-    /// `CreateClusterSnapshot` and `CreateUsageLimit` answer, and the sentence
+    /// `CreateClusterSnapshot`, `CreateUsageLimit` and
+    /// `FailoverPrimaryCompute` answer, and the sentence
     /// the two families that dereference a cluster without describing it —
     /// partner integration (`AddPartner`, `DeletePartner`, `DescribePartners`,
     /// `UpdatePartnerStatus`) and custom domain association

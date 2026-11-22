@@ -61,9 +61,11 @@ const STARTED: &str = "STARTED";
 ///
 /// Generous rather than tight: what it waits for is one execution of a submitted program, which
 /// is work of this emulator's own and not a span anybody waits out, and a host running a whole
-/// suite at once must not be the thing that trips it. Nothing here asserts how long anything
-/// took.
-const PATIENCE: Duration = Duration::from_secs(180);
+/// suite at once must not be the thing that trips it — a workspace-wide run gives that
+/// execution a small share of the machine, which is exactly when a deadline sized for an idle
+/// host turns a passing row into a failing one. Nothing here asserts how long anything took, so
+/// the bound only has to be far enough above the work to be no part of what is observed.
+const PATIENCE: Duration = Duration::from_secs(600);
 
 /// How often a poll asks again.
 const POLL: Duration = Duration::from_millis(25);

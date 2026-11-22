@@ -153,6 +153,12 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # and puts the delivery policy on it there, and enables logging here. Another
 # workspace member this repository already locks.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The same suite mounts Amazon CloudWatch Logs beside Redshift on one engine,
+# because the log groups a `cloudwatch` audit-log delivery is delivered into are
+# ITS resources: the suite reads them back through that service's own
+# `DescribeLogGroups` rather than out of this service's store. Another workspace
+# member this repository already locks.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The scheduled-action precondition suite mounts IAM beside Redshift on one
 # engine, because the role a scheduled action runs as is ITS resource: the suite
 # creates the role and its trust policy there, and names it here. Another

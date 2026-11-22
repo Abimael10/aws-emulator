@@ -181,8 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = store.cluster_position(&input.cluster_identifier) else {
             return Err(FailoverPrimaryComputeErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
+                    // The sentence this operation's own recorded refusal carries,
+                    // which is the one the operations that ACT on the cluster they
+                    // name answer with rather than the one the reads answer with —
+                    // the per-operation catalog [`st::ClusterNotFoundWording`].
                     message: Some(st::cluster_not_found_message(
-                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        st::ClusterNotFoundWording::NotFoundThenIdentifier,
                         &input.cluster_identifier,
                     )),
                 },
@@ -279,6 +283,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut stored.cluster,
             &cluster_type,
             ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
+        let moved_to = stored.cluster.availability_zone.clone();
+
+        // Moving a cluster's primary compute unit to another Availability Zone
+        // is the state-changing event of this operation, so it is attributable
+        // in the emulator's own log: which operation, the access key id the
+        // request presented, which cluster, the zone it now serves from and the
+        // outcome. The same record `EnableLogging` and `GetClusterCredentials`
+        // leave for the changes they make.
+        ::tracing::info!(
+            operation = Self::NAME,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            cluster_identifier = %input.cluster_identifier,
+            availability_zone = ?moved_to,
+            outcome = "failing-over",
+            "failed a Multi-AZ cluster's primary compute unit over to its secondary zone"
         );
 
         Ok(FailoverPrimaryComputeOutput {
