@@ -805,6 +805,11 @@ pub fn arn_account(arn: &str) -> Option<&str> {
 /// the `ConnectorStatusReason` that says so — or `None` when the ARN names a CA this
 /// connector could reach.
 ///
+/// This is the FIRST reading `CreateConnector` makes of a `CertificateAuthorityArn`, and the
+/// one that decides whether Private CA is asked about it at all: a CA this endpoint and
+/// principal do not resolve is one no read of this endpoint reaches, so what a reachable
+/// endpoint would answer about that ARN is the answer to a different question.
+///
 /// A connector talks to its private CA as the account it is created in, from the Region it
 /// is created in: a private CA is a regional resource of one account, and neither an
 /// endpoint of another Region nor a principal of another account resolves it. So the three

@@ -23,6 +23,15 @@
 //! differing only in its number, an account id differing in one digit, a partition with one or
 //! three words), how many differ at once, and which CA a reachable row names — so no assertion
 //! can pass by echoing one value.
+//!
+//! Where the ARN places the CA is read off the REQUEST, so it is settled before any other
+//! service is asked anything — and the whole table is driven a second time against an emulator
+//! that also mounts Amazon Web Services Private CA, which is what the assembled emulator
+//! mounts, to pin that the answer is the same either way: a CA outside the connector's reach is
+//! one no read of this endpoint reaches, so which other services happen to be mounted cannot
+//! decide whether the call is accepted.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -178,6 +187,22 @@ fn rows() -> Vec<Row> {
             reason: Some(REASON_NOT_FOUND),
         },
     ]
+}
+
+/// An emulator holding this service AND Amazon Web Services Private CA over one shared engine,
+/// which is what the assembled emulator mounts — so the question "does Private CA hold a
+/// certificate authority under this ARN?" can be put at all.
+fn emulator_with_private_ca() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // Signature verification is the emulator's own concern and is exercised elsewhere; these
+    // cases are about these services' behaviour.
+    router.set_request_authentication(false);
+    router.register_service(scep::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_acmpca_acmprivateca::EmulatedService::new(Arc::clone(&engine)),
+    );
+    (router, engine)
 }
 
 async fn create_connector(router: &MultiServiceRouter, body: Value) -> harness::Answer {
@@ -467,6 +492,71 @@ async fn the_region_compared_against_is_the_one_the_connector_is_created_in() {
             &reason.map_or(Value::Null, |reason| json!(reason)),
             "case {case:?}: expected StatusReason {reason:?}, got {:?}",
             read.body
+        );
+    }
+}
+
+/// Whether the call is ACCEPTED is decided by the request alone, so it is the same in an
+/// emulator that also mounts Amazon Web Services Private CA — the configuration the assembled
+/// emulator runs.
+///
+/// Every row of the table is driven again with that service mounted beside this one: a CA the
+/// ARN places outside the connector's reach is still accepted and reported on the connector
+/// with the same `ConnectorStatusReason`, because no read of this endpoint reaches such a CA
+/// and so nothing about it is that service's to answer. A row whose CA the connector COULD
+/// reach names a CA that service really holds, in the status a create requires, built through
+/// its own front door — which is what it is then asked about — and comes up the same way.
+#[tokio::test]
+async fn the_outcome_is_the_same_when_private_ca_is_mounted_beside_this_service() {
+    for row in rows() {
+        let case = row.name;
+        let (router, engine) = emulator_with_private_ca();
+
+        let (ca_arn, held_by_private_ca) = match row.reason {
+            None => (
+                harness::active_private_ca(&router, &engine, REGION, "scep-mounted-reachable")
+                    .await
+                    .0,
+                true,
+            ),
+            Some(_) => (row.ca_arn.clone(), false),
+        };
+
+        let created = create_connector(&router, json!({ "CertificateAuthorityArn": ca_arn })).await;
+        assert_eq!(
+            (created.status, created.error_type.as_str()),
+            (202, ""),
+            "case {case:?}: a create naming {ca_arn:?} is accepted whatever else is mounted \
+             (Private CA holds that CA: {held_by_private_ca}), so expected 202, got {} / {:?}",
+            created.status,
+            created.body
+        );
+        let arn = created.text("ConnectorArn");
+        harness::release_pending(&engine, &arn);
+
+        let expected_status = if row.reason.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_ACTIVE
+        };
+        let settled = get_connector(&router, &arn).await;
+        assert_eq!(
+            (settled.connector("Status"), settled.connector("StatusReason")),
+            (
+                &json!(expected_status),
+                &row.reason.map_or(Value::Null, |reason| json!(reason))
+            ),
+            "case {case:?}: with Private CA mounted, a connector linking {ca_arn:?} must settle \
+             into {expected_status} with reason {:?}, got {:?}",
+            row.reason,
+            settled.body
+        );
+        // The record is still the one the request asked for either way.
+        assert_eq!(
+            settled.connector("CertificateAuthorityArn"),
+            &json!(ca_arn),
+            "case {case:?}: expected the CA ARN the create named, got {:?}",
+            settled.body
         );
     }
 }

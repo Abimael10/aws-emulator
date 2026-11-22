@@ -6,11 +6,14 @@
 //! full record keyed by a freshly minted ARN, and answers that ARN. The resources the request
 //! REFERENCES are resolved against the services that own them before a connector is admitted:
 //! `CertificateAuthorityArn` names a resource Amazon Web Services Private CA owns
-//! ([`crate::service::private_ca`]), and a CA that service reports it does not hold is the
-//! modelled 404 `ResourceNotFoundException` naming that input member, while a CA it holds in
-//! any status other than `ACTIVE` is the modelled 400 `ValidationException` — the CA must be
-//! in service for the connector to issue its certificate from it, which is a precondition of
-//! this call — with no record created either way.
+//! ([`crate::service::private_ca`]). That service is asked only about a CA this endpoint and
+//! principal resolve at all — one the ARN places in this connector's own partition, Region and
+//! account ([`crate::state::private_ca_failure_reason`]) — and then a CA it reports it does not
+//! hold is the modelled 404 `ResourceNotFoundException` naming that input member, while a CA it
+//! holds in any status other than `ACTIVE` is the modelled 400 `ValidationException` — the CA
+//! must be in service for the connector to issue its certificate from it, which is a
+//! precondition of this call — with no record created either way. A CA the ARN places outside
+//! that reach is refused by neither: it is reported on the connector instead, below.
 //!
 //! The connector then starts `CREATING`; the clock owes it the status its creation lands in
 //! (see [`crate::state::TRANSITION_SPAN`]) — `ACTIVE`, or `FAILED` with the reason it failed
@@ -227,43 +230,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `CertificateAuthorityArn` references a resource Amazon Web Services Private CA
-        // owns, so whether that CA exists — and what status that service reports it in —
-        // is that service's own read to answer, and the reference is resolved BEFORE a
-        // connector is admitted. A CA that service reports it does not hold is this
-        // operation's modelled `ResourceNotFoundException`, naming the input member that
-        // referenced it — the thing that was not found is the caller's parameter, not the
-        // resource this call creates. The lookup is made with no lock held and writes nothing.
-        //
-        // It is made on EVERY call, a `ClientToken` retry included: the reference is part of
-        // the request, so a retry whose CA has since been deleted is a request this service
-        // can no longer satisfy rather than one it answers out of the record the first call
-        // left.
-        let private_ca =
-            crate::service::private_ca::resolve(ctx, &region, &input.certificate_authority_arn)
-                .await;
-        if private_ca.is_absent() {
-            return Err(certificate_authority_not_found(
-                &input.certificate_authority_arn,
-            ));
-        }
-
         // Where the ARN PLACES the CA, decided from the request alone
         // (`crate::state::private_ca_failure_reason`): a CA that sits in another partition,
         // Region or account is not one this endpoint and principal resolve, which is reported
-        // on the connector rather than refused here (see below).
+        // on the connector rather than refused here (see below). That reading comes FIRST and
+        // governs BOTH synchronous refusals below, because it decides whether the CA this
+        // request names is one a read of this endpoint reaches at all: a mis-placed ARN names
+        // an unreachable CA whatever any service holds under it, so what a reachable endpoint
+        // answers about it is the answer to a different question.
         let private_ca_failure =
             crate::state::private_ca_failure_reason(&region, &input.certificate_authority_arn);
 
-        // A CA this endpoint DOES resolve, which Private CA reports in any status other than
-        // ACTIVE, is a precondition of this call rather than an outcome of provisioning: a CA
-        // on its way into service cannot issue the connector's certificate yet and one taken
-        // out of service never will, so the call is refused synchronously and no connector
-        // record is left behind. The same request succeeds once that same CA reaches ACTIVE.
-        if private_ca_failure.is_none() && private_ca.is_not_active() {
-            return Err(certificate_authority_not_active(
-                &input.certificate_authority_arn,
-            ));
+        // `CertificateAuthorityArn` references a resource Amazon Web Services Private CA
+        // owns, so for a CA this endpoint and principal DO resolve — one placed in this
+        // connector's own partition, Region and account — whether that CA exists and what
+        // status that service reports it in is that service's own read to answer, and the
+        // reference is resolved BEFORE a connector is admitted. Both answers are preconditions
+        // of the call rather than outcomes of provisioning, so the call is refused
+        // synchronously and no connector record is left behind either way:
+        //
+        // * a CA that service reports it does not hold is this operation's modelled
+        //   `ResourceNotFoundException`, naming the input member that referenced it — the
+        //   thing that was not found is the caller's parameter, not the resource this call
+        //   creates;
+        // * a CA it holds in any status other than ACTIVE is the modelled
+        //   `ValidationException`: a CA on its way into service cannot issue the connector's
+        //   certificate yet and one taken out of service never will. The same request succeeds
+        //   once that same CA reaches ACTIVE.
+        //
+        // The lookup is made with no lock held and writes nothing, and it is made on EVERY
+        // call, a `ClientToken` retry included: the reference is part of the request, so a
+        // retry whose CA has since been deleted is a request this service can no longer
+        // satisfy rather than one it answers out of the record the first call left.
+        if private_ca_failure.is_none() {
+            let private_ca =
+                crate::service::private_ca::resolve(ctx, &region, &input.certificate_authority_arn)
+                    .await;
+            if private_ca.is_absent() {
+                return Err(certificate_authority_not_found(
+                    &input.certificate_authority_arn,
+                ));
+            }
+            if private_ca.is_not_active() {
+                return Err(certificate_authority_not_active(
+                    &input.certificate_authority_arn,
+                ));
+            }
         }
 
         // Why the connector's creation does not come up, if it does not: every resource this

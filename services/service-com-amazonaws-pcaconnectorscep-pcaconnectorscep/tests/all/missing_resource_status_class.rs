@@ -27,6 +27,14 @@
 //!    assembled emulator does — and creates the CAs its accepting rows need through that
 //!    service's own API.
 //!
+//!    That service is asked only about a CA the connector could reach it at, so this refusal
+//!    is the answer to "this endpoint and principal resolve the CA, and it is not there": the
+//!    rows name CAs of the connector's own partition, Region and account. A
+//!    `CertificateAuthorityArn` placed outside that reach names a CA no read of this endpoint
+//!    reaches at all, which is reported on the connector instead of refused here — that rule,
+//!    and the table spanning it, is `connector_private_ca_reachability`'s, which also pins
+//!    that its answer is the same whether or not Private CA is mounted beside this service.
+//!
 //! Every case drives the emulator the way a client does: one HTTP request per call through a
 //! `MultiServiceRouter`. The rows differ along what each rule generalises over — the resource
 //! kind, how the ARN came to name nothing, which tagging operation is called, and the
@@ -391,42 +399,61 @@ fn assert_unresolvable_reference(answer: &Answer, case: &str, arn: &str) {
 /// no connector.
 #[tokio::test]
 async fn create_connector_refuses_a_private_ca_that_does_not_exist() {
-    // The rows: well-formed CA ARNs that Private CA holds nothing under. They differ along
-    // the partition, the Region, the account and the CA id, so no assertion can pass by
-    // echoing one value.
-    let rows: Vec<(&str, String)> = vec![
+    // The rows: well-formed CA ARNs of the connector's own partition, Region and account —
+    // CAs this endpoint and principal DO resolve — that Private CA holds nothing under. They
+    // differ along the Region the connector and its CA live in and along the CA id, so no
+    // assertion can pass by echoing one value. A CA the ARN places outside that reach is not
+    // this rule's: it is reported on the connector (`connector_private_ca_reachability`).
+    let rows: Vec<(&str, &str, String)> = vec![
         (
             "a CA of this Region and account that was never created",
+            REGION,
             ca_arn("aws", REGION, ACCOUNT, "11111111-2222-3333-4444-555555555555"),
         ),
         (
             "another CA id of this Region and account",
+            REGION,
             ca_arn("aws", REGION, ACCOUNT, "0123456f-89ab-cdef-0123-456789abcdef"),
         ),
         (
-            "a CA of another Region",
-            ca_arn("aws", "ap-southeast-2", ACCOUNT, "deadbeef-0000-1111-2222-333344445555"),
-        ),
-        (
-            "a CA of another account",
-            ca_arn("aws", REGION, "123456789012", "99999999-8888-7777-6666-555544443333"),
-        ),
-        (
-            "a CA of another partition",
+            "a CA of another Region, for a connector created in that same Region",
+            "ap-southeast-2",
             ca_arn(
-                "aws-us-gov",
-                "us-gov-west-1",
+                "aws",
+                "ap-southeast-2",
+                ACCOUNT,
+                "deadbeef-0000-1111-2222-333344445555",
+            ),
+        ),
+        (
+            "yet another CA id, in a third Region this emulator serves",
+            "us-west-2",
+            ca_arn(
+                "aws",
+                "us-west-2",
                 ACCOUNT,
                 "abcdef01-2345-6789-abcd-ef0123456789",
             ),
         ),
+        (
+            // The Region this emulator serves by default, so nothing passes by a default
+            // standing in for the Region the call was signed for.
+            "a CA of the Region this emulator serves by default",
+            scep::state::DEFAULT_REGION,
+            ca_arn(
+                "aws",
+                scep::state::DEFAULT_REGION,
+                ACCOUNT,
+                "99999999-8888-7777-6666-555544443333",
+            ),
+        ),
     ];
 
-    for (case, arn) in &rows {
+    for (case, region, arn) in &rows {
         let (router, _engine) = emulator_with_private_ca();
         let answer = harness::call(
             &router,
-            REGION,
+            region,
             "POST",
             "/connectors",
             Some(json!({ "CertificateAuthorityArn": arn })),
@@ -436,7 +463,7 @@ async fn create_connector_refuses_a_private_ca_that_does_not_exist() {
 
         // Nothing was admitted: the refusal left no connector behind for any later call to
         // find.
-        let listed = harness::call(&router, REGION, "GET", "/connectors", None).await;
+        let listed = harness::call(&router, region, "GET", "/connectors", None).await;
         assert_eq!(
             listed.count("Connectors"),
             0,

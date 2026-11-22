@@ -7,7 +7,8 @@
 //! service's own API, over the emulator's in-process callback: whether the CA a request
 //! names exists at all and whether that service reports it in service
 //! ([`resolve`], which `CreateConnector` resolves its `CertificateAuthorityArn` through
-//! before admitting a connector), and the certificate it holds
+//! before admitting a connector, for a CA its own partition, Region and account place within
+//! that connector's reach), and the certificate it holds
 //! (`GetCertificateAuthorityCertificate`, which the SCEP data plane answers `GetCACert`
 //! from).
 //!
