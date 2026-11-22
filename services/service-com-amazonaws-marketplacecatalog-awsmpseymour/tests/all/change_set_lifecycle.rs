@@ -570,17 +570,14 @@ async fn a_started_change_set_is_reported_from_what_was_stored() {
                 entity.status, entity.body
             );
             let submitted = &request["ChangeSet"][index];
-            // `Change$Entity$Type` carries the type at a schema version, where the ENTITY
-            // it acts on is of the type that reference names.
-            let entity_type = submitted["Entity"]["Type"]
-                .as_str()
-                .unwrap_or_default()
-                .split('@')
-                .next()
-                .unwrap_or_default();
+            // `Change$Entity$Type` carries the type at a schema version, and the entity
+            // read reports the type at that version.
+            let reference = submitted["Entity"]["Type"].as_str().unwrap_or_default();
+            let entity_type = reference.split('@').next().unwrap_or_default();
             assert_eq!(
-                entity.body["EntityType"], json!(entity_type),
-                "case {case:?}: the entity's type must be the change's, got {:?}",
+                entity.body["EntityType"], json!(reference),
+                "case {case:?}: the entity's type must be the change's, at the version it \
+                 named, got {:?}",
                 entity.body
             );
             assert_eq!(

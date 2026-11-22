@@ -315,9 +315,9 @@ async fn an_entity_of_any_modelled_type_round_trips() {
         let described = describe_entity(&router, entity_id).await;
         assert_eq!(
             (described.status, described.text("/EntityType")),
-            (200, (*entity_type).to_string()),
+            (200, format!("{entity_type}@1.0")),
             "case {entity_type:?}: the created entity must be described under its own \
-             type, got {} with {:?}",
+             type at the schema version the change named, got {} with {:?}",
             described.status,
             described.body
         );

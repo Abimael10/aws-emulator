@@ -206,7 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeEntityOutput {
-            entity_type: Some(entity.entity_type.clone()),
+            // `DescribeEntityResponse$EntityType` is documented "in the format
+            // of EntityType@Version", so it reports the entity's type at the
+            // schema version its changes addressed it through — not the bare
+            // type, which is what the record is listed and filtered by.
+            entity_type: Some(entity.entity_type_reference()),
             entity_identifier: Some(entity.identifier()),
             entity_arn: Some(entity.arn.clone()),
             last_modified_date: Some(entity.last_modified_date.clone()),

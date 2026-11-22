@@ -505,8 +505,9 @@ async fn a_change_resolves_the_entity_of_the_change_it_names() {
                 }
                 assert_eq!(
                     entity.text("/EntityType"),
-                    *entity_type,
-                    "case {case:?}: the entity is of the type the changes named, got {:?}",
+                    format!("{entity_type}@1.0"),
+                    "case {case:?}: the entity is of the type the changes named, at the \
+                     version they named it at, got {:?}",
                     entity.text("/EntityType")
                 );
                 // The identifier a reader gets back addresses the entity at the revision

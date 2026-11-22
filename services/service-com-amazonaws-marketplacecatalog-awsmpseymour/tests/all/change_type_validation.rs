@@ -455,13 +455,18 @@ async fn a_change_type_this_catalog_performs_is_accepted_and_applied() {
             "case {case:?}: the applied change's entity must exist, got {} with {:?}",
             entity.status, entity.body
         );
-        // `Entity$Type` addresses the type at an optional schema version; the entity is of
-        // the type that reference names.
-        let named_type = entity_type.split('@').next().unwrap_or(entity_type);
+        // `Entity$Type` addresses the type at a schema version, and the entity read
+        // reports the type at that version.
+        let reference = if entity_type.contains('@') {
+            entity_type.to_string()
+        } else {
+            format!("{entity_type}@1.0")
+        };
         assert_eq!(
             entity.text("/EntityType"),
-            named_type,
-            "case {case:?}: the entity must be of the type the change acted under, got {:?}",
+            reference,
+            "case {case:?}: the entity must be of the type the change acted under, at the \
+             version it named, got {:?}",
             entity.body
         );
         assert_eq!(

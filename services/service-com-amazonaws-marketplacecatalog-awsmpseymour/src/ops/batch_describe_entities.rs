@@ -210,7 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     entity_details.insert(
                         request.entity_id.clone(),
                         EntityDetail {
-                            entity_type: Some(entity.entity_type.clone()),
+                            // `EntityDetail$EntityType` carries the same
+                            // documented form as the single read's member, "in
+                            // the format of EntityType@Version": the type at
+                            // the schema version the entity's changes
+                            // addressed it through.
+                            entity_type: Some(entity.entity_type_reference()),
                             entity_identifier: Some(entity.identifier()),
                             entity_arn: Some(entity.arn.clone()),
                             last_modified_date: Some(entity.last_modified_date.clone()),

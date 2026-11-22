@@ -1139,6 +1139,14 @@ pub struct EntityRecord {
     pub id: String,
     /// `EntityType`'s `^[a-zA-Z]+$`.
     pub entity_type: String,
+    /// The SCHEMA VERSION the entity's type was last addressed at: the
+    /// `@<version>` part of the `Change$Entity$Type` of the most recent change
+    /// applied to this record ([`entity_type_version_of`]).
+    ///
+    /// Kept beside the type because the two entity READS report the type at
+    /// that version ([`EntityRecord::entity_type_reference`]), while the type
+    /// alone is what the record is filtered, listed and named by.
+    pub entity_type_version: Option<String>,
     pub arn: String,
     /// How many change sets have applied a change to this entity. It is what
     /// makes `EntityIdentifier` (`<id>@<revision>`) move when the entity does.
@@ -1155,6 +1163,26 @@ pub struct EntityRecord {
 }
 
 impl EntityRecord {
+    /// The entity's type at its schema version (`EntityType@Version`), which is
+    /// the form the two members documented as carrying it report —
+    /// `DescribeEntityResponse$EntityType` and `EntityDetail$EntityType`, each
+    /// documented "in the format of `EntityType@Version`"
+    /// (`smithy_query(query="shape", shape="DescribeEntityResponse,EntityDetail")`).
+    ///
+    /// The version is the one the changes that wrote this record addressed its
+    /// type at. A record written without one — which no accepted change leaves,
+    /// since `Change$Entity$Type` must name a version
+    /// ([`check_entity_type_reference`]) — reports the type alone, the most of
+    /// the documented form that is known.
+    pub fn entity_type_reference(&self) -> String {
+        match &self.entity_type_version {
+            Some(version) => {
+                format!("{}{ENTITY_TYPE_VERSION_SEPARATOR}{version}", self.entity_type)
+            }
+            None => self.entity_type.clone(),
+        }
+    }
+
     /// `EntityIdentifier`: the entity id and the revision the reader is seeing,
     /// which is the form `Entity$Identifier` accepts back (`^[\w\-@]+$`).
     pub fn identifier(&self) -> String {
@@ -2191,11 +2219,13 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         for change in changes {
             let entity_id = change.entity_id.clone();
             let mut details = change.details_value();
-            // `Change$Entity$Type` is a REFERENCE to an entity type, optionally
-            // at a schema version (`DataProduct@1.0`); the entity itself is of
-            // the type that reference names, so the record and its ARN carry
-            // the type, never the version the request addressed it through.
+            // `Change$Entity$Type` is a REFERENCE to an entity type at a schema
+            // version (`DataProduct@1.0`); the entity itself is of the type that
+            // reference names, so the record's type and its ARN carry the type
+            // alone, and the version the change addressed it at is kept beside
+            // them for the reads whose members report the type at it.
             let entity_type = entity_type_of(&change.entity_type).to_string();
+            let entity_type_version = entity_type_version_of(&change.entity_type).map(str::to_string);
             // A delivery option this change submitted without an id is given
             // one BEFORE the entity is written, so the entity carries the same
             // id the assessment of that option reports.
@@ -2206,6 +2236,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                         arn: entity_arn(&region, &entity_type, &entity_id),
                         id: entity_id.clone(),
                         entity_type: entity_type.clone(),
+                        entity_type_version: entity_type_version.clone(),
                         revision: 0,
                         name: None,
                         visibility: DEFAULT_ENTITY_VISIBILITY.to_string(),
@@ -2216,6 +2247,12 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 });
                 entry.revision = entry.revision.saturating_add(1);
                 entry.last_modified_date = stamp.clone();
+                // The schema version moves with the changes, as the
+                // last-modified instant does: the entity is at the version the
+                // change that last wrote it addressed its type through.
+                if entity_type_version.is_some() {
+                    entry.entity_type_version = entity_type_version.clone();
+                }
                 merge_tags(&mut entry.tags, change.entity_tags);
                 if let Some(Value::Object(members)) = details {
                     if let Some(name) = detail_name(&entity_type, &members) {
@@ -4266,6 +4303,21 @@ pub fn invalid_change_type(change_type: &str) -> ValidationException {
 /// service accepts — while the entity itself is of the type the reference names.
 pub fn entity_type_of(reference: &str) -> &str {
     reference.split('@').next().unwrap_or(reference)
+}
+
+/// The schema version a `Change$Entity$Type` addresses its type at: the
+/// `@<version>` part of the reference, and `None` for a reference carrying
+/// none.
+///
+/// The counterpart of [`entity_type_of`]: between them they split the reference
+/// into the type the entity IS and the version the change addressed it through,
+/// which is what the entity reads report the type at
+/// ([`EntityRecord::entity_type_reference`]).
+pub fn entity_type_version_of(reference: &str) -> Option<&str> {
+    reference
+        .split_once(ENTITY_TYPE_VERSION_SEPARATOR)
+        .map(|(_, version)| version)
+        .filter(|version| !version.is_empty())
 }
 
 /// How long any member of this service that names an entity, an entity type or

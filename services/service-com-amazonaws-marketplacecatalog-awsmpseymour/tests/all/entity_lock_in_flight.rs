@@ -631,7 +631,7 @@ async fn a_reserved_entity_id_is_startable_once_its_holder_has_succeeded() {
                 // one.
                 identifier.split('@').next().unwrap_or_default().to_string(),
             ),
-            (200, entity_type.to_string(), entity_id.clone()),
+            (200, format!("{entity_type}@1.0"), entity_id.clone()),
             "case {entity_type:?}: the succeeded holder must have written the entity \
              {entity_id}, got {} with {:?}",
             described.status,

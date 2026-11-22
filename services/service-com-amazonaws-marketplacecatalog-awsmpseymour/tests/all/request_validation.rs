@@ -615,8 +615,8 @@ async fn an_entity_type_outside_the_catalogs_own_set_is_refused() {
 }
 
 /// RULE 3: an `Entity$Type` at a schema version passes shape validation and reaches the
-/// rules behind it, and the entity such a change creates is of the type the reference
-/// names — never of the versioned reference.
+/// rules behind it, and the entity such a change creates is listed and named under the
+/// type the reference names, while the entity READ reports that type at the version.
 ///
 /// The rows differ along the type, the version form and the rule reached: the entity
 /// lookup (a 404 naming the entity id inside the identifier), the unique entity/change
@@ -715,8 +715,8 @@ async fn a_versioned_entity_type_reaches_the_rules_behind_it() {
             contradicting.body
         );
 
-        // A create with that reference succeeds, and the entity it leaves is of the type
-        // the reference names.
+        // A create with that reference succeeds, and the entity it leaves is listed under
+        // the type the reference names.
         let created = call(
             &router,
             "POST",
@@ -760,9 +760,9 @@ async fn a_versioned_entity_type_reaches_the_rules_behind_it() {
         .await;
         assert_eq!(
             (described.status, described.text("/EntityType")),
-            (200, entity_type.to_string()),
-            "case {case:?}: the stored entity is of the type the reference names, got {} \
-             with {:?}",
+            (200, reference.to_string()),
+            "case {case:?}: the entity read reports the type at the schema version the \
+             change addressed it at, got {} with {:?}",
             described.status,
             described.body
         );
