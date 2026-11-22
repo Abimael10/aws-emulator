@@ -49,3 +49,28 @@ Cause 1 — UpdateApp, fixture resiliencehub-app-lifecycle, step task#5:
 4. UpdateApp(appArn=<appArn>, description=<new description>) — any valid partial update.
 5. Observe HTTP 200 whose $.app.tags does NOT contain the tag applied in step 2, while AWS's UpdateApp returns the application's complete tag set in $.app.tags.
 6. Full replay: call replay_wire_corpus() and re-check fixture resiliencehub-app-lifecycle step task#5; $.app.tags must carry every tag entry the application holds at the time of the update.
+
+## Resolution
+
+The requirement this issue states — UpdateApp's `app.tags` reproduces the application's
+complete tag set as the tagging plane left it, in agreement with DescribeApp and
+ListTagsForResource — holds and is now pinned by
+`services/service-com-amazonaws-resiliencehub-awsresiliencehub/tests/all/resource_tags.rs`
+(`update_app_reports_exactly_the_tag_set_the_tagging_plane_holds`): a table over the
+states the tagging plane can leave an application in (no tags member on the create, one,
+three and the modelled maximum of 50 keys, a new key, a replaced value, a removed key, a
+key removed and re-assigned, punctuated keys, an empty value, and a key spelling an input
+member of this API carrying the application's own ARN) requires UpdateApp, DescribeApp and
+ListTagsForResource to report exactly that set — no entry invented, none dropped.
+
+RESIDUAL, DECLINED — the recorded `$.app.tags.resourceArn` entry of
+resiliencehub-app-lifecycle#task#5 is a per-run artifact of that one recorded response, not
+state any call of the fixture produced. In that fixture CreateApp carries no `tags` member,
+the UpdateApp request carries only `appArn` and `description`, the fixture contains no
+TagResource step at all, and the DescribeApp that reads the SAME application immediately
+after the update agrees with an EMPTY tag map. So the application held no tags before the
+update and none after it, while that single UpdateApp response reported one entry whose key
+spells an API input member and whose value is the application's own ARN. Reproducing it
+would mean synthesising a tag from the request's ARN inside UpdateApp alone, which would
+make UpdateApp disagree with DescribeApp and ListTagsForResource — the opposite of the
+invariant above.

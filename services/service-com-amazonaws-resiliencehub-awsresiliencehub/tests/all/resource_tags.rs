@@ -291,12 +291,7 @@ async fn every_read_of_a_resource_answers_the_tag_set_assigned_to_it() {
                 }
             }
 
-            let wanted = tag_map(
-                &expected
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<(String, String)>>(),
-            );
+            let wanted = expected_map(&expected);
             let listed = list_tags(&router, &subject.arn).await;
             assert_eq!(
                 listed.ok(&case)["tags"],
@@ -663,4 +658,273 @@ async fn an_unknown_resource_arn_is_refused_by_every_tagging_operation() {
     )
     .await
     .ok("the application that exists");
+}
+
+/// A tag value a row assigns: a literal, or the application's OWN ARN — a client
+/// labelling a resource with its own identifier assigns an ordinary tag, so the
+/// value is no part of the rule either.
+#[derive(Clone, Debug)]
+enum TagText {
+    Literal(String),
+    OwnArn,
+}
+
+impl TagText {
+    /// The string this value spells for the application `app_arn` names.
+    fn resolve(&self, app_arn: &str) -> String {
+        match self {
+            TagText::Literal(text) => text.clone(),
+            TagText::OwnArn => app_arn.to_string(),
+        }
+    }
+}
+
+/// One call the tagging plane makes against an application after it was created.
+#[derive(Clone, Debug)]
+enum PlaneCall {
+    /// `TagResource` with these pairs — a MERGE, so a key it does not name keeps
+    /// the value it had.
+    Assign(Vec<(String, TagText)>),
+    /// `UntagResource` with these keys — it removes the keys it names and nothing
+    /// else.
+    Remove(Vec<String>),
+}
+
+/// One row: the tag set `CreateApp` persisted, and the tagging-plane calls made
+/// afterwards. The rows differ along what the rule generalises over — whether the
+/// create carried a `tags` member at all, how many keys one call writes, whether a
+/// key is new, replaced or removed, the form of the key and of the value, and how
+/// many tags the application ends up carrying.
+struct TagPlaneCase {
+    label: &'static str,
+    /// The `tags` member of the create, or `None` for a create that carries none.
+    created_with: Option<Vec<(String, String)>>,
+    calls: Vec<PlaneCall>,
+}
+
+/// Owned pairs from borrowed ones, which is how a row spells a literal tag map.
+fn owned_pairs(literal: &[(&str, &str)]) -> Vec<(String, String)> {
+    literal
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// A `TagResource` call assigning literal pairs.
+fn assign(literal: &[(&str, &str)]) -> PlaneCall {
+    PlaneCall::Assign(
+        literal
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), TagText::Literal((*value).to_string())))
+            .collect(),
+    )
+}
+
+/// An `UntagResource` call naming keys.
+fn remove(keys: &[&str]) -> PlaneCall {
+    PlaneCall::Remove(keys.iter().map(|key| (*key).to_string()).collect())
+}
+
+/// The table. Every row leaves the application carrying a DIFFERENT tag set,
+/// reached by a different route through the tagging plane.
+fn tag_plane_cases() -> Vec<TagPlaneCase> {
+    // The modelled ceiling, assigned in one call: `TagMap` is `@length 1..50`.
+    let at_the_maximum: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+
+    vec![
+        TagPlaneCase {
+            label: "a create carrying no tags member, never tagged",
+            created_with: None,
+            calls: vec![],
+        },
+        TagPlaneCase {
+            label: "one tag persisted by the create",
+            created_with: Some(owned_pairs(&[("Env", "prod")])),
+            calls: vec![],
+        },
+        TagPlaneCase {
+            label: "three tags persisted by the create",
+            created_with: Some(owned_pairs(&[
+                ("Env", "prod"),
+                ("team", "payments"),
+                ("cost-center", "1234"),
+            ])),
+            calls: vec![],
+        },
+        TagPlaneCase {
+            label: "a create with no tags, two merged by the tagging plane",
+            created_with: None,
+            calls: vec![assign(&[("Env", "staging"), ("owner", "ops")])],
+        },
+        TagPlaneCase {
+            label: "a key the create persisted, taking a new value",
+            created_with: Some(owned_pairs(&[("Env", "prod"), ("owner", "ops")])),
+            calls: vec![assign(&[("Env", "staging")])],
+        },
+        TagPlaneCase {
+            label: "one key removed, one left alone",
+            created_with: Some(owned_pairs(&[("Env", "prod"), ("owner", "ops")])),
+            calls: vec![remove(&["Env"])],
+        },
+        TagPlaneCase {
+            label: "a key removed that the application never carried",
+            created_with: Some(owned_pairs(&[("Env", "prod")])),
+            calls: vec![remove(&["never-assigned"])],
+        },
+        TagPlaneCase {
+            label: "every key removed, leaving no tags",
+            created_with: Some(owned_pairs(&[("Env", "prod"), ("owner", "ops")])),
+            calls: vec![remove(&["Env", "owner"])],
+        },
+        TagPlaneCase {
+            label: "a key removed and then assigned again",
+            created_with: Some(owned_pairs(&[("Env", "prod")])),
+            calls: vec![remove(&["Env"]), assign(&[("Env", "prod-again")])],
+        },
+        TagPlaneCase {
+            // A key spelling an input member of this API, carrying the
+            // application's own ARN: an ordinary tag, reported because the
+            // tagging plane holds it — and absent from every row that does not
+            // assign it.
+            label: "a key spelling an input member, carrying the application's own ARN",
+            created_with: None,
+            calls: vec![PlaneCall::Assign(vec![(
+                "resourceArn".to_string(),
+                TagText::OwnArn,
+            )])],
+        },
+        TagPlaneCase {
+            // Every character `TagKey`'s pattern `^[^\x00-\x1f\x22]+$` admits
+            // beyond the alphanumerics, and the empty value `TagValue`
+            // (`@length 0..256`) admits.
+            label: "a punctuated key and an empty value",
+            created_with: None,
+            calls: vec![assign(&[("project/name.v1+x@y=z -_", ""), ("optional", "")])],
+        },
+        TagPlaneCase {
+            label: "the modelled maximum number of tags, assigned in one call",
+            created_with: None,
+            calls: vec![PlaneCall::Assign(
+                at_the_maximum
+                    .iter()
+                    .map(|(key, value)| (key.clone(), TagText::Literal(value.clone())))
+                    .collect(),
+            )],
+        },
+    ]
+}
+
+/// The tag map `expected` spells, as a JSON object.
+fn expected_map(expected: &BTreeMap<String, String>) -> Value {
+    tag_map(
+        &expected
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<(String, String)>>(),
+    )
+}
+
+/// An application's tag set is ONE piece of state: the keys its create persisted,
+/// plus every key `TagResource` merged, minus every key `UntagResource` named. So
+/// `UpdateApp` reports EXACTLY that set — it invents no entry and drops none — and
+/// `DescribeApp` and `ListTagsForResource` report the same set, whatever route
+/// through the tagging plane produced it.
+#[tokio::test]
+async fn update_app_reports_exactly_the_tag_set_the_tagging_plane_holds() {
+    let router = emulator();
+
+    for (index, case) in tag_plane_cases().into_iter().enumerate() {
+        let name = format!("tag-plane-{index}");
+        let created = post(
+            &router,
+            "/create-app",
+            &match &case.created_with {
+                Some(tags) => json!({"name": name, "tags": tag_map(tags)}),
+                None => json!({"name": name}),
+            },
+        )
+        .await;
+        let app_arn = created.ok(case.label)["app"]["appArn"]
+            .as_str()
+            .expect("a minted appArn")
+            .to_string();
+
+        // The set the tagging plane holds, tracked independently of the emulator:
+        // a create persists what it carried, an assign merges, a remove takes out
+        // the keys it names.
+        let mut expected: BTreeMap<String, String> =
+            case.created_with.clone().unwrap_or_default().into_iter().collect();
+        for call in &case.calls {
+            match call {
+                PlaneCall::Assign(assigned) => {
+                    let resolved: Vec<(String, String)> = assigned
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.resolve(&app_arn)))
+                        .collect();
+                    tag(&router, &app_arn, &tag_map(&resolved))
+                        .await
+                        .ok(case.label);
+                    for (key, value) in resolved {
+                        expected.insert(key, value);
+                    }
+                }
+                PlaneCall::Remove(keys) => {
+                    let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+                    untag(&router, &app_arn, &borrowed).await.ok(case.label);
+                    for key in keys {
+                        expected.remove(key);
+                    }
+                }
+            }
+        }
+        let wanted = expected_map(&expected);
+
+        // An update of a member that is not a tag answers the whole application,
+        // tag set included — twice over, so a repeated update neither grows nor
+        // loses the set.
+        for (round, description) in [(1, "first update"), (2, "second update")] {
+            let case_label = format!("{} / update {round}", case.label);
+            let updated = post(
+                &router,
+                "/update-app",
+                &json!({"appArn": app_arn, "description": description}),
+            )
+            .await;
+            let app = updated.ok(&case_label)["app"].clone();
+            assert_eq!(
+                app["tags"], wanted,
+                "case {case_label:?}: UpdateApp must report exactly the tag set the \
+                 tagging plane holds, {wanted:?}, got {:?}",
+                app["tags"]
+            );
+            assert_eq!(
+                app["description"],
+                json!(description),
+                "case {case_label:?}: the update must persist the description it \
+                 carried, got {app:?}"
+            );
+        }
+
+        // The same set, from the dedicated read of the application and from the
+        // dedicated read of its tags: the three cannot disagree, and the updates
+        // above changed none of it.
+        let described = post(&router, "/describe-app", &json!({"appArn": app_arn})).await;
+        assert_eq!(
+            described.ok(case.label)["app"]["tags"],
+            wanted,
+            "case {:?}: DescribeApp must report {wanted:?}, got {:?}",
+            case.label,
+            described.body
+        );
+        let listed = list_tags(&router, &app_arn).await;
+        assert_eq!(
+            listed.ok(case.label)["tags"],
+            wanted,
+            "case {:?}: ListTagsForResource must report {wanted:?}, got {:?}",
+            case.label,
+            listed.body
+        );
+    }
 }
