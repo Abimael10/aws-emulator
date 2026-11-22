@@ -434,13 +434,15 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
     let router = service();
 
     // The rule: a revision is compatible with EC2 always (every revision is validated
-    // against the capacity of the caller's own account) and with MANAGED_INSTANCES always
-    // too (Amazon ECS Managed Instances run the task on EC2 capacity Amazon ECS operates),
-    // with FARGATE only when the network mode is `awsvpc` AND task-level cpu
+    // against the capacity of the caller's own account), with FARGATE only when the network
+    // mode is `awsvpc` AND task-level cpu
     // and memory are set ("For Amazon ECS tasks on Fargate, the awsvpc network mode is
     // required"; cpu/memory "required for Fargate"), and with EXTERNAL only when the
-    // network mode is not `awsvpc`. What a registration asks to be validated against adds
-    // nothing to the derived list (tabled in
+    // network mode is not `awsvpc`. MANAGED_INSTANCES is the launch type whose capacity an
+    // account holds only where a capacity provider of that class was created, and this
+    // router holds none, so no row reports it (tabled in
+    // [`crate::managed_instances_compatibility`]). What a registration asks to be validated
+    // against adds nothing to the derived list (tabled in
     // [`crate::task_definition_compatibility_validation`]), and none of these rows asks.
     // The list is reported in the launch-type order ECS reports, EXTERNAL, EC2,
     // MANAGED_INSTANCES, FARGATE, so a positional read names the same launch type the real
@@ -462,49 +464,49 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
             network_mode: None,
             task_size: false,
             expected_mode: "bridge",
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge",
             network_mode: Some("bridge"),
             task_size: false,
             expected_mode: "bridge",
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge with task size",
             network_mode: Some("bridge"),
             task_size: true,
             expected_mode: "bridge",
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "host",
             network_mode: Some("host"),
             task_size: false,
             expected_mode: "host",
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "none",
             network_mode: Some("none"),
             task_size: false,
             expected_mode: "none",
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "awsvpc without task size",
             network_mode: Some("awsvpc"),
             task_size: false,
             expected_mode: "awsvpc",
-            expected: &["EC2", "MANAGED_INSTANCES"],
+            expected: &["EC2"],
         },
         Row {
             case: "awsvpc with task size",
             network_mode: Some("awsvpc"),
             task_size: true,
             expected_mode: "awsvpc",
-            expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            expected: &["EC2", "FARGATE"],
         },
     ];
 

@@ -3784,6 +3784,13 @@ pub struct TaskDefinitionRecord {
     pub volumes: Vec<Volume>,
     pub placement_constraints: Vec<TaskDefinitionPlacementConstraint>,
     pub requires_compatibilities: Vec<String>,
+    /// Whether the account held Amazon ECS Managed Instances capacity when this revision
+    /// was registered
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::holds_managed_instances_capacity`]),
+    /// which is what decides whether the revision was validated against that launch type
+    /// ([`TaskDefinitionRecord::compatibilities`]). Resolved on the registering call, like
+    /// every other result of the validation a registration records.
+    pub managed_instances_capacity: bool,
     pub task_role_arn: Option<String>,
     pub execution_role_arn: Option<String>,
     pub pid_mode: Option<String>,
@@ -3918,7 +3925,10 @@ impl TaskDefinitionRecord {
     /// network mode is required") plus task-level `cpu` and `memory` ("This field is
     /// required for Fargate"); `awsvpc` is in turn not available to the external
     /// (on-premises) launch type; EC2 supports every network mode ("For Amazon ECS tasks on
-    /// Amazon EC2 Linux instances, any network mode can be used"); and Fargate additionally
+    /// Amazon EC2 Linux instances, any network mode can be used"); managed instances need
+    /// the account to hold that class of capacity at all, the one class no account holds by
+    /// default ([`TaskDefinitionRecord::managed_instances_capacity`]); and Fargate
+    /// additionally
     /// needs a principal for every image fetch the revision's containers need authenticating
     /// ([`TaskDefinitionRecord::pull_needs_execution_role`]), because a Fargate task runs
     /// on capacity Amazon ECS owns and so has no container instance whose own role the
@@ -3931,18 +3941,21 @@ impl TaskDefinitionRecord {
     ///
     /// What the REGISTRATION asked to be validated against (`requiresCompatibilities`) is
     /// reported separately and unchanged: the derived list neither adds a launch type the
-    /// parameters rule out nor withholds one they support, so it is a function of the
-    /// revision's own parameters rather than of what the request asked for.
+    /// revision was not validated against nor withholds one it was, so it is a function of
+    /// the revision's own parameters and of the capacity its account holds rather than of
+    /// what the request asked for.
     pub fn compatibilities(&self) -> Vec<String> {
         let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
         COMPATIBILITY_ORDER
             .iter()
             .filter(|launch_type| match **launch_type {
+                "EC2" => true,
                 // Amazon ECS Managed Instances run the caller's tasks on EC2 capacity
-                // Amazon ECS provisions and operates, so a revision EC2 supports is
-                // validated against that launch type too — which is what recorded
-                // projections of a revision report, whatever network mode it declares.
-                "EC2" | LAUNCH_TYPE_MANAGED_INSTANCES => true,
+                // Amazon ECS provisions and operates, which an account holds only where a
+                // capacity provider of that class was created for it, so a revision
+                // registered in an account holding none was never validated against that
+                // launch type.
+                LAUNCH_TYPE_MANAGED_INSTANCES => self.managed_instances_capacity,
                 "EXTERNAL" => !awsvpc,
                 "FARGATE" => {
                     awsvpc

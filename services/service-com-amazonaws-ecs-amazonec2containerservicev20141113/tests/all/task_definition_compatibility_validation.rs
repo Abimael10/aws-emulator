@@ -5,15 +5,17 @@
 //!
 //! The rule under test: `TaskDefinition$compatibilities` ("Amazon ECS validates the task
 //! definition parameters with those supported by the launch type") reports a launch type
-//! when the stored revision's parameters meet that launch type's documented requirements,
-//! whether or not the registration asked to be validated against it in its
+//! when the stored revision's parameters meet that launch type's documented requirements
+//! AND the account can place a task on that class of capacity at all, whether or not the
+//! registration asked to be validated against it in its
 //! `requiresCompatibilities` ("The task launch type that Amazon ECS validates the task
 //! definition against"), which is reported separately and unchanged. The launch types the
 //! derived list is drawn from are the whole `Compatibility` enum — `EXTERNAL`, `EC2`,
 //! `MANAGED_INSTANCES` and `FARGATE`, in the order recorded ECS projections report them — and
-//! Amazon ECS Managed Instances run a revision on EC2 capacity Amazon ECS operates, so every
-//! revision EC2 supports is validated against that launch type too; asking to be validated
-//! against it changes neither list's membership.
+//! managed-instances capacity is the one class no account holds by default, so the rows below,
+//! registered against an account that created no capacity provider of that class, report the
+//! other three ([`crate::managed_instances_compatibility`] is that half of the rule); asking
+//! to be validated against it changes neither list's membership.
 //!
 //! Which of those launch types a PLACEMENT may name is the narrower question: a
 //! `launchType` names the infrastructure outright, and managed-instances capacity is not
@@ -101,70 +103,70 @@ async fn compatibilities_report_only_the_launch_types_the_revision_supports() {
             network_mode: None,
             task_size: false,
             requires: &[],
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge asking for EC2",
             network_mode: Some("bridge"),
             task_size: false,
             requires: &["EC2"],
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge asking for managed instances",
             network_mode: Some("bridge"),
             task_size: false,
             requires: &["EC2", "MANAGED_INSTANCES"],
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "host with a task size",
             network_mode: Some("host"),
             task_size: true,
             requires: &[],
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "none",
             network_mode: Some("none"),
             task_size: false,
             requires: &[],
-            expected: &["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "awsvpc without a task size, asking for nothing",
             network_mode: Some("awsvpc"),
             task_size: false,
             requires: &[],
-            expected: &["EC2", "MANAGED_INSTANCES"],
+            expected: &["EC2"],
         },
         Row {
             case: "awsvpc with a task size, asking for nothing",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &[],
-            expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            expected: &["EC2", "FARGATE"],
         },
         Row {
             case: "awsvpc with a task size, asking for Fargate",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &["FARGATE"],
-            expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            expected: &["EC2", "FARGATE"],
         },
         Row {
             case: "awsvpc without a task size, asking for managed instances",
             network_mode: Some("awsvpc"),
             task_size: false,
             requires: &["MANAGED_INSTANCES"],
-            expected: &["EC2", "MANAGED_INSTANCES"],
+            expected: &["EC2"],
         },
         Row {
             case: "awsvpc with a task size, asking for every launch type awsvpc allows",
             network_mode: Some("awsvpc"),
             task_size: true,
             requires: &["EC2", "FARGATE", "MANAGED_INSTANCES"],
-            expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            expected: &["EC2", "FARGATE"],
         },
     ];
 
@@ -278,11 +280,8 @@ async fn the_derived_list_ignores_the_shape_of_the_container_list() {
 
     // (what the registration asks to be validated against, what the revision must report).
     let asks: [(&[&str], &[&str]); 2] = [
-        (&["FARGATE"], &["EC2", "MANAGED_INSTANCES", "FARGATE"]),
-        (
-            &["FARGATE", "MANAGED_INSTANCES"],
-            &["EC2", "MANAGED_INSTANCES", "FARGATE"],
-        ),
+        (&["FARGATE"], &["EC2", "FARGATE"]),
+        (&["FARGATE", "MANAGED_INSTANCES"], &["EC2", "FARGATE"]),
     ];
 
     for (index, (shape, containers, volumes)) in rows.iter().enumerate() {
@@ -332,22 +331,22 @@ async fn a_placement_may_name_only_a_launch_type_the_revision_reports() {
 
     // Two revisions of the SAME shape — `awsvpc` at a legal Fargate task size — that
     // differ only in whether the registration asked to be validated against
-    // managed-instances capacity: both report it among their compatibilities, and neither
-    // may be placed by NAMING that launch type, which is the narrower question the gate puts
-    // (`CreateService$launchType`).
+    // managed-instances capacity: neither reports it (this account created no capacity
+    // provider of that class), and neither may be placed by NAMING that launch type, which
+    // is the narrower question the gate puts (`CreateService$launchType`).
     let plain = Row {
         case: "asking for nothing",
         network_mode: Some("awsvpc"),
         task_size: true,
         requires: &[],
-        expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+        expected: &["EC2", "FARGATE"],
     };
     let validated = Row {
         case: "asking for managed instances",
         network_mode: Some("awsvpc"),
         task_size: true,
         requires: &["MANAGED_INSTANCES"],
-        expected: &["EC2", "MANAGED_INSTANCES", "FARGATE"],
+        expected: &["EC2", "FARGATE"],
     };
     register(&router, "gateplain", &plain, case).await;
     register(&router, "gatevalidated", &validated, case).await;

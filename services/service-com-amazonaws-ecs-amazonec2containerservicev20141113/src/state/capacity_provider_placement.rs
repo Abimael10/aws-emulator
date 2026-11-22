@@ -28,9 +28,10 @@
 
 use super::{
     capacity_provider_name_from_reference, CapacityProviderStrategyItem,
-    ComAmazonawsEcsAmazonec2containerservicev20141113State, CAPACITY_PROVIDER_TYPE_EC2_AUTOSCALING,
-    CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES, DEFAULT_LAUNCH_TYPE, LAUNCH_TYPE_FARGATE,
-    LAUNCH_TYPE_MANAGED_INSTANCES, MANAGED_CAPACITY_PROVIDERS,
+    ComAmazonawsEcsAmazonec2containerservicev20141113State, CAPACITY_PROVIDER_INACTIVE,
+    CAPACITY_PROVIDER_TYPE_EC2_AUTOSCALING, CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES,
+    DEFAULT_LAUNCH_TYPE, LAUNCH_TYPE_FARGATE, LAUNCH_TYPE_MANAGED_INSTANCES,
+    MANAGED_CAPACITY_PROVIDERS,
 };
 
 /// Which entry of `strategy` the NEXT task is placed through, given how many tasks each of
@@ -143,5 +144,29 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .get(&name)
                 .and_then(|provider| provider.provider_type.as_deref()),
         )
+    }
+
+    /// Whether this account holds Amazon ECS Managed Instances capacity at all: a capacity
+    /// provider of type [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`] that was created and
+    /// not deleted.
+    ///
+    /// Managed instances are the one class of capacity in `LaunchType` that neither the
+    /// caller registers itself (the container instances behind `EC2` and `EXTERNAL`) nor
+    /// Amazon ECS holds for every account in every Region (the Fargate providers,
+    /// [`MANAGED_CAPACITY_PROVIDERS`]): the capacity exists only as a provider somebody
+    /// created for a cluster (`CapacityProvider$cluster`: "Managed instances capacity
+    /// providers are cluster-scoped"), and a placement reaches it only through such a
+    /// provider (`RunTask$launchType`: "If you want to use Amazon ECS Managed Instances, you
+    /// must use the `capacityProviderStrategy` request parameter and omit the `launchType`
+    /// request parameter"). A provider whose capacity Amazon ECS is still standing up counts
+    /// — the account holds that capacity from the create that asked for it — while the
+    /// tombstone a deleted one leaves ([`CAPACITY_PROVIDER_INACTIVE`]) does not. Read where a
+    /// registration derives the launch types its revision is validated against
+    /// ([`super::TaskDefinitionRecord::compatibilities`]).
+    pub fn holds_managed_instances_capacity(&self) -> bool {
+        self.capacity_providers.values().any(|provider| {
+            provider.provider_type.as_deref() == Some(CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES)
+                && provider.status != CAPACITY_PROVIDER_INACTIVE
+        })
     }
 }

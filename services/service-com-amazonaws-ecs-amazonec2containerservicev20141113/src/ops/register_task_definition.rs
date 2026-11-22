@@ -695,6 +695,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volumes: input.volumes.clone().unwrap_or_default(),
             placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
             requires_compatibilities,
+            // Which launch types the registration validates the revision against is
+            // decided here, once: managed-instances capacity is held by an account only
+            // where a capacity provider of that class was created for it, so the
+            // registration records whether this account holds any.
+            managed_instances_capacity: guard.holds_managed_instances_capacity(),
             task_role_arn,
             execution_role_arn,
             pid_mode: input.pid_mode.clone(),
