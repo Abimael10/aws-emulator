@@ -57,7 +57,12 @@ fn release_window() -> Duration {
 /// One emulator carrying Elastic Load Balancing v2 and Certificate Manager over ONE
 /// shared engine, which is what makes the hand-off real: the certificate ARN ACM answered
 /// is handed to ELBv2, and the association ELBv2 records is what ACM then reports.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the suite beside this one
+/// (`acm_failed_certificate_refused_by_an_https_listener`) spans the same two services over
+/// one engine: ONE mounting for the crate, so the two cannot drift on how the hand-off is
+/// wired.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -73,7 +78,10 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One awsQuery call to the ELBv2 model, answered with its status and XML body.
-async fn elbv2(
+///
+/// `pub(crate)` for the reason [`emulator`] is: ONE writer of this service's awsQuery wire
+/// for the crate.
+pub(crate) async fn elbv2(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, &str)],
@@ -106,7 +114,7 @@ async fn elbv2(
 }
 
 /// One ELBv2 call that must succeed, answered with its XML body.
-async fn elbv2_ok(
+pub(crate) async fn elbv2_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -121,7 +129,14 @@ async fn elbv2_ok(
 }
 
 /// One `awsJson1_1` call to Certificate Manager, answered with its status and parsed body.
-async fn acm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` for the reason [`emulator`] is: ONE writer of that service's `awsJson1_1`
+/// wire for the crate.
+pub(crate) async fn acm(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -165,7 +180,11 @@ const ISSUANCE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Request one private certificate from ACM, wait until ACM reports it `ISSUED`, and answer
 /// the ARN it minted.
-async fn issued_certificate(router: &MultiServiceRouter, case: &str, domain: &str) -> String {
+pub(crate) async fn issued_certificate(
+    router: &MultiServiceRouter,
+    case: &str,
+    domain: &str,
+) -> String {
     let (status, body) = acm(
         router,
         "RequestCertificate",
@@ -200,7 +219,11 @@ async fn issued_certificate(router: &MultiServiceRouter, case: &str, domain: &st
 }
 
 /// What `DescribeCertificate` reports for `certificate_arn`.
-async fn described(router: &MultiServiceRouter, case: &str, certificate_arn: &str) -> Value {
+pub(crate) async fn described(
+    router: &MultiServiceRouter,
+    case: &str,
+    certificate_arn: &str,
+) -> Value {
     let (status, body) = acm(
         router,
         "DescribeCertificate",
@@ -215,7 +238,11 @@ async fn described(router: &MultiServiceRouter, case: &str, certificate_arn: &st
 }
 
 /// The resources `DescribeCertificate` reports as using `certificate_arn`.
-async fn in_use_by(router: &MultiServiceRouter, case: &str, certificate_arn: &str) -> Vec<String> {
+pub(crate) async fn in_use_by(
+    router: &MultiServiceRouter,
+    case: &str,
+    certificate_arn: &str,
+) -> Vec<String> {
     let certificate = described(router, case, certificate_arn).await;
     certificate["InUseBy"]
         .as_array()
