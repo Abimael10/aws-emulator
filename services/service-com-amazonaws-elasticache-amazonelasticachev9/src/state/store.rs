@@ -495,6 +495,10 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         name: &str,
         now: SystemTime,
     ) -> Option<&mut ServerlessCacheSnapshotRecord> {
+        // A snapshot whose removal the clock has already carried through is
+        // gone, so it resolves to nothing rather than to a record reporting
+        // `deleting` for ever.
+        self.purge_deleted_serverless_cache_snapshots(now);
         // Deliberately two lookups, for the reason
         // [`Self::settled_serverless_cache_mut`] gives: the first ends the
         // record's borrow so the transition's event can be written to the log
@@ -554,6 +558,19 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             .retain(|_, snapshot| snapshot.pending_removal.is_none_or(|due| now < due));
     }
 
+    /// Drop every serverless cache snapshot whose removal the clock already owes
+    /// — the snapshots a `DeleteServerlessCacheSnapshot` put into
+    /// [`STATUS_DELETING`] at least [`SNAPSHOT_TRANSITION`] ago.
+    ///
+    /// The serverless counterpart of [`Self::purge_deleted_snapshots`], and owed
+    /// by the clock alone for the same reason: the removal is due at this instant
+    /// whether or not anybody called, so a reporting operation materialises it
+    /// too.
+    pub fn purge_deleted_serverless_cache_snapshots(&mut self, now: SystemTime) {
+        self.serverless_cache_snapshots
+            .retain(|_, snapshot| snapshot.pending_removal.is_none_or(|due| now < due));
+    }
+
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
@@ -563,6 +580,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         // anything is reported from it.
         self.purge_deleted_serverless_caches(now);
         self.purge_deleted_snapshots(now);
+        self.purge_deleted_serverless_cache_snapshots(now);
         self.purge_deleted_replication_groups(now);
         let mut settled: Vec<(String, SettledClusterTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {

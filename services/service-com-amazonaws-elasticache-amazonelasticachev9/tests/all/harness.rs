@@ -101,6 +101,9 @@ pub fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
             if let Some(pending) = snapshot.pending_status.as_mut() {
                 pending.due = due;
             }
+            if snapshot.pending_removal.is_some() {
+                snapshot.pending_removal = Some(due);
+            }
         }
         for user in store.users.values_mut() {
             if let Some(pending) = user.pending_status.as_mut() {

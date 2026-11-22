@@ -253,7 +253,8 @@ pub fn serverless_cache_snapshot_arn(region: &str, name: &str) -> String {
 /// [`SERVERLESS_CACHE_ALREADY_EXISTS_MESSAGE`].
 ///
 /// One statement, so every operation that acts on a serverless cache snapshot
-/// by name — `ExportServerlessCacheSnapshot` today — words that fault the same
+/// by name — `ExportServerlessCacheSnapshot` and
+/// `DeleteServerlessCacheSnapshot` today — words that fault the same
 /// way. The READ words it differently, as
 /// [`serverless_cache_snapshot_not_described_message`] states, and a COPY whose
 /// SOURCE is missing differently again, as
@@ -768,6 +769,15 @@ pub struct ServerlessCacheSnapshotRecord {
     pub status: String,
     /// The status change the clock owes this snapshot, if any.
     pub pending_status: Option<PendingTransition>,
+    /// The instant the clock owes this snapshot's REMOVAL from the store, set by
+    /// the `DeleteServerlessCacheSnapshot` that put it into [`STATUS_DELETING`].
+    /// A deletion is not instant: the call answers with the snapshot reporting
+    /// `deleting`, so the record outlives the call by [`SNAPSHOT_TRANSITION`] and
+    /// is swept by
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_cache_snapshots`] —
+    /// the same posture [`SnapshotRecord::pending_removal`] holds for a cluster's
+    /// snapshot. `None` for a snapshot nothing has deleted.
+    pub pending_removal: Option<SystemTime>,
     /// "The date and time that the source serverless cache's metadata and cache
     /// data set was obtained for the snapshot."
     pub created_at: SystemTime,
@@ -813,6 +823,8 @@ impl ServerlessCacheSnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // Nothing is owed the removal of a snapshot just taken.
+            pending_removal: None,
             created_at: new.now,
             serverless_cache_name: cache.name.clone(),
             engine: cache.engine.clone(),
@@ -849,6 +861,9 @@ impl ServerlessCacheSnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // The copy is its own resource: whatever the source's deletion
+            // owes, nothing is owed on the record stored under the new name.
+            pending_removal: None,
             // `Tags` are "a list of tags to be added to the target snapshot
             // resource" — the copy's own, not the source's.
             tags: new.tags,
@@ -876,6 +891,24 @@ impl ServerlessCacheSnapshotRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this snapshot into [`STATUS_DELETING`] and let the clock owe its
+    /// removal [`SNAPSHOT_TRANSITION`] later.
+    ///
+    /// `DeleteServerlessCacheSnapshot` "deletes an existing serverless cache
+    /// snapshot" and answers WITH "the snapshot to be deleted"
+    /// (`DeleteServerlessCacheSnapshotResponse$ServerlessCacheSnapshot`), so the
+    /// record is still there when the call answers, reporting `deleting`, and the
+    /// removal is what the clock materialises
+    /// ([`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_cache_snapshots`]) —
+    /// the same way [`SnapshotRecord::begin_deletion`] leaves a cluster's
+    /// snapshot. Any status change that was still pending is dropped: a snapshot
+    /// on its way out is not owed `available` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.pending_removal = Some(now + SNAPSHOT_TRANSITION);
     }
 
     /// This record as the modelled `ServerlessCacheSnapshot`.

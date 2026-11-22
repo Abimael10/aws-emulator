@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServerlessCacheSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServerlessCacheSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! This operation IS implemented: the `handle` below serves it from state, so it no
+//! longer answers 501 and carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line
+//! (that line is the machine-readable record of which operations are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServerlessCacheSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule it serves: a delete BEGINS the removal of the snapshot the request
+//! names — the call answers with that stored snapshot reporting `deleting`, and
+//! the clock owes the record's removal, after which no read finds it.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +148,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServerlessCacheSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServerlessCacheSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServerlessCacheSnapshot"))
+        // This operation MUTATES: it "deletes an existing serverless cache
+        // snapshot", and answers with "the snapshot to be deleted" — the record
+        // as this call leaves it, on its way out.
+        // Nothing about this delete is read off the request parts: a snapshot is
+        // addressed by the name it is stored under, so — unlike the export, which
+        // takes the Region the bucket has to be in from them
+        // (`crate::state::request_region`) — this handler needs no request
+        // metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as every other operation that names a serverless
+        // cache snapshot: the name "is stored as a lowercase string", so the
+        // record this request resolves is the one stored under the lowercased
+        // name.
+        let stored_name = input.serverless_cache_snapshot_name.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The record read here is the one this instant owes: a snapshot whose
+        // removal an earlier delete made due is already gone, and one that has
+        // become `available` since it was created is available now.
+        let Some(snapshot) = store.settled_serverless_cache_snapshot_mut(&stored_name, now) else {
+            return Err(snapshot_not_found());
+        };
+
+        // A snapshot is deletable only from its settled status: one still
+        // `creating` is being written, and one already `deleting` from an
+        // earlier call is going away — both have work in flight over them, which
+        // is what `InvalidServerlessCacheSnapshotStateFault` ("the state of the
+        // serverless cache snapshot was not received") refuses rather than
+        // deleting a snapshot twice or part-way through being written.
+        if snapshot.status != crate::state::STATUS_AVAILABLE {
+            return Err(
+                DeleteServerlessCacheSnapshotErrorModeled::InvalidServerlessCacheSnapshotStateFault(
+                    InvalidServerlessCacheSnapshotStateFault {
+                        message: Some(format!(
+                            "Serverless cache snapshot {stored_name} is in {} state, not {}.",
+                            snapshot.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The snapshot is leaving: this call answers `deleting`, and the clock
+        // owes its removal from this call, so the read that follows that span
+        // finds it gone. The response is built from the record this call just
+        // wrote, so it reports persisted state.
+        snapshot.begin_deletion(now);
+        let deleted = snapshot.to_modeled();
+        // Deleting a serverless cache snapshot is one of the events this service
+        // records, under the snapshot itself — the source the event happened to,
+        // as `crate::state::SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT` explains; the
+        // cache it was taken of may be long gone, since a snapshot outlives it.
+        store.record_event(
+            crate::state::SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT,
+            &stored_name,
+            format!("Serverless cache snapshot {stored_name} deleted"),
+            now,
+        );
+
+        Ok(DeleteServerlessCacheSnapshotOutput {
+            serverless_cache_snapshot: Some(deleted),
+        })
     }
+}
+
+/// The modelled refusal for a `ServerlessCacheSnapshotName` the account holds no
+/// snapshot under: `ServerlessCacheSnapshotNotFoundFault`, HTTP 404, worded as
+/// [`crate::state::SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE`] — fixed text
+/// that states only that no snapshot is held under the specified name, the same
+/// sentence every operation ACTING on one by name answers with.
+fn snapshot_not_found() -> DeleteServerlessCacheSnapshotError {
+    DeleteServerlessCacheSnapshotErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+        ServerlessCacheSnapshotNotFoundFault {
+            message: Some(crate::state::SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE.to_string()),
+        },
+    )
+    .into()
 }

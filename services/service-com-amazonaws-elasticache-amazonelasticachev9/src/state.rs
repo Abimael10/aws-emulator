@@ -39,9 +39,11 @@
 //! `CreateServerlessCacheSnapshot` mints one from a stored serverless cache (and
 //! `DeleteServerlessCache`'s `FinalSnapshotName` mints the last one),
 //! `CopyServerlessCacheSnapshot` mints a second from a stored snapshot,
-//! `DescribeServerlessCacheSnapshots` reports it and `ExportServerlessCacheSnapshot`
-//! writes its data set out, while the delete call for one is still a scaffolded
-//! 501 that will read and write this same copy rather than a second one.
+//! `DescribeServerlessCacheSnapshots` reports it,
+//! `ExportServerlessCacheSnapshot` writes its data set out and
+//! `DeleteServerlessCacheSnapshot` takes it away. A deleted snapshot does not
+//! vanish at the call either: it answers `deleting` and the clock owes its
+//! removal ([`ServerlessCacheSnapshotRecord::pending_removal`]).
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster, `CopySnapshot` mints a
