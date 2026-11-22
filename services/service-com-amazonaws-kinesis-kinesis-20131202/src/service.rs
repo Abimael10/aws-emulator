@@ -121,6 +121,11 @@ mod validation;
 /// operation is served behind [`authorization::Authorized`], which asks it for them.
 pub(crate) use authorization::refusal as authorization_refusal;
 
+/// This service's wording for a broken input constraint, as a HANDLER that collected a
+/// violation itself asks it: the clause rules — the value set of an enumerated type included —
+/// stay in [`validation`], so the two layers cannot word one refusal differently.
+pub(crate) use validation::stated_message as stated_constraint_message;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::ProtocolError;
 use service_common::event_stream::EventStreamRoute;

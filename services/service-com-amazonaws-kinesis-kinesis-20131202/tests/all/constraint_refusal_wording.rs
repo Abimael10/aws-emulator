@@ -9,15 +9,17 @@
 //! requirement it failed, and the value AS SUBMITTED: in full, with nothing elided or
 //! annotated. Three parts of that sentence are the service's own: a `@pattern` is quoted
 //! WITHOUT the `^`/`$` pair a model writes a whole-value match with and with every
-//! alternative the front door admits, an enumerated type's value set is listed
-//! lexicographically whatever order the model declares it in, and the channel-name member's
-//! clause states no value at all.
+//! alternative the front door admits, an enumerated type's value set is listed in the order
+//! the front door walks its own hash table of those values (neither the model's declaration
+//! order nor lexicographic), and the channel-name member's clause states no value at all.
 //!
-//! The recorded cases this was derived from are three rows of the tables below (a channel
-//! name outside its expression, a malformed resource ARN, an out-of-set stream mode and an
+//! The recorded cases this was derived from are rows of the tables below (a channel
+//! name outside its expression, a malformed resource ARN, an out-of-set stream mode, an
+//! out-of-set billing commitment status, an out-of-set shard-level metric and an
 //! over-long partition key); the other rows differ along what the rule generalises over —
 //! which member carries the value, which constraint class it broke, which operation carried
-//! it, how long the value is, and how many clauses one refusal holds.
+//! it, how deep the member sits, how wide the value set it is outside is, how long the value
+//! is, and how many clauses one refusal holds.
 //!
 //! Every case drives the real awsJson1_1 request path (`POST /` with `X-Amz-Target:
 //! Kinesis_20131202.<Operation>` through `MultiServiceRouter::dispatch`), so the statuses,
@@ -169,18 +171,24 @@ async fn a_pattern_requirement_is_quoted_without_the_models_anchors() {
     }
 }
 
-/// An enumerated type's value set is listed in AWS's order — lexicographic — whatever order
-/// the model declares its members in.
+/// An enumerated type's value set is listed in AWS's order — the order the front door walks
+/// its own hash table of those values — whatever order the model declares its members in, and
+/// whichever member, operation and depth carries the value.
 #[tokio::test]
 async fn an_out_of_set_value_lists_the_value_set_in_aws_order() {
     let emulator = Emulator::new();
     let arn = stream_arn(REGION, "enum-order");
 
     // (case, operation, body, member path, the rejected value, the set as it must be listed).
-    // Each set is the model's own, sorted: `smithy_query(query="shape",
-    // shape="com.amazonaws.kinesis#<Enum>")` declares StreamMode as [PROVISIONED,
-    // ON_DEMAND], EncryptionType as [NONE, KMS] and ShardIteratorType as
-    // [AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER, TRIM_HORIZON, LATEST, AT_TIMESTAMP].
+    // The sets the rows name are the model's own — `smithy_query(query="shape",
+    // shape="com.amazonaws.kinesis#<Enum>")` declares StreamMode as [PROVISIONED, ON_DEMAND],
+    // EncryptionType as [NONE, KMS], ShardIteratorType as [AT_SEQUENCE_NUMBER,
+    // AFTER_SEQUENCE_NUMBER, TRIM_HORIZON, LATEST, AT_TIMESTAMP], ShardFilterType as
+    // [AFTER_SHARD_ID, AT_TRIM_HORIZON, FROM_TRIM_HORIZON, AT_LATEST, AT_TIMESTAMP,
+    // FROM_TIMESTAMP], MinimumThroughputBillingCommitmentInputStatus as [ENABLED, DISABLED],
+    // RecordDistributionStrategy as [AUTO, USER_PARTITION_KEY] and ScalingType as
+    // [UNIFORM_SCALING] — and are listed here in the one order the front door states, which
+    // for two of them is the declaration's reverse and for two more is neither order.
     let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
         (
             "a stream mode an update does not admit",
@@ -219,7 +227,60 @@ async fn an_out_of_set_value_lists_the_value_set_in_aws_order() {
             }),
             "shardIteratorType",
             "SOMETIME",
-            "[AFTER_SEQUENCE_NUMBER, AT_SEQUENCE_NUMBER, AT_TIMESTAMP, LATEST, TRIM_HORIZON]",
+            "[AFTER_SEQUENCE_NUMBER, LATEST, AT_TIMESTAMP, AT_SEQUENCE_NUMBER, TRIM_HORIZON]",
+        ),
+        (
+            // A commitment status, two members deep, where the listing is the declaration's
+            // reverse.
+            "a billing commitment status nothing admits",
+            "UpdateAccountSettings",
+            json!({ "MinimumThroughputBillingCommitment": { "Status": "NEGATIVE-1" } }),
+            "minimumThroughputBillingCommitment.status",
+            "NEGATIVE-1",
+            "[ENABLED, DISABLED]",
+        ),
+        (
+            "a lowercased billing commitment status",
+            "UpdateAccountSettings",
+            json!({ "MinimumThroughputBillingCommitment": { "Status": "enabled" } }),
+            "minimumThroughputBillingCommitment.status",
+            "enabled",
+            "[ENABLED, DISABLED]",
+        ),
+        (
+            // The widest set a nested member of this service carries, and the one whose
+            // listing two pairs of its values decide between themselves.
+            "a shard filter naming no shard class",
+            "ListShards",
+            json!({ "StreamName": "enum-order", "ShardFilter": { "Type": "AT_SOME_SHARD" } }),
+            "shardFilter.type",
+            "AT_SOME_SHARD",
+            "[FROM_TIMESTAMP, AT_TIMESTAMP, AT_TRIM_HORIZON, AT_LATEST, FROM_TRIM_HORIZON, \
+             AFTER_SHARD_ID]",
+        ),
+        (
+            "a distribution strategy nothing distributes by",
+            "UpdateStreamRecordDistributionStrategy",
+            json!({
+                "StreamARN": stream_arn(REGION, "enum-order"),
+                "RecordDistributionStrategy": "RANDOM",
+            }),
+            "recordDistributionStrategy",
+            "RANDOM",
+            "[AUTO, USER_PARTITION_KEY]",
+        ),
+        (
+            // A set of ONE value is listed as the one value, there being nothing to order.
+            "a scaling type nothing scales by",
+            "UpdateShardCount",
+            json!({
+                "StreamName": "enum-order",
+                "TargetShardCount": 2,
+                "ScalingType": "NON_UNIFORM_SCALING",
+            }),
+            "scalingType",
+            "NON_UNIFORM_SCALING",
+            "[UNIFORM_SCALING]",
         ),
     ];
 
@@ -233,6 +294,43 @@ async fn an_out_of_set_value_lists_the_value_set_in_aws_order() {
             message,
             envelope(&[clause.as_str()]),
             "case {case:?}: expected the value set listed as {listed:?}"
+        );
+    }
+}
+
+/// The same order for a value carried at a POSITION OF A LIST rather than by a member of its
+/// own: the set a shard-level metric has to be in is listed the one way, whatever the clause
+/// states around it (which member a broken element is reported at, and the value it echoes,
+/// are their own rule and are pinned where that rule lives).
+#[tokio::test]
+async fn an_out_of_set_element_lists_the_value_set_in_aws_order() {
+    let emulator = Emulator::new();
+
+    // MetricsName, as the model declares it: [IncomingBytes, IncomingRecords, OutgoingBytes,
+    // OutgoingRecords, WriteProvisionedThroughputExceeded,
+    // ReadProvisionedThroughputExceeded, IteratorAgeMilliseconds, ALL]
+    // (`smithy_query(query="shape", shape="com.amazonaws.kinesis#MetricsName")`), listed in
+    // the order the front door states it — the widest set this service carries, and neither
+    // of the two orders a model offers.
+    const METRICS: &str = "[ALL, IteratorAgeMilliseconds, IncomingBytes, \
+                           WriteProvisionedThroughputExceeded, OutgoingRecords, \
+                           ReadProvisionedThroughputExceeded, IncomingRecords, OutgoingBytes]";
+
+    for (case, operation) in [
+        ("a metric enhanced monitoring does not report", "EnableEnhancedMonitoring"),
+        ("a metric enhanced monitoring cannot drop", "DisableEnhancedMonitoring"),
+    ] {
+        let message = refusal(
+            &emulator,
+            case,
+            operation,
+            &json!({ "StreamName": "enum-order", "ShardLevelMetrics": ["NotARealMetric"] }),
+        )
+        .await;
+        let requirement = format!("Member must satisfy enum value set: {METRICS}");
+        assert!(
+            message.contains(&requirement),
+            "case {case:?}: expected the requirement {requirement:?}, got {message:?}"
         );
     }
 }
@@ -347,8 +445,8 @@ async fn a_request_breaking_two_constraints_states_both_clauses() {
         "Value 'two clauses' at 'streamName' failed to satisfy constraint: Member must \
          satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
         "Value 'SOMETIME' at 'shardIteratorType' failed to satisfy constraint: Member must \
-         satisfy enum value set: [AFTER_SEQUENCE_NUMBER, AT_SEQUENCE_NUMBER, AT_TIMESTAMP, \
-         LATEST, TRIM_HORIZON]",
+         satisfy enum value set: [AFTER_SEQUENCE_NUMBER, LATEST, AT_TIMESTAMP, \
+         AT_SEQUENCE_NUMBER, TRIM_HORIZON]",
     ] {
         assert!(
             message.contains(clause),

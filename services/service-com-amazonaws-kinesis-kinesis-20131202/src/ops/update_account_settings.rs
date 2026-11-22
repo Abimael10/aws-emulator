@@ -169,8 +169,13 @@ fn requested_commitment(
 /// `ValidationException` carrying the clause the constraint walk renders for an enum member,
 /// the member's path, the value at fault and the value set it has to be in, built through that
 /// walk's public violation rendering rather than re-worded here.
+///
+/// The sentence comes from [`crate::service::stated_constraint_message`], the one module that
+/// words a broken constraint for this service — the value set of an enumerated type included,
+/// which is listed in the order the front door states it rather than in the order this
+/// catalog happens to be written in.
 fn off_catalog_status(status: &str) -> UpdateAccountSettingsError {
-    use ::aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
+    use ::aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 
     let violation = Violation {
         path: path::join(&[
@@ -187,7 +192,7 @@ fn off_catalog_status(status: &str) -> UpdateAccountSettingsError {
         sensitive: false,
     };
     UpdateAccountSettingsErrorModeled::ValidationException(ValidationException {
-        message: envelope(&[violation]),
+        message: crate::service::stated_constraint_message(&[violation]),
     })
     .into()
 }

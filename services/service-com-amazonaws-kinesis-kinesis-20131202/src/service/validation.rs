@@ -27,9 +27,11 @@
 //!    demand a whole-string match (`service_common::validation::unanchored`), and for the
 //!    resource-ARN expression it is the one the service's own front door publishes
 //!    ([`STATED_EXPRESSIONS`]);
-//! 4. an enumerated type's value set is listed in LEXICOGRAPHIC order
-//!    (`service_common::validation_message::in_sorted_enum_order`), whatever order the model
-//!    declares its members in;
+//! 4. an enumerated type's value set is listed in the order the front door's own HASH TABLE
+//!    of those values is walked (`service_common::validation_message::in_hashed_enum_order`)
+//!    — ascending bucket of each value's string hash, and the later-declared of two values
+//!    that share a bucket first — which is neither the order the model declares its members
+//!    in nor lexicographic;
 //! 5. one member's clause states NO value at all ([`WITHHELD_VALUE_MEMBERS`]).
 //!
 //! The status (400) and the error code are what the framework already answers a constraint
@@ -49,13 +51,22 @@ pub(super) fn refusal(violations: &[Violation]) -> Option<Refused> {
     // still comes from the one place that writes it.
     let stated: Vec<Violation> = violations
         .iter()
-        .map(::service_common::validation_message::in_sorted_enum_order)
+        .map(::service_common::validation_message::in_hashed_enum_order)
         .collect();
     ::service_common::validation_message::aws_validation_refusal_withholding_with(
         &Refusal::Invalid(stated),
         stated_expression,
         withholds_value,
     )
+}
+
+/// The message this service states for violations a HANDLER collected itself, rather than for
+/// a refusal the framework's own walk handed over, and `None` when there is nothing to word.
+///
+/// The same clauses under the same rules through the same [`refusal`], so one broken constraint
+/// cannot be worded two ways depending on which layer found it.
+pub(crate) fn stated_message(violations: &[Violation]) -> Option<String> {
+    refusal(violations).map(|refused| refused.message)
 }
 
 /// The members whose clause states NO value: the member path is named, the requirement is
@@ -201,18 +212,33 @@ mod tests {
         );
     }
 
-    /// An enumerated type's value set is listed in lexicographic order, whatever order the
-    /// model declares it in.
+    /// An enumerated type's value set is listed in the order the front door walks its own
+    /// hash table of those values — neither the order the model declares them in nor
+    /// lexicographic — whatever the type and whatever member carries it.
     #[test]
-    fn an_enum_value_set_is_listed_in_lexicographic_order() {
-        // (case, the set as the model declares it, the set as a clause lists it). Source:
-        // `smithy_query(query="shape", shape="com.amazonaws.kinesis#<Enum>")`.
-        let rows: [(&str, &[&str], &str); 3] = [
+    fn an_enum_value_set_is_listed_in_the_front_doors_table_order() {
+        // (case, the set as the model declares it, the set as a clause lists it). The declared
+        // halves are the model's own: `smithy_query(query="shape",
+        // shape="com.amazonaws.kinesis#<Enum>")`. The stated halves follow the one order
+        // `service_common::validation_message::in_hashed_enum_order` derives from the values
+        // themselves, so no row is a case of its own.
+        let rows: [(&str, &[&str], &str); 7] = [
             ("StreamMode", &["PROVISIONED", "ON_DEMAND"], "[ON_DEMAND, PROVISIONED]"),
             (
                 "EncryptionType",
                 &["NONE", "KMS"],
                 "[KMS, NONE]",
+            ),
+            (
+                // Lexicographic and the table's order agree on neither of these two.
+                "MinimumThroughputBillingCommitmentInputStatus",
+                &["ENABLED", "DISABLED"],
+                "[ENABLED, DISABLED]",
+            ),
+            (
+                "MinimumThroughputBillingCommitmentOutputStatus",
+                &["ENABLED", "DISABLED", "ENABLED_UNTIL_EARLIEST_ALLOWED_END"],
+                "[ENABLED, ENABLED_UNTIL_EARLIEST_ALLOWED_END, DISABLED]",
             ),
             (
                 "ShardIteratorType",
@@ -223,7 +249,39 @@ mod tests {
                     "LATEST",
                     "AT_TIMESTAMP",
                 ],
-                "[AFTER_SEQUENCE_NUMBER, AT_SEQUENCE_NUMBER, AT_TIMESTAMP, LATEST, TRIM_HORIZON]",
+                "[AFTER_SEQUENCE_NUMBER, LATEST, AT_TIMESTAMP, AT_SEQUENCE_NUMBER, TRIM_HORIZON]",
+            ),
+            (
+                // A set holding two PAIRS of values that share a bucket, so the within-bucket
+                // half of the order is exercised too: the later-declared of the two is stated
+                // first.
+                "ShardFilterType",
+                &[
+                    "AFTER_SHARD_ID",
+                    "AT_TRIM_HORIZON",
+                    "FROM_TRIM_HORIZON",
+                    "AT_LATEST",
+                    "AT_TIMESTAMP",
+                    "FROM_TIMESTAMP",
+                ],
+                "[FROM_TIMESTAMP, AT_TIMESTAMP, AT_TRIM_HORIZON, AT_LATEST, FROM_TRIM_HORIZON, \
+                 AFTER_SHARD_ID]",
+            ),
+            (
+                "MetricsName",
+                &[
+                    "IncomingBytes",
+                    "IncomingRecords",
+                    "OutgoingBytes",
+                    "OutgoingRecords",
+                    "WriteProvisionedThroughputExceeded",
+                    "ReadProvisionedThroughputExceeded",
+                    "IteratorAgeMilliseconds",
+                    "ALL",
+                ],
+                "[ALL, IteratorAgeMilliseconds, IncomingBytes, \
+                 WriteProvisionedThroughputExceeded, OutgoingRecords, \
+                 ReadProvisionedThroughputExceeded, IncomingRecords, OutgoingBytes]",
             ),
         ];
 
