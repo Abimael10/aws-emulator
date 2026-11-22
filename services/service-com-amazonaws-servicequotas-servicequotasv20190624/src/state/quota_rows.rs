@@ -117,10 +117,12 @@ pub(super) use xray::xray_quotas;
 /// exactly this form around that quota's own counted phrase, with no closing stop.
 ///
 /// It is the form of THOSE services' rows, not a default for a row whose own published
-/// sentence nothing available here states: such a row carries none rather than a sentence
-/// worded here, which is why the services whose sentences the recorded listings report as
-/// divergent under every form available here ([`appmesh_plane`], [`backup_plane`],
-/// [`apprunner_quotas`], [`scalable_targets`]) publish their rows without one.
+/// sentence nothing available here states: a service that publishes its sentences in a
+/// voice of its own words them in that voice ([`appmesh_plane`] and [`backup_plane`] count
+/// with no leading article, [`apprunner_plane`] names where the resources are created,
+/// [`scalable_targets`] names the namespace the targets belong to), and a row whose own
+/// published sentence nothing available here states carries none rather than a sentence
+/// worded here.
 fn maximum_number_phrase(counted: &str) -> String {
     format!("The maximum number of {counted}")
 }
@@ -138,9 +140,12 @@ fn maximum_number_phrase(counted: &str) -> String {
 /// is published under, that is the binding the row carries: the developer-portal planes
 /// (`L-7D4D47CD`, `L-B4D69DB7`), the API-key count (`L-1D180A63`) and the stage-variable
 /// planes (`L-95BA6EA5`, `L-B2CF62DC`) are published as that listing states, with its
-/// adjustability and its sentence. API Gateway publishes a row's sentence as the quota's
-/// OWN published phrase rather than in a counted-plane voice, except on the planes it
-/// minted later (the portal and domain-name-access planes), which carry the
+/// adjustability and its sentence, and so are the request-payload size (`L-46624B39`,
+/// published in megabytes and as NOT adjustable), the account's client certificates
+/// (`L-824C9E42`) and the integration timeout in milliseconds (`L-E5AE38E3`). API Gateway
+/// publishes a row's sentence as the quota's OWN published phrase rather than in a
+/// counted-plane voice, except on the planes it minted later (the portal and
+/// domain-name-access planes) and the account's API keys, which carry the
 /// `The maximum number of …` form; a row whose own published phrase nothing available here
 /// states therefore carries no sentence rather than one worded here.
 pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
@@ -151,13 +156,23 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
         // The account's API-key plane, which the recorded listing publishes under THIS
         // code and as NOT adjustable; its limit is API Gateway's published default for
         // the API keys of an account in a Region.
-        quota("API keys", 10_000.0).code("L-1D180A63").fixed(),
+        quota("API keys", 10_000.0)
+            .code("L-1D180A63")
+            .fixed()
+            .describe(&maximum_number_phrase(
+                "API keys that you can create in this account in the current region",
+            )),
         quota("WebSocket APIs per account per Region", 600.0).code("L-20859C74"),
         quota("Resources per API", 300.0).code("L-24E7E662"),
         quota("Stages per API", 10.0).code("L-379E48B0"),
         quota("Routes per HTTP API", 300.0).code("L-3A613F94"),
         quota("Integrations per HTTP API", 300.0).code("L-45CC0E8B"),
-        quota("Authorizers per API", 10.0).code("L-46624B39"),
+        // The size of ONE request's payload, which the recorded listing publishes under
+        // THIS code, in megabytes and as not adjustable.
+        quota("API Payload Size", 10.0)
+            .code("L-46624B39")
+            .unit("Megabytes")
+            .fixed(),
         quota("Domain name access associations", 100.0)
             .code("L-4D98A8A5")
             .describe(
@@ -179,7 +194,9 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             .code("L-7D4D47CD")
             .fixed()
             .describe(&maximum_number_phrase("PortalProducts per account")),
-        quota("VPC links per account per Region", 20.0).code("L-824C9E42"),
+        // The account's client certificates, which the recorded listing publishes under
+        // THIS code at its published default.
+        quota("Client certificates", 60.0).code("L-824C9E42"),
         quota("Models per API", 300.0).code("L-85120D8E"),
         quota("Request validators per API", 20.0).code("L-8A5B8E43"),
         // The account-level request rate and its burst allowance: a rate quota, so it
@@ -243,7 +260,7 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             .code("L-B4D69DB7")
             .fixed()
             .describe(&maximum_number_phrase(
-                "Custom Domain Names per Portal",
+                "custom domain names per portal",
             )),
         quota("Tags per API stage", 50.0).code("L-B97207D0").fixed(),
         quota("Payload size", 10.0)
@@ -259,9 +276,11 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             .code("L-E11F7D5D")
             .fixed(),
         quota("Documentation versions per API", 200.0).code("L-E1465507"),
-        quota("Custom authorizer result TTL", 3600.0)
+        // The longest an integration may take to answer, which the recorded listing
+        // publishes under THIS code, in milliseconds.
+        quota("Maximum integration timeout in milliseconds", 29_000.0)
             .code("L-E5AE38E3")
-            .unit("Seconds"),
+            .unit("Milliseconds"),
         quota("Iterations in a mapping template loop", 1000.0)
             .code("L-E8693075")
             .fixed(),
@@ -271,7 +290,8 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
         quota("Maximum Logo Size", 200.0)
             .code("L-F8A34CAF")
             .unit("Kilobytes")
-            .fixed(),
+            .fixed()
+            .describe("The maximum size of a logo"),
         quota("Integrations per API", 300.0).code("L-F8BD84D3"),
         quota("Authorizers per WebSocket API", 10.0).code("L-FB4F0270"),
         quota("Tags per API", 50.0).code("L-FD0EB744").fixed(),
@@ -314,8 +334,13 @@ fn appconfig_resource_plane(code: &str, name: &str, limit: f64, resource: &str) 
 /// "AWS AppConfig quotas" table of the AWS AppConfig User Guide), whose quota names
 /// are published in the "Maximum number of …" form the rows below carry, and the recorded
 /// default-quota listing of that code for the resource planes' window and usage metric
-/// ([`appconfig_resource_plane`]), for the experiment-definition limit and for the
-/// deployment-strategy plane's published name.
+/// ([`appconfig_resource_plane`]), for the experiment-definition limit, for the
+/// deployment-strategy plane's published name, and for WHICH resource each plane counts
+/// and at what limit: the configuration profiles of an application are published under
+/// `L-FA210A1F`, with that resource type's own `ResourceCount` metric and the sentence
+/// AppConfig publishes for the plane, the applications of the account under `L-EEB0151E`,
+/// and the environments of an application under `L-A52E46BE`, at the limit that listing
+/// states for it.
 pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Maximum number of treatments per experiment", 5.0).code("L-08D2C632"),
@@ -325,25 +350,27 @@ pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
         )
         .code("L-48F9B951")
         .unit("Kilobytes"),
-        // A quota AWS publishes over a DAY rather than per resource: the deployment
-        // starts an account may make in one day, metered by that API's own
-        // `AWS/Usage` `CallCount` metric.
-        quota("Maximum number of deployments per day", 100.0)
-            .code("L-A52E46BE")
-            .period(1, "DAY")
-            .metric(call_count_metric("AppConfig", "StartDeployment")),
+        appconfig_resource_plane(
+            "L-A52E46BE",
+            "Maximum number of environments per application",
+            20.0,
+            "Environment",
+        ),
+        // The size limit on a configuration AppConfig does not host itself, beside the
+        // hosted store's own limit above.
         quota(
-            "Maximum number of configuration profiles per application",
-            100.0,
+            "Configuration size limit in other configuration stores",
+            1024.0,
         )
-        .code("L-A5FC0339"),
+        .code("L-A5FC0339")
+        .unit("Kilobytes"),
         quota("Maximum number of experiment definitions per application", 50.0)
             .code("L-B858C085"),
         appconfig_resource_plane(
             "L-EEB0151E",
-            "Maximum number of environments per application",
+            "Maximum number of applications",
             100.0,
-            "Environment",
+            "Application",
         ),
         appconfig_resource_plane(
             "L-F59D302B",
@@ -353,9 +380,16 @@ pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
         ),
         appconfig_resource_plane(
             "L-FA210A1F",
-            "Maximum number of applications",
+            "Maximum number of configuration profiles per application",
             100.0,
-            "Application",
+            "ConfigurationProfile",
+        )
+        .describe(
+            "A configuration profile contains metadata about a particular set of \
+             configuration data used by your application. To reduce the number of \
+             configuration profiles required per application, split configuration \
+             profiles across multiple applications. Limit increase requests will be \
+             automatically approved for values less than or equal to 500.",
         ),
     ]
 }
@@ -364,12 +398,33 @@ pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
 /// may register for the resources of ONE scalable service.
 ///
 /// Application Auto Scaling publishes a row of this class per scalable service, and every
-/// member but that service's own name and the limit is the same across the class — the
-/// `QuotaName` names the service the targets belong to — so one constructor fills them and
-/// two rows of the class cannot drift apart. The sentence the class is published with is
-/// one nothing available here states, so a row carries none rather than one worded here.
-fn scalable_targets(code: &str, scaled_service: &str, targets: f64) -> QuotaRow {
-    quota(format!("Scalable targets for {scaled_service}"), targets).code(code)
+/// member but that service's own name, the NAMESPACE its resources are registered under
+/// and the limit is the same across the class — the `QuotaName` names the service the
+/// targets belong to and the `Description` is the sentence the class is published with,
+/// which names that row's own namespace and then states what a scalable target is — so one
+/// constructor fills them and two rows of the class cannot drift apart.
+///
+/// SOURCE: the recorded default-quota listing of `application-autoscaling` for that
+/// sentence and for the namespace each row it states one for names, which is the scalable
+/// service's own name except where AWS publishes the namespace under a different one.
+fn scalable_targets(code: &str, scaled_service: &str, namespace: &str, targets: f64) -> QuotaRow {
+    quota(format!("Scalable targets for {scaled_service}"), targets)
+        .code(code)
+        .describe(&format!(
+            "The maximum number of scalable targets that you can register for the \
+             {namespace} namespace in this account in the current Region. A scalable \
+             target identifies the resource that Application Auto Scaling can scale."
+        ))
+}
+
+/// The sentence Application Auto Scaling publishes for a PER-TARGET plane — the policies,
+/// scheduled actions or step adjustments one target or policy may carry: the counted-plane
+/// form around that plane's own phrase, closed with a full stop.
+///
+/// SOURCE: the recorded default-quota listing of `application-autoscaling`, which
+/// publishes the per-target scaling-policy plane's sentence in exactly this form.
+fn per_target_phrase(counted: &str) -> String {
+    format!("The maximum number of {counted}.")
 }
 
 /// Application Auto Scaling's published default-quota catalog.
@@ -381,47 +436,66 @@ fn scalable_targets(code: &str, scaled_service: &str, targets: f64) -> QuotaRow 
 /// services rather than for a resource type.
 ///
 /// The recorded default-quota listing of that code states which service's targets three
-/// of those codes publish (`L-799ACCDF` Amazon Keyspaces, with its higher limit,
-/// `L-8998F403` AppStream and `L-D75CA9D2` EMR, which it publishes as adjustable) and that
-/// the per-target scheduled-action plane is the NOT-adjustable row published under
-/// `L-95848B5F`; the scalable service the remaining codes of the class publish is not
-/// stated there, so those rows keep the service they have carried.
+/// of those codes publish (`L-799ACCDF` Amazon Keyspaces, whose namespace AWS publishes as
+/// Cassandra and which carries the class's higher limit, `L-8998F403` AppStream and
+/// `L-D75CA9D2` EMR, whose namespace AWS publishes as Elastic MapReduce (EMR) and which it
+/// publishes as adjustable), that the per-target scheduled-action plane is the
+/// NOT-adjustable row published under `L-95848B5F`, and that the step adjustments of a step
+/// scaling policy are published under `L-9C25247C`; the scalable service the remaining
+/// codes of the class publish is not stated there, so those rows keep the service they have
+/// carried, and its name is the namespace their sentence names.
 pub(super) fn application_autoscaling_quotas() -> Vec<QuotaRow> {
     vec![
-        scalable_targets("L-17D5F681", "Comprehend", 500.0),
-        scalable_targets("L-1A11EB4B", "Lambda", 500.0),
-        scalable_targets("L-1AAF0700", "Aurora", 500.0),
-        scalable_targets("L-297D9EC9", "EC2", 500.0),
-        scalable_targets("L-4A11ECEB", "Custom Resource", 500.0),
-        scalable_targets("L-60E4E5E2", "DynamoDB", 500.0),
-        scalable_targets("L-782A3EE2", "ECS", 500.0),
+        scalable_targets("L-17D5F681", "Comprehend", "Comprehend", 500.0),
+        scalable_targets("L-1A11EB4B", "Lambda", "Lambda", 500.0),
+        scalable_targets("L-1AAF0700", "Aurora", "Aurora", 500.0),
+        scalable_targets("L-297D9EC9", "EC2", "EC2", 500.0),
+        scalable_targets("L-4A11ECEB", "Custom Resource", "Custom Resource", 500.0),
+        scalable_targets("L-60E4E5E2", "DynamoDB", "DynamoDB", 500.0),
+        scalable_targets("L-782A3EE2", "ECS", "ECS", 500.0),
         // The Amazon Keyspaces plane, the one row of the class AWS publishes a higher
-        // limit for, named for that service as AWS names it.
-        scalable_targets("L-799ACCDF", "Amazon Keyspaces", 1500.0),
-        scalable_targets("L-800F6F7B", "ElastiCache", 500.0),
-        scalable_targets("L-8998F403", "AppStream", 500.0),
-        scalable_targets("L-9C25247C", "MSK", 500.0),
-        scalable_targets("L-A1D42901", "Neptune", 500.0),
-        scalable_targets("L-A2AD6458", "SageMaker", 500.0),
-        scalable_targets("L-D75CA9D2", "EMR", 500.0),
+        // limit for, named for that service as AWS names it and described for the
+        // Cassandra namespace its targets are registered under.
+        scalable_targets("L-799ACCDF", "Amazon Keyspaces", "Cassandra", 1500.0),
+        scalable_targets("L-800F6F7B", "ElastiCache", "ElastiCache", 500.0),
+        scalable_targets("L-8998F403", "AppStream", "AppStream", 500.0),
+        scalable_targets("L-A1D42901", "Neptune", "Neptune", 500.0),
+        scalable_targets("L-A2AD6458", "SageMaker", "SageMaker", 500.0),
+        scalable_targets("L-D75CA9D2", "EMR", "Elastic MapReduce (EMR)", 500.0),
+        // The step adjustments of ONE step scaling policy, which the recorded listing
+        // publishes under `L-9C25247C` at its published default.
+        quota("Step adjustments per step scaling policy", 20.0)
+            .code("L-9C25247C")
+            .describe(&per_target_phrase(
+                "step adjustments per step scaling policy",
+            )),
         // The per-target planes AWS publishes as not adjustable.
         quota("Scaling policies per scalable target", 50.0)
             .code("L-B395C81B")
-            .fixed(),
+            .fixed()
+            .describe(&per_target_phrase("scaling policies per scalable target")),
         quota("Scheduled actions per scalable target", 200.0)
             .code("L-95848B5F")
-            .fixed(),
+            .fixed()
+            .describe(&per_target_phrase("scheduled actions per scalable target")),
     ]
 }
 
 /// One App Mesh plane.
 ///
-/// App Mesh publishes a sentence for every row, and the sentence of a row of this service
-/// is one nothing available here states: not the counted-plane form and not the quota's own
-/// phrase, both of which the recorded listing of this code reports as divergent. So a row
-/// carries none rather than a sentence worded here, and the plane is stated once.
-fn appmesh_plane(code: &str, plane: &str, limit: f64) -> QuotaRow {
-    quota(plane, limit).code(code)
+/// App Mesh publishes a sentence for every row, and across this service the sentence is
+/// one form — `Number of <the plane the row counts>` — so one constructor fills the name
+/// and the sentence from the plane and two rows of the class cannot drift apart. The
+/// counted phrase is passed beside the name because App Mesh publishes it in the sentence
+/// in a voice of its own (the Envoy planes are published as CONCURRENTLY connected
+/// processes), lower case where the name starts a title.
+///
+/// SOURCE: the recorded default-quota listing of `appmesh`, which publishes every one of
+/// its eleven rows with exactly that sentence around that row's own counted phrase.
+fn appmesh_plane(code: &str, plane: &str, counted: &str, limit: f64) -> QuotaRow {
+    quota(plane, limit)
+        .code(code)
+        .describe(&format!("Number of {counted}"))
 }
 
 /// AWS App Mesh's published default-quota catalog.
@@ -434,44 +508,153 @@ fn appmesh_plane(code: &str, plane: &str, limit: f64) -> QuotaRow {
 /// `L-87E74146`.
 pub(super) fn appmesh_quotas() -> Vec<QuotaRow> {
     vec![
-        appmesh_plane("L-33E8F9C9", "Connected Envoy processes per virtual gateway", 50.0),
-        appmesh_plane("L-50F6C35A", "Virtual routers per mesh", 200.0),
-        appmesh_plane("L-606A910B", "Connected Envoy processes per virtual node", 50.0),
+        appmesh_plane(
+            "L-33E8F9C9",
+            "Connected Envoy processes per virtual gateway",
+            "concurrently connected Envoy processes per virtual gateway",
+            50.0,
+        ),
+        appmesh_plane(
+            "L-50F6C35A",
+            "Virtual routers per mesh",
+            "virtual routers per mesh",
+            200.0,
+        ),
+        appmesh_plane(
+            "L-606A910B",
+            "Connected Envoy processes per virtual node",
+            "concurrently connected Envoy processes per virtual node",
+            50.0,
+        ),
         // The backend plane of a virtual node, which AWS publishes as fixed.
-        appmesh_plane("L-8775AB18", "Backends per virtual node", 50.0).fixed(),
-        appmesh_plane("L-87E74146", "Virtual gateways per mesh", 3.0),
-        appmesh_plane("L-AC861A39", "Meshes per account", 15.0),
+        appmesh_plane(
+            "L-8775AB18",
+            "Backends per virtual node",
+            "backends per virtual node",
+            50.0,
+        )
+        .fixed(),
+        appmesh_plane(
+            "L-87E74146",
+            "Virtual gateways per mesh",
+            "virtual gateways per mesh",
+            3.0,
+        ),
+        appmesh_plane("L-AC861A39", "Meshes per account", "meshes per account", 15.0),
         // The weighted-target plane of a route, which AWS publishes as fixed.
-        appmesh_plane("L-AE1D9567", "Weighted targets per route", 10.0).fixed(),
-        appmesh_plane("L-BB90B7FF", "Routes per virtual router", 50.0),
-        appmesh_plane("L-DA7495A7", "Virtual services per mesh", 200.0),
-        appmesh_plane("L-E043DFB4", "Virtual nodes per mesh", 200.0),
-        appmesh_plane("L-F6F26D09", "Gateway routes per virtual gateway", 10.0),
+        appmesh_plane(
+            "L-AE1D9567",
+            "Weighted targets per route",
+            "weighted targets per route",
+            10.0,
+        )
+        .fixed(),
+        appmesh_plane(
+            "L-BB90B7FF",
+            "Routes per virtual router",
+            "routes per virtual router",
+            50.0,
+        ),
+        appmesh_plane(
+            "L-DA7495A7",
+            "Virtual services per mesh",
+            "virtual services per mesh",
+            200.0,
+        ),
+        appmesh_plane(
+            "L-E043DFB4",
+            "Virtual nodes per mesh",
+            "virtual nodes per mesh",
+            200.0,
+        ),
+        appmesh_plane(
+            "L-F6F26D09",
+            "Gateway routes per virtual gateway",
+            "gateway routes per virtual gateway",
+            10.0,
+        ),
     ]
+}
+
+/// One AWS App Runner RESOURCE plane: the resources of one type an account may create.
+///
+/// App Runner names a row of this class for the resource type itself and publishes its
+/// sentence in one form — the maximum number of them you may CREATE in this account in the
+/// current Region — so one constructor fills the name and the sentence and two rows of the
+/// class cannot drift apart. A CONFIGURATION one service may share with another closes
+/// that sentence with the clause naming what is reused (`reused_as`), which is the only
+/// way the rows of this class differ in text.
+///
+/// SOURCE: the recorded default-quota listing of `apprunner`, which publishes the
+/// observability-configuration plane with exactly that sentence around that row's own
+/// counted phrase, followed by that clause.
+fn apprunner_plane(
+    code: &str,
+    plane: &str,
+    counted: &str,
+    limit: f64,
+    reused_as: Option<&str>,
+) -> QuotaRow {
+    let reusable = match reused_as {
+        Some(configuration) => {
+            format!(" You can use a single {configuration} in multiple services.")
+        }
+        None => String::new(),
+    };
+    quota(plane, limit).code(code).describe(&format!(
+        "The maximum number of {counted} that you can create in this account in the \
+         current Region.{reusable}"
+    ))
 }
 
 /// AWS App Runner's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `apprunner` service code (the
 /// "App Runner service quotas" table of the AWS App Runner Developer Guide), whose
-/// quota names are the resource names themselves.
-///
-/// App Runner publishes a sentence for every row, and the sentence of a row of this
-/// service is one nothing available here states: neither the counted-plane form nor the
-/// create-in-this-account form nor the quota's own phrase, each of which the recorded
-/// listing of this code reports as divergent. So a row carries none rather than a sentence
-/// worded here.
+/// quota names are the resource names themselves, and the recorded default-quota listing
+/// of that code for the sentence every row publishes ([`apprunner_plane`]) and for the
+/// per-service voice of the VPC-ingress-connection row, which is published for a SINGLE
+/// service rather than for the account.
 pub(super) fn apprunner_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Connections", 10.0).code("L-1BDBAAB6"),
-        quota("Auto scaling configurations", 10.0).code("L-1D8C5BDD"),
-        // AWS publishes the ingress connection allowance per VPC as fixed.
+        apprunner_plane(
+            "L-1BDBAAB6",
+            "Connections",
+            "connections",
+            10.0,
+            Some("connection"),
+        ),
+        apprunner_plane(
+            "L-1D8C5BDD",
+            "Auto scaling configurations",
+            "auto scaling configurations",
+            10.0,
+            Some("auto scaling configuration"),
+        ),
+        // AWS publishes the ingress connection allowance per VPC as fixed, and publishes
+        // its sentence for a SINGLE service rather than for the account.
         quota("VPC ingress connections", 1.0)
             .code("L-4064914D")
-            .fixed(),
-        quota("Services", 30.0).code("L-69F96A0C"),
-        quota("Observability configurations", 10.0).code("L-A0B46A0C"),
-        quota("VPC connectors", 10.0).code("L-F7ADEB8C"),
+            .fixed()
+            .describe(
+                "The maximum number of VPC Ingress Connections that you can create for a \
+                 single Service.",
+            ),
+        apprunner_plane("L-69F96A0C", "Services", "services", 30.0, None),
+        apprunner_plane(
+            "L-A0B46A0C",
+            "Observability configurations",
+            "observability configurations",
+            10.0,
+            Some("observability configuration"),
+        ),
+        apprunner_plane(
+            "L-F7ADEB8C",
+            "VPC connectors",
+            "VPC connectors",
+            10.0,
+            Some("VPC connector"),
+        ),
     ]
 }
 
@@ -483,6 +666,16 @@ const ATHENA_USAGE_SERVICE: &str = "Athena";
 /// REPLENISHMENT RATE of the token bucket those calls are served from (a per-second
 /// rate, metered by the API's `AWS/Usage` `CallCount` metric) and the BURST
 /// MULTIPLIER on it, which AWS publishes as not adjustable.
+///
+/// The burst row's `Description` is the sentence Athena publishes for that class, which
+/// states the multiplier's arithmetic against the rate quota and then what the burst is,
+/// with the row's OWN API named in each of its three places — so one constructor fills it
+/// and no row of the class carries another API's sentence. The replenishment row's
+/// published sentence is one nothing available here states, so it carries none rather than
+/// one worded here.
+///
+/// SOURCE: the recorded default-quota listing of `athena`, which publishes the burst
+/// multiplier of its `ListQueryExecutions` calls with exactly that sentence.
 fn athena_api_call_rate(
     replenishment_code: &str,
     rate: f64,
@@ -497,23 +690,40 @@ fn athena_api_call_rate(
             .metric(call_count_metric(ATHENA_USAGE_SERVICE, api_name)),
         quota(format!("Burst multiplier quota for {api_name} API"), burst)
             .code(burst_code)
-            .fixed(),
+            .fixed()
+            .describe(&format!(
+                "Multiplier factor to scale burst capacity for {api_name} API based on \
+                 the rate quota (Burst = Rate * BurstMultiplierQuota). {api_name} Burst \
+                 is the maximum number of {api_name} API tokens you can accumulate in \
+                 the account in the region"
+            )),
     ]
 }
 
 /// Amazon Athena's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `athena` service code (the
-/// "Service Quotas" page of the Amazon Athena User Guide): the query and workgroup
-/// quotas, plus the API call-rate pair every throttled Athena API publishes.
+/// "Service Quotas" page of the Amazon Athena User Guide): the query quotas, plus the API
+/// call-rate pair every throttled Athena API publishes.
 ///
 /// The recorded default-quota listing of that code states, for the rows it names: the
 /// burst multiplier on `CreateNamedQuery` calls is the row published under `L-7A12A1E6`
-/// and its multiplier is four; the active-DDL-query plane is published over a ONE-SECOND
-/// window and metered by the DDL class of the service's active-query count; the query
-/// timeouts and the workgroup and active-DML-query planes are published as NOT adjustable;
-/// and two of the API pairs are published the other way round from the class default — the
-/// replenishment rate NOT adjustable, or the burst multiplier beside it adjustable.
+/// and its multiplier is four; the burst multiplier on `GetQueryResults` calls is the row
+/// published under `L-3702C1C1` and its multiplier is five; the active-DDL-query plane is
+/// published over a ONE-SECOND window and metered by the DDL class of the service's
+/// active-query count, SUMMED over that window; the query timeouts and the active-DML-query
+/// plane are published as NOT adjustable; and two of the API pairs are published the other
+/// way round from the class default — the replenishment rate NOT adjustable, or the burst
+/// multiplier beside it adjustable.
+///
+/// The WORKGROUP plane is published here under no row at all. The code it had carried is
+/// the GetQueryResults burst multiplier's, as that listing states, and every other code of
+/// this catalog that listing reports a different quota's name for it also reports a window
+/// and a usage metric for — which a workgroup count has neither of. So the code AWS
+/// publishes that plane under is one nothing available here states, and the catalog serves
+/// no row for it rather than publishing it under another quota's code, where a client
+/// resolving that code would read the workgroup count in place of the quota AWS publishes
+/// there.
 pub(super) fn athena_quotas() -> Vec<QuotaRow> {
     let mut quotas = vec![
         quota("Active DML queries", 20.0).code("L-56A94400").fixed(),
@@ -525,22 +735,27 @@ pub(super) fn athena_quotas() -> Vec<QuotaRow> {
             .code("L-136E993A")
             .unit("Minutes")
             .fixed(),
-        quota("Workgroups per Region", 1000.0)
-            .code("L-3702C1C1")
-            .fixed(),
         // The active-DDL-query plane: a count published over a one-second window and
-        // metered by the DDL class of the service's active-query count.
+        // metered by the DDL class of the service's active-query count, which the
+        // recorded listing publishes as the SUM over that window rather than as the
+        // largest count seen in it.
         quota("Active DDL queries", 20.0)
             .code("L-3CE0BBA0")
             .period(1, "SECOND")
-            .metric(usage_metric(
+            .metric(aws_usage_metric(
+                "ResourceCount",
+                "Sum",
                 ATHENA_USAGE_SERVICE,
                 &[
                     ("Class", "DDL"),
                     ("Resource", "ActiveQueryCount"),
                     ("Type", "Resource"),
                 ],
-            )),
+            ))
+            .describe(
+                "The number of active DDL queries. DDL queries include CREATE TABLE and \
+                 ALTER TABLE ADD PARTITION queries.",
+            ),
         quota("Prepared statements per workgroup", 1000.0).code("L-41075247"),
         quota("Data catalogs per Region", 1000.0).code("L-4FF11DD3"),
         quota("Named queries per workgroup", 1000.0).code("L-52EFA794"),
@@ -549,7 +764,9 @@ pub(super) fn athena_quotas() -> Vec<QuotaRow> {
         athena_api_call_rate("L-076245C0", 5.0, "L-7A12A1E6", 4.0, "CreateNamedQuery"),
         athena_api_call_rate("L-70FD91F7", 5.0, "L-722F8D5C", 2.0, "GetNamedQuery"),
         athena_api_call_rate("L-76AFE6F2", 5.0, "L-5A8D5237", 2.0, "DeleteNamedQuery"),
-        athena_api_call_rate("L-07F4444F", 100.0, "L-B13EED8E", 2.0, "GetQueryResults"),
+        // The one API pair whose burst multiplier the recorded listing publishes above
+        // the class's two, under `L-3702C1C1`.
+        athena_api_call_rate("L-07F4444F", 100.0, "L-3702C1C1", 5.0, "GetQueryResults"),
         athena_api_call_rate("L-D0D8C912", 5.0, "L-D8C0E3AF", 2.0, "ListNamedQueries"),
         athena_api_call_rate("L-E20AD6B8", 20.0, "L-FE3693EE", 2.0, "ListQueryExecutions"),
         athena_api_call_rate("L-FC5F6546", 20.0, "L-FD9D80C2", 2.0, "StopQueryExecution"),
@@ -604,7 +821,11 @@ pub(super) fn autoscaling_quotas() -> Vec<QuotaRow> {
             .describe(&maximum_number_phrase(
                 "lifecycle hooks per Auto Scaling group",
             )),
-        quota("Launch configurations per region", 200.0).code("L-6B80B8FA"),
+        quota("Launch configurations per region", 200.0)
+            .code("L-6B80B8FA")
+            .describe(&maximum_number_phrase(
+                "launch configurations allowed for your AWS account",
+            )),
         quota("Step adjustments per step scaling policy", 20.0)
             .code("L-6C2A2F6E")
             .fixed()
@@ -626,6 +847,9 @@ pub(super) fn autoscaling_quotas() -> Vec<QuotaRow> {
                     ("Resource", "NumberOfAutoScalingGroup"),
                     ("Type", "Resource"),
                 ],
+            ))
+            .describe(&maximum_number_phrase(
+                "Auto Scaling groups allowed for your AWS account",
             )),
         quota("SNS topics per Auto Scaling group", 10.0)
             .code("L-CEE5E714")
@@ -650,12 +874,19 @@ pub(super) fn autoscaling_quotas() -> Vec<QuotaRow> {
 
 /// One AWS Backup plane.
 ///
-/// Backup publishes a sentence for every row, and the sentence of a row of this service is
-/// one nothing available here states: not the counted-plane form and not the quota's own
-/// phrase, both of which the recorded listing of this code reports as divergent. So a row
-/// carries none rather than a sentence worded here, and the plane is stated once.
-fn backup_plane(code: &str, plane: &str, limit: f64) -> QuotaRow {
-    quota(plane, limit).code(code)
+/// Backup publishes a sentence for every row, and across this service the sentence is one
+/// form — `Number of <the plane the row counts>` — so one constructor fills the name and
+/// the sentence from the plane and two rows of the class cannot drift apart. The counted
+/// phrase is passed beside the name because Backup publishes it in the sentence in a voice
+/// of its own, lower case where the name starts a title.
+///
+/// SOURCE: the recorded default-quota listing of `backup`, which publishes the
+/// report-plan framework plane and the per-vault recovery-point plane with exactly that
+/// sentence around each row's own counted phrase.
+fn backup_plane(code: &str, plane: &str, counted: &str, limit: f64) -> QuotaRow {
+    quota(plane, limit)
+        .code(code)
+        .describe(&format!("Number of {counted}"))
 }
 
 /// AWS Backup's published default-quota catalog.
@@ -664,29 +895,100 @@ fn backup_plane(code: &str, plane: &str, limit: f64) -> QuotaRow {
 /// "AWS Backup quotas" table of the AWS Backup Developer Guide), whose per-Region
 /// quotas are published in the "… per Region per account" form the rows below carry.
 ///
-/// The recorded default-quota listing of that code states which plane three of those codes
-/// publish — `L-C0A8C14B` the backup nest level, `L-FB1D55EC` the per-backup metadata tags
-/// (as NOT adjustable) and `L-9122A82F` the versions of a backup plan. The plane the
+/// The recorded default-quota listing of that code states which plane five of those codes
+/// publish — `L-C0A8C14B` the backup nest level (with the sentence it publishes for a
+/// DEPTH rather than for a count), `L-FB1D55EC` the per-backup metadata tags (as NOT
+/// adjustable), `L-9122A82F` the versions of a backup plan, `L-366B61FD` the concurrent
+/// backup jobs of ONE resource and `L-B4021FB0` the framework controls of the account —
+/// and that the plane published under `L-FFD6444F` is NOT adjustable. The plane the
 /// remaining codes publish is not stated there, so those rows keep the plane they have
 /// carried.
 pub(super) fn backup_quotas() -> Vec<QuotaRow> {
     vec![
-        // The rule plane of a backup plan, which AWS publishes as fixed.
-        backup_plane("L-366B61FD", "Rules per backup plan", 10.0).fixed(),
-        backup_plane("L-514878B6", "Recovery points per backup vault", 1_000_000.0),
-        backup_plane("L-7705D2CB", "Controls per framework", 50.0),
-        backup_plane("L-9122A82F", "Versions per backup plan", 2000.0),
+        // The backup jobs that may run at once against ONE resource, which the recorded
+        // listing publishes under this code at its published default and as fixed.
+        backup_plane(
+            "L-366B61FD",
+            "Concurrent backup jobs per resource",
+            "concurrent backup jobs per resource",
+            1.0,
+        )
+        .fixed(),
+        backup_plane(
+            "L-514878B6",
+            "Recovery points per backup vault",
+            "recovery points per backup vault",
+            1_000_000.0,
+        ),
+        backup_plane(
+            "L-7705D2CB",
+            "Controls per framework",
+            "controls per framework",
+            50.0,
+        ),
+        backup_plane(
+            "L-9122A82F",
+            "Versions per backup plan",
+            "versions per backup plan",
+            2000.0,
+        ),
         // AWS publishes the framework allowance of a report plan as fixed.
-        backup_plane("L-9CAF0B92", "Frameworks per report plan", 1000.0).fixed(),
-        backup_plane("L-B4021FB0", "Backup vaults per Region per account", 100.0),
-        backup_plane("L-BD69F607", "Backup plans per Region per account", 300.0),
-        // The nest level of a backup: a DEPTH rather than a count of something.
-        backup_plane("L-C0A8C14B", "Maximum backup nest level", 10.0),
-        backup_plane("L-C296F1F5", "Report plans per Region per account", 20.0),
-        backup_plane("L-E43E0ED6", "Frameworks per Region per account", 10.0),
+        backup_plane(
+            "L-9CAF0B92",
+            "Frameworks per report plan",
+            "frameworks per report plan",
+            1000.0,
+        )
+        .fixed(),
+        // The framework controls of the account, which the recorded listing publishes
+        // under this code at its published default.
+        backup_plane(
+            "L-B4021FB0",
+            "Framework controls per Region per account",
+            "framework controls per Region per account",
+            50.0,
+        ),
+        backup_plane(
+            "L-BD69F607",
+            "Backup plans per Region per account",
+            "backup plans per Region per account",
+            300.0,
+        ),
+        // The nest level of a backup: a DEPTH rather than a count of something, which is
+        // why the recorded listing publishes its sentence neither in this service's
+        // `Number of …` voice nor with the counted form's leading article.
+        quota("Maximum backup nest level", 10.0)
+            .code("L-C0A8C14B")
+            .describe("Maximum number of nested levels allowed for backups"),
+        backup_plane(
+            "L-C296F1F5",
+            "Report plans per Region per account",
+            "report plans per Region per account",
+            20.0,
+        ),
+        backup_plane(
+            "L-E43E0ED6",
+            "Frameworks per Region per account",
+            "frameworks per Region per account",
+            10.0,
+        ),
         // The metadata tags of one backup, which AWS publishes as fixed.
-        backup_plane("L-FB1D55EC", "Metadata tags per backup", 50.0).fixed(),
-        backup_plane("L-FFD6444F", "Tags per backup plan", 50.0),
+        backup_plane(
+            "L-FB1D55EC",
+            "Metadata tags per backup",
+            "metadata tags per backup",
+            50.0,
+        )
+        .fixed(),
+        // The plane published under this code, which the recorded listing publishes as
+        // NOT adjustable.
+        backup_plane(
+            "L-FFD6444F",
+            "Tags per backup plan",
+            "tags per backup plan",
+            50.0,
+        )
+        .fixed(),
     ]
 }
 

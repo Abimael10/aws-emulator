@@ -188,7 +188,6 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("athena", "L-9D86AA19"),
     ("athena", "L-A6257554"),
     ("athena", "L-AC64E3A0"),
-    ("athena", "L-B13EED8E"),
     ("athena", "L-C60BEAE0"),
     ("athena", "L-CC64F7CE"),
     ("athena", "L-D0D8C912"),

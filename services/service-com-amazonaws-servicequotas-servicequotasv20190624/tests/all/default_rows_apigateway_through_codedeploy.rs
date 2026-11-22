@@ -145,7 +145,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 1.0,
         unit: "None",
         adjustable: false,
-        description: Some("The maximum number of Custom Domain Names per Portal"),
+        description: Some("The maximum number of custom domain names per portal"),
         period: None,
         metric: None,
     },
@@ -158,7 +158,10 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 10_000.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of API keys that you can create in this account in the \
+             current region",
+        ),
         period: None,
         metric: None,
     },
@@ -206,7 +209,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 200.0,
         unit: "Kilobytes",
         adjustable: false,
-        description: None,
+        description: Some("The maximum size of a logo"),
         period: None,
         metric: None,
     },
@@ -242,13 +245,19 @@ const PUBLISHED_ROWS: &[Published] = &[
     Published {
         service_code: "appconfig",
         quota_code: "L-FA210A1F",
-        quota_name: "Maximum number of applications",
+        quota_name: "Maximum number of configuration profiles per application",
         value: 100.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "A configuration profile contains metadata about a particular set of \
+             configuration data used by your application. To reduce the number of \
+             configuration profiles required per application, split configuration \
+             profiles across multiple applications. Limit increase requests will be \
+             automatically approved for values less than or equal to 500.",
+        ),
         period: Some((1, "HOUR")),
-        metric: Some(resource_count("AWS AppConfig", "Application")),
+        metric: Some(resource_count("AWS AppConfig", "ConfigurationProfile")),
     },
     Published {
         service_code: "appconfig",
@@ -270,7 +279,11 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 1500.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of scalable targets that you can register for the \
+             Cassandra namespace in this account in the current Region. A scalable \
+             target identifies the resource that Application Auto Scaling can scale.",
+        ),
         period: None,
         metric: None,
     },
@@ -281,7 +294,11 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of scalable targets that you can register for the \
+             AppStream namespace in this account in the current Region. A scalable \
+             target identifies the resource that Application Auto Scaling can scale.",
+        ),
         period: None,
         metric: None,
     },
@@ -292,7 +309,12 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of scalable targets that you can register for the \
+             Elastic MapReduce (EMR) namespace in this account in the current Region. A \
+             scalable target identifies the resource that Application Auto Scaling can \
+             scale.",
+        ),
         period: None,
         metric: None,
     },
@@ -303,7 +325,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 200.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some("The maximum number of scheduled actions per scalable target."),
         period: None,
         metric: None,
     },
@@ -315,7 +337,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 10.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some("Number of weighted targets per route"),
         period: None,
         metric: None,
     },
@@ -326,7 +348,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 3.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some("Number of virtual gateways per mesh"),
         period: None,
         metric: None,
     },
@@ -338,7 +360,10 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 30.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of services that you can create in this account in the \
+             current Region.",
+        ),
         period: None,
         metric: None,
     },
@@ -349,7 +374,10 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 1.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of VPC Ingress Connections that you can create for a \
+             single Service.",
+        ),
         period: None,
         metric: None,
     },
@@ -363,7 +391,12 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 4.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "Multiplier factor to scale burst capacity for CreateNamedQuery API based on \
+             the rate quota (Burst = Rate * BurstMultiplierQuota). CreateNamedQuery \
+             Burst is the maximum number of CreateNamedQuery API tokens you can \
+             accumulate in the account in the region",
+        ),
         period: None,
         metric: None,
     },
@@ -374,11 +407,14 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 20.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The number of active DDL queries. DDL queries include CREATE TABLE and \
+             ALTER TABLE ADD PARTITION queries.",
+        ),
         period: Some((1, "SECOND")),
         metric: Some(Metric {
             metric_name: "ResourceCount",
-            statistic: "Maximum",
+            statistic: "Sum",
             usage_service: "Athena",
             class: "DDL",
             resource: "ActiveQueryCount",
@@ -410,11 +446,16 @@ const PUBLISHED_ROWS: &[Published] = &[
     Published {
         service_code: "athena",
         quota_code: "L-3702C1C1",
-        quota_name: "Workgroups per Region",
-        value: 1000.0,
+        quota_name: "Burst multiplier quota for GetQueryResults API",
+        value: 5.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "Multiplier factor to scale burst capacity for GetQueryResults API based on \
+             the rate quota (Burst = Rate * BurstMultiplierQuota). GetQueryResults Burst \
+             is the maximum number of GetQueryResults API tokens you can accumulate in \
+             the account in the region",
+        ),
         period: None,
         metric: None,
     },
@@ -451,7 +492,9 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 500.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of Auto Scaling groups allowed for your AWS account",
+        ),
         period: Some((5, "MINUTE")),
         metric: Some(resource_count("AutoScaling", "NumberOfAutoScalingGroup")),
     },
@@ -464,7 +507,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 10.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some("Maximum number of nested levels allowed for backups"),
         period: None,
         metric: None,
     },
@@ -475,7 +518,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 50.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some("Number of metadata tags per backup"),
         period: None,
         metric: None,
     },
@@ -486,7 +529,7 @@ const PUBLISHED_ROWS: &[Published] = &[
         value: 2000.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some("Number of versions per backup plan"),
         period: None,
         metric: None,
     },

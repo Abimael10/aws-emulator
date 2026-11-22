@@ -86,7 +86,7 @@ const SERVICES: &[ServiceRow] = &[
         published_quotas: 8,
         spot_checks: &[Published {
             quota_code: "L-EEB0151E",
-            quota_name: "Maximum number of environments per application",
+            quota_name: "Maximum number of applications",
             value: 100.0,
             unit: "None",
             adjustable: true,
@@ -140,7 +140,7 @@ const SERVICES: &[ServiceRow] = &[
     ServiceRow {
         service_code: "athena",
         service_name: "Amazon Athena",
-        published_quotas: 30,
+        published_quotas: 29,
         spot_checks: &[
             // The replenishment rate of one API's calls, and the burst multiplier on
             // it, which AWS publishes as fixed.
