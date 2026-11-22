@@ -65,7 +65,7 @@ const VALIDATION_ERROR: &str = "ValidationError";
 ///
 /// GENERATED here (`rcgen`), so a trust store below is built from a real CA bundle and every
 /// revocation list is one that CA really signed — what a caller stages in Amazon S3.
-fn authority() -> (rcgen::Certificate, rcgen::KeyPair) {
+pub(crate) fn authority() -> (rcgen::Certificate, rcgen::KeyPair) {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let mut params =
         rcgen::CertificateParams::new(vec!["ca.example.com".to_string()]).expect("parameters");
@@ -76,7 +76,11 @@ fn authority() -> (rcgen::Certificate, rcgen::KeyPair) {
 
 /// A revocation list revoking `revoked` certificates, signed by the authority `certificate`
 /// and `key`, PEM encoded as a caller stages one.
-fn crl_pem(certificate: &rcgen::Certificate, key: &rcgen::KeyPair, revoked: usize) -> String {
+pub(crate) fn crl_pem(
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    revoked: usize,
+) -> String {
     let params = rcgen::CertificateRevocationListParams {
         this_update: rcgen::date_time_ymd(2026, 1, 1),
         next_update: rcgen::date_time_ymd(2026, 2, 1),
@@ -104,7 +108,11 @@ fn crl_pem(certificate: &rcgen::Certificate, key: &rcgen::KeyPair, revoked: usiz
 // ---------------------------------------------------------------------------
 
 /// A trust store built from `authority`'s own certificate, staged under `name`, and its ARN.
-async fn trust_store(emulator: &Emulator, name: &str, certificate: &rcgen::Certificate) -> String {
+pub(crate) async fn trust_store(
+    emulator: &Emulator,
+    name: &str,
+    certificate: &rcgen::Certificate,
+) -> String {
     let key = format!("{name}-bundle.pem");
     emulator.stage(&key, &certificate.pem()).await;
     let mut form = action("CreateTrustStore");
@@ -122,7 +130,7 @@ async fn trust_store(emulator: &Emulator, name: &str, certificate: &rcgen::Certi
 }
 
 /// `AddTrustStoreRevocations` for the object `bucket`/`key`, with the extra fields `extra`.
-async fn add_revocation(
+pub(crate) async fn add_revocation(
     emulator: &Emulator,
     trust_store_arn: &str,
     bucket: &str,
@@ -138,7 +146,7 @@ async fn add_revocation(
 }
 
 /// `DescribeTrustStoreRevocations` for `trust_store_arn`, with the extra fields `fields`.
-async fn describe_revocations(
+pub(crate) async fn describe_revocations(
     emulator: &Emulator,
     trust_store_arn: &str,
     fields: &[(String, String)],
@@ -149,6 +157,71 @@ async fn describe_revocations(
     call(&emulator.router, &form).await
 }
 
+/// The revocation ids a request names, as the `RevocationIds.member.N` form fields a client
+/// submits them in — the one member both the removal and the read select by.
+///
+/// `pub(crate)`: the read suite beside this one (`crate::trust_store_revocation_reads`)
+/// selects by the same member, so there is ONE spelling of it.
+pub(crate) fn revocation_id_fields(revocation_ids: &[i64]) -> Vec<(String, String)> {
+    revocation_ids
+        .iter()
+        .enumerate()
+        .map(|(index, revocation_id)| {
+            p(
+                &format!("RevocationIds.member.{}", index + 1),
+                &revocation_id.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Walk every revocation file a read reports for `fields`, a page of at most `page_size` at
+/// a time and following each `NextMarker` the way a paginating client does, answering the
+/// revocation ids in the order they were walked. `expected` bounds how many pages the walk
+/// may take, so a walk that never ends fails the case instead of looping.
+///
+/// `pub(crate)`: the read suite beside this one walks a NARROWED selection the same way, so
+/// there is ONE walk rather than two that could drift on how a page is asked for or on when
+/// the walk is over.
+pub(crate) async fn walk_revocations(
+    emulator: &Emulator,
+    trust_store_arn: &str,
+    fields: &[(String, String)],
+    page_size: usize,
+    expected: usize,
+) -> Vec<i64> {
+    let mut walked: Vec<i64> = Vec::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..expected + 2 {
+        let mut page_fields = fields.to_vec();
+        page_fields.push(p("PageSize", &page_size.to_string()));
+        if let Some(marker) = marker.as_deref() {
+            page_fields.push(p("Marker", marker));
+        }
+        let page = describe_revocations(emulator, trust_store_arn, &page_fields).await;
+        assert_eq!(
+            page.status, 200,
+            "case PageSize {page_size}: expected 200 for a page, got {} body {}",
+            page.status, page.body
+        );
+        let reported = reported_revocations(&page);
+        assert!(
+            reported.len() <= page_size,
+            "case PageSize {page_size}: a page holds at most {page_size}, got {reported:?}"
+        );
+        walked.extend(reported.iter().map(|entry| entry.0));
+        marker = page.text("NextMarker");
+        if marker.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        marker, None,
+        "case PageSize {page_size}: the walk must end with no marker"
+    );
+    walked
+}
+
 /// `RemoveTrustStoreRevocations` for `revocation_ids` of `trust_store_arn`.
 async fn remove_revocations(
     emulator: &Emulator,
@@ -157,12 +230,7 @@ async fn remove_revocations(
 ) -> Reply {
     let mut form = action("RemoveTrustStoreRevocations");
     form.push(p("TrustStoreArn", trust_store_arn));
-    for (index, revocation_id) in revocation_ids.iter().enumerate() {
-        form.push(p(
-            &format!("RevocationIds.member.{}", index + 1),
-            &revocation_id.to_string(),
-        ));
-    }
+    form.extend_from_slice(&revocation_id_fields(revocation_ids));
     call(&emulator.router, &form).await
 }
 
@@ -215,7 +283,7 @@ fn message(reply: &Reply) -> String {
 
 /// The revocation files a describe reported, as `(RevocationId, RevocationType,
 /// NumberOfRevokedEntries, TrustStoreArn)`, in the order it reported them.
-fn reported_revocations(reply: &Reply) -> Vec<(i64, String, i64, String)> {
+pub(crate) fn reported_revocations(reply: &Reply) -> Vec<(i64, String, i64, String)> {
     members(&reply.body, "TrustStoreRevocations")
         .iter()
         .map(|entry| {
@@ -234,7 +302,7 @@ fn reported_revocations(reply: &Reply) -> Vec<(i64, String, i64, String)> {
 }
 
 /// What the trust store itself reports as the number of revoked certificates in it.
-async fn total_revoked_entries(emulator: &Emulator, trust_store_arn: &str) -> i64 {
+pub(crate) async fn total_revoked_entries(emulator: &Emulator, trust_store_arn: &str) -> i64 {
     let described = describe_trust_store(emulator, trust_store_arn).await;
     first_text(&described.body, "TotalRevokedEntries")
         .and_then(|total| total.parse::<i64>().ok())
@@ -942,29 +1010,7 @@ async fn a_paged_describe_walks_every_revocation_file_once() {
     }
 
     for page_size in 1..=held + 1 {
-        let mut walked: Vec<i64> = Vec::new();
-        let mut marker: Option<String> = None;
-        for _ in 0..held + 2 {
-            let mut fields = vec![p("PageSize", &page_size.to_string())];
-            if let Some(marker) = marker.as_deref() {
-                fields.push(p("Marker", marker));
-            }
-            let page = describe_revocations(&emulator, &arn, &fields).await;
-            let reported = reported_revocations(&page);
-            assert!(
-                reported.len() <= page_size,
-                "case PageSize {page_size}: a page holds at most {page_size}, got {reported:?}"
-            );
-            walked.extend(reported.iter().map(|entry| entry.0));
-            marker = page.text("NextMarker");
-            if marker.is_none() {
-                break;
-            }
-        }
-        assert_eq!(
-            marker, None,
-            "case PageSize {page_size}: the walk must end with no marker"
-        );
+        let walked = walk_revocations(&emulator, &arn, &[], page_size, held).await;
         assert_eq!(
             walked,
             (1..=held as i64).collect::<Vec<i64>>(),
