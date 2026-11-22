@@ -893,6 +893,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     REDSHIFT_SNAPSHOT_COPY_GRANT,
     // Amazon Rekognition
     "AWS::Rekognition::Collection",
+    crate::state::provisioner::rekognition_resources::REKOGNITION_DATASET,
     "AWS::Rekognition::Project",
     "AWS::Rekognition::StreamProcessor",
     // AWS Resource Groups

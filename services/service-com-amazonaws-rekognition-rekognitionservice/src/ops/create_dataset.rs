@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new Amazon Rekognition Custom Labels dataset on the project it belongs to and
+//! answers with the ARN it minted for it. The stored record is the only thing
+//! `DescribeDataset` and the owning project's `DescribeProjects` read, so nothing here is
+//! answered without being persisted first.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -190,18 +189,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"))
+        // The half of the project's data this dataset is. The model declares `DatasetType` as
+        // an enum, and this service answers a value outside it with the parameter error this
+        // operation declares rather than recording a third kind of dataset.
+        if !crate::state::datasets::DATASET_TYPES.contains(&input.dataset_type.as_str()) {
+            return Err(CreateDatasetErrorModeled::InvalidParameterException(
+                crate::state::modeled_error::invalid_parameters(),
+            )
+            .into());
+        }
+
+        // WHAT the dataset will hold, read off the source the request names — the object store
+        // read first, with no lock held, since it is a call out of this handler.
+        let manifest = match input.dataset_source.as_ref() {
+            None => None,
+            Some(source) => {
+                crate::state::dataset_source::locate_manifest(ctx, source)
+                    .await
+                    .map_err(dataset_source_refusal)?
+            }
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDatasetErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A project whose deletion the clock has completed is one this account no longer has,
+        // so its record goes before the request's `ProjectArn` is resolved: a dataset cannot
+        // be created in a project that is gone.
+        let creation_timestamp = ::std::time::SystemTime::now();
+        state.forget_deleted_projects(creation_timestamp);
+        state.forget_deleted_datasets(creation_timestamp);
+
+        // A dataset copied from another is the one case that reads a SECOND dataset, and it
+        // reads the contents that dataset really holds. Resolved before the destination
+        // project is taken mutably, since both live in the same store.
+        let copied = match input
+            .dataset_source
+            .as_ref()
+            .and_then(|source| source.dataset_arn.as_deref())
+        {
+            None => None,
+            Some(dataset_arn) => Some(
+                state
+                    .dataset_by_arn(dataset_arn)
+                    .map(|(_, dataset)| dataset.contents.clone())
+                    .ok_or_else(|| {
+                        CreateDatasetErrorModeled::ResourceNotFoundException(
+                            crate::state::modeled_error::dataset_arn_not_found(dataset_arn),
+                        )
+                    })?,
+            ),
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let project = state
+            .project_by_arn_mut(&input.project_arn)
+            .ok_or_else(|| {
+                CreateDatasetErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::project_arn_not_found(&input.project_arn),
+                )
+            })?;
+
+        // A project has at most one training and one test dataset, so a create of a half it
+        // already holds is a collision rather than a second dataset: it must not replace the
+        // dataset that holds the type, nor mint a second ARN for it.
+        if project.datasets.contains_key(&input.dataset_type) {
+            return Err(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
+                crate::state::modeled_error::dataset_type_already_exists(
+                    &input.dataset_type,
+                    &project.name,
+                ),
+            )
+            .into());
+        }
+
+        // What the dataset holds: the entries of the manifest that was read, the contents of
+        // the dataset being copied, or nothing at all for a create that named no source.
+        let contents = match (manifest.as_ref(), copied) {
+            (Some(manifest), _) => crate::state::dataset_source::counted_manifest(manifest),
+            (None, Some(copied)) => copied,
+            (None, None) => crate::state::datasets::DatasetContents::default(),
+        };
+
+        let arn = crate::state::datasets::dataset_arn(
+            &region,
+            &project.name,
+            &input.dataset_type,
+            creation_timestamp,
+        );
+        let dataset = crate::state::datasets::Dataset::new(
+            input.dataset_type.clone(),
+            arn.clone(),
+            contents,
+            input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            creation_timestamp,
+        );
+        project.datasets.insert(input.dataset_type, dataset);
+
+        Ok(CreateDatasetOutput {
+            dataset_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled answer for a `DatasetSource` this service could not read: one answer per
+/// reason, which is what [`crate::state::dataset_source::UnreadableDatasetSource`] is for.
+fn dataset_source_refusal(
+    reason: crate::state::dataset_source::UnreadableDatasetSource,
+) -> CreateDatasetError {
+    use crate::state::dataset_source::UnreadableDatasetSource;
+    match reason {
+        UnreadableDatasetSource::InvalidSource => {
+            CreateDatasetErrorModeled::InvalidParameterException(
+                crate::state::modeled_error::invalid_parameters(),
+            )
+        }
+        UnreadableDatasetSource::UnreadableObject => {
+            CreateDatasetErrorModeled::InvalidS3ObjectException(
+                InvalidS3ObjectException::with_message(
+                    crate::state::image_source::UNREADABLE_OBJECT_MESSAGE,
+                ),
+            )
+        }
+    }
+    .into()
 }

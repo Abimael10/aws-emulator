@@ -844,6 +844,18 @@ impl Provisioner {
             Self::Ec2ClientVpnAuthorizationRule => {
                 describe_client_vpn_authorization_rule(ctx, region, resource).await
             }
+            // Rekognition's own reads of the three resources a stack declares in it: the
+            // collection by the id it was created under, the project out of the description it
+            // reports for that name, and the dataset by the ARN it minted.
+            Self::RekognitionCollection => {
+                describe_rekognition_collection(ctx, region, physical_resource_id).await
+            }
+            Self::RekognitionProject => {
+                describe_rekognition_project(ctx, region, physical_resource_id).await
+            }
+            Self::RekognitionDataset => {
+                describe_rekognition_dataset(ctx, region, physical_resource_id).await
+            }
         }
     }
 }

@@ -1514,6 +1514,27 @@ pub(super) enum Provisioner {
     /// returns. The authorize leaves it `authorizing`, granting nothing yet, so the
     /// resource's creation is held open until that service reports it `active`.
     Ec2ClientVpnAuthorizationRule,
+    /// `AWS::Rekognition::Collection`: the face collection Amazon Rekognition's own
+    /// `CreateCollection` makes under the `CollectionId` the template states and
+    /// `DeleteCollection` removes. That id is the resource's physical id — every call on a
+    /// collection takes it and the type's `Ref` returns it — and the ARN that service reports
+    /// for the collection is its one published attribute
+    /// ([`rekognition_resources`]).
+    RekognitionCollection,
+    /// `AWS::Rekognition::Project`: the Custom Labels project that service's own
+    /// `CreateProject` makes under the `ProjectName` the template states and `DeleteProject`
+    /// removes. The name is the physical id, while the `ProjectArn` that create answers with
+    /// carries a numeric segment Rekognition assigns, so the ARN the resource publishes is the
+    /// one it reported; the delete is asynchronous, so the resource's deletion is held open
+    /// until that service no longer reports the project.
+    RekognitionProject,
+    /// `AWS::Rekognition::Dataset`: the training or test dataset OF such a project, which that
+    /// service's own `CreateDataset` makes and `DeleteDataset` removes. A dataset declares no
+    /// name of its own: Rekognition MINTS the `DatasetArn` the type's `Ref` returns, so it is
+    /// the resource's physical id. Both of its lifecycle changes are asynchronous, so the
+    /// resource's creation and its deletion are each held open on that service's own report of
+    /// the dataset.
+    RekognitionDataset,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1794,6 +1815,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         )),
         EC2_CLIENT_VPN_ENDPOINT => Some(Provisioner::Ec2ClientVpnEndpoint),
         EC2_CLIENT_VPN_AUTHORIZATION_RULE => Some(Provisioner::Ec2ClientVpnAuthorizationRule),
+        REKOGNITION_COLLECTION => Some(Provisioner::RekognitionCollection),
+        REKOGNITION_PROJECT => Some(Provisioner::RekognitionProject),
+        REKOGNITION_DATASET => Some(Provisioner::RekognitionDataset),
         // The Amazon Bedrock AgentCore family's entries are catalogued beside that family's
         // own type names and arms ([`type_registry`]), so adding one of its types is a change
         // to that file alone; every other type answers `None` and is left declared-only.
@@ -2807,6 +2831,22 @@ impl Provisioner {
             // declaration asks for.
             Self::BackupGatewayHypervisor => {
                 create_backup_gateway_hypervisor(ctx, region, resource, propagated).await
+            }
+            // `AWS::Rekognition::Collection` publishes `Tags`, and `CreateCollection` takes a
+            // `TagMap` of its own, so a collection a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::RekognitionCollection => {
+                create_rekognition_collection(ctx, region, resource, propagated).await
+            }
+            // `AWS::Rekognition::Project` publishes no `Tags` property at all — Rekognition
+            // holds a project's tags through its own `TagResource` and the type declares only
+            // the project's name — so no tags are propagated to one.
+            Self::RekognitionProject => create_rekognition_project(ctx, region, resource).await,
+            // `AWS::Rekognition::Dataset` publishes `Tags`, which `CreateDataset` takes as a
+            // `TagMap` of its own, so a dataset a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::RekognitionDataset => {
+                create_rekognition_dataset(ctx, region, resource, propagated).await
             }
         }
     }
@@ -3950,6 +3990,20 @@ impl Provisioner {
             Self::MediaConvertCertificateAssociation => {
                 disassociate_mediaconvert_certificate(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the collection by the `CollectionId` it was created under,
+            // which is this resource's physical id.
+            Self::RekognitionCollection => {
+                delete_rekognition_collection(ctx, region, physical_resource_id).await
+            }
+            // The delete addresses the project by the `ProjectArn` Rekognition minted for it,
+            // which the resource publishes as its own `Arn` rather than as its physical id
+            // (that being the project's name).
+            Self::RekognitionProject => delete_rekognition_project(ctx, region, resource).await,
+            // The delete addresses the dataset by the `DatasetArn` Rekognition minted for it,
+            // which is this resource's physical id.
+            Self::RekognitionDataset => {
+                delete_rekognition_dataset(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -4322,6 +4376,14 @@ pub(in crate::state) use apigatewayv2_routing_rules::*;
 /// entries for them by those names.
 pub(in crate::state) mod client_vpn;
 use client_vpn::*;
+
+/// The Amazon Rekognition family — a face collection, a Custom Labels project and a dataset of
+/// one — whose arms are [`rekognition_resources`]'s. Visible to the rest of this service's
+/// state because all three types' own NAMES live there, beside the arms that provision them,
+/// and the catalogue of declarable types, the naming rules and the return-value catalogue key
+/// their entries for them by those names.
+pub(in crate::state) mod rekognition_resources;
+use rekognition_resources::*;
 
 /// What the owning service says about a resource's LIFECYCLE PROGRESS — whether a created
 /// resource has come up, what it publishes once it has, and whether a deleted one is gone —

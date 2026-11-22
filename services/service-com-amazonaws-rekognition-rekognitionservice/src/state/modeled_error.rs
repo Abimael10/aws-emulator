@@ -384,3 +384,53 @@ pub fn project_has_associated_versions(project_name: &str) -> ResourceInUseExcep
          the project {project_name} and try again."
     ))
 }
+
+/// A `DatasetArn` naming no dataset this account has, as the operations ON a dataset word it:
+/// the request's own ARN between two pieces of fixed text, naming the KIND of resource that is
+/// missing and what to check.
+///
+/// It is the `Message` a recorded AWS refusal of a read of a dataset that is already gone
+/// carries verbatim, which is why this path words the class its own way rather than with the
+/// sentence a project ARN that names nothing is refused with ([`project_arn_not_found`]) — the
+/// same split as the two wordings of a collection that does not exist above.
+///
+/// `ResourceNotFoundException` is the class the operations given a dataset by ARN declare for
+/// it — "the resource specified in the request cannot be found".
+pub fn dataset_arn_not_found(dataset_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(format!(
+        "The dataset {dataset_arn} doesn't exist. Check that the dataset exists."
+    ))
+}
+
+/// A `DatasetType` the named project already holds a dataset of: a project has at most one
+/// training and one test dataset, so a second create of the same half is a collision rather
+/// than a second dataset.
+///
+/// Worded the way this service words the same class for an identifier a create repeats ("The
+/// project name: … already exists", "The collection id: … already exists"), with the SCOPE the
+/// type is unique in named as well, since a dataset type identifies a dataset only within its
+/// project.
+pub fn dataset_type_already_exists(
+    dataset_type: &str,
+    project_name: &str,
+) -> ResourceAlreadyExistsException {
+    ResourceAlreadyExistsException::with_message(format!(
+        "The dataset type: {dataset_type} already exists for the project: {project_name}"
+    ))
+}
+
+/// The fixed text a dataset that is not in a state it can be deleted from is refused the
+/// DELETE of, with the status it really holds taken from the store.
+///
+/// The precondition is documented on the operation itself: "you can't delete a dataset while
+/// it is creating (`Status` = `CREATE_IN_PROGRESS`) or if the dataset is updating (`Status` =
+/// `UPDATE_IN_PROGRESS`)" (`smithy_query(query="doc",shape="DeleteDataset")`), and
+/// `ResourceInUseException` — "the specified resource is already being used" — is the class the
+/// operation declares for it. It is worded the way this service words the other refusal a
+/// caller has to wait out ([`project_has_associated_versions`]).
+pub fn dataset_is_not_ready_to_delete(status: &str) -> ResourceInUseException {
+    ResourceInUseException::with_message(format!(
+        "The dataset cannot be deleted while its status is {status}. Please try again once the \
+         dataset operation has completed."
+    ))
+}

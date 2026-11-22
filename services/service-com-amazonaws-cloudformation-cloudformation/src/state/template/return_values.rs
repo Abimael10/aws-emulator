@@ -740,6 +740,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
         // carries an id SNS mints per subscription, which no naming rule could compute.
         || resource_type == SNS_SUBSCRIPTION
+        // An Amazon Rekognition Custom Labels DATASET is one more: `CreateDataset` takes no
+        // identifier for the dataset — a declaration states the project it belongs to, which
+        // half of that project's data it is and the source its entries come from — and answers
+        // the `DatasetArn` that service minted, whose own pattern ends in a numeric segment
+        // Rekognition assigns (`project/…/dataset/(train|test)/[0-9]+`). That ARN is what the
+        // type's `Ref` returns and the one handle `DescribeDataset`, `UpdateDatasetEntries` and
+        // `DeleteDataset` each take. (An `AWS::Rekognition::Collection` is NOT one of them: its
+        // `CollectionId` is the id its own declaration states, and an
+        // `AWS::Rekognition::Project` is identified by the `ProjectName` it states.)
+        || resource_type == crate::state::provisioner::rekognition_resources::REKOGNITION_DATASET
         // The two Application Auto Scaling types are the same case from the other side: a
         // scalable target's physical id is the
         // `<ResourceId>|<ScalableDimension>|<ServiceNamespace>` composite that service

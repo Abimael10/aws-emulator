@@ -78,6 +78,8 @@
 //! graded score — see its own module docs.
 
 pub mod celebrity_catalogue;
+pub mod dataset_source;
+pub mod datasets;
 pub mod face_association;
 pub mod face_detection;
 pub mod idempotency;
@@ -464,6 +466,15 @@ pub struct Project {
     /// `ListProjectPolicies`' order, and therefore its pagination, is deterministic;
     /// bounded by [`project_policies::MAX_POLICIES_PER_PROJECT`].
     pub policies: BTreeMap<String, project_policies::ProjectPolicyRecord>,
+    /// The Custom Labels datasets this project holds, keyed by their `DatasetType` — the
+    /// project's identity for one, a project having at most one training and one test dataset
+    /// ([`datasets`]). A `BTreeMap` so the `Datasets` list a `ProjectDescription` carries is
+    /// in a deterministic order; bounded by [`datasets::MAX_DATASETS_PER_PROJECT`], which is
+    /// that same one-per-type rule.
+    ///
+    /// A project created now holds none: a dataset is recorded by `CreateDataset` and goes
+    /// when the project goes, being a child of the record that goes.
+    pub datasets: BTreeMap<String, datasets::Dataset>,
 }
 
 /// One model version of a project: the name it was created under and the ARN this service
@@ -516,6 +527,7 @@ impl Project {
             tags,
             versions: BTreeMap::new(),
             policies: BTreeMap::new(),
+            datasets: BTreeMap::new(),
         }
     }
 
@@ -552,20 +564,36 @@ impl Project {
         }
     }
 
-    /// This project as the modelled `ProjectDescription`.
+    /// This project as the modelled `ProjectDescription` at `now`.
     ///
-    /// `Datasets` is the project's training and test datasets, of which it has none
-    /// until `CreateDataset` records one, so the list is empty rather than absent: the
-    /// project HAS a dataset list and this is its content.
-    pub fn modeled(&self) -> ProjectDescription {
+    /// `Datasets` is the project's training and test datasets, each summarised as the
+    /// `DatasetMetadata` that list is modelled as — so a dataset `CreateDataset` recorded is
+    /// reported here under the status the clock owes it, and a project holding none reports an
+    /// empty list rather than an absent one: the project HAS a dataset list and this is its
+    /// content.
+    pub fn modeled_at(&self, now: SystemTime) -> ProjectDescription {
         ProjectDescription {
             project_arn: Some(self.arn.clone()),
             creation_timestamp: Some(::aws_smithy_types::DateTime::from(self.creation_timestamp)),
             status: Some(self.status().to_string()),
-            datasets: Some(Vec::new()),
+            datasets: Some(
+                self.datasets
+                    .values()
+                    .map(|dataset| dataset.summarised_at(now))
+                    .collect(),
+            ),
             feature: Some(self.feature.clone()),
             auto_update: self.auto_update.clone(),
         }
+    }
+
+    /// The dataset of this project whose ARN is `dataset_arn`, or `None` where it holds none
+    /// under it. A dataset is addressed by ARN alone by every operation on one, so the lookup
+    /// is over the project's own datasets rather than over the key they are held under.
+    pub fn dataset_by_arn(&self, dataset_arn: &str) -> Option<&datasets::Dataset> {
+        self.datasets
+            .values()
+            .find(|dataset| arn_names(&dataset.arn, dataset_arn))
     }
 }
 
@@ -642,6 +670,21 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
             .retain(|_, project| !project.is_deleted_at(now));
     }
 
+    /// Drop the record of every DATASET whose deletion the clock has completed by `now`.
+    ///
+    /// The same rule as [`Self::forget_deleted_projects`], one level down: a dataset
+    /// `DeleteDataset` started removing is gone one [`datasets::DATASET_DELETION_SPAN`] later
+    /// whether or not anybody called, and dropping it is what frees the `DatasetType` its
+    /// project held for a later create — "if you try to access the dataset after it is
+    /// deleted, you get a `ResourceNotFoundException` exception".
+    pub fn forget_deleted_datasets(&mut self, now: SystemTime) {
+        for project in self.projects.values_mut() {
+            project
+                .datasets
+                .retain(|_, dataset| !dataset.is_deleted_at(now));
+        }
+    }
+
     /// The tag set of the resource `resource_arn` names, in either form of its ARN (see
     /// [`arn_names`]), or `None` when no live resource of this store carries that ARN.
     ///
@@ -657,7 +700,27 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
         {
             return Some(&collection.tags);
         }
-        self.project_by_arn(resource_arn).map(|project| &project.tags)
+        if let Some(project) = self.project_by_arn(resource_arn) {
+            return Some(&project.tags);
+        }
+        // A dataset is taggable too — `CreateDataset` takes a `TagMap` of its own — and its
+        // ARN names it as unambiguously as a project's names a project, so one ARN still
+        // resolves to at most one resource.
+        self.dataset_by_arn(resource_arn)
+            .map(|(_, dataset)| &dataset.tags)
+    }
+
+    /// The project holding the dataset `dataset_arn` names, and that dataset, or `None` when
+    /// this account has no such dataset.
+    ///
+    /// A dataset is addressed by its own ARN by every operation on one while the store holds
+    /// it on the project it belongs to, so the resolution lives here once rather than in each
+    /// of those handlers — and only the LIVE projects are searched, for the reason
+    /// [`Self::project_by_arn`] records: a dataset of a project this account no longer has is
+    /// one nothing holds.
+    pub fn dataset_by_arn(&self, dataset_arn: &str) -> Option<(&Project, &datasets::Dataset)> {
+        self.live_projects()
+            .find_map(|project| project.dataset_by_arn(dataset_arn).map(|held| (project, held)))
     }
 
     /// The project `project_arn` names, in either form of its ARN (see [`arn_names`]), or
@@ -681,6 +744,16 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
             .find(|project| arn_names(&project.arn, project_arn))
     }
 
+    /// The project holding the dataset `dataset_arn` names, for the operations that CHANGE
+    /// that dataset; see [`Self::dataset_by_arn`].
+    pub fn project_holding_dataset_mut(&mut self, dataset_arn: &str) -> Option<&mut Project> {
+        let now = SystemTime::now();
+        self.projects
+            .values_mut()
+            .filter(|project| !project.is_deleted_at(now))
+            .find(|project| project.dataset_by_arn(dataset_arn).is_some())
+    }
+
     /// The same resolution, for the operations that CHANGE the resource's tags.
     pub fn tags_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
         if let Some(collection) = self
@@ -691,11 +764,22 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
             return Some(&mut collection.tags);
         }
         let now = SystemTime::now();
+        // One walk of the live projects answers both kinds: the project the ARN names, and the
+        // dataset of a project it names. Two walks would be two mutable borrows of the same
+        // map, and one resource is what an ARN names either way.
         self.projects
             .values_mut()
             .filter(|project| !project.is_deleted_at(now))
-            .find(|project| arn_names(&project.arn, resource_arn))
-            .map(|project| &mut project.tags)
+            .find_map(|project| {
+                if arn_names(&project.arn, resource_arn) {
+                    return Some(&mut project.tags);
+                }
+                project
+                    .datasets
+                    .values_mut()
+                    .find(|dataset| arn_names(&dataset.arn, resource_arn))
+                    .map(|dataset| &mut dataset.tags)
+            })
     }
 }
 

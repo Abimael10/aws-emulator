@@ -43,6 +43,9 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the single integration-test target picks
+# up a new suite from its own file.
+automod = { workspace = true }
 # The Amazon S3 service, mounted beside rekognition on one engine so an image staged with
 # `PutObject` is the one an `Image.S3Object` resolves to.
 service-com-amazonaws-s3-amazons3 = { workspace = true }

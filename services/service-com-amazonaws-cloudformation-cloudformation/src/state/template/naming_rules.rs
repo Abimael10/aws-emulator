@@ -1037,6 +1037,15 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // the group is CREATED under and the identifier every call on one takes, so it is
         // the physical id.
         crate::state::template::DYNAMODB_GLOBAL_TABLE => Some("TableName"),
+        // Amazon Rekognition's `CreateCollection` takes a `CollectionId` — the case-sensitive
+        // id every call on a face collection takes, and what "Ref returns" for the type — so
+        // the type publishes `CollectionId`; the type's last segment is `Collection`, so
+        // neither `CollectionName` nor `Name` finds it. That id is what the collection is
+        // CREATED under, so it is the physical id: a generated `<stack>-<logical id>-<unique
+        // id>` would name no collection the owning service holds.
+        crate::state::provisioner::rekognition_resources::REKOGNITION_COLLECTION => {
+            Some(crate::state::provisioner::rekognition_resources::COLLECTION_ID_PROPERTY)
+        }
         _ => None,
     }
 }

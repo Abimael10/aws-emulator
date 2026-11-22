@@ -348,6 +348,14 @@ impl Provisioner {
             Self::DirectConnectResiliencyGroup => {
                 resiliency_group_readiness(ctx, region, physical_resource_id).await
             }
+            // "Creating a dataset takes a while to complete. Use DescribeDataset to check the
+            // current status. The dataset created successfully if the value of Status is
+            // CREATE_COMPLETE", so a dataset the create has just answered for holds nothing a
+            // model could train on yet and the resource's creation is finished once Amazon
+            // Rekognition reports it `CREATE_COMPLETE` ([`rekognition_resources`]).
+            Self::RekognitionDataset => {
+                rekognition_dataset_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -660,6 +668,18 @@ impl Provisioner {
             }
             Self::DirectConnectResiliencyGroup => {
                 resiliency_group_removal(ctx, region, physical_resource_id).await
+            }
+            // Both Rekognition deletes are asynchronous: "the project is deleted when the
+            // project no longer appears in the DescribeProjects response" and a deleted
+            // dataset answers `ResourceNotFoundException` only once it is gone, so each
+            // resource's deletion is finished on that service's own report
+            // ([`rekognition_resources`]). A project is addressed by the NAME it was created
+            // under, which is its physical id, and a dataset by the ARN that service minted.
+            Self::RekognitionProject => {
+                rekognition_project_removal(ctx, region, physical_resource_id).await
+            }
+            Self::RekognitionDataset => {
+                rekognition_dataset_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }
