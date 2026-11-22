@@ -67,6 +67,13 @@ const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 /// here is created ([`given_delivery_role`]).
 const DELIVERY_ROLE: &str = "removal-stabilisation-role";
 
+/// The Amazon S3 bucket every Firehose row's stream delivers into. Firehose resolves a
+/// destination's `BucketARN` against Amazon S3 before it writes the stream, exactly as it
+/// resolves the role, so the bucket exists before any stack here is created
+/// ([`given_data_bucket`]). One bucket for every row: where a row's objects would land is no
+/// part of the rule this suite states.
+const DATA_BUCKET: &str = "removal-stabilisation-data";
+
 /// The emulator with the services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way (the
@@ -181,6 +188,30 @@ async fn given_delivery_role(router: &MultiServiceRouter, case: &str) {
     );
 }
 
+/// Create the Amazon S3 bucket every Firehose row's stream delivers into, the pair of
+/// [`given_delivery_role`]: a destination whose bucket Amazon S3 does not hold is refused when
+/// the stream is written.
+///
+/// No `CreateBucketConfiguration`: this suite signs for `us-east-1`, the one Region a
+/// `LocationConstraint` may not name.
+async fn given_data_bucket(router: &MultiServiceRouter, case: &str) {
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("/{DATA_BUCKET}"))
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("authorization", authorization("s3"))
+        .body(Bytes::new())
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: expected HTTP 200 from CreateBucket, got {status} with body {}",
+        String::from_utf8_lossy(response.body())
+    );
+}
+
 /// Which service owns the resource a row's stack deletes.
 #[derive(Debug, Clone, Copy)]
 enum Owner {
@@ -218,7 +249,7 @@ impl Owner {
             Self::Firehose => json!({
                 "DeliveryStreamName": name,
                 "ExtendedS3DestinationConfiguration": {
-                    "BucketARN": format!("arn:aws:s3:::{name}-data"),
+                    "BucketARN": format!("arn:aws:s3:::{DATA_BUCKET}"),
                     "RoleARN": format!("arn:aws:iam::{ACCOUNT_ID}:role/{DELIVERY_ROLE}"),
                 }
             }),
@@ -378,6 +409,7 @@ async fn settles_only_once_gone(
 async fn an_update_that_drops_a_resource_completes_only_once_that_resource_is_gone() {
     let router = build_router();
     given_delivery_role(&router, "the delivery role every Firehose row needs").await;
+    given_data_bucket(&router, "the destination every Firehose row needs").await;
 
     for owner in OWNERS {
         let owner = *owner;
@@ -436,6 +468,7 @@ async fn an_update_that_drops_a_resource_completes_only_once_that_resource_is_go
 async fn an_update_that_replaces_a_resource_completes_only_once_the_old_one_is_gone() {
     let router = build_router();
     given_delivery_role(&router, "the delivery role every Firehose row needs").await;
+    given_data_bucket(&router, "the destination every Firehose row needs").await;
 
     for owner in OWNERS {
         let owner = *owner;
@@ -494,6 +527,7 @@ async fn an_update_that_replaces_a_resource_completes_only_once_the_old_one_is_g
 async fn a_stacks_deletion_completes_only_once_its_resources_are_gone() {
     let router = build_router();
     given_delivery_role(&router, "the delivery role every Firehose row needs").await;
+    given_data_bucket(&router, "the destination every Firehose row needs").await;
 
     for owner in OWNERS {
         let owner = *owner;

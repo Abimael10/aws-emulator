@@ -35,6 +35,18 @@
 //! reading the same source, delivers while the refused one writes nothing — and granting the
 //! missing permission in place restores the refused stream's delivery.
 //!
+//! Every row's stream is CREATED under a role that may make the whole read, and the row's own
+//! grant is then stated in place: `CreateDeliveryStream` resolves the source role's
+//! permissions before it writes the stream, so a configuration whose role may not read is
+//! refused outright and never becomes a stream (the sibling suite
+//! `firehose_create_resolves_its_configuration` pins that refusal). What this suite is about
+//! is therefore what every later attempt reads — the permissions in force AT THAT ATTEMPT.
+//! The narrowing is ordered against the stream's own readings and not against the clock: it
+//! is stated while the stream is still `CREATING`, before any poll of its source (a source is
+//! polled only for an `ACTIVE` stream), and a row whose refusal is reported then waits for
+//! that FIRST report before writing to the source — so the records it puts meet a retrieval
+//! the narrowed policy decided, whatever order the host happened to run things in.
+//!
 //! Nothing here is asserted about how fast the host ran: every wait polls for the CONDITION
 //! under a generous deadline, and what must stay empty is re-read at every one of those
 //! readings.
@@ -246,22 +258,29 @@ impl Aws {
         )
         .await;
         if !statements.is_empty() {
-            let document = format!(
-                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
-                statements.join(",")
-            );
-            self.iam(
-                case,
-                "PutRolePolicy",
-                &[
-                    ("RoleName", name),
-                    ("PolicyName", "firehose-source"),
-                    ("PolicyDocument", &document),
-                ],
-            )
-            .await;
+            self.put_role_policy(case, name, statements).await;
         }
         format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
+    }
+
+    /// State `statements` as the role's one inline policy, replacing whatever it carried —
+    /// which is how a row narrows what its stream's role may read, and how the repair at the
+    /// end of this suite restores it.
+    async fn put_role_policy(&self, case: &str, name: &str, statements: &[String]) {
+        let document = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+            statements.join(",")
+        );
+        self.iam(
+            case,
+            "PutRolePolicy",
+            &[
+                ("RoleName", name),
+                ("PolicyName", "firehose-source"),
+                ("PolicyDocument", &document),
+            ],
+        )
+        .await;
     }
 
     /// Create the destination bucket `name`.
@@ -343,10 +362,13 @@ impl Aws {
     }
 
     /// Create the `KinesisStreamAsSource` Firehose stream `name` reading `source_arn` under
-    /// `role_arn` and delivering into `bucket` under `prefix`, and answer its ARN once it
-    /// reports `ACTIVE`.
+    /// `role_arn` and delivering into `bucket` under `prefix`, and answer its ARN.
+    ///
+    /// The create does not wait for `ACTIVE` ([`Aws::await_active`] does): a row states the
+    /// grant it is about between the two, while no poll of this stream's source has happened
+    /// yet.
     #[allow(clippy::too_many_arguments)]
-    async fn given_stream(
+    async fn create_stream(
         &self,
         case: &str,
         name: &str,
@@ -391,10 +413,15 @@ impl Aws {
                 }),
             )
             .await;
-        let arn = answered["DeliveryStreamARN"]
+        answered["DeliveryStreamARN"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: the create answers {name}'s ARN, got {answered}"))
-            .to_string();
+            .to_string()
+    }
+
+    /// Wait for the Firehose stream `name` to report `ACTIVE` — the status it retrieves and
+    /// delivers in.
+    async fn await_active(&self, case: &str, name: &str) {
         let deadline = Instant::now() + DELIVERY_DEADLINE;
         loop {
             let described = self
@@ -405,7 +432,7 @@ impl Aws {
                 )
                 .await;
             if described["DeliveryStreamDescription"]["DeliveryStreamStatus"] == json!("ACTIVE") {
-                return arn;
+                return;
             }
             assert!(
                 Instant::now() < deadline,
@@ -627,18 +654,21 @@ async fn a_source_read_the_role_may_not_make_is_reported_and_retrieves_nothing()
         aws.given_bucket(case, bucket).await;
         aws.given_log_group(case, &[LOG_STREAM]).await;
         let source_arn = aws.given_source(case, "ingest").await;
-        let mut statements = vec![allow(&[OBJECT_WRITE], &format!("arn:aws:s3:::{bucket}/*"))];
-        if !row.source_actions.is_empty() {
-            let resource = if row.scoped_to_the_source {
-                source_arn.clone()
-            } else {
-                format!("arn:aws:kinesis:{REGION}:{}:stream/elsewhere", engine::emulator_account_id())
-            };
-            statements.push(allow(row.source_actions, &resource));
-        }
-        let role_arn = aws.given_role(case, "firehose-source", &statements).await;
+        let object_write = allow(&[OBJECT_WRITE], &format!("arn:aws:s3:::{bucket}/*"));
+        // The stream is created under a role that may make the whole read, because a create
+        // whose source role may not read is refused and writes no stream at all.
+        let role_arn = aws
+            .given_role(
+                case,
+                "firehose-source",
+                &[
+                    object_write.clone(),
+                    allow(EVERY_SOURCE_READ, &source_arn),
+                ],
+            )
+            .await;
         let stream_arn = aws
-            .given_stream(
+            .create_stream(
                 case,
                 "archiver",
                 &source_arn,
@@ -648,6 +678,28 @@ async fn a_source_read_the_role_may_not_make_is_reported_and_retrieves_nothing()
                 row.logging.then_some(LOG_STREAM),
             )
             .await;
+
+        // The row's own grant, stated while the stream is still `CREATING`: a source is
+        // polled only for an `ACTIVE` stream, so the first retrieval this stream attempts is
+        // decided under exactly these permissions.
+        let mut statements = vec![object_write];
+        if !row.source_actions.is_empty() {
+            let resource = if row.scoped_to_the_source {
+                source_arn.clone()
+            } else {
+                format!("arn:aws:kinesis:{REGION}:{}:stream/elsewhere", engine::emulator_account_id())
+            };
+            statements.push(allow(row.source_actions, &resource));
+        }
+        aws.put_role_policy(case, "firehose-source", &statements)
+            .await;
+        aws.await_active(case, "archiver").await;
+        // A row whose refusal is REPORTED puts its records only once that report is there: the
+        // stream has then asked IAM under the narrowed policy, so what the records meet is the
+        // decision this row is about rather than one taken before the narrowing landed.
+        if row.refused.is_some() && row.logging {
+            reported(&aws, case, LOG_STREAM).await;
+        }
         aws.put_records(case, "ingest", 3).await;
 
         match (row.refused, row.logging) {
@@ -740,8 +792,8 @@ async fn the_permitted_sibling_delivers_and_granting_the_permission_restores_the
     let source_arn = aws.given_source(case, "shared-ingest").await;
     let object_write = allow(&[OBJECT_WRITE], &format!("arn:aws:s3:::{bucket}/*"));
 
-    // One role may make the whole source read; the other may make everything but the records
-    // read, which is the ONE difference between the two streams.
+    // Both roles may make the whole source read when the streams are created — a create whose
+    // source role may not read writes no stream — and the refused one is then narrowed below.
     let permitted = aws
         .given_role(
             case,
@@ -758,15 +810,12 @@ async fn the_permitted_sibling_delivers_and_granting_the_permission_restores_the
             "firehose-refused",
             &[
                 object_write.clone(),
-                allow(
-                    &["kinesis:DescribeStream", "kinesis:GetShardIterator"],
-                    &source_arn,
-                ),
+                allow(EVERY_SOURCE_READ, &source_arn),
             ],
         )
         .await;
 
-    aws.given_stream(
+    aws.create_stream(
         case,
         "good",
         &source_arn,
@@ -776,7 +825,7 @@ async fn the_permitted_sibling_delivers_and_granting_the_permission_restores_the
         Some(good_stream),
     )
     .await;
-    aws.given_stream(
+    aws.create_stream(
         case,
         "bad",
         &source_arn,
@@ -786,6 +835,27 @@ async fn the_permitted_sibling_delivers_and_granting_the_permission_restores_the
         Some(bad_stream),
     )
     .await;
+
+    // The ONE difference between the two streams, stated while both are still `CREATING`:
+    // the second role may make everything but the records read.
+    aws.put_role_policy(
+        case,
+        "firehose-refused",
+        &[
+            object_write.clone(),
+            allow(
+                &["kinesis:DescribeStream", "kinesis:GetShardIterator"],
+                &source_arn,
+            ),
+        ],
+    )
+    .await;
+    aws.await_active(case, "good").await;
+    aws.await_active(case, "bad").await;
+    // The records go to the shared source only once the refused stream has reported the read
+    // it may not make: it has then asked IAM under the narrowed policy, so the retrieval the
+    // records meet is decided by it.
+    reported(&aws, case, bad_stream).await;
     aws.put_records(case, "shared-ingest", 3).await;
 
     // The permitted sibling delivers the whole record set.

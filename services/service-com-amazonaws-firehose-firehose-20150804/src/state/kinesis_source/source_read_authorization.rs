@@ -12,6 +12,16 @@
 //! and the decision is IAM's, asked of IAM
 //! (`service_common::iam_role::role_withholds_action_through`).
 //!
+//! The question is put twice: once by the CALL that configures the source
+//! ([`unreadable_source`]), which refuses a configuration whose role could never make the read
+//! before any stream is written, and then by every poll of the stream that configuration made
+//! ([`source_read_refusal`]), because the permissions that decide a retrieval are the ones in
+//! force AT THAT ATTEMPT — a grant withdrawn while the stream exists stops the retrieval it
+//! was created under, and one restored resumes it. One question, two readers, so what each
+//! answer STATES differs: the request's caller is answered about the authorization of the role
+//! it supplied, and an operator reads the condition of a live stream off that stream's own
+//! logging.
+//!
 //! A read the role may not make takes nothing out of the source, so the stream's shard
 //! positions stay where they are and its destination gets nothing — and since no client call
 //! is made for a source-fed stream at all, the only thing an operator can observe of it is
@@ -152,15 +162,65 @@ fn record_decision<Eng: Send + Sync + 'static>(
 /// `service_common::iam_role::role_withholds_action_through` reads it.
 async fn refused_source_read(hop: &DeliveryHop, cursor: &SourceCursor) -> Option<&'static str> {
     let emulator = hop.emulator()?;
-    let role_arn = cursor.role_arn.as_deref().filter(|arn| !arn.is_empty())?;
+    let role_arn = cursor.role_arn.as_deref()?;
     let region = delivery_region(&cursor.stream_arn)?;
+    withheld_source_read(emulator, region, role_arn, &cursor.source_arn).await
+}
+
+/// Why the source a REQUEST configures could not be read under the role that request names,
+/// when the role's permissions withhold the retrieval; `None` when nothing stands in its way.
+///
+/// The question [`refused_source_read`] puts for a poll of a live stream, put for the call
+/// that CONFIGURES the source: Firehose makes the source read under the role the
+/// configuration names, so a role whose permissions do not allow the Kinesis Data Streams
+/// calls that read is made of ([`SOURCE_READ_ACTIONS`]) names a source the stream could never
+/// retrieve — an argument fault of the call that named it, answered before anything is
+/// written, rather than a stream that reports healthy and ingests nothing.
+///
+/// What the two answers STATE differs, because their readers do: a refused poll reports the
+/// condition of a live stream to an operator through that stream's own logging
+/// ([`access_denied_message`]), while this answers the CALLER of the request about the
+/// authorization of the role it just supplied — which is the authorization sentence this
+/// service states for a role's own permissions, naming the role, the refused call and the
+/// resource (`crate::service::unauthorized_source_read_message`).
+///
+/// `None` for every question that could not be ANSWERED, exactly as the poll reads those: a
+/// configuration naming no role, an emulator with no IAM mounted, a role this account's IAM
+/// holds nothing under, and any other failure of the hop.
+pub async fn unreadable_source(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    source_arn: &str,
+    role_arn: &str,
+) -> Option<String> {
+    let action = withheld_source_read(ctx.callback(), region, role_arn, source_arn).await?;
+    Some(crate::service::unauthorized_source_read_message(
+        role_arn, action, source_arn,
+    ))
+}
+
+/// The first of [`SOURCE_READ_ACTIONS`] on `source_arn` that IAM answers the role `role_arn`
+/// names may not make, or `None` when it may make all three.
+///
+/// The ONE place that question is put — for the poll of a live stream and for the request that
+/// configures one alike — so the calls a retrieval is made of, and the reading of a
+/// non-answer, are stated once.
+async fn withheld_source_read(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    source_arn: &str,
+) -> Option<&'static str> {
+    if role_arn.is_empty() {
+        return None;
+    }
     for action in SOURCE_READ_ACTIONS {
         if ::service_common::iam_role::role_withholds_action_through(
-            emulator,
+            callback,
             region,
             role_arn,
             action,
-            &cursor.source_arn,
+            source_arn,
         )
         .await
         {

@@ -14,8 +14,8 @@
 //!
 //! The rows span what the rule generalises over: what the role's permissions say (an allow of
 //! the write, no policy at all, an allow of another action, an allow scoped to another
-//! bucket), which condition the delivery failed on (the role, and a destination bucket that
-//! does not exist), and whether the destination's logging options report anything (enabled,
+//! bucket), which condition the delivery failed on (the role, and a destination bucket that is
+//! no longer there), and whether the destination's logging options report anything (enabled,
 //! disabled, naming no stream).
 //!
 //! Four services are mounted on ONE shared engine, exactly as the router mounts them: the
@@ -52,8 +52,11 @@ const PAST_THE_DELIVERY_WINDOW: Duration = Duration::from_millis(2_000);
 /// The bucket each row's destination delivers into.
 const BUCKET: &str = "firehose-error-reporting";
 
-/// A bucket no row ever creates, for the destination whose location does not exist.
-const ABSENT_BUCKET: &str = "firehose-error-reporting-absent";
+/// The bucket the removed-bucket row delivers into: it is created like the others, so the
+/// stream can be configured against it, and DELETED once that stream exists — which is how a
+/// destination comes to name a bucket Amazon S3 no longer holds, the configuration having
+/// been resolved when the stream was written (`CreateDeliveryStream`).
+const REMOVED_BUCKET: &str = "firehose-error-reporting-absent";
 
 /// Another bucket Amazon S3 holds, so a row can grant the write on a bucket that is not the
 /// destination's.
@@ -213,6 +216,18 @@ impl Aws {
             status,
             200,
             "create bucket {bucket}: got {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// `DELETE /<bucket>` — Amazon S3's `DeleteBucket`, which is how the destination of a
+    /// live stream comes to name a bucket that is no longer there.
+    async fn delete_bucket(&self, bucket: &str) {
+        let (status, body) = self.s3("DELETE", &format!("/{bucket}"), b"").await;
+        assert_eq!(
+            status,
+            204,
+            "delete bucket {bucket}: got {status} {}",
             String::from_utf8_lossy(&body)
         );
     }
@@ -420,9 +435,12 @@ fn rows() -> Vec<Row> {
             reported: Some("S3.AccessDenied"),
         },
         Row {
-            case: "a destination bucket that does not exist reports the missing bucket",
-            policy: Some(allow("s3:PutObject", &format!("{}/*", bucket_arn(ABSENT_BUCKET)))),
-            bucket: ABSENT_BUCKET,
+            case: "a destination bucket that is no longer there reports the missing bucket",
+            policy: Some(allow(
+                "s3:PutObject",
+                &format!("{}/*", bucket_arn(REMOVED_BUCKET)),
+            )),
+            bucket: REMOVED_BUCKET,
             logging: enabled,
             delivers: false,
             reported: Some("S3.NoSuchBucket"),
@@ -491,6 +509,10 @@ async fn a_destination_reports_the_delivery_it_did_not_take_and_nothing_else() {
         let aws = Aws::new();
         aws.create_bucket(BUCKET).await;
         aws.create_bucket(OTHER_BUCKET).await;
+        // Every row's destination is configured against a bucket Amazon S3 holds: a create
+        // naming one it does not is refused outright, so the row about a missing destination
+        // reaches that condition by DELETING the bucket once its stream exists.
+        aws.create_bucket(REMOVED_BUCKET).await;
         let (status, answered) = aws
             .logs("CreateLogGroup", json!({ "logGroupName": LOG_GROUP }))
             .await;
@@ -521,6 +543,9 @@ async fn a_destination_reports_the_delivery_it_did_not_take_and_nothing_else() {
             .unwrap_or_else(|| panic!("case {case:?}: the create answers the stream's ARN"))
             .to_string();
         tokio::time::sleep(PAST_THE_TRANSITION).await;
+        if row.bucket == REMOVED_BUCKET {
+            aws.delete_bucket(REMOVED_BUCKET).await;
+        }
 
         aws.firehose_ok(
             "PutRecord",
@@ -576,9 +601,9 @@ async fn a_destination_reports_the_delivery_it_did_not_take_and_nothing_else() {
                     "case {case:?}: the event states what the code means, got {document}"
                 );
                 // Nothing of a refused delivery reaches the destination. A destination whose
-                // bucket does not exist holds nothing to read, which is the condition this
+                // bucket is no longer there holds nothing to read, which is the condition this
                 // row is about.
-                if row.bucket != ABSENT_BUCKET {
+                if row.bucket != REMOVED_BUCKET {
                     let keys = aws.keys(row.bucket).await;
                     assert!(
                         keys.is_empty(),

@@ -370,6 +370,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A role Firehose can assume is not yet a role that can do the job it was named for:
+        // the retrieval from a configured Kinesis source is made UNDER the source role, so
+        // what that role's permissions allow is resolved against IAM here too, before the
+        // stream exists. A role that may not make the Kinesis Data Streams calls the read is
+        // made of names a source this stream could never consume, so it is an argument fault
+        // of this call rather than a stream that reports healthy and ingests nothing
+        // (`crate::state::kinesis_source::unreadable_source`).
+        if configured == ConfiguredSource::KinesisStream {
+            if let Some(config) = input.kinesis_stream_source_configuration.as_ref() {
+                if let Some(message) = crate::state::kinesis_source::unreadable_source(
+                    ctx,
+                    &region,
+                    &config.kinesis_stream_arn,
+                    &config.role_arn,
+                )
+                .await
+                {
+                    return Err(invalid_argument(message));
+                }
+            }
+        }
+
+        // And every Amazon S3 location the create names is resolved against Amazon S3 before
+        // the stream exists, exactly as the update path resolves the ones an update names: a
+        // bucket Amazon S3 does not hold is a location no delivery of this stream could ever
+        // write an object to, so the create is refused and nothing is registered under the
+        // name it asked for.
+        if let Some(message) = crate::state::absent_destination_bucket(
+            ctx,
+            &region,
+            &bucket_arns(&input)
+                .iter()
+                .map(|(_, bucket_arn)| *bucket_arn)
+                .collect::<Vec<&str>>(),
+        )
+        .await
+        {
+            return Err(invalid_argument(message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let arn = ::engine::emulator_arn(
             "firehose",

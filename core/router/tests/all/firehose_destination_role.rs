@@ -26,23 +26,40 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
+// The one percent-encoder the cross-service suites share for an `awsQuery` form value, used
+// here for the one parameter that carries a policy document.
+use super::query_wire::form_encode;
+
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every request below is signed for.
 const REGION: &str = "us-west-2";
 
-/// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` span for a Firehose
-/// stream (`crate::state::TRANSITION_DELAY` in the firehose crate, mirrored by its own
-/// suites' `PAST_THE_TRANSITION`): an `UpdateDestination` lands only on a settled stream,
-/// so the one update below waits this out first.
-const PAST_THE_TRANSITION: std::time::Duration = std::time::Duration::from_millis(3_400);
+/// How long the one stream this suite updates is given to report itself usable, and how often
+/// it is asked. A generous wall-clock deadline whose only job is that the wait TERMINATES: an
+/// `UpdateDestination` lands only on a settled stream, and the span Firehose chooses for that
+/// takes the time it takes.
+const ACTIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The Firehose service principal a destination role must trust.
 const FIREHOSE_PRINCIPAL: &str = "\"firehose.amazonaws.com\"";
 
-/// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern.
+/// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern, naming the bucket the setup
+/// creates: Firehose resolves a destination's bucket against Amazon S3 when the stream is
+/// written, so the bucket is there for every row below and what a row varies is the ROLE.
+const BUCKET: &str = "demo-bucket";
 const BUCKET_ARN: &str = "arn:aws:s3:::demo-bucket";
+
+/// The Kinesis data stream the source rows read, and the read their source role has to be
+/// allowed to make for the row about a trusted source role to be about the trust.
+const SOURCE_ARN: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/source";
+const SOURCE_READ_POLICY: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"#,
+    r#"["kinesis:DescribeStream","kinesis:GetShardIterator","kinesis:GetRecords"],"#,
+    r#""Resource":"arn:aws:kinesis:us-west-2:000000000000:stream/source"}]}"#
+);
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`. The
 /// signature is never checked: this router runs with authentication off.
@@ -259,8 +276,7 @@ fn role_cases() -> Vec<RoleCase> {
             configuration: serde_json::json!({
                 "DeliveryStreamType": "KinesisStreamAsSource",
                 "KinesisStreamSourceConfiguration": {
-                    "KinesisStreamARN":
-                        format!("arn:aws:kinesis:{REGION}:000000000000:stream/source"),
+                    "KinesisStreamARN": SOURCE_ARN,
                     "RoleARN": role_arn("never-created-role"),
                 },
                 "S3DestinationConfiguration": s3_configuration(&trusted),
@@ -273,8 +289,7 @@ fn role_cases() -> Vec<RoleCase> {
             configuration: serde_json::json!({
                 "DeliveryStreamType": "KinesisStreamAsSource",
                 "KinesisStreamSourceConfiguration": {
-                    "KinesisStreamARN":
-                        format!("arn:aws:kinesis:{REGION}:000000000000:stream/source"),
+                    "KinesisStreamARN": SOURCE_ARN,
                     "RoleARN": role_arn("firehose-delivery-lists"),
                 },
                 "S3DestinationConfiguration": s3_configuration(&trusted),
@@ -380,6 +395,62 @@ fn unassumable(role_arn: &str) -> String {
     format!("Firehose is unable to assume role {role_arn}. Please check the role provided.")
 }
 
+/// Wait until `stream` reports itself `ACTIVE` — the status an `UpdateDestination` lands on.
+///
+/// A poll on that CONDITION under a generous deadline, so how fast the host runs decides
+/// nothing: the span the service chooses takes the time it takes.
+fn await_active(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    stream: &str,
+) {
+    let giving_up_at = std::time::Instant::now() + ACTIVE_DEADLINE;
+    loop {
+        let (status, described) = firehose(
+            router,
+            runtime,
+            "DescribeDeliveryStream",
+            &serde_json::json!({ "DeliveryStreamName": stream }),
+        );
+        if described["DeliveryStreamDescription"]["DeliveryStreamStatus"]
+            == serde_json::json!("ACTIVE")
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < giving_up_at,
+            "{stream} must report itself ACTIVE, got {status} {described}"
+        );
+        std::thread::sleep(LOOK_AGAIN_AFTER);
+    }
+}
+
+/// Create the bucket every row's destination names: `PUT /<bucket>` on Amazon S3's own wire.
+fn create_bucket(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    bucket: &str,
+) {
+    let host = format!("s3.{REGION}.amazonaws.com");
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("https://{host}/{bucket}"))
+        .header("host", host)
+        .header("authorization", authorization("s3"))
+        .body(bytes::Bytes::from(format!(
+            "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        )))
+        .expect("a well-formed request");
+    let response = runtime.block_on(router.dispatch(request));
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "setup: the destination bucket {bucket} must be created, got {}",
+        String::from_utf8_lossy(response.body())
+    );
+}
+
 #[test]
 fn a_stream_is_written_only_for_roles_iam_holds_and_firehose_may_assume() {
     std::thread::Builder::new()
@@ -415,6 +486,27 @@ fn a_stream_is_written_only_for_roles_iam_holds_and_firehose_may_assume() {
                     fixture.role_name
                 );
             }
+
+            // The two resources every row's configuration depends on and this suite does not
+            // vary: the destination bucket, and the source read the role of the Kinesis-source
+            // row makes. Firehose resolves both when the stream is written, so without them a
+            // row would be answered for its bucket or its permissions instead of its trust.
+            create_bucket(&router, &runtime, BUCKET);
+            let encoded = form_encode(SOURCE_READ_POLICY);
+            let (status, body) = iam(
+                &router,
+                &runtime,
+                "PutRolePolicy",
+                &[
+                    ("RoleName", "firehose-delivery-lists"),
+                    ("PolicyName", "source-read"),
+                    ("PolicyDocument", encoded.as_str()),
+                ],
+            );
+            assert_eq!(
+                status, 200,
+                "setup: the source role's read policy must be stated, got {status} {body}"
+            );
 
             for case in role_cases() {
                 let mut request = case.configuration.clone();
@@ -525,9 +617,9 @@ fn a_stream_is_written_only_for_roles_iam_holds_and_firehose_may_assume() {
             );
 
             // The same update onto a role IAM does hold succeeds, so the gate is the role
-            // and not the operation. (The stream was created above and the clock owes it
-            // ACTIVE, so the update waits for that span to elapse.)
-            std::thread::sleep(PAST_THE_TRANSITION);
+            // and not the operation. (An update lands only on a settled stream, so this waits
+            // for the CONDITION — the status the stream reports — rather than for a span.)
+            await_active(&router, &runtime, "trusted");
             let (status, body) = firehose(
                 &router,
                 &runtime,

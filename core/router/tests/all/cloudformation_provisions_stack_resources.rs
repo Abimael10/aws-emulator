@@ -43,14 +43,11 @@ const REGION: &str = "us-east-1";
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT_ID: &str = "000000000000";
 
-/// Long enough for both clock-owed spans these services choose to come due: the stack's
-/// (`STATUS_TRANSITION_DELAY`, 500 ms) and the stream's (`TRANSITION_DELAY`, 3 s), with
-/// margin for a loaded machine.
-const PAST_BOTH_SPANS: Duration = Duration::from_millis(3_900);
-
-/// How long a resource a stack deleted is given to be gone from its owning service, and how
-/// often that service is asked. A generous wall-clock deadline whose only job is that the
-/// wait TERMINATES: the spans those services choose take the time they take.
+/// How long a stream a stack created or deleted is given to reach the status its owning
+/// service owes it, and how often that service is asked. A generous wall-clock deadline whose
+/// only job is that the wait TERMINATES: the spans those services choose take the time they
+/// take, and every wait below is on the CONDITION it is about
+/// ([`await_stream_active`], [`await_stream_gone`]).
 const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
 const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -206,6 +203,36 @@ async fn given_delivery_role(router: &MultiServiceRouter, case: &str, role_name:
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateRole for {role_name:?}, got {status} \
          with body {body}"
+    );
+}
+
+/// Create the Amazon S3 bucket `bucket`, for a template that NAMES a destination bucket it
+/// does not DECLARE.
+///
+/// The pair of [`given_delivery_role`], for the other resource of another service a stream's
+/// configuration names: Firehose resolves a destination's `BucketARN` against Amazon S3
+/// before it writes the stream and refuses a bucket that is not there, so a template pointing
+/// at a bucket OUTSIDE the stack needs that bucket to exist first, exactly as it would in an
+/// account. A template that declares its own `AWS::S3::Bucket` needs none of this.
+async fn given_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
+    // No `CreateBucketConfiguration`: this suite signs for `us-east-1`, the one Region a
+    // `LocationConstraint` may not name ("if you don't specify a Region, the bucket is created
+    // in the US East (N. Virginia) Region").
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("/{bucket}"))
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("authorization", authorization("s3"))
+        .body(Bytes::new())
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: expected HTTP 200 from CreateBucket for {bucket:?}, got {status} with \
+         body {}",
+        String::from_utf8_lossy(response.body())
     );
 }
 
@@ -522,8 +549,18 @@ const ROWS: &[Row] = &[
         template: |stack| {
             json!({
                 "Resources": {
+                    // The destination bucket the stream delivers to: Firehose resolves a
+                    // `BucketARN` against Amazon S3 when the stream is written, so the stack
+                    // declares the bucket and the stream waits for it.
+                    "Sink": {
+                        "Type": "AWS::S3::Bucket",
+                        "Properties": {
+                            "BucketName": { "Fn::Sub": "${AWS::StackName}-sink" }
+                        }
+                    },
                     "Stream": {
                         "Type": "AWS::KinesisFirehose::DeliveryStream",
+                        "DependsOn": "Sink",
                         "Properties": {
                             "DeliveryStreamName": format!("{stack}-encrypted"),
                             "DeliveryStreamEncryptionConfigurationInput": { "KeyType": "AWS_OWNED_CMK" },
@@ -851,7 +888,7 @@ async fn a_stack_provisions_the_firehose_stream_its_template_declares() {
 
         // And the stack itself completes its deletion rather than failing it, with the
         // stream gone by then.
-        tokio::time::sleep(PAST_BOTH_SPANS).await;
+        await_stream_gone(&router, case, &stream_name).await;
         let (status, gone) = firehose(
             &router,
             "DescribeDeliveryStream",
@@ -870,7 +907,13 @@ async fn a_stack_provisions_the_firehose_stream_its_template_declares() {
             "case {case:?}: expected ResourceNotFoundException for the deleted stream, got \
              {gone}"
         );
-        let body = describe_stack(&router, case, &stack_id).await;
+        let body = crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+            &router,
+            &stack_id,
+            "DELETE_COMPLETE",
+        )
+        .await
+        .1;
         assert_eq!(
             xml_text(&body, "StackStatus").as_deref(),
             Some("DELETE_COMPLETE"),
@@ -891,6 +934,7 @@ async fn a_resource_the_owning_service_refuses_fails_the_stack() {
     let case = "a template naming a stream that already exists";
     let stream_name = "already-taken-stream";
     given_delivery_role(&router, case, "some-role").await;
+    given_bucket(&router, case, "some-bucket").await;
 
     let (status, created) = firehose(
         &router,
@@ -1009,6 +1053,7 @@ async fn one_stacks_deletion_leaves_another_stacks_resources_untouched() {
     let router = build_router();
     let case = "two stacks from one template, one deleted";
     given_delivery_role(&router, case, "shared-role").await;
+    given_bucket(&router, case, "shared-bucket").await;
     let template = |stack: &str| {
         json!({
             "Resources": {
@@ -1044,7 +1089,9 @@ async fn one_stacks_deletion_leaves_another_stacks_resources_untouched() {
     }
 
     // Both streams are active, as a client deleting a deployed stack would find them.
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    for stream_name in ["neighbour-a-stream", "neighbour-b-stream"] {
+        await_stream_active(&router, case, stream_name).await;
+    }
 
     // Deleting the first stack deletes the first stack's stream, and only that one.
     let (status, body) =
@@ -1053,7 +1100,7 @@ async fn one_stacks_deletion_leaves_another_stacks_resources_untouched() {
         status, 200,
         "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    await_stream_gone(&router, case, "neighbour-a-stream").await;
 
     let (status, gone) = firehose(
         &router,
@@ -1094,6 +1141,7 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
     let case = "an update that replaces one stream and keeps another";
     let stack_name = "updated-stack";
     given_delivery_role(&router, case, "update-role").await;
+    given_bucket(&router, case, "update-bucket").await;
     // Both templates declare `Kept` identically; only the second declares `Replaced`'s
     // stream under a new name, which is what the update has to create and clean up after.
     let template = |replaced: &str| {
@@ -1189,8 +1237,8 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
         status, 200,
         "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
     for stream_name in ["updated-stack-after", "updated-stack-kept"] {
+        await_stream_gone(&router, case, stream_name).await;
         let (status, gone) = firehose(
             &router,
             "DescribeDeliveryStream",
@@ -1220,6 +1268,7 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
     let stack_name = "in-place-stack";
     let stream_name = "in-place-stack-stream";
     given_delivery_role(&router, case, "in-place-role").await;
+    given_bucket(&router, case, "in-place-bucket").await;
     let template = |stage: &str| {
         json!({
             "Resources": {
@@ -1342,6 +1391,33 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
     await_stream_gone(&router, case, stream_name).await;
 }
 
+/// Wait until Amazon Data Firehose reports the stream `name` usable — `ACTIVE`, the status
+/// the clock owes a created stream — looking again until it holds or [`REMOVAL_DEADLINE`]
+/// passes, so how fast the host runs decides nothing.
+///
+/// The pair of [`await_stream_gone`], for the other thing a case has to wait for: a stream
+/// Firehose is still creating refuses its own deletion.
+async fn await_stream_active(router: &MultiServiceRouter, case: &str, name: &str) {
+    let giving_up_at = Instant::now() + REMOVAL_DEADLINE;
+    loop {
+        let (status, answered) = firehose(
+            router,
+            "DescribeDeliveryStream",
+            &json!({ "DeliveryStreamName": name }),
+        )
+        .await;
+        if answered["DeliveryStreamDescription"]["DeliveryStreamStatus"] == json!("ACTIVE") {
+            return;
+        }
+        assert!(
+            Instant::now() < giving_up_at,
+            "case {case:?}: expected {name:?} to report itself ACTIVE, got {status} with body \
+             {answered}"
+        );
+        tokio::time::sleep(REMOVAL_POLL_INTERVAL).await;
+    }
+}
+
 /// Wait until Amazon Data Firehose no longer has the stream `name`, which is what a stack's
 /// deletion owes: the wait is on that CONDITION, looked at again until it holds or
 /// [`REMOVAL_DEADLINE`] passes, so how fast the host runs decides nothing.
@@ -1380,6 +1456,7 @@ async fn a_deletion_the_owning_service_refuses_fails_the_stack_and_can_be_retrie
     let stack_name = "retried-deletion";
     let stream_name = format!("{stack_name}-stream");
     given_delivery_role(&router, case, "retry-role").await;
+    given_bucket(&router, case, "retry-bucket").await;
     let template = json!({
         "Resources": {
             "Stream": {
@@ -1439,15 +1516,16 @@ async fn a_deletion_the_owning_service_refuses_fails_the_stack_and_can_be_retrie
          with body {surviving}"
     );
 
-    // Past the stream's creation span the same deletion goes through.
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    // Past the stream's creation span the same deletion goes through: the wait is on the
+    // stream reporting itself usable, which is the condition Firehose refused the delete for.
+    await_stream_active(&router, case, &stream_name).await;
     let (status, body) = cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from the retried DeleteStack, got {status} with \
          body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    await_stream_gone(&router, case, &stream_name).await;
     let (status, gone) = firehose(
         &router,
         "DescribeDeliveryStream",

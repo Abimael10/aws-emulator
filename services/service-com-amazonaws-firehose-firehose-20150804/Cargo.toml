@@ -29,8 +29,9 @@ tracing = { workspace = true }
 # generated client is needed — the emulator supplies the transport.
 aws-sdk-iam = { version = "1", default-features = false }
 # The AWS SDK for Amazon S3, driven over the same in-process callback: a destination's
-# `BucketARN` is resolved with `HeadBucket` before `UpdateDestination` rewrites a stream's
-# destination. Only the generated client is needed — the emulator supplies the transport.
+# `BucketARN` is resolved with `HeadBucket` before `CreateDeliveryStream` writes a stream and
+# before `UpdateDestination` rewrites one. Only the generated client is needed — the emulator
+# supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false }
 # The AWS SDK for Lambda, driven over the same in-process callback: a destination whose
 # `ProcessingConfiguration` names a `Lambda` processor hands each buffer to that function

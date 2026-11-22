@@ -20,6 +20,14 @@
 //! and the one that may not becomes the one that may the moment its policy says so, with the
 //! records it never took still in the source.
 //!
+//! The stack deploys BOTH roles able to make the whole read, because
+//! `CreateDeliveryStream` resolves the source role's permissions before it writes a stream:
+//! a leg declared with a role that may not read would deploy no stream at all (the sibling
+//! suite `firehose_create_resolves_its_configuration` pins that refusal). The difference
+//! between the legs is therefore stated IN PLACE once both streams are live, which is exactly
+//! the condition this suite is about: what a deployed stream retrieves follows the permissions
+//! in force at each attempt, whichever way the stream was provisioned.
+//!
 //! Only a cross-service suite can ask this: the flow spans CloudFormation (which deploys the
 //! roles, the log destinations and the streams), IAM (which holds those roles and decides
 //! each read), Amazon Kinesis Data Streams (the shared source), Firehose (which retrieves,
@@ -167,16 +175,19 @@ impl Leg {
             Self::Refused => format!("{kind}Bad"),
         }
     }
+}
 
-    /// The identity policy the template puts on this leg's role: the object write both state,
-    /// and the source read — whole for the permitted leg, one call short for the refused one.
-    fn role_policy(self) -> String {
-        let mut reads: Vec<&str> = OTHER_SOURCE_READS.to_vec();
-        if self == Self::Permitted {
-            reads.push(RECORDS_READ);
-        }
-        policy_document(&reads)
-    }
+/// The identity policy the template puts on EITHER leg's role: the object write and the whole
+/// source read.
+///
+/// Both legs, because `CreateDeliveryStream` resolves the source role's permissions before it
+/// writes a stream, so a leg declared with a role that may not read would deploy no stream at
+/// all. What makes the legs differ is stated in place once both streams are live, which is the
+/// condition this suite is about: the permissions in force at each ATTEMPT.
+fn deployed_role_policy() -> String {
+    let mut reads: Vec<&str> = OTHER_SOURCE_READS.to_vec();
+    reads.push(RECORDS_READ);
+    policy_document(&reads)
 }
 
 /// An identity policy stating the object write on the stack's bucket and `reads` on the
@@ -234,7 +245,7 @@ fn template() -> String {
                     "AssumeRolePolicyDocument": TRUST_POLICY,
                     "Policies": [{
                         "PolicyName": POLICY_NAME,
-                        "PolicyDocument": leg.role_policy(),
+                        "PolicyDocument": deployed_role_policy(),
                     }],
                 },
             }),
@@ -359,6 +370,51 @@ async fn a_deployed_streams_retrieval_follows_the_permissions_its_source_role_ca
         await_stream_active(&router, leg).await;
     }
 
+    // ---- The ONE difference between the legs, taken away in place on the role the deployed
+    // stream already names: the refused leg may no longer read the records. ----
+    let narrowed = policy_document(OTHER_SOURCE_READS);
+    let (status, answered) = iam(
+        &router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", &Leg::Refused.role()),
+            ("PolicyName", POLICY_NAME),
+            ("PolicyDocument", &narrowed),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from PutRolePolicy, got {status} with {answered}"
+    );
+
+    // ---- The refused read is reported where that stream's logging says, under the one error
+    // code that condition carries, naming the refused call, the source and the role. The
+    // record goes to the source only once that report is there, so every reading below is of a
+    // retrieval attempted under the narrowed policy. ----
+    let document = await_reported(&router, Leg::Refused).await;
+    assert_eq!(
+        document["errorCode"],
+        json!(REFUSED_ERROR_CODE),
+        "case {:?}: expected the reported errorCode {REFUSED_ERROR_CODE:?}, got {document}",
+        Leg::Refused.case()
+    );
+    let stream_arn = document["deliveryStreamARN"].as_str().unwrap_or_default();
+    assert!(
+        stream_arn.starts_with("arn:aws:firehose:")
+            && stream_arn.ends_with(&format!(":deliverystream/{}", Leg::Refused.stream())),
+        "case {:?}: expected the event to name its own stream, got {document}",
+        Leg::Refused.case()
+    );
+    let message = document["message"].as_str().unwrap_or_default().to_string();
+    for named in [RECORDS_READ, &source_stream(), &Leg::Refused.role()] {
+        assert!(
+            message.contains(named),
+            "case {:?}: expected the message to name {named:?}, got {message:?}",
+            Leg::Refused.case()
+        );
+    }
+
     // ---- One record on the shared source, which each deployed stream retrieves for
     // itself — if its role lets it. ----
     let (status, answered) = json_rpc(
@@ -396,32 +452,8 @@ async fn a_deployed_streams_retrieval_follows_the_permissions_its_source_role_ca
         String::from_utf8_lossy(&held)
     );
 
-    // ---- And the refused read is reported where that stream's logging says, under the one
-    // error code that condition carries, naming the refused call, the source and the role. ----
-    let document = await_reported(&router, Leg::Refused).await;
-    assert_eq!(
-        document["errorCode"],
-        json!(REFUSED_ERROR_CODE),
-        "case {:?}: expected the reported errorCode {REFUSED_ERROR_CODE:?}, got {document}",
-        Leg::Refused.case()
-    );
-    let stream_arn = document["deliveryStreamARN"].as_str().unwrap_or_default();
-    assert!(
-        stream_arn.starts_with("arn:aws:firehose:")
-            && stream_arn.ends_with(&format!(":deliverystream/{}", Leg::Refused.stream())),
-        "case {:?}: expected the event to name its own stream, got {document}",
-        Leg::Refused.case()
-    );
-    let message = document["message"].as_str().unwrap_or_default().to_string();
-    for named in [RECORDS_READ, &source_stream(), &Leg::Refused.role()] {
-        assert!(
-            message.contains(named),
-            "case {:?}: expected the message to name {named:?}, got {message:?}",
-            Leg::Refused.case()
-        );
-    }
-    // Nothing of a refused retrieval reaches the destination, and the permitted stream
-    // reports nothing at all, at every reading over one more window.
+    // ---- And the refused retrieval delivers nothing, while the permitted stream reports
+    // nothing at all, at every reading over one more window. ----
     let until = Instant::now() + SILENCE_WINDOW;
     while Instant::now() < until {
         let keys = keys_under(&router, &Leg::Refused.prefix()).await;

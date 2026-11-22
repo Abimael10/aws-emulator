@@ -1158,6 +1158,20 @@ pub fn unreadable_glue_table_message(role_arn: &str) -> String {
     )
 }
 
+/// A call on a source a stream's configuration names that the role it names may not make: the
+/// role, the refused call and the resource it was refused on, stated as the refusal states it.
+///
+/// The same sentence Firehose states for the Data Catalog read above
+/// ([`unreadable_glue_table_message`]) — an authorization answer about the configuration's own
+/// role, in the `Role <role> is not authorized to perform: <action> on resource <resource>`
+/// form — because it is the same kind of answer: the permissions in force on a role the
+/// caller supplied do not admit a call Firehose would make under it. Every variable part is
+/// read from the request: the role and the resource are the caller's own values, and the
+/// action is the call that was refused.
+pub fn unauthorized_source_read_message(role_arn: &str, action: &str, source_arn: &str) -> String {
+    format!("Role {role_arn} is not authorized to perform: {action} on resource {source_arn}.")
+}
+
 /// The `com-amazonaws-firehose-firehose-20150804` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

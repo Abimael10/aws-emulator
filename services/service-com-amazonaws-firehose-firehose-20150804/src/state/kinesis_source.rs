@@ -78,7 +78,7 @@ use crate::state::{
 pub mod source_read_authorization;
 
 pub use source_read_authorization::{
-    SourceReadDecision, KINESIS_ACCESS_DENIED, SOURCE_AUTHORIZATION_SPAN,
+    unreadable_source, SourceReadDecision, KINESIS_ACCESS_DENIED, SOURCE_AUTHORIZATION_SPAN,
 };
 
 /// The `DeliveryStreamType` whose records come from a Kinesis data stream:

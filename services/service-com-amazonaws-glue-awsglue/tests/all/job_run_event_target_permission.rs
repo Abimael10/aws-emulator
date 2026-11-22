@@ -76,8 +76,10 @@ const ROLE_NAME: &str = "glue-job-event-target-role";
 /// The run's lifecycle and the publication are both the service's own clock's, so what is
 /// waited for is the CONDITION (the envelope on the queue) against a deadline far longer than
 /// the spans involved: a loaded or a fast host reaches the same verdict, and nothing here
-/// asserts on how long it took.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(120);
+/// asserts on how long it took. The deadline is generous because this suite RUNS the job's
+/// script, which is the one piece of work here that a loaded host slows down: the rest of the
+/// workspace's tests running beside it must not be able to decide this case.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(240);
 const DELIVERY_POLL: Duration = Duration::from_millis(50);
 
 /// An emulator with Glue, IAM, Amazon S3, EventBridge AND SQS on one shared engine.

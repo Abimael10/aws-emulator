@@ -57,8 +57,14 @@ const TRUSTED_ROLE: &str = "firehose-source-rule";
 /// role.
 const ABSENT_ROLE: &str = "never-created-role";
 
-/// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern.
+/// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern, naming the bucket the setup
+/// creates: Firehose resolves a destination's bucket against Amazon S3 when the stream is
+/// written, so it is there for every row and what a row varies is its SOURCE.
+const BUCKET: &str = "demo-bucket";
 const BUCKET_ARN: &str = "arn:aws:s3:::demo-bucket";
+
+/// The Kinesis data stream every `KinesisStreamSourceConfiguration` below names.
+const UPSTREAM_ARN: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/upstream";
 
 /// Every value of `DeliveryStreamType`
 /// (`smithy_query(query="shape",shape="DeliveryStreamType")`).
@@ -95,9 +101,21 @@ fn firehose_trust_policy() -> String {
 /// stream and the role Firehose reads it under.
 fn kinesis_source(role: &str) -> Value {
     json!({
-        "KinesisStreamARN": format!("arn:aws:kinesis:{REGION}:000000000000:stream/upstream"),
+        "KinesisStreamARN": UPSTREAM_ARN,
         "RoleARN": role,
     })
+}
+
+/// The source read the role of a `KinesisStreamSourceConfiguration` has to be allowed to
+/// make: Firehose resolves it when the stream is written, so the trusted role states it and a
+/// row's outcome is about its source configuration rather than about that permission. Written
+/// with no `&`, `=`, `+` or `%`, so it travels in an `awsQuery` form body as written.
+fn source_read_policy() -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Action\":[\"kinesis:DescribeStream\",\"kinesis:GetShardIterator\",\
+         \"kinesis:GetRecords\"],\"Resource\":\"{UPSTREAM_ARN}\"}}]}}"
+    )
 }
 
 /// An `MSKSourceConfiguration`: the cluster, the topic and the authentication Firehose
@@ -495,6 +513,32 @@ fn firehose(
     (status, parsed)
 }
 
+/// Create the bucket every row's destination names: `PUT /<bucket>` on Amazon S3's own wire.
+fn create_bucket(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    bucket: &str,
+) {
+    let host = format!("s3.{REGION}.amazonaws.com");
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("https://{host}/{bucket}"))
+        .header("host", host)
+        .header("authorization", authorization("s3"))
+        .body(bytes::Bytes::from(format!(
+            "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        )))
+        .expect("a well-formed request");
+    let response = runtime.block_on(router.dispatch(request));
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "setup: the destination bucket {bucket} must be created, got {}",
+        String::from_utf8_lossy(response.body())
+    );
+}
+
 /// The wire error code, without its namespace.
 fn error_code(body: &Value) -> String {
     body.get("__type")
@@ -571,6 +615,23 @@ fn a_create_ignores_every_source_configuration_its_declared_type_is_not_fed_by()
                 ],
             );
             assert_eq!(status, 200, "setup: CreateRole got {status} {body}");
+
+            // The two resources a create resolves beside its source configuration, so that no
+            // row below is answered for one of them: the destination bucket Amazon S3 has to
+            // hold, and the source read the trusted role has to be allowed to make.
+            let read = source_read_policy();
+            let (status, body) = iam(
+                &router,
+                &runtime,
+                "PutRolePolicy",
+                &[
+                    ("RoleName", TRUSTED_ROLE),
+                    ("PolicyName", "source-read"),
+                    ("PolicyDocument", read.as_str()),
+                ],
+            );
+            assert_eq!(status, 200, "setup: PutRolePolicy got {status} {body}");
+            create_bucket(&router, &runtime, BUCKET);
 
             let cases = cases();
 
