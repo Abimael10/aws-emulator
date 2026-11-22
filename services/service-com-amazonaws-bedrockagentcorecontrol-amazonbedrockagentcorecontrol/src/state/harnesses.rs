@@ -228,6 +228,29 @@ impl HarnessRecord {
         }
     }
 
+    /// This harness's `HarnessSummary`, as a listing of harnesses reports it at
+    /// `now`.
+    ///
+    /// Rendered from the same record [`Self::harness`] reads, so a summary and a
+    /// full read cannot disagree on the identity, the version, the status or the
+    /// timestamps of one harness. `HarnessSummary` carries only the identity, the
+    /// status, the timestamps and the latest version
+    /// (`smithy_query shape=HarnessSummary`) — the configuration stays with the
+    /// full read.
+    pub fn summary(&self, now: SystemTime) -> HarnessSummary {
+        HarnessSummary {
+            harness_id: self.harness_id.clone(),
+            harness_name: self.harness_name.clone(),
+            arn: self.harness_arn.clone(),
+            status: self.status_at(now).to_string(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            // The latest version this harness holds; a create publishes the
+            // first, and only an update publishes another.
+            harness_version: Some(self.version_string()),
+        }
+    }
+
     /// Every version this harness holds, keyed by [`harness_version_key`] so the
     /// map's own order IS ascending version order.
     ///

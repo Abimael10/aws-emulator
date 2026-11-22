@@ -176,8 +176,8 @@ struct Route {
 
 /// Rule 1: every modelled harness route reaches the operation bound there.
 ///
-/// Rows differ along the method, the URI depth, the operation's implementation state
-/// (implemented, scaffolded) and the answer's class (success, modelled error, 501). Every
+/// Rows differ along the method, the URI depth and the answer's class (success, modelled
+/// error). Every
 /// row asserts the SAME thing about the envelope: this service answered, so the error code
 /// is never the router's `UnknownService` and the content type is always this service's
 /// `restJson1` `application/json` — never the router's `application/x-amz-json-1.1`.
@@ -236,12 +236,12 @@ async fn every_modelled_harness_route_reaches_its_own_operation() {
             error_type: "",
         },
         Route {
-            case: "ListHarnesses, scaffolded",
+            case: "ListHarnesses, implemented",
             method: "GET",
             uri: "/harnesses".to_string(),
             body: None,
-            status: 501,
-            error_type: "NotImplemented",
+            status: 200,
+            error_type: "",
         },
         Route {
             case: "CreateHarnessEndpoint on a stored harness, implemented",

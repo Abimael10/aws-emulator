@@ -120,6 +120,7 @@ use crate::ops::types::{
     HarnessEndpoint,
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
+    HarnessSummary,
     HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration, HarnessVersionSummary,
     HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, KmsConfiguration,
     LifecycleConfiguration,

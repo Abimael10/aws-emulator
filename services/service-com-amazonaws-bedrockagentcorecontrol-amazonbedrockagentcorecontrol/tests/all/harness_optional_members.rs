@@ -323,7 +323,6 @@ async fn a_create_omitting_a_required_member_is_refused_and_creates_nothing() {
 
     // Nothing a refused create left behind: the name one of them carried is still this
     // account's to use, which it would not be if the refused create had stored a harness.
-    // (`ListHarnesses` is still a stub in this emulator, so the name is the observable.)
     let created = send(
         &router,
         "POST",
