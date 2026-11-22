@@ -18,9 +18,9 @@ use std::collections::HashMap;
 
 use crate::ops::types::{
     AccessGrant, AccessGrantPrincipal, AccessGrantSummary, AccessProfile, AccessProfileSummary,
-    Alert, AlertStateInfo, Domain, EncryptionConfiguration, IdentityProviderConfiguration,
-    NotificationRule, OmniDashboard, OmniDashboardSummary, Rule, Space, SpaceSummary,
-    ALERT_STATE_VALUES, COMPARATOR_VALUES, ENCRYPTION_STRATEGY_VALUES,
+    Alert, AlertStateInfo, Domain, DomainSummary, EncryptionConfiguration,
+    IdentityProviderConfiguration, NotificationRule, OmniDashboard, OmniDashboardSummary, Rule,
+    Space, SpaceSummary, ALERT_STATE_VALUES, COMPARATOR_VALUES, ENCRYPTION_STRATEGY_VALUES,
     NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES, THRESHOLD_MODE_VALUES,
 };
 
@@ -167,10 +167,10 @@ pub const OMNI_DASHBOARD_ARN_RESOURCE_TYPE: &str = "omni-dashboard";
 /// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboards`] and, with
 /// it, `create_omni_dashboard_tokens` (one entry per live dashboard) — and therefore the
-/// per-request work [`omni_dashboard_named`] does under the store lock, which is linear
+/// per-request work [`omni_dashboards_after`] does under the store lock, which is linear
 /// in the number of stored dashboards.
 ///
-/// [`omni_dashboard_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboard_named
+/// [`omni_dashboards_after`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboards_after
 pub const OMNI_DASHBOARD_QUOTA: usize = 10_000;
 
 /// The resource type an alert's ARN carries, as the model's own `CreateAlert` examples
@@ -219,10 +219,9 @@ pub const VIEW_TYPE_USER: &str = "USER";
 /// How many views the store holds before `CreateView` refuses.
 ///
 /// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]: it bounds
-/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::views`] and, with it,
-/// `create_view_tokens` (one entry per live view), so neither can grow without end.
-/// `CreateView` declares no quota error, so the refusal past this bound is its modelled
-/// `ValidationException`.
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::views`], so it cannot grow
+/// without end. `CreateView` declares no quota error, so the refusal past this bound is
+/// its modelled `ValidationException`.
 pub const VIEW_QUOTA: usize = 10_000;
 
 /// A dashboard as persisted. The wire `OmniDashboard` shape carries no parent id, so
@@ -351,12 +350,13 @@ pub struct StoredView {
 /// Every map here is BOUNDED: `domains` (and the token map keyed one-to-one to a live
 /// domain) by the one-domain-per-account rule a create is admitted under
 /// ([`DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT`]), `spaces` (and the token map keyed to a live
-/// space) by [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live
+/// space) by the one-space-per-Region rule and, above it, [`SPACE_QUOTA`],
+/// `access_profiles` (and the token map keyed to a live
 /// profile) by
 /// [`ACCESS_PROFILE_QUOTA`], `access_grants` (and the token map keyed to a live grant)
 /// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
 /// dashboard) by [`OMNI_DASHBOARD_QUOTA`], `alerts` (and the token map keyed to a live
-/// alert) by [`ALERT_QUOTA`], `views` (and the token map keyed to a live view) by
+/// alert) by [`ALERT_QUOTA`], `views` by
 /// [`VIEW_QUOTA`], and `query_sessions` by [`QUERY_SESSION_QUOTA`]. The quota-bounded
 /// creates refuse with the modelled
 /// `ServiceQuotaExceededException` once their bound is reached, and the deletes release
@@ -370,7 +370,9 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     /// most one account-scoped domain, so this map holds at most one record — see
     /// [`DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT`] for the rule that keeps it that way.
     pub domains: HashMap<String, StoredDomain>,
-    /// Every persisted space, keyed by its `spaceId`.
+    /// The account's persisted spaces, keyed by their `spaceId`. An account holds at
+    /// most one space per Region, so this map holds at most one record per Region — see
+    /// [`space_already_exists_message`] for the rule that keeps it that way.
     pub spaces: HashMap<String, StoredSpace>,
     /// `CreateDomain` `clientToken` -> the `domainId` that token created.
     pub create_domain_tokens: HashMap<String, String>,
@@ -386,18 +388,22 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub create_access_grant_tokens: HashMap<String, String>,
     /// Every persisted dashboard, keyed by its `dashboardId`.
     pub omni_dashboards: HashMap<String, StoredOmniDashboard>,
-    /// `CreateOmniDashboard` `clientToken` -> the `dashboardId` that token created.
-    pub create_omni_dashboard_tokens: HashMap<String, String>,
+    /// (`spaceId`, `CreateOmniDashboard` `clientToken`) -> the `dashboardId` that token
+    /// created in that space. Keyed by the space as well as the token, because a
+    /// dashboard belongs to one space: a token presented against another space resolves
+    /// nothing rather than reporting a dashboard of a space the caller was not authorized
+    /// for.
+    pub create_omni_dashboard_tokens: HashMap<(String, String), String>,
     /// Every persisted alert, keyed by its `alertId`.
     pub alerts: HashMap<String, StoredAlert>,
     /// `CreateAlert` `clientToken` -> the `alertId` that token created.
     pub create_alert_tokens: HashMap<String, String>,
     /// Every persisted view, keyed by its name — which is a view's identity, since
     /// `CreateView`'s doc reads "View names must be unique within the account and
-    /// region" and every view operation addresses one by name.
+    /// region" and every view operation addresses one by name. A create under a live name
+    /// is refused, so no idempotency token is remembered for a view: there is never a
+    /// second record for one to collapse onto.
     pub views: HashMap<String, StoredView>,
-    /// `CreateView` `clientToken` -> the view name that token created.
-    pub create_view_tokens: HashMap<String, String>,
     /// Every telemetry query session the store holds, keyed by the `sessionId` the
     /// backend minted for it — which is what `StartTelemetryQuery` and
     /// `StopTelemetryQuerySession` address a session by.
@@ -418,6 +424,21 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub fn next_seq(&mut self) -> u64 {
         self.next_seq += 1;
         self.next_seq
+    }
+
+    /// Every stored domain in creation order, skipping everything at or before
+    /// `after_seq`.
+    ///
+    /// Bounded by the one-domain-per-account rule a create is admitted under
+    /// ([`DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT`]).
+    pub fn domains_after(&self, after_seq: u64) -> Vec<&StoredDomain> {
+        let mut selected: Vec<&StoredDomain> = self
+            .domains
+            .values()
+            .filter(|stored| stored.seq > after_seq)
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
     }
 
     /// Every stored space in creation order, optionally restricted to one parent
@@ -627,45 +648,86 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         ))
     }
 
-    /// The ids of the access grants that reference the access profile `profile_id`.
+    /// The ids of the access grants that are HELD BY the access profile `profile_id` —
+    /// the grants whose principal is that profile.
     ///
-    /// `DeleteAccessProfile`'s doc: "An access profile cannot be deleted while access
-    /// grants reference it." A grant references a profile either way round: its resource
-    /// scopes name the profile, which is what [`access_profiles_scoped_by`] records as
-    /// the profile's `assume_grant_ids`, or the profile IS the principal the grant is
-    /// held by ([`ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE`] with that `principalId`).
+    /// `AccessGrantPrincipalType`'s ACCESS_PROFILE value ("An access profile.") makes the
+    /// profile the principal a grant authorizes, so such a grant is an authorization OF
+    /// that profile and cannot outlive it: deleting the profile deletes them.
     ///
     /// Linear in the number of stored grants, which [`ACCESS_GRANT_QUOTA`] bounds.
-    ///
-    /// [`access_profiles_scoped_by`]: Self::access_profiles_scoped_by
-    pub fn grants_referencing_profile(&self, profile_id: &str) -> Vec<String> {
-        let scoped = self
-            .access_profiles
-            .get(profile_id)
-            .map(|stored| stored.assume_grant_ids.clone())
-            .unwrap_or_default();
-        let mut referencing: Vec<String> = self
+    pub fn grants_held_by_profile(&self, profile_id: &str) -> Vec<String> {
+        let mut held: Vec<String> = self
             .access_grants
             .values()
             .filter(|stored| {
                 let principal = &stored.grant.principal;
-                scoped.contains(&stored.grant.grant_id)
-                    || (principal.principal_type == ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE
-                        && principal.principal_id.as_deref() == Some(profile_id))
+                principal.principal_type == ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE
+                    && principal.principal_id.as_deref() == Some(profile_id)
             })
             .map(|stored| stored.grant.grant_id.clone())
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// The ids of the access grants that REFERENCE the access profile `profile_id`: the
+    /// grants some other principal holds whose resource scopes name this profile.
+    ///
+    /// `DeleteAccessProfile`'s doc: "An access profile cannot be deleted while access
+    /// grants reference it." A grant references the profile when its resource scopes
+    /// reach it — which is what [`access_profiles_scoped_by`] records as the profile's
+    /// `assume_grant_ids` — because the access it grants is access TO this profile,
+    /// granted to someone else. A grant the profile itself holds is not a reference to it
+    /// but an authorization of it ([`grants_held_by_profile`]).
+    ///
+    /// Linear in the number of stored grants, which [`ACCESS_GRANT_QUOTA`] bounds.
+    ///
+    /// [`access_profiles_scoped_by`]: Self::access_profiles_scoped_by
+    /// [`grants_held_by_profile`]: Self::grants_held_by_profile
+    pub fn grants_referencing_profile(&self, profile_id: &str) -> Vec<String> {
+        let held = self.grants_held_by_profile(profile_id);
+        let mut referencing: Vec<String> = self
+            .access_profiles
+            .get(profile_id)
+            .map(|stored| stored.assume_grant_ids.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|grant_id| !held.contains(grant_id))
+            .filter(|grant_id| self.access_grants.contains_key(grant_id))
             .collect();
         referencing.sort();
         referencing
     }
 
-    /// The dashboard `space_id` holds under `name`, if the store holds one.
+    /// Remove the access profile `profile_id` and the grants it holds, as deleting the
+    /// profile does, and report the grants that went with it.
     ///
-    /// Linear in the number of stored dashboards, which [`OMNI_DASHBOARD_QUOTA`] bounds.
-    pub fn omni_dashboard_named(&self, space_id: &str, name: &str) -> Option<&StoredOmniDashboard> {
-        self.omni_dashboards
-            .values()
-            .find(|stored| stored.space_id == space_id && stored.dashboard.name == name)
+    /// A grant whose principal is the profile is an authorization OF that profile
+    /// ([`grants_held_by_profile`]), so it goes when the profile goes: the principal it
+    /// names no longer exists, so nothing could address or evaluate it afterwards. A
+    /// removed grant is also no longer recorded against any profile, the same way
+    /// deleting a grant through the API withdraws the trust it recorded, and the create
+    /// tokens that minted the removed records no longer name live resources — so a later
+    /// replay of either create mints a new record rather than resurrecting this one.
+    ///
+    /// [`grants_held_by_profile`]: Self::grants_held_by_profile
+    pub fn remove_access_profile(&mut self, profile_id: &str) -> Vec<String> {
+        let held = self.grants_held_by_profile(profile_id);
+        self.access_profiles.remove(profile_id);
+        self.create_access_profile_tokens
+            .retain(|_, minted| minted != profile_id);
+        for grant_id in &held {
+            self.access_grants.remove(grant_id);
+        }
+        self.create_access_grant_tokens
+            .retain(|_, grant_id| !held.contains(grant_id));
+        for profile in self.access_profiles.values_mut() {
+            profile
+                .assume_grant_ids
+                .retain(|grant_id| !held.contains(grant_id));
+        }
+        held
     }
 
     /// Every stored access grant that matches every filter the request supplied, in
@@ -1118,6 +1180,31 @@ pub fn reported_identity_provider_configuration(
     Some(configuration.unwrap_or_default())
 }
 
+/// Project a stored domain into the `DomainSummary` `ListDomains` returns.
+///
+/// Every `DomainSummary` member is read from the persisted domain rather than from the
+/// request: the ones `Domain` carries under the same name are copied, and
+/// `identityCenterInstanceArn` — "Identity Center instance ARN configured for the
+/// domain. Absent for IAM-only domains" — is the instance the domain's identity-provider
+/// configuration names, so a domain configured with no Identity Center instance reports
+/// no ARN.
+pub fn domain_summary(domain: &Domain) -> DomainSummary {
+    DomainSummary {
+        domain_id: domain.domain_id.clone(),
+        domain_arn: Some(domain.domain_arn.clone()),
+        name: domain.name.clone(),
+        identity_center_instance_arn: domain
+            .identity_provider_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.identity_center_configuration.as_ref())
+            .and_then(|center| center.identity_center_instance_arn.clone()),
+        region: Some(domain.region.clone()),
+        created_at: domain.created_at,
+        updated_at: domain.updated_at,
+        status: domain.status.clone(),
+    }
+}
+
 /// Project a stored space into the `SpaceSummary` the list operations return.
 ///
 /// Every `SpaceSummary` member is a member of `Space` with the same name, so the
@@ -1511,6 +1598,11 @@ pub use query_session::{
 /// rather than about one request.
 mod domain_admission;
 
+/// The rule a space create is admitted under, and the text its refusal carries. It lives
+/// beside the store because the rule is a fact about the account's spaces in a Region
+/// rather than about one request.
+mod space_admission;
+
 /// Whether a request may act on the space it addresses. It lives beside the store
 /// because the decision is read from the account's space records, which every operation
 /// that addresses a space reads too.
@@ -1522,6 +1614,8 @@ pub use domain_admission::{
     client_token_required_message, identity_center_instance_required,
     DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT, IDENTITY_CENTER_INSTANCE_REQUIRED,
 };
+
+pub use space_admission::space_already_exists_message;
 
 pub use resource_not_found::{
     alert_not_found_message, dashboard_not_found_message, view_not_found_message,
@@ -1590,6 +1684,9 @@ pub fn omni_dashboard_summary(dashboard: &OmniDashboard) -> OmniDashboardSummary
 /// cannot be replayed against another.
 const SPACE_PAGE_TOKEN_PREFIX: &str = "spaces:";
 
+/// The prefix a domain-list page token carries, for the same reason.
+const DOMAIN_PAGE_TOKEN_PREFIX: &str = "domains:";
+
 /// The prefix a dashboard-list page token carries, for the same reason.
 const OMNI_DASHBOARD_PAGE_TOKEN_PREFIX: &str = "omni-dashboards:";
 
@@ -1610,6 +1707,17 @@ fn decode_page_token(prefix: &str, token: &str) -> Option<u64> {
 /// Mint the opaque `nextToken` that resumes a space listing after `seq`.
 pub fn encode_space_page_token(seq: u64) -> String {
     encode_page_token(SPACE_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Mint the opaque `nextToken` that resumes a domain listing after `seq`.
+pub fn encode_domain_page_token(seq: u64) -> String {
+    encode_page_token(DOMAIN_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Read a domain-list `nextToken` back, or `None` when it is not one this service minted
+/// for a domain listing.
+pub fn decode_domain_page_token(token: &str) -> Option<u64> {
+    decode_page_token(DOMAIN_PAGE_TOKEN_PREFIX, token)
 }
 
 /// Read a space-list `nextToken` back, or `None` when it is not one this service minted.

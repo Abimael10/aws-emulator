@@ -249,13 +249,18 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (the router's routing key) and the region the handlers record.
 fn signed_request_parts() -> http::request::Parts {
+    signed_request_parts_in(REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+fn signed_request_parts_in(region: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -265,6 +270,36 @@ fn signed_request_parts() -> http::request::Parts {
     parts
 }
 
+/// The Regions a suite signs its space creates for, this suite's own first.
+///
+/// An account holds at most ONE space per Region, so a case needing more than one space
+/// creates each in a Region of its own; everything after the create addresses the space
+/// by its id, which no Region scopes. Every suite of this crate that needs a second space
+/// shares this list, so one rule is stated in one place. The entries are real AWS Region
+/// codes, because a Region reaches a space's `region` member and its ARN.
+pub const SPACE_REGIONS: [&str; 20] = [
+    REGION,
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "ca-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-south-1",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "sa-east-1",
+    "me-south-1",
+    "af-south-1",
+];
+
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
 struct Omni {
@@ -272,6 +307,9 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// How many spaces this emulator has created through [`Omni::next_space_region`],
+    /// which picks each create's Region out of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
 }
 
 impl Omni {
@@ -287,7 +325,19 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The Region the next space this emulator creates is signed for.
+    fn next_space_region(&self) -> &'static str {
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own")
     }
 
     fn ctx(&self) -> OperationContext<'_> {
@@ -344,6 +394,24 @@ impl Omni {
     ) -> Result<CreateSpaceOutput, CreateSpaceError> {
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    /// The same create, signed for `region` rather than for the suite's own — which is
+    /// what a case needing more than one space of the account uses.
+    async fn create_space_in_region(
+        &self,
+        input: &CreateSpaceInput,
+        region: &str,
+    ) -> Result<CreateSpaceOutput, CreateSpaceError> {
+        let parts = signed_request_parts_in(region);
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
+        CreateSpace::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &ctx)
             .await
     }
 
@@ -493,11 +561,16 @@ async fn domain(omni: &Omni, case: &str, name: &str, providers: &[&str]) -> Doma
         .domain
 }
 
+/// A space of `domain_id`, created in a Region of its own ([`SPACE_REGIONS`]) so an
+/// account that already holds one elsewhere can still have it.
 async fn space(omni: &Omni, case: &str, name: &str, domain_id: &str) -> Space {
-    omni.create_space(&create_space_input(name, domain_id))
-        .await
-        .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
-        .space
+    omni.create_space_in_region(
+        &create_space_input(name, domain_id),
+        omni.next_space_region(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
+    .space
 }
 
 /// Walk every page of `ListSpaces` and return the space ids in the order they came
@@ -710,20 +783,23 @@ async fn create_space_derives_every_member_from_its_parent_and_round_trips() {
         },
     ];
 
-    for SpaceCase {
+    for (index, SpaceCase {
         name,
         requested_encryption,
         agent_role,
         expected_strategy,
         expected_key,
-    } in cases
+    }) in cases.into_iter().enumerate()
     {
-        let case = format!("name={name} strategy={expected_strategy}");
+        // Each row's space is the account's only one in its Region, so each is created in
+        // a Region of its own and every derived member is checked against THAT Region.
+        let region = SPACE_REGIONS[index];
+        let case = format!("name={name} strategy={expected_strategy} region={region}");
         let mut input = create_space_input(&name, &parent.domain_id);
         input.encryption_configuration = requested_encryption;
         input.agent_core_evaluation_role_arn = agent_role.map(str::to_string);
         let space = omni
-            .create_space(&input)
+            .create_space_in_region(&input, region)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
             .space;
@@ -736,7 +812,7 @@ async fn create_space_derives_every_member_from_its_parent_and_round_trips() {
         assert_eq!(
             space.space_arn,
             format!(
-                "arn:aws:cloudwatch:{REGION}:{}:space/{}",
+                "arn:aws:cloudwatch:{region}:{}:space/{}",
                 engine::EMULATOR_ACCOUNT_ID, space.space_id
             ),
             "case {case:?}: spaceArn is not built in the service's ARN namespace"
@@ -747,7 +823,7 @@ async fn create_space_derives_every_member_from_its_parent_and_round_trips() {
             "case {case:?}: domainArn was not copied from the parent domain"
         );
         assert_eq!(
-            space.region, REGION,
+            space.region, region,
             "case {case:?}: region is not the signed region"
         );
         assert!(
@@ -1389,15 +1465,18 @@ async fn an_idempotency_token_replay_returns_the_original_resource() {
             "case {case:?}: a CreateDomain replay did not return the original domain"
         );
 
+        // Each row's space is the account's only one in its Region, so the pair of
+        // creates the replay is observed through is signed for a Region of its own.
+        let region = SPACE_REGIONS[index];
         let mut space_input = create_space_input(&format!("idem-space-{index}"), &parent.domain_id);
         space_input.client_token = Some(token.clone());
         let first = omni
-            .create_space(&space_input)
+            .create_space_in_region(&space_input, region)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
             .space;
         let replay = omni
-            .create_space(&space_input)
+            .create_space_in_region(&space_input, region)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: the replay failed: {error:?}"))
             .space;
@@ -1716,13 +1795,19 @@ async fn the_modelled_input_constraints_refuse_what_they_declare() {
 #[tokio::test]
 async fn the_space_store_is_bounded_and_refuses_past_its_quota() {
     // Same bound for spaces, and a delete frees a slot again.
+    //
+    // An account holds one space per Region, so each of these spaces is created in a
+    // Region of its own: the credential scope's Region is what gives a space its slot,
+    // and [`SPACE_QUOTA`] is the store's own bound ABOVE that rule, which is what stops
+    // the store growing over Regions without end.
     let omni = Omni::new();
     let parent = domain(&omni, "quota", "omni-space-quota", &["IAM"]).await;
     let input = create_space_input("quota-space", &parent.domain_id);
+    let slot = |index: usize| format!("us-quota-{index}");
     let mut last = String::new();
     for index in 0..SPACE_QUOTA {
         last = omni
-            .create_space(&input)
+            .create_space_in_region(&input, &slot(index))
             .await
             .unwrap_or_else(|error| panic!("space {index} within the quota failed: {error:?}"))
             .space
@@ -1730,7 +1815,7 @@ async fn the_space_store_is_bounded_and_refuses_past_its_quota() {
     }
     expect_modelled_error(
         "one space past SPACE_QUOTA",
-        omni.create_space(&input).await,
+        omni.create_space_in_region(&input, &slot(SPACE_QUOTA)).await,
         402,
         "ServiceQuotaExceededException",
     );
@@ -1738,12 +1823,13 @@ async fn the_space_store_is_bounded_and_refuses_past_its_quota() {
     omni.delete_space(&last)
         .await
         .expect("deleting a space releases its slot");
-    omni.create_space(&input)
+    omni.create_space_in_region(&input, &slot(SPACE_QUOTA + 1))
         .await
         .expect("a freed slot accepts another space");
     expect_modelled_error(
         "full again",
-        omni.create_space(&input).await,
+        omni.create_space_in_region(&input, &slot(SPACE_QUOTA + 2))
+            .await,
         402,
         "ServiceQuotaExceededException",
     );

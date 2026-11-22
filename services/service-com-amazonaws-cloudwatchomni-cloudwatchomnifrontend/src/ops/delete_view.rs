@@ -165,11 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.views.remove(&input.name);
-        // The create token that minted this view no longer names a live resource, so a
-        // later replay of that create mints a new view rather than resurrecting this one.
-        store
-            .create_view_tokens
-            .retain(|_, name| *name != input.name);
         drop(store);
 
         audit(ctx, &input.name, "deleted");

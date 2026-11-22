@@ -148,13 +148,21 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 /// name (the router's routing key), the region the handlers record, and `access_key_id` —
 /// which is the principal the handlers read the caller's identity from.
 fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
+    signed_request_parts_in(access_key_id, REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+///
+/// An account holds at most ONE space per Region, so a case needing a second space signs
+/// that create for another Region ([`SPACE_REGIONS`]).
+fn signed_request_parts_in(access_key_id: &str, region: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -163,6 +171,11 @@ fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
         .into_parts();
     parts
 }
+
+/// The Regions this suite signs its space creates for, from the suite that owns the
+/// space rule: an account holds at most one space per Region, so each space a case needs
+/// is created in a Region of its own.
+use super::domain_space_lifecycle::SPACE_REGIONS;
 
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
@@ -175,6 +188,9 @@ struct Omni {
     /// owner may always assume it, so what a GRANT authorizes is observed through a
     /// principal that owns nothing here.
     other_parts: http::request::Parts,
+    /// How many spaces this emulator has created, which picks each create's Region out
+    /// of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
 }
 
 impl Omni {
@@ -191,6 +207,7 @@ impl Omni {
             router,
             parts: signed_request_parts(ACCESS_KEY_ID),
             other_parts: signed_request_parts("AKIDSOMEONEELSE"),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -232,8 +249,34 @@ impl Omni {
             .domain_id
     }
 
+    /// The Region the next space this emulator creates is signed for.
+    ///
+    /// An account holds at most ONE space per Region, so each space a case needs is
+    /// created in a Region of its own; everything after the create addresses the space by
+    /// its id, which no Region scopes.
+    fn next_space_region(&self) -> &'static str {
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own")
+    }
+
+    /// The request metadata a space create signed for `region` carries.
+    fn space_parts(&self, region: &str) -> http::request::Parts {
+        signed_request_parts_in(ACCESS_KEY_ID, region)
+    }
+
     /// A space of `domain_id`, through the handler that owns it.
     async fn space(&self, case: &str, domain_id: &str, name: &str) -> String {
+        let parts = self.space_parts(self.next_space_region());
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
@@ -242,7 +285,7 @@ impl Omni {
                     data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
                     ..Default::default()
                 },
-                &self.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
@@ -1529,6 +1572,13 @@ async fn creating_a_space_provisions_its_service_managed_access_control() {
 
     for (index, row) in space_rows().into_iter().enumerate() {
         let case = row.case;
+        let region = omni.next_space_region();
+        let parts = omni.space_parts(region);
+        let ctx = OperationContext::new(
+            &parts,
+            omni.service.definition().identity(),
+            EmbeddedEmulator::from_router(omni.router.clone()),
+        );
         let space = CreateSpace::new(Arc::clone(&omni.engine))
             .handle(
                 CreateSpaceInput {
@@ -1540,7 +1590,7 @@ async fn creating_a_space_provisions_its_service_managed_access_control() {
                     agent_core_evaluation_role_arn: row.agent_core_evaluation_role_arn.clone(),
                     ..Default::default()
                 },
-                &omni.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
@@ -1598,8 +1648,8 @@ async fn creating_a_space_provisions_its_service_managed_access_control() {
             profile
                 .arn
                 .ends_with(&format!(":access-profile/{profile_id}"))
-                && profile.arn.contains(&format!(":{REGION}:")),
-            "case {case:?}: the provisioned profile's ARN {:?} does not name it in {REGION}",
+                && profile.arn.contains(&format!(":{region}:")),
+            "case {case:?}: the provisioned profile's ARN {:?} does not name it in {region}",
             profile.arn
         );
         assert!(

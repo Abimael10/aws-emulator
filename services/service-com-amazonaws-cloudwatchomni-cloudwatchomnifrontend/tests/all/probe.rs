@@ -45,10 +45,9 @@ async fn status_of(operation: &str) -> (u16, String) {
 
 #[tokio::test]
 async fn an_operation_outside_this_slice_still_answers_501() {
-    // Both rows take an all-optional input, so an empty body is a complete request
-    // and the only thing that can decide the answer is whether the operation is
-    // implemented.
-    for operation in ["ListDomains", "ListIntegrations"] {
+    // The row takes an all-optional input, so an empty body is a complete request and
+    // the only thing that can decide the answer is whether the operation is implemented.
+    for operation in ["ListIntegrations"] {
         let (status, body) = status_of(operation).await;
         assert_eq!(
             status, 501,
@@ -63,15 +62,20 @@ async fn an_operation_outside_this_slice_still_answers_501() {
 
 #[tokio::test]
 async fn an_operation_in_this_slice_no_longer_answers_501() {
-    // `ListSpaces` is in the slice and also takes an all-optional input, so the same
-    // empty-body request that proves the rows above are stubs proves this one is not.
-    let (status, body) = status_of("ListSpaces").await;
-    assert_eq!(
-        status, 200,
-        "ListSpaces is implemented and must serve an empty store, got {status}: {body:?}"
-    );
-    assert!(
-        !body.contains("NotImplemented"),
-        "ListSpaces must not answer the scaffold signal, got {body:?}"
-    );
+    // `ListSpaces` and `ListDomains` are implemented and also take an all-optional
+    // input, so the same empty-body request that proves the row above is a stub proves
+    // these are not.
+    for operation in ["ListSpaces", "ListDomains"] {
+        let (status, body) = status_of(operation).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?}: an implemented operation must serve an empty store, got \
+             {status}: {body:?}"
+        );
+        assert!(
+            !body.contains("NotImplemented"),
+            "case {operation:?}: an implemented operation must not answer the scaffold \
+             signal, got {body:?}"
+        );
+    }
 }

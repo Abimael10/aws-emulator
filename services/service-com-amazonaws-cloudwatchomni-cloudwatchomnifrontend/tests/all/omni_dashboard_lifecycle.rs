@@ -26,8 +26,10 @@
 //!   authorizes nobody, so a read, a create, a patch or a delete addressing it is
 //!   refused `AccessDeniedException` (403) BEFORE the dashboard is looked for, before
 //!   anything is written and before the body's schema is read at all;
-//! * a name already identifying a dashboard of that space cannot identify a second one;
-//! * `@idempotencyToken` replays return the original dashboard.
+//! * a dashboard's identity is its minted `dashboardId`: a name identifies as many
+//!   dashboards of a space as are created under it, each its own record;
+//! * `@idempotencyToken` replays return the original dashboard — under the SPACE the
+//!   token created it in, so a token presented against another space replays nothing.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row
 //! of the table that broke.
@@ -117,6 +119,14 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (the router's routing key), the region the handlers record and `access_key_id`.
 fn signed_request_parts(access_key_id: Option<&str>) -> http::request::Parts {
+    signed_request_parts_in(access_key_id, REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+///
+/// An account holds at most ONE space per Region, so a case needing a second space signs
+/// that create for another Region ([`SPACE_REGIONS`]).
+fn signed_request_parts_in(access_key_id: Option<&str>, region: &str) -> http::request::Parts {
     let mut builder = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused");
@@ -124,7 +134,7 @@ fn signed_request_parts(access_key_id: Option<&str>) -> http::request::Parts {
         builder = builder.header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         );
@@ -136,6 +146,11 @@ fn signed_request_parts(access_key_id: Option<&str>) -> http::request::Parts {
     parts
 }
 
+/// The Regions this suite signs its space creates for, from the suite that owns the
+/// space rule: an account holds at most one space per Region, so each space a case needs
+/// is created in a Region of its own.
+use super::domain_space_lifecycle::SPACE_REGIONS;
+
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
 struct Omni {
@@ -143,6 +158,11 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The access key id every request of this emulator is signed with, or none.
+    access_key_id: Option<String>,
+    /// How many spaces this emulator has created, which picks each create's Region out
+    /// of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
     /// The account's one domain, remembered after the first space is created in it.
     domain: std::sync::Mutex<Option<String>>,
 }
@@ -165,6 +185,8 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(access_key_id),
+            access_key_id: access_key_id.map(str::to_string),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
             domain: std::sync::Mutex::new(None),
         }
     }
@@ -175,6 +197,17 @@ impl Omni {
             self.service.definition().identity(),
             EmbeddedEmulator::from_router(self.router.clone()),
         )
+    }
+
+    /// The Region the next space this emulator creates is signed for.
+    fn next_space_region(&self) -> &'static str {
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own")
     }
 
     /// The account's domain, created on first use.
@@ -209,8 +242,18 @@ impl Omni {
     }
 
     /// A space to create dashboards in, through the handlers that own those resources.
+    ///
+    /// An account holds at most ONE space per Region, so each space is created in a
+    /// Region of its own ([`SPACE_REGIONS`]); the dashboard calls that follow address the
+    /// space by its id, which no Region scopes.
     async fn space(&self, case: &str, name: &str) -> String {
         let domain_id = self.domain(case).await;
+        let parts = signed_request_parts_in(self.access_key_id.as_deref(), self.next_space_region());
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
@@ -219,7 +262,7 @@ impl Omni {
                     data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
                     ..Default::default()
                 },
-                &self.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
@@ -819,26 +862,79 @@ async fn a_space_the_account_does_not_hold_authorizes_no_dashboard_operation() {
 
 
 #[tokio::test]
-async fn a_name_identifies_one_dashboard_per_space() {
+async fn a_name_identifies_as_many_dashboards_of_a_space_as_are_created_under_it() {
     let omni = Omni::new();
     let first = omni.space("first", "dashboard-names-a").await;
     let second = omni.space("second", "dashboard-names-b").await;
 
-    // Rows span the name class: each is created once, refused the second time in the
-    // same space, and accepted in another space.
+    // Rows span the name class the model admits (`@length(1..256)`,
+    // `^[a-zA-Z0-9_.@~()-]+$`): each is created TWICE in the same space and once in
+    // another, and every create is its own dashboard.
     for name in ["a", "Checkout_latency.p99@~(prod)-view", &"n".repeat(256)] {
         let created = omni
             .create_dashboard(&create_input(&first, name, EMPTY_PANELS_BODY))
             .await
             .unwrap_or_else(|error| panic!("case {name:?}: the first create failed: {error:?}"))
             .omni_dashboard;
-        expect_modelled_error(
-            name,
-            omni.create_dashboard(&create_input(&first, name, EMPTY_PANELS_BODY))
-                .await,
-            409,
-            "ConflictException",
+        let twin = omni
+            .create_dashboard(&create_input(&first, name, EMPTY_PANELS_BODY))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {name:?}: the second create under the same name failed: {error:?}")
+            })
+            .omni_dashboard;
+        assert_ne!(
+            twin.dashboard_id, created.dashboard_id,
+            "case {name:?}: two creates under one name are two dashboards, got {:?} twice",
+            twin.dashboard_id
         );
+
+        // Both are readable and both are listed under that one name: the identity is the
+        // minted id, not the name.
+        for (which, dashboard_id) in [("the first", &created.dashboard_id), ("the second", &twin.dashboard_id)] {
+            let read = omni
+                .get_dashboard(&first, dashboard_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {name:?}: {which} dashboard does not read back: {error:?}")
+                })
+                .omni_dashboard;
+            assert_eq!(
+                read.name, name,
+                "case {name:?}: {which} dashboard reports name {:?}",
+                read.name
+            );
+        }
+        let listed = omni
+            .list_dashboards(&ListOmniDashboardsInput {
+                space_id: first.clone(),
+                name_prefix: Some(name.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {name:?}: ListOmniDashboards failed: {error:?}"));
+        let under_the_name: Vec<&str> = listed
+            .items
+            .iter()
+            .filter(|item| item.name == name)
+            .map(|item| item.dashboard_id.as_str())
+            .collect();
+        assert!(
+            under_the_name.contains(&created.dashboard_id.as_str())
+                && under_the_name.contains(&twin.dashboard_id.as_str()),
+            "case {name:?}: the listing must report both dashboards of that name, got {under_the_name:?}"
+        );
+
+        // Deleting one leaves the other readable: they are separate records.
+        omni.delete_dashboard(&first, &created.dashboard_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {name:?}: DeleteOmniDashboard failed: {error:?}"));
+        omni.get_dashboard(&first, &twin.dashboard_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {name:?}: deleting one dashboard of the name removed the other: {error:?}")
+            });
+
         let elsewhere = omni
             .create_dashboard(&create_input(&second, name, EMPTY_PANELS_BODY))
             .await
@@ -847,7 +943,7 @@ async fn a_name_identifies_one_dashboard_per_space() {
             })
             .omni_dashboard;
         assert_ne!(
-            elsewhere.dashboard_id, created.dashboard_id,
+            elsewhere.dashboard_id, twin.dashboard_id,
             "case {name:?}: the same name in another space is a different dashboard, got {:?} twice",
             elsewhere.dashboard_id
         );
@@ -871,6 +967,7 @@ async fn a_name_identifies_one_dashboard_per_space() {
 async fn an_idempotency_token_replay_returns_the_original_dashboard() {
     let omni = Omni::new();
     let space_id = omni.space("tokens", "dashboard-tokens").await;
+    let elsewhere = omni.space("tokens-other", "dashboard-tokens-other").await;
 
     // Rows span `ClientToken`'s `@length(1..64)` and its `^[!-~]+$` character class.
     for (index, token) in ["!", "a-token", "~{}[]|\\^`", &"t".repeat(64)]
@@ -917,6 +1014,36 @@ async fn an_idempotency_token_replay_returns_the_original_dashboard() {
             "case {token:?}: a fresh token must mint a new dashboard, got {:?} twice",
             fresh.dashboard_id
         );
+
+        // A dashboard belongs to ONE space, so the same token presented against another
+        // space replays nothing: it mints that space's own dashboard, and the dashboard
+        // the token created in the first space is not what the caller is handed.
+        let other = omni
+            .create_dashboard(&CreateOmniDashboardInput {
+                space_id: elsewhere.clone(),
+                ..input.clone()
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {token:?}: the token in another space failed: {error:?}")
+            })
+            .omni_dashboard;
+        assert_ne!(
+            other.dashboard_id, created.dashboard_id,
+            "case {token:?}: a token of another space must not resolve this one's dashboard, \
+             got {:?} twice",
+            other.dashboard_id
+        );
+        omni.get_dashboard(&elsewhere, &other.dashboard_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {token:?}: the other space does not hold its dashboard: {error:?}")
+            });
+        omni.get_dashboard(&space_id, &created.dashboard_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {token:?}: the first space's dashboard was disturbed: {error:?}")
+            });
     }
 }
 

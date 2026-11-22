@@ -27,7 +27,9 @@
 //!   and paged at `maxResults` with a `nextToken` that resumes where the page stopped;
 //! * `DeleteView` releases the view its name identifies, so the name resolves to nothing
 //!   and is free again, and a name the store holds nothing under is a 404;
-//! * `@idempotencyToken` replays return the original view rather than minting a second;
+//! * the name conflict wins over an `@idempotencyToken` repeat: a create repeated with
+//!   the token that minted the view asks for a name the account holds, so it is refused
+//!   like any other create under that name;
 //! * `UpdateView` is a PARTIAL update of the persisted view: every member the request
 //!   carries replaces the stored one, every member it omits — the identity, the ARN, the
 //!   ownership category and `createdAt` among them — keeps exactly what it held, and the
@@ -599,7 +601,7 @@ async fn an_unknown_view_name_resolves_to_nothing() {
 }
 
 #[tokio::test]
-async fn an_idempotency_token_replay_returns_the_original_view() {
+async fn the_name_conflict_wins_over_an_idempotency_token_replay() {
     let omni = Omni::new();
     let name = view_name("token-replayed");
     let request = CreateViewInput {
@@ -611,8 +613,13 @@ async fn an_idempotency_token_replay_returns_the_original_view() {
         .await
         .expect("the first call creates the view");
 
+    // A view's name is its identity, so a repeat of a create that LANDED asks for a name
+    // the account already holds — and that conflict is the answer whatever the request
+    // carries, the token of the create that minted it included. Rows span what a repeat
+    // can differ in beside the token: nothing at all, the definition, and the
+    // description.
     for (case, replay) in [
-        ("the same request", request.clone()),
+        ("the same request, token and all", request.clone()),
         (
             "the same token with another definition",
             CreateViewInput {
@@ -620,41 +627,71 @@ async fn an_idempotency_token_replay_returns_the_original_view() {
                 ..request.clone()
             },
         ),
+        (
+            "the same token with another description",
+            CreateViewInput {
+                description: Some("a second description".to_string()),
+                ..request.clone()
+            },
+        ),
     ] {
-        let replayed = omni
-            .create_view(&replay)
+        let message = conflict_message(&omni, case, &replay).await;
+        let expected = format!("View already exists: {name}");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        // The refusal left the first request's view exactly as it was.
+        let read = omni
+            .get_view(&name)
             .await
-            .unwrap_or_else(|error| panic!("case {case:?}: the replay failed: {error:?}"));
+            .unwrap_or_else(|error| panic!("case {case:?}: GetView failed: {error:?}"));
         assert_eq!(
             (
-                replayed.name.as_str(),
-                replayed.definition.as_str(),
-                replayed.arn.as_str(),
-                replayed.created_at
+                read.definition.as_str(),
+                read.description.as_deref(),
+                read.arn.as_str(),
+                read.created_at,
+                read.updated_at
             ),
             (
-                original.name.as_str(),
                 original.definition.as_str(),
+                original.description.as_deref(),
                 original.arn.as_str(),
-                original.created_at
+                original.created_at,
+                original.updated_at
             ),
-            "case {case:?}: a token replay must return the original view, got {replayed:?}"
+            "case {case:?}: the refused repeat changed the stored view, got {read:?}"
         );
     }
 
-    // Another token under another name is another view.
+    // The token is not what refused it: the SAME token under a free name creates a view,
+    // and the name it was first used under is free again once the view is deleted.
     let fresh_name = view_name("token-fresh");
     let fresh = omni
         .create_view(&CreateViewInput {
-            client_token: Some("another-client-token".to_string()),
+            client_token: Some("a-client-token".to_string()),
             ..create_input(&fresh_name, "SELECT * FROM logs")
         })
         .await
-        .expect("another token creates another view");
+        .expect("the same token under a free name creates a view");
     assert_ne!(
         fresh.arn, original.arn,
-        "a different token must create a different view, got {:?} twice",
+        "a second name must be a second view, got {:?} twice",
         fresh.arn
+    );
+    omni.delete_view(&name)
+        .await
+        .expect("the first view is deleted");
+    let recreated = omni
+        .create_view(&request)
+        .await
+        .expect("the freed name accepts the same request again");
+    assert_ne!(
+        recreated.arn, original.arn,
+        "the recreate must mint a new view rather than resurrect the deleted one, got {:?} \
+         twice",
+        recreated.arn
     );
 }
 

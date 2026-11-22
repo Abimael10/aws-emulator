@@ -18,7 +18,9 @@
 //!   values the record already holds.
 //!
 //! The refusals are asserted the same way: a record the store does not hold is the
-//! modelled 404, a rename onto a sibling's name is the modelled 409, a definition that
+//! modelled 404, a rename onto a sibling's name is the modelled 409 where that kind's
+//! name is its identity (an access profile) and no refusal at all where the identity is a
+//! minted id (a dashboard), a definition that
 //! violates its own rule is the modelled 400 — and none of them writes anything. The
 //! MESSAGE each refusal carries is a requirement too, so the suite also asserts it over a
 //! table, for EVERY resource kind this service reports a miss for: one text per kind,
@@ -137,13 +139,21 @@ fn millis(at: aws_smithy_types::DateTime) -> (i64, u32) {
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (the router's routing key) and the region the handlers record.
 fn signed_request_parts() -> http::request::Parts {
+    signed_request_parts_in(REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+///
+/// An account holds at most ONE space per Region, so a case needing a second space signs
+/// that create for another Region ([`SPACE_REGIONS`]).
+fn signed_request_parts_in(region: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -153,6 +163,11 @@ fn signed_request_parts() -> http::request::Parts {
     parts
 }
 
+/// The Regions this suite signs its space creates for, from the suite that owns the
+/// space rule: an account holds at most one space per Region, so each space a case needs
+/// is created in a Region of its own.
+use super::domain_space_lifecycle::SPACE_REGIONS;
+
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
 struct Omni {
@@ -160,6 +175,9 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// How many spaces this emulator has created, which picks each create's Region out
+    /// of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
     /// The account's one domain, remembered after the first space is created in it.
     domain: std::sync::Mutex<Option<String>>,
 }
@@ -177,6 +195,7 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
             domain: std::sync::Mutex::new(None),
         }
     }
@@ -222,8 +241,25 @@ impl Omni {
 
     /// A space to hang the suite's profiles and dashboards off, through the handlers that
     /// own those resources.
+    ///
+    /// An account holds at most ONE space per Region, so each space is created in a
+    /// Region of its own ([`SPACE_REGIONS`]); the calls that follow address the space by
+    /// its id, which no Region scopes.
     async fn space(&self, case: &str, name: &str) -> String {
         let domain_id = self.domain(case).await;
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let region = SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own");
+        let parts = signed_request_parts_in(region);
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
@@ -232,7 +268,7 @@ impl Omni {
                     data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
                     ..Default::default()
                 },
-                &self.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
@@ -1410,6 +1446,9 @@ async fn a_rename_onto_a_name_a_sibling_holds_is_the_modelled_conflict_and_write
         "the rename in the other space answered {moved:?}"
     );
 
+    // A dashboard's identity is its minted id, and its name carries no uniqueness rule:
+    // a rename onto a sibling's name is accepted, and both dashboards keep their own
+    // records under that one name.
     let taken = omni
         .create_dashboard("conflict", &space_id, "taken-dashboard", PANELS_BODY, None)
         .await;
@@ -1422,18 +1461,30 @@ async fn a_rename_onto_a_name_a_sibling_holds_is_the_modelled_conflict_and_write
             Some("kept"),
         )
         .await;
-    expect_modelled_error(
-        "a dashboard renamed onto a sibling's name",
-        omni.update_dashboard(&UpdateOmniDashboardInput {
+    let renamed = omni
+        .update_dashboard(&UpdateOmniDashboardInput {
             space_id: space_id.clone(),
             dashboard_id: free.dashboard_id.clone(),
             name: Some("taken-dashboard".to_string()),
             description: Some("second".to_string()),
             body: Some(ONE_PANEL_BODY.to_string()),
         })
-        .await,
-        409,
-        "ConflictException",
+        .await
+        .expect("renaming a dashboard onto a sibling's name succeeds");
+    assert_eq!(
+        (
+            renamed.dashboard_id.as_str(),
+            renamed.name.as_str(),
+            renamed.body.as_str(),
+            renamed.description.as_deref()
+        ),
+        (
+            free.dashboard_id.as_str(),
+            "taken-dashboard",
+            ONE_PANEL_BODY,
+            Some("second")
+        ),
+        "the rename answered {renamed:?}"
     );
     let stored = omni
         .stored_dashboard("conflict", &space_id, &free.dashboard_id)
@@ -1444,8 +1495,17 @@ async fn a_rename_onto_a_name_a_sibling_holds_is_the_modelled_conflict_and_write
             stored.body.as_str(),
             stored.description.as_deref()
         ),
-        ("free-dashboard", PANELS_BODY, Some("kept")),
-        "the refused rename changed the dashboard: {stored:?}"
+        ("taken-dashboard", ONE_PANEL_BODY, Some("second")),
+        "the rename is not what the store holds: {stored:?}"
+    );
+    // The sibling it took its name from is untouched and still readable on its own id.
+    let sibling = omni
+        .stored_dashboard("conflict", &space_id, &taken.dashboard_id)
+        .await;
+    assert_eq!(
+        (sibling.name.as_str(), sibling.body.as_str()),
+        ("taken-dashboard", PANELS_BODY),
+        "the rename changed the sibling: {sibling:?}"
     );
     let kept = omni
         .update_dashboard(&UpdateOmniDashboardInput {

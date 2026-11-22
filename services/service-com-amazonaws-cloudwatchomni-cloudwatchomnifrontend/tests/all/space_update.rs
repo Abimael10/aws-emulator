@@ -86,13 +86,21 @@ fn encryption(configuration: Encryption) -> EncryptionConfiguration {
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name and the region the handlers record.
 fn signed_request_parts() -> http::request::Parts {
+    signed_request_parts_in(REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+///
+/// An account holds at most ONE space per Region, so a case needing a second space signs
+/// that create for another Region ([`SPACE_REGIONS`]).
+fn signed_request_parts_in(region: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -102,6 +110,11 @@ fn signed_request_parts() -> http::request::Parts {
     parts
 }
 
+/// The Regions this suite signs its space creates for, from the suite that owns the
+/// space rule: an account holds at most one space per Region, so each space a case needs
+/// is created in a Region of its own.
+use super::domain_space_lifecycle::SPACE_REGIONS;
+
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
 struct Omni {
@@ -109,6 +122,9 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// How many spaces this emulator has created, which picks each create's Region out
+    /// of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
 }
 
 impl Omni {
@@ -122,6 +138,7 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -154,6 +171,9 @@ impl Omni {
             .domain_id
     }
 
+    /// A space of `domain_id`, created in a Region of its own ([`SPACE_REGIONS`]): an
+    /// account holds at most one space per Region, and every call after the create
+    /// addresses the space by its id, which no Region scopes.
     async fn create_space(
         &self,
         case: &str,
@@ -162,6 +182,19 @@ impl Omni {
         agent_role: Option<&str>,
         configuration: Option<Encryption>,
     ) -> Space {
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let region = SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own");
+        let parts = signed_request_parts_in(region);
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
@@ -172,7 +205,7 @@ impl Omni {
                     encryption_configuration: configuration.map(encryption),
                     ..Default::default()
                 },
-                &self.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))

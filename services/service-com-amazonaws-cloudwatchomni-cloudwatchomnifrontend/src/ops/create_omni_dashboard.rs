@@ -168,13 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // @idempotencyToken: a replay returns the dashboard the token already created.
-        // As in `CreateAccessProfile`, the token alone decides — the model declares no
-        // error for a token reused with different members — and it is answered BEFORE
-        // any refusal, so replaying the original request is not a conflict with itself.
+        // The token is read UNDER the space the decision above authorized — a dashboard
+        // belongs to one space, so a token presented against another space resolves
+        // nothing and this create goes on to mint its own record. Which members the
+        // repeated request carries does not decide it: the model declares no error for a
+        // token reused with different members.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(existing) = store
                 .create_omni_dashboard_tokens
-                .get(token)
+                .get(&(input.space_id.clone(), token.to_string()))
                 .and_then(|dashboard_id| store.omni_dashboards.get(dashboard_id))
             {
                 let replayed = existing.dashboard.clone();
@@ -205,33 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved that parent from the store — the same record a lookup here would read
         // — so there is no second parent check to make.
 
-        // `name`'s model doc: "A name that identifies the dashboard", and a dashboard
-        // belongs to one space — so a name that already identifies a dashboard of that
-        // space cannot identify a second one. `ConflictException` is the modelled
-        // refusal for a request that conflicts with the current state.
-        if let Some(existing) = store.omni_dashboard_named(&input.space_id, &input.name) {
-            let existing_id = existing.dashboard.dashboard_id.clone();
-            audit(
-                ctx,
-                &input.space_id,
-                &input.name,
-                &existing_id,
-                "refused_duplicate_name",
-            );
-            return Err(CreateOmniDashboardErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "A dashboard named '{}' already exists in space '{}'.",
-                        input.name, input.space_id
-                    ),
-                    conflict_type: Some("ALREADY_EXISTS".to_string()),
-                    resource_id: Some(existing_id),
-                    resource_type: Some("OmniDashboard".to_string()),
-                    error_code: None,
-                },
-            )
-            .into());
-        }
+        // A dashboard's identity is the `dashboardId` minted below: `name` is only "A
+        // name that identifies the dashboard" and the model constrains it to its length
+        // and pattern alone, so a space holds as many dashboards under one name as the
+        // caller creates, each its own record.
 
         // The store is bounded: past its quota a create is refused rather than adding
         // another record. `ServiceQuotaExceededException` is the modelled refusal for
@@ -276,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             store
                 .create_omni_dashboard_tokens
-                .insert(token, dashboard_id.clone());
+                .insert((space_id.clone(), token), dashboard_id.clone());
         }
         store.omni_dashboards.insert(dashboard_id, stored);
         drop(store);

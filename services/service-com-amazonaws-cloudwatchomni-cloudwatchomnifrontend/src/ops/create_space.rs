@@ -6,6 +6,10 @@
 //! returns the persisted record. `GetSpace` and `ListSpaces` answer from the same
 //! store.
 //!
+//! A space is the account's single resource of its kind in a Region — see
+//! `crate::state::space_already_exists_message` — so a create made while the account
+//! already holds one in the request's Region is refused rather than minting a second.
+//!
 //! Creating a space also provisions the access control the service owns for it — see
 //! `crate::state::provision_space_access_control` — so the profile and grant readers
 //! answer from the same store too.
@@ -206,6 +210,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let parent_domain_arn = parent.domain.domain_arn.clone();
+
+        // A space is the account's single resource of its kind in a Region, so a create
+        // made while the account already holds one in the Region this request is signed
+        // for conflicts with that space rather than minting a second one — whatever name
+        // it asks for and whichever domain it names. The conflict is with the account's
+        // Region, so the refusal names only the account and the Region.
+        if store.space_in_region(&region).is_some() {
+            return Err(CreateSpaceErrorModeled::ConflictException(ConflictException {
+                message: crate::state::space_already_exists_message(
+                    ::engine::emulator_account_id(),
+                    &region,
+                ),
+                conflict_type: None,
+                resource_id: None,
+                resource_type: None,
+                error_code: None,
+            })
+            .into());
+        }
 
         // The store is bounded: past its quota a create is refused rather than adding
         // another record. `ServiceQuotaExceededException` is the modelled refusal for

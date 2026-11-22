@@ -154,23 +154,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
-        // @idempotencyToken: a replay returns the view the token already created rather
-        // than minting a second one — answered BEFORE any refusal, as in `CreateDomain`,
-        // so replaying the original request is not a conflict with itself. The token
-        // alone decides: the model declares no error for a token reused with different
-        // members.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store
-                .create_view_tokens
-                .get(token)
-                .and_then(|name| store.views.get(name))
-            {
-                let replayed = view_output(existing);
-                audit(ctx, &replayed.name, "replayed");
-                return Ok(replayed);
-            }
-        }
-
         // The definition is what the view IS, and the model expresses only its length,
         // so the rule it has to satisfy is checked here — before the name is looked up,
         // because a definition that is not a SQL query is wrong whatever name it is
@@ -186,8 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A view's name is its identity within the account and region, so a second view
-        // under a live name conflicts with it rather than replacing it.
+        // A view's name is its identity ("View names must be unique within the account
+        // and region"), so a second view under a live name conflicts with it rather than
+        // replacing it — and that conflict is evaluated for EVERY request, the
+        // `@idempotencyToken` one included: a retry whose first attempt landed asks for a
+        // name the account now holds, so it is refused exactly as another caller's
+        // request for that name is. There is nothing a token could replay instead, since
+        // a create that did not land left no view under the name.
         if let Some(existing) = store.views.get(&input.name) {
             audit(ctx, &input.name, "refused_duplicate_name");
             return Err(CreateViewErrorModeled::ConflictException(ConflictException {
@@ -237,9 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let output = view_output(&stored);
-        if let Some(token) = input.client_token {
-            store.create_view_tokens.insert(token, input.name.clone());
-        }
+        // Nothing is remembered about `clientToken`: the view's name is its identity, so
+        // the conflict above answers every repeat of this request and no token could name
+        // a view this operation would replay.
         store.views.insert(input.name, stored);
         drop(store);
 

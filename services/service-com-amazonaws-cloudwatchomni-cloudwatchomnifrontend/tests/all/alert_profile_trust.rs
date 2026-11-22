@@ -44,14 +44,16 @@ use omni::ops::delete_access_grant::DeleteAccessGrant;
 use omni::ops::delete_access_profile::{
     DeleteAccessProfile, DeleteAccessProfileError, DeleteAccessProfileErrorModeled,
 };
+use omni::ops::get_access_grant::{GetAccessGrant, GetAccessGrantError};
 use omni::ops::get_access_profile::{GetAccessProfile, GetAccessProfileError};
 use omni::ops::get_alert::GetAlert;
 use omni::ops::types::{
     AccessGrantPrincipal, AlertCondition, AlertEvaluation, AlertRuleQuery, CreateAccessGrantInput,
     CreateAccessProfileInput, CreateAlertInput, CreateAlertOutput, CreateDomainInput,
     CreateSpaceInput, DeleteAccessGrantInput, DeleteAccessProfileInput, DeleteAccessProfileOutput,
-    GetAccessProfileInput, GetAccessProfileOutput, GetAlertInput, ResourceScope, Rule,
-    ScopedActions, TelemetryRule, ACCESS_GRANT_PRINCIPAL_TYPE_VALUES,
+    GetAccessGrantInput, GetAccessGrantOutput, GetAccessProfileInput, GetAccessProfileOutput,
+    GetAlertInput, ResourceScope, Rule, ScopedActions, TelemetryRule,
+    ACCESS_GRANT_PRINCIPAL_TYPE_VALUES,
 };
 use omni::scaffolded::Scaffolded;
 use omni::state::{
@@ -95,13 +97,21 @@ fn expected_refusal(profile_id: &str) -> String {
 /// name (the router's routing key), the region the handlers record and `access_key_id` —
 /// which is the principal the handlers read the caller's identity from.
 fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
+    signed_request_parts_in(access_key_id, REGION)
+}
+
+/// The same, signed for `region` rather than for the suite's own.
+///
+/// An account holds at most ONE space per Region, so a case needing a second space signs
+/// that create for another Region ([`SPACE_REGIONS`]).
+fn signed_request_parts_in(access_key_id: &str, region: &str) -> http::request::Parts {
     let (parts, ()) = http::Request::builder()
         .method("POST")
         .uri("/service/CloudWatchOmniFrontend/operation/Unused")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/cloudwatch/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/cloudwatch/aws4_request, \
                  SignedHeaders=host, Signature=emulator"
             ),
         )
@@ -110,6 +120,11 @@ fn signed_request_parts(access_key_id: &str) -> http::request::Parts {
         .into_parts();
     parts
 }
+
+/// The Regions this suite signs its space creates for, from the suite that owns the
+/// space rule: an account holds at most one space per Region, so each space a case needs
+/// is created in a Region of its own.
+use super::domain_space_lifecycle::SPACE_REGIONS;
 
 /// An action name that is not the one assuming an access profile is. `ScopedActionName`
 /// enumerates no catalog (`smithy_query(query="shape",shape="ScopedActions")`: `actions`
@@ -157,6 +172,9 @@ struct Omni {
     /// owner may always assume it, so the CALLER's `assumeStatus` is observed through a
     /// principal that owns nothing here.
     other_parts: http::request::Parts,
+    /// How many spaces this emulator has created, which picks each create's Region out
+    /// of [`SPACE_REGIONS`].
+    spaces_created: std::sync::atomic::AtomicUsize,
     /// The account's one domain, remembered after the first space is created in it.
     domain: std::sync::Mutex<Option<String>>,
 }
@@ -175,6 +193,7 @@ impl Omni {
             router,
             parts: signed_request_parts(ACCESS_KEY_ID),
             other_parts: signed_request_parts("AKIDSOMEONEELSE"),
+            spaces_created: std::sync::atomic::AtomicUsize::new(0),
             domain: std::sync::Mutex::new(None),
         }
     }
@@ -219,8 +238,25 @@ impl Omni {
     }
 
     /// A domain, a space of it and two access profiles of that space.
+    ///
+    /// An account holds at most ONE space per Region, so each space is created in a
+    /// Region of its own ([`SPACE_REGIONS`]); the calls that follow address the space by
+    /// its id, which no Region scopes.
     async fn world(&self, case: &str, name: &str) -> World {
         let domain_id = self.domain(case).await;
+        let index = self
+            .spaces_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let region = SPACE_REGIONS
+            .get(index)
+            .copied()
+            .expect("the suite signs each space it creates for a Region of its own");
+        let parts = signed_request_parts_in(ACCESS_KEY_ID, region);
+        let ctx = OperationContext::new(
+            &parts,
+            self.service.definition().identity(),
+            EmbeddedEmulator::from_router(self.router.clone()),
+        );
         let space_id = CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
@@ -229,7 +265,7 @@ impl Omni {
                     data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
                     ..Default::default()
                 },
-                &self.ctx(),
+                &ctx,
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
@@ -373,6 +409,21 @@ impl Omni {
                 GetAccessProfileInput {
                     space_id: space_id.to_string(),
                     profile_id: profile_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// Read an access grant back, and answer what the reader answered.
+    async fn read_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<GetAccessGrantOutput, GetAccessGrantError> {
+        GetAccessGrant::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessGrantInput {
+                    grant_id: grant_id.to_string(),
                 },
                 &self.ctx(),
             )
@@ -809,20 +860,24 @@ async fn deleting_the_trust_grant_revokes_what_it_granted() {
 }
 
 #[tokio::test]
-async fn an_access_profile_cannot_be_deleted_while_access_grants_reference_it() {
+async fn a_profile_delete_refuses_a_grant_that_reaches_it_and_cascades_the_grants_it_holds() {
     let omni = Omni::new();
-    // The rows are the two ways a grant references a profile: its resource scopes name
-    // the profile, and the profile IS the principal the grant is held by.
-    for (index, (case, principal_type, scope)) in [
+    // The rows are the two relations a grant can have to a profile, and the delete
+    // answers each differently: a grant ANOTHER principal holds whose resource scopes
+    // reach the profile references it, so the delete is refused while it exists; a grant
+    // the profile itself holds is an authorization OF the profile, so it goes with it.
+    for (index, (case, principal_type, scope, references)) in [
         (
-            "a grant whose resource scope names the profile",
+            "a grant another principal holds whose resource scope names the profile",
             ACCESS_GRANT_PRINCIPAL_TYPE_ALERT,
             Scope::TheProfile,
+            true,
         ),
         (
             "a grant held by the profile itself",
             ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE,
             Scope::Unscoped,
+            false,
         ),
     ]
     .into_iter()
@@ -831,46 +886,55 @@ async fn an_access_profile_cannot_be_deleted_while_access_grants_reference_it() 
         let world = omni.world(case, &format!("in-use-{index}")).await;
         let grant_id = omni.grant(case, &world, "trust", principal_type, scope).await;
 
-        // While the grant references it the profile stays, and the refusal names the
-        // grant to remove first.
-        let refused = omni
-            .delete_profile(&world.space_id, &world.profile_id)
-            .await;
-        let conflict = match refused {
-            Ok(output) => panic!("case {case:?}: expected ConflictException (409), got {output:?}"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            conflict.shape_name(),
-            "ConflictException",
-            "case {case:?}: expected error code ConflictException, got {conflict:?}"
-        );
-        assert_eq!(
-            conflict.http_status(),
-            409,
-            "case {case:?}: expected HTTP 409, got {}",
-            conflict.http_status()
-        );
-        match conflict {
-            Scaffolded::Modeled(DeleteAccessProfileErrorModeled::ConflictException(refusal)) => {
-                assert!(
-                    refusal.message.contains(&grant_id)
-                        && refusal.message.contains(&world.profile_id),
-                    "case {case:?}: expected the refusal to name the profile and the grant \
-                     {grant_id:?}, got {:?}",
-                    refusal.message
-                );
+        if references {
+            // While the grant references it the profile stays, and the refusal names the
+            // grant to remove first.
+            let refused = omni
+                .delete_profile(&world.space_id, &world.profile_id)
+                .await;
+            let conflict = match refused {
+                Ok(output) => {
+                    panic!("case {case:?}: expected ConflictException (409), got {output:?}")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                conflict.shape_name(),
+                "ConflictException",
+                "case {case:?}: expected error code ConflictException, got {conflict:?}"
+            );
+            assert_eq!(
+                conflict.http_status(),
+                409,
+                "case {case:?}: expected HTTP 409, got {}",
+                conflict.http_status()
+            );
+            match conflict {
+                Scaffolded::Modeled(DeleteAccessProfileErrorModeled::ConflictException(
+                    refusal,
+                )) => {
+                    assert!(
+                        refusal.message.contains(&grant_id)
+                            && refusal.message.contains(&world.profile_id),
+                        "case {case:?}: expected the refusal to name the profile and the grant \
+                         {grant_id:?}, got {:?}",
+                        refusal.message
+                    );
+                }
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
             }
-            other => panic!("case {case:?}: expected the modelled ConflictException, got {other:?}"),
-        }
-        omni.read_profile(&world.space_id, &world.profile_id)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("case {case:?}: the refused delete must leave the profile: {error:?}")
-            });
+            omni.read_profile(&world.space_id, &world.profile_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: the refused delete must leave the profile: {error:?}")
+                });
 
-        // Once nothing references it the profile goes, and the reader stops resolving it.
-        omni.delete_grant(case, &grant_id).await;
+            // Once nothing references it the profile goes.
+            omni.delete_grant(case, &grant_id).await;
+        }
+
         omni.delete_profile(&world.space_id, &world.profile_id)
             .await
             .unwrap_or_else(|error| {
@@ -886,6 +950,25 @@ async fn an_access_profile_cannot_be_deleted_while_access_grants_reference_it() 
             ("ResourceNotFoundException", 404),
             "case {case:?}: expected the deleted profile to answer 404, got {gone:?}"
         );
+        if !references {
+            // The grant the profile held went with it: its principal no longer exists, so
+            // nothing can resolve it either.
+            let grant_gone = omni
+                .read_grant(&grant_id)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the grant {grant_id:?} the deleted profile held still \
+                         resolves"
+                    )
+                });
+            assert_eq!(
+                (grant_gone.shape_name(), grant_gone.http_status()),
+                ("ResourceNotFoundException", 404),
+                "case {case:?}: expected the cascaded grant to answer 404, got {grant_gone:?}"
+            );
+        }
 
         // @idempotent, and the model declares no `ResourceNotFoundException`: deleting an
         // id this space does not hold succeeds without removing anything, so a profile
