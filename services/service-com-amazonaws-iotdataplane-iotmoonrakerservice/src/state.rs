@@ -24,7 +24,7 @@
 //! The store is a `BTreeMap` so a list operation walks it in a stable key order and an
 //! offset-style `nextToken` keeps meaning across calls.
 //!
-//! Beside the two stores, this module holds the service's RESPONSE TEXT: the fixed
+//! Beside that store, this module holds the service's RESPONSE TEXT: the fixed
 //! message it answers each condition with, and the two templates it renders from the
 //! request. They live here, not in the handlers, because several operations answer the
 //! same condition and a message composed per handler drifts into describing the

@@ -528,7 +528,8 @@ pub fn render_pingresp(
 }
 
 /// Render one delivery as a PUBLISH to a client of `version`, at the QoS the delivery was
-/// made at and with the message properties that version can carry.
+/// made at, carrying the RETAIN flag the delivery carries, and with the message properties
+/// that version can carry.
 ///
 /// `retain` is the RETAIN flag of THIS delivery, which is a fact about the delivery and not
 /// about the message: MQTT 3.1.1 section 3.3.1.3 sets it on the PUBLISH that answers a new

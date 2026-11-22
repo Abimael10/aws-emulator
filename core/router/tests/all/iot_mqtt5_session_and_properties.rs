@@ -243,7 +243,11 @@ async fn discover(router: &MultiServiceRouter) -> String {
 /// The topic as one URI path LABEL: `Publish` binds the topic to `/topics/{topic}`, a
 /// single path segment, so a multi-level topic's separators travel percent-encoded (as do
 /// the other characters that would otherwise be read as path syntax).
-fn encode_label(topic: &str) -> String {
+///
+/// `pub(crate)` because every suite that drives a publication over HTTP has to spell the
+/// topic the same way — `iot_retained_message_on_subscribe` reads it from here rather than
+/// writing the escaping a second time.
+pub(crate) fn encode_label(topic: &str) -> String {
     topic
         .chars()
         .map(|character| match character {

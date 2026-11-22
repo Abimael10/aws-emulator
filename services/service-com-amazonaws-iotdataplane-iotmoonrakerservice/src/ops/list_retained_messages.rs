@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRetainedMessages
-//! Summarises every retained message the account holds — one entry per topic a
-//! `Publish` with `retain=true` left a message on, in a stable topic order, carrying
+//! Summarises every retained message the account holds — one entry per topic a retained
+//! publication left a message on, in a stable topic order, carrying
 //! the topic, the payload's SIZE in bytes, the QoS and when it was stored. It never
 //! carries a payload: `GetRetainedMessage` is what answers with one. A page is bounded
 //! by `maxResults` and continued with the `nextToken` the previous page returned.

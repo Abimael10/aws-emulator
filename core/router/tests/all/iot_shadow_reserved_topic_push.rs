@@ -47,7 +47,7 @@ const REGION: &str = "ap-south-1";
 
 /// The address this emulator's API is served at, as the core publishes it from its data
 /// port; the broker's own socket is a different address, read back from the control plane.
-const SERVED_AT: &str = "https://127.0.0.1:39359";
+pub(crate) const SERVED_AT: &str = "https://127.0.0.1:39359";
 
 /// How long a leg of the exchange may take before the case fails. Generous: it bounds a
 /// wait on a CONDITION (a packet the broker writes), not the speed of the host.
@@ -87,7 +87,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One in-process API call through the whole router, as its status and body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     url: &str,
@@ -247,7 +247,7 @@ impl Device {
     }
 
     /// Write one packet, rendered by the codec.
-    async fn write<Render>(&mut self, render: Render)
+    pub(crate) async fn write<Render>(&mut self, render: Render)
     where
         Render: FnOnce(&mut BytesMut) -> Result<usize, mqttbytes::Error>,
     {
@@ -261,7 +261,7 @@ impl Device {
     }
 
     /// Read one packet the broker wrote, waiting for it until [`EXCHANGE_DEADLINE`].
-    async fn read_packet(&mut self) -> v4::Packet {
+    pub(crate) async fn read_packet(&mut self) -> v4::Packet {
         let case = self.case;
         let read = tokio::time::timeout(EXCHANGE_DEADLINE, async {
             loop {

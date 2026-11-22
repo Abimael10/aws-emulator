@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRetainedMessage
-//! Answers with the retained message a `Publish` with `retain=true` stored for the
-//! topic: the payload byte-for-byte as published, its QoS, its user properties and
-//! when it was stored. A topic with no retained message is a 404.
+//! Answers with the retained message a retained publication stored for the topic: the
+//! payload byte-for-byte as published, its QoS, its user properties and when it was
+//! stored. A topic with no retained message is a 404.
 //!
 //! The topic is the retained-message store's KEY on this path, so what is asked of it is
 //! that it be one topic: a string carrying an MQTT subscription wildcard matches a SET of
