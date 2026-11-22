@@ -645,8 +645,9 @@ fn not_authorized_message(action: &str) -> String {
 /// travels as. A token the clock has run out on is `ExpiredToken` / HTTP 400 — the one class
 /// with an error of its own — and every other class is `InvalidIdentityToken` / HTTP 400,
 /// told apart by the fixed text its class carries: a token nothing signed, a signature that
-/// did not check out, an issuer the account registered no provider for, a verification key
-/// that could not be retrieved, and a value that is no token at all.
+/// did not check out, an issuer the account registered no provider for, a token the
+/// partition's own web identity issuer minted, a verification key that could not be
+/// retrieved, and a value that is no token at all.
 fn refuse_token(defect: crate::state::web_identity::TokenDefect) -> AssumeRoleWithWebIdentityError {
     let message = Some(defect.message());
     match defect {

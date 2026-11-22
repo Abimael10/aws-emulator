@@ -259,6 +259,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Web identity federation hosted inside the partition is OUTBOUND only: the issuer
+        // an account of this partition is given mints tokens for its principals to present
+        // to parties OUTSIDE it, so its issuer URL cannot be registered as an INBOUND trust
+        // anchor of the same partition — a role naming it as a `Federated` principal would
+        // be a same-partition token exchange, which `AssumeRole` is the operation for. Such
+        // a Url is therefore "an invalid … value … supplied for an input parameter", refused
+        // with the fixed sentence of this class
+        // (`crate::state::PARTITION_ISSUER_PROVIDER_MESSAGE`) and before anything is
+        // written. The reading is the store's
+        // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::names_partition_web_identity_issuer`),
+        // which answers for the issuer this account holds and for every address of this
+        // emulator carrying an issuer segment, so an account that has not enabled the
+        // feature — and another account's issuer in the same partition — are refused too.
+        let names_partition_issuer = {
+            // A READ under a short-lived guard: the lock is given up before anything else
+            // this handler does, and nothing is written whichever way it answers.
+            let store = state.lock();
+            store.names_partition_web_identity_issuer(&input.url, ctx.endpoint().as_str())
+        };
+        if names_partition_issuer {
+            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::PARTITION_ISSUER_PROVIDER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The provider is stored and reported WITHOUT the scheme: `GetOpenIDConnectProvider`
         // answers the host-and-path form that "corresponds to the iss claim in the
         // provider's OpenID Connect ID tokens" (`$Url`) and that the ARN is built from, so

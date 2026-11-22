@@ -133,6 +133,48 @@ pub fn is_issuer_identifier_segment(segment: &str) -> bool {
             .all(|digit| digit.is_ascii_digit() || (b'A'..=b'F').contains(&digit))
 }
 
+/// How AWS words the refusal of an INBOUND OpenID Connect provider whose URL names a web
+/// identity issuer of the caller's OWN partition.
+///
+/// The feature is outbound-only: the issuer this emulator hosts for an account mints tokens
+/// for principals of the partition to present OUTSIDE it, so its issuer URL cannot be turned
+/// back into an inbound trust anchor of the same partition — a trust topology AWS does not
+/// put an account in. The whole sentence is FIXED text for this refusal class: it
+/// interpolates nothing from the request, so the URL the caller submitted does not appear in
+/// it, and the second half is the guidance AWS gives in its place.
+pub const PARTITION_ISSUER_PROVIDER_MESSAGE: &str =
+    "Creating an OIDC provider with an STS issuer URL from the same partition is not \
+     supported. Within a partition, use AssumeRole instead of web identity federation.";
+
+/// Whether `url` addresses a web identity ISSUER this emulator hosts: an address of
+/// `endpoint` whose whole path is one segment of the form an account's issuer is minted in
+/// ([`is_issuer_identifier_segment`]).
+///
+/// The FORM, not one account's value — every account of this partition is given an issuer of
+/// this shape under this endpoint ([`outbound_web_identity_issuer`]), so a URL of the shape
+/// names an in-partition issuer whether or not the account holding it has the feature on,
+/// and a URL of ANY other host names an identity provider outside the partition. The
+/// authority and the scheme are compared case-insensitively, as a URL's host is, and a
+/// trailing slash is not part of the address.
+#[must_use]
+pub fn is_hosted_web_identity_issuer_url(url: &str, endpoint: &str) -> bool {
+    let Some((scheme, authority_and_path)) = url.trim_end_matches('/').split_once("://") else {
+        return false;
+    };
+    let Some((endpoint_scheme, endpoint_authority)) =
+        endpoint.trim_end_matches('/').split_once("://")
+    else {
+        return false;
+    };
+    let (authority, path) = match authority_and_path.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (authority_and_path, ""),
+    };
+    scheme.eq_ignore_ascii_case(endpoint_scheme)
+        && authority.eq_ignore_ascii_case(endpoint_authority)
+        && is_issuer_identifier_segment(path)
+}
+
 /// How AWS words `FeatureDisabledException` for a call that needs the feature ON while the
 /// account has it off: the account's outbound identity federation is disabled.
 ///
@@ -185,6 +227,40 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         self.outbound_web_identity_federation
             .as_ref()
             .filter(|held| held.enabled)
+    }
+
+    /// Whether `url` names the web identity ISSUER this account holds — the value
+    /// `EnableOutboundWebIdentityFederation` minted and
+    /// `GetOutboundWebIdentityFederationInfo` reports, whatever the feature's flag stands at.
+    ///
+    /// The one reading of "this is the account's own issuer", so every caller that has to
+    /// tell the partition's own web identity issuer from a third party's — this service's own
+    /// provider registration, and STS's reading of a presented token — asks the same
+    /// question. A READ: nothing is written.
+    #[must_use]
+    pub fn holds_web_identity_issuer(&self, url: &str) -> bool {
+        let addressed = url.trim_end_matches('/');
+        self.outbound_web_identity_federation
+            .as_ref()
+            .is_some_and(|held| held.issuer_identifier.trim_end_matches('/') == addressed)
+    }
+
+    /// Whether `url` names a web identity ISSUER of this partition: the issuer identifier
+    /// this account holds ([`Self::holds_web_identity_issuer`]), or any address of this
+    /// emulator carrying an issuer segment of the form every account's issuer is minted in
+    /// ([`is_hosted_web_identity_issuer_url`]).
+    ///
+    /// `endpoint` is where this emulator is served, which is what an issuer URL is built on.
+    /// The held value is checked TOO because an account keeps the issuer it was first given
+    /// while the endpoint this emulator reports can change under it, so the URL the
+    /// outbound-federation operations report is an in-partition issuer whatever the endpoint
+    /// now says.
+    ///
+    /// A READ: nothing is written, and an account that never enabled the feature is still
+    /// answered for the form.
+    #[must_use]
+    pub fn names_partition_web_identity_issuer(&self, url: &str, endpoint: &str) -> bool {
+        self.holds_web_identity_issuer(url) || is_hosted_web_identity_issuer_url(url, endpoint)
     }
 
     /// Turn the feature ON for this account and answer the issuer URL it is served under,

@@ -99,6 +99,17 @@ const UNVERIFIABLE_TOKEN_MESSAGE: &str =
     "Couldn't retrieve verification key from your identity provider, please reference \
      AssumeRoleWithWebIdentity documentation for requirements";
 
+/// How AWS words the refusal of a token the caller's OWN partition minted: a JWT vended
+/// against the account's outbound web identity issuer, presented back to this partition's
+/// token exchange.
+///
+/// That federation is OUTBOUND only — the token is for a party outside the partition to
+/// verify — so inside the partition the exchange does not serve it, and the sentence says so
+/// and names the operation it is answering. Fixed text: the class is the token's issuer, so
+/// nothing of the request or of the account appears in it.
+const STS_ISSUED_TOKEN_MESSAGE: &str =
+    "AssumeRoleWithWebIdentity with STS-issued tokens is not yet supported.";
+
 /// Why a presented value is not a web identity this service can federate.
 ///
 /// One variant per class AWS tells apart, in the order a verifier decides them. The caller
@@ -116,6 +127,9 @@ pub enum TokenDefect {
     Expired { at: i64, expiry: i64 },
     /// Nothing signed the token: RFC 7519 §6's unsecured form.
     Unsigned,
+    /// The `iss` names a web identity issuer of the caller's OWN partition — the account's
+    /// outbound federation issuer — whose tokens this exchange does not serve.
+    StsIssued,
     /// The `iss` names a provider the ACCOUNT has not registered, so there is no provider
     /// whose keys or condition keys the token could be read against. Carries the issuer the
     /// token claims.
@@ -141,6 +155,7 @@ impl TokenDefect {
                  date/time {expiry}"
             ),
             Self::Unsigned => UNSIGNED_TOKEN_MESSAGE.to_string(),
+            Self::StsIssued => STS_ISSUED_TOKEN_MESSAGE.to_string(),
             Self::UnregisteredIssuer(issuer) => {
                 format!("No OpenIDConnect provider found in your account for {issuer}")
             }
@@ -297,9 +312,13 @@ fn scalar_values(value: &::serde_json::Value) -> Vec<String> {
 ///    expired WHATEVER its signature, so this is decided before the signature is;
 /// 4. a token nothing signed is [`TokenDefect::Unsigned`], which is decided from the token
 ///    alone and so needs no provider;
-/// 5. a token whose issuer the account registered no provider for is
+/// 5. a token the caller's OWN partition minted — one vended against the account's outbound
+///    web identity issuer — is [`TokenDefect::StsIssued`], which this exchange does not
+///    serve, decided before the account's providers are consulted because no provider for
+///    that issuer can be registered;
+/// 6. a token whose issuer the account registered no provider for is
 ///    [`TokenDefect::UnregisteredIssuer`]; and
-/// 6. a token of a registered issuer is verified against the key set that issuer publishes
+/// 7. a token of a registered issuer is verified against the key set that issuer publishes
 ///    in this process, accepted when the signature checks out and otherwise refused as the
 ///    signature having failed ([`TokenDefect::NotValidated`]) or as the key not being
 ///    readable at all ([`TokenDefect::KeyUnretrievable`]), which are different answers to
@@ -339,6 +358,14 @@ pub fn resolve<Eng: Send + Sync + 'static>(
     // second copy of it: `read` refuses exactly the token nothing signed.
     if matches!(jwt::read(presented), Err(jwt::FormDefect::Unsecured)) {
         return Err(TokenDefect::Unsigned);
+    }
+    // A token the caller's OWN partition minted: web identity federation hosted inside the
+    // partition is outbound only, so a JWT vended against the account's own issuer is not
+    // exchanged back here — and the caller is told that class rather than that the issuer is
+    // unregistered, which it cannot act on, because no provider for that issuer can be
+    // registered in the partition at all.
+    if partition_issued(engine, issuer) {
+        return Err(TokenDefect::StsIssued);
     }
     if !registered_issuer(engine, issuer) {
         return Err(TokenDefect::UnregisteredIssuer(issuer.to_string()));
@@ -466,6 +493,19 @@ fn authentication_methods(claim: &::serde_json::Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether `issuer` is the web identity issuer the account's OUTBOUND federation vends
+/// against: the issuer of the caller's own partition, which this emulator hosts and
+/// `sts:GetWebIdentityToken` signs tokens for.
+///
+/// Asked of IAM's own record in the same engine
+/// (`::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::ComAmazonawsIamAwsidentitymanagementv20100508State::holds_web_identity_issuer`),
+/// which is the one reading of "this is the partition's own issuer" — the same one IAM's
+/// provider registration refuses such a URL by — whatever the feature's flag stands at: a
+/// token vended while it was on stays a token of that issuer after it has been turned off.
+fn partition_issued<Eng: Send + Sync + 'static>(engine: &Eng, issuer: &str) -> bool {
+    super::iam_state(engine).is_some_and(|iam| iam.lock().holds_web_identity_issuer(issuer))
 }
 
 /// Whether the ACCOUNT can resolve `issuer` as an identity provider at all.
