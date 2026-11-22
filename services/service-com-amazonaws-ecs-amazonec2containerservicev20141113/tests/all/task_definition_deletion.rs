@@ -44,6 +44,17 @@ use crate::task_lifecycle::container;
 /// The image every revision here starts from; irrelevant to the rules, so one value.
 const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 
+/// How many references ONE `DeleteTaskDefinitions` request may carry, as the
+/// `DeleteTaskDefinitionsRequest$taskDefinitions` doc publishes it: "You can specify up to
+/// 10 task definitions as a comma separated list."
+const MAX_REFERENCES: usize =
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::MAX_DELETE_TASK_DEFINITIONS;
+
+/// The sentence a `taskDefinitions` list longer than that earns. All of it is fixed text:
+/// the size of the list Amazon ECS names it by and the service limit for the member, with
+/// nothing of the request in it.
+const OVER_LENGTH_LIST_MESSAGE: &str = "Size of TaskDefinition references list cannot exceed 10";
+
 /// The ARN a revision of `family` carries, as
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:<revision>`.
 fn definition_arn(family: &str, revision: i64) -> String {
@@ -612,9 +623,10 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
         );
     }
 
-    // The documented batch size is a property of the REQUEST rather than of one entry, so
-    // its refusal states the entries and the bound instead of naming a member: "You can
-    // specify up to 10 task definitions as a comma separated list."
+    // The documented batch size is a property of the REQUEST rather than of one entry, and
+    // a list longer than its member documents is a parameter outside its constraint: the
+    // refusal is the operation's `InvalidParameterException`, stating the size of the named
+    // list and the cap. Spanned by its own table below.
     let (code, message) = refusal(
         &router,
         "DeleteTaskDefinitions",
@@ -624,10 +636,7 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
     .await;
     assert_eq!(
         (code.as_str(), message.as_str()),
-        (
-            "ClientException",
-            "task definitions can have at most 10 items."
-        ),
+        ("InvalidParameterException", OVER_LENGTH_LIST_MESSAGE),
         "case \"eleven entries\": expected the batch-size refusal, got {code} with \
          {message:?}"
     );
@@ -639,6 +648,130 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
             string(&still, "status", "after the refusals"),
             "INACTIVE",
             "expected revision {slot} to be untouched by the refusals, got {still}"
+        );
+    }
+}
+
+/// A `taskDefinitions` list longer than its own member documents is refused BY ITS SIZE:
+/// "You can specify up to 10 task definitions as a comma separated list." The list is a
+/// parameter outside its documented constraint, so the refusal is this operation's
+/// `InvalidParameterException` (HTTP 400) carrying the sentence that states the size of the
+/// list and the cap — the same sentence whatever the entries were, since the size is decided
+/// before any entry is read, and nothing of the request reaches it.
+///
+/// The table spans what the rule generalises over: how far past the cap the list runs, and
+/// what its entries are (stored revisions, references that name no revision, text that is no
+/// reference at all, and one reference repeated). The published bound itself is a row too —
+/// a list of exactly the documented size is served.
+#[tokio::test]
+async fn an_over_length_task_definitions_list_is_refused_by_its_size_whatever_it_holds() {
+    let router = service();
+    let case = "setup";
+    let family = "deletebatchfamily";
+    for slot in 1..=MAX_REFERENCES {
+        register_revision(&router, family, slot as i64, case).await;
+    }
+    for slot in 1..=MAX_REFERENCES {
+        deregister(&router, &format!("{family}:{slot}"), case).await;
+    }
+
+    let stored = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{family}:{}", index % MAX_REFERENCES + 1))
+            .collect()
+    };
+    let rows: [(&str, Vec<String>); 6] = [
+        (
+            "one past the cap, every entry a stored revision",
+            stored(MAX_REFERENCES + 1),
+        ),
+        (
+            "one past the cap, every entry naming no revision",
+            vec![family.to_string(); MAX_REFERENCES + 1],
+        ),
+        (
+            "one past the cap, no entry a reference at all",
+            vec!["not a reference".to_string(); MAX_REFERENCES + 1],
+        ),
+        (
+            "one past the cap, one reference repeated",
+            vec![format!("{family}:1"); MAX_REFERENCES + 1],
+        ),
+        ("twice the cap", stored(2 * MAX_REFERENCES)),
+        (
+            "many times the cap, mixing stored revisions with ARNs of unknown ones",
+            stored(MAX_REFERENCES)
+                .into_iter()
+                .chain(
+                    (1..=5 * MAX_REFERENCES)
+                        .map(|slot| definition_arn("neverregistered", slot as i64)),
+                )
+                .collect(),
+        ),
+    ];
+
+    for (case, references) in rows {
+        let (code, message) = refusal(
+            &router,
+            "DeleteTaskDefinitions",
+            json!({ "taskDefinitions": references.clone() }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {case:?}: expected an InvalidParameterException for {} references, got \
+             {code} with {message:?}",
+            references.len()
+        );
+        assert_eq!(
+            message, OVER_LENGTH_LIST_MESSAGE,
+            "case {case:?}: expected {OVER_LENGTH_LIST_MESSAGE:?}, got {message:?}"
+        );
+        // The sentence is fixed text: neither the entries nor how many there were appear
+        // in it.
+        assert!(
+            !message.contains(family) && !message.contains(&references.len().to_string()),
+            "case {case:?}: expected the refusal to echo nothing of the request, got \
+             {message:?} for {} references",
+            references.len()
+        );
+    }
+
+    // A refusal deleted nothing: every revision is still exactly as it was deregistered.
+    for slot in 1..=MAX_REFERENCES {
+        let case = format!("after the over-length refusals, revision {slot}");
+        let still = describe(&router, &format!("{family}:{slot}"), &case).await;
+        assert_eq!(
+            string(&still, "status", &case),
+            "INACTIVE",
+            "case {case:?}: expected the revision to be untouched, got {still}"
+        );
+        assert!(
+            still.get("deleteRequestedAt").is_none(),
+            "case {case:?}: expected no deleteRequestedAt, got {still}"
+        );
+    }
+
+    // The published bound itself is served, so the cap is the documented size and not one
+    // short of it.
+    let at_the_bound = stored(MAX_REFERENCES);
+    let case = "the list at its documented size";
+    let (deleted, failures) = delete(&router, &at_the_bound, case).await;
+    assert!(
+        failures.is_empty(),
+        "case {case:?}: expected every deregistered revision to delete, got {failures:?}"
+    );
+    assert_eq!(
+        deleted.len(),
+        MAX_REFERENCES,
+        "case {case:?}: expected {MAX_REFERENCES} deleted revisions, got {deleted:?}"
+    );
+    for entry in &deleted {
+        assert_eq!(
+            string(entry, "status", case),
+            "DELETE_IN_PROGRESS",
+            "case {case:?}: expected DELETE_IN_PROGRESS, got {entry}"
         );
     }
 }

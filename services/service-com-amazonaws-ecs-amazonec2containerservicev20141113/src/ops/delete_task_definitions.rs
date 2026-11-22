@@ -162,18 +162,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "You can specify up to 10 task definitions as a comma separated list" — the
-        // documented size of ONE request, refused like every other batch bound this
-        // service states, naming the entries and the bound.
+        // documented size of ONE request. A list longer than its own member documents is a
+        // parameter outside its constraint, so the refusal is this operation's
+        // `InvalidParameterException` rather than the `ClientException` a malformed or
+        // unauthorized request earns, and it states the SIZE of the named list and the cap
+        // and nothing of the request.
         if input.task_definitions.len() > crate::state::MAX_DELETE_TASK_DEFINITIONS {
-            return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::at_most_items_message(
-                        "task definitions",
-                        crate::state::MAX_DELETE_TASK_DEFINITIONS,
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                DeleteTaskDefinitionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::size_of_list_message(
+                            crate::state::TASK_DEFINITION_REFERENCES_LIST,
+                            crate::state::MAX_DELETE_TASK_DEFINITIONS,
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
 
         // Every entry is resolved to ONE (family, revision) BEFORE anything is written,

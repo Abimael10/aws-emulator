@@ -2745,6 +2745,11 @@ pub const MAX_DESCRIBE_SERVICES: usize = 10;
 /// definitions as a comma separated list."
 pub const MAX_DELETE_TASK_DEFINITIONS: usize = 10;
 
+/// How Amazon ECS names that list in the refusal for a request carrying more references
+/// than the member documents ([`size_of_list_message`]): the list of references to the
+/// `TaskDefinition` shape, written in that shape's own spelling.
+pub const TASK_DEFINITION_REFERENCES_LIST: &str = "TaskDefinition references list";
+
 /// How many tags ONE resource may carry, whoever wrote them. The `Tag` doc's first
 /// restriction: "Maximum number of tags per resource - 50" — the same number the `Tags`
 /// list's own length constraint caps a single request at, which is why it bites only
@@ -2897,6 +2902,21 @@ pub fn at_most_items_message(entries: &str, max: usize) -> String {
 /// the bound of a list of names or ids.
 pub fn arn_count_message(resource: &str, max: usize) -> String {
     format!("{resource} ARN count cannot exceed {max}")
+}
+
+/// `InvalidParameterException$message` for a caller-supplied list of RESOURCE REFERENCES
+/// that names more of them than one request may carry: Amazon ECS states the SIZE of the
+/// list, written in the words of the shape whose references it holds, and the cap, in one
+/// sentence with no trailing period — "Size of <list> cannot exceed <N>".
+///
+/// The sentence `DeleteTaskDefinitions` answers for a `taskDefinitions` longer than its own
+/// doc allows ("You can specify up to 10 task definitions as a comma separated list"), as
+/// against [`at_most_items_message`] and [`arn_count_message`], which are how this API
+/// states the bound of its other caller-sized lists. The whole of it is fixed text: it
+/// echoes neither the references the list held nor how many there were, so a refusal names
+/// nothing of the request.
+pub fn size_of_list_message(list: &str, max: usize) -> String {
+    format!("Size of {list} cannot exceed {max}")
 }
 
 /// The same sentence for a caller-supplied STRING longer than the member documents.
