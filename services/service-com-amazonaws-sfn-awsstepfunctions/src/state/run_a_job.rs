@@ -35,6 +35,16 @@
 //! integration calls are made, and a second parked job is watched exactly as the first
 //! was.
 //!
+//! ## The job a closed task leaves behind
+//!
+//! A task the clock CLOSED leaves its job running at the invoked service with nobody
+//! waiting for it, so that job is stopped ([`stop_abandoned_jobs`]). The closure is
+//! materialised by whichever caller settles first — this poll, a report of the parked
+//! execution, a start of another one — so the record of what to stop is queued by the
+//! settle that closed it and handed over by whoever settled, exactly as the status
+//! changes a settle produces are. The stop is therefore owed by the CLOSURE and not by
+//! which caller happened to be looking at the moment it came due.
+//!
 //! ## Who it polls as
 //!
 //! The execution role, as the starting call was made as: the reporting call is the
@@ -83,21 +93,14 @@ pub fn watch<Eng: Send + Sync + 'static>(
 /// ([`super::JobTask::times_out_at`]) and removes the job record when that span has
 /// run out — so the longest this can run is that span plus one interval, whatever the
 /// invoked service does. It also ends as soon as the job is resolved, the execution is
-/// stopped, or the store is gone.
+/// stopped, or the store is gone. Every pass hands over the stop a closed job owes,
+/// whichever caller's settle closed it ([`stop_abandoned_jobs`]).
 async fn poll<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     callback: &EmbeddedEmulator,
     depth: u8,
     execution_arn: &str,
 ) {
-    // The job this watcher last saw in the store, kept across passes: WHICHEVER caller
-    // materialises the closure of this task removes the record — the settle below, or any
-    // request of this service that settles first (a report of the parent execution, a
-    // start of another one) — so the record is often already gone by the time this watcher
-    // sees the task end. The job behind it is still running, and it is this watcher's
-    // business to stop it, so what the stop needs is held HERE rather than read back out of
-    // a store that no longer has it.
-    let mut last_seen: Option<super::JobTask> = None;
     loop {
         ::tokio::time::sleep(super::PARKED_JOB_POLL_INTERVAL).await;
         let Some(state) = super::service_state(&**engine) else {
@@ -115,13 +118,8 @@ async fn poll<Eng: Send + Sync + 'static>(
         // key's and the clock's together, so it is taken wherever a due outcome is
         // materialised rather than only where a caller reaches it.
         super::encryption::fail_due_runs_the_key_refuses(&**engine, super::now());
-        let (parked, task, role_arn) = {
+        let (task, role_arn) = {
             let mut store = state.lock();
-            // The job as it stands BEFORE this pass settles, so the settle can be told
-            // from the job ending: a task the settle CLOSES — because it ran out of the
-            // time it was allowed, or because the execution waiting at it is gone — is
-            // no longer in the store afterwards.
-            let parked = store.job_tasks.get(execution_arn).cloned();
             store.settle(super::now());
             let task = store.job_tasks.get(execution_arn).cloned();
             let machine = store
@@ -129,28 +127,18 @@ async fn poll<Eng: Send + Sync + 'static>(
                 .get(execution_arn)
                 .and_then(|execution| store.state_machines.get(&execution.state_machine_arn));
             let role_arn = machine.map_or_else(String::new, |machine| machine.role_arn.clone());
-            (parked, task, role_arn)
+            (task, role_arn)
         };
+        // The stop every job this store has closed is owed, made here with no store
+        // locked: the settle above may have closed THIS job — because its task ran out
+        // of the time it was allowed, or because the execution waiting at it is gone —
+        // and any other caller's settle may have closed it first, which is why the stop
+        // is carried by the store rather than by whichever of them was looking
+        // ([`stop_abandoned_jobs`]).
+        stop_abandoned_jobs(engine, callback).await;
         let Some(task) = task else {
-            // The task is gone: whatever the job is still doing is waited for by
-            // nobody, so the job is STOPPED rather than left running behind the task
-            // that started it — the same thing that happens to a job a failed state
-            // abandoned ([`integration::stop_abandoned`]). A job that had already
-            // ended ignores the call. The job is the one this pass found still parked,
-            // else the one the previous pass saw: the closure is the clock's, so it is
-            // carried through by whichever caller reads the store first and the record
-            // may have gone before this pass looked.
-            if let Some(parked) = parked.or(last_seen) {
-                let (call, request) = integration::stopping(
-                    parked.api,
-                    parked.family,
-                    parked.job,
-                    &parked.job_id,
-                    &parked.naming,
-                );
-                let _answered =
-                    integration::call_api(callback, &parked.region, &call, &request).await;
-            }
+            // The job this watcher was polling is closed, and the stop it owed has gone
+            // out above: there is nothing left to ask about.
             return;
         };
 
@@ -167,9 +155,6 @@ async fn poll<Eng: Send + Sync + 'static>(
 
         let (call, request) =
             integration::describing(task.api, task.family, task.job, &task.job_id, &task.naming);
-        // What this pass saw, for the pass that finds the task closed: the stop it then
-        // makes names the job this record carries.
-        last_seen = Some(task.clone());
         // The poll is one of the execution's own calls, so the policies in force on
         // its role decide whether it is made: a role that may not report the job
         // cannot be told what the job did, and the task it belongs to has already been
@@ -189,9 +174,6 @@ async fn poll<Eng: Send + Sync + 'static>(
             .map(asl::reported);
         if let Some(refusal) = denied {
             resolve(engine, callback, depth, execution_arn, &task, Err(refusal)).await;
-            // The task was resolved HERE, so its record is gone by the walk's own doing
-            // rather than by the clock closing it: there is no abandoned job to stop.
-            last_seen = None;
             continue;
         }
         let reported = integration::call_api(callback, &task.region, &call, &request).await;
@@ -223,10 +205,49 @@ async fn poll<Eng: Send + Sync + 'static>(
         // may itself have parked at another job — the next pass finds it, and finds
         // nothing to poll when there is none.
         resolve(engine, callback, depth, execution_arn, &task, outcome).await;
-        // As above: a task this loop resolved leaves no job for the pass that finds the
-        // record gone to stop.
-        last_seen = None;
     }
+}
+
+/// Tell the invoked service to STOP every job this store has closed and nothing has
+/// answered for yet, and answer how many stops went out.
+///
+/// A job whose task ran out of the time it was allowed, and one whose execution ended or
+/// went away while it was parked, is waited for by nobody: it is stopped rather than left
+/// running behind the task that started it, through the stopping call its own integration
+/// names — the same thing that happens to a job a failed state abandoned
+/// ([`integration::stop_abandoned`]). A job that had already ended ignores the call, so
+/// what it answers decides nothing here.
+///
+/// The closure is the CLOCK's, and whichever caller settles first materialises it — the
+/// job's own poll, a report of the parked execution, a start of another one — so the
+/// record of what to stop is queued by the settle itself
+/// ([`super::ComAmazonawsSfnAwsstepfunctionsState::take_abandoned_jobs`]) and handed over
+/// by whoever settled, exactly as the status changes a settle produces are
+/// ([`super::events`]). That is what makes the stop owed by the closure rather than by
+/// how two callers happened to interleave.
+///
+/// Called with NO store of this service locked: the queue is emptied in one critical
+/// section, so one closure is stopped exactly once however many callers drain at the same
+/// moment, and the calls are made outside it.
+pub(super) async fn stop_abandoned_jobs<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    callback: &EmbeddedEmulator,
+) -> usize {
+    let Some(state) = super::service_state(&**engine) else {
+        return 0;
+    };
+    let abandoned = state.lock().take_abandoned_jobs();
+    for job in &abandoned {
+        let (call, request) = integration::stopping(
+            job.api,
+            job.family,
+            job.job,
+            &job.job_id,
+            &job.naming,
+        );
+        let _answered = integration::call_api(callback, &job.region, &call, &request).await;
+    }
+    abandoned.len()
 }
 
 /// Record what the job ENDED as: the execution carries on from the state that started

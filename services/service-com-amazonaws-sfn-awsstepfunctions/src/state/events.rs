@@ -422,8 +422,9 @@ fn text(value: Option<&str>) -> Value {
 
 /// Publish everything the transitions this store has materialised owe: every status
 /// change queued onto the account's default EventBridge bus, every observation queued
-/// for CloudWatch and CloudWatch Logs, and the clock that keeps doing both for the
-/// transitions nobody will ask for.
+/// for CloudWatch and CloudWatch Logs, the stop a closed run-a-job task's job is owed
+/// ([`super::run_a_job::stop_abandoned_jobs`]), and the clock that keeps doing all of
+/// them for the transitions nobody will ask for.
 ///
 /// Called with NO lock held, by every operation whose own settle can materialise an
 /// execution's transition — a call that MOVES a status, and a REPORT that finds one the
@@ -494,7 +495,17 @@ async fn hand_over<Eng: Send + Sync + 'static>(
     // X-Ray whether or not anybody calls this service again
     // ([`super::xray_tracing`]).
     let segments = super::xray_tracing::publish(engine, callback).await;
-    changes + segments + super::observability::publish(&**engine, callback).await
+    // So is the stop a job a CLOSED run-a-job task left running: the task it belonged to
+    // is over, so nobody waits for that job, and the settle that closed the task queued
+    // the stop its own service is owed ([`super::run_a_job::stop_abandoned_jobs`]). It
+    // goes out here for the same reason the changes above do — whoever settled hands over
+    // what that settle produced — so the stop does not depend on which caller was looking
+    // when the bound ran out.
+    let stopped = super::run_a_job::stop_abandoned_jobs(engine, callback).await;
+    changes
+        + segments
+        + stopped
+        + super::observability::publish(&**engine, callback).await
 }
 
 /// Publish what is queued onto the account's event bus, and answer how many changes went
@@ -730,8 +741,10 @@ fn in_flight_or_release(
     generation: u64,
 ) -> Option<Option<SystemTime>> {
     // A queued change is work in flight of its own: it is published before this clock
-    // may stand down.
-    let mut in_flight = !store.pending_execution_events.is_empty();
+    // may stand down. So is a job this store has closed and whose own service has not
+    // been told to stop it yet ([`super::run_a_job::stop_abandoned_jobs`]).
+    let mut in_flight =
+        !store.pending_execution_events.is_empty() || store.owes_a_job_stop();
     let mut next_due: Option<SystemTime> = None;
     for execution in store.executions.values() {
         if execution.is_terminal() {

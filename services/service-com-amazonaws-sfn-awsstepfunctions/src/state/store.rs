@@ -1090,7 +1090,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             }
         }
         for execution_arn in orphaned {
-            self.discard_job_task(&execution_arn);
+            self.abandon_job_task(&execution_arn);
         }
         for (execution_arn, due) in timed_out {
             self.time_out_job_task(&execution_arn, due);
@@ -1156,6 +1156,45 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Some(task)
     }
 
+    /// Take the job the execution `execution_arn` is parked at out of the store because
+    /// nothing waits for it any more, and QUEUE the stop its own service is owed
+    /// ([`Self::abandoned_jobs`]). `None` when the execution is parked at none.
+    ///
+    /// The one path for a job the CLOCK closed — a task that ran out of the time it was
+    /// allowed, an execution that ended or went away while it was parked — as against
+    /// one a caller takes out to stop itself ([`Self::discard_job_task`], whose caller
+    /// makes that call with the record it is handed). The queued record stays counted
+    /// against this store's ceiling until the stop goes out, because the store is still
+    /// holding it.
+    fn abandon_job_task(&mut self, execution_arn: &str) -> Option<JobTask> {
+        let task = self.discard_job_task(execution_arn)?;
+        self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
+        self.abandoned_jobs.push_back(task.clone());
+        Some(task)
+    }
+
+    /// Take out every queued stop of a job this store closed, oldest first, giving back
+    /// what each record retained.
+    ///
+    /// Taken in ONE critical section, so one closure is stopped exactly once however
+    /// many callers drain at the same moment, and the calls themselves are made with no
+    /// store locked ([`super::run_a_job::stop_abandoned_jobs`]).
+    pub(super) fn take_abandoned_jobs(&mut self) -> Vec<JobTask> {
+        let taken: Vec<JobTask> = self.abandoned_jobs.drain(..).collect();
+        for task in &taken {
+            self.retained_bytes = self.retained_bytes.saturating_sub(task.retained_bytes);
+        }
+        taken
+    }
+
+    /// Whether a job this store closed is still waiting for its own service to be told
+    /// to stop it: work in flight, which is why the clock does not stand down while any
+    /// is queued ([`super::events`]).
+    #[must_use]
+    pub(super) fn owes_a_job_stop(&self) -> bool {
+        !self.abandoned_jobs.is_empty()
+    }
+
     /// Record what the job an execution was parked at ENDED as: the job is closed and
     /// the execution waiting at it carries on with what the continuation produced.
     ///
@@ -1198,7 +1237,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// `due` is the instant the bound was reached, not the instant somebody looked, so
     /// two callers reading afterwards see the same `stopDate`.
     fn time_out_job_task(&mut self, execution_arn: &str, due: SystemTime) {
-        let Some(task) = self.discard_job_task(execution_arn) else {
+        let Some(task) = self.abandon_job_task(execution_arn) else {
             return;
         };
         let Some(execution) = self.executions.get_mut(execution_arn) else {
@@ -1442,6 +1481,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 
     /// Drop every outstanding task of the executions `arns` names, for a removal that
     /// takes those executions with it.
+    ///
+    /// A job one of them was PARKED at is a job nobody waits for once its execution is
+    /// gone, so the stop its own service is owed is queued here as it is for a job the
+    /// clock closed any other way ([`Self::abandon_job_task`]).
     pub(super) fn discard_tasks_of_executions(&mut self, arns: &[String]) {
         let tokens: Vec<String> = self
             .activity_tasks
@@ -1453,7 +1496,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             self.discard_activity_task(&token);
         }
         for arn in arns {
-            self.discard_job_task(arn);
+            self.abandon_job_task(arn);
         }
     }
 

@@ -64,7 +64,9 @@
 //!   it finished, which is what resolves the task. This is NOT a transition the clock
 //!   owes — only the invoked service can say whether its job is done — but the TIME
 //!   the task is allowed is: a job unfinished past [`JobTask::times_out_at`] fails the
-//!   execution with the language's own timeout error.
+//!   execution with the language's own timeout error, and the job that task left
+//!   running is stopped, which the settle that closed the task queues for whoever
+//!   settled to hand over ([`run_a_job::stop_abandoned_jobs`]).
 //! * `DeleteStateMachine` is documented as asynchronous: it "sets the state machine's
 //!   status to `DELETING` and begins the deletion process", so the record moves to
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
@@ -2779,6 +2781,24 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// is not finished until the invoked service reports finished. A walk parks at one
     /// state at a time, so one execution has at most one.
     pub job_tasks: BTreeMap<String, JobTask>,
+    /// Every job this store has CLOSED and whose own service has not been told to stop
+    /// it yet, oldest first: a job whose task ran out of the time it was allowed, and
+    /// one whose execution ended or went away while it was parked, is work nobody waits
+    /// for any more, and it is stopped through the call its integration names
+    /// ([`run_a_job::stop_abandoned_jobs`]).
+    ///
+    /// The queue is what makes that stop owed by the CLOSURE rather than by whichever
+    /// caller happens to look next: the record leaves [`Self::job_tasks`] wherever the
+    /// closure is materialised — a settle in front of any request of this service as
+    /// much as the job's own poll — so a stop carried only by the poll that was looking
+    /// would be made, or not made, by how the two happened to interleave. It is the same
+    /// hand-over the status changes a settle produces go out through
+    /// ([`Self::pending_execution_events`]).
+    ///
+    /// It holds at most one entry per execution, because closing a job is what takes the
+    /// one record an execution can be parked at out of the store, and an entry's bytes
+    /// stay counted against this store's own ceiling while it waits.
+    abandoned_jobs: std::collections::VecDeque<JobTask>,
     /// One activity's outstanding task tokens in SCHEDULE order, so a poll claims the
     /// task that has waited longest and two executions' tasks cannot cross.
     pub activity_tasks_by_activity: HashMap<String, Vec<String>>,

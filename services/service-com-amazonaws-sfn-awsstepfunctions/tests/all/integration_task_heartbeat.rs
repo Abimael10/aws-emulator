@@ -111,7 +111,15 @@ async fn settled(emulator: &Emulator, case: &str, execution: &str) -> Value {
 
 /// The child execution the parent's one child-start answered, read off the executions
 /// of the child state machine rather than guessed at.
-async fn child_execution(emulator: &Emulator, case: &str, child_machine: &str) -> String {
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` declares every suite of this target,
+/// so a sibling suite reading the same job reads this rather than carrying a second
+/// copy of it.
+pub(crate) async fn child_execution(
+    emulator: &Emulator,
+    case: &str,
+    child_machine: &str,
+) -> String {
     let began = Instant::now();
     loop {
         let listed = emulator
