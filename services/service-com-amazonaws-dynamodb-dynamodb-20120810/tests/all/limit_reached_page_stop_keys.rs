@@ -240,29 +240,31 @@ async fn a_statement_page_that_reached_its_limit_reports_its_cursor() {
 }
 
 #[tokio::test]
-async fn a_scan_states_a_range_clause_in_the_item_request_form() {
+async fn a_scan_states_a_range_clause_in_the_form_of_the_member_refused() {
     let router = emulator();
     paged_table(&router, "ScanClauses").await;
 
     // Rows differ in the member, which end of its published range the value broke, and how
-    // far past the bound it went. The page size and the parallel-scan bounds beside it all
-    // take the item-request form, which names the member as the model spells it and echoes no
-    // value; the last row is the CONTRAST that the form is the served operation's: a
-    // control-plane listing's page size, one below the same minimum, is stated in the request
-    // validator's form, which echoes the rejected value.
+    // far past the bound it went. The walk's PAGE SIZE is stated in the request validator's
+    // form, which names the member by its lowerCamel path and echoes the rejected value,
+    // while the parallel-scan bounds beside it take the item-request form, which names the
+    // member as the model spells it and echoes no value; the last row is the CONTRAST that
+    // the page size's form is not the operation's alone — a control-plane listing's page
+    // size, one below the same minimum, is stated the same way the walk's is
+    // (`tests/all/page_size_clause_forms.rs` pins every form side by side).
     let cases: [(&str, &str, Value, &str); 6] = [
         (
             "a page size one below its range minimum",
             "Scan",
             json!({"TableName": "ScanClauses", "Limit": 0}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1",
         ),
         (
             "a page size far below that minimum states the same requirement",
             "Scan",
             json!({"TableName": "ScanClauses", "Limit": -7}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '-7' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1",
         ),
         (

@@ -601,9 +601,10 @@ fn stated_enum_order(allowed: &[String]) -> Vec<String> {
 //
 //   * the ITEM-REQUEST form, which names the member by its WIRE spelling and
 //     echoes NO value — `Value at 'Limit' failed to satisfy constraint: Member
-//     must have value greater than or equal to 1` for a keyed read's or a table
-//     walk's page size below its `@range` minimum, and `Value at
-//     'RequestItems.<table>.member.Keys' …` for a batched key list past its cap;
+//     must have value greater than or equal to 1` for a keyed read's page size
+//     below its `@range` minimum, `Value at 'TotalSegments' …` for a table walk's
+//     parallel-scan bounds, and `Value at 'RequestItems.<table>.member.Keys' …`
+//     for a batched key list past its cap;
 //   * the VALIDATOR-PATH form, which echoes no value either but names the member
 //     by the lowerCamel path the request validator builds — `Value at
 //     'requestItems' …` for a `BatchWriteItem` request map past either end of its
@@ -615,12 +616,14 @@ fn stated_enum_order(allowed: &[String]) -> Vec<String> {
 //     'timeToLiveSpecification.attributeName' …` for an empty TTL attribute name.
 //
 // All three are observed for the SAME violation class on the SAME member name
-// (`Limit`, `@range` min 1, on `Query` and `Scan` and on `ListBackups`;
+// (`Limit`, `@range` min 1, on `Query` and on `Scan` and on `ListBackups`;
 // `RequestItems`, `@length` min 1, on `BatchGetItem` and on `BatchWriteItem`), so
 // nothing about the model or about the violation distinguishes them: only the
-// OPERATION being served does, which is why [`ITEM_REQUEST_FORM_OPERATIONS`] and
-// [`VALIDATOR_PATH_FORM_OPERATIONS`] list the operations whose refusals are
-// observed to take the first two forms and every other operation takes the last.
+// member of the OPERATION being served does, which is why
+// [`ITEM_REQUEST_FORM_OPERATIONS`] and [`VALIDATOR_PATH_FORM_OPERATIONS`] list the
+// operations whose refusals are observed to take the first two forms, every other
+// operation takes the last, and [`VALUE_ECHOING_MEMBERS`] names the individual
+// members of a listed operation that take the last one all the same.
 // [`OperationScopedClauseForm`] is how the served operation
 // reaches [`Service::override_refusal`], which the framework hands no request.
 //
@@ -702,7 +705,8 @@ impl ClauseForm {
     }
 }
 
-/// The form `operation`'s refusals take.
+/// The form the refusals of `operation` take where that operation states no form of its
+/// own for the member in hand ([`VALUE_ECHOING_MEMBERS`]).
 fn clause_form(operation: &str) -> ClauseForm {
     if ITEM_REQUEST_FORM_OPERATIONS.binary_search(&operation).is_ok() {
         ClauseForm::WireMemberOnly
@@ -716,11 +720,67 @@ fn clause_form(operation: &str) -> ClauseForm {
     }
 }
 
+/// The MEMBERS an operation of one of the lists above states in the request-validator form
+/// all the same, each named by the validator path the walk reports it under, per operation.
+///
+/// The form is a fact of the served operation AND of the member refused, not of the
+/// operation alone: a table walk's page size below its `@range` minimum is refused `Value
+/// '0' at 'limit' failed to satisfy constraint: …`, echoing the rejected value under the
+/// validator's path, while the SAME member name carrying the SAME violation of the SAME
+/// bound on a keyed read is refused `Value at 'Limit' …` and the walk's own parallel-scan
+/// bounds beside it (`TotalSegments`, `Segment`) keep that no-value wire form too. One
+/// member name, one trait, two sentences, so nothing about the model or about the violation
+/// distinguishes them and this is the only place the difference is recorded; a member later
+/// found to be stated in a form its operation does not otherwise state needs its own entry
+/// here. `tests/all/page_size_clause_forms.rs` pins the forms side by side, per operation
+/// and per member, so the difference is visible rather than silent.
+const VALUE_ECHOING_MEMBERS: &[(&str, &[&str])] = &[("Scan", &["limit"])];
+
+/// The forms ONE operation states its clauses in: the form every member of it takes
+/// ([`clause_form`]) and the members it states in the request-validator form instead
+/// ([`VALUE_ECHOING_MEMBERS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatedClauseForms {
+    /// The form a member this operation states no form of its own for takes.
+    operations: ClauseForm,
+    /// The validator paths of the members it states in the request-validator form.
+    echoing: &'static [&'static str],
+}
+
+impl StatedClauseForms {
+    /// What a refusal raised outside any operation's run states: the request validator's
+    /// form, which is the general one, with no member of its own.
+    const VALIDATOR: Self = Self {
+        operations: ClauseForm::PathAndValue,
+        echoing: &[],
+    };
+
+    /// The forms `operation` states its clauses in.
+    fn of(operation: &str) -> Self {
+        Self {
+            operations: clause_form(operation),
+            echoing: VALUE_ECHOING_MEMBERS
+                .iter()
+                .find(|(named, _)| *named == operation)
+                .map_or(&[][..], |(_, members)| *members),
+        }
+    }
+
+    /// The form a clause about the member at `path` takes.
+    fn member(self, path: &str) -> ClauseForm {
+        if self.echoing.contains(&path) {
+            ClauseForm::PathAndValue
+        } else {
+            self.operations
+        }
+    }
+}
+
 tokio::task_local! {
-    /// The form the operation this request is being served as states its clauses in,
+    /// The forms the operation this request is being served as states its clauses in,
     /// set by [`OperationScopedClauseForm::run`] around that operation's whole run and
     /// read back by [`EmulatedService::override_refusal`].
-    static SERVED_CLAUSE_FORM: ClauseForm;
+    static SERVED_CLAUSE_FORM: StatedClauseForms;
 
     /// Whether that operation states a clause about a member the service checks itself
     /// BARE ([`BARE_CLAUSE_OPERATIONS`]), set and read back the same way.
@@ -760,15 +820,18 @@ tokio::task_local! {
     static SERVED_CAPPED_LIST_CLAUSE: Option<request_constraints::CappedListClause>;
 }
 
-/// The form the operation this task is serving states its clauses in.
+/// The form the operation this task is serving states a clause about the member at `path`
+/// in.
 ///
 /// Absent altogether means the refusal happened outside an operation's run, where
 /// there is no served operation to read a form off; the request validator's form is
-/// the general one, so that is what such a refusal states.
-fn served_clause_form() -> ClauseForm {
+/// the general one, so that is what such a refusal states
+/// ([`StatedClauseForms::VALIDATOR`]).
+fn served_clause_form(path: &str) -> ClauseForm {
     SERVED_CLAUSE_FORM
-        .try_with(|form| *form)
-        .unwrap_or(ClauseForm::PathAndValue)
+        .try_with(|forms| *forms)
+        .unwrap_or(StatedClauseForms::VALIDATOR)
+        .member(path)
 }
 
 /// Whether the operation this task is serving states such a clause bare. Absent
@@ -963,7 +1026,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
             };
             let answered = SERVED_CLAUSE_FORM
                 .scope(
-                    clause_form(operation),
+                    StatedClauseForms::of(operation),
                     SERVED_BARE_CLAUSE.scope(
                         states_service_checked_clause_bare(operation),
                         SERVED_NULL_CLAUSE.scope(
@@ -1054,7 +1117,7 @@ fn body_violation_refusal(
     req: &aws_smithy_runtime_api::http::Request,
     violations: &[Violation],
 ) -> Option<String> {
-    SERVED_CLAUSE_FORM.sync_scope(clause_form(operation), || {
+    SERVED_CLAUSE_FORM.sync_scope(StatedClauseForms::of(operation), || {
         SERVED_BARE_CLAUSE.sync_scope(states_service_checked_clause_bare(operation), || {
             SERVED_NULL_CLAUSE.sync_scope(states_absent_member_as_clause(operation), || {
                 SERVED_MEMBER_CHECK.sync_scope(checks_its_own_members(operation), || {
@@ -1337,7 +1400,7 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
     if let Some(masking) = masking_violation(violations) {
         return crate::state::validation_message([violation_clause(
             masking,
-            served_clause_form(),
+            served_clause_form(&masking.path),
             true,
         )?]);
     }
@@ -1381,7 +1444,7 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
         .into_iter()
         .map(|violation| match capped_list.as_ref() {
             Some(capped) if violation.path == capped.path => Some(capped.clause.clone()),
-            _ => violation_clause(violation, served_clause_form(), alone),
+            _ => violation_clause(violation, served_clause_form(&violation.path), alone),
         })
         .collect::<Option<Vec<_>>>()?;
     // The violations this service found by READING the request are violations of the same
@@ -1820,9 +1883,9 @@ mod tests {
     use super::{
         checks_its_own_members, clause_form, holds_table_name_to_its_form, stated_enum_order,
         states_absent_member_as_clause, states_service_checked_clause_bare, ClauseForm,
-        BARE_CLAUSE_OPERATIONS, ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS,
-        SELF_CHECKED_MEMBER_OPERATIONS, TABLE_NAME_FORM_OPERATIONS,
-        VALIDATOR_NULL_CLAUSE_OPERATIONS, VALIDATOR_PATH_FORM_OPERATIONS,
+        StatedClauseForms, BARE_CLAUSE_OPERATIONS, ITEM_REQUEST_FORM_OPERATIONS,
+        PUBLISHED_ENUM_ORDERS, SELF_CHECKED_MEMBER_OPERATIONS, TABLE_NAME_FORM_OPERATIONS,
+        VALIDATOR_NULL_CLAUSE_OPERATIONS, VALIDATOR_PATH_FORM_OPERATIONS, VALUE_ECHOING_MEMBERS,
     };
 
     /// The admissible sets as the walk hands them over.
@@ -2040,5 +2103,50 @@ mod tests {
                 "case {operation:?}: expected the request-validator form, got {form:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_member_of_its_own_overrides_the_operations_form() {
+        // Every member named for an operation is stated in the request-validator form,
+        // whatever form that operation states its other members in.
+        for (operation, members) in VALUE_ECHOING_MEMBERS {
+            let forms = StatedClauseForms::of(operation);
+            for member in *members {
+                let form = forms.member(member);
+                assert_eq!(
+                    form,
+                    ClauseForm::PathAndValue,
+                    "case {operation:?} member {member:?}: expected the request-validator \
+                     form, got {form:?}"
+                );
+            }
+            // And a member of the SAME operation that is not named keeps that operation's
+            // own form, so the entry above is about the member and not about the operation.
+            let other = forms.member("notAMemberOfItsOwn");
+            assert_eq!(
+                other,
+                clause_form(operation),
+                "case {operation:?}: a member it states no form of its own for keeps the \
+                 operation's form, got {other:?}"
+            );
+        }
+        // An operation that names no member of its own states every member in its own form,
+        // and a refusal raised outside any operation's run states the validator's.
+        let keyed = StatedClauseForms::of("Query");
+        for member in ["limit", "Limit", "totalSegments"] {
+            let form = keyed.member(member);
+            assert_eq!(
+                form,
+                ClauseForm::WireMemberOnly,
+                "case \"Query\" member {member:?}: expected the item-request form, got {form:?}"
+            );
+        }
+        let outside = StatedClauseForms::VALIDATOR.member("limit");
+        assert_eq!(
+            outside,
+            ClauseForm::PathAndValue,
+            "case \"outside an operation's run\": expected the request-validator form, got \
+             {outside:?}"
+        );
     }
 }

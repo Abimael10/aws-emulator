@@ -23,10 +23,11 @@
 //!    `ValidationError` reason, and answers a fault of the VALUE the request carried
 //!    (the emptiness rule) directly, like every other write path;
 //! 2. a numeric input member outside the `@range` its model declares is refused by
-//!    a clause whose FORM follows the OPERATION it was refused on: the item-request
-//!    form names the member by the spelling the model gives it on the wire and
-//!    echoes no value, while the request validator's form names it by the lowerCamel
-//!    input path that validator builds and echoes the NUMBER the request carried.
+//!    a clause whose FORM follows the OPERATION it was refused on AND the MEMBER it
+//!    is about: the item-request form names the member by the spelling the model
+//!    gives it on the wire and echoes no value, while the request validator's form
+//!    names it by the lowerCamel input path that validator builds and echoes the
+//!    NUMBER the request carried.
 //!
 //! The rows differ along what each rule generalises over. For rule 1: the declared
 //! type (`S`, `N`, `B`), the type supplied (a scalar of another type, a set, a
@@ -784,14 +785,18 @@ async fn a_numeric_member_outside_its_range_is_refused_in_its_operation_s_form()
             echoes: false,
         },
         RangeRow {
+            // The SAME bound on the SAME member name as the keyed read above, stated in the
+            // other form: the table WALK echoes the rejected page size under the validator's
+            // path, while its parallel-scan bounds below keep the no-value wire form
+            // (`tests/all/page_size_clause_forms.rs` pins every form side by side).
             case: "the same bound on another data-plane read, far below it",
             operation: "Scan",
             member: "Limit",
-            path: "Limit",
+            path: "limit",
             value: -7,
             requirement: "",
             table: Some(TABLE),
-            echoes: false,
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment count one past its maximum",
