@@ -78,7 +78,7 @@ const MAX_TAG_VALUE_CHARS: usize = 256;
 
 /// Turn the account's outbound web identity federation ON through IAM's own operation, and
 /// report the issuer URL it announced.
-async fn enable_federation(router: &MultiServiceRouter) -> String {
+pub(crate) async fn enable_federation(router: &MultiServiceRouter) -> String {
     let (status, body) = query(
         router,
         LONG_TERM_KEY,
@@ -144,7 +144,10 @@ fn issuer_path(issuer: &str) -> String {
 
 /// The key set the account's issuer publishes, fetched over the wire from the issuer URL it
 /// announced.
-async fn published_key_set(router: &MultiServiceRouter, issuer: &str) -> serde_json::Value {
+pub(crate) async fn published_key_set(
+    router: &MultiServiceRouter,
+    issuer: &str,
+) -> serde_json::Value {
     let path = format!("{}/.well-known/jwks.json", issuer_path(issuer));
     let (status, body) = fetch(router, &path).await;
     assert_eq!(
@@ -157,7 +160,7 @@ async fn published_key_set(router: &MultiServiceRouter, issuer: &str) -> serde_j
 
 /// The form parameters one call carries: the audiences, the algorithm and, when a row names
 /// one, the duration.
-fn token_params(
+pub(crate) fn token_params(
     audiences: &[&str],
     algorithm: &str,
     duration: Option<i64>,
@@ -176,7 +179,7 @@ fn token_params(
 }
 
 /// `params` as the borrowed pairs the call helper takes.
-fn borrowed(params: &[(String, String)]) -> Vec<(&str, String)> {
+pub(crate) fn borrowed(params: &[(String, String)]) -> Vec<(&str, String)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.clone()))
