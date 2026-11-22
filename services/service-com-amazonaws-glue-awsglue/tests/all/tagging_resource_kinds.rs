@@ -47,9 +47,26 @@ const SCHEMA_REGISTRY: &str = "kinds-schema-registry";
 const AVRO_DEFINITION: &str =
     r#"{"type":"record","name":"Row","fields":[{"name":"id","type":"string"}]}"#;
 
-/// The `Message` a tagging call answers for an ARN of a taggable kind that names no resource
+/// The `Message` a tagging WRITE answers for an ARN of a taggable kind that names no resource
 /// this endpoint holds. Recorded wording, which names neither the ARN nor the kind.
 const ENTITY_NOT_FOUND: &str = "Entity not found";
+
+/// The `Message` the tagging READ answers for such an ARN of the kind `segment`, whose name
+/// after the type segment is `name`.
+///
+/// The read resolves the ARN through the surface that OWNS the kind, so its miss is that
+/// surface's own sentence: recorded as "Job not found." for a job ARN, as the database
+/// surface's sentence naming the database for a database ARN, and as the crawler-definition
+/// surface's naming the crawler for a crawler ARN. Every other kind answers the generic
+/// entity sentence, which is what the read is recorded to answer for a workflow ARN.
+pub fn read_miss_message(segment: &str, name: &str) -> String {
+    match segment {
+        "job" => "Job not found.".to_string(),
+        "database" => format!("Database {name} not found."),
+        "crawler" => format!("Crawler entry with name {name} does not exist"),
+        _ => ENTITY_NOT_FOUND.to_string(),
+    }
+}
 
 /// What [`error_message`] answers for a refusal that carries NO prose at all, which is how
 /// the tagging surface refuses an ARN that names none of its resources.
@@ -426,8 +443,8 @@ async fn every_taggable_kind_round_trips_its_tags() {
 }
 
 /// An ARN of a taggable kind that names no resource this endpoint holds is a MISS for all
-/// three tagging operations — 400 `EntityNotFoundException` with the recorded wording — and
-/// the refused call changes nothing.
+/// three tagging operations — 400 `EntityNotFoundException`, worded as the refusing call
+/// words one ([`read_miss_message`]) — and the refused call changes nothing.
 #[tokio::test]
 async fn an_arn_of_a_taggable_kind_naming_nothing_is_a_miss() {
     let router = emulator();
@@ -464,9 +481,16 @@ async fn an_arn_of_a_taggable_kind_naming_nothing_is_a_miss() {
                 "case {segment} / {operation}: expected EntityNotFoundException, got {}",
                 error_code(&answer)
             );
+            // The READ words the miss as the surface owning the kind does; the two WRITES
+            // answer the one fixed sentence their own recordings state.
+            let expected = if operation == "GetTags" {
+                read_miss_message(segment, &absent)
+            } else {
+                ENTITY_NOT_FOUND.to_string()
+            };
             assert_eq!(
                 error_message(&answer),
-                ENTITY_NOT_FOUND,
+                expected,
                 "case {segment} / {operation}: unexpected wording for a tagging miss"
             );
         }

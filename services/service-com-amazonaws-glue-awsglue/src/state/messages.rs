@@ -659,18 +659,20 @@ pub fn dashboard_url_not_supported(resource_type: &str) -> String {
 /// may be re-worded without the other.
 pub const DASHBOARD_URL_RESOURCE_NOT_FOUND: &str = "Entity not found";
 
-/// The miss of the TAGGING surface: a `ResourceArn` that is the ARN of a taggable Glue
-/// resource but names none this endpoint holds — `GetTags`, `TagResource` and
-/// `UntagResource` alike.
+/// The miss of the TAGGING WRITES: a `ResourceArn` that is the ARN of a taggable Glue
+/// resource but names none this endpoint holds — `TagResource` and `UntagResource` — and the
+/// tag READ's own answer for every kind whose own sentence no recording states
+/// ([`crate::state::tag_read_not_found_message`]).
 ///
-/// RECORDED constant, and the whole message: the tagging surface resolves the ARN and, when
-/// nothing is there, answers its modelled `EntityNotFoundException` with this fixed, generic
-/// sentence — it names neither the ARN it was handed, nor the kind of resource it was looked
-/// for as, nor the name inside it, and carries no trailing period. So the tag read of an
-/// absent workflow and of an absent database read the same, which is what distinguishes
-/// "this resource is not here" from "this is not a resource I tag" (the latter being the
-/// operation's `InvalidInputException`, which carries no prose at all —
-/// [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
+/// RECORDED constant, and the whole message: this fixed, generic sentence names neither the
+/// ARN it was handed, nor the kind of resource it was looked for as, nor the name inside it,
+/// and carries no trailing period. For the WRITES it is the answer whatever the kind is,
+/// which is what distinguishes "this resource is not here" from "this is not a resource I
+/// tag" (the latter being the operation's `InvalidInputException`, which carries no prose at
+/// all — [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]). The READ resolves the ARN through
+/// the surface that owns the kind, so it answers this sentence only where that surface's own
+/// miss is recorded to read this way — the workflow's, whose surface answers exactly this
+/// text ([`WORKFLOW_NOT_FOUND`]).
 ///
 /// It reads the same as other surfaces' generic misses ([`WORKFLOW_NOT_FOUND`],
 /// [`DASHBOARD_URL_RESOURCE_NOT_FOUND`]) and is a separate constant all the same, for the
@@ -990,11 +992,58 @@ pub fn glue_version_invalid(glue_version: &str) -> String {
 /// and it is a client-INPUT refusal rather than a miss — a Glue ARN of another Region
 /// is a bad parameter, whether or not that Region holds the resource.
 ///
-/// This is the WRITE's wording and not yet this crate's answer everywhere: the tag
-/// READ (`GetTags`) still answers that condition with the kind's miss, which is what
-/// the cross-service tag projection's own suite pins it to. Only a recording of the
-/// read's refusal settles whether the two are one sentence.
+/// This is the WRITE's wording and not this crate's answer everywhere: the tag
+/// READ (`GetTags`) answers that condition with the kind's own miss
+/// ([`crate::state::tag_read_not_found_message`]), as recorded for a job ARN addressed at
+/// another Region's endpoint — an ARN of another Region names a resource THIS endpoint
+/// holds nothing for, which the read reports as the miss it is.
 pub const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
+
+/// A listing whose `Expression` is not a regular expression at all
+/// (`crate::ops::get_tables`).
+///
+/// RECORDED template: the service compiles the caller's expression and RELAYS what the
+/// engine compiling it said about it — fixed text (" near index ", and the layout that
+/// writes the expression on a line of its own under a caret) around three variable parts,
+/// every one of them read off the request's own value: what is wrong with it, the index
+/// into it the parse stopped at, and the expression itself. The reading of that fault is
+/// the workspace's one reading of it
+/// ([`::service_common::pattern_syntax_fault`]), so a caller locating a fault in its own
+/// expression reads one form wherever this emulator compiles one.
+///
+/// `None` for a value that IS a regular expression — a pattern this catalog's matcher
+/// cannot build is not a syntax fault to place, and carries no index
+/// ([`expression_not_matchable`]).
+///
+/// Nothing of the matcher behind the listing appears in the statement: neither the name of
+/// the engine this emulator compiles with, nor the expression this catalog rewrites the
+/// caller's into ([`super::translate_name_pattern`]) — the wildcard expansion makes the two
+/// texts different lengths, so the fault is placed back at the character of the CALLER's own
+/// expression the faulting one came from.
+pub fn expression_syntax_fault(pattern: &str) -> Option<String> {
+    let read_as = super::translate_name_pattern(pattern);
+    let fault = ::service_common::pattern_syntax_fault::pattern_fault(&read_as.translated)?;
+    // A fault the parse reached at the END of the text it read belongs one past the last
+    // character of the caller's own, which is where such a fault is stated.
+    let placed_at = read_as
+        .origin
+        .get(fault.index())
+        .copied()
+        .unwrap_or_else(|| pattern.chars().count());
+    Some(fault.placed_at(placed_at).stated_in(pattern))
+}
+
+/// A listing whose `Expression` IS a regular expression but no matcher this catalog can
+/// build: one whose matcher would be larger than the catalog compiles
+/// ([`super::MAX_PATTERN_PROGRAM_BYTES`]), or one using a construct its matcher does not
+/// implement.
+///
+/// NOT recorded: no fault can be placed inside such a value — it has none — so what is
+/// pinned is the behaviour (400 with the listing's own `InvalidInputException`) and the
+/// sentence states the member's value and nothing of the matcher behind it.
+pub fn expression_not_matchable(pattern: &str) -> String {
+    format!("Expression {pattern} is not a pattern this catalog can match")
+}
 
 /// A listing whose `MaxResults` asks for a page smaller than one entry
 /// (`crate::ops::get_tables`).

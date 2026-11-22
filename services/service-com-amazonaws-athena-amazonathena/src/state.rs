@@ -714,14 +714,35 @@ pub fn relayed_catalog_entity_not_found(reason: &str) -> String {
     )
 }
 
-/// The refusal message for a listing whose `Expression` is no pattern the catalog can
-/// match: a value that is not a valid regular expression, or one whose compiled matcher
-/// would be larger than the catalog compiles
-/// ([`glue_state::MAX_PATTERN_PROGRAM_BYTES`]). Beside the other refusal sentences of
-/// this slice, so a reader of the pattern language is told the same thing wherever it is
-/// matched.
-pub fn malformed_pattern(pattern: &str, reason: &impl ::std::fmt::Display) -> String {
-    format!("Expression {pattern:?} is not a valid regular expression: {reason}")
+/// The refusal message for a listing whose `Expression` is not a regular expression at all.
+///
+/// The statement is the one the engine compiling the expression makes about it — what is
+/// wrong with it, the index into the CALLER's own expression the parse stopped at, and the
+/// expression under a caret at that index — composed by the crate that OWNS this pattern
+/// language ([`glue_state::messages::expression_syntax_fault`]), which is what the Data
+/// Catalog's own listing over these same tables answers too, so one fault in one expression
+/// reads the same from either listing. Nothing of the matcher appears in it: neither the
+/// engine this emulator compiles with nor the expression that language expands the caller's
+/// into, whose character positions are not the caller's.
+///
+/// A value that IS a regular expression but that this catalog can build no matcher for
+/// carries no fault to place ([`unmatchable_pattern`]).
+pub fn malformed_pattern(pattern: &str) -> String {
+    glue_state::messages::expression_syntax_fault(pattern)
+        .unwrap_or_else(|| unmatchable_pattern(pattern))
+}
+
+/// The refusal message for a filter whose matcher this catalog cannot build: one whose
+/// matcher would be larger than the catalog compiles
+/// ([`glue_state::MAX_PATTERN_PROGRAM_BYTES`]), and the `LIKE` form of such a filter, which
+/// is TRANSLATED before it is compiled — so a failure there is about the matcher rather than
+/// about a fault inside the caller's own text, and there is no position in that text to
+/// place.
+///
+/// Beside the other refusal sentences of this slice, so a reader of the pattern language is
+/// told the same thing wherever it is matched.
+pub fn unmatchable_pattern(pattern: &str) -> String {
+    format!("Expression {pattern:?} is not a pattern this catalog can match")
 }
 
 /// One stored Glue table as the `TableMetadata` Athena reports for it.

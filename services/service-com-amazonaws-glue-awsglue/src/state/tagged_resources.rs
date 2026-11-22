@@ -238,6 +238,39 @@ pub fn tagged_resource_not_found_message(resource: &TaggedResource, resource_arn
     }
 }
 
+/// The message the tagging READ answers for a `ResourceArn` of a known kind that names no
+/// resource this endpoint holds — a name nothing was created under, a resource that was
+/// deleted, another account's estate, or another Region's, each of which is this endpoint
+/// holding no such resource.
+///
+/// RECORDED per KIND: the read resolves the ARN through the surface that OWNS the kind, so
+/// the refusal carries that surface's own miss sentence rather than one generic sentence for
+/// every kind — "Job not found." for a job ARN ([`messages::JOB_NOT_FOUND`], the sentence
+/// every job-definition lookup answers), the database surface's sentence naming the database
+/// ([`messages::database_not_found`]) for a database ARN, and the crawler-definition
+/// surface's naming the crawler ([`messages::crawler_not_found`]) for a crawler ARN. The
+/// name in a sentence that carries one comes from the ARN the request sent, resolved exactly
+/// as the store keys it; the ARN itself is never echoed.
+///
+/// Every other kind keeps the generic entity sentence
+/// ([`messages::TAGGED_RESOURCE_NOT_FOUND`]), which is RECORDED as the tag read's answer for
+/// a workflow ARN — and is also that surface's own miss ([`messages::WORKFLOW_NOT_FOUND`]),
+/// so the two readings agree. A kind moves off it when a recording states its own sentence,
+/// and not before: nothing here guesses one from the sentence the kind's other operations
+/// answer.
+///
+/// The tag WRITES do not resolve their miss this way: theirs is the fixed sentence their own
+/// recordings state ([`messages::TAGGED_RESOURCE_NOT_FOUND`]), so this is the READ's wording
+/// and not the tagging surface's.
+pub fn tag_read_not_found_message(resource: &TaggedResource) -> String {
+    match resource.kind {
+        TaggedResourceKind::Job => messages::JOB_NOT_FOUND.to_string(),
+        TaggedResourceKind::Database => messages::database_not_found(&resource.name),
+        TaggedResourceKind::Crawler => messages::crawler_not_found(&resource.name),
+        _ => messages::TAGGED_RESOURCE_NOT_FOUND.to_string(),
+    }
+}
+
 /// Whether the refusal of a `ResourceArn` that is not the ARN of a taggable Glue resource
 /// ([`parse_tagged_resource`] answers `None`) states any prose at all: it does NOT.
 ///

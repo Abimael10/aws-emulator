@@ -596,6 +596,11 @@ pub mod iso8601_span;
 /// The ONE minification of a JSON document a service takes as an opaque string member and
 /// reports back on every read, so no two services report one document's bytes differently.
 pub mod json_document;
+/// The ONE reading of WHERE a value a caller submitted as a REGULAR EXPRESSION stopped
+/// parsing — what is wrong with it, the index into the caller's own expression it was found
+/// at, and the caret under that index — for every service whose refusal relays the statement
+/// the engine behind its pattern language makes about such a value.
+pub mod pattern_syntax_fault;
 /// The ONE reading of WHERE a JSON document a caller submitted stopped parsing — the
 /// character or the unquoted word the parse stopped on, what was expected there, and the
 /// line and column — for every service whose refusal carries its JSON parser's own

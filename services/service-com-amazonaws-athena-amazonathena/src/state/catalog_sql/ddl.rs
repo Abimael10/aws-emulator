@@ -990,7 +990,7 @@ pub fn show_relations(
 fn name_matcher(filter: &RelationFilter) -> Result<::regex::Regex, Failure> {
     match filter {
         RelationFilter::Pattern(pattern) => glue_state::compile_name_pattern(pattern)
-            .map_err(|reason| Failure::user(crate::state::malformed_pattern(pattern, &reason))),
+            .map_err(|_| Failure::user(crate::state::malformed_pattern(pattern))),
         RelationFilter::Like {
             pattern,
             case_insensitive,
@@ -1008,9 +1008,7 @@ fn name_matcher(filter: &RelationFilter) -> Result<::regex::Regex, Failure> {
                 .case_insensitive(*case_insensitive)
                 .size_limit(glue_state::MAX_PATTERN_PROGRAM_BYTES)
                 .build()
-                .map_err(|reason| {
-                    Failure::user(crate::state::malformed_pattern(pattern, &reason))
-                })
+                .map_err(|_| Failure::user(crate::state::unmatchable_pattern(pattern)))
         }
         RelationFilter::Other(form) => Err(Failure::user(format!(
             "Unsupported filter in a SHOW statement: {form}"

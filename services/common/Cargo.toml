@@ -303,6 +303,10 @@ cron = "0.15"
 # `unapplied_patterns`: the same engine the framework's boundary validator compiles a
 # `@pattern` with, asked whether it compiles one at all.
 regex = "1.13"
+# `pattern_syntax_fault`: the PARSER behind that crate, whose structured syntax error is what
+# places and names the fault in a caller's own regular expression — so a refusal relays that
+# statement rather than one engine's rendered diagnostic.
+regex-syntax = "0.8"
 # `unapplied_patterns`: applies a modelled `@pattern` the engine above cannot compile — one
 # carrying look-around, which that engine treats as satisfied. Bounded range (0.16.x), and
 # every match runs under an explicit backtrack budget (`PATTERN_BACKTRACK_LIMIT`), so a

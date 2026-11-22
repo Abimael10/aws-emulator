@@ -14,7 +14,11 @@
 //! (recorded): what is wrong, the index into the rewritten expression the compiler stopped at,
 //! the expression on a line of its own, and a caret under that index when the index is INSIDE
 //! the expression — a fault the compiler reaches at the END of an expression has no character
-//! there to point at.
+//! there to point at. Naming and placing that fault is the workspace's one reading of a syntax
+//! fault in a caller's expression ([`::service_common::pattern_syntax_fault`]), so this
+//! service and every other that relays such a statement place one fault alike; what is this
+//! module's own is the form the compiler reads the expression in and the sentence the
+//! diagnostic opens with.
 //!
 //! WHAT BOUNDS IT: the expression is part of a query string the model constrains to
 //! `@length(0..10000)`; it is PARSED — to decide whether it is an expression, and to place the
@@ -23,15 +27,15 @@
 
 use std::fmt::Write as _;
 
+use ::service_common::pattern_syntax_fault::{pattern_fault, PatternFault};
+
 /// Why a regular-expression literal is not a regular expression, in the terms the query
 /// compiler reports a compile failure in.
 pub(super) struct InvalidExpression {
     /// The expression as the compiler reads it ([`rewritten_expression`]).
     rewritten: String,
-    /// What is wrong, as the compiler names that fault.
-    description: String,
-    /// The index into [`InvalidExpression::rewritten`] the compiler stopped at.
-    index: usize,
+    /// What is wrong and where in that expression it was found.
+    fault: PatternFault,
 }
 
 impl InvalidExpression {
@@ -43,17 +47,10 @@ impl InvalidExpression {
         let mut diagnostic = String::new();
         let _ = write!(
             diagnostic,
-            "{INVALID_EXPRESSION_PREFIX}'{}' — {} near index {}\n{}",
-            self.rewritten, self.description, self.index, self.rewritten
+            "{INVALID_EXPRESSION_PREFIX}'{}' — {}",
+            self.rewritten,
+            self.fault.stated_in(&self.rewritten)
         );
-        let characters = self.rewritten.chars().count();
-        if self.index < characters {
-            diagnostic.push('\n');
-            for _ in 0..self.index {
-                diagnostic.push(' ');
-            }
-            diagnostic.push('^');
-        }
         diagnostic
     }
 }
@@ -70,77 +67,8 @@ const INVALID_EXPRESSION_PREFIX: &str = "Invalid regular expression in query: ";
 /// constructs one parser implements.
 pub(super) fn invalid_expression(pattern: &str) -> Option<InvalidExpression> {
     let rewritten = rewritten_expression(pattern);
-    let error = ::regex_syntax::ast::parse::Parser::new()
-        .parse(&rewritten)
-        .err()?;
-    let characters: Vec<char> = rewritten.chars().collect();
-    // The parser places a fault by BYTE offset; an index into the expression counts
-    // CHARACTERS, the way the expression itself is written out beside it.
-    let at = rewritten
-        .char_indices()
-        .position(|(byte, _)| byte == error.span().start.offset)
-        .unwrap_or(characters.len());
-    let faulting = characters.get(at).copied().unwrap_or(' ');
-    let (description, index) = match error.kind() {
-        // A group the expression never closes is read to the END of the expression, so that
-        // is where the compiler stopped.
-        ::regex_syntax::ast::ErrorKind::GroupUnclosed => ("Unclosed group".to_string(), characters.len()),
-        ::regex_syntax::ast::ErrorKind::GroupUnopened => ("Unmatched closing ')'".to_string(), at),
-        // A character class the expression never closes is read to the end too, and the
-        // compiler stops on its last character.
-        ::regex_syntax::ast::ErrorKind::ClassUnclosed => (
-            "Unclosed character class".to_string(),
-            characters.len().saturating_sub(1),
-        ),
-        // A quantifier with nothing to quantify is a meta character left dangling where the
-        // expression it repeats was owed.
-        ::regex_syntax::ast::ErrorKind::RepetitionMissing => {
-            (format!("Dangling meta character '{faulting}'"), at)
-        }
-        ::regex_syntax::ast::ErrorKind::RepetitionCountUnclosed => {
-            ("Unclosed counted closure".to_string(), at)
-        }
-        ::regex_syntax::ast::ErrorKind::RepetitionCountInvalid
-        | ::regex_syntax::ast::ErrorKind::RepetitionCountDecimalEmpty => {
-            ("Illegal repetition".to_string(), at)
-        }
-        ::regex_syntax::ast::ErrorKind::EscapeUnrecognized
-        | ::regex_syntax::ast::ErrorKind::EscapeUnexpectedEof
-        | ::regex_syntax::ast::ErrorKind::ClassEscapeInvalid => {
-            ("Illegal/unsupported escape sequence".to_string(), at)
-        }
-        ::regex_syntax::ast::ErrorKind::EscapeHexEmpty
-        | ::regex_syntax::ast::ErrorKind::EscapeHexInvalid
-        | ::regex_syntax::ast::ErrorKind::EscapeHexInvalidDigit => {
-            ("Illegal hexadecimal escape sequence".to_string(), at)
-        }
-        ::regex_syntax::ast::ErrorKind::ClassRangeInvalid
-        | ::regex_syntax::ast::ErrorKind::ClassRangeLiteral => {
-            ("Illegal character range".to_string(), at)
-        }
-        ::regex_syntax::ast::ErrorKind::GroupNameEmpty
-        | ::regex_syntax::ast::ErrorKind::GroupNameInvalid
-        | ::regex_syntax::ast::ErrorKind::GroupNameUnexpectedEof => (
-            "named capturing group is missing trailing '>'".to_string(),
-            at,
-        ),
-        ::regex_syntax::ast::ErrorKind::FlagUnrecognized
-        | ::regex_syntax::ast::ErrorKind::FlagUnexpectedEof
-        | ::regex_syntax::ast::ErrorKind::FlagDanglingNegation => {
-            ("Unknown inline modifier".to_string(), at)
-        }
-        // Constructs the expression engine reads: the text IS an expression.
-        ::regex_syntax::ast::ErrorKind::UnsupportedLookAround
-        | ::regex_syntax::ast::ErrorKind::UnsupportedBackreference => return None,
-        // Every other fault the parser reports is one the compiler has no account of its own
-        // for, so it states that it has none and still places the index.
-        _ => ("Unexpected internal error".to_string(), at),
-    };
-    Some(InvalidExpression {
-        rewritten,
-        description,
-        index,
-    })
+    let fault = pattern_fault(&rewritten)?;
+    Some(InvalidExpression { rewritten, fault })
 }
 
 /// `pattern` as the compiler reads it: every named capture group renamed to the positional

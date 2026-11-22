@@ -258,10 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(pattern) => match glue_state::compile_name_pattern(pattern) {
                 Ok(matcher) => Some(matcher),
-                Err(reason) => {
-                    return Err(invalid_request(crate::state::malformed_pattern(
-                        pattern, &reason,
-                    )));
+                Err(_) => {
+                    return Err(invalid_request(crate::state::malformed_pattern(pattern)));
                 }
             },
         };

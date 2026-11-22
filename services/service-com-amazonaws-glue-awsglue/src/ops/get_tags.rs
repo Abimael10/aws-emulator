@@ -17,8 +17,8 @@
 //!
 //! An ARN that names no taggable Glue resource at all earns the modelled client-input
 //! refusal; one of a known kind this store holds no resource for earns the modelled
-//! `EntityNotFoundException` carrying the tagging surface's recorded sentence
-//! ([`crate::state::messages::TAGGED_RESOURCE_NOT_FOUND`]), as does one naming another
+//! `EntityNotFoundException` carrying the miss sentence of the surface that OWNS that kind
+//! ([`crate::state::tag_read_not_found_message`]), as does one naming another
 //! Region's or another account's estate.
 //!
 //! That client-input refusal is this handler's, not the framework boundary's
@@ -183,7 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let not_found = || {
             GetTagsErrorModeled::EntityNotFoundException(EntityNotFoundException {
-                message: Some(crate::state::messages::TAGGED_RESOURCE_NOT_FOUND.to_string()),
+                // The read resolves the ARN through the surface that owns the kind, so the
+                // miss carries that surface's own sentence
+                // ([`crate::state::tag_read_not_found_message`]).
+                message: Some(crate::state::tag_read_not_found_message(&resource)),
                 from_federation_source: None,
             })
         };

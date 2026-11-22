@@ -533,17 +533,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(pattern) => match crate::state::compile_name_pattern(pattern) {
                 Ok(matcher) => Some(matcher),
-                Err(error) => {
+                // The refusal relays what the engine compiling the expression said about
+                // it — the fault, the index into the CALLER's own expression and the caret
+                // under it — and, for a value that carries no such fault, states that this
+                // catalog can build no matcher for it.
+                Err(_) => {
+                    let message = crate::state::messages::expression_syntax_fault(pattern)
+                        .unwrap_or_else(|| {
+                            crate::state::messages::expression_not_matchable(pattern)
+                        });
                     return Err(GetTablesErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(format!(
-                                "Expression {pattern:?} is not a valid regular expression: \
-                                 {error}"
-                            )),
+                            message: Some(message),
                             from_federation_source: None,
                         },
                     )
-                    .into())
+                    .into());
                 }
             },
         };

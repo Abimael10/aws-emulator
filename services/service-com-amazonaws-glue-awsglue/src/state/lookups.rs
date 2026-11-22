@@ -104,37 +104,46 @@ pub fn is_registered_federation_source(federated: &FederatedCatalog) -> bool {
 /// pattern past it with its OWN modelled client error.
 pub const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
 
-/// The matcher a name pattern selects names with, or the reason the value is no pattern
-/// this catalog can match.
+/// A name pattern as the matcher READS it, beside where each of its characters came from in
+/// the pattern the caller sent.
 ///
-/// The pattern language is the one the Data Catalog's listings document: "A regular
-/// expression pattern. If present, only those tables whose names match the pattern are
-/// returned" (`GetTablesRequest$Expression`), in which `*` additionally stands for any run
-/// of characters (including none) — the Hive-metastore substitution that makes `events*`
-/// select `events` and `events_raw` while `ev_.*` selects `ev_one` and `ev_two`. The
-/// pattern is anchored at both ends, because a listing selects the names that match it as
-/// a WHOLE, and compared case-sensitively: a stored catalog name is folded to lowercase
-/// ([`fold_name`]), the pattern is not, and a pattern in another case selects nothing.
+/// The two travel together because a fault placed in the text the matcher reads has to be
+/// reported at a character of the text the CALLER wrote: the wildcard expansion makes the
+/// two texts different lengths, so an index into one points at the wrong character of the
+/// other.
+#[derive(Debug, Clone)]
+pub struct TranslatedNamePattern {
+    /// The expression the matcher is built from: the caller's pattern with every WILDCARD
+    /// `*` expanded to the regular expression that matches any run of characters.
+    pub translated: String,
+    /// For each CHARACTER of [`TranslatedNamePattern::translated`], in order, the index of
+    /// the character of the caller's own pattern it came from — the two characters a
+    /// wildcard expands to both coming from that `*`.
+    pub origin: Vec<usize>,
+}
+
+/// `pattern` as the matcher reads it ([`compile_name_pattern`]): every wildcard `*`
+/// expanded, every other character left exactly as written, and each character of the
+/// result traced back to the character of `pattern` it came from.
 ///
 /// A `*` that is ESCAPED (`\*`) or inside a character class (`[*]`) is the regular
 /// expression's own star rather than the wildcard, so it is left as written: substituting
 /// there would change `[*]` into a class of dot-or-star and `\*` into any run of dots,
 /// i.e. a different pattern from the one the caller sent.
-///
-/// It lives here rather than in one operation's file because every listing of these
-/// tables has to select them the same way — `GetTables`'s own `Expression`, and Athena's
-/// `ListTableMetadata` over this same catalog — so there is ONE pattern language and two
-/// listings of one set of tables can never disagree.
-pub fn compile_name_pattern(pattern: &str) -> Result<::regex::Regex, ::regex::Error> {
+pub fn translate_name_pattern(pattern: &str) -> TranslatedNamePattern {
     let mut translated = String::with_capacity(pattern.len() + 1);
+    let mut origin: Vec<usize> = Vec::with_capacity(pattern.len() + 1);
     let mut escaped = false;
     let mut in_class = false;
-    for character in pattern.chars() {
+    for (index, character) in pattern.chars().enumerate() {
         let wildcard = character == '*' && !escaped && !in_class;
         if wildcard {
             translated.push_str(".*");
+            origin.push(index);
+            origin.push(index);
         } else {
             translated.push(character);
+            origin.push(index);
         }
         // The state for the NEXT character: a backslash escapes exactly the one after it,
         // and a class runs from an unescaped `[` to the next unescaped `]`.
@@ -149,6 +158,32 @@ pub fn compile_name_pattern(pattern: &str) -> Result<::regex::Regex, ::regex::Er
             }
         }
     }
+    TranslatedNamePattern { translated, origin }
+}
+
+/// The matcher a name pattern selects names with, or the reason the value is no pattern
+/// this catalog can match.
+///
+/// The pattern language is the one the Data Catalog's listings document: "A regular
+/// expression pattern. If present, only those tables whose names match the pattern are
+/// returned" (`GetTablesRequest$Expression`), in which `*` additionally stands for any run
+/// of characters (including none) — the Hive-metastore substitution that makes `events*`
+/// select `events` and `events_raw` while `ev_.*` selects `ev_one` and `ev_two`. The
+/// pattern is anchored at both ends, because a listing selects the names that match it as
+/// a WHOLE, and compared case-sensitively: a stored catalog name is folded to lowercase
+/// ([`fold_name`]), the pattern is not, and a pattern in another case selects nothing.
+///
+/// The wildcard expansion is [`translate_name_pattern`], which also traces each character
+/// of the expanded text back to the caller's own — so a value that is no pattern at all is
+/// refused with the fault placed in the text the CALLER sent
+/// ([`messages::expression_syntax_fault`]).
+///
+/// It lives here rather than in one operation's file because every listing of these
+/// tables has to select them the same way — `GetTables`'s own `Expression`, and Athena's
+/// `ListTableMetadata` over this same catalog — so there is ONE pattern language and two
+/// listings of one set of tables can never disagree.
+pub fn compile_name_pattern(pattern: &str) -> Result<::regex::Regex, ::regex::Error> {
+    let translated = translate_name_pattern(pattern).translated;
     ::regex::RegexBuilder::new(&format!("^(?:{translated})$"))
         .size_limit(MAX_PATTERN_PROGRAM_BYTES)
         .build()
