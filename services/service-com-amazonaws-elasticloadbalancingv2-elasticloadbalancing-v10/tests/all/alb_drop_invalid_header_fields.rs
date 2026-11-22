@@ -205,7 +205,11 @@ pub(crate) async fn lambda(
 }
 
 /// Write one value of the attribute, and answer the status and body of the write.
-async fn modify(router: &MultiServiceRouter, lb_arn: &str, value: &str) -> (u16, String) {
+///
+/// `pub(crate)` for the sibling suite that pins WHERE on the request path the removal happens
+/// (`crate::alb_drop_invalid_header_fields_before_rules`): it writes the same attribute, and a
+/// second copy of this would be a second spelling of one control-plane call.
+pub(crate) async fn modify(router: &MultiServiceRouter, lb_arn: &str, value: &str) -> (u16, String) {
     let mut form = action("ModifyLoadBalancerAttributes");
     form.push(p("LoadBalancerArn", lb_arn));
     form.push(p("Attributes.member.1.Key", ATTRIBUTE));
