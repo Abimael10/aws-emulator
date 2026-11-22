@@ -1251,12 +1251,39 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     // lookup key a client joins on, so one the catalog publishes but this crate does not
     // record is left absent rather than invented.
     ControlSeed {
+        slug: "acm-certificate-expiration-check",
+        name: "Checks if AWS Certificate Manager Certificates in your account are marked \
+               for expiration within the specified number of days",
+        // The implementing AWS Config managed rule's own published description, reproduced
+        // as the catalog publishes it for a control under a `CONFIG.…` designator: the
+        // rule's documented text, whose first sentence is the control's published name.
+        description: "Checks if AWS Certificate Manager Certificates in your account are \
+                      marked for expiration within the specified number of days. \
+                      Certificates provided by ACM are automatically renewed. ACM does \
+                      not automatically renew certificates that you import. The rule is \
+                      NON_COMPLIANT if your certificates are about to expire.",
+        behavior: DETECTIVE,
+        severity: MEDIUM,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("ACM_CERTIFICATE_EXPIRATION_CHECK"),
+        control_tower_identifier: None,
+        designators: &["CONFIG.ACM.DT.3"],
+        scope: REGIONAL,
+        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::CertificateManager::Certificate"],
+        governed_providers: AWS,
+        implements: "certificate-lifecycle-management",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
         slug: "acm-pca-certificate-authority-tagged",
         name: "Checks if AWS Private CA certificate authorities have tags",
-        description: "Checks if AWS Private CA certificate authorities have tags. The \
-                      rule is NON_COMPLIANT if the certificate authority has no tags, or \
-                      if it is missing a tag key or value the rule's input parameter \
-                      names.",
+        description: "Checks if AWS Private CA certificate authorities have tags. \
+                      Optionally, you can specify tag keys. The rule is NON_COMPLIANT if \
+                      there are no tags or if the specified tag keys are not present. The \
+                      rule does not check for tags starting with 'aws:'.",
         behavior: DETECTIVE,
         severity: LOW,
         implementation_type: CONFIG_RULE,
@@ -1277,8 +1304,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         name: "Checks if an Amazon Cognito user pool has advanced security enabled",
         description: "Checks if an Amazon Cognito user pool has advanced security \
                       enabled. The rule is NON_COMPLIANT if advanced security is not \
-                      enabled for the user pool, or if its security mode is weaker than \
-                      the mode the rule's input parameter names.",
+                      enabled. Optionally, you can specify an advanced security mode for \
+                      the rule to check.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1343,13 +1370,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
                encrypted with AWS Key Management Service (AWS KMS)",
         description: "Checks if an Amazon Simple Notification Service (Amazon SNS) topic \
                       is encrypted with AWS Key Management Service (AWS KMS). The rule \
-                      is NON_COMPLIANT if the topic is not encrypted with a KMS key.",
+                      is NON_COMPLIANT if an Amazon SNS topic is not encrypted with AWS \
+                      KMS. Optionally, you can specify the AWS KMS key ARNs, the AWS KMS \
+                      key aliases, or the AWS KMS key IDs the topic has to be encrypted \
+                      with.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("SNS_ENCRYPTED_KMS"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.SNS.DT.2"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1435,11 +1465,17 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("REDSHIFT_REQUIRE_TLS_SSL"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.REDSHIFT.DT.9"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::Redshift::Cluster"],
+        // The rule reads the cluster's parameter group to decide the cluster's
+        // compliance, so the catalog publishes the control as governing both resource
+        // types.
+        governed_resources: &[
+            "AWS::Redshift::Cluster",
+            "AWS::Redshift::ClusterParameterGroup",
+        ],
         governed_providers: AWS,
         implements: "enforce-encryption-in-transit",
         frameworks: NO_FRAMEWORK_ITEMS,
@@ -1456,7 +1492,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("ELB_TLS_HTTPS_LISTENERS_ONLY"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.ELASTICLOADBALANCING.DT.16"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1491,15 +1527,13 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "s3-bucket-logging-enabled",
         name: "Checks whether logging is enabled for your S3 buckets",
         description: "Checks whether logging is enabled for your S3 buckets. The rule is \
-                      NON_COMPLIANT if server access logging is not enabled, or if it \
-                      does not deliver to the target bucket and prefix the rule's input \
-                      parameters name.",
+                      NON_COMPLIANT if logging is not enabled.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("S3_BUCKET_LOGGING_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.S3.DT.14"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1534,15 +1568,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         name: "Checks if the Application Load Balancer and the Classic Load Balancer have \
                logging enabled",
         description: "Checks if the Application Load Balancer and the Classic Load \
-                      Balancer have logging enabled. The rule is NON_COMPLIANT if access \
-                      logging is not enabled, or if it does not deliver to a bucket the \
-                      rule's input parameter names.",
+                      Balancer have logging enabled. The rule is NON_COMPLIANT if the \
+                      access_logs.s3.enabled is false or access_logs.S3.bucket is not \
+                      equal to the s3BucketName that you provided.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("ELB_LOGGING_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.ELASTICLOADBALANCING.DT.12"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1898,7 +1932,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("VPC_DEFAULT_SECURITY_GROUP_CLOSED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.EC2.DT.49"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -2370,10 +2404,9 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         release_time: Some(1_779_840_000),
     },
     // Two controls of the wider AWS Config-implemented surface: the catalog publishes
-    // each of them under the identifier recorded here, and records a release instant for
-    // the first of the two only. That instant is later than every other instant recorded
-    // above because the catalog released this control later, not because it is dated by
-    // anything in this crate.
+    // each of them under the identifier recorded here. Their release instants are a
+    // decade apart because the catalog released them a decade apart, not because anything
+    // in this crate dates them.
     PublishedCatalogRecord {
         slug: "acm-pca-certificate-authority-tagged",
         identifier: "6yl9xxuky13vzaxi3n6lm73k5",
@@ -2382,7 +2415,7 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "cognito-user-pool-advanced-security-enabled",
         identifier: "1038h7d21e6g8i10g6v3xsssi",
-        release_time: None,
+        release_time: Some(1_715_212_800),
     },
     // The rest of the AWS Config-implemented surface whose published identifier this
     // catalog records: the controls the catalog publishes under a `CONFIG.…` designator
@@ -2513,6 +2546,52 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         identifier: "6rilu41n0gb9w6mxrkyewoer4",
         release_time: Some(1_542_240_000),
     },
+    // The control over certificate expiry belongs to the same release as the other most
+    // recently released controls recorded above (see
+    // `acm-pca-certificate-authority-tagged` and `securityhub-config-1`), so the catalog
+    // dates it with that one instant.
+    PublishedCatalogRecord {
+        slug: "acm-certificate-expiration-check",
+        identifier: "a6kwsgw65ayxiqg7dhzbz2n7w",
+        release_time: Some(1_779_840_000),
+    },
+    PublishedCatalogRecord {
+        slug: "elb-logging-enabled",
+        identifier: "8abhdcvu10syqrdyfgr2300px",
+        release_time: Some(1_534_896_000),
+    },
+    // A published identifier is opaque content the catalog assigns, so it is recorded as
+    // the catalog publishes it: this one is 24 characters where most are 25.
+    PublishedCatalogRecord {
+        slug: "elb-tls-https-listeners-only",
+        identifier: "7laz29268m0wkplaj7z2fxxl",
+        release_time: Some(1_594_166_400),
+    },
+    // The control over Amazon Redshift connections and the one over Amazon SNS encryption
+    // were released together, so the catalog dates both with one instant — the instant it
+    // also dates `rds-snapshot-encrypted` with.
+    PublishedCatalogRecord {
+        slug: "redshift-require-tls-ssl",
+        identifier: "dfbp3c8jerraflh2g68427p4k",
+        release_time: Some(1_590_364_800),
+    },
+    PublishedCatalogRecord {
+        slug: "sns-encrypted-kms",
+        identifier: "bn8ygh3zsy33drdeojmu09a4z",
+        release_time: Some(1_590_364_800),
+    },
+    // The earliest release instant this catalog records: S3 server access logging predates
+    // every other control recorded here.
+    PublishedCatalogRecord {
+        slug: "s3-bucket-logging-enabled",
+        identifier: "bd9d97ndoue5lss1zjjiecle4",
+        release_time: Some(1_475_280_000),
+    },
+    PublishedCatalogRecord {
+        slug: "vpc-default-security-group-closed",
+        identifier: "3ucly6t3j33t5zhbzy45l619n",
+        release_time: Some(1_534_291_200),
+    },
 ];
 
 /// The published catalog record of the control `slug` names, or `None` when this catalog
@@ -2588,6 +2667,12 @@ const CONFIG_RULE_PARAMETERS: &[(&str, &[(&str, &str)])] = &[
         &[("centralMonitoringAccount", OPTIONAL)],
     ),
     ("CLOUDWATCH_LOG_GROUP_ENCRYPTED", &[("KmsKeyId", OPTIONAL)]),
+    // The number of days before expiry at which a certificate is reported, which the rule
+    // defaults, so the caller may supply it.
+    (
+        "ACM_CERTIFICATE_EXPIRATION_CHECK",
+        &[("daysToExpiration", OPTIONAL)],
+    ),
     ("ACMPCA_CERTIFICATE_AUTHORITY_TAGGED", &[("tags", OPTIONAL)]),
     (
         "COGNITO_USER_POOL_ADVANCED_SECURITY_ENABLED",
@@ -2932,6 +3017,26 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
         ],
     ),
     (
+        "certificate-lifecycle-management",
+        &[
+            // "Public key infrastructure certificates".
+            (NIST_SP_800_53_R5, "SC-17"),
+            // "Identities and credentials are issued, managed, verified, revoked and
+            // audited for authorized devices, users and processes".
+            (NIST_CSF_V1_1, "PR.AC-1"),
+            // "Establish and manage cryptographic keys for cryptography employed in
+            // organizational systems".
+            (NIST_SP_800_171_R2, "3.13.10"),
+            // "An inventory of the entity's trusted keys and certificates is
+            // maintained".
+            (PCI_DSS_V4_0, "4.2.1.1"),
+            // "Use of cryptography".
+            (ISO_IEC_27001_2022_ANNEX_A, "8.24"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
         "restrict-public-access",
         &[
             // "Access enforcement".
@@ -3235,7 +3340,7 @@ const CONTROLS_IN_800_53_R4: &[&str] = &[
     // Identification and authentication.
     "IA-2", "IA-5",
     // System and communications protection.
-    "SC-7", "SC-8", "SC-28",
+    "SC-7", "SC-8", "SC-17", "SC-28",
     // System and information integrity.
     "SI-4",
 ];

@@ -60,9 +60,9 @@ const SSAE_18_SOC_2_OCT_2023: &str = "SSAE-18-SOC-2-Oct-2023";
 /// of them. Written out here so the restriction the service applies is checked against
 /// an independent list: revision 5 introduced families revision 4 has none of, so a
 /// revision-4 baseline cannot name every revision-5 control.
-const CONTROLS_IN_800_53_R4: [&str; 14] = [
+const CONTROLS_IN_800_53_R4: [&str; 15] = [
     "AC-3", "AC-6", "AU-2", "AU-6", "AU-9", "AU-11", "AU-12", "CM-8", "IA-2", "IA-5",
-    "SC-7", "SC-8", "SC-28", "SI-4",
+    "SC-7", "SC-8", "SC-17", "SC-28", "SI-4",
 ];
 
 /// The ISO/IEC 27001:2013 Annex A controls each 2022 Annex A clause the catalog

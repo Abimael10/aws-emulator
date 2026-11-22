@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::control_catalog::{by_arn, drain, Emulator};
+use crate::control_catalog::{by_arn, drain, strings, Emulator};
 
 /// The AWS Config implementation type, as the catalog spells it.
 const CONFIG_RULE: &str = "AWS::Config::ConfigRule";
@@ -241,4 +241,283 @@ async fn a_filtered_walk_reaches_every_control_the_filter_selects() {
         "case type {CONFIG_RULE}: the catalog must publish at least the {config_rules} \
          recorded Config-implemented control(s), got {served}"
     );
+}
+
+/// One control the catalog publishes over an AWS Config managed rule, as the catalog
+/// publishes it.
+///
+/// Source: the Control Catalog's own published control list — the opaque identifier its
+/// ARN `arn:{PARTITION}:controlcatalog:::control/{identifier}` carries, the `CONFIG.…`
+/// designators it is published under, the resource types it governs and the instant it
+/// records as the control's release time — together with the implementing AWS Config
+/// managed rule's own published title and description, which is the text the catalog
+/// publishes for such a control.
+struct PublishedConfigControl {
+    /// The implementing rule's identifier, which is what an `Implementations.Identifiers`
+    /// filter names.
+    rule: &'static str,
+    identifier: &'static str,
+    designators: &'static [&'static str],
+    release_time: i64,
+    governed_resources: &'static [&'static str],
+    parameter_requirement_summary: &'static str,
+    /// The catalog's published description, where this row pins the whole sentence;
+    /// `None` leaves it to the first-sentence rule every row is held to.
+    description: Option<&'static str>,
+}
+
+/// Controls the catalog publishes over an AWS Config managed rule, spanning what the rule
+/// below generalises over: the designator family and number (`CONFIG.ACM.…`,
+/// `CONFIG.ACM-PCA.…`, `CONFIG.COGNITO-IDP.…`, `CONFIG.ELASTICLOADBALANCING.…`,
+/// `CONFIG.REDSHIFT.…`, `CONFIG.S3.…`, `CONFIG.SNS.…`, `CONFIG.EC2.…`,
+/// `CONFIG.CLOUDTRAIL.…`, `CONFIG.RDS.…`), the length of the opaque identifier (24 and 25
+/// characters), release instants from 2016 to 2026 including two controls released
+/// together on one instant, governed-resource lists of none, one and two types, both
+/// parameter summaries a Config-implemented control can carry, and a description that
+/// names optional parameters against one that does not.
+///
+/// The last two rows are controls no page this suite was written for named, so the rule is
+/// asserted beyond the cited ones.
+const PUBLISHED_CONFIG_CONTROLS: &[PublishedConfigControl] = &[
+    PublishedConfigControl {
+        rule: "ACM_CERTIFICATE_EXPIRATION_CHECK",
+        identifier: "a6kwsgw65ayxiqg7dhzbz2n7w",
+        designators: &["CONFIG.ACM.DT.3"],
+        release_time: 1_779_840_000,
+        governed_resources: &["AWS::CertificateManager::Certificate"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "ACMPCA_CERTIFICATE_AUTHORITY_TAGGED",
+        identifier: "6yl9xxuky13vzaxi3n6lm73k5",
+        designators: &["CONFIG.ACM-PCA.DT.2"],
+        release_time: 1_779_840_000,
+        governed_resources: &["AWS::ACMPCA::CertificateAuthority"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: Some(
+            "Checks if AWS Private CA certificate authorities have tags. Optionally, you \
+             can specify tag keys. The rule is NON_COMPLIANT if there are no tags or if \
+             the specified tag keys are not present. The rule does not check for tags \
+             starting with 'aws:'.",
+        ),
+    },
+    PublishedConfigControl {
+        rule: "COGNITO_USER_POOL_ADVANCED_SECURITY_ENABLED",
+        identifier: "1038h7d21e6g8i10g6v3xsssi",
+        designators: &["CONFIG.COGNITO-IDP.DT.1"],
+        release_time: 1_715_212_800,
+        governed_resources: &["AWS::Cognito::UserPool"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: Some(
+            "Checks if an Amazon Cognito user pool has advanced security enabled. The \
+             rule is NON_COMPLIANT if advanced security is not enabled. Optionally, you \
+             can specify an advanced security mode for the rule to check.",
+        ),
+    },
+    PublishedConfigControl {
+        rule: "ELB_LOGGING_ENABLED",
+        identifier: "8abhdcvu10syqrdyfgr2300px",
+        designators: &["CONFIG.ELASTICLOADBALANCING.DT.12"],
+        release_time: 1_534_896_000,
+        governed_resources: &[
+            "AWS::ElasticLoadBalancing::LoadBalancer",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        ],
+        parameter_requirement_summary: "OPTIONAL",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "ELB_TLS_HTTPS_LISTENERS_ONLY",
+        identifier: "7laz29268m0wkplaj7z2fxxl",
+        designators: &["CONFIG.ELASTICLOADBALANCING.DT.16"],
+        release_time: 1_594_166_400,
+        governed_resources: &["AWS::ElasticLoadBalancing::LoadBalancer"],
+        parameter_requirement_summary: "NONE",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "REDSHIFT_REQUIRE_TLS_SSL",
+        identifier: "dfbp3c8jerraflh2g68427p4k",
+        designators: &["CONFIG.REDSHIFT.DT.9"],
+        release_time: 1_590_364_800,
+        governed_resources: &[
+            "AWS::Redshift::Cluster",
+            "AWS::Redshift::ClusterParameterGroup",
+        ],
+        parameter_requirement_summary: "NONE",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "S3_BUCKET_LOGGING_ENABLED",
+        identifier: "bd9d97ndoue5lss1zjjiecle4",
+        designators: &["CONFIG.S3.DT.14"],
+        release_time: 1_475_280_000,
+        governed_resources: &["AWS::S3::Bucket"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "SNS_ENCRYPTED_KMS",
+        identifier: "bn8ygh3zsy33drdeojmu09a4z",
+        designators: &["CONFIG.SNS.DT.2"],
+        release_time: 1_590_364_800,
+        governed_resources: &["AWS::SNS::Topic"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "VPC_DEFAULT_SECURITY_GROUP_CLOSED",
+        identifier: "3ucly6t3j33t5zhbzy45l619n",
+        designators: &["CONFIG.EC2.DT.49"],
+        release_time: 1_534_291_200,
+        governed_resources: &["AWS::EC2::SecurityGroup"],
+        parameter_requirement_summary: "NONE",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "MULTI_REGION_CLOUD_TRAIL_ENABLED",
+        identifier: "d5kdbugbadk3r481vtwnvoynv",
+        designators: &["CONFIG.CLOUDTRAIL.DT.10"],
+        release_time: 1_539_993_600,
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        parameter_requirement_summary: "OPTIONAL",
+        description: None,
+    },
+    PublishedConfigControl {
+        rule: "RDS_SNAPSHOT_ENCRYPTED",
+        identifier: "84hd48gyrb6e5ribkmsoub44c",
+        designators: &["CONFIG.RDS.DT.39"],
+        release_time: 1_590_364_800,
+        // "If GovernedResources cannot be represented by available resource types, it's
+        // returned as an empty list."
+        governed_resources: &[],
+        parameter_requirement_summary: "NONE",
+        description: None,
+    },
+];
+
+/// A page is the catalog's own records: the control an `Implementations.Identifiers`
+/// filter selects is served under the catalog's published ARN identifier, with the
+/// designators, release instant and governed resource types the catalog publishes and the
+/// implementing rule's own published description — nothing minted and nothing re-worded.
+#[tokio::test]
+async fn a_filtered_page_serves_the_catalogs_own_published_config_records() {
+    let emulator = Emulator::new();
+    let published = catalog(&emulator).await;
+    let mut identifier_lengths: BTreeSet<usize> = BTreeSet::new();
+    let mut summaries_seen: BTreeSet<&str> = BTreeSet::new();
+
+    for row in PUBLISHED_CONFIG_CONTROLS {
+        let case = row.rule;
+        let expected_arn = format!("arn:aws:controlcatalog:::control/{}", row.identifier);
+        let selected = drain(
+            &emulator,
+            "/list-controls",
+            "Controls",
+            None,
+            &identifier_filter(row.rule),
+        )
+        .await;
+        let arns: Vec<&str> = selected
+            .iter()
+            .filter_map(|control| control["Arn"].as_str())
+            .collect();
+        assert_eq!(
+            arns,
+            vec![expected_arn.as_str()],
+            "case {case}: expected the catalog's own control {expected_arn}, got {arns:?}"
+        );
+
+        let control = &selected[0];
+        assert_eq!(
+            strings(control, "Aliases"),
+            row.designators,
+            "case {case}: expected the published designators {:?}, got {:?}",
+            row.designators,
+            strings(control, "Aliases")
+        );
+        assert_eq!(
+            control["CreateTime"].as_f64(),
+            Some(row.release_time as f64),
+            "case {case}: expected the published release instant {}, got {:?}",
+            row.release_time,
+            control["CreateTime"]
+        );
+        assert_eq!(
+            strings(control, "GovernedResources"),
+            row.governed_resources,
+            "case {case}: expected the published governed resource types {:?}, got {:?}",
+            row.governed_resources,
+            strings(control, "GovernedResources")
+        );
+        assert_eq!(
+            control["ParameterRequirementSummary"].as_str(),
+            Some(row.parameter_requirement_summary),
+            "case {case}: expected ParameterRequirementSummary {}, got {:?}",
+            row.parameter_requirement_summary,
+            control["ParameterRequirementSummary"]
+        );
+
+        // The published description is the implementing rule's own text, whose first
+        // sentence is the control's published name — a paraphrase of the row would drop
+        // or re-word it.
+        let name = control["Name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: a control carries its name"));
+        let description = control["Description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: a control carries its description"));
+        assert!(
+            description.starts_with(name) && description.len() > name.len(),
+            "case {case}: expected a description opening with the published name {name:?}, \
+             got {description:?}"
+        );
+        if let Some(expected) = row.description {
+            assert_eq!(
+                description, expected,
+                "case {case}: expected the catalog's published description {expected:?}, \
+                 got {description:?}"
+            );
+        }
+
+        // The same record, read back by the ARN a client harvested from the page.
+        let read_back = emulator
+            .ok(
+                "/get-control",
+                &format!(r#"{{"ControlArn":"{expected_arn}"}}"#),
+            )
+            .await;
+        for member in ["Arn", "Name", "Description", "CreateTime"] {
+            assert_eq!(
+                read_back[member], control[member],
+                "case {case}: GetControl and ListControls must report one {member}, got \
+                 {:?} and {:?}",
+                read_back[member], control[member]
+            );
+        }
+        assert!(
+            published.contains_key(&expected_arn),
+            "case {case}: the unfiltered listing must publish {expected_arn} too"
+        );
+
+        identifier_lengths.insert(row.identifier.chars().count());
+        summaries_seen.insert(row.parameter_requirement_summary);
+    }
+
+    // The table spans what the rule generalises over rather than one shape of row: the
+    // identifier is opaque published content of the catalog's own length, and the
+    // parameter summary follows the implementing rule's parameters.
+    assert!(
+        identifier_lengths.len() > 1,
+        "case table: the rows must span more than one published identifier length, saw \
+         {identifier_lengths:?}"
+    );
+    for summary in ["NONE", "OPTIONAL"] {
+        assert!(
+            summaries_seen.contains(summary),
+            "case table: the rows must span the {summary} parameter summary, saw \
+             {summaries_seen:?}"
+        );
+    }
 }

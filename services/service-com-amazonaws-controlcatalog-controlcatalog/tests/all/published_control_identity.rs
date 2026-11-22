@@ -590,8 +590,6 @@ async fn every_served_control_carries_its_own_catalog_identifier() {
     // carries neither account nor Region: `arn:{PARTITION}:controlcatalog:::control/
     // {CONTROL_CATALOG_OPAQUE_ID}` (`smithy_query(query="shape", shape="ControlArn")`).
     const PREFIX: &str = "arn:aws:controlcatalog:::control/";
-    /// The length of the opaque identifier the catalog's published ARNs carry.
-    const IDENTIFIER_LEN: usize = 25;
 
     let mut identifiers: BTreeSet<String> = BTreeSet::new();
     for control in &controls {
@@ -601,11 +599,13 @@ async fn every_served_control_carries_its_own_catalog_identifier() {
         let identifier = arn
             .strip_prefix(PREFIX)
             .unwrap_or_else(|| panic!("case {arn}: expected the global form {PREFIX}…"));
-        assert_eq!(
-            identifier.len(),
-            IDENTIFIER_LEN,
-            "case {arn}: expected a {IDENTIFIER_LEN}-character catalog identifier, got \
-             {identifier}"
+        // The identifier is opaque published content, and the modeled `ControlArn` pattern
+        // bounds its character class (`[0-9a-zA-Z_\-]+`) without fixing a length — the
+        // catalog's own published identifiers are not all one length — so what is
+        // asserted is that one is served, not how long it is.
+        assert!(
+            !identifier.is_empty(),
+            "case {arn}: expected the catalog's opaque identifier after {PREFIX}"
         );
         assert!(
             identifier
