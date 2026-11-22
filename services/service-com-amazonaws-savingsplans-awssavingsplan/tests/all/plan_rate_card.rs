@@ -82,25 +82,24 @@ fn filter_field(rate: &Value, name: &str) -> Option<String> {
 }
 
 /// A rate as a whole number of [`state::AMOUNT_SCALE`] units, which is also an
-/// assertion that it is spelled at the service's one fixed scale.
+/// assertion that it is spelled as the catalog SPELLS a price it holds: the
+/// shortest exact decimal, never padded out to the billing scale
+/// ([`state::AMOUNT_WIRE_DIGITS`]) a commitment and its payments are held at.
 fn rate_units(case: &str, rate: &Value) -> i128 {
     let rendered = text(rate, "rate");
-    let Some((whole, fraction)) = rendered.split_once('.') else {
+    let units = state::parse_amount_at_wire_scale(&rendered).unwrap_or_else(|| {
+        panic!("case {case:?}: a rate must be a decimal amount, got {rendered:?}")
+    });
+    let Some((_, fraction)) = rendered.split_once('.') else {
         panic!("case {case:?}: a rate must be a decimal amount, got {rendered:?}");
     };
     assert_eq!(
         fraction.len(),
-        state::AMOUNT_WIRE_DIGITS,
-        "case {case:?}: a rate must carry {} fractional digits, got {rendered:?}",
-        state::AMOUNT_WIRE_DIGITS
+        state::quoted_digits(units).max(1),
+        "case {case:?}: a rate carries the digits the catalog holds its price at and no \
+         padding, got {rendered:?}"
     );
-    let whole: i128 = whole
-        .parse()
-        .unwrap_or_else(|_| panic!("case {case:?}: {rendered:?} is not a decimal amount"));
-    let fraction: i128 = fraction
-        .parse()
-        .unwrap_or_else(|_| panic!("case {case:?}: {rendered:?} is not a decimal amount"));
-    whole * state::AMOUNT_SCALE + fraction
+    units
 }
 
 /// Every page of a plan-rate search, as `(rows, nextToken)`. `request` is sent

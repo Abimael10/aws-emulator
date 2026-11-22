@@ -96,25 +96,24 @@ fn key(rate: &Value) -> String {
 }
 
 /// A rate as a whole number of [`state::AMOUNT_SCALE`] units, which is also an
-/// assertion that it is spelled at the service's one fixed scale.
+/// assertion that it is spelled as the catalog SPELLS a price it holds: the
+/// shortest exact decimal, never padded out to the billing scale
+/// ([`state::AMOUNT_WIRE_DIGITS`]) a commitment and its payments are held at.
 fn rate_units(case: &str, rate: &Value) -> i128 {
     let rendered = text(rate, "rate");
-    let Some((whole, fraction)) = rendered.split_once('.') else {
+    let units = state::parse_amount_at_wire_scale(&rendered).unwrap_or_else(|| {
+        panic!("case {case:?}: a rate must be a decimal amount, got {rendered:?}")
+    });
+    let Some((_, fraction)) = rendered.split_once('.') else {
         panic!("case {case:?}: a rate must be a decimal amount, got {rendered:?}");
     };
     assert_eq!(
         fraction.len(),
-        state::AMOUNT_WIRE_DIGITS,
-        "case {case:?}: a rate must carry {} fractional digits, got {rendered:?}",
-        state::AMOUNT_WIRE_DIGITS
+        state::quoted_digits(units).max(1),
+        "case {case:?}: a rate carries the digits the catalog holds its price at and no \
+         padding, got {rendered:?}"
     );
-    let whole: i128 = whole
-        .parse()
-        .unwrap_or_else(|_| panic!("case {case:?}: {rendered:?} is not a decimal amount"));
-    let fraction: i128 = fraction
-        .parse()
-        .unwrap_or_else(|_| panic!("case {case:?}: {rendered:?} is not a decimal amount"));
-    whole * state::AMOUNT_SCALE + fraction
+    units
 }
 
 /// Every page of a rate search, as `(rows, nextToken)`.
@@ -492,6 +491,7 @@ async fn a_rate_scales_with_the_size_of_the_usage_it_prices() {
                 "filters": [
                     { "name": "instanceFamily", "values": ["m5"] },
                     { "name": "region", "values": ["us-east-1"] },
+                    { "name": "productDescription", "values": [state::PRODUCT_DESCRIPTION_LINUX] },
                 ],
                 "maxResults": 1000,
             }),
@@ -503,19 +503,50 @@ async fn a_rate_scales_with_the_size_of_the_usage_it_prices() {
             by_type.insert(property(rate, "instanceType"), rate_units(&case, rate));
         }
         // The size ladder doubles the vCPUs at each step, so it doubles the
-        // price: `large` is the unit of comparison, and the sizes above it are
-        // its multiples.
+        // ON-DEMAND price the rate discounts — and the rate is that doubled
+        // price as the catalog quotes it. The rule is therefore asserted
+        // against the quoted price of each size's own on-demand price, not
+        // against a multiple of another size's already-quoted rate, which the
+        // quoting of the smaller size would carry into the bigger one.
+        let discount = state::discount_basis_points(plan_type, duration, payment_option);
+        let per_vcpu = state::EC2_INSTANCE_FAMILIES
+            .iter()
+            .find(|(family, _)| *family == "m5")
+            .map(|(_, units)| *units)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog prices the m5 family"));
         let large = *by_type.get("m5.large").unwrap_or_else(|| {
             panic!("case {case:?}: expected a rate for m5.large, got {:?}", by_type.keys())
         });
-        for (instance_type, multiple) in [("m5.xlarge", 2), ("m5.2xlarge", 4)] {
+        for (instance_type, vcpus) in [("m5.large", 2), ("m5.xlarge", 4), ("m5.2xlarge", 8)] {
             let actual = *by_type.get(instance_type).unwrap_or_else(|| {
                 panic!("case {case:?}: expected a rate for {instance_type}, got {:?}", by_type.keys())
             });
+            // The search holds the platform fixed (unlicensed Linux), so a
+            // size's on-demand price is the family's per-vCPU price over that
+            // size's vCPUs.
+            let on_demand = per_vcpu * vcpus;
+            let expected = state::quote_price_units(
+                state::discounted_units(discount, on_demand),
+                state::quoted_digits(on_demand),
+            );
             assert_eq!(
                 actual,
-                large * multiple,
-                "case {case:?} {instance_type}: {multiple} times the vCPUs of m5.large must be priced at {multiple} times its rate ({large}), got {actual}"
+                expected,
+                "case {case:?} {instance_type}: {vcpus} vCPUs of m5 must be priced at the \
+                 catalog's quoted price for {vcpus} vCPU-hours (m5.large is {large}), got {actual}"
+            );
+            // And the proportionality itself: twice the vCPUs is twice the
+            // price, up to the precision the two rows are quoted at (each is
+            // held within half a quoted unit of the price it discounts, and
+            // scaling the smaller rate scales its slack with it).
+            let multiple = vcpus / 2;
+            let slack = state::quoted_unit(state::quoted_digits(actual))
+                + multiple * state::quoted_unit(state::quoted_digits(large));
+            assert!(
+                (actual - large * multiple).abs() <= slack,
+                "case {case:?} {instance_type}: {multiple} times the vCPUs of m5.large must be \
+                 priced at {multiple} times its rate ({large}), got {actual} (more than {slack} \
+                 units out)"
             );
         }
     }

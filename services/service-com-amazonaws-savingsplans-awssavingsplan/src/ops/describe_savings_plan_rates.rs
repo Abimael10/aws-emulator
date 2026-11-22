@@ -242,6 +242,11 @@ fn admits(input: &DescribeSavingsPlanRatesInput, item: &crate::state::RateLineIt
 /// item's own billing dimensions and the dimensions of the USAGE it prices, at
 /// the rate THIS plan charges for it.
 ///
+/// Every value comes from the catalog entry: its `rate` is the catalog's price
+/// for that entry's own dimension tuple under this plan's commitment, spelled at
+/// the precision the catalog quotes that product's prices at, and its
+/// `properties` are the entry's own, in the catalog's order.
+///
 /// A plan rate reports the dimensions that identify the usage being priced — the
 /// region it is billed in, the instance type, the platform (`productDescription`)
 /// and the tenancy. The instance FAMILY is a dimension of the commitment's own
@@ -252,9 +257,7 @@ fn project(
     item: &crate::state::RateLineItem,
 ) -> SavingsPlanRate {
     SavingsPlanRate {
-        rate: Some(crate::state::format_amount(
-            plan.rate_units(item.on_demand_units),
-        )),
+        rate: Some(plan.rate(item)),
         currency: Some(plan.currency.clone()),
         unit: Some(item.unit.clone()),
         product_type: Some(item.product_type.clone()),

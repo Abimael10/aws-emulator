@@ -179,14 +179,23 @@ pub fn check_purchase_time(purchase_millis: i64, now_millis: i64) -> Result<(), 
 // Amounts
 // ---------------------------------------------------------------------------
 
-/// How many fractional digits a rendered `Amount` carries.
+/// How many fractional digits a BILLED `Amount` carries.
 ///
 /// `Amount` targets `string` in the model, so the rendering IS the wire value:
 /// a client that compares, displays or hashes it sees exactly these digits,
-/// rather than a number it is free to reformat. This service renders every
-/// `Amount` at this one fixed scale — eight fractional digits, the scale AWS
-/// bills Savings Plans commitments and payments at — so no amount is ever
-/// reported in two spellings.
+/// rather than a number it is free to reformat. Every amount this service
+/// BILLS — a plan's `commitment`, its `upfrontPaymentAmount` and its
+/// `recurringPaymentAmount`, each computed from the commitment the caller
+/// bought — is rendered at this one fixed scale, eight fractional digits, the
+/// scale AWS bills Savings Plans commitments and payments at, so no billed
+/// amount is ever reported in two spellings.
+///
+/// A rate is NOT one of them: a `SavingsPlanRate`/`SavingsPlanOfferingRate`
+/// `rate` is a quotation out of the price list, and a price list quotes each
+/// product at its own precision — so a rate is held and spelled as the catalog
+/// holds it ([`format_price`]) rather than padded out to this scale. It is also
+/// the scale amounts are HELD at internally ([`AMOUNT_SCALE`]), which is why a
+/// quoted price is still an exact integer number of these units.
 pub const AMOUNT_WIRE_DIGITS: usize = 8;
 
 /// The scale an `Amount` is held at: the wire scale, so every value the service
@@ -346,30 +355,51 @@ pub fn parse_commitment(value: &str) -> Result<i128, String> {
 ///
 /// A bound is a number the service publishes rather than a value a caller sent,
 /// and the documentation writes it this way ("a value between 0.001 and 1
-/// million"), so it is quoted this way too. Every amount the service REPORTS
-/// still goes through [`format_amount`]'s one fixed scale.
+/// million"), so it is quoted this way too. Every amount the service BILLS still
+/// goes through [`format_amount`]'s one fixed scale.
 pub fn format_bound(units: i128) -> String {
-    let rendered = format_amount(units);
-    match rendered.split_once('.') {
-        Some((whole, fraction)) => match fraction.trim_end_matches('0') {
-            "" => whole.to_string(),
-            trimmed => format!("{whole}.{trimmed}"),
-        },
-        None => rendered,
-    }
+    shortest_exact(format_amount(units), 0)
 }
 
-/// Render [`AMOUNT_SCALE`] units as an `Amount`: FIXED WIDTH, always with a
-/// decimal point and exactly [`AMOUNT_WIRE_DIGITS`] fractional digits.
+/// `rendered` — a fixed-scale amount as [`format_amount`] writes it — in the
+/// shortest EXACT decimal spelling of the same number: its insignificant
+/// trailing fractional zeros dropped, keeping at least `min_digits` fractional
+/// digits, and the decimal point with them when none are kept.
+///
+/// The crate's one home for that spelling rule, since its two callers differ
+/// only in how far they trim: a BOUND a message quotes drops the point entirely
+/// on a whole amount ([`format_bound`]), while a PRICE the catalog quotes keeps a
+/// fractional digit ([`format_price`]) so every price carries a point.
+fn shortest_exact(rendered: String, min_digits: usize) -> String {
+    let Some((whole, fraction)) = rendered.split_once('.') else {
+        return rendered;
+    };
+    // `trim_end_matches` leaves a PREFIX of `fraction`, so keeping `kept` of its
+    // own digits is the same number spelled at that many places.
+    let kept = fraction
+        .trim_end_matches('0')
+        .len()
+        .max(min_digits.min(fraction.len()));
+    if kept == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{}", &fraction[..kept])
+}
+
+/// Render [`AMOUNT_SCALE`] units as a BILLED `Amount`: FIXED WIDTH, always with
+/// a decimal point and exactly [`AMOUNT_WIRE_DIGITS`] fractional digits.
 ///
 /// Trailing zeros are significant here, not noise: see [`AMOUNT_WIRE_DIGITS`].
+/// Total over its argument — the magnitude is taken unsigned, so no value of
+/// `i128` can turn a response into a panic.
 pub fn format_amount(units: i128) -> String {
     let sign = if units < 0 { "-" } else { "" };
-    let units = units.abs();
+    let magnitude = units.unsigned_abs();
+    let scale = AMOUNT_SCALE.unsigned_abs();
     format!(
         "{sign}{}.{:0width$}",
-        units / AMOUNT_SCALE,
-        units % AMOUNT_SCALE,
+        magnitude / scale,
+        magnitude % scale,
         width = AMOUNT_WIRE_DIGITS
     )
 }
@@ -396,11 +426,74 @@ pub fn is_whole(units: i128) -> bool {
 /// Divide `units` by `divisor`, rounding to the nearest unit: the recurring
 /// payment is the balance spread over the term's hours, and the service holds
 /// it at [`AMOUNT_SCALE`].
+///
+/// Saturating, like every other amount helper here: a value this module reads an
+/// over-large request amount as ([`AMOUNT_OVERFLOW_UNITS`]) is divided rather
+/// than overflowing before the member's own range refuses it.
 pub fn divide_rounded(units: i128, divisor: i128) -> i128 {
     if divisor == 0 {
         return 0;
     }
-    (units + divisor / 2) / divisor
+    units.saturating_add(divisor / 2).saturating_div(divisor)
+}
+
+// ---------------------------------------------------------------------------
+// Quoted prices
+// ---------------------------------------------------------------------------
+
+/// How many fractional digits the catalog QUOTES `units` at: the digits its
+/// shortest exact decimal spelling carries.
+///
+/// A price list quotes each product's price at that product's own precision — an
+/// instance-hour at a thousandth of a dollar, a GB-second far finer — and the
+/// quoted price is what fixes it. Reading the precision off the price itself is
+/// what keeps a rate DERIVED from that price in step with it: both are reported
+/// at the precision the price list publishes, rather than at the billing scale
+/// [`AMOUNT_WIRE_DIGITS`] that a plan's commitment and payments are held at.
+///
+/// Read off the one spelling rule ([`shortest_exact`]), so the digits this
+/// counts are exactly the digits [`format_price`] writes.
+pub fn quoted_digits(units: i128) -> usize {
+    format_amount(units)
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.trim_end_matches('0').len())
+}
+
+/// The smallest amount a price quoted at `digits` fractional digits can spell,
+/// in [`AMOUNT_SCALE`] units.
+pub fn quoted_unit(digits: usize) -> i128 {
+    let mut unit = AMOUNT_SCALE;
+    for _ in 0..digits.min(AMOUNT_WIRE_DIGITS) {
+        unit /= 10;
+    }
+    unit
+}
+
+/// `units` as a price quoted at `digits` fractional digits: rounded to the
+/// nearest quoted unit, and never to nothing — a discounted price is still a
+/// price, so a value below half a quoted unit is reported as the smallest price
+/// that precision can spell.
+pub fn quote_price_units(units: i128, digits: usize) -> i128 {
+    let unit = quoted_unit(digits);
+    let rounded = divide_rounded(units, unit).saturating_mul(unit);
+    if rounded == 0 && units > 0 {
+        return unit;
+    }
+    rounded
+}
+
+/// Render `units` as the catalog SPELLS a price it holds: the shortest EXACT
+/// decimal — no digit beyond the precision the price is held at — with at least
+/// one fractional digit, so every price this service reports carries a decimal
+/// point.
+///
+/// `Amount` targets `string`, so the spelling is the wire value: a price list
+/// quotes a price at its own precision, and padding it out to the billing scale
+/// [`format_amount`] renders a commitment at would report digits the catalog
+/// does not hold. The trimming is the crate's one spelling rule
+/// ([`shortest_exact`]), which [`format_bound`] shares.
+pub fn format_price(units: i128) -> String {
+    shortest_exact(format_amount(units), 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -997,10 +1090,10 @@ const REGIONS: [(&str, &str); 22] = [
 /// Each family carries the on-demand price of ONE vCPU-hour in it, in
 /// [`AMOUNT_SCALE`] units — AWS's published on-demand Linux price for a family,
 /// divided by the vCPUs it is for (`m5.large` at $0.096 an hour is two vCPUs at
-/// $0.048) — which is what [`discounted_rate_units`] discounts into a Savings
+/// $0.048) — which is what [`RateLineItem::rate`] discounts into a Savings
 /// Plan rate. One list, so a family the offering catalog sells is a family the
 /// rate catalog prices.
-const EC2_INSTANCE_FAMILIES: [(&str, i128); 18] = [
+pub const EC2_INSTANCE_FAMILIES: [(&str, i128); 18] = [
     ("m5", 4_800_000),
     ("m6a", 4_320_000),
     ("m6i", 4_800_000),
@@ -1274,6 +1367,37 @@ pub const PRODUCT_DESCRIPTION_LINUX: &str = "Linux/UNIX";
 /// See [`PRODUCT_DESCRIPTION_LINUX`].
 pub const TENANCY_SHARED: &str = "shared";
 
+/// What a paid operating-system licence adds to the price of one vCPU-hour, in
+/// [`AMOUNT_SCALE`] units: AWS's published licence uplifts, which is why an
+/// `m5.large` (two vCPUs) at $0.096 an hour on unlicensed Linux is $0.188 an
+/// hour on Windows.
+///
+/// A platform's licence is the SUM of its operating-system uplift and its
+/// database-edition uplift ([`LICENCE_SQL_WEB`] and the two below it), so the
+/// licence column of [`EC2_PLATFORMS`] is composed from these rather than
+/// written out per platform: a platform is an operating system plus a database
+/// edition, and that is how EC2 prices one.
+const LICENCE_WINDOWS: i128 = 4_600_000;
+/// See [`LICENCE_WINDOWS`].
+const LICENCE_RHEL: i128 = 1_500_000;
+/// See [`LICENCE_WINDOWS`]. Red Hat's high-availability add-on doubles the
+/// Red Hat Enterprise Linux uplift.
+const LICENCE_RHEL_HA: i128 = 2 * LICENCE_RHEL;
+/// See [`LICENCE_WINDOWS`].
+const LICENCE_SUSE: i128 = 1_000_000;
+/// See [`LICENCE_WINDOWS`].
+const LICENCE_UBUNTU_PRO: i128 = 500_000;
+/// What a SQL Server Web licence adds to the price of one vCPU-hour, in
+/// [`AMOUNT_SCALE`] units: AWS's published per-vCPU database licence prices, so
+/// an `m5.large` on unlicensed Linux at $0.096 an hour is $0.193 an hour with
+/// SQL Server Web and $0.928 an hour on Windows with SQL Server Standard. See
+/// [`LICENCE_WINDOWS`].
+const LICENCE_SQL_WEB: i128 = 4_850_000;
+/// See [`LICENCE_SQL_WEB`].
+const LICENCE_SQL_STANDARD: i128 = 37_000_000;
+/// See [`LICENCE_SQL_WEB`].
+const LICENCE_SQL_ENTERPRISE: i128 = 140_000_000;
+
 /// Every EC2 platform a Savings Plan rate card prices, as `(productDescription,
 /// operation, licence units per vCPU-hour)`.
 ///
@@ -1289,70 +1413,78 @@ pub const TENANCY_SHARED: &str = "shared";
 /// Server Web, and so on.
 ///
 /// The licence column is what the platform adds to the price of one vCPU-hour of
-/// the instance family ([`EC2_INSTANCE_FAMILIES`]), in [`AMOUNT_SCALE`] units.
-/// Those magnitudes are the catalog's own; the ORDERING is AWS's published one —
-/// usage that brings its own licence (BYOL) costs no more than unlicensed Linux,
-/// a paid operating system costs more than that, and a database licence costs
-/// more the larger its edition, Enterprise above Standard above Web.
+/// the instance family ([`EC2_INSTANCE_FAMILIES`]), composed from the published
+/// per-vCPU uplifts above. This list is the platform CATALOG, in its reference
+/// order — the unlicensed row first, then the platforms by operating system —
+/// and a rate card lists an instance type's platforms in the catalog's own
+/// pricing order instead ([`ec2_platforms_in_card_order`]).
 pub const EC2_PLATFORMS: [(&str, &str, i128); 19] = [
     (PRODUCT_DESCRIPTION_LINUX, "RunInstances", 0),
     ("Red Hat BYOL Linux", "RunInstances:00g0", 0),
-    ("Red Hat Enterprise Linux", "RunInstances:0010", 1_500_000),
-    ("Red Hat Enterprise Linux with HA", "RunInstances:1010", 3_000_000),
+    ("Red Hat Enterprise Linux", "RunInstances:0010", LICENCE_RHEL),
+    (
+        "Red Hat Enterprise Linux with HA",
+        "RunInstances:1010",
+        LICENCE_RHEL_HA,
+    ),
     (
         "Red Hat Enterprise Linux with HA and SQL Server Standard",
         "RunInstances:1014",
-        7_600_000,
+        LICENCE_RHEL_HA + LICENCE_SQL_STANDARD,
     ),
     (
         "Red Hat Enterprise Linux with HA and SQL Server Enterprise",
         "RunInstances:1110",
-        20_600_000,
+        LICENCE_RHEL_HA + LICENCE_SQL_ENTERPRISE,
     ),
     (
         "Red Hat Enterprise Linux with SQL Server Web",
         "RunInstances:0210",
-        2_600_000,
+        LICENCE_RHEL + LICENCE_SQL_WEB,
     ),
     (
         "Red Hat Enterprise Linux with SQL Server Standard",
         "RunInstances:0014",
-        6_100_000,
+        LICENCE_RHEL + LICENCE_SQL_STANDARD,
     ),
     (
         "Red Hat Enterprise Linux with SQL Server Enterprise",
         "RunInstances:0110",
-        19_100_000,
+        LICENCE_RHEL + LICENCE_SQL_ENTERPRISE,
     ),
-    ("SUSE Linux", "RunInstances:000g", 1_000_000),
-    ("Ubuntu Pro", "RunInstances:0g00", 500_000),
-    ("Windows", "RunInstances:0002", 4_600_000),
+    ("SUSE Linux", "RunInstances:000g", LICENCE_SUSE),
+    ("Ubuntu Pro", "RunInstances:0g00", LICENCE_UBUNTU_PRO),
+    ("Windows", "RunInstances:0002", LICENCE_WINDOWS),
     ("Windows BYOL", "RunInstances:0800", 0),
     (
         "Windows with SQL Server Web",
         "RunInstances:0202",
-        5_700_000,
+        LICENCE_WINDOWS + LICENCE_SQL_WEB,
     ),
     (
         "Windows with SQL Server Standard",
         "RunInstances:0006",
-        9_200_000,
+        LICENCE_WINDOWS + LICENCE_SQL_STANDARD,
     ),
     (
         "Windows with SQL Server Enterprise",
         "RunInstances:0102",
-        22_200_000,
+        LICENCE_WINDOWS + LICENCE_SQL_ENTERPRISE,
     ),
-    ("Linux with SQL Server Web", "RunInstances:0200", 1_100_000),
+    (
+        "Linux with SQL Server Web",
+        "RunInstances:0200",
+        LICENCE_SQL_WEB,
+    ),
     (
         "Linux with SQL Server Standard",
         "RunInstances:0004",
-        4_600_000,
+        LICENCE_SQL_STANDARD,
     ),
     (
         "Linux with SQL Server Enterprise",
         "RunInstances:0100",
-        17_600_000,
+        LICENCE_SQL_ENTERPRISE,
     ),
 ];
 
@@ -1373,34 +1505,42 @@ const MAX_DISCOUNT_BASIS_POINTS: i128 = 7_200;
 /// The discount, in basis points, a ONE-year No Upfront plan of each
 /// `SavingsPlanType` earns.
 ///
-/// A chosen ladder, not a documented one: what AWS publishes is the ORDERING and
-/// the ceiling ([`MAX_DISCOUNT_BASIS_POINTS`]), not a discount per plan type, so
-/// these magnitudes are the catalog's own and only the relations between them are
-/// the service's. The ordering is the documented one: an EC2 Instance Savings
-/// Plan, which commits to one instance family in one region, earns the deepest
-/// discount; a Compute Savings Plan, which commits to nothing but an hourly
-/// spend, earns less; the plan types scoped to one service sit between a Compute
-/// plan and nothing.
+/// The Compute row is ANCHORED on AWS's published Savings Plans price list, read
+/// off the relation between an instance's on-demand price and its Savings Plans
+/// rate: an `m5.large` in `us-east-1` at $0.096 an hour on-demand is $0.072 an
+/// hour under a one-year No Upfront Compute plan (25 percent off) and $0.066
+/// under the All Upfront one, which is what
+/// [`payment_option_discount_percent`] deepens it to. The other three are the
+/// catalog's own magnitudes, as they were before: what AWS publishes for them is
+/// the ORDERING and the ceiling ([`MAX_DISCOUNT_BASIS_POINTS`]), and the ordering
+/// is the documented one — an EC2 Instance Savings Plan, which commits to one
+/// instance family in one region, earns the deepest discount; a Compute Savings
+/// Plan, which commits to nothing but an hourly spend, earns less; the plan types
+/// scoped to one service sit between a Compute plan and nothing.
 fn plan_type_discount_basis_points(plan_type: &str) -> i128 {
     match plan_type {
-        "EC2Instance" => 4_000,
-        "Compute" => 2_700,
-        "SageMaker" => 2_400,
+        "EC2Instance" => 2_800,
+        "Compute" => 2_500,
+        "SageMaker" => 2_200,
         // Every other `SavingsPlanType` the model declares (Database today)
         // commits to one family of services, which earns the shallowest of the
         // published discounts.
-        _ => 2_000,
+        _ => 1_800,
     }
 }
 
 /// How much of the base discount a payment option earns, in percent: paying
 /// more of the commitment up front earns a deeper discount, which is why AWS
-/// prices All Upfront below Partial Upfront below No Upfront. Chosen magnitudes,
-/// as in [`plan_type_discount_basis_points`]; the ordering is the service's.
+/// prices All Upfront below Partial Upfront below No Upfront.
+///
+/// Read off the published price list the same way the bases are
+/// ([`plan_type_discount_basis_points`]): a one-year All Upfront Compute plan
+/// earns a quarter more discount than the No Upfront one of the same term, so an
+/// `m5.large` at $0.072 an hour under No Upfront is $0.066 under All Upfront.
 fn payment_option_discount_percent(payment_option: &str) -> i128 {
     match payment_option {
-        PAYMENT_ALL_UPFRONT => 112,
-        PAYMENT_PARTIAL_UPFRONT => 108,
+        PAYMENT_ALL_UPFRONT => 125,
+        PAYMENT_PARTIAL_UPFRONT => 120,
         // No Upfront pays nothing in advance and earns the base discount.
         _ => 100,
     }
@@ -1437,20 +1577,22 @@ pub fn offering_discount_basis_points(offering: &Offering) -> i128 {
 }
 
 /// What a commitment earning `discount_basis_points` charges for usage whose
-/// on-demand price is `on_demand_units`: the on-demand price less that discount.
+/// on-demand price is `on_demand_units`, before the catalog quotes it: the
+/// on-demand price less that discount.
 ///
 /// Never zero — a discounted price is still a price — so a unit billed at a
 /// fraction of the service's scale is reported at the smallest amount the scale
-/// can spell rather than as free.
+/// can spell rather than as free. What a rate card REPORTS is this price quoted
+/// at the catalog's own precision ([`RateLineItem::rate`]).
 pub fn discounted_units(discount_basis_points: i128, on_demand_units: i128) -> i128 {
     let retained = BASIS_POINTS - discount_basis_points;
     divide_rounded(on_demand_units.saturating_mul(retained), BASIS_POINTS).max(1)
 }
 
-/// What `offering` charges for usage whose on-demand price is
-/// `on_demand_units`. See [`discounted_units`].
-pub fn discounted_rate_units(offering: &Offering, on_demand_units: i128) -> i128 {
-    discounted_units(offering_discount_basis_points(offering), on_demand_units)
+/// The catalog's rate for `item` under `offering`, as the catalog spells it. See
+/// [`RateLineItem::rate`].
+pub fn offering_rate(offering: &Offering, item: &RateLineItem) -> String {
+    item.rate(offering_discount_basis_points(offering))
 }
 
 /// The instance sizes the catalog prices in every EC2 family, with the vCPUs of
@@ -1459,7 +1601,7 @@ pub fn discounted_rate_units(offering: &Offering, on_demand_units: i128) -> i128
 /// EC2 doubles the vCPUs — and the on-demand price — at each step up the size
 /// ladder, so the hourly price of a size is its vCPU count times the family's
 /// per-vCPU price (see [`EC2_INSTANCE_FAMILIES`]).
-const EC2_SIZES: [(&str, i128); 3] = [("large", 2), ("xlarge", 4), ("2xlarge", 8)];
+pub const EC2_SIZES: [(&str, i128); 3] = [("large", 2), ("xlarge", 4), ("2xlarge", 8)];
 
 /// The SageMaker ML instance types the catalog prices, with the on-demand hourly
 /// price of one instance in [`AMOUNT_SCALE`] units (AWS's published SageMaker
@@ -1676,6 +1818,50 @@ impl RateLineItem {
         };
         property_filter_admits(values, field)
     }
+
+    /// How many fractional digits the catalog quotes this line item's prices at:
+    /// the precision of its own published on-demand price
+    /// ([`quoted_digits`]), so a rate is reported at the precision the product
+    /// it prices is published at.
+    pub fn quoted_digits(&self) -> usize {
+        quoted_digits(self.on_demand_units)
+    }
+
+    /// The catalog's rate for this line item under a commitment earning
+    /// `discount_basis_points`, in [`AMOUNT_SCALE`] units: its own on-demand
+    /// price less that discount, HELD at the precision the catalog quotes this
+    /// product at — so the value a client compares or hashes is the catalog's
+    /// price for this combination and not a figure carried to the billing scale.
+    pub fn rate_units(&self, discount_basis_points: i128) -> i128 {
+        quote_price_units(
+            discounted_units(discount_basis_points, self.on_demand_units),
+            self.quoted_digits(),
+        )
+    }
+
+    /// That rate as the catalog spells it: `Amount` targets `string`, so the
+    /// spelling IS the wire value, and the catalog spells a price exactly as it
+    /// holds it ([`format_price`]) rather than padded to the billing scale
+    /// ([`AMOUNT_WIRE_DIGITS`]) a commitment and its payments are held at.
+    pub fn rate(&self, discount_basis_points: i128) -> String {
+        format_price(self.rate_units(discount_basis_points))
+    }
+}
+
+/// [`EC2_PLATFORMS`] in the order a rate card lists an instance type's platform
+/// rows: the dearest licence first, so every licensed platform precedes the
+/// unlicensed Linux row and the rows of one instance type read down from the
+/// most expensive platform to the cheapest.
+///
+/// A rate card is a page of a price list, and a price list lists the platforms of
+/// one instance type in its own order rather than in the order the
+/// platform-details table happens to document them.
+pub fn ec2_platforms_in_card_order() -> Vec<(&'static str, &'static str, i128)> {
+    let mut platforms = EC2_PLATFORMS.to_vec();
+    // Stable, so platforms carrying the same licence keep the catalog's
+    // reference order among themselves.
+    platforms.sort_by_key(|platform| std::cmp::Reverse(platform.2));
+    platforms
 }
 
 /// Every usage line item the catalog prices, in a stable order.
@@ -1707,6 +1893,9 @@ pub fn rate_line_items() -> &'static [RateLineItem] {
 /// Build the line items [`rate_line_items`] hands out.
 fn build_rate_line_items() -> Vec<RateLineItem> {
     let mut items = Vec::new();
+    // The platform order a card lists an instance type's rows in, resolved once
+    // for the whole catalog rather than per instance type.
+    let platforms = ec2_platforms_in_card_order();
     for product_type in crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES {
         for (region, _) in REGIONS {
             match *product_type {
@@ -1714,7 +1903,7 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                     for (family, vcpu_units) in EC2_INSTANCE_FAMILIES {
                         for (size, vcpus) in EC2_SIZES {
                             let instance_type = format!("{family}.{size}");
-                            for (product_description, operation, licence_units) in EC2_PLATFORMS {
+                            for (product_description, operation, licence_units) in &platforms {
                                 items.push(line_item(
                                     product_type,
                                     "AmazonEC2",
@@ -1722,14 +1911,14 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                                     operation,
                                     "Hrs",
                                     vcpu_units
-                                        .saturating_add(licence_units)
+                                        .saturating_add(*licence_units)
                                         .saturating_mul(vcpus),
                                     vec![
-                                        (PROPERTY_INSTANCE_FAMILY, family),
-                                        (RATE_PROPERTY_INSTANCE_TYPE, &instance_type),
-                                        (RATE_PROPERTY_PRODUCT_DESCRIPTION, product_description),
-                                        (PROPERTY_REGION, region),
                                         (RATE_PROPERTY_TENANCY, TENANCY_SHARED),
+                                        (RATE_PROPERTY_INSTANCE_TYPE, &instance_type),
+                                        (PROPERTY_REGION, region),
+                                        (RATE_PROPERTY_PRODUCT_DESCRIPTION, product_description),
+                                        (PROPERTY_INSTANCE_FAMILY, family),
                                     ],
                                 ));
                             }
@@ -1751,9 +1940,9 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
                             "Hrs",
                             hourly_units,
                             vec![
-                                (PROPERTY_INSTANCE_FAMILY, family),
                                 (RATE_PROPERTY_INSTANCE_TYPE, instance_type),
                                 (PROPERTY_REGION, region),
+                                (PROPERTY_INSTANCE_FAMILY, family),
                             ],
                         ));
                     }
@@ -1819,8 +2008,12 @@ pub fn offering_prices(offering: &Offering, item: &RateLineItem) -> bool {
 
 /// One line item of the rate catalog.
 ///
-/// `properties` are given in `SavingsPlanRatePropertyKey` order, so two line
-/// items of one product report their dimensions in the same order.
+/// `properties` are given in the CATALOG's own order and are reported in it: the
+/// dimensions that identify the usage being priced first — its tenancy, its
+/// instance type, the region it is billed in, then the platform it runs — and
+/// the dimension of a commitment's SCOPE ([`PROPERTY_INSTANCE_FAMILY`], which a
+/// plan rate does not repeat because the instance type implies it) last. Two line
+/// items of one product therefore report their dimensions in the same order.
 fn line_item(
     product_type: &str,
     service_code: &str,
@@ -1955,20 +2148,24 @@ impl SavingsPlanRecord {
         )
     }
 
-    /// What this plan charges for usage whose on-demand price is
-    /// `on_demand_units`: that price less the discount the plan's type, term and
+    /// The discount this plan earns, in basis points: the ladder the offering it
+    /// was bought from is priced by, asked of the plan's own type, term and
+    /// payment option.
+    pub fn discount_basis_points(&self) -> i128 {
+        discount_basis_points(
+            &self.savings_plan_type,
+            self.term_duration_in_seconds,
+            &self.payment_option,
+        )
+    }
+
+    /// The catalog's rate for `item` under this plan, as the catalog spells it:
+    /// the line item's own price less the discount this plan's type, term and
     /// payment option earn — the ladder the offering it was bought from is
     /// priced by, so a plan's rate for a line item is that offering's rate for
-    /// it.
-    pub fn rate_units(&self, on_demand_units: i128) -> i128 {
-        discounted_units(
-            discount_basis_points(
-                &self.savings_plan_type,
-                self.term_duration_in_seconds,
-                &self.payment_option,
-            ),
-            on_demand_units,
-        )
+    /// it. See [`RateLineItem::rate`].
+    pub fn rate(&self, item: &RateLineItem) -> String {
+        item.rate(self.discount_basis_points())
     }
 
     /// Record that this plan's return was accepted at `now_millis`: it leaves the

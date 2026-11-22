@@ -294,6 +294,10 @@ fn item_admits(
 }
 
 /// Project a priced line item, and the offering pricing it, onto the wire shape.
+///
+/// The rate is the catalog's price for that line item under this offering,
+/// spelled at the precision the catalog quotes the product's prices at, and the
+/// properties are the line item's own, in the catalog's order.
 fn project(
     offering: &crate::state::Offering,
     item: &crate::state::RateLineItem,
@@ -307,9 +311,7 @@ fn project(
             currency: Some(offering.currency.clone()),
             plan_description: Some(offering.description.clone()),
         }),
-        rate: Some(crate::state::format_amount(
-            crate::state::discounted_rate_units(offering, item.on_demand_units),
-        )),
+        rate: Some(crate::state::offering_rate(offering, item)),
         unit: Some(item.unit.clone()),
         product_type: Some(item.product_type.clone()),
         service_code: Some(item.service_code.clone()),
