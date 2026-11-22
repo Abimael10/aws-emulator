@@ -41,10 +41,13 @@ use crate::event_source_mappings::{
     shard_source_readings, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
 };
 
-/// The `State` a mapping an update was accepted for carries, and the two it settles into,
-/// from `EventSourceMappingConfiguration$State`: "It can be one of the following: Creating,
-/// Enabling, Enabled, Disabling, Disabled, Updating, or Deleting."
+/// The `State` a mapping whose accepted update changed its CONFIGURATION carries, and the
+/// two it settles into, from `EventSourceMappingConfiguration$State`: "It can be one of the
+/// following: Creating, Enabling, Enabled, Disabling, Disabled, Updating, or Deleting."
 const STATE_UPDATING: &str = "Updating";
+/// See [`STATE_UPDATING`]: the state an accepted PAUSE carries instead, since the call is the
+/// one that can "pause invocation and resume later".
+const STATE_DISABLING: &str = "Disabling";
 /// See [`STATE_UPDATING`].
 const STATE_ENABLED: &str = "Enabled";
 /// See [`STATE_UPDATING`].
@@ -117,6 +120,8 @@ struct Row {
     /// The members the update must have changed, each as `(reported member, value)`.
     /// EVERY other member of the configuration must come back unchanged.
     changed: Vec<(&'static str, Value)>,
+    /// The transitional state the accepted update reports while it is being applied.
+    accepted_as: &'static str,
     /// The state the mapping settles into once the clock makes the move due.
     settles_into: &'static str,
 }
@@ -144,6 +149,7 @@ fn rows() -> Vec<Row> {
             }),
             update: json!({ "BatchSize": 10_000 }),
             changed: vec![("BatchSize", json!(10_000))],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         Row {
@@ -154,6 +160,7 @@ fn rows() -> Vec<Row> {
             create_extras: json!({ "StartingPosition": "LATEST", "BatchSize": 50 }),
             update: json!({ "Enabled": false }),
             changed: vec![],
+            accepted_as: STATE_DISABLING,
             settles_into: STATE_DISABLED,
         },
         Row {
@@ -175,6 +182,7 @@ fn rows() -> Vec<Row> {
                 ("MaximumRecordAgeInSeconds", json!(604_800)),
                 ("MaximumRetryAttempts", json!(10_000)),
             ],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         Row {
@@ -196,6 +204,7 @@ fn rows() -> Vec<Row> {
                     json!({ "Filters": [{ "Pattern": "{\"body\":{\"kind\":[\"order\"]}}" }] }),
                 ),
             ],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         Row {
@@ -212,6 +221,7 @@ fn rows() -> Vec<Row> {
                 ("FunctionResponseTypes", json!(["ReportBatchItemFailures"])),
                 ("MetricsConfig", json!({ "Metrics": ["EventCount"] })),
             ],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         Row {
@@ -221,6 +231,7 @@ fn rows() -> Vec<Row> {
             create_extras: json!({ "BatchSize": 6 }),
             update: json!({ "FunctionName": RETARGET_FUNCTION }),
             changed: vec![("FunctionArn", json!(function_arn(RETARGET_FUNCTION)))],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         Row {
@@ -230,6 +241,7 @@ fn rows() -> Vec<Row> {
             create_extras: json!({ "StartingPosition": "TRIM_HORIZON", "BatchSize": 7 }),
             update: json!({}),
             changed: vec![],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
     ]
@@ -322,11 +334,12 @@ async fn an_update_moves_the_members_it_states_and_leaves_every_other_one_alone(
         assert_eq!(
             (answer.string("State"), answer.string("StateTransitionReason")),
             (
-                Some(STATE_UPDATING.to_string()),
+                Some(row.accepted_as.to_string()),
                 Some(shard_source_readings(Some(row.event_source)).0.to_string())
             ),
-            "case {label:?}: the update must answer the mapping as {STATE_UPDATING}, asked for \
-             by a caller, got {}",
+            "case {label:?}: the update must answer the mapping as {}, asked for by a caller, \
+             got {}",
+            row.accepted_as,
             answer.text()
         );
 

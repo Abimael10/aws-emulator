@@ -64,10 +64,16 @@
 //! [`crate::state::scaling_config_sets_no_limit`]).
 //!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
-//! returns: the mapping moves into `Updating` — one of the states
-//! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
-//! `Enabled` setting asks for is owed by the CLOCK (see
+//! returns: the mapping moves into the transitional state of the change it accepted — one
+//! of the states `EventSourceMappingConfiguration$State` enumerates — and the move to the
+//! state its `Enabled` setting asks for is owed by the CLOCK (see
 //! [`crate::state::EventSourceMappingRecord::begin_update`]). Nothing sleeps for it.
+//! WHICH of them it is follows from what the update changes, because this is the call that
+//! can "pause invocation and resume later": an update that turns polling off reports
+//! `Disabling` until the pause is in force, one that turns it back on reports `Enabling`,
+//! and one that leaves polling exactly as it found it changed the CONFIGURATION and reports
+//! `Updating` — so a client that paused a consumer and is waiting for the pause to take hold
+//! reads the pause's own window rather than a state that names an unrelated change.
 //!
 //! The window a mapping is UNAVAILABLE to an update in is the one its own CREATE opens:
 //! `ResourceInUseException` is "The operation conflicts with the resource's availability.
@@ -700,6 +706,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // Whether this mapping was POLLING when the update arrived, read before any member
+        // is replaced: which transitional state the accepted change reports follows from
+        // whether the change turns polling on, off, or leaves it where it was (see
+        // [`crate::state::EventSourceMappingRecord::begin_update`]).
+        let polled_before = record.enabled;
+
         if let Some((function_name, function_arn, function_qualifier)) = retarget {
             record.function_name = function_name;
             record.function_arn = function_arn;
@@ -782,9 +794,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.provisioned_poller_config = input.provisioned_poller_config.clone();
         }
 
-        // The change is accepted rather than applied: the mapping is `Updating` until the
-        // clock makes the move out of it due. See the module docs.
-        record.begin_update(now);
+        // The change is accepted rather than applied: the mapping is in the transitional
+        // state of the change it accepted — `Enabling` for a resume, `Disabling` for a
+        // pause, `Updating` for a change that leaves polling where it was — until the clock
+        // makes the move out of it due. See the module docs.
+        record.begin_update(now, polled_before);
 
         // Answered by reading the stored record back, so `GetEventSourceMapping` reports
         // exactly what this call persisted.

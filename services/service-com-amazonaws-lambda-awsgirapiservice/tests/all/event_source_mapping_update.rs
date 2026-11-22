@@ -35,10 +35,19 @@ use crate::event_source_mappings::{
     STATE_CREATING,
 };
 
-/// The `State` a mapping an update was accepted for carries, from
+/// The `State` a mapping whose accepted update changed its CONFIGURATION carries, from
 /// `EventSourceMappingConfiguration$State`: "It can be one of the following: Creating,
 /// Enabling, Enabled, Disabling, Disabled, Updating, or Deleting."
 const STATE_UPDATING: &str = "Updating";
+
+/// See [`STATE_UPDATING`]: the `State` a mapping whose accepted update RESUMES polling
+/// carries until that resume is in force, and the one an accepted PAUSE carries. The call is
+/// the one that can "pause invocation and resume later" (`UpdateEventSourceMapping`), so the
+/// window each of those changes is applied in is its own and not the configuration one.
+const STATE_ENABLING: &str = "Enabling";
+
+/// See [`STATE_ENABLING`].
+const STATE_DISABLING: &str = "Disabling";
 
 /// See [`STATE_UPDATING`].
 const STATE_ENABLED: &str = "Enabled";
@@ -91,6 +100,9 @@ struct UpdateCase {
     update: Value,
     /// The members the mapping must report afterwards, each as `(member, value)`.
     expected: Vec<(&'static str, Value)>,
+    /// The transitional state the accepted update reports until the clock makes the move
+    /// out of it due: the pause's and the resume's own, or the configuration one.
+    accepted_as: &'static str,
     /// The state the mapping settles into once the clock makes the move due.
     settles_into: &'static str,
 }
@@ -106,6 +118,7 @@ fn update_cases() -> Vec<UpdateCase> {
             create_extras: json!({ "BatchSize": 5 }),
             update: json!({ "BatchSize": 9 }),
             expected: vec![("BatchSize", json!(9))],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         UpdateCase {
@@ -115,6 +128,7 @@ fn update_cases() -> Vec<UpdateCase> {
             create_extras: json!({ "BatchSize": 5 }),
             update: json!({ "Enabled": false }),
             expected: vec![("BatchSize", json!(5))],
+            accepted_as: STATE_DISABLING,
             settles_into: STATE_DISABLED,
         },
         UpdateCase {
@@ -124,6 +138,7 @@ fn update_cases() -> Vec<UpdateCase> {
             create_extras: json!({ "Enabled": false, "BatchSize": 3 }),
             update: json!({ "Enabled": true }),
             expected: vec![("BatchSize", json!(3))],
+            accepted_as: STATE_ENABLING,
             settles_into: STATE_ENABLED,
         },
         UpdateCase {
@@ -142,6 +157,7 @@ fn update_cases() -> Vec<UpdateCase> {
                     json!({ "Filters": [{ "Pattern": "{\"eventName\":[\"INSERT\"]}" }] }),
                 ),
             ],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         UpdateCase {
@@ -161,6 +177,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 ("BisectBatchOnFunctionError", json!(true)),
                 ("ParallelizationFactor", json!(3)),
             ],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
         UpdateCase {
@@ -170,6 +187,7 @@ fn update_cases() -> Vec<UpdateCase> {
             create_extras: json!({ "BatchSize": 7 }),
             update: json!({}),
             expected: vec![("BatchSize", json!(7))],
+            accepted_as: STATE_UPDATING,
             settles_into: STATE_ENABLED,
         },
     ]
@@ -262,13 +280,13 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
                 updated.string("EventSourceArn"),
             ),
             (
-                Some(STATE_UPDATING.to_string()),
+                Some(case.accepted_as.to_string()),
                 Some(uuid.clone()),
                 Some(arn.clone()),
                 Some(case.event_source.to_string()),
             ),
-            "case {label:?}: the update must answer the stored mapping as {STATE_UPDATING}, \
-             got {}",
+            "case {label:?}: the update must answer the stored mapping as {}, got {}",
+            case.accepted_as,
             updated.text()
         );
         for (member, value) in &case.expected {
@@ -280,14 +298,14 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
             );
         }
 
-        // Read back: the update persisted what it answered, still `Updating` until the
-        // clock makes the move due.
+        // Read back: the update persisted what it answered, still in the transitional state
+        // of the change it accepted until the clock makes the move due.
         let reading = get_mapping(&router, &uuid).await;
         assert_eq!(
             (reading.status, reading.string("State")),
-            (200, Some(STATE_UPDATING.to_string())),
-            "case {label:?}: the mapping must read back as {STATE_UPDATING} before the \
-             settle is due, got {} {}",
+            (200, Some(case.accepted_as.to_string())),
+            "case {label:?}: the mapping must read back as {} before the settle is due, got {} {}",
+            case.accepted_as,
             reading.status,
             reading.text()
         );

@@ -43,6 +43,23 @@ pub const EVENT_SOURCE_MAPPING_STATE_DELETING: &str = "Deleting";
 /// currently UPDATING".
 pub const EVENT_SOURCE_MAPPING_STATE_UPDATING: &str = "Updating";
 
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`]: the state a mapping is in while it is
+/// being RESUMED, which is the only change either of the two transitional states the
+/// model enumerates beside `Creating`, `Updating` and `Deleting` can name.
+///
+/// `UpdateEventSourceMapping` is the call that can "pause invocation and resume later",
+/// and `Enabled` is what asks for it — "when true, the event source mapping is active.
+/// When false, Lambda pauses polling and invocation" — so an accepted update that turns
+/// polling ON is in force only once the mapping reports `Enabled`, and what it reports
+/// until then is this, while an accepted update that changes anything ELSE reports
+/// [`EVENT_SOURCE_MAPPING_STATE_UPDATING`]
+/// (see [`EventSourceMappingRecord::begin_update`]).
+pub const EVENT_SOURCE_MAPPING_STATE_ENABLING: &str = "Enabling";
+
+/// See [`EVENT_SOURCE_MAPPING_STATE_ENABLING`]: the same, for the accepted update that
+/// turns polling OFF — the PAUSE, which is in force once the mapping reports `Disabled`.
+pub const EVENT_SOURCE_MAPPING_STATE_DISABLING: &str = "Disabling";
+
 /// The `State` a mapping `CreateEventSourceMapping` has just accepted is in, from the
 /// `Enabled` setting the request asked for: "When true, the event source mapping is
 /// active. When false, Lambda pauses polling and invocation."
@@ -690,11 +707,11 @@ impl EventSourceMappingRecord {
     ///
     /// The ONLY transition it applies is the one the clock owed at `now`: a mapping whose
     /// poller has finished being stood up, or whose accepted change has finished being
-    /// applied, leaves `Creating` or `Updating` for the state its `Enabled` setting asks
-    /// for — "When true, the event source mapping is active. When false, Lambda pauses
-    /// polling and invocation." It would have been owed at the same instant even if nobody
-    /// had called, so applying it on a read reports the truth rather than inventing a
-    /// change.
+    /// applied, leaves the transitional state it was in ([`Self::is_settling`]) for the
+    /// state its `Enabled` setting asks for — "When true, the event source mapping is
+    /// active. When false, Lambda pauses polling and invocation." It would have been owed
+    /// at the same instant even if nobody had called, so applying it on a read reports the
+    /// truth rather than inventing a change.
     pub fn materialize(&mut self, now: SystemTime) {
         if self.is_settling() && now >= self.settled_due {
             self.state = if self.enabled {
@@ -711,8 +728,8 @@ impl EventSourceMappingRecord {
     }
 
     /// Whether this mapping is still moving into the state its settings ask for — the
-    /// window `Creating` and `Updating` name, which the clock closes at
-    /// [`Self::settled_due`].
+    /// window `Creating`, `Enabling`, `Disabling` and `Updating` name, which the clock
+    /// closes at [`Self::settled_due`].
     ///
     /// Read it only after [`Self::materialize`], so a window the clock has already closed
     /// is not reported as still open.
@@ -720,7 +737,10 @@ impl EventSourceMappingRecord {
     pub fn is_settling(&self) -> bool {
         matches!(
             self.state.as_str(),
-            EVENT_SOURCE_MAPPING_STATE_CREATING | EVENT_SOURCE_MAPPING_STATE_UPDATING
+            EVENT_SOURCE_MAPPING_STATE_CREATING
+                | EVENT_SOURCE_MAPPING_STATE_UPDATING
+                | EVENT_SOURCE_MAPPING_STATE_ENABLING
+                | EVENT_SOURCE_MAPPING_STATE_DISABLING
         )
     }
 
@@ -743,15 +763,33 @@ impl EventSourceMappingRecord {
         self.state == EVENT_SOURCE_MAPPING_STATE_CREATING
     }
 
-    /// Accept an `UpdateEventSourceMapping` of this mapping.
+    /// Accept an `UpdateEventSourceMapping` of this mapping, which found it polling (or
+    /// paused) as `polled_before` says.
     ///
     /// The operation answers 202 Accepted, so the change is not in effect at the instant
-    /// the call returns: the mapping moves into `Updating` and the move to the state its
-    /// `Enabled` setting asks for is owed by the CLOCK
-    /// ([`EVENT_SOURCE_MAPPING_SETTLE_DELAY`]) exactly as the move out of `Creating` is.
-    /// Nothing sleeps for it.
-    pub fn begin_update(&mut self, now: SystemTime) {
-        self.state = EVENT_SOURCE_MAPPING_STATE_UPDATING.to_string();
+    /// the call returns: the mapping moves into the transitional state of the change it
+    /// accepted and the move to the state its `Enabled` setting asks for is owed by the
+    /// CLOCK ([`EVENT_SOURCE_MAPPING_SETTLE_DELAY`]) exactly as the move out of `Creating`
+    /// is. Nothing sleeps for it.
+    ///
+    /// WHICH transitional state that is follows from what the update changes, because the
+    /// model enumerates one for each: `UpdateEventSourceMapping` is the call that can "pause
+    /// invocation and resume later", so an update that turns polling off is the PAUSE and
+    /// reports [`EVENT_SOURCE_MAPPING_STATE_DISABLING`] until it is in force, one that turns
+    /// it back on is the RESUME and reports [`EVENT_SOURCE_MAPPING_STATE_ENABLING`], and one
+    /// that leaves polling exactly as it found it changed the mapping's CONFIGURATION and
+    /// reports [`EVENT_SOURCE_MAPPING_STATE_UPDATING`]. So a client that paused a consumer
+    /// and is waiting for the pause to take hold reads the pause's own window rather than a
+    /// state that names an unrelated change.
+    pub fn begin_update(&mut self, now: SystemTime, polled_before: bool) {
+        self.state = if self.enabled == polled_before {
+            EVENT_SOURCE_MAPPING_STATE_UPDATING
+        } else if self.enabled {
+            EVENT_SOURCE_MAPPING_STATE_ENABLING
+        } else {
+            EVENT_SOURCE_MAPPING_STATE_DISABLING
+        }
+        .to_string();
         self.state_transition_reason = self.caller_transition_reason().to_string();
         // "The date that the event source mapping was last updated or that its state
         // changed": both happened now.
@@ -807,20 +845,28 @@ impl EventSourceMappingRecord {
         )
     }
 
-    /// Whether a change this mapping already accepted is still being applied — the
-    /// `Updating` window [`Self::begin_update`] opens and the clock closes at
-    /// [`Self::settled_due`].
+    /// Whether a change this mapping already accepted is still being applied — the window
+    /// [`Self::begin_update`] opens, whichever of its three transitional states names the
+    /// change, and the clock closes at [`Self::settled_due`].
     ///
     /// What it is for: `ResourceInUseException` names that window as the one a mapping is NOT
     /// available to be DELETED in ("you tried to delete an event source mapping currently
     /// UPDATING"), so a teardown asked for inside it is refused until the change the mapping
-    /// acknowledged has settled. A further UPDATE inside it is accepted — the window an
-    /// update is refused inside is the create's ([`Self::is_creating`]).
+    /// acknowledged has settled — and a mapping that is still pausing or resuming is applying
+    /// an accepted change exactly as one that is still taking a configuration change is, so
+    /// the window is the same one however the update was worded. A further UPDATE inside it is
+    /// accepted — the window an update is refused inside is the create's
+    /// ([`Self::is_creating`]).
     /// Read it only after [`Self::materialize`], so a window the clock has already closed
     /// is not read as still open.
     #[must_use]
     pub fn is_updating(&self) -> bool {
-        self.state == EVENT_SOURCE_MAPPING_STATE_UPDATING
+        matches!(
+            self.state.as_str(),
+            EVENT_SOURCE_MAPPING_STATE_UPDATING
+                | EVENT_SOURCE_MAPPING_STATE_ENABLING
+                | EVENT_SOURCE_MAPPING_STATE_DISABLING
+        )
     }
 
     /// Whether the clock has already made this mapping's removal due; see

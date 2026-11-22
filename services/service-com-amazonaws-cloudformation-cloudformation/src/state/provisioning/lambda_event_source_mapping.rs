@@ -511,8 +511,11 @@ async fn await_settled(
 
 /// The `State` values a mapping is not available for a further call in, from
 /// `ResourceInUseException`'s own sentence: "you tried to update an event source mapping in the
-/// CREATING state, or you tried to delete an event source mapping currently UPDATING".
-const TRANSITIONAL_STATES: &[&str] = &["Creating", "Updating"];
+/// CREATING state, or you tried to delete an event source mapping currently UPDATING" — and
+/// `Enabling` and `Disabling` with it, since a mapping still applying the pause or the resume
+/// it accepted is applying an accepted update exactly as one still taking a configuration
+/// change is.
+const TRANSITIONAL_STATES: &[&str] = &["Creating", "Updating", "Enabling", "Disabling"];
 
 /// Whether this deployment changes a property that can only be set when the mapping is
 /// CREATED ([`CREATE_ONLY_PROPERTIES`]), or the `Tags` no arm here applies to a mapping that

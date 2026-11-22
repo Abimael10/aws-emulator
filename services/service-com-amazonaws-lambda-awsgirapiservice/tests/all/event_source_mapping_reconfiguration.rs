@@ -29,10 +29,14 @@ use crate::event_source_mappings::{
     router_on, Answer, MAPPINGS_URI, QUEUE_SOURCE, STATE_DISABLED, STATE_ENABLED,
 };
 
-/// The `State` a mapping an update was accepted for carries, from
+/// The `State` a mapping whose accepted update changed its CONFIGURATION carries, from
 /// `EventSourceMappingConfiguration$State`: "It can be one of the following: Creating,
 /// Enabling, Enabled, Disabling, Disabled, Updating, or Deleting."
 const STATE_UPDATING: &str = "Updating";
+
+/// See [`STATE_UPDATING`]: the state an accepted PAUSE carries instead, since
+/// `UpdateEventSourceMapping` is the call that can "pause invocation and resume later".
+const STATE_DISABLING: &str = "Disabling";
 
 /// The error code the boundary answers for a member whose value is outside the range the
 /// model declares for it, which is the refusal a value is held to whatever state the resource
@@ -88,6 +92,8 @@ struct RunCase {
     function: &'static str,
     /// The bodies of the run, in order. Each must be accepted.
     steps: Vec<Value>,
+    /// The transitional state each of those steps must be accepted as, in the same order.
+    accepted_as: Vec<&'static str>,
     /// What the mapping reports once the whole run has been accepted, each as
     /// `(member, value)`; a `Null` expectation means the member must be ABSENT.
     expected: Vec<(&'static str, Value)>,
@@ -108,6 +114,7 @@ fn run_cases() -> Vec<RunCase> {
                 json!({ "ScalingConfig": { "MaximumConcurrency": 50 } }),
                 json!({ "ScalingConfig": {} }),
             ],
+            accepted_as: vec![STATE_UPDATING, STATE_UPDATING, STATE_UPDATING],
             // "To remove the configuration, pass an empty value" (`ScalingConfig`): the
             // mapping then has no scaling configuration at all, exactly as one created
             // without one.
@@ -121,6 +128,7 @@ fn run_cases() -> Vec<RunCase> {
                 json!({ "ScalingConfig": { "MaximumConcurrency": CONCURRENCY_FLOOR } }),
                 json!({ "ScalingConfig": { "MaximumConcurrency": CONCURRENCY_CEILING } }),
             ],
+            accepted_as: vec![STATE_UPDATING, STATE_UPDATING],
             expected: vec![(
                 "ScalingConfig",
                 json!({ "MaximumConcurrency": CONCURRENCY_CEILING }),
@@ -134,6 +142,7 @@ fn run_cases() -> Vec<RunCase> {
                 json!({ "BatchSize": 7 }),
                 json!({ "BatchSize": 20, "MaximumBatchingWindowInSeconds": 5 }),
             ],
+            accepted_as: vec![STATE_UPDATING, STATE_UPDATING],
             expected: vec![
                 ("BatchSize", json!(20)),
                 ("MaximumBatchingWindowInSeconds", json!(5)),
@@ -147,6 +156,7 @@ fn run_cases() -> Vec<RunCase> {
                 json!({ "BatchSize": 9 }),
                 json!({ "Enabled": false }),
             ],
+            accepted_as: vec![STATE_UPDATING, STATE_DISABLING],
             expected: vec![("BatchSize", json!(9))],
             settles_into: STATE_DISABLED,
         },
@@ -154,6 +164,7 @@ fn run_cases() -> Vec<RunCase> {
             name: "one step alone, which is a run of length one",
             function: "esm-recfg-single",
             steps: vec![json!({ "ScalingConfig": { "MaximumConcurrency": 10 } })],
+            accepted_as: vec![STATE_UPDATING],
             expected: vec![("ScalingConfig", json!({ "MaximumConcurrency": 10 }))],
             settles_into: STATE_ENABLED,
         },
@@ -177,10 +188,15 @@ async fn a_settled_mapping_takes_every_update_in_a_run() {
                 answer.status,
                 answer.text()
             );
+            let wanted = case
+                .accepted_as
+                .get(step)
+                .copied()
+                .unwrap_or_else(|| panic!("case {label:?}: step {step} states no expected state"));
             assert_eq!(
                 answer.string("State").as_deref(),
-                Some(STATE_UPDATING),
-                "case {label:?}: step {step} must answer the mapping as {STATE_UPDATING}, got {}",
+                Some(wanted),
+                "case {label:?}: step {step} must answer the mapping as {wanted}, got {}",
                 answer.text()
             );
         }

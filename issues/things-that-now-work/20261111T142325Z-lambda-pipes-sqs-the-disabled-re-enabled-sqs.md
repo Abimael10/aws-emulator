@@ -39,3 +39,29 @@ Scenario: source queue with VisibilityTimeout 30, function timeout 10, a forward
 3. Send a warm-up message and confirm delivery; UpdateEventSourceMapping(Enabled=False) and wait for State 'Disabled'.
 4. Send a second message, confirm no invocation and that the message remains on the source queue; UpdateEventSourceMapping(Enabled=True) and confirm the withheld message is then delivered.
 5. The sequence does not complete within 60 s.
+
+## Resolution
+
+Cause 1 is DECLINED as a per-run wall-clock envelope: the unit's only evidence is
+"Check timed out after 60.0s" with no assertion reached, and no status, error code, message
+or member of the create/warm-up/disable/re-enable sequence differs. Every modelled
+observation the cause calls unobservable is served and pinned end to end — the delivery gate
+by `services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/event_source_mapping_pause_and_resume_delivery.rs`
+and, against the emulator a customer STARTS (the built binary, request authentication on,
+SigV4 over TLS), by `core/router/tests/all/lambda_sqs_mapping_enabled_gate_on_a_started_emulator.rs`.
+The lifecycle converges in well under a second per transition
+(`crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY`) and a delivery follows a `SendMessage`
+within about a second.
+
+Auditing those same two transitions did find a real defect, which is what this change fixes:
+an accepted `UpdateEventSourceMapping` reported `Updating` whatever it changed, so the
+`Enabling` and `Disabling` states `EventSourceMappingConfiguration$State` enumerates were
+never reported. An accepted update that turns polling off now reports `Disabling` until the
+pause is in force, one that turns it back on reports `Enabling`, and one that leaves polling
+as it found it reports `Updating`
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/event_source_mapping.rs`,
+`src/ops/update_event_source_mapping.rs`,
+`tests/all/event_source_mapping_polling_transition_state.rs`) — so a client that pauses a
+consumer and waits for the pause to take hold reads the pause's own window rather than a
+state that names an unrelated change.
+

@@ -33,9 +33,14 @@ use crate::event_source_mappings::{
     DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
 };
 
-/// The `State` a mapping an update was accepted for carries, from
+/// The `State` a mapping whose accepted update changed its CONFIGURATION carries, from
 /// `EventSourceMappingConfiguration$State`.
 const STATE_UPDATING: &str = "Updating";
+
+/// See [`STATE_UPDATING`]: the state an accepted PAUSE carries instead — the window a
+/// mapping asked to stop polling is applying that change in, which is as much an accepted
+/// change being applied as a configuration one.
+const STATE_DISABLING: &str = "Disabling";
 
 /// See [`STATE_UPDATING`]: the state a delete moves a mapping into.
 const STATE_DELETING: &str = "Deleting";
@@ -92,6 +97,8 @@ struct InUseCase {
     /// What the update states — the change the mapping is still applying when the delete
     /// arrives.
     update: Value,
+    /// The transitional state that accepted update reports while it is being applied.
+    accepted_as: &'static str,
 }
 
 /// The rows: one per event source, each updating a different member.
@@ -103,6 +110,7 @@ fn in_use_cases() -> Vec<InUseCase> {
             event_source: QUEUE_SOURCE,
             create_extras: json!({ "BatchSize": 5 }),
             update: json!({ "BatchSize": 10 }),
+            accepted_as: STATE_UPDATING,
         },
         InUseCase {
             name: "a queue mapping that is being paused",
@@ -110,6 +118,7 @@ fn in_use_cases() -> Vec<InUseCase> {
             event_source: QUEUE_SOURCE,
             create_extras: json!({ "BatchSize": 5 }),
             update: json!({ "Enabled": false }),
+            accepted_as: STATE_DISABLING,
         },
         InUseCase {
             name: "a kinesis mapping whose filter criteria are being changed",
@@ -119,6 +128,7 @@ fn in_use_cases() -> Vec<InUseCase> {
             update: json!({
                 "FilterCriteria": { "Filters": [{ "Pattern": "{\"eventName\":[\"INSERT\"]}" }] },
             }),
+            accepted_as: STATE_UPDATING,
         },
         InUseCase {
             name: "a dynamodb mapping whose retry settings are being changed",
@@ -126,6 +136,7 @@ fn in_use_cases() -> Vec<InUseCase> {
             event_source: DYNAMODB_SOURCE,
             create_extras: json!({ "StartingPosition": "TRIM_HORIZON" }),
             update: json!({ "MaximumRetryAttempts": 4 }),
+            accepted_as: STATE_UPDATING,
         },
     ]
 }
@@ -184,9 +195,10 @@ async fn a_delete_is_refused_while_the_mapping_is_applying_an_update() {
         let updated = update_mapping(&router, &uuid, &case.update).await;
         assert_eq!(
             (updated.status, updated.string("State")),
-            (202, Some(STATE_UPDATING.to_string())),
-            "case {:?}: the update must be accepted and report {STATE_UPDATING}, got {} {}",
+            (202, Some(case.accepted_as.to_string())),
+            "case {:?}: the update must be accepted and report {}, got {} {}",
             case.name,
+            case.accepted_as,
             updated.status,
             updated.text()
         );
@@ -214,9 +226,10 @@ async fn a_delete_is_refused_while_the_mapping_is_applying_an_update() {
         let still_there = get_mapping(&router, &uuid).await;
         assert_eq!(
             (still_there.status, still_there.string("State")),
-            (200, Some(STATE_UPDATING.to_string())),
-            "case {:?}: the refused mapping must still read as {STATE_UPDATING}, got {} {}",
+            (200, Some(case.accepted_as.to_string())),
+            "case {:?}: the refused mapping must still read as {}, got {} {}",
             case.name,
+            case.accepted_as,
             still_there.status,
             still_there.text()
         );
