@@ -133,16 +133,6 @@ pub struct ScheduledActionPut {
 }
 
 impl ScheduledActionPut {
-    /// The sizes this put states, in the order the service reports them: the ones a bound
-    /// check reads, with the members the request left out absent rather than zero.
-    #[must_use]
-    pub fn stated_sizes(&self) -> Vec<i32> {
-        [self.min_size, self.max_size, self.desired_capacity]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
     /// Take this put against every rule in this module's own documentation, against the
     /// group it would be stored on.
     ///
@@ -173,9 +163,16 @@ impl ScheduledActionPut {
             }
         }
         // Those checks are all RELATIVE, so none of them bounds the absolute size: the
-        // capacity this action would have the group hold is stored instances, so it is held
-        // to the same ceiling every writer of a group's sizes is.
-        if let Some(size) = super::size_past_ceiling(&self.stated_sizes()) {
+        // capacity this action would have the group RUN is stored instances, so THAT is
+        // what is held to the same ceiling every writer of a group's sizes holds a
+        // capacity to — the bounds the action states are stored verbatim and hold no
+        // instance of their own.
+        let capacity_after_run = super::capacity_within_bounds(
+            self.desired_capacity.unwrap_or(group.desired_capacity),
+            min_size,
+            max_size,
+        );
+        if let Some(size) = super::size_past_ceiling(&[capacity_after_run]) {
             return Err(ScheduledActionRefusal::SizePastCeiling(size));
         }
         if let (Some(start_time), Some(end_time)) = (self.start_time, self.end_time) {
@@ -433,9 +430,7 @@ impl ScheduledActionRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::NoSizeStated => SIZE_REQUIRED_MESSAGE.to_string(),
-            Self::NegativeMinSize(min_size) => {
-                format!("The MinSize must not be negative, but it is {min_size}")
-            }
+            Self::NegativeMinSize(min_size) => super::negative_min_size_message(*min_size),
             Self::MaxBelowMin { max_size, min_size } => {
                 super::max_below_min_message(*max_size, *min_size)
             }

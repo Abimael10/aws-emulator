@@ -1264,9 +1264,11 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
     );
 }
 
-/// Sizes this emulator cannot hold are refused before anything is allocated: the
-/// bounds an operation checks against each other cannot bound the ABSOLUTE size,
-/// and every unit of capacity is a stored instance.
+/// Capacities this emulator cannot hold are refused before anything is allocated: the
+/// bounds an operation checks against each other cannot bound the ABSOLUTE size, and every
+/// unit of capacity a group RUNS is a stored instance. A bound past the ceiling is only
+/// headroom and is accepted (`capacity_sign_and_headroom_bounds.rs`), so each row here
+/// states a CAPACITY past it.
 #[tokio::test]
 async fn sizes_past_the_capacity_ceiling_are_refused() {
     let engine = new_engine();
@@ -1288,10 +1290,10 @@ async fn sizes_past_the_capacity_ceiling_are_refused() {
             "",
         ),
         (
-            "a maximum one past the ceiling",
-            "0",
+            "a minimum one past the ceiling, which the capacity follows",
             past_the_ceiling.as_str(),
-            "0",
+            past_the_ceiling.as_str(),
+            past_the_ceiling.as_str(),
             400,
             "LimitExceeded",
         ),
@@ -1350,12 +1352,13 @@ async fn sizes_past_the_capacity_ceiling_are_refused() {
         }
     }
 
-    // An update cannot raise a stored group past the ceiling either.
+    // An update cannot raise a stored group's CAPACITY past the ceiling either.
     let (status, body) = query(
         &router,
         "UpdateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "ceiling-0"),
+            ("MinSize", past_the_ceiling.as_str()),
             ("MaxSize", past_the_ceiling.as_str()),
         ],
     )

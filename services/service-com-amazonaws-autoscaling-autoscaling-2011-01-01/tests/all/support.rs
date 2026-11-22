@@ -532,6 +532,16 @@ pub fn max_below_min_message(
     format!("Max bound, {max_size}, must be greater than or equal to min bound, {min_size}")
 }
 
+/// The whole message the service refuses a request whose minimum group size is below zero
+/// with: fixed text apart from the bound the request handed it.
+///
+/// THE ONE COPY for this crate's tests, written out here rather than taken from the
+/// service's own builder — a test that re-used the implementation's literal would assert
+/// nothing. Generic over how a suite spells the bound, as [`max_below_min_message`] is.
+pub fn negative_min_size_message(min_size: impl ::std::fmt::Display) -> String {
+    format!("Min bound, {min_size}, must be non-negative")
+}
+
 /// The text of the first `<tag>…</tag>`, or `""` when the member is absent.
 pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()

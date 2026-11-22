@@ -444,10 +444,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch source: a request whose bounds cannot describe a group is refused for
         // the bounds, whatever else it carries.
         if input.min_size < 0 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MinSize must not be negative, but it is {}",
-                input.min_size
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::negative_min_size_message(input.min_size),
+            ));
         }
         if input.max_size < input.min_size {
             return Err(crate::scaffolded::Scaffolded::validation_error(
@@ -501,14 +500,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal);
         }
         // The checks above are all RELATIVE, so none of them bounds the absolute
-        // size: every unit of capacity is a stored instance, and the service has a
-        // quota for exactly that reason. Refuse past the ceiling before anything is
-        // allocated or the store is locked.
-        if let Some(size) = crate::state::size_past_ceiling(&[
-            input.min_size,
-            input.max_size,
-            desired_capacity,
-        ]) {
+        // size: every unit of capacity the group RUNS is a stored instance, and the
+        // service has a quota for exactly that reason. The bounds themselves are not
+        // instances — a `MaxSize` is headroom the group may grow into later, and it is
+        // stored verbatim — so what is held to the ceiling is the capacity this request
+        // asks the group to hold, checked before anything is allocated or the store is
+        // locked.
+        if let Some(size) = crate::state::size_past_ceiling(&[desired_capacity]) {
             return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
                 LimitExceededFault {
                     message: Some(format!(

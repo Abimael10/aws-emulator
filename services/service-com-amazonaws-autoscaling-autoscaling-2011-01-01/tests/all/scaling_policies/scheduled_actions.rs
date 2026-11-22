@@ -38,8 +38,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    borrowed, list_members, max_below_min_message, new_engine, p, query, router_with, tag_value,
-    tag_values, xml_unescape, REGION,
+    borrowed, list_members, max_below_min_message, negative_min_size_message, new_engine, p,
+    query, router_with, tag_value, tag_values, xml_unescape, REGION,
 };
 
 /// The launch source every group in this suite is created from — a launch TEMPLATE, because
@@ -725,7 +725,7 @@ async fn a_definition_that_cannot_be_scheduled_is_refused_and_stores_nothing() {
             "a negative minimum",
             group,
             vec![("StartTime", "2030-06-01T12:00:00Z"), ("MinSize", "-1")],
-            "The MinSize must not be negative, but it is -1".to_string(),
+            negative_min_size_message(-1),
         ),
         (
             "a group the account does not hold",
@@ -1020,13 +1020,15 @@ async fn a_quota_is_answered_as_the_modelled_limit_exceeded_fault() {
     let group = "quota-group";
     let router = given_group(group).await;
 
-    // A size past the ceiling this process holds a group to.
+    // A capacity past the ceiling this process holds a group to: the bounds are only
+    // headroom, so it is the capacity they leave the group at that crosses it.
     let (status, code, message) = put_action(
         &router,
         group,
         "past-the-ceiling",
         &[
             ("StartTime", "2030-06-01T12:00:00Z"),
+            ("MinSize", &(MAX_GROUP_CAPACITY + 1).to_string()),
             ("MaxSize", &(MAX_GROUP_CAPACITY + 1).to_string()),
         ],
     )

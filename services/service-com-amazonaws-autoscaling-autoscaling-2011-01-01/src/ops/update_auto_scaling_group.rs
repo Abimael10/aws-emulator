@@ -565,9 +565,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let max_size = input.max_size.unwrap_or(group.max_size);
         let current_capacity = group.desired_capacity;
         if min_size < 0 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MinSize must not be negative, but it is {min_size}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::negative_min_size_message(min_size),
+            ));
         }
         if max_size < min_size {
             return Err(crate::scaffolded::Scaffolded::validation_error(
@@ -585,14 +585,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
-        // Those checks are all RELATIVE, so none of them bounds the absolute size:
-        // every unit of capacity is a stored instance. Refuse past the ceiling
-        // before any member is applied or any instance allocated.
-        if let Some(size) = crate::state::size_past_ceiling(&[
+        // The capacity the group holds after the update: what the request asked
+        // for, else the capacity it had brought within the new bounds — "If you
+        // specify a new value for MinSize without specifying a value for
+        // DesiredCapacity, and the new MinSize is larger than the current size of
+        // the group, this sets the group's DesiredCapacity to the new MinSize
+        // value", and the mirror of that for MaxSize.
+        let desired_capacity = crate::state::capacity_within_bounds(
+            input.desired_capacity.unwrap_or(current_capacity),
             min_size,
             max_size,
-            input.desired_capacity.unwrap_or(0),
-        ]) {
+        );
+        // Those checks are all RELATIVE, so none of them bounds the absolute size:
+        // every unit of capacity the group RUNS is a stored instance, while the bounds
+        // themselves are stored verbatim and hold no instance of their own. So what is
+        // held to the ceiling is the capacity this update leaves the group at, refused
+        // before any member is applied or any instance allocated.
+        if let Some(size) = crate::state::size_past_ceiling(&[desired_capacity]) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "The group size {size} exceeds the limit of {} instances per Auto Scaling group",
                 crate::state::MAX_GROUP_CAPACITY
@@ -611,17 +620,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal);
         }
 
-        // The capacity the group holds after the update: what the request asked
-        // for, else the capacity it had brought within the new bounds — "If you
-        // specify a new value for MinSize without specifying a value for
-        // DesiredCapacity, and the new MinSize is larger than the current size of
-        // the group, this sets the group's DesiredCapacity to the new MinSize
-        // value", and the mirror of that for MaxSize.
-        let desired_capacity = crate::state::capacity_within_bounds(
-            input.desired_capacity.unwrap_or(current_capacity),
-            min_size,
-            max_size,
-        );
         let launches_needed = group.launches_needed(desired_capacity);
         // The zones the group places instances in after this update: the ones the request
         // named, else those its new subnets resolve to, else the ones it already has. A

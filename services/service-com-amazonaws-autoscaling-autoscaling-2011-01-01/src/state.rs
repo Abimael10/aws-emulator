@@ -3751,6 +3751,17 @@ pub fn max_below_min_message(max_size: i32, min_size: i32) -> String {
     format!("Max bound, {max_size}, must be greater than or equal to min bound, {min_size}")
 }
 
+/// The message the service refuses a request whose minimum group size is below zero with,
+/// shared by every operation that sets a group's bounds.
+///
+/// A bound is a COUNT of instances, so the service states the bound it was handed and the
+/// requirement that bound has to meet, in the same shape as the relational refusal above
+/// ([`max_below_min_message`]): the fixed text `Min bound, ` and `, must be non-negative`
+/// around the one value the request carried, and nothing else from the request.
+pub fn negative_min_size_message(min_size: i32) -> String {
+    format!("Min bound, {min_size}, must be non-negative")
+}
+
 /// The message the service refuses a request whose desired capacity falls outside the
 /// bounds that request leaves the group with, shared by every operation that sets those
 /// three sizes together.
@@ -3777,9 +3788,14 @@ pub fn desired_capacity_out_of_bounds_message(
 
 /// The first of `sizes` past [`MAX_GROUP_CAPACITY`], if any.
 ///
-/// Every operation that sets a group's sizes checks them through this, so one
-/// request cannot store bounds whose capacity this process could not hold, and
-/// the refusal can name the offending value.
+/// What a caller passes here is the capacity a request would have a group RUN — the
+/// instances it is asked to hold — and never the bounds it may later grow within: the
+/// ceiling is a ceiling on STORED INSTANCES, so a group whose `MaxSize` is a large
+/// headroom value holds no instance for that headroom and is created and updated like any
+/// other, while the capacity it is actually driven to is held to this ceiling. Every
+/// operation that sets a group's sizes checks that capacity through this, so no request
+/// can leave a group running more instances than this process holds one to, and the
+/// refusal can name the offending value.
 pub fn size_past_ceiling(sizes: &[i32]) -> Option<i32> {
     sizes.iter().copied().find(|size| *size > MAX_GROUP_CAPACITY)
 }
@@ -4278,6 +4294,17 @@ pub fn capacity_outside_bounds_message(desired_capacity: i32, bound: CapacityBou
         "New SetDesiredCapacity value {desired_capacity} is {relation} value {limit} for the \
          AutoScalingGroup."
     )
+}
+
+/// The sentence a capacity change is refused with when the capacity it asks for is not a
+/// count at all.
+///
+/// A negative capacity is refused for its SIGN rather than against either bound: no group's
+/// minimum is what such a request missed, so the service states its own name, the value it
+/// was handed and that the value is negative, and stops there.
+#[must_use]
+pub fn negative_capacity_message(desired_capacity: i32) -> String {
+    format!("New SetDesiredCapacity value {desired_capacity} is negative.")
 }
 
 /// The sentence Amazon EC2 Auto Scaling states for `ScalingActivityInProgressFault` when

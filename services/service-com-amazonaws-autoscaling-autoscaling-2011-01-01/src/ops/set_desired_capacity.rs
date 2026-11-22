@@ -213,6 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cooldown_until = group.cooldown_until;
         let in_cooldown = group.in_cooldown(now);
 
+        // A capacity is a COUNT of instances, so a negative one is not a capacity at all:
+        // it is refused for its sign, ahead of either bound comparison, in the sentence
+        // this service states for that ([`crate::state::negative_capacity_message`]) —
+        // naming no bound, because no bound of the group is what the request missed.
+        if desired_capacity < 0 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::negative_capacity_message(desired_capacity),
+            ));
+        }
         // A capacity outside the group's own bounds is refused in the ONE wording this
         // service states for both of them
         // ([`crate::state::capacity_outside_bounds_message`]): the sentence names what was

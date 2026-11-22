@@ -98,8 +98,8 @@ fn desired_capacity_message(desired_capacity: i32, min_size: i32, max_size: i32)
     )
 }
 
-/// The whole message an action whose size is past the ceiling this process holds a group to is
-/// refused with.
+/// The whole message an action whose capacity is past the ceiling this process holds a group
+/// to is refused with.
 fn size_past_ceiling_message(size: i32) -> String {
     format!(
         "The group size {size} exceeds the limit of {MAX_GROUP_CAPACITY} instances per Auto \
@@ -707,9 +707,10 @@ async fn an_action_that_cannot_be_scheduled_is_reported_on_its_own() {
             INVALID_TIME_ZONE_MESSAGE.to_string(),
         ),
         (
-            "a size past the ceiling a group is held to",
+            "a capacity past the ceiling a group is held to",
             vec![
                 ("StartTime", "2030-06-01T12:00:00Z"),
+                ("MinSize", "1001"),
                 ("MaxSize", "1001"),
             ],
             "LimitExceeded",
@@ -766,7 +767,11 @@ async fn an_action_that_cannot_be_scheduled_is_reported_on_its_own() {
         &[
             (
                 "both-bad-1",
-                vec![("StartTime", "2030-06-01T12:00:00Z"), ("MaxSize", "1001")],
+                vec![
+                    ("StartTime", "2030-06-01T12:00:00Z"),
+                    ("MinSize", "1001"),
+                    ("MaxSize", "1001"),
+                ],
             ),
             ("both-bad-2", vec![("StartTime", "2030-06-01T12:00:00Z")]),
         ],
