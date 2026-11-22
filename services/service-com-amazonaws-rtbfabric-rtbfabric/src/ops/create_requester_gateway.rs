@@ -175,6 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut store = state.lock();
+        // The replay path below reports a stored status, so the transitions the clock
+        // has already made due are materialised before anything is reported: the
+        // change was owed at this same instant whether or not anybody called, and
+        // without this the replayed status would depend on whether some unrelated
+        // call happened to settle the record.
+        store.settle_all(now);
 
         // `clientToken` is an `@idempotencyToken`: the same token replays the first
         // call's answer, and the same token with different parameters is refused

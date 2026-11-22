@@ -209,6 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut store = state.lock();
+        // See `create_requester_gateway`: the replay path below reports a stored
+        // status, so the transitions the clock has already made due are materialised
+        // before anything is reported.
+        store.settle_all(now);
 
         // "A domain name or managed endpoint is required" — this operation's own
         // modelled documentation (`smithy_query(query="doc",

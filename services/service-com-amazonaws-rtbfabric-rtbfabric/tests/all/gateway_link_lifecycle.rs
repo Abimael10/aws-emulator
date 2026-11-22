@@ -3184,3 +3184,225 @@ async fn a_repeated_client_token_answers_with_the_first_external_link() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// An `@idempotencyToken` replay answers from the clock, not from who called first.
+//
+// The rule under test: an operation that reports a stored record's status
+// materialises the status transitions the clock has already made due before it
+// answers, so every answer about one record at one instant agrees, whatever
+// other calls happened to run in between.
+// ---------------------------------------------------------------------------
+
+/// The status a gateway create reports for the record it has just stored: the
+/// non-terminal one, because provisioning is asynchronous. A member of both
+/// `RequesterGatewayStatus` and `ResponderGatewayStatus`, checked against the
+/// modelled value lists below.
+const GATEWAY_TRANSIENT_STATUS: &str = "PENDING_CREATION";
+
+/// The status the clock owes a stored gateway once provisioning is due. Also a
+/// member of both modelled status enums.
+const GATEWAY_SETTLED_STATUS: &str = "ACTIVE";
+
+/// One replay case: which gateway create is replayed, how the same record is read
+/// back, and whether an unrelated reader runs before the replay.
+struct ReplayCase {
+    name: &'static str,
+    /// The create's path, which is also the replay's.
+    create_path: &'static str,
+    /// The read path this record is reached at, before its `gatewayId`.
+    read_prefix: &'static str,
+    /// The request body, built from the lifecycle row so the replay is exercised
+    /// over the same spread of inputs every other rule here is.
+    body: fn(&Row, &str) -> Value,
+    /// Whether a `Get…Gateway` call — which settles the record — runs between the
+    /// create and the replay. The replayed status must be the same either way.
+    read_before_replay: bool,
+}
+
+/// The rows differ along the two axes the rule generalises over: which of the two
+/// gateway creates is replayed, and whether anything else touched the store
+/// first.
+const REPLAY_CASES: &[ReplayCase] = &[
+    ReplayCase {
+        name: "requester gateway, nothing else touches the store",
+        create_path: "/requester-gateway",
+        read_prefix: "/requester-gateway",
+        body: Row::requester_body,
+        read_before_replay: false,
+    },
+    ReplayCase {
+        name: "requester gateway, a reader settles the record first",
+        create_path: "/requester-gateway",
+        read_prefix: "/requester-gateway",
+        body: Row::requester_body,
+        read_before_replay: true,
+    },
+    ReplayCase {
+        name: "responder gateway, nothing else touches the store",
+        create_path: "/responder-gateway",
+        read_prefix: "/responder-gateway",
+        body: Row::responder_body,
+        read_before_replay: false,
+    },
+    ReplayCase {
+        name: "responder gateway, a reader settles the record first",
+        create_path: "/responder-gateway",
+        read_prefix: "/responder-gateway",
+        body: Row::responder_body,
+        read_before_replay: true,
+    },
+];
+
+impl Fabric {
+    /// Replay one create — the same path with the same `clientToken` and the same
+    /// parameters — until it reports `expected` as its `status`, and answer with
+    /// that reading.
+    ///
+    /// Waits for the CONDITION rather than for a span, exactly as
+    /// [`Fabric::poll_until_status`] does, giving up only once
+    /// [`SETTLE_DEADLINE`] passed. NOTHING else touches the store between two
+    /// looks, so reaching `expected` here is the replay's own doing.
+    async fn poll_replay_until_status(
+        &self,
+        case: &str,
+        path: &str,
+        body: &Value,
+        gateway_id: &str,
+        expected: &str,
+    ) -> Value {
+        let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let replay = self.replay_create(case, path, body, gateway_id).await;
+            if text(&replay, "status") == expected {
+                return replay;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: expected the replayed create to report {expected:?} once the clock \
+                 had made the transition due, got {:?}",
+                replay["status"]
+            );
+            tokio::time::sleep(SETTLE_POLL).await;
+        }
+    }
+
+    /// One replay of a create, checked to answer 200 for the record the first call
+    /// stored rather than minting a second one.
+    async fn replay_create(
+        &self,
+        case: &str,
+        path: &str,
+        body: &Value,
+        gateway_id: &str,
+    ) -> Value {
+        let (status, replay) = self.send("POST", path, Some(body.clone())).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the replayed create to answer 200, got {status} {replay:?}"
+        );
+        assert_eq!(
+            text(&replay, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the replay to answer for the stored gateway {gateway_id:?}, got {:?}",
+            replay["gatewayId"]
+        );
+        replay
+    }
+}
+
+#[tokio::test]
+async fn an_idempotent_create_replay_reports_the_status_the_clock_has_made_due() {
+    // Both statuses are modelled members of both gateway status enums, from
+    // `smithy_query(query="shape",
+    // shape="RequesterGatewayStatus,ResponderGatewayStatus")`.
+    for status in [GATEWAY_TRANSIENT_STATUS, GATEWAY_SETTLED_STATUS] {
+        for (enum_name, values) in [
+            ("RequesterGatewayStatus", REQUESTER_GATEWAY_STATUS_VALUES),
+            ("ResponderGatewayStatus", RESPONDER_GATEWAY_STATUS_VALUES),
+        ] {
+            assert!(
+                values.contains(&status),
+                "case {enum_name:?}: expected {status:?} to be a modelled status, got {values:?}"
+            );
+        }
+    }
+
+    for row in ROWS {
+        for replay_case in REPLAY_CASES {
+            let case = format!("{} / {}", replay_case.name, row.name);
+            let fabric = Fabric::new();
+            let body = (replay_case.body)(row, "token-replay");
+
+            let (status, first) = fabric
+                .send("POST", replay_case.create_path, Some(body.clone()))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to answer 200, got {status} {first:?}"
+            );
+            // The create reports the record it just stored, so this is the
+            // transient status whatever the clock does next.
+            assert_eq!(
+                text(&first, "status"),
+                GATEWAY_TRANSIENT_STATUS,
+                "case {case:?}: expected the create to report the status it stored, got {:?}",
+                first["status"]
+            );
+            let gateway_id = text(&first, "gatewayId");
+            let read_path = format!("{}/{gateway_id}", replay_case.read_prefix);
+
+            if replay_case.read_before_replay {
+                // An unrelated reader materialises the transition first; the
+                // replay must report the same thing it does.
+                fabric
+                    .poll_until_status(&case, &read_path, GATEWAY_SETTLED_STATUS)
+                    .await;
+                let replayed = fabric
+                    .replay_create(&case, replay_case.create_path, &body, &gateway_id)
+                    .await;
+                assert_eq!(
+                    text(&replayed, "status"),
+                    GATEWAY_SETTLED_STATUS,
+                    "case {case:?}: expected the replay to report the settled status a reader had already reported, got {:?}",
+                    replayed["status"]
+                );
+            } else {
+                // Nothing else is called, so the replay itself is what has to
+                // materialise the transition the clock made due.
+                fabric
+                    .poll_replay_until_status(
+                        &case,
+                        replay_case.create_path,
+                        &body,
+                        &gateway_id,
+                        GATEWAY_SETTLED_STATUS,
+                    )
+                    .await;
+            }
+
+            // Two answers about this one record at this one instant agree.
+            let (status, read) = fabric.send("GET", &read_path, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the read-back to answer 200, got {status} {read:?}"
+            );
+            let replayed = fabric
+                .replay_create(&case, replay_case.create_path, &body, &gateway_id)
+                .await;
+            assert_eq!(
+                text(&replayed, "status"),
+                text(&read, "status"),
+                "case {case:?}: expected the replay and the reader to agree on {:?}, got {:?}",
+                read["status"],
+                replayed["status"]
+            );
+            assert_eq!(
+                text(&read, "status"),
+                GATEWAY_SETTLED_STATUS,
+                "case {case:?}: expected the settled status, got {:?}",
+                read["status"]
+            );
+        }
+    }
+}
+
