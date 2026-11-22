@@ -278,6 +278,66 @@ async fn creating_target_groups_persists_them_and_both_identifier_forms_read_the
     }
 }
 
+/// `CreateTargetGroup` request bodies spanning the whole modelled `type` catalog (`IP`,
+/// `LAMBDA`, `INSTANCE`, `ALB` — `smithy_query(query="shape",shape="TargetGroupType")`)
+/// and the config members each of those types supports, named under `prefix` so two
+/// callers of this table never collide on the account-scoped `name`.
+///
+/// Lives here, beside the operation it drives, for the suites that need a spread of
+/// VALID creates and assert nothing about the config a row persists. The tables that do
+/// assert the stored config keep their own rows: this crate's inline `cases` table above
+/// pairs each request with the config it must persist, and
+/// `delete_rule_and_target_group.rs` pairs each with the identifier form its delete sends.
+pub(crate) fn type_catalog_rows(prefix: &str) -> Vec<(String, serde_json::Value)> {
+    vec![
+        (
+            format!("{prefix}: LAMBDA with no config at all"),
+            serde_json::json!({ "name": format!("{prefix}-lambda"), "type": "LAMBDA" }),
+        ),
+        (
+            format!("{prefix}: LAMBDA carrying the non-default event structure version"),
+            serde_json::json!({
+                "name": format!("{prefix}-lambda-v2"),
+                "type": "LAMBDA",
+                "config": { "lambdaEventStructureVersion": "V2" },
+            }),
+        ),
+        (
+            format!("{prefix}: IP over HTTP in a VPC"),
+            serde_json::json!({
+                "name": format!("{prefix}-ip"),
+                "type": "IP",
+                "config": { "protocol": "HTTP", "vpcIdentifier": A_VPC },
+            }),
+        ),
+        (
+            format!("{prefix}: INSTANCE over HTTPS with a half-filled health check"),
+            serde_json::json!({
+                "name": format!("{prefix}-instance"),
+                "type": "INSTANCE",
+                "config": {
+                    "protocol": "HTTPS",
+                    "port": 8443,
+                    "vpcIdentifier": A_VPC,
+                    "healthCheck": {
+                        "enabled": true,
+                        "healthCheckIntervalSeconds": 60,
+                        "matcher": { "httpCode": "200-299" },
+                    },
+                },
+            }),
+        ),
+        (
+            format!("{prefix}: ALB over HTTP on the documented default port"),
+            serde_json::json!({
+                "name": format!("{prefix}-alb"),
+                "type": "ALB",
+                "config": { "protocol": "HTTP", "port": 80, "vpcIdentifier": A_VPC },
+            }),
+        ),
+    ]
+}
+
 /// One value for each config member, so a member can be sent on its own.
 pub(crate) fn member_value(member: &str) -> serde_json::Value {
     match member {

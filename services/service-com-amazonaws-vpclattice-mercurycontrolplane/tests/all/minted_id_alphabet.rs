@@ -32,9 +32,9 @@
 use crate::default_rule_and_rule_update::update_rule;
 use crate::list_rules::{default_rule_id, items_of, list_page};
 use crate::listeners::{a_service, create_listener, listener_kind, target_group};
-use crate::rules::{create_rule, fixed_response_rule, get_rule, rule_kind};
-use crate::target_groups::create_target_group;
-use crate::vpclattice_service_slice::{expected_arn, Answer, Lattice};
+use crate::rules::{a_listener, create_rule, fixed_response_rule, get_rule, rule_kind};
+use crate::target_groups::{create_target_group, get_target_group, type_catalog_rows};
+use crate::vpclattice_service_slice::{as_label, expected_arn, message_of, Answer, Lattice};
 use service_com_amazonaws_vpclattice_mercurycontrolplane::state;
 
 /// How many characters a minted id carries after its prefix, as every modelled id pattern
@@ -797,4 +797,193 @@ async fn every_rule_operation_reports_the_minted_rule_suffix() {
         minted.len(),
         minted
     );
+}
+
+/// A STORED id keeps the minted suffix on the two paths that report one rather than mint
+/// it: the read that echoes a stored resource, and the `resourceId` of the 409 a duplicate
+/// NAME is refused with — for a target group and for a listener rule alike.
+///
+/// What this adds over the cases above, which assert the suffix a create answers with:
+/// `GetTargetGroup` and `GetRule` in both modelled identifier forms (the bare id and the
+/// ARN as a label), and `ConflictException.resourceId`, which is the id of the resource
+/// ALREADY holding the name and so comes from the store rather than from a fresh mint. A
+/// base-36 suffix satisfies every modelled pattern (`^tg-[0-9a-z]{17}$`,
+/// `^rule-[0-9a-z]{17}$`), so only these assertions pin the narrower form the service
+/// hands out.
+///
+/// The target-group rows are the shared `type`-catalog table of this crate's target-group
+/// suite ([`crate::target_groups::type_catalog_rows`]) and the rule rows the shared
+/// [`rule_rows`] of this file, so neither catalog is enumerated twice; the name's length
+/// is not a dimension of the minted suffix, so the bounds of `TargetGroupName`'s
+/// `@length` stay with the suite that tests them.
+///
+/// The rule half repeats the create and `GetRule` assertions of
+/// [`every_rule_operation_reports_the_minted_rule_suffix`] only as the setup its new legs
+/// need: the read in the ARN identifier form, and the duplicate-NAME conflict.
+#[tokio::test]
+async fn reads_and_duplicate_name_conflicts_report_the_minted_hex_suffix() {
+    let lattice = Lattice::new();
+
+    for (case, body) in type_catalog_rows("hexform") {
+        let created = create_target_group(&lattice, body.clone()).await;
+        served(&case, 201, &created);
+        let id = created.str_field("id");
+        assert_hex_id(&case, &id, state::PREFIX_TARGET_GROUP);
+        let arn = created.str_field("arn");
+        assert_eq!(
+            arn,
+            expected_arn(state::KIND_TARGET_GROUP, &id),
+            "case {case}: the ARN must embed the minted id {id:?}, got {}",
+            created.body
+        );
+
+        // Both modelled identifier forms read the stored record back, and each echoes the
+        // minted id and the ARN built from it unchanged.
+        for (form, identifier) in [("the bare id", id.clone()), ("the ARN", as_label(&arn))] {
+            let read_case = format!("{case}, read by {form}");
+            let read = get_target_group(&lattice, &identifier).await;
+            served(&read_case, 200, &read);
+            assert_hex_id(&read_case, &read.str_field("id"), state::PREFIX_TARGET_GROUP);
+            for (member, expected) in [("id", id.clone()), ("arn", arn.clone())] {
+                assert_eq!(
+                    read.str_field(member),
+                    expected,
+                    "case {read_case}, member {member}: expected the stored {expected:?}, got {}",
+                    read.body
+                );
+            }
+        }
+
+        // The name is taken, so a second create under it is refused with the id of the
+        // target group that holds it.
+        let conflict_case = format!("{case}, the name taken a second time");
+        let conflict = create_target_group(&lattice, body.clone()).await;
+        served(&conflict_case, 409, &conflict);
+        assert_eq!(
+            conflict.error_code.as_deref(),
+            Some("ConflictException"),
+            "case {conflict_case}: expected a ConflictException, got {:?}",
+            conflict.error_code
+        );
+        // `ConflictException` declares `resourceId` and `resourceType` required members
+        // (`smithy_query(query="shape",shape="ConflictException")`), and the refusal is
+        // the one over the taken NAME: it names the name and the scope it is taken in. The
+        // token is the wire literal recorded vpc-lattice errors carry for this kind, not a
+        // value read back out of the service.
+        assert_eq!(
+            conflict.str_field("resourceType"),
+            "TARGET_GROUP",
+            "case {conflict_case}: expected the target-group resource type, got {}",
+            conflict.body
+        );
+        let taken_name = body["name"]
+            .as_str()
+            .expect("every row of the catalog carries a name");
+        let message = message_of(&conflict_case, &conflict);
+        assert!(
+            message.contains(taken_name),
+            "case {conflict_case}: the refusal must name the taken name {taken_name:?}, \
+             got {message:?}"
+        );
+        let reported = conflict.str_field("resourceId");
+        assert_hex_id(&conflict_case, &reported, state::PREFIX_TARGET_GROUP);
+        assert_eq!(
+            reported, id,
+            "case {conflict_case}: resourceId must be the stored target group {id:?}, \
+             got {reported:?}"
+        );
+    }
+
+    // The same on the rule namespace, over the rule table of this file: a rule's name is
+    // unique within its listener, so a second create under a taken name reports the stored
+    // rule's id. The second create carries a priority no rule of the listener holds, so the
+    // refusal under test is the one over the NAME and not the one over the priority.
+    let (service_id, _) = a_service(&lattice, "hexform-conflict-host").await;
+    let listener_id = a_listener(&lattice, &service_id, "hexform-conflict-listener").await;
+    for (row, (case, body, _)) in rule_rows().into_iter().enumerate() {
+        let created = create_rule(&lattice, &service_id, &listener_id, body.clone()).await;
+        served(case, 201, &created);
+        let id = created.str_field("id");
+        assert_hex_id(case, &id, state::PREFIX_RULE);
+        let arn = created.str_field("arn");
+        assert_eq!(
+            arn,
+            expected_arn(&rule_kind(&service_id, &listener_id), &id),
+            "case {case}: the rule ARN must nest under its listener and embed {id:?}, got {}",
+            created.body
+        );
+
+        // The same read-back as the target-group half: both modelled identifier forms
+        // report the stored id and the ARN built from it.
+        for (form, identifier) in [("the bare id", id.clone()), ("the ARN", as_label(&arn))] {
+            let read_case = format!("{case}, read by {form}");
+            let read = get_rule(&lattice, &service_id, &listener_id, &identifier).await;
+            served(&read_case, 200, &read);
+            assert_hex_id(&read_case, &read.str_field("id"), state::PREFIX_RULE);
+            for (member, expected) in [("id", id.clone()), ("arn", arn.clone())] {
+                assert_eq!(
+                    read.str_field(member),
+                    expected,
+                    "case {read_case}, member {member}: expected the stored {expected:?}, got {}",
+                    read.body
+                );
+            }
+        }
+
+        let conflict_case = format!("{case}, the name taken a second time");
+        let taken_name = body["name"]
+            .as_str()
+            .expect("every row of the rule table carries a name")
+            .to_string();
+        // A priority distinct per row and held by no row of the table, so the second
+        // create collides on the NAME alone; the table is the authority on which
+        // priorities are taken, so the choice is checked against it rather than assumed.
+        let free_priority = 1500 + i64::try_from(row).expect("the row count fits an i64");
+        assert!(
+            rule_rows()
+                .iter()
+                .all(|(_, row_body, _)| row_body["priority"] != serde_json::json!(free_priority)),
+            "case {case}: priority {free_priority} is held by a row of the rule table, so a \
+             second create under it would collide on the priority instead of the name"
+        );
+        let conflict = create_rule(
+            &lattice,
+            &service_id,
+            &listener_id,
+            serde_json::json!({
+                "name": taken_name,
+                "priority": free_priority,
+                "match": { "httpMatch": {} },
+                "action": { "fixedResponse": { "statusCode": 404 } },
+            }),
+        )
+        .await;
+        served(&conflict_case, 409, &conflict);
+        assert_eq!(
+            conflict.error_code.as_deref(),
+            Some("ConflictException"),
+            "case {conflict_case}: expected a ConflictException, got {:?}",
+            conflict.error_code
+        );
+        assert_eq!(
+            conflict.str_field("resourceType"),
+            "RULE",
+            "case {conflict_case}: expected the rule resource type, got {}",
+            conflict.body
+        );
+        // The refusal over the taken name names the name and the listener it is taken in,
+        // which is how it differs from the refusal over a taken priority.
+        let message = message_of(&conflict_case, &conflict);
+        assert!(
+            message.contains(&taken_name) && message.contains(&listener_id),
+            "case {conflict_case}: the refusal must name {taken_name:?} and the listener \
+             {listener_id:?}, got {message:?}"
+        );
+        let reported = conflict.str_field("resourceId");
+        assert_hex_id(&conflict_case, &reported, state::PREFIX_RULE);
+        assert_eq!(
+            reported, id,
+            "case {conflict_case}: resourceId must be the stored rule {id:?}, got {reported:?}"
+        );
+    }
 }
