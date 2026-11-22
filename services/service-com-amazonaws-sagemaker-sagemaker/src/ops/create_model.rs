@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // create is refused for it rather than accepted into a model that could only fail
             // later (see `crate::state::s3_access`). A request that names no role assumes
             // none, so there is nothing to read as and nothing to settle.
-            let artifacts = model_data_locations(
+            let artifacts = crate::state::model_data_locations(
                 input.primary_container.as_ref(),
                 input.containers.as_deref(),
             );
@@ -322,32 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Every Amazon S3 location the model's containers hold their model data at, in the order the
-/// request carries them: the primary container's first, then each of the inference pipeline's.
-///
-/// A container holds its model data at `ModelDataUrl` ("the S3 path where the model artifacts
-/// … are stored") or at `ModelDataSource.S3DataSource.S3Uri` ("specifies the S3 path of ML
-/// model data to deploy"), and a data source may carry a manifest naming where the artifacts
-/// are listed (`ManifestS3Uri`) — each of them a location the deployment reads, so each is a
-/// location this create settles. A container that names none holds no model data, which the
-/// model's own image may well supply, so it contributes nothing to settle.
-fn model_data_locations(
-    primary: Option<&ContainerDefinition>,
-    containers: Option<&[ContainerDefinition]>,
-) -> Vec<String> {
-    primary
-        .into_iter()
-        .chain(containers.unwrap_or_default())
-        .flat_map(|container| {
-            let source = container.model_data_source.as_ref();
-            let s3_source = source.and_then(|source| source.s3_data_source.as_ref());
-            [
-                container.model_data_url.clone(),
-                s3_source.map(|source| source.s3_uri.clone()),
-                s3_source.and_then(|source| source.manifest_s3_uri.clone()),
-            ]
-        })
-        .flatten()
-        .filter(|uri| !uri.is_empty())
-        .collect()
-}
+// Where a model's containers hold their model data is the ONE reading in
+// `crate::state::model_serving` (`crate::state::model_data_locations`), because the
+// deployment that stands an endpoint up resolves the same locations as this create: the
+// reading lives there rather than being repeated here.

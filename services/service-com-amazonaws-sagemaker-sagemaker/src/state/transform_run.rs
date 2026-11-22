@@ -499,6 +499,7 @@ mod tests {
             intercept: 1.0,
             weights: vec![2.0],
             epochs: 1,
+            link: ObjectiveLink::Identity,
         }));
         // (case, the input object's records, the predictions each line has to carry)
         let rows: [(&str, &str, &[f64]); 3] = [

@@ -112,6 +112,27 @@ impl ObjectiveLink {
         Self::Identity
     }
 
+    /// The name this link is RECORDED under in a model document this emulator's own training
+    /// writes ([`super::model_document`]), so an artifact replays the function its model's
+    /// predictions are answered through rather than having it decided again on the way out.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Logistic => "logistic",
+            Self::Exponential => "exponential",
+        }
+    }
+
+    /// The link `label` names ([`Self::label`]), and `None` for a name none of them carries —
+    /// which is what a document stating no link at all carries, and answers the margin.
+    #[must_use]
+    pub fn named(label: &str) -> Option<Self> {
+        [Self::Identity, Self::Logistic, Self::Exponential]
+            .into_iter()
+            .find(|link| link.label() == label)
+    }
+
     /// `margin` through this link.
     #[must_use]
     pub fn apply(self, margin: f64) -> f64 {

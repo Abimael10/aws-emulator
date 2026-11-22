@@ -47,8 +47,10 @@
 //! modes, so the candidates are not the ones AWS would generate and the `CandidateSteps` of
 //! one are the empty list: the work was done by the job itself rather than by sub-jobs a
 //! caller could describe, and naming a step ARN nothing answers would be a dangling
-//! reference. `InferenceContainers` is empty for the same reason — no container image was
-//! built or pulled for a candidate — while the model each candidate fitted is a real object.
+//! reference. What a candidate IS deployable as is reported in full — the
+//! `InferenceContainers` definition naming the inference container of its problem type and
+//! the `ModelDataUrl` of the model it fitted, which is a real object — because that pair is
+//! the documented way a candidate is promoted to a model.
 //!
 //! The run is the JOB's own work, so what it could not do is the job's modelled `Failed`
 //! status with the `FailureReason` naming the condition that failed, never a refusal of the
@@ -96,6 +98,40 @@ const DATA_EXPLORATION_NOTEBOOK: &str = "SageMakerAutopilotDataExplorationNotebo
 /// The object the candidate-definition notebook is written as, which
 /// `AutoMLJobArtifacts$CandidateDefinitionNotebookLocation` reports.
 const CANDIDATE_DEFINITION_NOTEBOOK: &str = "SageMakerAutopilotCandidateDefinitionNotebook.ipynb";
+
+/// The Amazon ECR repository AWS publishes the inference container a TABULAR Autopilot
+/// candidate is served by: Autopilot's tabular modes build their candidates on the AutoGluon
+/// framework, whose inference container AWS publishes as `autogluon-inference` (the SageMaker
+/// Developer Guide's registry-path tables list it among the Deep Learning Containers).
+///
+/// It is the repository a candidate's container definition names, and nothing is pulled from
+/// it: the model behind the candidate is the artifact the run wrote, which this emulator
+/// serves itself.
+const CANDIDATE_INFERENCE_REPOSITORY: &str = "autogluon-inference";
+
+/// The Amazon ECR registry account AWS publishes the Deep Learning Containers from — the
+/// registry [`CANDIDATE_INFERENCE_REPOSITORY`] is published in, which the Deep Learning
+/// Containers' registry table gives as one account across the Regions it publishes them in.
+const DEEP_LEARNING_REGISTRY_ACCOUNT: &str = "763104351884";
+
+/// The Amazon ECR path of the inference container a candidate of this run is served by, in the
+/// Region the job ran in.
+///
+/// A container image is addressed `<account>.dkr.ecr.<region>.<domain>/<repository>`, and a
+/// Region AWS publishes no such registry in is left to the only registry this emulator serves
+/// there, which is this account's own ([`super::aws_publishes_from`] is the one reading of
+/// which registry AWS publishes a SageMaker container from in a Region). No TAG is named: no
+/// image was built or pulled for the candidate, so no version of one is claimed — what the
+/// candidate is served from is its own `ModelDataUrl`.
+#[must_use]
+fn candidate_inference_image(region: &str) -> String {
+    let registry = if aws_publishes_from(region, DEEP_LEARNING_REGISTRY_ACCOUNT) {
+        DEEP_LEARNING_REGISTRY_ACCOUNT
+    } else {
+        ::emulator_server::EMULATOR_ACCOUNT_ID
+    };
+    format!("{registry}.dkr.ecr.{region}.amazonaws.com/{CANDIDATE_INFERENCE_REPOSITORY}")
+}
 
 /// The most distinct target values a dataset may take for the run to resolve its problem type
 /// as a classification rather than a regression.
@@ -165,6 +201,10 @@ pub struct AutoMLCandidateRun {
     pub metrics: Vec<CandidateMetric>,
     /// The object this candidate's fitted model was written to.
     pub model_artifacts: String,
+    /// The Amazon ECR path of the inference container the candidate is served by, resolved in
+    /// the Region the job ran in ([`candidate_inference_image`]) — the `Image` of the
+    /// container definition `AutoMLCandidate$InferenceContainers` reports beside the artifact.
+    pub inference_image: String,
     /// How many descent passes this candidate's fit took — what makes it a different
     /// candidate from its siblings.
     pub epochs: usize,
@@ -352,12 +392,17 @@ pub async fn run_auto_ml_job_v2(
     let base_epochs = fit_epochs(fitted_on.len(), columns);
     let widest = CANDIDATE_EPOCH_BUDGETS.iter().copied().max().unwrap_or(1);
     let problem_type = resolved_problem_type.clone();
+    // What a candidate ANSWERS follows the problem type the analysis resolved: a binary
+    // classification is the probability of the positive class, so its candidates are fitted
+    // and served through the logistic link ([`super::ObjectiveLink`]), while a regression and
+    // a multiclass problem answer in the target's own space.
+    let link = candidate_link(&resolved_problem_type);
     let fitting = ::tokio::task::spawn_blocking(move || {
         CANDIDATE_EPOCH_BUDGETS
             .iter()
             .map(|budget| {
                 let epochs = (base_epochs.saturating_mul(*budget) / widest.max(1)).max(1);
-                let model = fit(&fitted_on, epochs);
+                let model = fit_under(&fitted_on, epochs, link);
                 let metrics = measure(&model, &measured_over, &problem_type);
                 (model, epochs, metrics)
             })
@@ -395,6 +440,7 @@ pub async fn run_auto_ml_job_v2(
             name,
             metrics,
             model_artifacts: artifact.uri(),
+            inference_image: candidate_inference_image(region),
             epochs,
         });
     }
@@ -512,6 +558,19 @@ fn job_object(output: &S3Location, job_name: &str, suffix: &str) -> S3Location {
         } else {
             format!("{prefix}/{tail}")
         },
+    }
+}
+
+/// The function the candidates of `problem_type` answer their score through: a BINARY
+/// classification's candidate answers the probability of the positive class, which is what the
+/// logistic link gives, and a regression or a multiclass problem answers in the target's own
+/// space.
+#[must_use]
+fn candidate_link(problem_type: &str) -> ObjectiveLink {
+    if problem_type == PROBLEM_TYPE_BINARY_CLASSIFICATION {
+        ObjectiveLink::Logistic
+    } else {
+        ObjectiveLink::Identity
     }
 }
 
@@ -924,10 +983,11 @@ fn candidate_document(
         "problemTypeConfigName": auto_ml_problem_type_config_name(&request.auto_ml_problem_type_config),
         "model": {
             "type": "linear",
-            "inference": "prediction = intercept + sum(weights[i] * feature[i])",
+            "inference": "prediction = link(intercept + sum(weights[i] * feature[i]))",
             "intercept": model.intercept,
             "weights": model.weights,
             "epochs": model.epochs,
+            "link": model.link.label(),
         },
         "channels": channel_summaries(reads),
         "metrics": metrics
@@ -1056,12 +1116,17 @@ pub fn candidate_metric_data(candidate: &AutoMLCandidateRun) -> Vec<MetricDatum>
 /// objective metric picked, with the metric it was picked on and every metric it was measured
 /// by.
 ///
-/// `CandidateSteps` and `InferenceContainers` are the EMPTY lists: the candidate's work was
-/// performed by the job's own run rather than by sub-jobs a caller could describe, and no
-/// container image was built or pulled to serve it, so naming either would be a reference
-/// nothing answers. The model the candidate fitted IS a real object — written under the job's
-/// output location and named, with the candidate's measurements, in the candidate-definition
-/// notebook `AutoMLJobArtifacts` reports.
+/// `InferenceContainers` carries the ONE container definition the candidate is deployable as:
+/// the `Image` of the inference container that serves this problem type's candidates and the
+/// `ModelDataUrl` of the model this candidate's own fit wrote under the job's output location,
+/// which is the pair `CreateModel` takes — so the documented Autopilot deploy path (describe
+/// the job, read the best candidate's container, register it as a model) needs nothing
+/// re-derived. The artifact it names is an object Amazon S3 really holds: the run writes it
+/// before the job's status claims the candidate.
+///
+/// `CandidateSteps` is the EMPTY list: the candidate's work was performed by the job's own run
+/// rather than by sub-jobs a caller could describe, so naming a step ARN nothing answers would
+/// be a dangling reference.
 #[must_use]
 pub fn best_candidate_report(
     job: &super::AutoMLJobV2,
@@ -1085,7 +1150,13 @@ pub fn best_candidate_report(
         objective_status: OBJECTIVE_STATUS_SUCCEEDED.to_string(),
         candidate_steps: Vec::new(),
         candidate_status: CANDIDATE_STATUS_COMPLETED.to_string(),
-        inference_containers: Some(Vec::new()),
+        inference_containers: Some(vec![crate::ops::types::AutoMLContainerDefinition {
+            image: candidate.inference_image.clone(),
+            model_data_url: candidate.model_artifacts.clone(),
+            // "The environment variables to set in the container": the candidate's model is
+            // read out of the artifact itself, so the container is told nothing beside it.
+            environment: None,
+        }]),
         creation_time: timestamp(job.creation_time),
         end_time: job.end_time.map(timestamp),
         last_modified_time: timestamp(job.last_modified_time),

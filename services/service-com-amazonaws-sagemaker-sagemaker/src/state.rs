@@ -164,8 +164,8 @@ pub use job_config_schema::{
 pub mod admission;
 pub use admission::{
     could_not_access_model_data, could_not_assume_role, could_not_find_model_data,
-    execution_role_failure_reason, execution_role_is_unassumable, no_s3_objects_found,
-    s3_listing_refusal, s3_location_holds_no_objects, vpc_placement_refusal,
+    execution_role_failure_reason, execution_role_is_unassumable, failed_to_download_model_data,
+    no_s3_objects_found, s3_listing_refusal, s3_location_holds_no_objects, vpc_placement_refusal,
     SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
 };
 
@@ -837,6 +837,10 @@ pub const STATUS_IN_SERVICE: &str = "InService";
 /// deployment and the instant that deployment is owed complete. See
 /// [`Endpoint::begin_update`].
 pub const STATUS_UPDATING: &str = "Updating";
+/// `EndpointStatus`'s member an endpoint whose deployment could not be brought up at all
+/// carries, and the one `DescribeEndpoint$FailureReason` is populated for ("the reason why
+/// the endpoint is in this state"). See [`Endpoint::settle_status`].
+pub const STATUS_FAILED: &str = "Failed";
 /// `ClusterStatus`'s member a cluster carries between the call that asked for its
 /// deletion and the instant the deletion completes. See [`Cluster::begin_deletion`].
 pub const STATUS_DELETING: &str = "Deleting";

@@ -225,6 +225,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // The fleet of a create comes up at the instant the clock owes this endpoint, and
+        // what has to be there at that instant is the model data its models name: a create
+        // whose outcome falls due on this call resolves it now, as the deployment's own
+        // download would (`crate::state::resolve_due_endpoint_deployment`). It changes
+        // nothing for an endpoint whose outcome is not due on this call, and it is awaited
+        // with no store guard held.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        crate::state::resolve_due_endpoint_deployment(
+            &state,
+            ctx,
+            &region,
+            &input.endpoint_name,
+            now,
+        )
+        .await;
+
         let mut store = state.lock();
         let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_name) else {
             return Err(crate::scaffolded::Scaffolded::validation(
@@ -238,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a reporting call makes: the deployment the clock already owed.
         // It was due at the stored instant whether or not anybody described the
         // endpoint, so a waiter terminates and no caller's read changes the outcome.
-        let settled = endpoint.settle_status(::std::time::SystemTime::now());
+        let settled = endpoint.settle_status(now);
         let endpoint_arn = endpoint.arn.clone();
 
         // CaptureStatus follows the stored EnableCapture, whose model doc says data

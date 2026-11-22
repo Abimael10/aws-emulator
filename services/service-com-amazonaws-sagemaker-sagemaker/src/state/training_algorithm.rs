@@ -186,6 +186,11 @@ pub struct TrainingAlgorithm {
     /// metric this run can measure nothing for — such a job reports no final metric at all,
     /// because a name with no measurement behind it is not a metric the run emitted.
     pub metric: Option<ChannelMetric>,
+    /// The function the learning task the job asked for answers its score through, which is
+    /// the space the model it trains is fitted and served in ([`super::ObjectiveLink`]): a
+    /// probability task answers the logistic of the score, a count task a positive quantity,
+    /// and every other — including a job that asked for no task at all — the score itself.
+    pub link: ObjectiveLink,
 }
 
 impl TrainingAlgorithm {
@@ -222,9 +227,17 @@ impl TrainingAlgorithm {
             Some(named) => ChannelMetric::named(named),
             None => Some(default_metric_for_objective(read(OBJECTIVE_HYPER_PARAMETER))),
         };
+        // The learning task itself decides what the trained model ANSWERS, which is a
+        // different question from how it is evaluated: the task is read off the same
+        // hyperparameter and through the one reading of an objective this crate has
+        // ([`super::ObjectiveLink::of_objective`]), so the model an invocation is served from
+        // answers in the space its task is defined on.
+        let link = read(OBJECTIVE_HYPER_PARAMETER)
+            .map_or(ObjectiveLink::Identity, ObjectiveLink::of_objective);
         Self {
             boosted_trees,
             metric,
+            link,
         }
     }
 
@@ -281,6 +294,7 @@ mod tests {
             intercept: 0.0,
             weights: vec![1.0],
             epochs: 1,
+            link: ObjectiveLink::Identity,
         }
     }
 
@@ -482,7 +496,96 @@ mod tests {
         }
     }
 
-    /// RULE: the algorithm is read off the REPOSITORY an image path names, so a tag, a digest,
+    /// RULE: the function a trained model answers its score through follows the LEARNING TASK
+    /// the job's hyperparameters declare, so a task whose output is a probability serves a
+    /// value in the unit interval and a task whose output is a count a positive quantity.
+    ///
+    /// The rows differ along the objective family (probability, count, survival, regression,
+    /// the raw-margin members of the probability family, one no catalog entry names) and along
+    /// whether the request declares a task at all. `reg:logistic` and `count:poisson` are
+    /// entries no report cited.
+    #[test]
+    fn the_answer_space_follows_the_learning_task() {
+        // (case, the `objective` hyperparameter, the link the task answers through)
+        let rows: [(&str, Option<&str>, ObjectiveLink); 8] = [
+            (
+                "a binary probability task",
+                Some("binary:logistic"),
+                ObjectiveLink::Logistic,
+            ),
+            (
+                "a regression task on a probability target",
+                Some("reg:logistic"),
+                ObjectiveLink::Logistic,
+            ),
+            (
+                "the raw-margin member of the same family",
+                Some("binary:logitraw"),
+                ObjectiveLink::Identity,
+            ),
+            (
+                "a binary task answering a class rather than a probability",
+                Some("binary:hinge"),
+                ObjectiveLink::Identity,
+            ),
+            (
+                "a count task",
+                Some("count:poisson"),
+                ObjectiveLink::Exponential,
+            ),
+            (
+                "a survival task",
+                Some("survival:cox"),
+                ObjectiveLink::Exponential,
+            ),
+            (
+                "a squared-error regression task",
+                Some("reg:squarederror"),
+                ObjectiveLink::Identity,
+            ),
+            ("no task declared at all", None, ObjectiveLink::Identity),
+        ];
+        for (case, objective, expected) in rows {
+            let request = crate::ops::types::CreateTrainingJobInput {
+                hyper_parameters: Some(
+                    objective
+                        .map(|named| {
+                            (
+                                OBJECTIVE_HYPER_PARAMETER.to_string(),
+                                named.to_string(),
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            let link = TrainingAlgorithm::of(&request).link;
+            assert_eq!(
+                link, expected,
+                "case {case:?}: expected the link {expected:?}, got {link:?}"
+            );
+            // The link is what the model ANSWERS through, so a probability task's model
+            // cannot answer outside the unit interval however large its score.
+            if expected == ObjectiveLink::Logistic {
+                let model = LinearModel {
+                    intercept: 0.0,
+                    weights: vec![1.0],
+                    epochs: 1,
+                    link,
+                };
+                for feature in [-1e6, -3.0, 0.0, 2.5, 1e6] {
+                    let served = model.predict(&[feature]);
+                    assert!(
+                        (0.0..=1.0).contains(&served),
+                        "case {case:?}: a probability task's model must answer in [0, 1] \
+                         for the feature {feature}, got {served}"
+                    );
+                }
+            }
+        }
+    }
+
     /// a registry and a repository that merely contains the name are each read for what they
     /// are.
     #[test]

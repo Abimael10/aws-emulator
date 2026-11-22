@@ -48,6 +48,16 @@ pub struct EndpointConfig {
 /// serving, and the new one is what [`Endpoint::settle_status`] swaps in when the
 /// deployment falls due. `last_deployment_config` is the deployment configuration of the
 /// most recent deployment the endpoint was given one for.
+///
+/// `deployment_failure` is why the fleet this endpoint was created for cannot come up at
+/// all — resolved against the model data its variants' models name
+/// ([`model_data_deployment_failure`]) — and it is the `FailureReason` the endpoint settles
+/// `Failed` with when the clock reaches the instant its outcome was owed. `None` is a
+/// deployment with nothing standing in its way, which settles `InService`.
+///
+/// `deployment_artifacts` is the model data that deployment DOWNLOADS, snapshotted by the
+/// create like every other property of the fleet it stands up, so the instant the fleet is
+/// due to serve can be resolved against it ([`resolve_due_endpoint_deployment`]).
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub name: String,
@@ -68,6 +78,8 @@ pub struct Endpoint {
     pub instance_usage: BTreeMap<String, i64>,
     pub pending_update: Option<EndpointUpdate>,
     pub last_deployment_config: Option<DeploymentConfig>,
+    pub deployment_failure: Option<String>,
+    pub deployment_artifacts: Vec<DeployedArtifact>,
 }
 
 /// The deployment an `UpdateEndpoint` started and the clock has not completed yet: the
@@ -258,6 +270,149 @@ pub fn deployed_variant_images(
 /// [`account_quota_exceeded`] states them.
 pub const INSTANCES_UNIT: &str = "Instances";
 
+/// The most model artifacts ONE deployment resolves before the fleet it stands up comes up.
+///
+/// An EMULATOR ceiling, not an AWS limit: the modelled lists admit up to ten production
+/// variants (`ProductionVariantList` is `@length 1..10`) of up to fifteen containers each
+/// (`ContainerDefinitionList` is `@length 0..15`), and every location is a question to Amazon
+/// S3 and to IAM, so the work one create can ask for is bounded whatever the configuration
+/// declares.
+pub const MAX_DEPLOYMENT_ARTIFACTS: usize = 16;
+
+/// One model artifact a deployment has to DOWNLOAD to bring a fleet up: the Amazon S3
+/// location a variant's model holds its model data at, and the execution role that model is
+/// read as.
+#[derive(Debug, Clone)]
+pub struct DeployedArtifact {
+    /// The model the variant hosts, which is what a failure about this download names.
+    pub model_name: String,
+    /// `CreateModel$ExecutionRoleArn`: "the ARN of the IAM role that SageMaker can assume to
+    /// access model artifacts and docker image for deployment".
+    pub role_arn: String,
+    /// The model data location, as the model's container names it.
+    pub uri: String,
+}
+
+/// Every model artifact the fleet of `variants` has to download, in the order the
+/// configuration lists the variants and each model names its locations
+/// ([`model_data_locations`]), bounded by [`MAX_DEPLOYMENT_ARTIFACTS`].
+///
+/// A model deployed out of the REGISTRY carries no model data of its own: its artifact is
+/// where the model package's inference specification names it ([`served_artifact_url`]), which
+/// is the location such a deployment downloads, so that is what is resolved for it.
+///
+/// A variant naming no model, a model this account does not hold and a model whose containers
+/// name no model data at all each have nothing to download: there is no artifact of theirs for
+/// the deployment to fetch, so none is reported here. A model that assumes no execution role
+/// has one all the same — whether the object is THERE is not a question about the role.
+#[must_use]
+pub fn deployed_model_artifacts<'variants>(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    variants: impl IntoIterator<Item = &'variants ProductionVariant>,
+) -> Vec<DeployedArtifact> {
+    variants
+        .into_iter()
+        .filter_map(|variant| store.models.get(variant.model_name.as_deref()?))
+        .flat_map(|model| {
+            let role_arn = model.execution_role_arn.clone().unwrap_or_default();
+            let mut locations =
+                model_data_locations(model.primary_container.as_ref(), model.containers.as_deref());
+            if locations.is_empty() {
+                locations.extend(served_artifact_url(store, model));
+            }
+            locations.into_iter().map(move |uri| DeployedArtifact {
+                model_name: model.name.clone(),
+                role_arn: role_arn.clone(),
+                uri,
+            })
+        })
+        .take(MAX_DEPLOYMENT_ARTIFACTS)
+        .collect()
+}
+
+/// Resolve the model data of an endpoint whose CREATE's outcome falls due on this call, so the
+/// outcome it settles is the one the deployment's own download reaches.
+///
+/// The fleet comes up at the instant the clock owes the endpoint, and what has to be there at
+/// that instant is the model data — "SageMaker uses Amazon Web Services Security Token Service
+/// to download model artifacts from the S3 path you provided" (`CreateEndpoint`) — so a
+/// location that went away between the call that asked for the endpoint and the instant it was
+/// due to serve fails the deployment exactly as one that was already gone. The artifacts are
+/// the ones the CREATE snapshotted ([`Endpoint::deployment_artifacts`]), so a model deleted or
+/// re-registered afterwards does not change what this deployment downloads.
+///
+/// Changes nothing for an endpoint whose create is not due on this call, one already settled,
+/// one with nothing to download and one whose create already resolved a failure: the question
+/// is asked once per deployment, and only when its outcome is being materialised. The read
+/// itself is Amazon S3's, so no store guard is held across it.
+pub async fn resolve_due_endpoint_deployment(
+    state: &::engine::ServiceState<ComAmazonawsSagemakerSagemakerState>,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    endpoint_name: &str,
+    now: SystemTime,
+) {
+    let artifacts = {
+        let store = state.lock();
+        let Some(endpoint) = store.endpoints.get(endpoint_name) else {
+            return;
+        };
+        if endpoint.status != STATUS_CREATING
+            || now < endpoint.in_service_at
+            || endpoint.deployment_failure.is_some()
+            || endpoint.deployment_artifacts.is_empty()
+        {
+            return;
+        }
+        endpoint.deployment_artifacts.clone()
+    };
+    let Some(reason) = model_data_deployment_failure(ctx, region, &artifacts).await else {
+        return;
+    };
+    let mut store = state.lock();
+    if let Some(endpoint) = store.endpoints.get_mut(endpoint_name) {
+        // Still the same create, still unsettled: a deployment another call materialised in
+        // the meantime keeps the outcome that call reached.
+        if endpoint.status == STATUS_CREATING && endpoint.deployment_failure.is_none() {
+            endpoint.deployment_failure = Some(reason);
+        }
+    }
+}
+
+/// Why the deployment of `artifacts` cannot come up — the endpoint's `FailureReason` — or
+/// `None` when every one of them can be read as the role its own model assumes.
+///
+/// "If any of the models hosted at this endpoint get model data from an Amazon S3 location,
+/// SageMaker uses Amazon Web Services Security Token Service to download model artifacts from
+/// the S3 path you provided" (`CreateEndpoint`): the download happens while the endpoint is
+/// brought up, so a location that holds no object, or one the role may not read, is a fleet
+/// that never serves. Both are the DOWNLOAD failing, which is the one sentence a deployment
+/// reports them with ([`failed_to_download_model_data`]) — it names the location and both of
+/// the things that have to hold for the download to succeed.
+///
+/// Asked through the same reading the hosting creates ask ([`first_unreadable_location_as_role`])
+/// and awaited with NO store guard held; only what Amazon S3 and IAM ANSWERED fails a
+/// deployment.
+pub async fn model_data_deployment_failure(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    artifacts: &[DeployedArtifact],
+) -> Option<String> {
+    for artifact in artifacts {
+        let unreadable = first_unreadable_location_as_role(
+            ctx,
+            region,
+            &artifact.role_arn,
+            [artifact.uri.as_str()],
+        )
+        .await;
+        if let Some(unreadable) = unreadable {
+            return Some(failed_to_download_model_data(unreadable.uri()));
+        }
+    }
+    None
+}
+
 /// The published name of the quota that bounds how many instances of ONE ML instance type
 /// an account may run behind its endpoints, as a refusal states it.
 ///
@@ -402,6 +557,14 @@ impl Endpoint {
     /// `Creating` -> `InService` one of a create (see [`settle_creating`]), or the
     /// `Updating` -> `InService` one of a deployment, which swaps the configuration being
     /// deployed in for the one that was serving.
+    ///
+    /// A create whose fleet cannot come up at all settles `Failed` with the reason it
+    /// carries instead of `InService`: "If any of the models hosted at this endpoint get
+    /// model data from an Amazon S3 location, SageMaker uses Amazon Web Services Security
+    /// Token Service to download model artifacts from the S3 path you provided"
+    /// (`CreateEndpoint`), so a deployment whose model data cannot be downloaded has no
+    /// model to serve. The outcome was owed at the same instant either way — the condition
+    /// was resolved by the create, not by this reader.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if settle_creating(
             &mut self.status,
@@ -409,6 +572,10 @@ impl Endpoint {
             self.in_service_at,
             now,
         ) {
+            if let Some(reason) = self.deployment_failure.clone() {
+                self.status = STATUS_FAILED.to_string();
+                self.failure_reason = Some(reason);
+            }
             return true;
         }
         self.settle_update(now)

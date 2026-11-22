@@ -350,19 +350,36 @@ pub fn container_inputs(channels: &[ChannelData]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A fitted linear model: `prediction = intercept + weights · features`, in the caller's own
-/// scale.
+/// A fitted linear model: `prediction = link(intercept + weights · features)`, in the
+/// caller's own scale.
+///
+/// `link` is what the LEARNING TASK the job asked for answers through
+/// ([`super::ObjectiveLink`]): a task whose output is a probability answers the logistic of
+/// the linear score and a task whose output is a count a positive quantity, so the value this
+/// model serves lies in the range its own task is defined on rather than being the unbounded
+/// score. A job that asked for no such task answers the score itself
+/// ([`super::ObjectiveLink::Identity`]).
 #[derive(Debug, Clone)]
 pub struct LinearModel {
     pub intercept: f64,
     pub weights: Vec<f64>,
     /// How many passes over the data the descent took, which the artifact reports.
     pub epochs: usize,
+    /// The function the linear score is answered through, which the job's own learning task
+    /// decides.
+    pub link: ObjectiveLink,
 }
 
 impl LinearModel {
-    /// What this model predicts for one record's features.
+    /// What this model predicts for one record's features: its linear score through the
+    /// learning task's own link.
     pub fn predict(&self, features: &[f64]) -> f64 {
+        self.link.apply(self.margin(features))
+    }
+
+    /// The LINEAR SCORE this model gives one record's features, before the link: the space the
+    /// fit's own descent works in.
+    pub fn margin(&self, features: &[f64]) -> f64 {
         self.intercept
             + self
                 .weights
@@ -658,7 +675,11 @@ pub async fn run_training_job(
         .map(|read| (read.name.clone(), read.records.clone()))
         .collect();
     let fit_and_measure = ::tokio::task::spawn_blocking(move || {
-        let model = fit(&fitted_on, fit_epochs(fitted_on.len(), columns));
+        let model = fit_under(
+            &fitted_on,
+            fit_epochs(fitted_on.len(), columns),
+            algorithm.link,
+        );
         let metrics: Vec<MetricData> = measured
             .iter()
             .filter_map(|(name, records)| {
@@ -1170,11 +1191,37 @@ pub fn read_records(bytes: &[u8], read: &mut ChannelData) {
 /// Fit a least-squares linear model on `records` by batch gradient descent over `epochs`
 /// passes.
 ///
+/// The fit of a learning task that answers the linear score itself; a task that answers
+/// through a link of its own is fitted in that task's own space ([`fit_under`]).
+pub fn fit(records: &[Record], epochs: usize) -> LinearModel {
+    fit_under(records, epochs, ObjectiveLink::Identity)
+}
+
+/// Fit a linear model on `records` by batch gradient descent over `epochs` passes, answering
+/// through `link`.
+///
 /// The features are standardised for the descent — each column by its own mean and standard
 /// deviation, so one step is comparable across columns whatever units they carry — and the
 /// fitted weights are returned in the CALLER's scale, so the model predicts from the data as
 /// it was given. A column that does not vary has no scale to divide by and takes no part.
-pub fn fit(records: &[Record], epochs: usize) -> LinearModel {
+///
+/// The descent is over the task the model ANSWERS, in the space where its step is bounded by
+/// the caller's own data:
+///
+/// * a link whose output is BOUNDED — the logistic one, whose value lies in the unit interval
+///   — is fitted by the canonical gradient of its own loss, the difference between the value
+///   it answers for a record and that record's target, which can never exceed the width of
+///   that interval. So a probability task is fitted as a probability task rather than fitted
+///   as a line and squashed afterwards.
+/// * every other link is fitted by least squares on the target taken BACK through the link
+///   ([`super::ObjectiveLink::margin_of`]), which for the identity link is the target itself
+///   and for a growing one is the target in the score's own space. The residual is then a
+///   difference between numbers the caller's data states, so a link that grows with the score
+///   cannot grow the step with it.
+///
+/// Either way the value served for a record is the link applied to the fitted score, so it
+/// lies in the range the task's output is defined on.
+pub fn fit_under(records: &[Record], epochs: usize, link: ObjectiveLink) -> LinearModel {
     let columns = records.first().map_or(0, |record| record.features.len());
     let count = records.len().max(1) as f64;
     // The column sums and the squared deviations are accumulated by WALKING each record, so
@@ -1224,22 +1271,36 @@ pub fn fit(records: &[Record], epochs: usize) -> LinearModel {
         let mut gradient = vec![0.0_f64; columns];
         let mut bias_gradient = 0.0_f64;
         for (row, record) in standardised.iter().zip(records) {
-            let predicted = intercept
+            let score = intercept
                 + weights
                     .iter()
                     .zip(row)
                     .map(|(weight, value)| weight * value)
                     .sum::<f64>();
-            let error = predicted - record.target;
+            let error = match link {
+                ObjectiveLink::Logistic => link.apply(score) - record.target,
+                _ => score - link.margin_of(record.target),
+            };
             bias_gradient += error;
             for (slot, value) in gradient.iter_mut().zip(row) {
                 *slot += error * value;
             }
         }
-        intercept -= LEARNING_RATE * bias_gradient / count;
-        for (weight, slot) in weights.iter_mut().zip(&gradient) {
-            *weight -= LEARNING_RATE * slot / count;
+        // A pass whose step leaves the numbers a model can carry is not taken: the descent
+        // stops at the last pass that was finite, so the model served is one fitted on the
+        // caller's data rather than one carrying values no prediction can be computed from.
+        // Only a link that grows without bound can reach this at all.
+        let stepped_intercept = intercept - LEARNING_RATE * bias_gradient / count;
+        let stepped: Vec<f64> = weights
+            .iter()
+            .zip(&gradient)
+            .map(|(weight, slot)| weight - LEARNING_RATE * slot / count)
+            .collect();
+        if !stepped_intercept.is_finite() || stepped.iter().any(|weight| !weight.is_finite()) {
+            break;
         }
+        intercept = stepped_intercept;
+        weights = stepped;
     }
 
     // Back to the caller's own scale: `w·(x - m)/s + b` is `(w/s)·x + (b - Σ w·m/s)`.
@@ -1257,6 +1318,7 @@ pub fn fit(records: &[Record], epochs: usize) -> LinearModel {
         intercept: offset,
         weights: scaled,
         epochs,
+        link,
     }
 }
 
@@ -1279,10 +1341,13 @@ fn model_document(
         "hyperParameters": request.hyper_parameters.clone().unwrap_or_default(),
         "model": {
             "type": "linear",
-            "inference": "prediction = intercept + sum(weights[i] * feature[i])",
+            "inference": "prediction = link(intercept + sum(weights[i] * feature[i]))",
             "intercept": model.intercept,
             "weights": model.weights,
             "epochs": model.epochs,
+            // The function the learning task answers its score through, so whatever serves
+            // this artifact answers in the same space the fit measured in.
+            "link": model.link.label(),
         },
         "channels": channels
             .iter()
@@ -1401,6 +1466,13 @@ fn fitted_model_in(document: ::serde_json::Value) -> Option<LinearModel> {
             .get("epochs")
             .and_then(::serde_json::Value::as_u64)
             .unwrap_or(0) as usize,
+        // A document that states no link states a model answering its own score, which is
+        // what an artifact written before the link was recorded carries.
+        link: model
+            .get("link")
+            .and_then(::serde_json::Value::as_str)
+            .and_then(ObjectiveLink::named)
+            .unwrap_or(ObjectiveLink::Identity),
     })
 }
 

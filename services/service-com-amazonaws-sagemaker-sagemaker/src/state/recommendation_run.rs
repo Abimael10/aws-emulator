@@ -503,6 +503,7 @@ mod tests {
             intercept: 1.0,
             weights: (0..features).map(|index| index as f64).collect(),
             epochs: 1,
+            link: ObjectiveLink::Identity,
         }))
     }
 

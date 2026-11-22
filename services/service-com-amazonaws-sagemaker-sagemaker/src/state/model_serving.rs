@@ -240,6 +240,41 @@ pub fn endpoint_serving_variants(
         .collect()
 }
 
+/// Every Amazon S3 location a model's containers hold their model data at, in the order the
+/// model carries them: the primary container's first, then each of the inference pipeline's.
+///
+/// A container holds its model data at `ModelDataUrl` ("the S3 path where the model artifacts
+/// … are stored") or at `ModelDataSource.S3DataSource.S3Uri` ("specifies the S3 path of ML
+/// model data to deploy"), and a data source may carry a manifest naming where the artifacts
+/// are listed (`ManifestS3Uri`) — each of them a location a deployment of the model DOWNLOADS,
+/// so each is a location a create that resolves the model data settles. A container that names
+/// none holds no model data, which the model's own image may well supply, so it contributes
+/// nothing to settle.
+///
+/// The ONE reading of where a model's model data is, so `CreateModel`'s synchronous resolution
+/// and the deployment's own cannot disagree about which locations a model needs.
+#[must_use]
+pub fn model_data_locations(
+    primary: Option<&ContainerDefinition>,
+    containers: Option<&[ContainerDefinition]>,
+) -> Vec<String> {
+    primary
+        .into_iter()
+        .chain(containers.unwrap_or_default())
+        .flat_map(|container| {
+            let source = container.model_data_source.as_ref();
+            let s3_source = source.and_then(|source| source.s3_data_source.as_ref());
+            [
+                container.model_data_url.clone(),
+                s3_source.map(|source| source.s3_uri.clone()),
+                s3_source.and_then(|source| source.manifest_s3_uri.clone()),
+            ]
+        })
+        .flatten()
+        .filter(|uri| !uri.is_empty())
+        .collect()
+}
+
 /// Where a model's artifacts are: its primary container's `ModelDataUrl`, and otherwise the
 /// first of its inference containers that names one.
 ///

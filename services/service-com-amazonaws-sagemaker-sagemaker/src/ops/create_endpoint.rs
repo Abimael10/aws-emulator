@@ -3,9 +3,11 @@
 //! @op CreateEndpoint
 //! IMPLEMENTED: looks the endpoint configuration up in `crate::state`, refuses a
 //! deployment past the account's hosting quota for an instance type its variants name,
-//! snapshots its variants as `ProductionVariantSummary`s and stores the endpoint in
-//! `Creating`, with the instant the clock owes it `InService`. This is the ONLY file to
-//! touch for this operation.
+//! resolves the model data its variants' models name against Amazon S3 as each model's
+//! execution role, snapshots its variants as `ProductionVariantSummary`s and stores the
+//! endpoint in `Creating`, with the instant the clock owes it its outcome — `InService`, or
+//! `Failed` with the `FailureReason` naming the model data that could not be downloaded.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -185,77 +187,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(&region, "endpoint", &input.endpoint_name);
 
+        // What the deployment would stand up, read under the guard and taken out by value:
+        // the fleet's variants, the images they deploy and the model artifacts the fleet has
+        // to download. The download itself is an Amazon S3 call, so it is made with NO guard
+        // held, which is why the plan is snapshotted here.
+        let planned = {
+            let store = state.lock();
+            // The store is bounded, so a caller varying `EndpointName` cannot grow it without
+            // end. `ResourceLimitExceeded` is the limit failure this operation models.
+            if !store.endpoints_below_quota() {
+                return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for endpoints is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::ENDPOINT_QUOTA,
+                        store.endpoints.len()
+                    )),
+                })
+                .into());
+            }
+            if store.endpoints.contains_key(&input.endpoint_name) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Cannot create already existing endpoint \"{arn}\"."
+                )));
+            }
+
+            let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::could_not_find(
+                        crate::state::ENDPOINT_CONFIG_KIND_LABEL,
+                        &input.endpoint_config_name,
+                    ),
+                ));
+            };
+
+            // Launching the endpoint takes ML instances of the types its variants name, and an
+            // account may only hold as many of one type as its hosting quota for that type
+            // allows — zero, for a generation it has been granted no capacity on. A deployment
+            // past a quota is refused with the limit failure this operation models, and nothing
+            // is created: the request is evaluated before the endpoint is stored.
+            let demand = crate::state::instance_demand(
+                config
+                    .production_variants
+                    .iter()
+                    .chain(config.shadow_production_variants.iter().flatten()),
+            );
+            if let Some(message) = store.hosting_quota_exceeded(&demand) {
+                return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                    message: Some(message),
+                })
+                .into());
+            }
+
+            // The endpoint snapshots the configuration it was created from, the way the real
+            // service does: a later CreateEndpointConfig does not retroactively change it. The
+            // images each variant deploys are snapshotted with it, from the model the variant
+            // hosts as that model was registered (`crate::state::deployed_variant_images`).
+            let production_images =
+                crate::state::deployed_variant_images(&config.production_variants, &store.models);
+            let shadow_images = config
+                .shadow_production_variants
+                .as_deref()
+                .map(|variants| crate::state::deployed_variant_images(variants, &store.models))
+                .unwrap_or_default();
+            // Every model artifact this fleet has to download to come up — the production
+            // variants' and the shadow variants', since both stand up a model.
+            let artifacts = crate::state::deployed_model_artifacts(
+                &store,
+                config
+                    .production_variants
+                    .iter()
+                    .chain(config.shadow_production_variants.iter().flatten()),
+            );
+            PlannedEndpoint {
+                production_variants: crate::state::variant_summaries(
+                    &config.production_variants,
+                    &production_images,
+                ),
+                shadow_production_variants: config
+                    .shadow_production_variants
+                    .as_deref()
+                    .map(|variants| crate::state::variant_summaries(variants, &shadow_images))
+                    .unwrap_or_default(),
+                data_capture_config: config.data_capture_config.clone(),
+                async_inference_config: config.async_inference_config.clone(),
+                explainer_config: config.explainer_config.clone(),
+                metrics_config: config.metrics_config.clone(),
+                demand,
+                artifacts,
+            }
+        };
+
+        // "If any of the models hosted at this endpoint get model data from an Amazon S3
+        // location, SageMaker uses Amazon Web Services Security Token Service to download
+        // model artifacts from the S3 path you provided": the download is part of bringing
+        // the endpoint up, so a location that holds no object or one the model's role may not
+        // read is a fleet that never serves. The call is ACCEPTED either way — the endpoint
+        // reports `Creating` and then the outcome the clock owes it — and this is what that
+        // outcome is (see `crate::state::model_data_deployment_failure`). Awaited with no
+        // store guard held.
+        let deployment_failure = crate::state::model_data_deployment_failure(
+            ctx,
+            &region,
+            &planned.artifacts,
+        )
+        .await;
+
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The store is bounded, so a caller varying `EndpointName` cannot grow it without
-        // end. `ResourceLimitExceeded` is the limit failure this operation models.
-        if !store.endpoints_below_quota() {
-            return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
-                message: Some(format!(
-                    "The account-level service limit for endpoints is {}, with current \
-                     utilization of {} and a request delta of 1.",
-                    crate::state::ENDPOINT_QUOTA,
-                    store.endpoints.len()
-                )),
-            })
-            .into());
-        }
         if store.endpoints.contains_key(&input.endpoint_name) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "Cannot create already existing endpoint \"{arn}\"."
             )));
         }
-
-        let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::could_not_find(
-                    crate::state::ENDPOINT_CONFIG_KIND_LABEL,
-                    &input.endpoint_config_name,
-                ),
-            ));
-        };
-
-        // Launching the endpoint takes ML instances of the types its variants name, and an
-        // account may only hold as many of one type as its hosting quota for that type
-        // allows — zero, for a generation it has been granted no capacity on. A deployment
-        // past a quota is refused with the limit failure this operation models, and nothing
-        // is created: the request is evaluated before the endpoint is stored.
-        let demand = crate::state::instance_demand(
-            config
-                .production_variants
-                .iter()
-                .chain(config.shadow_production_variants.iter().flatten()),
-        );
-        if let Some(message) = store.hosting_quota_exceeded(&demand) {
-            return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
-                message: Some(message),
-            })
-            .into());
-        }
-
-        // The endpoint snapshots the configuration it was created from, the way the real
-        // service does: a later CreateEndpointConfig does not retroactively change it. The
-        // images each variant deploys are snapshotted with it, from the model the variant
-        // hosts as that model was registered (`crate::state::deployed_variant_images`).
-        let production_images =
-            crate::state::deployed_variant_images(&config.production_variants, &store.models);
-        let shadow_images = config
-            .shadow_production_variants
-            .as_deref()
-            .map(|variants| crate::state::deployed_variant_images(variants, &store.models))
-            .unwrap_or_default();
-        let production_variants =
-            crate::state::variant_summaries(&config.production_variants, &production_images);
-        let shadow_production_variants = config
-            .shadow_production_variants
-            .as_deref()
-            .map(|variants| crate::state::variant_summaries(variants, &shadow_images))
-            .unwrap_or_default();
-        let data_capture_config = config.data_capture_config.clone();
-        let async_inference_config = config.async_inference_config.clone();
-        let explainer_config = config.explainer_config.clone();
-        let metrics_config = config.metrics_config.clone();
-
-        let now = ::std::time::SystemTime::now();
         store.endpoints.insert(
             input.endpoint_name.clone(),
             crate::state::Endpoint {
@@ -264,21 +308,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 config_name: input.endpoint_config_name.clone(),
                 status: crate::state::STATUS_CREATING.to_string(),
                 failure_reason: None,
-                production_variants,
-                shadow_production_variants,
-                data_capture_config,
-                async_inference_config,
-                explainer_config,
-                metrics_config,
+                production_variants: planned.production_variants,
+                shadow_production_variants: planned.shadow_production_variants,
+                data_capture_config: planned.data_capture_config,
+                async_inference_config: planned.async_inference_config,
+                explainer_config: planned.explainer_config,
+                metrics_config: planned.metrics_config,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 last_modified_time: now,
                 in_service_at: now + crate::state::ENDPOINT_IN_SERVICE_AFTER,
-                instance_usage: demand,
+                instance_usage: planned.demand,
                 // Nothing is being deployed over this endpoint and it was given no
                 // deployment configuration: a create takes none.
                 pending_update: None,
                 last_deployment_config: None,
+                deployment_failure,
+                deployment_artifacts: planned.artifacts,
             },
         );
         drop(store);
@@ -286,4 +332,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateEndpointOutput { endpoint_arn: arn })
     }
+}
+
+/// What the create resolved under the store's guard about the fleet it is about to stand up,
+/// taken out by value so the model-data download that follows holds no guard.
+struct PlannedEndpoint {
+    production_variants: Vec<ProductionVariantSummary>,
+    shadow_production_variants: Vec<ProductionVariantSummary>,
+    data_capture_config: Option<DataCaptureConfig>,
+    async_inference_config: Option<AsyncInferenceConfig>,
+    explainer_config: Option<ExplainerConfig>,
+    metrics_config: Option<MetricsConfig>,
+    /// How many instances of each ML instance type the fleet holds.
+    demand: ::std::collections::BTreeMap<String, i64>,
+    /// The model artifacts the fleet has to download to come up.
+    artifacts: Vec<crate::state::DeployedArtifact>,
 }

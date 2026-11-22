@@ -115,6 +115,26 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
     )
 }
 
+/// How a DEPLOYMENT reports model data it could not download: the download that failed, the
+/// location it was attempted on AS THE MODEL NAMES IT, and the two things that have to hold
+/// for it to succeed — an object at that URL, and a role that may read it.
+///
+/// A different surface from the creates above, and so a different sentence: those REFUSE a
+/// call, while this travels on the endpoint as its `FailureReason` once the fleet it was
+/// standing up could not come up ("If any of the models hosted at this endpoint get model data
+/// from an Amazon S3 location, SageMaker uses Amazon Web Services Security Token Service to
+/// download model artifacts from the S3 path you provided", `CreateEndpoint`). One sentence
+/// for the whole condition, because it names both of the things that can make the download
+/// fail and the deployment reports the download rather than which of them it was.
+#[must_use]
+pub fn failed_to_download_model_data(s3_url: &str) -> String {
+    format!(
+        "Failed to download data. Cannot download {s3_url}. Please ensure that there is an \
+         object located at the URL and that the role passed to CreateModel has permissions to \
+         access the object."
+    )
+}
+
 /// How a create whose resource's work would READ an Amazon S3 location words one that holds
 /// no object at all: the location AS THE CALLER SENT IT, and the two facts that make it name
 /// nothing — there is no such location, or there is nothing under it.
