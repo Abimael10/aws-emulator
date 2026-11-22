@@ -85,7 +85,7 @@ contents — read that shape in the model above when you need its own members.
 
 ## CreateView
 
-- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9_-]{0,250}$, required), `definition` (string, len 1..10000, required), `description` (string, len ..1024), `tags` (map<string,string>, len ..50), `clientToken` (string, @idempotencyToken)
+- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9._-]{0,250}$, required), `definition` (string, len 1..10000, required), `description` (string, len ..1024), `tags` (map<string,string>, len ..50), `clientToken` (string, @idempotencyToken)
 - **Output:** `name` (string, required), `type` (ViewType, one of: MANAGED | USER, required), `description` (string), `definition` (string, required), `createdAt` (timestamp, required), `updatedAt` (timestamp, required), `arn` (string, required)
 - **Errors:** `AccessDeniedException (HTTP 403)`, `ConflictException (HTTP 409)`, `InternalServerException (HTTP 500)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 
@@ -155,7 +155,7 @@ contents — read that shape in the model above when you need its own members.
 ## DeleteView
 
 - **Traits:** @idempotent
-- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9_-]{0,250}$, required)
+- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9._-]{0,250}$, required)
 - **Output:** (no members)
 - **Errors:** `AccessDeniedException (HTTP 403)`, `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 
@@ -252,7 +252,7 @@ contents — read that shape in the model above when you need its own members.
 ## GetView
 
 - **Traits:** @readonly
-- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9_-]{0,250}$, required)
+- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9._-]{0,250}$, required)
 - **Output:** `name` (string, required), `type` (ViewType, one of: MANAGED | USER, required), `description` (string), `definition` (string, required), `createdAt` (timestamp, required), `updatedAt` (timestamp, required), `arn` (string, required)
 - **Errors:** `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 
@@ -432,6 +432,6 @@ contents — read that shape in the model above when you need its own members.
 ## UpdateView
 
 - **Traits:** @idempotent
-- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9_-]{0,250}$, required), `definition` (string, len 1..10000), `description` (string, len ..1024)
+- **Input:** `name` (string, len 6..256, pattern ^view\.[a-z0-9][a-z0-9._-]{0,250}$, required), `definition` (string, len 1..10000), `description` (string, len ..1024)
 - **Output:** `name` (string, required), `type` (ViewType, one of: MANAGED | USER, required), `description` (string), `definition` (string, required), `createdAt` (timestamp, required), `updatedAt` (timestamp, required), `arn` (string, required)
 - **Errors:** `AccessDeniedException (HTTP 403)`, `ConflictException (HTTP 409)`, `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`

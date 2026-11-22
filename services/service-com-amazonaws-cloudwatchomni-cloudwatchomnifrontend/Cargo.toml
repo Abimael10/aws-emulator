@@ -58,6 +58,9 @@ automod = { workspace = true }
 hex = { workspace = true }
 # Decodes the rpcv2Cbor error envelope a test reads a refusal's message out of.
 aws-smithy-cbor = "0.62.2"
+# `regex`: compiles the expression a constraint-violation message advertises, so a suite can
+# check it decides the same values the front door does — see `tests/all/view_name_rule.rs`.
+regex = "1.13"
 
 [lints]
 workspace = true

@@ -12049,6 +12049,7 @@ dependencies = [
  "hex",
  "html-escape",
  "http",
+ "regex",
  "serde_json",
  "service-com-amazonaws-identitystore-awsidentitystore",
  "service-common",
