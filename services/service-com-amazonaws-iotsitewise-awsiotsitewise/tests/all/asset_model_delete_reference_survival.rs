@@ -21,10 +21,16 @@
 //! The rows differ along what the rule generalises over: how many other models
 //! name the subject (none, one, two), whether the naming model holds hierarchies
 //! besides the one that names it, whether the subject is itself the parent of a
-//! further model, and which spelling the reference and the delete address the
-//! subject by (its id, or its `externalId:` alias). The rows where NOTHING names
-//! the subject sit beside them, so the suite cannot pass by holding every delete
-//! back.
+//! further model, what the subject's own definition carries (a composite model
+//! among it, so the composite projection is part of what survives), and which
+//! spelling the reference and the delete address the subject by (its id, or its
+//! `externalId:` alias). The rows where NOTHING names the subject sit beside them,
+//! so the suite cannot pass by holding every delete back.
+//!
+//! What the read serves alongside the body is pinned too: the model keeps answering
+//! its `ETag` response header, which moves with the version the accepted delete
+//! wrote, and the delete that finally converges reports the subject's own
+//! `assetModelId` beside the `DELETING` status.
 //!
 //! `assetModelStatus` and the @required projection come from
 //! `smithy_query(query="operation", operation="DescribeAssetModel")` and
@@ -41,6 +47,7 @@ use crate::asset_lifecycle::{call, error_code, router};
 use crate::asset_model_settle_failures::{
     create, delete, describe, measurement, update, REFERENCED_BY_PARENT, VALIDATION_ERROR,
 };
+use crate::hierarchies_etags_and_refusals::{describe_e_tag, is_modelled_e_tag};
 use crate::support::{named_by_stored_id, settled_asset_model_status};
 
 /// Every member `DescribeAssetModelResponse` marks @required, from
@@ -63,13 +70,15 @@ const REQUIRED_PROJECTION: [&str; 9] = [
 /// read back as they were. `assetModelStatus` is what the delete settles, and
 /// `assetModelVersion` is what the accepted write advances — both are asserted on
 /// their own below.
-const UNCHANGED_BY_A_HELD_BACK_DELETE: [&str; 7] = [
+const UNCHANGED_BY_A_HELD_BACK_DELETE: [&str; 9] = [
     "assetModelId",
     "assetModelArn",
     "assetModelName",
     "assetModelDescription",
     "assetModelProperties",
     "assetModelHierarchies",
+    "assetModelCompositeModels",
+    "assetModelCompositeModelSummaries",
     "assetModelCreationDate",
 ];
 
@@ -203,6 +212,10 @@ enum Shape {
     /// The holder names the subject by its `externalId:` alias, and the delete
     /// addresses the subject the same way.
     ReferencedByExternalId,
+    /// One other model names the subject, which carries a composite model of its
+    /// own: the composite definitions and the summaries derived from them are part
+    /// of the projection the held-back delete leaves untouched.
+    WithCompositeModel,
 }
 
 /// A model whose hierarchy names the subject, and the hierarchies it keeps once
@@ -260,6 +273,16 @@ async fn build(router: &MultiServiceRouter, case: &str, shape: Shape) -> Subject
     });
     if let Some(external_id) = external_id {
         subject_body["assetModelExternalId"] = json!(external_id);
+    }
+    // A composite model on the subject, so `assetModelCompositeModels` and the
+    // `assetModelCompositeModelSummaries` derived from it are both non-empty in the
+    // projection the held-back delete has to leave as it was.
+    if matches!(shape, Shape::WithCompositeModel) {
+        subject_body["assetModelCompositeModels"] = json!([{
+            "name": "Vibration",
+            "type": "CUSTOM",
+            "properties": [measurement("Amplitude")],
+        }]);
     }
     let id = created(router, case, subject_body).await;
     settled_active(router, case, &id).await;
@@ -362,6 +385,14 @@ async fn delete_is_held_back_until_the_last_reference_goes(
     // The version the subject carries going into each delete: every accepted
     // write advances it by one, and the held-back delete is one of them.
     let mut version = version_of(case, &before);
+    // The entity tag the read serves beside the body. It is derived from the stored
+    // definition and the version, so an accepted write moves it — and a model the
+    // delete left in state still has one to serve.
+    let mut tag = describe_e_tag(router, &subject.label).await;
+    assert!(
+        is_modelled_e_tag(&tag),
+        "case {case:?}: expected a modelled ETag before the delete, got {tag:?}"
+    );
 
     for (dropped, holder) in subject.holders.iter().enumerate() {
         let left = subject.holders.len() - dropped;
@@ -443,6 +474,19 @@ async fn delete_is_held_back_until_the_last_reference_goes(
              got {active_version} in {active}"
         );
         let summary = listed(router, case, &subject.id).await;
+        // The surviving model still answers its ETag header, moved with the version
+        // the accepted delete wrote.
+        let now_tag = describe_e_tag(router, &subject.label).await;
+        assert!(
+            is_modelled_e_tag(&now_tag),
+            "{step}: the surviving model must still serve a modelled ETag, got {now_tag:?}"
+        );
+        assert_ne!(
+            now_tag, tag,
+            "{step}: the accepted delete must advance the ETag, both {tag:?}"
+        );
+        tag = now_tag;
+
         let summary = summary
             .unwrap_or_else(|| panic!("{step}: the surviving model is absent from the listing"));
         assert_eq!(
@@ -467,6 +511,11 @@ async fn delete_is_held_back_until_the_last_reference_goes(
         answered["assetModelStatus"]["state"].as_str(),
         Some("DELETING"),
         "case {case:?}: the accepted delete reports DELETING, got {answered}"
+    );
+    assert_eq!(
+        answered["assetModelId"].as_str(),
+        Some(subject.id.as_str()),
+        "case {case:?}: the converged delete names the subject, got {answered}"
     );
     let (status, gone) = describe(router, &subject.label).await;
     assert_eq!(
@@ -512,6 +561,10 @@ async fn a_delete_a_hierarchy_reference_holds_back_leaves_the_model_served_uncha
         (
             "the reference and the delete spell the subject by its external id",
             Shape::ReferencedByExternalId,
+        ),
+        (
+            "the named subject carries a composite model",
+            Shape::WithCompositeModel,
         ),
     ];
 
