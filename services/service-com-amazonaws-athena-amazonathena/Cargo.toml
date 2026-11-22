@@ -121,6 +121,13 @@ uuid = { version = "1", features = ["v4"] }
 # query settling without polling Athena. Only the generated client is needed — the emulator
 # supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The CloudWatch metric store a query's own metrics are published into: a workgroup whose
+# configuration enables Amazon CloudWatch metrics publishes the query metric family for every
+# query that ran in it (`state::query_metrics`), and those series have ONE home — the store
+# `GetMetricStatistics`, `GetMetricData` and `ListMetrics` read. Reached through that
+# service's own state accessor rather than over `PutMetricData`, which refuses a publish into
+# a namespace the services own.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # Renders the authenticated bytes of a page token, and a binary result value, as hex.
 hex = { workspace = true }
 smithy-macros = { workspace = true }

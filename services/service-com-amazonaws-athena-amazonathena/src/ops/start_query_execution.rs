@@ -571,6 +571,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 });
 
+            // WHETHER THIS QUERY IS METERED is decided HERE, by the configuration in force
+            // over its workgroup at the instant it is submitted: the metrics a workgroup
+            // publishes are the ones of the queries run in it while they are enabled, so a
+            // query submitted while they are off is not metered by an update that turns them
+            // on afterwards, and one submitted while they are on is still metered by the time
+            // it completes (see `crate::state::query_metrics`).
+            let publishes_metrics = store.work_group_publishes_metrics(&work_group);
+
             // The completion is due a span after the submit; `complete_query_execution`
             // moves it out if the engine was still running then, so a query is reported
             // complete because its work is over and not because a span elapsed.
@@ -612,6 +620,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `crate::state::query_events`).
                 published_state: None,
                 published_events: 0,
+                // Nothing has been metered for this query either: its own metric family is
+                // published once it reaches a terminal state, and only where the switch read
+                // above has it metered (see `crate::state::query_metrics`).
+                publishes_metrics,
+                metrics_published: false,
             };
             store.record_query_execution(record, input.client_request_token);
 

@@ -368,6 +368,11 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// What the clock pump waits for next, or `None` — having RELEASED its claim — when this
     /// store owes nothing more.
     ///
+    /// Two things are owed at an instant: the next transition to publish, and the next
+    /// query's own metrics ([`query_metrics`]) where there is a store to publish them into —
+    /// `metering` says whether there is. The pump waits for the earlier of them, so a query
+    /// whose transitions are all published is still kept up with until its metrics are.
+    ///
     /// Observing "nothing is owed" and standing down happen in ONE critical section, which is
     /// what makes the hand-over race-free: the call that starts a query stores it (and so its
     /// due instants) under this same lock BEFORE it tries to claim the pump, so either this
@@ -377,8 +382,15 @@ impl ComAmazonawsAthenaAmazonathenaState {
         &mut self,
         now: SystemTime,
         generation: u64,
+        metering: bool,
     ) -> Option<SystemTime> {
-        match self.next_query_event_due_at(now) {
+        let metrics_due = metering.then(|| self.next_query_metric_due_at()).flatten();
+        match self
+            .next_query_event_due_at(now)
+            .into_iter()
+            .chain(metrics_due)
+            .min()
+        {
             Some(due) => Some(due),
             None => {
                 self.release_query_clock_pump(generation);
@@ -440,8 +452,9 @@ impl ComAmazonawsAthenaAmazonathenaState {
     }
 }
 
-/// Publish every query-execution transition this call observed, and keep this store's clock
-/// pump running for the transitions still to fall due.
+/// Publish every query-execution transition this call observed and the metrics every query it
+/// observed COMPLETE owes, and keep this store's clock pump running for the transitions and
+/// the metrics still to fall due.
 ///
 /// The ONE call an operation makes: `engine` is the handler's own `self.engine`, and the
 /// Region the publication is addressed to is the Region the call was signed for
@@ -450,7 +463,9 @@ impl ComAmazonawsAthenaAmazonathenaState {
 /// Called by the operations that report a query's state, AFTER they have released this
 /// service's store: a publication reaches EventBridge's own handler, which matches the event
 /// against the account's rules and delivers it to their targets, so holding this store across
-/// it would serialise every other Athena call behind that fan-out.
+/// it would serialise every other Athena call behind that fan-out. The metrics go into
+/// CloudWatch's own store beside it ([`query_metrics`]), which this service's store is not
+/// held across either.
 pub async fn announce_query_state_changes<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -459,9 +474,13 @@ pub async fn announce_query_state_changes<Eng: Send + Sync + 'static>(
         return;
     };
     let region = authorization::region_from_request(ctx.parts());
-    // What the publication ANSWERED matters only to the pump, which paces itself by it.
+    // The store a query's own metrics are published into, taken once: `None` is an emulator
+    // with no CloudWatch mounted, which has nowhere to publish them.
+    let cloudwatch = query_metrics::cloudwatch_state(&**engine);
+    // What the publications ANSWERED matters only to the pump, which paces itself by it.
     publish_due(&state, ctx.callback(), &region).await;
-    drive_query_clock(&state, ctx.callback(), &region);
+    query_metrics::publish_due_query_metrics(&state, cloudwatch.as_ref());
+    drive_query_clock(&state, ctx.callback(), &region, cloudwatch);
 }
 
 /// Record and publish what this store owes at this instant, with no lock held across the
@@ -532,13 +551,13 @@ async fn publish(
 }
 
 /// Start the one in-process task that waits for the instants this store's queries owe their
-/// next state at, and publishes what is then due — so no request ever has to be the one that
-/// asks.
+/// next state and their own metrics at, and publishes what is then due — so no request ever
+/// has to be the one that asks.
 ///
 /// A client that keys off these events to react to a query completing makes no further
-/// Athena call, so a transition published only by the next reader would never be published at
-/// all. The pump publishes exactly what [`announce_query_state_changes`] publishes and
-/// decides nothing about WHEN a query moves.
+/// Athena call, and so does one that watches the workgroup's metrics, so what is published
+/// only by the next reader would never be published at all. The pump publishes exactly what
+/// [`announce_query_state_changes`] publishes and decides nothing about WHEN a query moves.
 ///
 /// At most one pump runs per store (the store carries the claim), it is bounded by
 /// [`MAX_CLOCK_WAKE_UPS`] wake-ups, and it stands down as soon as the store owes nothing.
@@ -548,6 +567,7 @@ fn drive_query_clock(
     state: &::engine::ServiceState<ComAmazonawsAthenaAmazonathenaState>,
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
+    cloudwatch: Option<::engine::ServiceState<query_metrics::CloudWatchState>>,
 ) {
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
@@ -570,9 +590,11 @@ fn drive_query_clock(
         let mut floor = MIN_CLOCK_WAIT;
         for _ in 0..MAX_CLOCK_WAKE_UPS {
             let now = SystemTime::now();
-            let due = pumped
-                .lock()
-                .next_query_event_due_or_release_pump(now, generation);
+            let due = pumped.lock().next_query_event_due_or_release_pump(
+                now,
+                generation,
+                cloudwatch.is_some(),
+            );
             let Some(due) = due else {
                 capped = false;
                 break;
@@ -585,7 +607,13 @@ fn drive_query_clock(
                 .unwrap_or_default()
                 .clamp(floor, MAX_CLOCK_WAIT);
             ::tokio::time::sleep(wait).await;
-            floor = match publish_due(&pumped, &callback, &region).await {
+            // Both publications are made, whichever of them failed: they are owed
+            // independently, and the floor below is what paces a pump whose work is not
+            // getting through.
+            let announced = publish_due(&pumped, &callback, &region).await;
+            let metered =
+                query_metrics::publish_due_query_metrics(&pumped, cloudwatch.as_ref());
+            floor = match announced && metered {
                 true => MIN_CLOCK_WAIT,
                 false => MAX_CLOCK_WAIT,
             };

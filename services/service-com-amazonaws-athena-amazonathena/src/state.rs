@@ -40,7 +40,11 @@
 //!
 //! A query execution is also ANNOUNCED as it moves: every state it reaches is published
 //! onto the account's default EventBridge bus ([`query_events`]), so a client that keys off
-//! those events observes the query settling without calling Athena again.
+//! those events observes the query settling without calling Athena again. And it is
+//! METERED: a query that ran in a workgroup whose configuration enables Amazon CloudWatch
+//! metrics publishes, once it is terminal, the query metric family CloudWatch reports for
+//! that workgroup ([`query_metrics`]), read off the very statistics the execution itself
+//! reports.
 //!
 //! NOTEBOOKS are kept in the [`NotebookRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::notebooks`]: `ImportNotebook` stores the ipynb
@@ -133,6 +137,10 @@ mod runtime_statistics;
 /// The EventBridge events every state a query execution moves into is published as.
 mod query_events;
 pub use query_events::*;
+
+/// The CloudWatch metrics a metrics-enabled workgroup publishes about the queries it ran.
+mod query_metrics;
+pub use query_metrics::*;
 
 /// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
 mod notebooks;
@@ -1594,6 +1602,17 @@ pub struct QueryExecutionRecord {
     /// How many state-change events have been published for this query, which is the
     /// `sequenceNumber` the last of them carried ([`query_events`]).
     pub(crate) published_events: u32,
+    /// Whether this query is METERED: whether Amazon CloudWatch metrics were enabled for its
+    /// workgroup at the instant it was submitted, which is what decides whether it publishes
+    /// the query metric family at all ([`query_metrics`]). Stored rather than derived, so a
+    /// later update of the workgroup's switch neither meters a query that ran while they were
+    /// off nor withholds the metrics of one that ran while they were on.
+    pub(crate) publishes_metrics: bool,
+    /// Whether the CloudWatch metrics this query publishes have been published yet. Read and
+    /// written by the metric path alone ([`query_metrics`]), which is what keeps a terminal
+    /// query's own metric family published exactly once; nothing a read reports is derived
+    /// from it.
+    pub(crate) metrics_published: bool,
 }
 
 impl QueryExecutionRecord {
