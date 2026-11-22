@@ -27,6 +27,14 @@
 //! (nothing here records which queue each message came from), and a `SourceArn` that is
 //! not a queue ARN at all.
 //!
+//! ## The permissions a move needs
+//!
+//! A move is a composite of what the task DOES, so it needs a grant for each of them: this
+//! operation's own action on the source queue, the receive and delete of the messages it
+//! takes out of that queue, and the send that delivers them into the destination queue. A
+//! caller holding only part of that is refused with no task recorded, and the refusal names
+//! the action and the queue whose grant was missing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -286,19 +294,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Whether this caller may move the source queue's messages is decided against
-        // that queue's own policy and the caller's identity-based policies, before any
-        // task is recorded.
+        // A move is not one permission but a composite of what the task DOES, and this is
+        // its source-queue leg: the caller has to be allowed to start the task on that queue
+        // and to take its messages — the receive and the delete the task performs there — all
+        // decided against that queue's own policy and the caller's identity-based policies,
+        // in the order the task performs them, before any task is recorded.
         let (queue_arn, policy) = {
             let queue = state
                 .queue(&region, &source_name)
                 .expect("the queue was resolved out of this same store");
             (queue.arn.clone(), queue.policy().map(str::to_string))
         };
-        if let Some(denied) = sqs::authorization::denied(
+        if let Some(denied) = sqs::authorization::denied_under_all(
             &*self.engine,
             ctx,
-            Self::NAME,
+            sqs::authorization::MESSAGE_MOVE_SOURCE_ACTIONS,
             &queue_arn,
             policy.as_deref(),
         ) {
@@ -361,6 +371,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(Scaffolded::invalid_parameter_value(
                 sqs::SAME_SOURCE_AND_DESTINATION,
             ));
+        }
+        // The destination-queue leg of the same composite grant: the task delivers the
+        // source queue's messages into the destination queue, so a caller that may not send
+        // to that queue may not start the task — decided against the DESTINATION queue's own
+        // policy and the caller's identity-based policies, with the refusal naming that
+        // queue's ARN, so the caller is told which side it lacked. Whichever way the
+        // destination was resolved, it is the queue the messages are written to, so the
+        // blank-destination form is charged the same way.
+        let (destination_arn, destination_policy) = {
+            let destination = state.queue(&region, &destination_name).ok_or_else(|| {
+                StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("DestinationArn"),
+                )
+            })?;
+            (
+                destination.arn.clone(),
+                destination.policy().map(str::to_string),
+            )
+        };
+        if let Some(denied) = sqs::authorization::denied_under_all(
+            &*self.engine,
+            ctx,
+            sqs::authorization::MESSAGE_MOVE_DESTINATION_ACTIONS,
+            &destination_arn,
+            destination_policy.as_deref(),
+        ) {
+            return Err(denied);
         }
         // A move hands the source queue's messages to the destination queue as they are, so
         // the two have to be the same KIND of queue: a FIFO queue's messages carry the group

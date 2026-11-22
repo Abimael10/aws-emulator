@@ -35,6 +35,11 @@
 //! identity-based policies did allow the call, and those policies where nothing allowed it
 //! at all — and the operation has no effect.
 //!
+//! A call that acts on SEVERAL queues, or performs several actions on one, is decided once
+//! per (action, queue) pair, each against that queue's own policy: a composite grant is
+//! needed, so a caller holding part of it is refused, and the refusal names the action and
+//! the queue whose grant was missing ([`denied`] and [`denied_under_all`]).
+//!
 //! A statement that names the ACCOUNT rather than the caller (the account's root ARN, or
 //! the bare account id that stands for it) delegates to the account rather than granting:
 //! "you must also attach an identity-based policy" to the principal. So the account
@@ -111,6 +116,17 @@ const BATCH_ACTIONS: &[(&str, &str)] = &[
         "ChangeMessageVisibility",
     ),
 ];
+
+/// The actions a message move task performs on its SOURCE queue, in the order it performs
+/// them: starting the task on that queue, then taking each message out of it — the receive
+/// and the delete the task does on the caller's behalf. A move needs a grant for every one
+/// of them on that queue ([`denied_under_all`]).
+pub const MESSAGE_MOVE_SOURCE_ACTIONS: &[&str] =
+    &["StartMessageMoveTask", "ReceiveMessage", "DeleteMessage"];
+
+/// The actions a message move task performs on its DESTINATION queue: the send that
+/// delivers each moved message into it.
+pub const MESSAGE_MOVE_DESTINATION_ACTIONS: &[&str] = &["SendMessage"];
 
 /// The IAM action an operation of this service is authorized under: `sqs:<ActionName>`,
 /// with a batch operation decided under its single-message sibling's action (see
@@ -359,6 +375,27 @@ pub fn denied<Eng: Send + Sync + 'static, E>(
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
     authorize(engine, ctx, operation, resource, resource_policy)
         .err()
+        .map(crate::scaffolded::Scaffolded::access_denied)
+}
+
+/// The refusal an operation returns for a queue its call acts on under SEVERAL actions, or
+/// `None` when the policies in force permit every one of them.
+///
+/// A call that performs more than one action on a queue needs a grant for each of them, so
+/// the actions are charged in the order the call performs them and the refusal names the
+/// FIRST one the policies in force withhold — the permission the caller has to add.
+///
+/// An empty `operations` states no permission to decide, so there is nothing to refuse.
+pub fn denied_under_all<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operations: &[&str],
+    resource: &str,
+    resource_policy: Option<&str>,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    operations
+        .iter()
+        .find_map(|operation| authorize(engine, ctx, operation, resource, resource_policy).err())
         .map(crate::scaffolded::Scaffolded::access_denied)
 }
 
