@@ -623,6 +623,8 @@ fn statement_error(kind: EngineErrorKind) -> (u16, &'static str) {
     match kind {
         EngineErrorKind::Syntax => (1064, "42000"),
         EngineErrorKind::UndefinedObject => (1146, "42S02"),
+        // `ER_TABLE_EXISTS_ERROR`: an object of that name is already there.
+        EngineErrorKind::DuplicateObject => (1050, "42S01"),
         EngineErrorKind::UniqueViolation => (1062, "23000"),
         EngineErrorKind::NotNullViolation => (1048, "23000"),
         EngineErrorKind::CheckViolation => (3819, "HY000"),

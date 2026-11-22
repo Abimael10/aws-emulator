@@ -37,11 +37,11 @@ use tokio::net::TcpStream;
 use crate::cluster_lifecycle::{Answer, Emulator, POLL_INTERVAL};
 
 /// The admin user every cluster below is created with.
-const MASTER_USER: &str = "adminuser";
+pub(crate) const MASTER_USER: &str = "adminuser";
 
 /// Its password. A test credential, and the only place in this suite it
 /// appears.
-const MASTER_PASSWORD: &str = "Pw9xZqEmulator1";
+pub(crate) const MASTER_PASSWORD: &str = "Pw9xZqEmulator1";
 
 /// The address every published endpoint carries: this emulator's own loopback
 /// interface, which is where the core binds its listeners and so the only
@@ -63,7 +63,7 @@ const ISSUANCE_SLACK_SECONDS: i64 = 60;
 /// How a session is opened: in the clear, or with the PostgreSQL in-band TLS
 /// upgrade on the same port — which is what `sslmode=require` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transport {
+pub(crate) enum Transport {
     Plaintext,
     Tls,
 }
@@ -350,11 +350,22 @@ async fn a_temporary_credential_logs_on_to_the_published_endpoint() {
             .unwrap_or_else(|refusal| {
                 panic!("case {case}: current_user() must run, got {refusal:?}")
             });
+        // The DATABASE USER the session runs as. The `IAMA:` prefix the response
+        // carries says the user is CREATED on the way in ("the database user
+        // name prefixed with IAM: if AutoCreate is False or IAMA: if AutoCreate
+        // is True"), and the user it creates is that identity's own database
+        // user — the one under the plain `IAM:` prefix — so that is what the
+        // engine's session functions answer, whichever prefix the credential was
+        // reported under.
+        let runs_as = reported_user.replace(
+            state::AUTO_CREATED_DB_USER_PREFIX,
+            ::service_common::redshift_database_users::IAM_IDENTITY_DB_USER_PREFIX,
+        );
         assert_eq!(
             whoami.only(),
-            Some(reported_user.as_str()),
-            "case {case}: expected the session to run as the user the credential names, got \
-             {whoami:?}"
+            Some(runs_as.as_str()),
+            "case {case}: expected the session to run as the database user the credential stands \
+             for, got {whoami:?}"
         );
     }
 }
@@ -443,6 +454,12 @@ async fn only_the_clusters_own_credentials_are_admitted() {
 
     // (case, the user, the password, the database asked for, the SQLSTATE the
     // protocol refuses it with)
+    //
+    // A login with a TEMPORARY CREDENTIAL this cluster minted is an IAM
+    // authentication, and the cluster refuses one as that — the
+    // `invalid_authorization_specification` class — rather than as a password
+    // the database holds for an account of its own (`invalid_password`), which
+    // is what the cluster's admin user is refused under.
     let cases: Vec<(&str, &str, &str, Option<&str>, &str)> = vec![
         (
             "the admin user with the wrong password",
@@ -463,7 +480,7 @@ async fn only_the_clusters_own_credentials_are_admitted() {
             temp_user.as_str(),
             "not-the-password",
             Some(state::DEFAULT_DB_NAME),
-            "28P01",
+            "28000",
         ),
         (
             "the admin user on a database the cluster does not hold",
@@ -477,7 +494,7 @@ async fn only_the_clusters_own_credentials_are_admitted() {
             temp_user.as_str(),
             temp_password.as_str(),
             Some("no-such-database"),
-            "28P01",
+            "28000",
         ),
     ];
     for (case, user, password, database, code) in cases {
@@ -531,8 +548,8 @@ async fn only_the_clusters_own_credentials_are_admitted() {
     .err()
     .unwrap_or_else(|| panic!("case an expired credential: expected the login to be refused"));
     assert_eq!(
-        expired.code, "28P01",
-        "case an expired credential: expected the authentication refusal, got {expired:?}"
+        expired.code, "28000",
+        "case an expired credential: expected the IAM authentication refusal, got {expired:?}"
     );
     // The admin credentials are not temporary, so they still log on.
     postgres_login(
@@ -937,7 +954,7 @@ async fn a_constraint_the_warehouse_enforces_carries_its_own_condition_code() {
 
 /// Create the cluster `identifier` with `params`, wait for it to report
 /// `available`, and answer the read a client takes of it.
-async fn available_cluster(
+pub(crate) async fn available_cluster(
     emulator: &Emulator,
     identifier: &str,
     params: &[(&str, &str)],
@@ -968,7 +985,7 @@ async fn available_cluster(
 
 /// The endpoint a cluster published, as a client reads it: an address this
 /// emulator answers on and the port its database engine listens on there.
-fn endpoint_of(case: &str, described: &Answer) -> (String, u16) {
+pub(crate) fn endpoint_of(case: &str, described: &Answer) -> (String, u16) {
     let address = described.text("Address").unwrap_or_else(|| {
         panic!(
             "case {case}: expected a serving cluster to publish an endpoint address, got body {}",
@@ -1052,21 +1069,21 @@ type Client = Box<dyn Connection>;
 /// A refusal the server sent: the SQLSTATE a client branches on and the
 /// sentence it reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Refusal {
-    code: String,
-    message: String,
+pub(crate) struct Refusal {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 /// One result set a client read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Rows {
-    columns: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
+pub(crate) struct Rows {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Option<String>>>,
 }
 
 impl Rows {
     /// The one value a single-row, single-column answer carries.
-    fn only(&self) -> Option<&str> {
+    pub(crate) fn only(&self) -> Option<&str> {
         self.rows
             .first()
             .and_then(|row| row.first())
@@ -1076,14 +1093,14 @@ impl Rows {
 
 /// A PostgreSQL session a client has opened, and the parameters the backend
 /// reported for it.
-struct PostgresSession {
+pub(crate) struct PostgresSession {
     conn: Client,
     parameters: Vec<(String, String)>,
 }
 
 impl PostgresSession {
     /// The value the backend reported for the parameter `name`.
-    fn parameter(&self, name: &str) -> Option<String> {
+    pub(crate) fn parameter(&self, name: &str) -> Option<String> {
         self.parameters
             .iter()
             .find(|(held, _)| held == name)
@@ -1091,7 +1108,7 @@ impl PostgresSession {
     }
 
     /// Run one simple query and read everything the server answers for it.
-    async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
+    pub(crate) async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
         let case = "a statement";
         let mut message = Vec::new();
         put_cstring(&mut message, sql);
@@ -1157,7 +1174,7 @@ impl PostgresSession {
 /// Open a PostgreSQL session on `address:port`, as libpq does: the optional
 /// `SSLRequest` first, then the startup message, the password, and the
 /// parameters the server reports.
-async fn postgres_login(
+pub(crate) async fn postgres_login(
     case: &str,
     address: &str,
     port: u16,

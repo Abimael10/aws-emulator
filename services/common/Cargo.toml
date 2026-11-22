@@ -176,6 +176,12 @@ rusqlite = { version = "0.41", features = [
     "hooks",
     "limits",
 ] }
+# `sqlparser`: `sql_wire_planes::dialect` reads a statement as the TOKENS of the wire's own
+# SQL dialect — which is how a keyword that is part of a string literal, a quoted
+# identifier, a dollar-quoted body or a comment stays part of it — rather than by a scan of
+# its own. The same maintained parser every other service in this workspace reads SQL with,
+# at the version they already lock.
+sqlparser = "0.59"
 # `sql_wire_planes`: `sha1` is the digest the MySQL `mysql_native_password` handshake is
 # defined in terms of, and the only form a native-password login can be verified against.
 sha1 = "0.10"

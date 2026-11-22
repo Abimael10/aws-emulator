@@ -480,7 +480,7 @@ pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
 
 /// The prefix the database user of an identity `AutoCreate` creates on the way in
 /// carries. See [`credential_db_user`].
-const AUTO_CREATED_DB_USER_PREFIX: &str = "IAMA:";
+pub const AUTO_CREATED_DB_USER_PREFIX: &str = "IAMA:";
 
 /// The prefix the database user of an IAM ROLE identity carries, beside the
 /// `IAM:` prefix [`credential_db_user`] states for every other IAM identity.

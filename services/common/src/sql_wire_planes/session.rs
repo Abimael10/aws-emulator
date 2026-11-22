@@ -23,7 +23,9 @@
 //! database read and write the same tables — and a transaction belongs to that
 //! connection rather than to one session. What that costs is stated where it
 //! matters: a session that opens a transaction holds it against the database's
-//! other sessions, a second `BEGIN` is refused by the engine itself, and a
+//! other sessions, a `BEGIN` issued while one is open does nothing — the
+//! warning both servers answer it with, never the engine's own refusal of a
+//! nested transaction — and a
 //! session that goes away with a transaction open has it rolled back
 //! ([`Session::drop`]) rather than leaving the engine mid-transaction for
 //! whoever connects next.
@@ -31,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::dialect::{self, DialectReading, Refusal, SqlDialect};
 use super::sql_engine::{
     self, Cell, Column, DatabaseEngine, EngineError, EngineErrorKind, EngineView, ResultSet,
 };
@@ -97,6 +100,13 @@ pub struct Session {
     /// what its `COMMIT` ends, what its status flag reports, and what its own
     /// end rolls back.
     in_transaction: bool,
+    /// The dialect of the engine the resource publishes, as its OWNING SERVICE
+    /// states it ([`super::ServedDatabase::dialect`]): what reads a statement
+    /// this product spells its own way, the sentence its `version()` answers,
+    /// and the `SQLSTATE` it reports a refusal under. `None` for a service that
+    /// supplies none, and then every statement goes to the engine as the client
+    /// wrote it.
+    dialect: Option<Arc<dyn SqlDialect>>,
 }
 
 impl Session {
@@ -125,11 +135,49 @@ impl Session {
             settings: BTreeMap::new(),
             autocommit: true,
             in_transaction: false,
+            dialect: None,
         };
         for (name, value) in session.server_settings() {
             session.settings.insert(name, value);
         }
         session
+    }
+
+    /// This session, served under the dialect of the engine its resource
+    /// publishes.
+    #[must_use]
+    pub fn with_dialect(mut self, dialect: Option<Arc<dyn SqlDialect>>) -> Self {
+        self.dialect = dialect;
+        self.publish_version_sentence();
+        // The database user this session RUNS AS, which is the user the engine's
+        // session functions answer: a login name the product resolves to
+        // another user is resolved here, once, and nothing downstream sees the
+        // name it was resolved from.
+        if let Some(dialect) = &self.dialect {
+            self.view.user = dialect.session_user(&self.view.user);
+        }
+        self
+    }
+
+    /// Put the sentence `version()` answers into the view the engine's server
+    /// functions read: the sentence the engine's own DIALECT states, where it
+    /// states one, and the wire's own banner for that version otherwise.
+    fn publish_version_sentence(&mut self) {
+        self.view.server_banner = self
+            .dialect
+            .as_ref()
+            .and_then(|dialect| dialect.version_sentence(&self.facts.server_version))
+            .unwrap_or_else(|| version_banner(self.wire, &self.facts.server_version));
+    }
+
+    /// How the engine's dialect reports `error` to the client — its `SQLSTATE`,
+    /// its message and its detail — where that differs from what the engine
+    /// itself said; `None` leaves the wire's own mapping.
+    #[must_use]
+    pub fn dialect_refusal(&self, error: &EngineError) -> Option<Refusal> {
+        self.dialect
+            .as_ref()
+            .and_then(|dialect| dialect.refusal(error))
     }
 
     /// The settings a session of this wire starts with, which is what a `SHOW`
@@ -204,8 +252,8 @@ impl Session {
     /// password rotation or a state change reaches the next statement.
     pub fn refresh(&mut self, facts: DatabaseFacts) {
         self.view.server_version = facts.server_version.clone();
-        self.view.server_banner = version_banner(self.wire, &facts.server_version);
         self.facts = facts;
+        self.publish_version_sentence();
     }
 
     /// Run what the client sent, and answer what the LAST statement of it
@@ -237,8 +285,53 @@ impl Session {
             "USE" => self.use_database(&rest),
             "BEGIN" | "START" => self.begin().await,
             "COMMIT" | "ROLLBACK" | "END" => self.end_transaction(&verb).await,
-            _ => self.run_on_the_engine(statement).await,
+            _ => self.run_statement(statement).await,
         }
+    }
+
+    /// Run one statement that is not a command of the server's own: read it as
+    /// the wire's spelling and then as the ENGINE's own dialect, and do what
+    /// that reading asks for.
+    async fn run_statement(&mut self, statement: &str) -> Result<Answer, EngineError> {
+        // The PostgreSQL session functions are reserved words on that wire and
+        // functions on this engine, so the one spelling is read as the other
+        // before anything else looks at the statement.
+        let spelled = match self.wire {
+            EngineWire::Postgres | EngineWire::Redshift => {
+                dialect::respell_session_keywords(statement)
+            }
+            EngineWire::MySql => None,
+        };
+        let text = spelled.unwrap_or_else(|| statement.to_string());
+        let Some(dialect) = self.dialect.clone() else {
+            return self.run_on_the_engine(statement, &text).await;
+        };
+        match self.read_as_the_dialect(&dialect, text).await? {
+            DialectReading::Run(sql) => self.run_on_the_engine(statement, &sql).await,
+            DialectReading::Answered(answer) => Ok(answer),
+            DialectReading::Refused(error) => Err(error),
+        }
+    }
+
+    /// Ask the engine's dialect to read `statement`.
+    ///
+    /// Off the async worker, because the reading may put a catalogue of the
+    /// product's own on the engine, and engine work is blocking.
+    async fn read_as_the_dialect(
+        &mut self,
+        dialect: &Arc<dyn SqlDialect>,
+        statement: String,
+    ) -> Result<DialectReading, EngineError> {
+        let engine = Arc::clone(&self.engine);
+        let dialect = Arc::clone(dialect);
+        let mut view = self.view.clone();
+        let (reading, view) = off_the_async_worker(move || {
+            let reading = dialect.read(&statement, &engine, &mut view);
+            (reading, view)
+        })
+        .await?;
+        self.view = view;
+        Ok(reading)
     }
 
     /// `SET <name> = <value>`, and the forms each engine spells it in
@@ -402,14 +495,18 @@ impl Session {
 
     /// Hand one statement to the engine, opening the transaction a session in
     /// `autocommit = 0` is owed first.
-    async fn run_on_the_engine(&mut self, statement: &str) -> Result<Answer, EngineError> {
+    async fn run_on_the_engine(
+        &mut self,
+        statement: &str,
+        sql: &str,
+    ) -> Result<Answer, EngineError> {
         // A session that is not in autocommit is inside a transaction from its
         // first statement on, which is what makes its later `ROLLBACK` put
         // those rows back.
         if !self.autocommit && !self.in_transaction {
             self.engine_statement("BEGIN").await?;
         }
-        let result = self.on_the_engine(statement.to_string()).await?;
+        let result = self.on_the_engine(sql.to_string()).await?;
         let (verb, _) = split_verb(statement);
         let verb = command_tag_verb(statement, &verb);
         // The row id belongs to the statement that minted one: a server reports

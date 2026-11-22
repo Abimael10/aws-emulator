@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::session::{Answer, Session};
 use super::sql_engine::{Cell, Column, EngineError, EngineErrorKind};
 use super::{
-    admit_issued, EngineWire, LoginRefusal, PasswordProof, ServingState, SessionContext,
+    admit_issued, EngineWire, LoginRefusal, PasswordProof, Refusal, ServingState, SessionContext,
 };
 
 /// The protocol version this server speaks, as a startup message declares it
@@ -196,7 +196,13 @@ async fn serve_session(
     ) {
         Ok(database) => database,
         Err(refusal) => {
-            let (code, message) = refusal_sentence(&refusal, &user);
+            // How the engine's own product refuses a login of its own
+            // credentials, where it has its own words for it; the wire's
+            // otherwise.
+            let (code, message) = context
+                .dialect()
+                .and_then(|dialect| dialect.login_refusal(&refusal, &user))
+                .unwrap_or_else(|| refusal_sentence(&refusal, &user));
             return fatal(&mut conn, code, &message).await;
         }
     };
@@ -209,7 +215,8 @@ async fn serve_session(
         user.clone(),
         database,
         context.take_connection_id(),
-    );
+    )
+    .with_dialect(context.dialect());
     send(&mut conn, b'R', &0i32.to_be_bytes()).await?;
     for (name, value) in [
         ("server_version", session.server_version().to_string()),
@@ -220,7 +227,7 @@ async fn serve_session(
         ("integer_datetimes", "on".to_string()),
         ("standard_conforming_strings", "on".to_string()),
         ("is_superuser", "off".to_string()),
-        ("session_authorization", user.clone()),
+        ("session_authorization", session.user().to_string()),
     ] {
         let mut body = Vec::new();
         put_cstring(&mut body, name);
@@ -268,7 +275,13 @@ async fn serve_session(
                         failed_in_transaction = false;
                     }
                     Err(error) => {
-                        engine_error_response(&mut conn, wire, &error).await?;
+                        engine_error_response(
+                            &mut conn,
+                            wire,
+                            &error,
+                            session.dialect_refusal(&error),
+                        )
+                        .await?;
                         failed_in_transaction = session.in_transaction();
                     }
                 }
@@ -500,6 +513,8 @@ fn sqlstate(wire: EngineWire, kind: EngineErrorKind) -> &'static str {
     match kind {
         EngineErrorKind::Syntax => "42601",
         EngineErrorKind::UndefinedObject => "42P01",
+        // `duplicate_object`: an object of that name is already there.
+        EngineErrorKind::DuplicateObject => "42710",
         EngineErrorKind::UniqueViolation => "23505",
         EngineErrorKind::NotNullViolation => "23502",
         EngineErrorKind::CheckViolation => "23514",
@@ -514,12 +529,22 @@ fn sqlstate(wire: EngineWire, kind: EngineErrorKind) -> &'static str {
 }
 
 /// Report a failed statement, keeping the engine's own message.
+///
+/// `refusal` is how the engine's own product reports the failure — its
+/// `SQLSTATE`, its wording and what it says in the detail field beside it —
+/// where that differs from what the engine itself said
+/// ([`super::SqlDialect::refusal`]).
 async fn engine_error_response(
     conn: &mut ::emulator_server::ListenerConn,
     wire: EngineWire,
     error: &EngineError,
+    refusal: Option<Refusal>,
 ) -> std::io::Result<()> {
-    error_response(conn, "ERROR", sqlstate(wire, error.kind), &error.message).await
+    let (code, message, detail) = match refusal {
+        Some(refusal) => (refusal.sqlstate, refusal.message, refusal.detail),
+        None => (sqlstate(wire, error.kind), error.message.clone(), None),
+    };
+    reported(conn, "ERROR", code, &message, detail.as_deref()).await
 }
 
 /// One `ErrorResponse`.
@@ -528,6 +553,17 @@ async fn error_response(
     severity: &str,
     code: &str,
     message: &str,
+) -> std::io::Result<()> {
+    reported(conn, severity, code, message, None).await
+}
+
+/// One `ErrorResponse`, with the `Detail` field where the refusal carries one.
+async fn reported(
+    conn: &mut ::emulator_server::ListenerConn,
+    severity: &str,
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
 ) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -538,6 +574,10 @@ async fn error_response(
     put_cstring(&mut body, code);
     body.push(b'M');
     put_cstring(&mut body, message);
+    if let Some(detail) = detail {
+        body.push(b'D');
+        put_cstring(&mut body, detail);
+    }
     body.push(0);
     send(conn, b'E', &body).await?;
     conn.flush().await

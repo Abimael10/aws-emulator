@@ -54,10 +54,14 @@
 use std::sync::Arc;
 
 use ::service_common::sql_wire_planes::{
-    self, DatabaseFacts, EngineWire, IssuedCredential, ServedDatabase, ServingState,
+    self, DatabaseFacts, EngineWire, IssuedCredential, ServedDatabase, ServingState, SqlDialect,
 };
 
 use super::*;
+
+/// The SQL a session on this endpoint speaks: Amazon Redshift's dialect, and
+/// the catalogue views a Redshift client reads this database's shape out of.
+pub mod cluster_sql;
 
 /// The SigV4 signing name of this service, which is what names the service
 /// answering at an address it opened for an in-process client.
@@ -132,6 +136,11 @@ pub struct ClusterFacts {
     state: ::engine::ServiceState<ComAmazonawsRedshiftRedshiftserviceversion20121201State>,
     clock: ::engine::ServiceState<Clock>,
     key: String,
+    /// The dialect the sessions on this cluster's endpoint are served under,
+    /// which holds the catalogue of schemas and temporary relations the
+    /// endpoint's engine has: one per endpoint, so every session on it resolves
+    /// a name the same way.
+    sql: Arc<cluster_sql::ClusterSql>,
 }
 
 impl ClusterFacts {
@@ -198,6 +207,10 @@ impl ServedDatabase for ClusterFacts {
         })
         .unwrap_or_default()
     }
+
+    fn dialect(&self) -> Option<Arc<dyn SqlDialect>> {
+        Some(Arc::clone(&self.sql) as Arc<dyn SqlDialect>)
+    }
 }
 
 /// Whether a cluster in `status` is serving, as the wire reads it.
@@ -245,6 +258,7 @@ pub async fn open_cluster_endpoint_plane<Eng: Send + Sync + 'static>(
         state,
         clock,
         key: cluster_key.to_string(),
+        sql: Arc::new(cluster_sql::ClusterSql::new()),
     });
     sql_wire_planes::open_sql_wire_plane(engine, EngineWire::Redshift, served, SIGNING_NAME).await
 }

@@ -114,6 +114,9 @@ pub struct ResultSet {
 pub enum EngineErrorKind {
     Syntax,
     UndefinedObject,
+    /// An object the database already holds, which the statement would create a
+    /// second of.
+    DuplicateObject,
     UniqueViolation,
     NotNullViolation,
     CheckViolation,
@@ -181,8 +184,11 @@ const SERVER_FUNCTIONS: &[&str] = &[
     "version",
     "database",
     "current_database",
+    "current_catalog",
+    "current_schema",
     "user",
     "current_user",
+    "current_role",
     "session_user",
     "connection_id",
     "last_insert_id",
@@ -630,7 +636,7 @@ fn register_server_functions(
     let read = |view: &Arc<Mutex<EngineView>>| -> EngineView {
         view.lock().unwrap_or_else(PoisonError::into_inner).clone()
     };
-    let text_functions: [(&str, TextFunction); 6] = [
+    let text_functions: [(&str, TextFunction); 9] = [
         ("version", |view| {
             if view.server_banner.is_empty() {
                 view.server_version.clone()
@@ -640,8 +646,15 @@ fn register_server_functions(
         }),
         ("database", |view| view.database.clone()),
         ("current_database", |view| view.database.clone()),
+        ("current_catalog", |view| view.database.clone()),
+        // The schema a PostgreSQL-derived engine resolves an unqualified name
+        // in, which is the one this engine holds its relations under.
+        ("current_schema", |_view| {
+            super::catalog_views::DEFAULT_SCHEMA.to_string()
+        }),
         ("user", |view| view.user.clone()),
         ("current_user", |view| view.user.clone()),
+        ("current_role", |view| view.user.clone()),
         ("session_user", |view| view.user.clone()),
     ];
     for (name, answer) in text_functions {
@@ -668,6 +681,11 @@ fn register_server_functions(
     Ok(())
 }
 
+/// The pragmas a statement may reach: the engine's own schema introspection,
+/// which answers the columns a relation declares and nothing about this
+/// process, its files or its settings.
+const SCHEMA_PRAGMAS: &[&str] = &["table_info", "table_xinfo", "table_list"];
+
 /// What a client's SQL may do inside ONE database.
 ///
 /// DEFAULT DENY: an action not named here is refused, so an engine capability
@@ -677,10 +695,12 @@ fn register_server_functions(
 /// defines them, transactions, and pure computation over the values in them.
 ///
 /// `ATTACH`/`DETACH` would make a host path visible to SQL (and `VACUUM INTO`
-/// is implemented by attaching its output file), `PRAGMA` reaches engine
-/// configuration including temp-file paths, and a virtual table is arbitrary
-/// registered code — and none of them is something a MySQL or PostgreSQL client
-/// can ask for over its own wire anyway.
+/// is implemented by attaching its output file), a configuration `PRAGMA`
+/// reaches engine configuration including temp-file paths, and a virtual table
+/// is arbitrary registered code — and none of them is something a MySQL or
+/// PostgreSQL client can ask for over its own wire anyway. The pragmas that are
+/// allowed are the schema introspection a catalog query reads
+/// ([`SCHEMA_PRAGMAS`]), which reaches nothing but this database's own schema.
 fn confine_to_the_database(context: AuthContext<'_>) -> Authorization {
     match context.action {
         AuthAction::Select
@@ -710,6 +730,19 @@ fn confine_to_the_database(context: AuthContext<'_>) -> Authorization {
         | AuthAction::AlterTable { .. }
         | AuthAction::Reindex { .. }
         | AuthAction::Analyze { .. } => Authorization::Allow,
+        // The engine's own SCHEMA INTROSPECTION, which is how a client's
+        // catalog query reads the columns a relation declares
+        // ([`super::catalog_views`]). It reads this database's own schema and
+        // nothing else: it names no path, opens no file and changes no setting,
+        // unlike the configuration pragmas the deny arm below keeps
+        // unreachable.
+        AuthAction::Pragma { pragma_name, .. }
+            if SCHEMA_PRAGMAS
+                .iter()
+                .any(|schema| pragma_name.eq_ignore_ascii_case(schema)) =>
+        {
+            Authorization::Allow
+        }
         // Pure computation over the values in those tables, as an ALLOW-LIST: a
         // function this emulator has not reviewed — including one a future
         // engine build defines — falls through to the deny arm below.
@@ -735,16 +768,24 @@ fn unavailable(error: ::rusqlite::Error) -> EngineError {
 
 /// The class and the message a failed statement is reported under: the ENGINE's
 /// own sentence, under the class its result code names.
+///
+/// A statement the engine could not PREPARE carries its own sentence beside the
+/// text it was reading and the offset it stopped at; what a client is told is
+/// that sentence, because the statement is the client's own and a server does
+/// not quote it back.
 fn engine_error(error: ::rusqlite::Error) -> EngineError {
-    let message = match &error {
-        ::rusqlite::Error::SqliteFailure(_, Some(message)) => message.clone(),
+    let (code, message) = match &error {
+        ::rusqlite::Error::SqliteFailure(code, Some(message)) => (Some(*code), message.clone()),
+        ::rusqlite::Error::SqliteFailure(code, None) => (Some(*code), error.to_string()),
         // Text the engine could not PARSE: its own sentence is the `msg`, which
         // names what it stopped at, rather than the `Display` form that repeats
         // the statement back.
-        ::rusqlite::Error::SqlInputError { msg, .. } => msg.clone(),
-        other => other.to_string(),
+        ::rusqlite::Error::SqlInputError {
+            error: code, msg, ..
+        } => (Some(*code), msg.clone()),
+        other => (None, other.to_string()),
     };
-    let Some(code) = failure_code(&error) else {
+    let Some(code) = code else {
         return EngineError::new(EngineErrorKind::Internal, message);
     };
     let kind = match code.code {
@@ -766,6 +807,7 @@ fn engine_error(error: ::rusqlite::Error) -> EngineError {
 }
 
 /// The SQLite failure behind `error`, where it carries one.
+#[allow(dead_code)]
 fn failure_code(error: &::rusqlite::Error) -> Option<::rusqlite::ffi::Error> {
     match error {
         ::rusqlite::Error::SqliteFailure(code, _) => Some(*code),
@@ -778,12 +820,12 @@ fn failure_code(error: &::rusqlite::Error) -> Option<::rusqlite::ffi::Error> {
 }
 
 /// Whether the engine's own sentence says the statement named something that
-/// does not exist, which is a class of its own on both wires, or is a statement
-/// the engine could not parse at all.
+/// does not exist, something that is already there, or is a statement the engine
+/// could not parse at all.
 ///
-/// SQLite reports both as `SQLITE_ERROR`, and the only thing that tells them
-/// apart is the sentence it wrote — which is what the client is shown either
-/// way.
+/// SQLite reports all of them as `SQLITE_ERROR`, and the only thing that tells
+/// them apart is the sentence it wrote — which is what the client is shown
+/// either way.
 fn undefined_or_syntax(message: &str) -> EngineErrorKind {
     let lowered = message.to_ascii_lowercase();
     if lowered.starts_with("no such table")
@@ -793,6 +835,9 @@ fn undefined_or_syntax(message: &str) -> EngineErrorKind {
         || lowered.starts_with("no such function")
     {
         return EngineErrorKind::UndefinedObject;
+    }
+    if lowered.contains("already exists") {
+        return EngineErrorKind::DuplicateObject;
     }
     if lowered.contains("not authorized") {
         return EngineErrorKind::InsufficientPrivilege;

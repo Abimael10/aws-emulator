@@ -56,12 +56,19 @@ use sql_engine::DatabaseEngine;
 pub mod mysql_wire;
 /// The server half of the PostgreSQL frontend/backend protocol.
 pub mod pg_wire;
+/// The CATALOG a client reads a database's own shape out of: the
+/// `information_schema` views, served out of the engine's own catalog.
+pub mod catalog_views;
+/// The DIALECT one database's engine speaks, as the service that owns it states
+/// it.
+pub mod dialect;
 /// What one session on either wire shares: its settings, its transaction and
 /// the server's own commands.
 pub mod session;
 /// The in-process SQL engine one database's statements run against.
 pub mod sql_engine;
 
+pub use dialect::{DialectReading, Refusal, SqlDialect};
 /// The host a MySQL refusal names as the client's own.
 ///
 /// MySQL's `ER_ACCESS_DENIED_ERROR` names the account AND the host the login
@@ -195,6 +202,18 @@ pub trait ServedDatabase: Send + Sync + 'static {
     fn issued_credentials(&self) -> Vec<IssuedCredential> {
         Vec::new()
     }
+
+    /// The DIALECT the engine of this resource speaks
+    /// ([`SqlDialect`]): which product's statements, `version()` sentence and
+    /// `SQLSTATE`s a session on it is answered under.
+    ///
+    /// A service that supplies none is served the engine as it stands: the
+    /// statement reaches it as the client wrote it, `version()` answers the
+    /// version the resource publishes, and a refusal carries the class the
+    /// engine itself named.
+    fn dialect(&self) -> Option<Arc<dyn SqlDialect>> {
+        None
+    }
 }
 
 /// One credential the OWNING SERVICE issued for a database beside its master
@@ -277,6 +296,13 @@ impl SessionContext {
     #[must_use]
     pub fn issued_credentials(&self) -> Vec<IssuedCredential> {
         self.served.issued_credentials()
+    }
+
+    /// The dialect the engine behind this endpoint speaks
+    /// ([`ServedDatabase::dialect`]).
+    #[must_use]
+    pub fn dialect(&self) -> Option<Arc<dyn SqlDialect>> {
+        self.served.dialect()
     }
 }
 

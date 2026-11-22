@@ -97,6 +97,20 @@ impl<'a> TempRelations<'a> {
         Self { prefix, relations }
     }
 
+    /// The relations one connection holds, for a caller that keeps that
+    /// connection's own set itself.
+    ///
+    /// A submission's connection is this service's
+    /// ([`ConnectionScope::relations`]), but the dialect this crate reads a
+    /// statement as is also what reads the statements of a PROVISIONED
+    /// CLUSTER's own endpoint — a connection that service holds, not one of
+    /// this service's submissions — so that caller names its connection's
+    /// prefix and set here.
+    #[must_use]
+    pub fn held_by(prefix: &'a str, relations: &'a BTreeSet<String>) -> Self {
+        Self { prefix, relations }
+    }
+
     /// Whether this connection holds a temporary relation of this name.
     pub fn holds(&self, relation: &str) -> bool {
         self.relations.contains(&relation.to_ascii_lowercase())
