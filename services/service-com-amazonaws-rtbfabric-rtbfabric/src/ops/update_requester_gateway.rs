@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRequesterGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRequesterGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRequesterGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a configuration change to the requester gateway record
+//! `CreateRequesterGateway` persisted in [`crate::state`]: the stated `description`
+//! replaces what the record holds, `GetRequesterGateway` reads the change back, and
+//! the `status` this call answers is the record's own.
+//!
+//! A gateway in service takes the change while it is in service, so this call
+//! reports it as pending and the clock owes the gateway its way back to `ACTIVE`;
+//! one moving through a lifecycle of its own — coming up after its create — has no
+//! configuration in service to change, so the modelled `ConflictException` refuses
+//! it. A `clientToken` replayed with different parameters is refused with the
+//! modelled `ValidationException`, exactly as `UpdateResponderGateway` and this
+//! service's creates refuse it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +167,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRequesterGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRequesterGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRequesterGateway"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRequesterGatewayErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The answer below reports a stored status, so the transitions the clock has
+        // already made due are materialised first: each was owed at this same instant
+        // whether or not anybody called.
+        store.settle_all(now);
+
+        // `clientToken` is an `@idempotencyToken`: a retry of the change the gateway
+        // last took is answered with that gateway rather than applied to it again, and
+        // the same token carrying DIFFERENT parameters is refused rather than silently
+        // answering for parameters the caller did not send. The model declares no
+        // `IdempotentParameterMismatch`, so that refusal is this operation's
+        // `ValidationException` (400), exactly as the sibling updates and creates of
+        // this service refuse it.
+        let fingerprint =
+            crate::state::parameter_fingerprint(&format!("description={:?}", input.description));
+        let key = crate::state::idempotency_key(Self::NAME, &input.client_token);
+
+        let Some(gateway) = store.requester_gateways.get_mut(&input.gateway_id) else {
+            return Err(UpdateRequesterGatewayErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // Fixed text: this service's not-found names no id, so the message
+                    // is the same whichever gateway was asked for.
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The record of the change this gateway most recently took lives on the
+        // gateway itself, so a retry is answered from the resource it addressed.
+        if let Some(prior) = gateway.last_update.as_ref().filter(|prior| prior.key == key) {
+            if prior.fingerprint != fingerprint {
+                return Err(UpdateRequesterGatewayErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "clientToken {} was already used for a {} request with different parameters",
+                            input.client_token,
+                            Self::NAME,
+                        ),
+                    },
+                )
+                .into());
+            }
+            // The same change under the same token: report the record it already
+            // produced rather than apply it a second time.
+            return Ok(UpdateRequesterGatewayOutput {
+                gateway_id: gateway.gateway_id.clone(),
+                status: gateway.status.clone(),
+            });
+        }
+
+        if !gateway.in_service() {
+            // The gateway is moving through a lifecycle of its own, so it has no
+            // configuration in service for this call to change.
+            return Err(UpdateRequesterGatewayErrorModeled::ConflictException(
+                ConflictException {
+                    message: gateway.status_conflict_message("updated"),
+                },
+            )
+            .into());
+        }
+
+        // A member the caller states replaces what the record holds; one it leaves out
+        // is not a request to clear the stored value.
+        if input.description.is_some() {
+            gateway.description = input.description;
+        }
+        gateway.updated_at = now;
+        gateway.last_update = Some(crate::state::IdempotentUpdate { key, fingerprint });
+        // The gateway is in service, so the change is applied to a live gateway: this
+        // call reports the update as pending, and the clock owes the gateway its way
+        // back into service.
+        gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
+        gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+
+        Ok(UpdateRequesterGatewayOutput {
+            gateway_id: gateway.gateway_id.clone(),
+            status: gateway.status.clone(),
+        })
     }
 }

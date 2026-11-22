@@ -259,6 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             created_at: now,
             updated_at: now,
+            // Nothing has been updated yet: the record carries an update's
+            // client token only once it has taken one.
+            last_update: None,
         };
 
         let output = CreateRequesterGatewayOutput {

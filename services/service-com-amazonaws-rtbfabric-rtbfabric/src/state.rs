@@ -169,8 +169,9 @@ pub struct RequesterGateway {
     pub gateway_id: String,
     pub domain_name: String,
     pub status: String,
-    /// The instant the clock makes `PENDING_CREATION` -> `ACTIVE` due; `None`
-    /// once the record has settled.
+    /// The instant the clock makes this record's pending status — the one a
+    /// create or an update left it in — `ACTIVE` due; `None` once the record has
+    /// settled.
     pub settles_at: Option<SystemTime>,
     pub vpc_id: String,
     pub subnet_ids: Vec<String>,
@@ -179,18 +180,44 @@ pub struct RequesterGateway {
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// The `@idempotencyToken` of the most recent accepted change of this
+    /// gateway's configuration, and a digest of that call's other parameters;
+    /// `None` until one is accepted. See [`IdempotentUpdate`].
+    pub last_update: Option<IdempotentUpdate>,
 }
 
 impl RequesterGateway {
-    /// Materialise the `PENDING_CREATION` -> `ACTIVE` transition the clock has
-    /// already made due, dated at the instant it was owed rather than now, so
-    /// the record does not depend on when it was next read.
+    /// Materialise the transition the clock has already made due — the created
+    /// gateway coming up, or a configuration change it has taken reaching
+    /// service — dated at the instant it was owed rather than now, so the record
+    /// does not depend on when it was next read. Both transitions end at
+    /// [`GATEWAY_STATUS_ACTIVE`]: a gateway that is in service is what either one
+    /// is owed.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.settles_at.filter(|due| *due <= now) {
             self.status = GATEWAY_STATUS_ACTIVE.to_string();
             self.settles_at = None;
             self.updated_at = due;
         }
+    }
+
+    /// Whether this gateway is in service, so a configuration change can be
+    /// applied to it: it is carrying traffic, or it is already applying one.
+    /// Every other status reports the gateway moving through a lifecycle of its
+    /// own, and has no configuration in service to change. Stated exactly as
+    /// [`ResponderGateway::in_service`] states it for the other kind.
+    pub fn in_service(&self) -> bool {
+        self.status == GATEWAY_STATUS_ACTIVE || self.status == GATEWAY_STATUS_PENDING_UPDATE
+    }
+
+    /// The words a refusal carries when this gateway's current status does not
+    /// admit the transition a call asks for: the gateway the call addressed and
+    /// the status that refuses it, both from the record.
+    pub fn status_conflict_message(&self, transition: &str) -> String {
+        format!(
+            "requester gateway {} is {} and cannot be {}",
+            self.gateway_id, self.status, transition
+        )
     }
 }
 
