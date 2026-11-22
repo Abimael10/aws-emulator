@@ -952,12 +952,15 @@ async fn a_read_of_a_partitioned_table_scans_only_the_partitions_its_predicate_a
     let router = emulator();
     given_a_source_table(&router).await;
 
-    // The partitioned table the reads below are of, written by a statement of its own.
+    // The partitioned table the reads below are of, written by a statement of its own. A
+    // ROW-FORMAT table, because what a read of one goes through is the objects it reads
+    // whole — which is what the sizes below are; a columnar table's read goes through the
+    // chunks of the columns the statement names and not the rest of the object.
     let ctas = run(
         &router,
         "setup",
         &format!(
-            "CREATE TABLE \"{DATABASE}\".\"pruned\" WITH (format = 'PARQUET', \
+            "CREATE TABLE \"{DATABASE}\".\"pruned\" WITH (format = 'TEXTFILE', \
              partitioned_by = ARRAY['dt'], external_location = 's3://{BUCKET}/pruned/') \
              AS SELECT id, name, dt FROM \"{DATABASE}\".\"{SOURCE}\""
         ),

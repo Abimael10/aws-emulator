@@ -557,6 +557,13 @@ pub fn read_parsed(
                 ))),
             };
         }
+        // A table definition whose COLUMN TYPES that grammar takes and the general parser
+        // does not read is the same case: it is read with those types made readable and the
+        // text each column was really declared with put back (see
+        // [`super::hive_column_types`]).
+        if let Some(reading) = table_with_hive_types(sql, context) {
+            return reading;
+        }
         return Reading {
             statements: None,
             statement_type: None,
@@ -586,6 +593,42 @@ pub fn read_parsed(
         counts_rows,
         plan: plan_of(sql, statement, context),
     }
+}
+
+/// The reading of a table definition whose COLUMN TYPES the general parser cannot read:
+/// the statement read with those types made readable, with the text each column was really
+/// declared with put back on it.
+///
+/// `None` for text that is no such definition, and for one that still does not parse once
+/// its column types are readable — that text is no statement of this grammar at all.
+fn table_with_hive_types(sql: &str, context: &QueryContext) -> Option<Reading> {
+    let (readable, declared) = super::hive_column_types::readable(sql)?;
+    let mut statements = parse_statements(&readable)?;
+    if statements.len() != 1 {
+        return None;
+    }
+    let statement = statements.remove(0);
+    let statement_type = statement_type_of(&statement);
+    let substatement_type = substatement_type_of(&statement);
+    let mut plan = plan_of(&readable, statement, context);
+    // The declarations go back on the columns they belong to: what the catalog records for a
+    // column is the type text the client wrote, never the one this reading made readable.
+    if let Plan::Catalog(statement) = &mut plan {
+        if let CatalogStatement::CreateExternalTable(table) = statement.as_mut() {
+            for (position, data_type) in declared {
+                if let Some(column) = table.columns.get_mut(position) {
+                    column.data_type = data_type.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    Some(Reading {
+        statements: Some(1),
+        statement_type: Some(statement_type),
+        substatement_type,
+        counts_rows: false,
+        plan,
+    })
 }
 
 /// What an `EXECUTE` submission names: the prepared statement whose own query statement
@@ -703,6 +746,38 @@ fn token_count(sql: &str) -> Option<usize> {
             .filter(|token| !matches!(token, Token::Whitespace(..)))
             .count(),
     )
+}
+
+/// Where in `sql` the OPERATOR an expression applies appears: the first `operator` token
+/// that follows the identifier `left`, which is where a refusal about that expression reports
+/// it, or `None` when the submitted text carries no such pair.
+///
+/// Read through the same lexer every other position here is read through
+/// ([`super::grammar`]), so what is located is the operator token itself and never a
+/// character inside a literal or a name. An expression whose left operand is not an
+/// identifier is located by the operator alone.
+#[must_use]
+pub fn operator_position(sql: &str, left: Option<&str>, operator: &str) -> Option<Position> {
+    let tokens = super::grammar::significant_tokens(sql);
+    let is_operator = |token: &::sqlparser::tokenizer::TokenWithSpan| {
+        token.token.to_string() == operator
+    };
+    let after_left = left.and_then(|left| {
+        let at = tokens
+            .iter()
+            .position(|token| super::grammar::word_is(token, left))?;
+        tokens
+            .get(at + 1..)?
+            .iter()
+            .find(|token| is_operator(token))
+            .map(super::grammar::position_of)
+    });
+    after_left.or_else(|| {
+        tokens
+            .iter()
+            .find(|token| is_operator(token))
+            .map(super::grammar::position_of)
+    })
 }
 
 /// The columns one query PROJECTS, in projection order.
@@ -1811,6 +1886,78 @@ impl Visitor for Columns<'_> {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// The columns of the relations a parsed node READS, folded the way the catalog folds a
+/// column name — or `None` when it reads every column one of them carries, which is what a
+/// wildcard projection asks for.
+///
+/// What this answers is which columns of a table a statement has to be HANDED: a columnar
+/// object holds each column apart, so a read of such a table goes through only the columns
+/// the statement names — while a row-format object holds every column of a row together and
+/// is read whole whatever the statement projects.
+pub fn read_columns<N: Visit>(node: &N) -> Option<HashSet<String>> {
+    let mut collector = ReadColumns::default();
+    let _ = node.visit(&mut collector);
+    (!collector.every).then_some(collector.named)
+}
+
+/// Collects the columns a statement names, and whether it names every one; see
+/// [`read_columns`].
+#[derive(Debug, Default)]
+struct ReadColumns {
+    /// The column names found, folded.
+    named: HashSet<String>,
+    /// Whether a projection of EVERY column was found, in which case the set above says
+    /// nothing about what the statement reads.
+    every: bool,
+}
+
+impl Visitor for ReadColumns {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            Expr::Identifier(ident) => {
+                self.named.insert(glue_state::fold_name(&ident.value));
+            }
+            // A qualified name's LAST part is the column; the ones in front of it name the
+            // relation it is read from.
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(column) = parts.last() {
+                    self.named.insert(glue_state::fold_name(&column.value));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, query: &::sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        if projects_every_column(query.body.as_ref()) {
+            self.every = true;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether one query body projects EVERY column of what it reads: a wildcard, on its own or
+/// qualified by a relation.
+fn projects_every_column(body: &::sqlparser::ast::SetExpr) -> bool {
+    use ::sqlparser::ast::{SelectItem, SetExpr};
+    match body {
+        SetExpr::Select(select) => select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(..) | SelectItem::QualifiedWildcard(..)
+            )
+        }),
+        SetExpr::Query(query) => projects_every_column(query.body.as_ref()),
+        SetExpr::SetOperation { left, right, .. } => {
+            projects_every_column(left) || projects_every_column(right)
+        }
+        _ => false,
     }
 }
 

@@ -11,12 +11,12 @@
 //! table's definition.
 
 /// The records one object of the columnar Parquet format holds.
-mod parquet_objects;
+pub(super) mod parquet_objects;
 /// The compression one TEXT object at a table's location carries.
 mod text_codecs;
 
 use ::std::borrow::Cow;
-use ::std::collections::HashMap;
+use ::std::collections::{HashMap, HashSet};
 
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 use ::service_com_amazonaws_s3_amazons3::state as s3_state;
@@ -291,6 +291,15 @@ impl Default for Budget {
 }
 
 impl Budget {
+    /// The DEFAULT cap on the object data one query reads is never above the CEILING a
+    /// configured cutoff may raise it to — asserted here, where the raising below reads both
+    /// constants, so a change to either of them fails to compile instead of reaching a
+    /// caller's request.
+    const BOUNDS_ARE_ORDERED: () = assert!(
+        query_engine::MAX_MATERIALISED_BYTES <= query_engine::MAX_SCAN_BYTES,
+        "the default read cap must not be above the ceiling a configured cutoff raises it to"
+    );
+
     /// The budget one query runs under, given the data usage cutoff its workgroup sets.
     ///
     /// A cutoff in force is what the query is held to, so the emulator's own cap on the
@@ -300,6 +309,7 @@ impl Budget {
     /// raised no further than [`query_engine::MAX_SCAN_BYTES`], the ceiling on what one
     /// query can make this process read whatever cutoff is configured.
     pub fn for_scan_cutoff(scan_cutoff: Option<i64>) -> Self {
+        let () = Self::BOUNDS_ARE_ORDERED;
         let scan_cutoff = scan_cutoff
             .and_then(|cutoff| usize::try_from(cutoff).ok())
             .filter(|cutoff| *cutoff > 0);
@@ -613,6 +623,7 @@ impl DataSource {
         objects: &s3_state::ComAmazonawsS3Amazons3State,
         budget: &mut Budget,
         metadata: &[MetadataColumn],
+        read_columns: Option<&HashSet<String>>,
     ) -> Result<(LocalObject, usize), Failure> {
         if self.columns.is_empty() {
             return Err(Failure::user(format!(
@@ -620,7 +631,7 @@ impl DataSource {
                 self.relation.database, self.relation.table
             )));
         }
-        let (rows, scanned) = self.rows(objects, budget, metadata)?;
+        let (rows, scanned) = self.rows(objects, budget, metadata, read_columns)?;
         let local_column = |position: &usize| {
             self.columns.get(*position).map(|column| LocalColumn {
                 name: column.name.clone(),
@@ -661,11 +672,17 @@ impl DataSource {
 
     /// The rows the objects at this table's location decode to, and the bytes read for
     /// them.
+    ///
+    /// `read_columns` are the columns the statement NAMES, or `None` where it reads every
+    /// column: what a read GOES THROUGH depends on how the objects hold a row, so a columnar
+    /// object is read through the column chunks those columns live in and a row-format object
+    /// whole ([`Self::scanned_bytes`]).
     fn rows(
         &self,
         objects: &s3_state::ComAmazonawsS3Amazons3State,
         budget: &mut Budget,
         metadata: &[MetadataColumn],
+        read_columns: Option<&HashSet<String>>,
     ) -> Result<(Vec<Vec<::rusqlite::types::Value>>, usize), Failure> {
         let mut rows: Vec<Vec<::rusqlite::types::Value>> = Vec::new();
         let mut scanned = 0usize;
@@ -714,8 +731,9 @@ impl DataSource {
                 // cutoff the query's workgroup sets and this emulator's own cap are both
                 // measured on the stored data a read goes through
                 // ([`Budget::charge_scan`]).
-                budget.charge_scan(&self.relation, object.body.len())?;
-                scanned = scanned.saturating_add(object.body.len());
+                let going_through = self.scanned_bytes(&object.body, read_columns);
+                budget.charge_scan(&self.relation, going_through)?;
+                scanned = scanned.saturating_add(going_through);
                 let split = format!("s3://{bucket_name}/{key}");
                 // What the hidden metadata columns carry is a property of THIS object, so it
                 // is read once per object and held by every row that object holds.
@@ -728,6 +746,30 @@ impl DataSource {
             }
         }
         Ok((rows, scanned))
+    }
+
+    /// How many bytes of ONE stored object a read of it GOES THROUGH, which is what the
+    /// query is charged for scanning and what `DataScannedInBytes` reports.
+    ///
+    /// The format decides it. A COLUMNAR object holds each column apart and self-describes
+    /// where, so a read goes through the chunks of the columns the statement NAMES and
+    /// nothing else — which is why projecting one column of such a table scans a fraction of
+    /// what the same projection over a row-format table does, why those per-column costs add
+    /// up, and why even reading every column costs less than the object holds
+    /// ([`parquet_objects::scanned_bytes`]). Every row-format object — one record per line,
+    /// whatever the SerDe — holds a whole row together, so a read goes through all of it
+    /// however few columns the statement projects. A statement that names every column (a
+    /// wildcard projection) goes through the whole object either way, and so does a columnar
+    /// object this reader cannot read the metadata of.
+    fn scanned_bytes(&self, body: &[u8], read_columns: Option<&HashSet<String>>) -> usize {
+        let whole = body.len();
+        if self.decoder != Decoder::Parquet {
+            return whole;
+        }
+        let Some(named) = read_columns else {
+            return whole;
+        };
+        parquet_objects::scanned_bytes(body, named).unwrap_or(whole)
     }
 
     /// The data directories a read of this table scans, and which partition the rows found

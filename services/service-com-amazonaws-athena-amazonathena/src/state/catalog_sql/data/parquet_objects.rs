@@ -15,7 +15,7 @@
 //! against a file's schema: a file carrying a column the table does not declare contributes
 //! nothing for it, and a column the table declares that the file does not carry is NULL.
 
-use ::std::collections::HashMap;
+use ::std::collections::{HashMap, HashSet};
 
 use ::parquet::file::reader::{FileReader, SerializedFileReader};
 use ::parquet::record::{Field, Row};
@@ -83,12 +83,13 @@ pub fn stores_parquet(library: &str, input_format: Option<&str>) -> bool {
 /// What one read of a Parquet object may decode, as the query reading it can still afford.
 ///
 /// A columnar object is held COMPRESSED and column by column, and what one of its pages
-/// decodes to is DECLARED in the file's own metadata — so the declaration is read as a lower
-/// bound on what decoding the object would cost, and a ROW GROUP declaring more than the
-/// query can hold is refused before a page of it is read. What the records really decode to
-/// is charged record by record by the caller, which is the authoritative bound and the one
-/// that stops a file whose groups each fit but whose records together do not; the stored
-/// bytes the object was fetched under bound its compressed size only.
+/// decodes to is DECLARED in the file's own metadata. Those declarations are the CALLER's
+/// bytes to spend: the reader allocates a page's buffer at the size the page declares, so
+/// holding the declarations of every row group — cumulatively, and together with the stored
+/// size of the body itself — to what the query may still decode is what bounds the memory
+/// one object can make this process allocate. What the records really decode to is charged
+/// record by record by the caller as well, which is the authoritative bound and the one that
+/// stops a file whose groups each fit but whose records together do not.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// How many records the rest of this query may still materialise.
@@ -103,9 +104,14 @@ pub struct Limits {
 /// work Hive calls a split is one object of the table's location, and an object that is not
 /// the Parquet file the table says it is cannot be opened as one at all.
 ///
-/// STREAMING: the reader decodes one record at a time and each is handed over as it is
-/// read, so a caller that charges a record against a budget stops the read at the first one
-/// over it rather than after the whole object is decoded.
+/// BOUNDED before anything is decoded, in this order: the STORED size of the body, which no
+/// read can be cheaper than; then the declarations of every row group ACCUMULATED — the rows
+/// it holds and the bytes its chunks decode to — so a file of many individually-conforming
+/// groups is refused as surely as one oversized group, and the buffers the reader allocates
+/// from those declarations are bounded by what the query may still decode. Then STREAMING:
+/// the reader decodes one record at a time and each is handed over as it is read, so a caller
+/// that charges a record against a budget stops the read at the first one over it rather than
+/// after the whole object is decoded.
 pub fn for_each_record(
     body: &[u8],
     relation: &Relation,
@@ -113,20 +119,32 @@ pub fn for_each_record(
     limits: Limits,
     mut take: impl FnMut(&Row) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
+    // The STORED bytes first, before the file's own metadata is read at all: what an object
+    // decodes to is at least what it holds, so a body larger than the query may still decode
+    // is refused whatever it declares about itself.
+    if body.len() > limits.decoded_bytes {
+        return Err(Budget::too_many_bytes(relation));
+    }
     let reader = SerializedFileReader::new(::bytes::Bytes::copy_from_slice(body))
         .map_err(|reason| cannot_open_split(split, &reason.to_string()))?;
+    let mut rows_left = limits.records;
+    let mut bytes_left = limits.decoded_bytes;
     for group in reader.metadata().row_groups() {
-        if declared(group.num_rows()) > limits.records {
+        let rows = declared(group.num_rows());
+        if rows > rows_left {
             return Err(Budget::too_many_rows(relation));
         }
+        rows_left -= rows;
         let chunks = group
             .columns()
             .iter()
             .map(|chunk| declared(chunk.uncompressed_size()))
             .fold(0usize, usize::saturating_add);
-        if declared(group.total_byte_size()).max(chunks) > limits.decoded_bytes {
+        let decoded = declared(group.total_byte_size()).max(chunks);
+        if decoded > bytes_left {
             return Err(Budget::too_many_bytes(relation));
         }
+        bytes_left -= decoded;
     }
     let records = reader
         .get_row_iter(None)
@@ -241,6 +259,40 @@ fn bad_data(relation: &Relation, reason: &str) -> Failure {
         "HIVE_BAD_DATA: Error reading the data of {}.{}: {reason}",
         relation.database, relation.table
     ))
+}
+
+/// How many STORED bytes of one Parquet object a read that needs the columns `named` GOES
+/// THROUGH, or `None` for a body this reader cannot read the metadata of.
+///
+/// This is what makes a columnar read cheaper than a row-format one: the file's own metadata
+/// says where each column of each row group lives and how many bytes it takes compressed, so
+/// a read that needs three of a table's ten columns goes through those three columns' chunks
+/// and nothing else. What is not a column chunk — the file's header, its footer and the page
+/// indexes that locate the chunks — is not row data and is not charged, so reading EVERY
+/// column of an object still costs less than the object holds, and per-column costs are
+/// ADDITIVE: reading two columns costs exactly what reading each of them costs.
+///
+/// A read that needs NO column the file carries (a count of its rows) goes through no chunk
+/// at all.
+pub fn scanned_bytes(body: &[u8], named: &HashSet<String>) -> Option<usize> {
+    let reader = SerializedFileReader::new(::bytes::Bytes::copy_from_slice(body)).ok()?;
+    let mut scanned = 0usize;
+    for group in reader.metadata().row_groups() {
+        for chunk in group.columns() {
+            // The leaf's own name, taken from the path it sits at: a nested column's leaves
+            // all belong to the column its path begins with, which is the name a statement
+            // addresses it by.
+            let column = chunk
+                .column_path()
+                .parts()
+                .first()
+                .map(|part| glue_state::fold_name(part));
+            if column.is_some_and(|column| named.contains(&column)) {
+                scanned = scanned.saturating_add(declared(chunk.compressed_size()));
+            }
+        }
+    }
+    Some(scanned)
 }
 
 #[cfg(test)]

@@ -138,8 +138,158 @@ fn type_of(expression: &Expr, types: &ColumnTypes) -> Option<String> {
         }
         // A conversion has the type it converts TO, which the statement wrote down.
         Expr::Cast { data_type, .. } => hive_types::reported_type(&data_type.to_string()),
+        // A LITERAL has the type its own text names: a character literal the character type
+        // of its own length, and a number written without a point one of the whole-number
+        // types by the width it needs.
+        Expr::Value(value) => literal_type(&value.value),
         _ => None,
     }
+}
+
+/// The type a literal has, as Athena's own SQL types it, or `None` for a literal this reader
+/// names no type for.
+fn literal_type(value: &SqlValue) -> Option<String> {
+    match value {
+        SqlValue::SingleQuotedString(text)
+        | SqlValue::DoubleQuotedString(text)
+        | SqlValue::EscapedStringLiteral(text) => {
+            Some(format!("varchar({})", text.chars().count()))
+        }
+        SqlValue::Boolean(..) => Some("boolean".to_string()),
+        SqlValue::Number(digits, ..) => {
+            if digits.contains('.') || digits.to_ascii_lowercase().contains('e') {
+                return Some("double".to_string());
+            }
+            match digits.parse::<i32>() {
+                Ok(_) => Some("integer".to_string()),
+                Err(_) => digits.parse::<i64>().ok().map(|_| "bigint".to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// An operator one statement applies to operands of types it is not defined between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mismatch {
+    /// The column the LEFT operand reads, where it reads one — what locates the operator in
+    /// the submitted text.
+    pub left_column: Option<String>,
+    /// The operator, as the statement wrote it.
+    pub operator: String,
+    /// The type of its left operand.
+    pub left: String,
+    /// The type of its right operand.
+    pub right: String,
+}
+
+/// The FIRST operator in `statement` whose operand types no such operator is defined
+/// between, or `None` for a statement whose types are all consistent.
+///
+/// What is judged is what the CATALOG and the statement's own literals fix: an arithmetic
+/// operator is defined between two numbers, between two instants and between a date and an
+/// interval — never between a number and character data — and a statement that applies one
+/// across those families is a failure of Athena's type analysis rather than a query whose
+/// engine reads one operand as the other. An operand whose type neither the catalog nor the
+/// statement fixes is judged against nothing: nothing here invents a type.
+#[must_use]
+pub fn mismatch(statement: &SqlStatement, types: &ColumnTypes) -> Option<Mismatch> {
+    use ::sqlparser::ast::BinaryOperator;
+
+    let mut found: Option<Mismatch> = None;
+    let _ = ::sqlparser::ast::visit_expressions(statement, |expression: &Expr| {
+        if found.is_some() {
+            return ControlFlow::<()>::Break(());
+        }
+        let Expr::BinaryOp { left, op, right } = expression else {
+            return ControlFlow::Continue(());
+        };
+        if !matches!(
+            op,
+            BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo
+        ) {
+            return ControlFlow::Continue(());
+        }
+        let (Some(left_type), Some(right_type)) =
+            (type_of(left, types), type_of(right, types))
+        else {
+            return ControlFlow::Continue(());
+        };
+        if !across_number_and_character(family(&left_type), family(&right_type)) {
+            return ControlFlow::Continue(());
+        }
+        found = Some(Mismatch {
+            left_column: named_column(left),
+            operator: op.to_string(),
+            left: left_type,
+            right: right_type,
+        });
+        ControlFlow::Break(())
+    });
+    found
+}
+
+/// The column one operand reads, where it reads one.
+fn named_column(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Nested(inner) => named_column(inner),
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|part| part.value.clone()),
+        _ => None,
+    }
+}
+
+/// Whether one operand is a NUMBER and the other CHARACTER data: the pairing arithmetic is
+/// defined between neither way round, whichever side each is on.
+///
+/// Only this pairing is judged. The families this reader cannot place — the calendar and
+/// interval types, over which arithmetic IS defined — and two operands of one family are
+/// left to the engine, because what is wanted here is the failure Athena's analysis is
+/// certain of and never a refusal of a statement it runs.
+fn across_number_and_character(left: Family, right: Family) -> bool {
+    matches!(
+        (left, right),
+        (Family::Number, Family::Character) | (Family::Character, Family::Number)
+    )
+}
+
+/// The FAMILY one type name belongs to: what decides whether an operator is defined between
+/// two types at all.
+fn family(reported: &str) -> Family {
+    let head = reported
+        .split_once('(')
+        .map_or(reported, |(head, _)| head)
+        .trim();
+    match head {
+        "tinyint" | "smallint" | "integer" | "bigint" | "real" | "double" | "decimal" => {
+            Family::Number
+        }
+        "varchar" | "char" | "json" => Family::Character,
+        "boolean" => Family::Boolean,
+        "varbinary" => Family::Binary,
+        _ => Family::Other,
+    }
+}
+
+/// The families a type name belongs to, for the one question asked of them: whether an
+/// operator applies across two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    /// Every numeric type, exact or approximate.
+    Number,
+    /// Character data.
+    Character,
+    /// A boolean.
+    Boolean,
+    /// Binary data.
+    Binary,
+    /// Everything else — the calendar and interval types among them — which this reader
+    /// judges nothing about, so two of them never mismatch.
+    Other,
 }
 
 #[cfg(test)]

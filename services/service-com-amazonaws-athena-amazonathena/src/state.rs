@@ -1996,10 +1996,14 @@ impl QueryExecutionRecord {
             statistics: Some(self.statistics_at(now)),
             work_group: Some(self.work_group.clone()),
             engine_version: Some(self.engine_version.clone()),
-            // `ExecutionParameters` holds at least one value, so a query that carried
-            // none reports the member as absent rather than as an empty list.
-            execution_parameters: (!self.execution_parameters.is_empty())
-                .then(|| self.execution_parameters.clone()),
+            // The values BOUND to a query's placeholders are not reported back: Athena
+            // leaves `ExecutionParameters` absent on every execution it reports, whether the
+            // submission carried the list itself or ran a prepared statement with arguments
+            // — the bound values are the part of a parameterised query a client keeps out of
+            // a response, and a read of the execution reports the statement, not them. They
+            // are held on the record all the same: what a statement BINDS decides what it
+            // computes, and a later submission's result reuse is keyed to them.
+            execution_parameters: None,
             substatement_type: self.substatement_type.clone(),
             query_results_s3_access_grants_configuration: None,
         }

@@ -38,8 +38,12 @@ pub mod expression_types;
 pub mod grammar;
 /// The `CREATE DATABASE` clauses Hive's DDL grammar takes beyond the general parser.
 pub mod hive_database;
+/// The column types Hive's DDL grammar takes beyond the general parser.
+pub mod hive_column_types;
 /// Whether a catalog column's declared type names a type, and the name a query reports.
 pub mod hive_types;
+/// Reading INTO a column whose value is a structure rather than one scalar.
+pub mod nested_values;
 /// The objects a statement WRITES, and the format and layout they are written in.
 pub mod query_output;
 /// What one submitted statement is, and the plan for running it.
@@ -85,6 +89,14 @@ pub const ERROR_TYPE_CATALOG_LAYER: i32 = 1006;
 /// metastore refused: a statement that would define an object the catalog already holds,
 /// and one that would drop a database that still holds tables.
 pub const ERROR_TYPE_DDL_TASK: i32 = ERROR_TYPE_CATALOG_LAYER;
+
+/// The `AthenaError$ErrorType` Athena publishes for a failure the query's EVALUATION raises
+/// over the values it was given rather than one its analysis or the catalog raises: a cast
+/// of a value that is not a value of the type it names.
+///
+/// RECORDED behaviour: such an execution settles FAILED with this type beside
+/// [`ERROR_CATEGORY_USER`].
+pub const ERROR_TYPE_EVALUATION: i32 = 1100;
 
 /// The `AthenaError$ErrorType` Athena publishes for the NOT-FOUND class: a statement
 /// naming a table or a database the data catalog does not hold.
@@ -342,6 +354,33 @@ impl Failure {
             ERROR_CATEGORY_USER,
             ERROR_TYPE_ENTITY_NOT_FOUND,
         )
+    }
+
+    /// The statement applies an operator to operands of types no such operator is defined
+    /// between.
+    ///
+    /// Athena's own class for a statement its TYPE ANALYSIS refuses, worded like its other
+    /// analysis failures: the `TYPE_MISMATCH: ` prefix and "Cannot apply operator: " are
+    /// fixed text, the two types are the ones the catalog and the statement's own literals
+    /// fix, the operator is the one the statement wrote, and the line and column are where it
+    /// wrote it.
+    pub fn type_mismatch(at: Position, mismatch: &expression_types::Mismatch) -> Self {
+        Self::user(format!(
+            "{TYPE_MISMATCH}: line {}:{}: Cannot apply operator: {} {} {}",
+            at.line, at.column, mismatch.left, mismatch.operator, mismatch.right
+        ))
+    }
+
+    /// The statement asked for a value to be read as a type it is not a value of, which the
+    /// engine raised while the statement RAN.
+    ///
+    /// `message` is the engine's own, in Athena's words for that class
+    /// (`super::query_engine::strict_casts`), and what is added here is the classification:
+    /// the caller's own statement is the cause, and the type Athena publishes for a failure
+    /// its EVALUATION raises over the values the statement asked for
+    /// ([`ERROR_TYPE_EVALUATION`]).
+    pub fn invalid_cast_argument(message: String) -> Self {
+        Self::classified(message, ERROR_CATEGORY_USER, ERROR_TYPE_EVALUATION)
     }
 
     /// The statement names a column no relation it reads carries.
@@ -766,7 +805,7 @@ pub fn execute<Eng: Send + Sync + 'static>(
         }
         Plan::Relations(relational) => {
             let started = Instant::now();
-            match resolved_sql(engine, handle, *relational, context, access, scan_cutoff) {
+            match resolved_sql(engine, handle, *relational, context, access, scan_cutoff, sql) {
                 Ok(prepared) => {
                     // Resolving the statement's relations against the catalog and reading
                     // the objects at their locations is what Athena measures as the query
@@ -807,7 +846,7 @@ pub fn execute<Eng: Send + Sync + 'static>(
                 Ok(output) => output,
                 Err(failure) => return refused(failure, started),
             };
-            match resolved_sql(engine, handle, query, context, access, scan_cutoff) {
+            match resolved_sql(engine, handle, query, context, access, scan_cutoff, sql) {
                 Ok(prepared) => {
                     // The query is run exactly as any other read is, and measured the same
                     // way: its relations are resolved first and the engine is handed SQL
@@ -1218,6 +1257,16 @@ fn sheet_values(result: &StoredResultSet) -> Vec<Vec<Option<&str>>> {
 /// code a client reads off it.
 const COLUMN_NOT_FOUND: &str = "COLUMN_NOT_FOUND";
 
+/// What Athena's message for a statement its TYPE ANALYSIS refuses opens with: the class of
+/// an operator applied to operands no such operator is defined between.
+const TYPE_MISMATCH: &str = "TYPE_MISMATCH";
+
+/// What Athena's message for a CAST it could not perform opens with: the class of a value
+/// that is not a value of the type the cast names. The engine itself raises the message, in
+/// those words (`super::query_engine::strict_casts`); this is where the CLASS it belongs to
+/// is put back on it.
+const INVALID_CAST_ARGUMENT: &str = "INVALID_CAST_ARGUMENT";
+
 /// Report a run the SQL engine stopped over a NAME the SUBMITTED statement wrote and it
 /// could not resolve as the failure of Athena's own class for it.
 ///
@@ -1245,6 +1294,14 @@ fn classify_unresolvable_name(
     else {
         return;
     };
+    // A failure the engine reports in ATHENA's own words is one of Athena's published
+    // classes already — the checked reading of a cast raises exactly that
+    // (`super::query_engine::strict_casts`) — so it carries that class's category and type
+    // rather than being reported as a plain engine error.
+    if message.starts_with(INVALID_CAST_ARGUMENT) {
+        completion.outcome = Failure::invalid_cast_argument(message.clone()).outcome();
+        return;
+    }
     let Some(column) = unresolvable_column(message) else {
         return;
     };
@@ -1670,6 +1727,9 @@ struct Prepared {
 }
 
 /// Resolve every relation one statement reads, and render the SQL the engine runs.
+///
+/// `sql` is the text the statement was SUBMITTED as, which is where a refusal about the
+/// statement reports a line and a column from.
 fn resolved_sql<Eng: Send + Sync + 'static>(
     engine: &Eng,
     handle: &DatabaseHandle,
@@ -1677,6 +1737,7 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
     context: &QueryContext,
     access: &DataLakeAccess,
     scan_cutoff: Option<i64>,
+    sql: &str,
 ) -> Result<Prepared, Failure> {
     let RelationalStatement {
         mut statement,
@@ -1737,9 +1798,14 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
             .copied()
             .filter(|column| statement::names_column(&statement, column.name()))
             .collect();
+        // Which COLUMNS the statement reads, for the same reason: a columnar object holds
+        // each column apart, so a read of one goes through the columns the statement names
+        // and no others — while a row-format object is read whole whatever it projects.
+        let read_columns = statement::read_columns(&statement);
         for source in &resolution.sources {
             hidden_columns.extend(source.hidden_columns());
-            let (object, scanned) = source.read(&store, &mut budget, &metadata)?;
+            let (object, scanned) =
+                source.read(&store, &mut budget, &metadata, read_columns.as_ref())?;
             scanned_bytes = scanned_bytes.saturating_add(scanned);
             objects.push(object);
         }
@@ -1778,7 +1844,29 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
             .iter()
             .flat_map(data::DataSource::visible_columns),
     );
+    // What those types make IMPOSSIBLE is judged here, before the engine is handed anything:
+    // an operator applied across two type families it is not defined between is a failure of
+    // Athena's analysis, and this engine would otherwise read one operand as the other and
+    // answer a value.
+    if let Some(found) = expression_types::mismatch(&statement, &column_types) {
+        let at = statement::operator_position(sql, found.left_column.as_deref(), &found.operator)
+            .unwrap_or(Position::START);
+        return Err(Failure::type_mismatch(at, &found));
+    }
     expression_types::resolve(&mut statement, &column_types);
+    // A reading INTO a column the catalog declares as a STRUCTURE is resolved here for the
+    // same reason: the engine holds such a value as the document the object carried it as,
+    // and its own dialect has no production for a field, an element or an entry of one (see
+    // [`nested_values`]).
+    nested_values::resolve(
+        &mut statement,
+        &nested_values::structures(
+            resolution
+                .sources
+                .iter()
+                .flat_map(data::DataSource::visible_columns),
+        ),
+    );
 
     Ok(Prepared {
         sql: statement::rewritten(&mut statement, &rewrites),

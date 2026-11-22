@@ -138,6 +138,18 @@ pub fn reported_type(declared: &str) -> Option<String> {
     }
 }
 
+/// Whether `declared` — the type text a catalog column carries — names a COLLECTION or
+/// RECORD type: one whose values are themselves values of a declared type, written with the
+/// angle brackets `array<…>`, `map<…,…>`, `struct<…>` and `uniontype<…>` take.
+///
+/// Such a column's value is a STRUCTURE rather than one scalar, so a statement reads INTO it
+/// — a field, an element or an entry of it — which is what makes this question worth asking
+/// (see [`super::nested_values`]).
+#[must_use]
+pub fn is_nested(declared: &str) -> bool {
+    matches!(reads(declared, 0), Some(Read::Elements))
+}
+
 /// What reading one type text established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Read<'t> {

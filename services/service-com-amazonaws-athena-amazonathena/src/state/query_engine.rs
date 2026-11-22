@@ -28,6 +28,12 @@ mod exact_decimal;
 /// rather than by the values it produced.
 mod projection;
 
+/// The COLUMNS a relation alias names, which this engine's dialect names nowhere.
+mod relation_columns;
+
+/// What a CAST does with a value that is not a value of the type it names.
+mod strict_casts;
+
 /// The table functions Athena's own language reads rows from that this engine's dialect
 /// has no production for.
 mod table_functions;
@@ -107,9 +113,12 @@ const NO_ORIGIN_RELATION: &str = "";
 /// The EMULATOR's own bound, with no AWS counterpart (Athena's own query timeout is
 /// measured in minutes): a query that is still running past this is stopped and the
 /// execution reports FAILED, so no request can keep an engine thread for longer than
-/// this however expensive the SQL it submitted is.
-pub const MAX_QUERY_DEADLINE: Duration = Duration::from_secs(5);
-
+/// this however expensive the SQL it submitted is. Set to what a read of the largest data
+/// one query may go through ([`MAX_MATERIALISED_BYTES`]) needs to finish — listing,
+/// decoding and materialising a table of that many bytes, and then computing over it —
+/// because a scan AWS completes must complete here too; a query that wants more than that
+/// is stopped rather than given the thread.
+pub const MAX_QUERY_DEADLINE: Duration = Duration::from_secs(10);
 /// Step budget per second of [`MAX_QUERY_DEADLINE`], counted in SQLite virtual-machine
 /// instructions. A wall-clock deadline cannot stop a CPU-bound query if the host clock
 /// stalls or the process is suspended; this can. Set well above the instruction rate the
@@ -137,25 +146,31 @@ const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// The EMULATOR's own bound, with no AWS counterpart (Athena scans whatever the table's
 /// location holds): without it the objects a caller put at one location would decide how
-/// much this process holds for one query.
-pub const MAX_MATERIALISED_ROWS: usize = 200_000;
+/// much this process holds for one query. Raised with the byte bound below only as far as a
+/// table of [`MAX_MATERIALISED_BYTES`] of narrow records needs, so that it is still a bound
+/// an ordinary read meets rather than a formality.
+pub const MAX_MATERIALISED_ROWS: usize = 750_000;
 
 /// How many BYTES of object data one query may read while materialising the catalog
 /// tables it reads; the byte counterpart of [`MAX_MATERIALISED_ROWS`].
-pub const MAX_MATERIALISED_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Set above the smallest data usage cutoff a workgroup may configure
+/// (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`, `@range` min 10000000), so a table
+/// a caller built to exercise that cutoff is one a query with NO cutoff still reads whole:
+/// what bounds what such a read HOLDS is the rows and the values one query may materialise
+/// ([`MAX_MATERIALISED_ROWS`], [`MAX_MATERIALISED_CELLS`]), which this does not raise.
+pub const MAX_MATERIALISED_BYTES: usize = 24 * 1024 * 1024;
 
 /// The CEILING on the object data one query may read, whatever data usage cutoff the
 /// workgroup it runs in configures.
 ///
-/// A workgroup cutoff is a limit the caller sets, and the smallest one the model admits
-/// (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`, `@range` min 10000000) is already
-/// above [`MAX_MATERIALISED_BYTES`] — so a query in such a workgroup reads up to its cutoff
-/// rather than stopping at this emulator's default cap, which would pre-empt the limit the
-/// caller asked to be held to. The cutoff itself is a caller-chosen number of no upper
-/// bound, so this is where that raising stops: the EMULATOR's own ceiling on what one query
-/// can make this process read. What a read then holds is bounded as before, by the rows and
-/// the values one query may materialise.
-pub const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
+/// A workgroup cutoff is a limit the caller sets, so a query in such a workgroup reads up to
+/// its cutoff rather than stopping at this emulator's default cap, which would pre-empt the
+/// limit the caller asked to be held to. The cutoff itself is a caller-chosen number of no
+/// upper bound, so this is where that raising stops: the EMULATOR's own ceiling on what one
+/// query can make this process read. What a read then holds is bounded as before, by the
+/// rows and the values one query may materialise.
+pub const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 /// How many VALUES (rows times columns) one query may materialise from the Data Catalog.
 ///
@@ -163,7 +178,7 @@ pub const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 /// not: how many rows an object holds and how many columns a table declares are both
 /// caller-chosen, and one value costs memory whatever it holds, so a row of a wide table
 /// is charged for its width.
-pub const MAX_MATERIALISED_CELLS: usize = 500_000;
+pub const MAX_MATERIALISED_CELLS: usize = 2_000_000;
 
 /// How many RELATIONS one statement may resolve through the data catalog, counted over
 /// the whole statement and every level of view it reads through.
@@ -208,9 +223,13 @@ const MAX_EXPR_DEPTH: i32 = 100;
 const MAX_COMPOUND_SELECT: i32 = 50;
 
 /// `PRAGMA max_page_count`, applied to BOTH schemas a statement can write (`main` and
-/// `temp`). At SQLite's default 4 KiB page this is 16 MiB each, so a query that builds a
-/// huge table runs out of database rather than out of the host's memory.
-const MAX_DATABASE_PAGES: i64 = 4_096;
+/// `temp`). At SQLite's default 4 KiB page this is 48 MiB each, so a query that builds a
+/// huge table runs out of database rather than out of the host's memory. Above what the
+/// object data one query ordinarily reads materialises to, and under what the engine may
+/// ALLOCATE in all ([`MAX_ENGINE_HEAP_BYTES`], a process-wide ceiling this does not raise) —
+/// which is the bound that holds however many databases are open, and the one a read past
+/// either page count meets first.
+const MAX_DATABASE_PAGES: i64 = 12_288;
 
 /// `PRAGMA hard_heap_limit`: the ceiling on what the SQL engine may allocate, so engine
 /// memory is capped however many databases are open and whatever one query does.
@@ -317,6 +336,11 @@ impl Database {
         // binary double (see [`exact_decimal`]). The authorizer below admits the call as it
         // admits every other function that is not one of `DENIED_SQL_FUNCTIONS`.
         exact_decimal::register_exact_decimal(&connection)?;
+
+        // The CHECKED reading of a cast, registered for the same reason: a value that is not
+        // a value of the type a cast names fails the query rather than being read by this
+        // engine's own rules (see [`strict_casts`]).
+        strict_casts::register_strict_casts(&connection)?;
 
         // Default-deny: every action a query legitimately needs is named, and anything
         // else — including an action a future engine version introduces — is refused.
@@ -688,11 +712,19 @@ pub fn run_over(
     // same rows in a production it has; one carrying none is run exactly as submitted.
     let expanded = table_functions::expanded(sql);
     let sql = expanded.as_deref().unwrap_or(sql);
+    // A relation whose alias names its own COLUMNS names them where this dialect names the
+    // columns of a relation instead; one whose aliases name none is, again, run as written.
+    let aliased = relation_columns::named_columns(sql);
+    let sql = aliased.as_deref().unwrap_or(sql);
     // An exact-numeric value the statement PROJECTS is read as the digits it has rather
     // than through this engine's double; a statement projecting none is, again, run as
     // submitted.
     let exact = exact_decimal::exactly_projected(sql);
     let sql = exact.as_deref().unwrap_or(sql);
+    // A cast to a number or a boolean has its argument judged before the cast reads it, so a
+    // value that is not a value of that type fails the query as Athena fails it.
+    let checked = strict_casts::checked(sql);
+    let sql = checked.as_deref().unwrap_or(sql);
     let mut database = handle.lock().unwrap_or_else(PoisonError::into_inner);
     let guard = Arc::new(RunGuard::default());
     let handler = Arc::clone(&guard);
@@ -979,6 +1011,13 @@ fn materialise(
 }
 
 /// Define `table` under the already-quoted name `quoted` and insert every row it holds.
+///
+/// The rows go in under ONE transaction of the engine's own: an in-memory database still
+/// commits every statement that is not inside one, and a catalog table is materialised a row
+/// at a time — so for a table of many rows the commits, and not the inserts, would be most
+/// of the run. The transaction is rolled back if any row cannot be inserted, which is the
+/// same outcome a failed materialisation had before: the run reports the engine's error and
+/// the table it was building is not read.
 fn define_table(
     connection: &rusqlite::Connection,
     quoted: &str,
@@ -986,11 +1025,15 @@ fn define_table(
 ) -> Result<(), RunFailure> {
     declare_table(connection, quoted, &table.columns)?;
     let placeholders = vec!["?"; table.columns.len()].join(", ");
-    let mut insert =
-        connection.prepare(&format!("INSERT INTO {quoted} VALUES ({placeholders})"))?;
-    for row in &table.rows {
-        insert.execute(rusqlite::params_from_iter(row.iter()))?;
+    let rows = connection.unchecked_transaction()?;
+    {
+        let mut insert =
+            rows.prepare(&format!("INSERT INTO {quoted} VALUES ({placeholders})"))?;
+        for row in &table.rows {
+            insert.execute(rusqlite::params_from_iter(row.iter()))?;
+        }
     }
+    rows.commit()?;
     Ok(())
 }
 

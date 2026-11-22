@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -81,6 +71,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::service_com_amazonaws_glue_awsglue::state as glue_state;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,20 +141,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDatabase"))
+        // Where this read's metadata comes from is decided by the catalog the request
+        // names and the registry this account holds, exactly as it is for the LISTING of
+        // the same databases (`crate::ops::list_databases`) and for the read of one table's
+        // metadata — so one catalog name reads alike whichever metadata read addresses it.
+        let catalog_id = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(internal_server("Athena state is not reachable on this engine"));
+            };
+            // The registry's lock is taken and released here, before the catalog's own
+            // store is reached, so no two stores are ever held at once.
+            let store = state.lock();
+            match crate::state::metadata_source(&store.data_catalogs, &input.catalog_name) {
+                crate::state::MetadataSource::GlueDataCatalog(catalog_id) => catalog_id,
+                crate::state::MetadataSource::ExternalMetastore(catalog_type) => {
+                    return Err(metadata_exception(crate::state::metastore_unreachable(
+                        &input.catalog_name,
+                        &catalog_type,
+                    )));
+                }
+                crate::state::MetadataSource::ForeignGlueCatalog(catalog_id) => {
+                    return Err(metadata_exception(crate::state::foreign_glue_catalog(
+                        &input.catalog_name,
+                        &catalog_id,
+                    )));
+                }
+                crate::state::MetadataSource::Unregistered => {
+                    return Err(invalid_request(crate::state::metadata_catalog_not_found(
+                        &input.catalog_name,
+                    )));
+                }
+            }
+        };
+
+        let Some(catalog) = glue_state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the Glue Data Catalog store is not reachable on this engine",
+            ));
+        };
+        let catalog = catalog.lock();
+        // The catalog keys a database by its folded name and folds a requested name the
+        // same way, so a database is reachable by any casing the client sends — the one
+        // resolution every metadata read here takes.
+        let Some(database) = catalog.database(&catalog_id, &input.database_name) else {
+            return Err(metadata_exception(crate::state::database_not_found(
+                &input.database_name,
+            )));
+        };
+        Ok(GetDatabaseOutput {
+            database: Some(crate::state::to_database(database)),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400) for a request Athena itself refuses:
+/// "Indicates that something is wrong with the input to the request." The catalog this
+/// read addresses is the request's own member, so the refusal carries the code for a
+/// request at fault ([`crate::state::ERROR_CODE_INVALID_INPUT`]).
+fn invalid_request(message: impl Into<String>) -> GetDatabaseError {
+    GetDatabaseError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
+}
+
+/// The operation's own client error (HTTP 400) for what the METASTORE answered: "An
+/// exception that Athena received when it called a custom metastore. Occurs if the error
+/// is not caused by user input (InvalidRequestException) or from the Athena platform."
+fn metadata_exception(message: impl Into<String>) -> GetDatabaseError {
+    GetDatabaseErrorModeled::MetadataException(MetadataException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The operation's own server error (HTTP 500): "Indicates a platform issue, which may be
+/// due to a transient condition or outage."
+fn internal_server(message: &str) -> GetDatabaseError {
+    GetDatabaseErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
