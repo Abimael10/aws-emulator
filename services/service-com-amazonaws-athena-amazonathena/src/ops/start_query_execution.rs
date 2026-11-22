@@ -394,6 +394,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // would really run under against the one the earlier call ran under.
             let managed_query_results =
                 crate::state::resolved_managed_query_results(group.as_ref());
+            // A workgroup that FLOORS the encryption of its results admits only a
+            // submission at or above that floor: "when enabled, workgroup users can set
+            // encryption only to the minimum level set by the administrator or higher when
+            // they submit queries"
+            // (`WorkGroupConfiguration$EnableMinimumEncryptionConfiguration`). So a
+            // submission naming a weaker option is refused here and mints no execution —
+            // and writes nothing — rather than running under an encryption the workgroup
+            // does not allow (see `crate::state::result_encryption`).
+            if let Some(refusal) = crate::state::minimum_encryption_refusal(
+                input
+                    .result_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.encryption_configuration.as_ref()),
+                group.as_ref(),
+            ) {
+                return Err(invalid_request(refusal));
+            }
             let result_configuration = match crate::state::resolved_result_configuration(
                 input.result_configuration,
                 group.as_ref(),
@@ -443,18 +460,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // condition on the write Athena itself would make (see
         // `crate::state::result_access::expected_owner_refusal`), so a destination owned by
         // another account is refused whatever the caller's own policies allow.
-        let result_write_refusal = crate::state::result_object_uri(
+        let result_object_uri = crate::state::result_object_uri(
             statement_type,
             result_configuration.output_location.as_deref(),
             &id,
-        )
-        .and_then(|uri| {
+        );
+        let result_write_refusal = result_object_uri.as_deref().and_then(|uri| {
             crate::state::result_access::expected_owner_refusal(
                 result_configuration.expected_bucket_owner.as_deref(),
-                &uri,
+                uri,
             )
-            .or_else(|| crate::state::result_access::write_refusal(&*self.engine, ctx, &uri))
+            .or_else(|| crate::state::result_access::write_refusal(&*self.engine, ctx, uri))
         });
+
+        // HOW the results are encrypted at rest is the resolved configuration's own
+        // `EncryptionConfiguration`, and the key it names is resolved against KMS BEFORE the
+        // statement runs — the same resolution Amazon S3 makes of a write that asks for that
+        // encryption (see `crate::state::query_results::resolved_encryption`). A key KMS
+        // mints no data key under encrypts nothing, so such a submission is a write Athena
+        // cannot make: it joins the refusals above and settles the execution FAILED carrying
+        // KMS's own sentence, rather than saving results with no encryption on them.
+        let (result_encryption, encryption_refusal) = if result_object_uri.is_none() {
+            (None, None)
+        } else {
+            let region = crate::state::authorization::region_from_request(ctx.parts());
+            match crate::state::query_results::resolved_encryption(
+                &*self.engine,
+                &region,
+                result_configuration.encryption_configuration.as_ref(),
+            ) {
+                Ok(encryption) => (encryption, None),
+                Err(refusal) => (None, Some(refusal)),
+            }
+        };
+        let result_write_refusal = result_write_refusal.or(encryption_refusal);
 
         // Everything that reads or writes the registry happens here, and the lock is
         // released before the engine is asked to run anything: a query running on one
@@ -681,7 +720,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(crate::state::query_results::result_objects)
                 .unwrap_or_default()
         };
-        crate::state::query_results::write(&*self.engine, results);
+        crate::state::query_results::write(&*self.engine, results, &result_encryption);
 
         // Athena ANNOUNCES a query as it moves: the state this submission put the execution
         // in is published onto the account's default event bus, and the clock pump this

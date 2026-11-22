@@ -158,6 +158,10 @@ tokio = { workspace = true, features = ["time"] }
 # the same path a client's own rule takes.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# KMS, mounted beside Athena and Amazon S3 on one engine in the result-encryption suite: a
+# query whose results are written under SSE-KMS is stored under a customer managed key that
+# service holds, so without it mounted there is no key for the write to resolve.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

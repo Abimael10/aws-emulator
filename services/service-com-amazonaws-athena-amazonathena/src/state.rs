@@ -118,6 +118,11 @@ pub mod query_results;
 /// Whether the resolved output location is one the caller may write a query's results to.
 pub mod result_access;
 
+/// Which encryption a query's results may be written under, and the floor a workgroup puts
+/// under them.
+mod result_encryption;
+pub use result_encryption::*;
+
 /// Whether a submission is answered out of an earlier query's results, and which.
 mod result_reuse;
 pub use result_reuse::*;
@@ -2140,6 +2145,14 @@ pub fn new_query_execution_id() -> String {
 /// own to use — so the client's own stands even where the workgroup enforces its
 /// configuration. `None` when neither names a location, which is the refusal the quoted
 /// sentence calls for.
+///
+/// A workgroup that FLOORS the encryption of its results ([`floors_encryption`]) supplies
+/// its own `EncryptionConfiguration` to a request that names none, for the same reason it
+/// supplies its output location: the flag "enforces a minimal level of encryption for the
+/// workgroup for query and calculation results that are written to Amazon S3", so a
+/// submission asking for no encryption runs at the floor rather than writing results with
+/// none. A request naming an encryption BELOW that floor is refused instead
+/// ([`minimum_encryption_refusal`]).
 pub fn resolved_result_configuration(
     requested: Option<ResultConfiguration>,
     work_group: Option<&WorkGroupRecord>,
@@ -2155,7 +2168,14 @@ pub fn resolved_result_configuration(
         match (requested, group.clone()) {
             (Some(mut requested), group) => {
                 if output_location(Some(&requested)).is_none() {
-                    requested.output_location = group.and_then(|group| group.output_location);
+                    requested.output_location = group
+                        .as_ref()
+                        .and_then(|group| group.output_location.clone());
+                }
+                if requested.encryption_configuration.is_none() && floors_encryption(work_group) {
+                    requested.encryption_configuration = group
+                        .as_ref()
+                        .and_then(|group| group.encryption_configuration.clone());
                 }
                 Some(requested)
             }

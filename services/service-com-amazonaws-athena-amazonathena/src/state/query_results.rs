@@ -24,6 +24,12 @@
 //! perform; it is logged and the execution is left exactly as the engine reported it, because
 //! nothing about the destination is this service's own state to invent.
 //!
+//! HOW the objects are stored is the resolved configuration's own as well: its
+//! `EncryptionConfiguration` "indicates the encryption option used […] and key information"
+//! for the results, so each object of a run is written under the server-side encryption that
+//! option names, with the key it names resolved against KMS ([`resolved_encryption`]) \u2014 which
+//! is what a later read of a result object reports back.
+//!
 //! WHEN: the objects are saved by the call that ran the statement, as soon as the run has
 //! reported — ahead of the instant the record's completion falls due, which is what makes the
 //! execution terminal. So the saved results are already there when the query first reports a
@@ -46,8 +52,9 @@ use ::service_com_amazonaws_s3_amazons3::state as s3_state;
 
 use super::catalog_sql::data::parse_s3_uri;
 use super::query_engine::{Outcome, StoredResultSet};
+use super::result_encryption::{ENCRYPTION_OPTION_SSE_KMS, ENCRYPTION_OPTION_SSE_S3};
 use super::QueryExecutionRecord;
-use crate::ops::types::{ColumnInfo, Row};
+use crate::ops::types::{ColumnInfo, EncryptionConfiguration, Row};
 
 /// The suffix of the METADATA object written beside a results object: Athena saves a
 /// query's results and "metadata information" together, keyed
@@ -132,13 +139,113 @@ pub fn result_objects(record: &QueryExecutionRecord) -> Vec<ResultObject> {
     ]
 }
 
-/// Save `objects` into the object store on `engine`.
+/// The server-side encryption the objects of one query's results are stored under: the
+/// configuration the write RECORDS on each of them, or `None` when the resolved result
+/// configuration asks the object store for no server-side encryption at all — the case the
+/// destination bucket's own default encryption configuration decides, exactly as it does for
+/// a client's own write that names none.
+pub type ResultEncryption = Option<s3_state::ObjectEncryption>;
+
+/// Which server-side encryption the resolved result `configuration` asks the object store
+/// for, before the key it names is resolved.
+///
+/// Two of the three options are SERVER-side: `SSE_S3` is "Amazon S3 server-side encryption
+/// with Amazon S3-managed keys", which is the object store's own
+/// `ServerSideEncryption` value for that encryption
+/// ([`s3_state::DEFAULT_SSE_ALGORITHM`]), and `SSE_KMS` is "server-side encryption with
+/// KMS-managed keys" under the key the configuration names — "for `SSE_KMS` and `CSE_KMS`,
+/// this is the KMS key ARN or ID" (`EncryptionConfiguration$KmsKey`), so the reference is
+/// carried as given and resolved by [`resolved_encryption`].
+///
+/// `CSE_KMS` is CLIENT-side encryption, so the write itself asks the object store for no
+/// server-side encryption of its own — which is what a configuration naming no encryption at
+/// all asks for too, and the case the destination bucket's default encryption decides.
+fn requested_encryption(configuration: Option<&EncryptionConfiguration>) -> ResultEncryption {
+    let configuration = configuration?;
+    // Neither option supplies an encryption context, an S3 Bucket Key or a customer-provided
+    // key: a result configuration names an option and a key, and nothing else about the
+    // encryption.
+    match configuration.encryption_option.as_str() {
+        // The S3-managed encryption is performed under a key of Amazon S3's own, which is
+        // reported nowhere, so this write names the algorithm alone.
+        ENCRYPTION_OPTION_SSE_S3 => Some(s3_state::ObjectEncryption {
+            sse_algorithm: Some(s3_state::DEFAULT_SSE_ALGORITHM.to_string()),
+            ..s3_state::ObjectEncryption::default()
+        }),
+        ENCRYPTION_OPTION_SSE_KMS => Some(s3_state::ObjectEncryption {
+            sse_algorithm: Some(s3_state::KMS_SSE_ALGORITHMS[0].to_string()),
+            // The reference as the configuration wrote it, which [`resolved_encryption`]
+            // resolves to the key itself; a configuration naming none leaves the key to the
+            // object store's own rule for a write that names none.
+            kms_key_id: configuration
+                .kms_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
+            ..s3_state::ObjectEncryption::default()
+        }),
+        _ => None,
+    }
+}
+
+/// The encryption one query's result objects are written under, with the key the resolved
+/// result `configuration` names RESOLVED against KMS, or the sentence KMS refused that key
+/// with.
+///
+/// Resolved through the object store's own resolution of a write's SSE-KMS key
+/// ([`s3_state::sse_kms::write_key`]), so the value a read of a result object reports is the
+/// key itself whichever of its three spellings the configuration named — "the KMS key ARN or
+/// ID" (`EncryptionConfiguration$KmsKey`) — and a reference KMS mints no data key for
+/// encrypts nothing, which is a write this service cannot make at all.
+///
+/// `region` is the Region the submission was signed for, which is where the key is resolved:
+/// a KMS key is a regional resource, and the results and the key they are encrypted under
+/// live at the same endpoint.
+///
+/// LOCKING: this takes the KMS store's lock and no other, and no store of this service is
+/// held while it asks.
+pub fn resolved_encryption<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    configuration: Option<&EncryptionConfiguration>,
+) -> Result<ResultEncryption, String> {
+    let Some(requested) = requested_encryption(configuration) else {
+        return Ok(None);
+    };
+    match s3_state::sse_kms::write_key(engine, region, &requested) {
+        // Nothing was asked of KMS — the encryption is not the KMS one, or the reference is
+        // one KMS declines before resolving anything — so the write records what the
+        // configuration named, unresolved.
+        s3_state::sse_kms::WriteKey::Unasked => Ok(Some(requested)),
+        // A reference KMS does resolve names ONE key whatever form it took, so what the
+        // objects record is that key's ARN.
+        s3_state::sse_kms::WriteKey::Resolved(key) => Ok(Some(s3_state::ObjectEncryption {
+            kms_key_id: Some(key),
+            ..requested
+        })),
+        // KMS mints no data key under that reference, so there is nothing to encrypt the
+        // results with: the write cannot be made, in KMS's own words for the reference.
+        s3_state::sse_kms::WriteKey::Refused(relay) => Err(relay.message),
+    }
+}
+
+/// Save `objects` into the object store on `engine`, each under `encryption`.
 ///
 /// Each one is stored at the key its URI names, in the bucket its URI names, through the
 /// one way an object is recorded there — so a saved result counts against the object
 /// store's own budgets and is read back by that store's own operations, exactly like an
 /// object a client wrote itself.
-pub fn write<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<ResultObject>) {
+///
+/// `encryption` is the server-side encryption the execution's resolved result configuration
+/// settled on ([`resolved_encryption`]), which EVERY object of that execution is stored
+/// under: the results and the metadata information beside them are one query's results, so
+/// a read of either reports the encryption that query's configuration asked for.
+pub fn write<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    objects: Vec<ResultObject>,
+    encryption: &ResultEncryption,
+) {
     if objects.is_empty() {
         return;
     }
@@ -161,11 +268,23 @@ pub fn write<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<ResultObject
         };
         let written = {
             let mut store = state.lock();
-            store.put_object(
-                &bucket,
-                &key,
-                s3_state::Object::stored(object.body, Some(object.content_type.to_string())),
-            )
+            // HOW the object is encrypted at rest: the configuration this execution's
+            // result configuration settled on, and the destination bucket's own default
+            // encryption configuration where it asks for none — the object store's own rule
+            // for every write another service makes into a bucket, so a result object and a
+            // client's own object in that bucket are stored under one record of it.
+            let encryption = match encryption {
+                Some(encryption) => encryption.clone(),
+                None => s3_state::written_object_encryption(&store, &bucket, None),
+            };
+            let mut stored =
+                s3_state::Object::stored(object.body, Some(object.content_type.to_string()));
+            // An object sealed under a key carries an entity tag that is NOT the digest of
+            // its bytes, which is the object store's own rule for the tag a stored object
+            // takes ([`s3_state::stored_object_etag`]).
+            stored.etag = s3_state::stored_object_etag(&stored.etag, &encryption);
+            stored.encryption = encryption;
+            store.put_object(&bucket, &key, stored)
         };
         match written {
             Some(s3_state::ObjectWrite::Created | s3_state::ObjectWrite::Replaced) => {}
