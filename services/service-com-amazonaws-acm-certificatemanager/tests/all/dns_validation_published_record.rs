@@ -11,6 +11,12 @@
 //! request keeps waiting the documented 72-hour window out and carries no
 //! `FailureReason`.
 //!
+//! Resolving it is the whole of the rule: a record only resolves where the public DNS
+//! delegation chain for the name reaches the zone it was published in, which is what
+//! [`a_zone_the_public_dns_does_not_reach_proves_nothing`] spans — so every zone these
+//! suites publish a proof in is one the account holds the delegation for
+//! ([`register_domain`]).
+//!
 //! The tables span what the rule generalises over: how many names the certificate
 //! covers and how deep they sit, a wildcard name as against a plain one, the spelling
 //! the record is published with (trailing dot, letter case), and — on the negative side
@@ -38,6 +44,13 @@ use crate::certificate_validation_state_machine::{
 /// The host a Route 53 request addresses, which is also the routing signal the router
 /// resolves that service from.
 const DNS_ENDPOINT: &str = "route53.amazonaws.com";
+
+/// The host a Route 53 Domains request addresses, and the routing signal for that
+/// service.
+const REGISTRAR_ENDPOINT: &str = "route53domains.us-east-1.amazonaws.com";
+
+/// The `X-Amz-Target` prefix every Route 53 Domains operation is addressed under.
+const REGISTRAR_TARGET_PREFIX: &str = "Route53Domains_v20140515";
 
 /// The `VPCRegion` the private-zone row associates its VPC in (a value of the modelled
 /// `VPCRegion` enum).
@@ -80,7 +93,87 @@ pub(crate) fn router_with_dns() -> (MultiServiceRouter, Arc<engine::InMemoryEngi
     router.register_service(
         service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(Arc::clone(&engine)),
     );
+    // The REGISTRAR, because what puts a hosted zone into the public DNS at all is the
+    // registry's delegation of the name, which this account holds as a registration.
+    router.register_service(
+        service_com_amazonaws_route53domains_route53domains_v20140515::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
+}
+
+/// Send one Route 53 Domains request and return `(status, parsed body)`.
+async fn registrar_call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(http::header::HOST, REGISTRAR_ENDPOINT)
+        .header(http::header::CONTENT_TYPE, "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{REGISTRAR_TARGET_PREFIX}.{operation}"))
+        .body(Bytes::from(body.to_string()))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed: Value = serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// Register `name` with the registrar, the way the account that holds it does.
+///
+/// This is what delegates the name to this account's own DNS: registering a domain
+/// "[c]reates a Route 53 hosted zone that has the same name as the domain. Route 53
+/// assigns four name servers to your hosted zone and automatically updates your domain
+/// registration with the names of these name servers" (`RegisterDomain` doc). Without a
+/// registration nothing above the account delegates the name, so no zone the account
+/// creates for it is ever asked — which is what
+/// [`a_zone_the_public_dns_does_not_reach_proves_nothing`] pins.
+pub(crate) async fn register_domain(case: &str, router: &MultiServiceRouter, name: &str) {
+    // The contacts are required members the registry stores as sent; nothing here reads
+    // them back, so one contact stands for all three.
+    let contact = json!({
+        "FirstName": "Dns",
+        "LastName": "Prober",
+        "ContactType": "PERSON",
+        "Email": "dns-prober@dns-proof.invalid",
+    });
+    let body = json!({
+        "DomainName": name,
+        "DurationInYears": 1,
+        "AdminContact": contact,
+        "RegistrantContact": contact,
+        "TechContact": contact,
+    });
+    let (status, reply) = registrar_call(router, "RegisterDomain", &body).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: registering {name} must be accepted, got {status} {reply}"
+    );
+}
+
+/// The registrable name an apex of these suites sits under: the labels after its first.
+///
+/// Every apex these suites create a zone for is one label under a registrable name
+/// (`alpha.dns-proof.net` under `dns-proof.net`), and the registrable name is the one a
+/// registration is held for — see [`register_domain`].
+fn registrable_part(apex: &str) -> &str {
+    apex.split_once('.').map_or(apex, |(_, rest)| rest)
+}
+
+/// Create a PUBLIC hosted zone for `apex` AND hold the registration that delegates it,
+/// so the zone is one the public DNS reaches.
+pub(crate) async fn create_delegated_public_zone(
+    router: &MultiServiceRouter,
+    apex: &str,
+    caller_reference: &str,
+) -> String {
+    let zone = create_public_zone(router, apex, caller_reference).await;
+    register_domain(caller_reference, router, registrable_part(apex)).await;
+    zone
 }
 
 /// Send one Route 53 request and return `(status, body)`.
@@ -189,14 +282,41 @@ pub(crate) async fn submit_change(
     action: &str,
     record: &Record,
 ) -> String {
+    let values = [record.value.clone()];
+    submit_record_set(
+        case,
+        router,
+        zone_id,
+        action,
+        &record.name,
+        &record.rr_type,
+        &values,
+    )
+    .await
+}
+
+/// Submit one change batch applying `action` to the record set at `name` carrying every
+/// value in `values` — the general form [`submit_change`] writes one value through.
+async fn submit_record_set(
+    case: &str,
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    action: &str,
+    name: &str,
+    rr_type: &str,
+    values: &[String],
+) -> String {
+    let records: String = values
+        .iter()
+        .map(|value| format!("<ResourceRecord><Value>{value}</Value></ResourceRecord>"))
+        .collect();
     let body = format!(
         "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
          <ChangeBatch><Changes><Change><Action>{action}</Action><ResourceRecordSet>\
-         <Name>{}</Name><Type>{}</Type><TTL>{RECORD_TTL}</TTL>\
-         <ResourceRecords><ResourceRecord><Value>{}</Value></ResourceRecord></ResourceRecords>\
+         <Name>{name}</Name><Type>{rr_type}</Type><TTL>{RECORD_TTL}</TTL>\
+         <ResourceRecords>{records}</ResourceRecords>\
          </ResourceRecordSet></Change></Changes></ChangeBatch>\
-         </ChangeResourceRecordSetsRequest>",
-        record.name, record.rr_type, record.value
+         </ChangeResourceRecordSetsRequest>"
     );
     let (status, reply) = dns_call(
         router,
@@ -207,7 +327,8 @@ pub(crate) async fn submit_change(
     .await;
     assert_eq!(
         status, 200,
-        "case {case}: the {action} of {record:?} must be accepted, got {status} {reply}"
+        "case {case}: the {action} of the {rr_type} record set at {name} must be accepted, \
+         got {status} {reply}"
     );
     bare_id_after(&reply, "/change/")
 }
@@ -452,7 +573,7 @@ async fn a_published_validation_record_issues_the_certificate() {
         // A fresh store per row, so one row's zone or certificate cannot explain
         // another's.
         let (router, engine) = router_with_dns();
-        let zone = create_public_zone(&router, row.apex, row.case).await;
+        let zone = create_delegated_public_zone(&router, row.apex, row.case).await;
         let (arn, records) =
             request_dns_validated(row.case, &router, row.domain_name, row.sans).await;
 
@@ -594,8 +715,13 @@ async fn an_unmatched_record_leaves_the_certificate_waiting() {
     for row in rows {
         let (router, engine) = router_with_dns();
         let zone = match row.publication {
-            Publication::InAPrivateZone => create_private_zone(&router, row.apex, row.case).await,
-            _ => create_public_zone(&router, row.apex, row.case).await,
+            Publication::InAPrivateZone => {
+                // The name itself IS delegated to the account here: what leaves the
+                // record unresolvable is the zone it is published in being private.
+                register_domain(row.case, &router, registrable_part(row.apex)).await;
+                create_private_zone(&router, row.apex, row.case).await
+            }
+            _ => create_delegated_public_zone(&router, row.apex, row.case).await,
         };
         let (arn, records) =
             request_dns_validated(row.case, &router, row.domain_name, row.sans).await;
@@ -637,7 +763,7 @@ async fn one_certificate_s_published_record_proves_only_that_certificate() {
     let apex = "shared.dns-proof.net";
     let domain = "www.shared.dns-proof.net";
     let (router, engine) = router_with_dns();
-    let zone = create_public_zone(&router, apex, case).await;
+    let zone = create_delegated_public_zone(&router, apex, case).await;
 
     let (proven, records) = request_dns_validated(case, &router, domain, &[]).await;
     let (other, other_records) = request_dns_validated(case, &router, domain, &[]).await;
@@ -678,7 +804,7 @@ async fn a_withdrawn_record_stops_proving_the_name() {
     let case = "the validation record created, deleted and created again";
     let apex = "withdrawn.dns-proof.com";
     let (router, engine) = router_with_dns();
-    let zone = create_public_zone(&router, apex, case).await;
+    let zone = create_delegated_public_zone(&router, apex, case).await;
     let (arn, records) =
         request_dns_validated(case, &router, "www.withdrawn.dns-proof.com", &[]).await;
 
@@ -695,44 +821,272 @@ async fn a_withdrawn_record_stops_proving_the_name() {
 }
 
 /// RULE: a client that publishes the handed-out record and polls `DescribeCertificate`
-/// reaches `ISSUED` on the wall clock — the issuance the proof owes falls due a bounded
-/// span later, so the poll terminates without the test pushing any stored instant.
+/// reaches `ISSUED` without the test pushing any stored instant — the issuance the proof
+/// owes falls due by itself, so the poll terminates on the certificate's own status.
 #[tokio::test]
 async fn a_poll_after_publishing_the_record_reaches_issued() {
     let case = "polled to ISSUED after publishing the record";
     let apex = "polled.dns-proof.org";
     let (router, _engine) = router_with_dns();
-    let zone = create_public_zone(&router, apex, case).await;
+    let zone = create_delegated_public_zone(&router, apex, case).await;
     let (arn, records) = request_dns_validated(case, &router, "www.polled.dns-proof.org", &[]).await;
 
-    let published_at = Instant::now();
     submit_change(case, &router, &zone, "CREATE", &records[0]).await;
 
-    // A cap far above the emulator's own span, so an expired budget is a real failure
-    // rather than a tight-timing artefact.
-    let budget = VALIDATION_SETTLE_DELAY * 20;
-    let mut polls = 0_u32;
+    // A deadline far above the emulator's own span, so an expired budget is a real
+    // failure rather than an artefact of a loaded host. Nothing here measures how long
+    // the issuance took: the poll waits for the CONDITION.
+    let deadline = Instant::now() + VALIDATION_SETTLE_DELAY * 20;
     loop {
         let detail = describe(&router, &arn).await;
         if detail["Status"].as_str() != Some("PENDING_VALIDATION") {
             assert_issued(case, &detail);
             break;
         }
-        polls += 1;
         assert!(
-            published_at.elapsed() < budget,
-            "case {case}: polling for ISSUED gave up after {polls} polls in {:?}: still {detail}",
-            published_at.elapsed()
+            Instant::now() < deadline,
+            "case {case}: polling for ISSUED gave up with the certificate still {detail}"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    assert!(
-        polls > 0,
-        "case {case}: the pending state must still be observable right after publication"
+}
+
+/// How long the poll above waits between two `DescribeCertificate` reads.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The name servers `GetHostedZone` reports for `zone_id` — the ones a delegation to this
+/// zone names.
+async fn zone_name_servers(case: &str, router: &MultiServiceRouter, zone_id: &str) -> Vec<String> {
+    let (status, reply) = dns_call(
+        router,
+        "GET",
+        &format!("/2013-04-01/hostedzone/{zone_id}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: reading the zone {zone_id} back must be accepted, got {status} {reply}"
     );
+    // The elements' text, through the ONE extractor this test target has for a Route 53
+    // reply (the sibling tag-discovery suite owns it).
+    let servers: Vec<String> = crate::tag_discovered_zone_certificate_issuance::elements(
+        &reply,
+        "NameServer",
+    )
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     assert!(
-        published_at.elapsed() >= VALIDATION_SETTLE_DELAY,
-        "case {case}: the issuance must not fall due before its span has passed, got {:?}",
-        published_at.elapsed()
+        !servers.is_empty(),
+        "case {case}: a hosted zone reports the name servers it is delegated to, got {reply}"
     );
+    servers
+}
+
+/// How a row of the delegation table places the zone the challenge is published in
+/// against the public DNS hierarchy.
+#[derive(Debug, Clone, Copy)]
+enum Delegation {
+    /// The account holds the registry's registration of the zone's registrable name.
+    RegisteredByTheAccount,
+    /// Nothing registers the name: the account created a zone and nothing else.
+    Unregistered,
+    /// The registry holds the name for ANOTHER registrant, so its delegation is not this
+    /// account's.
+    RegisteredElsewhere,
+    /// A name the registries RESERVE rather than delegate, which no registrar sells, so
+    /// the account's own public zone is the only authority there is for it.
+    ReservedByTheRegistries,
+    /// The registration covers a PARENT zone of the account, which publishes the `NS` cut
+    /// that delegates the child zone the challenge is published in.
+    ParentZoneCutsToTheChild,
+    /// The same two zones of the account, with no cut in the parent — so nothing refers a
+    /// resolver down to the child.
+    ParentZoneWithoutACut,
+}
+
+/// One row of the delegation table: how the zone is placed, the zone's apex, the name the
+/// certificate is requested for, the registrable name the apex sits at or under, and
+/// whether the public DNS reaches the zone at all.
+struct DelegationRow<'a> {
+    case: &'a str,
+    delegation: Delegation,
+    apex: &'a str,
+    domain_name: &'a str,
+    registrable: &'a str,
+    /// Whether publishing the handed-out CNAME in that zone proves the name.
+    proves: bool,
+}
+
+/// RULE: a published validation CNAME proves control of a name only when the public DNS
+/// delegation chain for that name reaches the hosted zone it is published in — the
+/// account holds the name's registry delegation (its registration of the registrable
+/// name, or, for a name the registries reserve rather than delegate, its own public zone
+/// being the only authority), and each zone below the one that delegation lands on is
+/// reached only through the `NS` cut its parent publishes. A zone the chain does not
+/// reach is answered by nobody, so the request keeps waiting the documented window out.
+#[tokio::test]
+async fn a_zone_the_public_dns_does_not_reach_proves_nothing() {
+    let rows = [
+        DelegationRow {
+            case: "the registrable name registered by the account",
+            delegation: Delegation::RegisteredByTheAccount,
+            apex: "probe-zone.com",
+            domain_name: "www.probe-zone.com",
+            registrable: "probe-zone.com",
+            proves: true,
+        },
+        DelegationRow {
+            case: "a registration under a multi-label public suffix",
+            delegation: Delegation::RegisteredByTheAccount,
+            apex: "probe-zone.co.uk",
+            domain_name: "probe-zone.co.uk",
+            registrable: "probe-zone.co.uk",
+            proves: true,
+        },
+        DelegationRow {
+            case: "a zone for a registrable name nothing registers",
+            delegation: Delegation::Unregistered,
+            apex: "unreached-zone.com",
+            domain_name: "unreached-zone.com",
+            registrable: "unreached-zone.com",
+            proves: false,
+        },
+        DelegationRow {
+            case: "a zone several labels under a registrable name nothing registers",
+            delegation: Delegation::Unregistered,
+            apex: "sub.unreached-zone.net",
+            domain_name: "www.sub.unreached-zone.net",
+            registrable: "unreached-zone.net",
+            proves: false,
+        },
+        DelegationRow {
+            // `github.com` is one of the names the registry holds for a third party, which
+            // the registrar's own `RegisterDomain` refusal below confirms.
+            case: "a zone for a name another registrant holds",
+            delegation: Delegation::RegisteredElsewhere,
+            apex: "github.com",
+            domain_name: "www.github.com",
+            registrable: "github.com",
+            proves: false,
+        },
+        DelegationRow {
+            // A documentation name the registries reserve (RFC 2606 §3), which is the one
+            // kind of name no registration could ever cover.
+            case: "a zone for a name the registries reserve rather than delegate",
+            delegation: Delegation::ReservedByTheRegistries,
+            apex: "docs.example.net",
+            domain_name: "www.docs.example.net",
+            registrable: "example.net",
+            proves: true,
+        },
+        DelegationRow {
+            case: "a child zone its parent cuts to",
+            delegation: Delegation::ParentZoneCutsToTheChild,
+            apex: "child.probe-chain.org",
+            domain_name: "www.child.probe-chain.org",
+            registrable: "probe-chain.org",
+            proves: true,
+        },
+        DelegationRow {
+            case: "a child zone its parent publishes no cut to",
+            delegation: Delegation::ParentZoneWithoutACut,
+            apex: "child.probe-nocut.org",
+            domain_name: "www.child.probe-nocut.org",
+            registrable: "probe-nocut.org",
+            proves: false,
+        },
+    ];
+
+    for row in rows {
+        // A fresh store per row, so one row's zones or registrations cannot explain
+        // another's.
+        let (router, engine) = router_with_dns();
+        let zone = create_public_zone(&router, row.apex, row.case).await;
+
+        match row.delegation {
+            Delegation::RegisteredByTheAccount => {
+                register_domain(row.case, &router, row.registrable).await;
+            }
+            Delegation::Unregistered | Delegation::ReservedByTheRegistries => {}
+            Delegation::RegisteredElsewhere => {
+                // The registry holds this name for somebody else, so the account cannot
+                // take its delegation: the registrar refuses the registration.
+                let (status, reply) = registrar_call(
+                    &router,
+                    "RegisterDomain",
+                    &json!({
+                        "DomainName": row.registrable,
+                        "DurationInYears": 1,
+                        "AdminContact": {},
+                        "RegistrantContact": {},
+                        "TechContact": {},
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, 400,
+                    "case {}: a name another registrant holds cannot be registered here, \
+                     got {status} {reply}",
+                    row.case
+                );
+            }
+            Delegation::ParentZoneCutsToTheChild | Delegation::ParentZoneWithoutACut => {
+                let parent =
+                    create_public_zone(&router, row.registrable, &format!("{}/parent", row.case))
+                        .await;
+                register_domain(row.case, &router, row.registrable).await;
+                if matches!(row.delegation, Delegation::ParentZoneCutsToTheChild) {
+                    let servers = zone_name_servers(row.case, &router, &zone).await;
+                    submit_record_set(
+                        row.case, &router, &parent, "CREATE", row.apex, "NS", &servers,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let (arn, records) = request_dns_validated(row.case, &router, row.domain_name, &[]).await;
+        for record in &records {
+            submit_change(row.case, &router, &zone, "CREATE", record).await;
+        }
+
+        if row.proves {
+            assert_issuance_owed(row.case, &router, &engine, &arn).await;
+            make_validation_due_now(&engine);
+            assert_issued(row.case, &describe(&router, &arn).await);
+        } else {
+            assert_still_waiting(row.case, &router, &engine, &arn).await;
+            let issued = arns_in_statuses(&router, &["ISSUED"]).await;
+            assert!(
+                issued.is_empty(),
+                "case {}: a zone the public DNS does not reach proves nothing, so nothing \
+                 is issued, got {issued:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// RULE's other half: the delegation is READ on every pass, never remembered — a
+/// challenge published in a zone nothing delegates yet starts proving the name the moment
+/// the account holds that delegation, with no second publication.
+#[tokio::test]
+async fn the_delegation_is_read_on_every_pass() {
+    let case = "the registration taken after the challenge was published";
+    let apex = "late-registration.com";
+    let (router, engine) = router_with_dns();
+    let zone = create_public_zone(&router, apex, case).await;
+    let (arn, records) = request_dns_validated(case, &router, "www.late-registration.com", &[]).await;
+
+    for record in &records {
+        submit_change(case, &router, &zone, "CREATE", record).await;
+    }
+    assert_still_waiting(case, &router, &engine, &arn).await;
+
+    register_domain(case, &router, apex).await;
+    assert_issuance_owed(case, &router, &engine, &arn).await;
+    make_validation_due_now(&engine);
+    assert_issued(case, &describe(&router, &arn).await);
 }

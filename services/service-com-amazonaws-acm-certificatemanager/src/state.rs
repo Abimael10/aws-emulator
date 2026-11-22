@@ -99,10 +99,12 @@
 //! goes through [`ComAmazonawsAcmCertificatemanagerState::materialize_due_in`], which
 //! first resolves each pending DNS validation against the account's hosted zones in the
 //! shared engine (`dns_validation`) — a published CNAME is what takes such a request to
-//! issuance.
+//! issuance, and only where the public DNS delegation chain for the name reaches the
+//! zone it was published in (`public_delegation`).
 
 pub mod acme_socket;
 mod dns_validation;
+mod public_delegation;
 
 pub use dns_validation::first_unvalidatable_name_in;
 

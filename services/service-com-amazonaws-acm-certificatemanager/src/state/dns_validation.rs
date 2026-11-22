@@ -25,10 +25,12 @@
 //!
 //! Whether the record is published is the DNS service's fact, not this one's, so it is
 //! READ from the Route 53 store in the shared engine: the record set has to carry the
-//! name, the type and the value this service handed out, in a PUBLIC hosted zone of the
-//! account (a private zone resolves nowhere the public DNS can see it, so it proves
-//! nothing). Nothing is copied into a certificate's record, so a zone that stops
-//! publishing the CNAME stops proving the name.
+//! name, the type and the value this service handed out — and it has to be published in
+//! the zone the PUBLIC DNS actually answers that name from ([`public_delegation`]),
+//! since ACM resolves the challenge from the root down and a zone nothing delegates the
+//! name to is a zone no resolver ever asks. Nothing is copied into a certificate's
+//! record, so a zone that stops publishing the CNAME — or a delegation that stops
+//! leading to it — stops proving the name.
 //!
 //! The transition itself is OWED, never slept on, exactly as every other transition
 //! this store carries: the pass that first observes the published records replaces the
@@ -41,6 +43,7 @@ use std::time::SystemTime;
 
 use ::service_com_amazonaws_route53_awsdnsv20130401::state as dns_store;
 
+use super::public_delegation::{authoritative_zone_for, Registrations, Zones};
 use super::*;
 
 impl ComAmazonawsAcmCertificatemanagerState {
@@ -70,9 +73,9 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// name is proven and every pending request keeps the outcome it already owed.
     ///
     /// LOCK ORDER: this store is already held by the handler that called in, and the DNS
-    /// store is taken under it — so this service locks ACM then Route 53, never the
-    /// other way round. A cross-read added in the other direction has to use the same
-    /// order.
+    /// stores are taken under it — so this service locks ACM, then Route 53, then the
+    /// registrar, never the other way round. A cross-read added in the other direction
+    /// has to use the same order.
     fn resolve_dns_validations<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -81,9 +84,17 @@ impl ComAmazonawsAcmCertificatemanagerState {
         let Some(zones) = dns_store::service_state(engine) else {
             return;
         };
+        // Which name servers the REGISTRY delegates a registrable name to is the
+        // registrar service's fact, read the same way: an engine carrying no registrar
+        // store holds no registration, so no such name is delegated anywhere.
+        let registrations =
+            ::service_com_amazonaws_route53domains_route53domains_v20140515::state::service_state(
+                engine,
+            );
         let zones = zones.lock();
+        let registrations = registrations.as_ref().map(::engine::ServiceState::lock);
         for certificate in self.certificates.values_mut() {
-            resolve_dns_validation(certificate, &zones, now);
+            resolve_dns_validation(certificate, &zones, registrations.as_deref(), now);
         }
     }
 }
@@ -181,7 +192,8 @@ fn zone_delegates(zone: &dns_store::StoredZone, domain_name: &str) -> bool {
 /// documented [`VALIDATION_WINDOW`] out from the instant it was made.
 fn resolve_dns_validation(
     certificate: &mut Certificate,
-    zones: &dns_store::ComAmazonawsRoute53Awsdnsv20130401State,
+    zones: &Zones,
+    registrations: Option<&Registrations>,
     now: SystemTime,
 ) {
     if certificate.status != STATUS_PENDING_VALIDATION
@@ -196,7 +208,7 @@ fn resolve_dns_validation(
     else {
         return;
     };
-    let proven = certificate_is_proven(certificate, zones);
+    let proven = certificate_is_proven(certificate, zones, registrations);
     match (proven, &owed) {
         (true, ValidationOutcome::TimedOut) => {
             certificate.pending_validation = Some(PendingValidation {
@@ -225,7 +237,8 @@ fn resolve_dns_validation(
 /// validation's is a fetched URL, neither of which the DNS answers.
 fn certificate_is_proven(
     certificate: &Certificate,
-    zones: &dns_store::ComAmazonawsRoute53Awsdnsv20130401State,
+    zones: &Zones,
+    registrations: Option<&Registrations>,
 ) -> bool {
     !certificate.domain_validations.is_empty()
         && certificate.domain_validations.iter().all(|validation| {
@@ -233,14 +246,21 @@ fn certificate_is_proven(
                 && validation
                     .resource_record
                     .as_ref()
-                    .is_some_and(|record| record_is_published(record, zones))
+                    .is_some_and(|record| record_is_published(record, zones, registrations))
         })
 }
 
-/// Whether `record` — the name, type and value this service handed out — is published
-/// in one of the account's PUBLIC hosted zones.
+/// Whether `record` — the name, type and value this service handed out — RESOLVES in
+/// the public DNS to the value this service handed out.
 ///
-/// Which record sets answer for a name and type is the DNS service's own lookup
+/// ACM resolves the challenge from the public root down, so the only zone that can
+/// answer is the one the public delegation chain for that name leads to
+/// ([`authoritative_zone_for`]): a record published in a zone nothing delegates the name
+/// to, or in a zone below a cut the chain never follows, is published where no resolver
+/// looks, and a name the chain reaches no zone of the account for resolves to nothing at
+/// all.
+///
+/// Which record sets answer for a name and type is then the DNS service's own lookup
 /// (`StoredZone::records_at`), so the key order it rests on stays single-homed in the
 /// crate that owns it, and its name identity decides which spellings of the name match
 /// (the trailing dot, the letter case and the escaping a publisher wrote it with do
@@ -249,20 +269,20 @@ fn certificate_is_proven(
 /// nothing.
 fn record_is_published(
     record: &ResourceRecord,
-    zones: &dns_store::ComAmazonawsRoute53Awsdnsv20130401State,
+    zones: &Zones,
+    registrations: Option<&Registrations>,
 ) -> bool {
+    let Some(zone) = authoritative_zone_for(&record.name, zones, registrations) else {
+        return false;
+    };
     let value = dns_store::canonical_dns_name(&record.value);
-    zones.zones.values().any(|zone| {
-        !zone.private_zone
-            && zone
-                .records_at(&record.name, &record.r#type)
+    zone.records_at(&record.name, &record.r#type)
+        .iter()
+        .any(|published| {
+            published
+                .resource_records
                 .iter()
-                .any(|published| {
-                    published
-                        .resource_records
-                        .iter()
-                        .flatten()
-                        .any(|data| dns_store::canonical_dns_name(&data.value) == value)
-                })
-    })
+                .flatten()
+                .any(|data| dns_store::canonical_dns_name(&data.value) == value)
+        })
 }

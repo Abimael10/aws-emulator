@@ -41,7 +41,7 @@ use crate::certificate_lifecycle::describe;
 use crate::certificate_validation_state_machine::{arns_in_statuses, make_validation_due_now};
 use crate::dns_validation_published_record::{
     assert_issuance_owed, assert_issued, create_private_zone, create_public_zone, dns_call,
-    request_dns_validated, router_with_dns, submit_change, Record,
+    register_domain, request_dns_validated, router_with_dns, submit_change, Record,
 };
 
 /// The tag this suite's client selects its zones by. Both halves are the TEST's own: a
@@ -111,7 +111,10 @@ struct Row {
 
 /// The text inside every `<tag>…</tag>` element of `body`, in document order. The
 /// delimiters carry the closing `>`, so `<Tag>` never matches `<Tags>`.
-fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
+///
+/// `pub(crate)` so a sibling suite reads a Route 53 reply's elements through this ONE
+/// extractor rather than growing a second copy of it.
+pub(crate) fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
@@ -145,6 +148,21 @@ struct Enumerated {
     apex: String,
     /// `Config/PrivateZone`, as reported.
     private: bool,
+}
+
+/// Hold the registration that delegates the row's TARGET zone in the public DNS.
+///
+/// A hosted zone is answered by nobody until something above it delegates the name, so a
+/// challenge published in a zone the public DNS does not reach proves nothing (see
+/// `dns_validation_published_record::a_zone_the_public_dns_does_not_reach_proves_nothing`).
+/// The registration is held for the registrable name the target apex sits under — the
+/// labels after its first, every target here being one label under a registrable name.
+async fn delegate_target(router: &MultiServiceRouter, row: &Row) {
+    let registrable = row
+        .target
+        .split_once('.')
+        .map_or(row.target, |(_, rest)| rest);
+    register_domain(row.case, router, registrable).await;
 }
 
 /// Create one spec's zone, write its tags, and return its bare id.
@@ -513,6 +531,10 @@ async fn a_tag_discovered_zone_validates_a_requested_certificate() {
         for spec in row.account {
             create_and_tag(&router, spec, row.case).await;
         }
+        // The discovered zone is one the public DNS reaches: the account holds the
+        // registry's delegation of the registrable name its apex sits under, which is what
+        // lets a challenge published there prove the name at all.
+        delegate_target(&router, &row).await;
 
         let discovered = discover_by_tag(&router, &row).await;
         let zone = discovered.get(row.target).unwrap_or_else(|| {
@@ -578,6 +600,7 @@ async fn the_discovery_reads_report_the_same_account_after_issuance() {
     for spec in row.account {
         create_and_tag(&router, spec, row.case).await;
     }
+    delegate_target(&router, &row).await;
 
     let before = enumerate(&router, row.page_size, row.case, row.account.len()).await;
     let discovered = discover_by_tag(&router, &row).await;

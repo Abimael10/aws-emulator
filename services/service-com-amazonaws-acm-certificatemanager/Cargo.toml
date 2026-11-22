@@ -31,6 +31,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # hosted zones is that service's fact, read through the shared engine, which needs the
 # owning service's state TYPE.
 service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+# The Route 53 Domains store, for the other half of that DNS fact: which name servers the
+# REGISTRY delegates a registrable name to, which is what puts a hosted zone into the
+# public DNS hierarchy a validation challenge is resolved through.
+service-com-amazonaws-route53domains-route53domains-v20140515 = { workspace = true }
 # `iam_authorization`: the shared evaluation of those documents against an action on a
 # resource, so every service that enforces authorization decides alike.
 service-common = { path = "../common" }
