@@ -21,6 +21,12 @@
 //! timeout ends on its own outcome. Nothing here shortens or lengthens the span a job's work
 //! takes — it only ends an attempt the caller's own deadline has already run out on.
 //!
+//! A job this deadline ends is one "Batch TERMINATES ... if they aren't finished", which is
+//! what [`ComAmazonawsBatchAwsbatchv20160810State::time_out_attempt`] records as
+//! `JobDetail$isTerminated` ("indicates whether the job is terminated"): it was terminated by
+//! the service rather than failed by its work, so its `retryStrategy` gives it no further
+//! attempt ([`super::job_retries`]) — the same reading a job a caller terminated takes.
+//!
 //! # When it is noticed
 //!
 //! On the CLOCK, like every other transition this service owes
@@ -53,9 +59,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     ///
     /// Measured from the attempt that is still OPEN where there is one, so a later attempt
     /// gets the whole duration over again rather than inheriting the first one's deadline, and
-    /// from the job's own `startedAt` otherwise — which is the same instant while a job has
-    /// had exactly one attempt, the only shape this lifecycle produces today (nothing
-    /// re-queues a job for a second attempt).
+    /// from the job's own `startedAt` otherwise — the same instant for a job that has had
+    /// exactly one attempt, and the fresh one for every attempt a retry strategy re-queued the
+    /// job for ([`super::job_retries`]).
     pub(super) fn attempt_deadline(&self, id: &str) -> Option<i64> {
         let job = self.jobs.get(id)?;
         if is_terminal_status(&job.status) {

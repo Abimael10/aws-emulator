@@ -433,13 +433,22 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.set_job_due_bounded_by_attempt_deadline(id, at.saturating_add(JOB_PHASE_MILLIS));
     }
 
-    /// End `id` at `at` with what its container's program did: the status that program
-    /// exited with decides the job's own, and the exit code is reported on the container and
-    /// on the attempt that ran it.
+    /// End the ATTEMPT `id` was running at `at` with what its container's program did: the
+    /// status that program exited with decides the job's own, and the exit code is reported on
+    /// the container and on the attempt that ran it.
+    ///
+    /// Whether a failing program ends the JOB is the retry strategy's to decide
+    /// ([`super::job_retries`]), which is what the answer reports: a job with attempts left
+    /// goes back to `RUNNABLE` for another run of the same program.
     ///
     /// What the program WROTE was delivered when the job entered `RUNNING`
     /// ([`Self::start_running_job`]), as a container's output is.
-    pub(super) fn end_running_job(&mut self, id: &str, run: &ContainerRun, at: i64) {
+    pub(super) fn end_running_job(
+        &mut self,
+        id: &str,
+        run: &ContainerRun,
+        at: i64,
+    ) -> AttemptEnding {
         let (status, reason) = run.ending();
         let code = run.exit_code();
         if let Some(job) = self.jobs.get_mut(id) {
@@ -454,7 +463,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 attempt.exit_code = code;
             }
         }
-        self.finish_job(id, status, Some(&reason), at);
+        self.end_job_attempt(id, status, Some(&reason), at)
     }
 
     /// Queue the lines `id`'s container wrote, for delivery to the log stream the `awslogs`

@@ -586,7 +586,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 } else if spent >= MAX_UNANSWERED_TASK_READS {
                     self.give_up_on_a_task(job_id, now);
                     let reason = container_lost_its_task_reason();
-                    self.finish_job(job_id, JOB_FAILED, Some(&reason), now);
+                    // The attempt produced no outcome at all, which is a failed attempt: a job
+                    // with attempts left gets another one, on a task of its own
+                    // ([`super::job_retries`]).
+                    self.end_job_attempt(job_id, JOB_FAILED, Some(&reason), now);
                 } else {
                     self.set_job_due_bounded_by_attempt_deadline(job_id, now + JOB_TASK_POLL_MILLIS);
                 }
@@ -677,6 +680,13 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                                 Some(report.network_interfaces.clone());
                         }
                     }
+                    // No retry strategy is consulted here, and this is the one failure of an
+                    // attempt where none is: the task this attempt was placed as is STILL
+                    // RUNNING, so the job's own end is what stops it
+                    // ([`Self::take_task_steps`]'s `Stop` step, which addresses the task of a
+                    // job that has gone terminal). A retry would leave that task running
+                    // beside the one the next attempt is placed as, which is one container of
+                    // one attempt running twice.
                     self.finish_job(job_id, JOB_FAILED, Some(&detail), now);
                     return;
                 }
@@ -707,15 +717,20 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 report.stopped_reason.as_deref(),
                 ended_at,
             ),
-            Some(_) => self.finish_job(
-                job_id,
-                JOB_FAILED,
-                report
-                    .container_reason
-                    .as_deref()
-                    .or(report.stopped_reason.as_deref()),
-                ended_at,
-            ),
+            // The attempt FAILED, and whether that ends the job is its retry strategy's to
+            // decide ([`super::job_retries`]): a job with attempts left is moved back to
+            // `RUNNABLE`, where the next placement runs its container as a task of its own.
+            Some(_) => {
+                self.end_job_attempt(
+                    job_id,
+                    JOB_FAILED,
+                    report
+                        .container_reason
+                        .as_deref()
+                        .or(report.stopped_reason.as_deref()),
+                    ended_at,
+                );
+            }
             // The task stopped without its container ever producing an exit status. What that
             // says about the job is the task's own stop CODE: a task that never started — one
             // whose image could not be fetched, whose execution resources could not be
@@ -736,7 +751,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     Some(reason) if !exited => reason.to_string(),
                     _ => nothing_performed_reason(declared.as_ref()),
                 };
-                self.finish_job(job_id, JOB_FAILED, Some(&reason), ended_at);
+                self.end_job_attempt(job_id, JOB_FAILED, Some(&reason), ended_at);
             }
         }
     }

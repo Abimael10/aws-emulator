@@ -57,6 +57,10 @@
 //! lines it wrote. A fetch the registry refused, and a program this emulator performs none
 //! of (the one inside the caller's own image), end the job without a run: no `startedAt`
 //! and no `exitCode` is invented for a container nothing ran.
+//! An attempt that FAILED is not necessarily the end of the job: the `retryStrategy` the job
+//! carries decides ([`job_retries`]), so a job with `attempts` left is moved back to
+//! `RUNNABLE` for another placement, another task and another run — until a matching
+//! `evaluateOnExit` condition's action ends it or the budget is spent.
 //! WHICH of the jobs waiting on one environment is placed when room is free is the
 //! environment's own maximum and the queues' own ordering ([`compute_capacity`]).
 //! Everything around it — accepting, resolving, scheduling, placing, running, listing,
@@ -109,6 +113,7 @@ mod input_rules;
 mod job_clock;
 mod job_definition_projection;
 mod job_logs;
+mod job_retries;
 mod placement;
 mod queue_snapshot;
 mod service_job_dispatch;
@@ -129,6 +134,7 @@ pub use input_rules::*;
 pub use job_clock::*;
 pub use job_definition_projection::*;
 pub use job_logs::*;
+pub use job_retries::*;
 pub use placement::*;
 pub use queue_snapshot::*;
 pub use service_job_dispatch::*;
@@ -138,7 +144,8 @@ use crate::ops::types::{
     AttemptContainerDetail, AttemptDetail, CapacityLimit, ClientException, ComputeEnvironmentOrder,
     ComputeResource,
     ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
-    EcsProperties, EcsSettings, EksConfiguration, FairsharePolicy, JobDefinition, JobDependency,
+    EcsProperties, EcsSettings, EksConfiguration, EvaluateOnExit, FairsharePolicy, JobDefinition,
+    JobDependency,
     JobStateTimeLimitAction, JobTimeout, KeyValuePair, NetworkInterface, NodeProperties,
     QuotaShareCapacityLimit, QuotaSharePolicy, QuotaSharePreemptionConfiguration,
     QuotaShareResourceSharingConfiguration, ResourceRequirement, RetryStrategy, ServerException,
@@ -1912,6 +1919,18 @@ enum Advanced {
     Terminal,
 }
 
+impl From<AttemptEnding> for Advanced {
+    /// The ending of an attempt as the clock reads it: a job whose retry strategy asked for
+    /// another attempt MOVED back to `RUNNABLE` ([`job_retries`]), and one the attempt ended
+    /// is terminal.
+    fn from(ending: AttemptEnding) -> Self {
+        match ending {
+            AttemptEnding::Retried => Self::Moved,
+            AttemptEnding::EndedJob => Self::Terminal,
+        }
+    }
+}
+
 /// How many request ids this process has minted, so two refusals answered in the same
 /// nanosecond still name two different requests (see [`new_uuid`]).
 static MINTED_REQUEST_IDS: AtomicU64 = AtomicU64::new(0);
@@ -3346,8 +3365,13 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // ([`container_run`]).
                     JOB_STARTING => {
                         if let Some(ImageFetch::Refused(reason)) = self.image_fetch_of(id) {
-                            self.finish_job(id, JOB_FAILED, Some(&reason), due);
-                            return Some(Advanced::Terminal);
+                            // The initiation of this attempt's container failed, so the
+                            // attempt did: whether that ends the JOB is its retry strategy's
+                            // to decide ([`job_retries`]).
+                            return Some(
+                                self.end_job_attempt(id, JOB_FAILED, Some(&reason), due)
+                                    .into(),
+                            );
                         }
                         match self.container_run_of(id) {
                             // Nothing has performed the program yet
@@ -3356,12 +3380,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                             // verdict nothing took.
                             None => None,
                             // A program nothing performed produced no run at all, so the job
-                            // never reaches `RUNNING`: it ends with the reason naming what
-                            // was not performed, and with no exit code or `startedAt`.
+                            // never reaches `RUNNING`: the attempt ends with the reason naming
+                            // what was not performed, and with no exit code or `startedAt`.
                             Some(run) if !run.performed() => {
                                 let (status, reason) = run.ending();
-                                self.finish_job(id, status, Some(&reason), due);
-                                Some(Advanced::Terminal)
+                                Some(self.end_job_attempt(id, status, Some(&reason), due).into())
                             }
                             Some(_) => {
                                 self.start_running_job(id, due);
@@ -3383,8 +3406,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                                 reason: container_lost_its_task_reason(),
                             }
                         });
-                        self.end_running_job(id, &run, due);
-                        Some(Advanced::Terminal)
+                        Some(self.end_running_job(id, &run, due).into())
                     }
                     _ => None,
                 }
