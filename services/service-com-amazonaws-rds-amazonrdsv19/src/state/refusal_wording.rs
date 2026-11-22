@@ -101,6 +101,30 @@ pub fn restore_time_after_the_window_message(latest: ::aws_smithy_types::DateTim
     )
 }
 
+/// How Amazon RDS refuses a point-in-time restore of a DB instance there is no instant to
+/// restore to, which is what the modelled `PointInTimeRestoreNotEnabled` fault reports.
+///
+/// WHY the instance has no restorable instant decides the sentence, because the two reasons
+/// ask the caller for different things. `BackupRetentionPeriod` "setting this parameter to 0
+/// disables automated backups", so a period of ZERO means the instance keeps no continuous
+/// backup at all and the caller has to turn backups on — the service's own fixed sentence for
+/// that condition ([`AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE`]), which names the operation that
+/// turns them on. A NON-ZERO period means backups are on and none has been taken yet, which
+/// the caller clears by waiting rather than by changing anything: that sentence states the
+/// period in effect — the only variable part of it — and that no backup covers any instant
+/// yet, the state an instance is in while it is still being created and just after the period
+/// was raised from zero.
+pub fn point_in_time_restore_not_enabled_message(backup_retention_period: i32) -> String {
+    if backup_retention_period < 1 {
+        return AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE.to_string();
+    }
+    format!(
+        "The backup retention period is set to {backup_retention_period}, but no backups are \
+         available yet. Most likely this is because backup retention has only recently been \
+         changed from zero to a non-zero value."
+    )
+}
+
 /// An instant as a restore-window refusal writes one: the UTC date and time to the SECOND,
 /// the form `RestoreTime` itself is given in — a recovery point's sub-second part is not part
 /// of the bound the sentence states.

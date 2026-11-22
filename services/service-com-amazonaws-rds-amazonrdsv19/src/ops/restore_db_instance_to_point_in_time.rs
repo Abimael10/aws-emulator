@@ -557,14 +557,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // automated backups off has no such window at all, which is exactly what the
             // modelled `PointInTimeRestoreNotEnabledFault` reports
             // (`SourceDBInstanceIdentifier` "refers to a DB instance with
-            // BackupRetentionPeriod equal to 0").
+            // BackupRetentionPeriod equal to 0"). An instance whose retention period is NON-zero
+            // and whose backups have covered nothing yet has no window either, and that is the
+            // other state the same fault reports — the sentence states which of the two the
+            // instance is in ([`crate::state::point_in_time_restore_not_enabled_message`]),
+            // because turning backups on and waiting for the first one are different answers
+            // for the caller.
             let Some((earliest, latest)) = source.restorable_window() else {
                 return Err(
                     RestoreDBInstanceToPointInTimeErrorModeled::PointInTimeRestoreNotEnabledFault(
                         PointInTimeRestoreNotEnabledFault {
-                            message: Some(format!(
-                                "Automated backups are not enabled for the DB instance {}",
-                                source.identifier
+                            message: Some(crate::state::point_in_time_restore_not_enabled_message(
+                                source.backup_retention_period,
                             )),
                         },
                     )
