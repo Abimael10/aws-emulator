@@ -2423,6 +2423,192 @@ async fn a_create_that_supplies_no_metadata_is_accepted_and_its_verdict_gates_th
     }
 }
 
+/// The registries a create that supplies NO `customMetadata` is made under, one row per
+/// way the applicable schema can constrain (or fail to constrain) such a record: the case,
+/// the registry's `customMetadataSchemaConfiguration` (`Value::Null` for a registry that
+/// declares none), the `recordType` the create carries, and the property the schema that
+/// applies to that record type REQUIRES — `None` where it requires none.
+///
+/// The record types are `RecordType`'s own catalogue (`smithy_query(query="shape",
+/// shape="RecordType")`: AGENT | CUSTOM | GATEWAY | MCP | SKILL), every one of which a row
+/// covers; the required properties differ in name and in declared type, so the message's
+/// variable part cannot be a fixed word.
+fn absent_metadata_table() -> Vec<(&'static str, Value, &'static str, Option<&'static str>)> {
+    vec![
+        (
+            "a defaultSchema requiring a string property from an enumeration",
+            json!({ "defaultSchema": r#"{"type":"object","properties":{"environment":{"type":"string","enum":["dev","prod"]},"critical":{"type":"boolean"}},"required":["environment"]}"# }),
+            "CUSTOM",
+            Some("environment"),
+        ),
+        (
+            "an override for the record's OWN type requiring an integer property",
+            json!({
+                "defaultSchema": r#"{"type":"object"}"#,
+                "recordTypeSchemaOverrides": [
+                    { "recordType": "MCP", "schema": r#"{"type":"object","properties":{"tier":{"type":"integer"}},"required":["tier"]}"# }
+                ]
+            }),
+            "MCP",
+            Some("tier"),
+        ),
+        (
+            "an override for ANOTHER record type, leaving this one the common attributes",
+            json!({
+                "defaultSchema": r#"{"type":"object"}"#,
+                "recordTypeSchemaOverrides": [
+                    { "recordType": "CUSTOM", "schema": r#"{"type":"object","properties":{"environment":{"type":"string"}},"required":["environment"]}"# }
+                ]
+            }),
+            "AGENT",
+            None,
+        ),
+        (
+            "a defaultSchema requiring a boolean property",
+            json!({ "defaultSchema": r#"{"type":"object","properties":{"critical":{"type":"boolean"}},"required":["critical"]}"# }),
+            "SKILL",
+            Some("critical"),
+        ),
+        (
+            "a defaultSchema requiring a property the issue's schema never named",
+            json!({ "defaultSchema": r#"{"type":"object","properties":{"ownerEmail":{"type":"string"}},"required":["ownerEmail"]}"# }),
+            "AGENT",
+            Some("ownerEmail"),
+        ),
+        (
+            "a defaultSchema that declares properties but requires none",
+            json!({ "defaultSchema": r#"{"type":"object","properties":{"owner":{"type":"string"}}}"# }),
+            "GATEWAY",
+            None,
+        ),
+        (
+            "a registry that declares no schema at all",
+            Value::Null,
+            "CUSTOM",
+            None,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_create_carrying_no_metadata_is_never_refused_for_the_registrys_schema() {
+    let router = router();
+
+    // `customMetadata` is NOT a required input member, so a create that carries none asserts
+    // nothing about a record's metadata: whatever the registry's schema requires, the create
+    // is accepted and the record settles in DRAFT. Whether the record satisfies the schema
+    // that applies to its record type is then a verdict every read reports, and the gate the
+    // submission that would publish it has to pass — so the refusal lives on the submission,
+    // not on the create. Every registry here auto-approves submissions, so an accepted
+    // submission lands APPROVED and the gate is the only thing that can hold one back.
+    for (at, (case, configuration, record_type, required)) in
+        absent_metadata_table().into_iter().enumerate()
+    {
+        let mut registry_body = json!({
+            "name": format!("absent-metadata-registry-{at}"),
+            "approvalConfiguration": { "autoApprovalRules": ["APPROVE_ALL"] }
+        });
+        if !configuration.is_null() {
+            registry_body["customMetadataSchemaConfiguration"] = configuration;
+        }
+        let registry_id = ready_registry_with(&router, registry_body).await;
+
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": format!("absent-metadata-{at}"),
+                "recordType": record_type,
+                "descriptors": descriptors_for(record_type)
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: a create carrying no customMetadata is accepted, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        let draft = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+
+        // The verdict the record's absent metadata earns, read back from the record itself
+        // and from the summary of the page it is listed on.
+        let expected_compliance = if required.is_some() {
+            "NON_COMPLIANT"
+        } else {
+            "COMPLIANT"
+        };
+        assert_eq!(
+            draft.field("customMetadataSchemaComplianceStatus"),
+            &json!(expected_compliance),
+            "case {case:?}: the created record reads back {expected_compliance}, got {:?}",
+            draft.body
+        );
+        let listed = list_records(&router, &registry_id, json!({})).await;
+        assert_eq!(
+            &listed.field("registryRecords")[0]["customMetadataSchemaComplianceStatus"],
+            &json!(expected_compliance),
+            "case {case:?}: the listed summary carries the same verdict, got {:?}",
+            listed.body
+        );
+        // A record exists to read a verdict from, so the create wrote one.
+        assert_eq!(
+            draft.str_field("recordArn"),
+            created.str_field("recordArn"),
+            "case {case:?}: the record the create answered is the one that was stored, got {:?}",
+            draft.body
+        );
+
+        let submitted = submit_record(&router, &registry_id, &record_id).await;
+        match required {
+            Some(property) => {
+                assert_eq!(
+                    submitted.status, 400,
+                    "case {case:?}: submitting a record the schema does not admit is refused, \
+                     got {} {:?}",
+                    submitted.status, submitted.body
+                );
+                assert_eq!(
+                    submitted.error_code.as_deref(),
+                    Some("ValidationException"),
+                    "case {case:?}: the modelled error code is ValidationException, got {:?}",
+                    submitted.error_code
+                );
+                assert_eq!(
+                    submitted.str_field("message"),
+                    schema_refusal(
+                        record_type,
+                        &format!(": required property '{property}' not found")
+                    ),
+                    "case {case:?}: the refusal names the record type and the required \
+                     property, got {:?}",
+                    submitted.body
+                );
+                let still_draft = get_record(&router, &registry_id, &record_id).await;
+                assert_eq!(
+                    still_draft.str_field("status"),
+                    "DRAFT",
+                    "case {case:?}: a refused submission leaves the record in DRAFT, got {:?}",
+                    still_draft.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    submitted.status, 202,
+                    "case {case:?}: a record nothing holds back is submitted, got {} {:?}",
+                    submitted.status, submitted.body
+                );
+                assert_eq!(
+                    submitted.str_field("status"),
+                    "APPROVED",
+                    "case {case:?}: the registry auto-approves what it admits, got {:?}",
+                    submitted.body
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn get_registry_reports_the_effective_discovery_and_approval_configuration() {
     let router = router();
