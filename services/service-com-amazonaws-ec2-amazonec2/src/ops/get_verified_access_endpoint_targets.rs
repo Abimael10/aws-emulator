@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVerifiedAccessEndpointTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVerifiedAccessEndpointTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVerifiedAccessEndpointTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the targets of the network CIDR endpoint the request names — one
+//! target per address INSIDE that endpoint's CIDR that a network interface of the VPC it
+//! reaches really holds, in address order, paged by `MaxResults`/`NextToken` — this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,263 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVerifiedAccessEndpointTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVerifiedAccessEndpointTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // Every member of a reported target is derived from the stored endpoint and from the
+        // instance it belongs to, so nothing here reads the request's metadata; the store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The token for the next page of results" (`$NextToken`) — anything else is refused
+        // rather than read as a position, and it is refused before any state is resolved, so
+        // whether a bogus token is caught never depends on what the store holds. The token is
+        // SCOPED to the endpoint it was minted while paging: a position here names an address
+        // inside ONE endpoint's CIDR, so a token minted while paging another endpoint names no
+        // position in this walk.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, &input.verified_access_endpoint_id)
+                    .ok_or_else(state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call" (`$MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for; the
+        // modelled `range 5..1000` has already refused a size outside that range.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_TARGETS_PER_PAGE)
+            .clamp(1, MAX_TARGETS_PER_PAGE);
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+
+        // A reporting operation may write only what the CLOCK already made due — an
+        // endpoint's `pending` -> `active` move, and the removal a delete left owed — so this
+        // read reports the state a caller would have seen anyway.
+        store.materialize_due_transitions();
+
+        // "Gets the targets for the SPECIFIED network CIDR endpoint": an id this account holds
+        // no endpoint for has no targets to report, so it is refused rather than answered with
+        // the empty set an endpoint nothing occupies the CIDR of answers.
+        let endpoint = store
+            .verified_access_endpoints
+            .get(&input.verified_access_endpoint_id)
+            .ok_or_else(|| {
+                state::invalid_verified_access_endpoint_id_not_found(
+                    &input.verified_access_endpoint_id,
+                )
+            })?;
+        // "The CIDR" and "The IDs of the subnets"
+        // (`VerifiedAccessEndpointCidrOptions`) of this endpoint's own options block: the
+        // address range it fronts, and the subnets it reaches that range through. An endpoint
+        // of any other kind — one that names a load balancer, a network interface or an RDS
+        // resource — carries no such block, so it fronts no range and has no target.
+        let cidr = endpoint
+            .view
+            .cidr_options
+            .as_ref()
+            .and_then(|options| options.cidr.clone())
+            .unwrap_or_default();
+        let subnet_ids: Vec<String> = endpoint
+            .view
+            .cidr_options
+            .as_ref()
+            .and_then(|options| options.subnet_ids.clone())
+            .unwrap_or_default();
+        let endpoint_id = endpoint.view.verified_access_endpoint_id.clone();
+        let endpoint_domain = endpoint.view.endpoint_domain.clone();
+        let instance_id = endpoint.view.verified_access_instance_id.clone();
+
+        // The zone this endpoint's targets are named under: the custom subdomain of the
+        // INSTANCE the endpoint belongs to when that instance has one — "Describes a custom
+        // subdomain for a network CIDR endpoint for Verified Access"
+        // (`VerifiedAccessInstanceCustomSubDomain`), which is the name the network CIDR
+        // endpoints of an instance are reached under — and otherwise the endpoint's own
+        // generated name, "A DNS name that is generated for the endpoint"
+        // (`VerifiedAccessEndpoint$EndpointDomain`).
+        let sub_domain = instance_id
+            .as_deref()
+            .and_then(|instance_id| store.verified_access_instances.get(instance_id))
+            .and_then(|instance| instance.cidr_endpoints_custom_sub_domain.as_ref())
+            .and_then(|custom| custom.sub_domain.clone())
+            .filter(|sub_domain| !sub_domain.is_empty());
+        let zone = sub_domain
+            .or(endpoint_domain)
+            .unwrap_or_default();
+
+        // DryRun sits AFTER the named endpoint has been resolved and BEFORE anything is
+        // reported: the flag asks whether the request WOULD have succeeded, so a request that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // One target per address INSIDE the endpoint's CIDR that a network interface of the
+        // account really holds there: "Describes the targets for the specified Verified Access
+        // endpoint" (`VerifiedAccessEndpointTarget`) reports the resources the endpoint fronts,
+        // so the addresses the block merely covers are not targets — an endpoint whose range
+        // nothing occupies has none, and one gets a target as soon as something takes an
+        // address in it. Every address a VPC resource holds is an address of a network
+        // interface, so the interfaces are where the question is asked.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVerifiedAccessEndpointTargets"))
+        // Only the interfaces of the VPC the endpoint reaches the range THROUGH are asked:
+        // private ranges repeat across VPCs, so an address inside the CIDR but in another VPC
+        // is another VPC's address and no target of this endpoint.
+        let reached_vpcs: ::std::collections::BTreeSet<&str> = subnet_ids
+            .iter()
+            .filter_map(|subnet_id| store.subnets.get(subnet_id))
+            .filter_map(|subnet| subnet.vpc_id.as_deref())
+            .collect();
+        let mut rows: Vec<TargetRow> = Vec::new();
+        for interface in store.network_interfaces.values() {
+            if interface
+                .vpc_id
+                .as_deref()
+                .is_none_or(|vpc_id| !reached_vpcs.contains(vpc_id))
+            {
+                continue;
+            }
+            for address in interface_addresses(interface) {
+                if state::cidr_block_contains_address(&cidr, &address) {
+                    rows.push(TargetRow::new(&address, endpoint_id.as_deref(), &zone));
+                }
+            }
+        }
+        // Reported in ADDRESS order, which the cursor below names a position in — so a page
+        // always advances, and an address taken or released elsewhere in the order cannot shift
+        // what a page holds. One address is one target however many records name it, so a
+        // position never names two rows.
+        rows.sort_by(|left, right| left.position.cmp(&right.position));
+        rows.dedup_by(|left, right| left.position == right.position);
+
+        // "This value is null when there are no more results to return" (`$NextToken`): a token
+        // only when a target follows this page, through the crate's one reading of that rule.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &input.verified_access_endpoint_id,
+            &rows,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |row| row.position.as_str(),
+        );
+
+        Ok(GetVerifiedAccessEndpointTargetsOutput {
+            verified_access_endpoint_targets: Some(
+                page.iter()
+                    .map(|row| row.target.clone())
+                    .collect::<Vec<VerifiedAccessEndpointTarget>>(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// Every address a network interface holds, of either family: its primary private address and
+/// each secondary one, and its IPv6 addresses.
+///
+/// The addresses of the account's resources are the candidates a CIDR endpoint's targets are
+/// found among, so they are read off the interface in ONE place rather than once per member.
+fn interface_addresses(interface: &NetworkInterface) -> Vec<String> {
+    let mut addresses: Vec<String> = Vec::new();
+    addresses.extend(interface.private_ip_address.clone());
+    addresses.extend(
+        interface
+            .private_ip_addresses
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.private_ip_address.clone()),
+    );
+    addresses.extend(interface.ipv6_address.clone());
+    addresses.extend(
+        interface
+            .ipv6_addresses
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.ipv6_address.clone()),
+    );
+    addresses
+}
+
+/// One target this operation reports, beside the position it holds in the order the report is
+/// paged in.
+///
+/// The position is carried on the row rather than recomputed per comparison, so the sort, the
+/// cursor the page token names and the page boundary all read ONE value: a row's position and
+/// the order it is reported in cannot disagree.
+struct TargetRow {
+    /// The row's place in that order: the target's address as a FIXED-WIDTH number, so
+    /// comparing the text compares the addresses — an address's text does not sort in address
+    /// order (`10.0.0.9` sorts after `10.0.0.10`). Total, because one address is one target.
+    position: String,
+    /// The target as the model reports it.
+    target: VerifiedAccessEndpointTarget,
+}
+
+impl TargetRow {
+    /// The row for the address `address` of the endpoint `endpoint_id`, whose targets are named
+    /// under `zone`.
+    fn new(address: &str, endpoint_id: Option<&str>, zone: &str) -> Self {
+        Self {
+            position: format!("{:032x}", address_order_key(address)),
+            target: VerifiedAccessEndpointTarget {
+                // "The ID of the Verified Access endpoint"
+                // (`VerifiedAccessEndpointTarget$VerifiedAccessEndpointId`): the endpoint this
+                // target was reported for.
+                verified_access_endpoint_id: endpoint_id.map(str::to_string),
+                // "The IP address of the target"
+                // (`VerifiedAccessEndpointTarget$VerifiedAccessEndpointTargetIpAddress`): the
+                // address itself, as the family it belongs to spells it.
+                verified_access_endpoint_target_ip_address: Some(address.to_string()),
+                verified_access_endpoint_target_dns: Some(target_dns_name(address, zone)),
+            },
+        }
+    }
+}
+
+/// The number `address`'s bits make: the ONE reading of the address order this report is
+/// sorted, paged and cursored in.
+///
+/// An address of neither family has no place in that order, so it sorts after every address
+/// that has one — no such value is reported anyway, because only an address the endpoint's CIDR
+/// contains is ([`crate::state::cidr_block_contains_address`] reads both the block and the
+/// address).
+fn address_order_key(address: &str) -> u128 {
+    match address.parse::<::std::net::IpAddr>() {
+        Ok(::std::net::IpAddr::V4(address)) => u128::from(u32::from(address)),
+        Ok(::std::net::IpAddr::V6(address)) => u128::from(address),
+        Err(_) => u128::MAX,
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets, and the most one call reports:
+/// the largest page the model publishes for this operation
+/// (`GetVerifiedAccessEndpointTargetsMaxResults`, `range 5..1000`).
+const MAX_TARGETS_PER_PAGE: usize = 1000;
+
+/// "The DNS name of the target"
+/// (`VerifiedAccessEndpointTarget$VerifiedAccessEndpointTargetDns`) for `address`, inside the
+/// `zone` the endpoint's targets are reached under.
+///
+/// CHOSEN form, on the same terms
+/// [`crate::state::verified_access_endpoint_domain`] chose the endpoint's own generated name
+/// on: the model says only that the member is a DNS name, so what a caller can rely on is
+/// what this gives it — one name per target, inside that endpoint's own zone, carrying the
+/// address it stands for, and unchanged between reads. An address's own separators cannot
+/// appear in a DNS label, so each is written as a hyphen.
+fn target_dns_name(address: &str, zone: &str) -> String {
+    let label: String = address
+        .chars()
+        .map(|character| match character {
+            '.' | ':' => '-',
+            other => other,
+        })
+        .collect();
+    if zone.is_empty() {
+        return label;
+    }
+    format!("{label}.{zone}")
 }
