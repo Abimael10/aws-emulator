@@ -17,11 +17,12 @@
 //! keeps the stored one. A `TtlDuration` replaces the record's TTL duration, from which
 //! `ExpiresAt = EventTime + TtlDuration` is re-derived; an omitted one leaves the
 //! record's TTL setting as it stands, and a record under no TTL setting of its own is
-//! under the default its feature group's `OnlineStoreConfig` configures. Because that
-//! expiry is derived from the event time,
-//! an update made under a TTL — the request's own `TtlDuration`, or the default one the
-//! feature group's `OnlineStoreConfig` configures — must carry an `EventTime`, and one
-//! that does not is refused with `ValidationError` (400).
+//! under the default its feature group's `OnlineStoreConfig` configures. A request that
+//! states a `TtlDuration` of its own must also carry an `EventTime` — the two together
+//! state the instant `ExpiresAt` is — and one that does not is refused with
+//! `ValidationError` (400). A request that states no `TtlDuration` needs no `EventTime`,
+//! whatever TTL the record or its feature group already stands under, because the expiry
+//! is then re-derived from the event time the record keeps.
 //!
 //! This is the one operation that GROWS a stored record — a posted feature the record
 //! does not carry yet is appended, where `PutRecord` replaces a record's feature values
@@ -315,12 +316,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you specify a TtlDuration, you must also provide an EventTime in the
         // request. Otherwise, the operation returns a ValidationError." (`ExpiresAt` is
         // `EventTime + TtlDuration`, so a TTL with no event time states no instant.) The
-        // same holds for the TTL the feature group's own `OnlineStoreConfig` configures by
-        // default: an update of a record under a default TTL re-derives that record's
-        // expiry from its event time, so this request has to state one.
-        let ttl_in_force =
-            input.ttl_duration.is_some() || definition.default_ttl_seconds.is_some();
-        if ttl_in_force && posted_event_time.is_none() {
+        // condition is on what THIS REQUEST states: a request that names no `TtlDuration`
+        // is the documented partial update — "If you omit EventTime, the service keeps the
+        // record's existing EventTime and applies the update" — and the expiry of a record
+        // already standing under a TTL, its own or its feature group's default, is
+        // re-derived from the event time the record keeps, so nothing has to be restated.
+        if input.ttl_duration.is_some() && posted_event_time.is_none() {
             return Err(validation(EVENT_TIME_REQUIRED_FOR_TTL));
         }
         let ttl_secs = match input.ttl_duration.as_ref() {
@@ -537,11 +538,13 @@ const CONFLICTING_EVENT_TIME: &str =
     "Update rejected: the provided EventTime is older than the record's current EventTime. The \
      record was not modified.";
 
-/// How this operation states a `TtlDuration` — the request's own, or the feature group's
-/// default — with no `EventTime` to derive an expiry from.
+/// How this operation states a `TtlDuration` with no `EventTime` to derive an expiry
+/// from.
 ///
-/// Fixed text: the rule names the two members it is about and the feature a request
-/// carries an event time in, and nothing of this request or this feature group.
+/// Fixed text, as the service words this error class: it names the two members the rule is
+/// about, the way a TTL can also be in force without the request naming one, and the
+/// feature a request carries an event time in — and nothing of this request or this
+/// feature group.
 const EVENT_TIME_REQUIRED_FOR_TTL: &str =
     "Validation Error: EventTime is required when TtlDuration is specified or when the feature \
      group has a default TTL configured. Include the EventTime feature in the Features list.";

@@ -5,6 +5,14 @@
 //! `OnlineStoreConfig.TtlDuration` configures — and what every later call that moves the
 //! record's event time, an update or a soft delete, re-derives its `ExpiresAt` to.
 //!
+//! The group's default is a property of the STORED record, not a condition on a later
+//! request: `UpdateRecord` requires an `EventTime` beside a `TtlDuration` the REQUEST
+//! states ("If you specify a TtlDuration, you must also provide an EventTime in the
+//! request. Otherwise, the operation returns a ValidationError"), and an update that states
+//! no `TtlDuration` applies with the record's own event time ("If you omit EventTime, the
+//! service keeps the record's existing EventTime and applies the update") whatever TTL the
+//! record already stands under.
+//!
 //! Every case goes through the real front door — the multi-service router, the restJson1
 //! protocol, the modelled constraint validation — so what is asserted is the wire
 //! behaviour a client sees, not a handler's return value.
@@ -558,6 +566,372 @@ async fn an_update_re_derives_the_expiry_from_the_ttl_in_force() {
             &later,
             Some(expected),
         );
+    }
+}
+
+/// The features a `GetRecord` response serves, as `(name, value)` pairs, and an empty list
+/// when it serves no record at all.
+fn record_pairs(body: &Value) -> Vec<(String, String)> {
+    body.get("Record")
+        .and_then(Value::as_array)
+        .map(|features| {
+            features
+                .iter()
+                .map(|held| {
+                    (
+                        held["FeatureName"].as_str().unwrap_or_default().to_owned(),
+                        held["ValueAsString"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The value a served record carries for `name`, or `None` when it carries no such
+/// feature.
+fn served_value(body: &Value, name: &str) -> Option<String> {
+    record_pairs(body)
+        .into_iter()
+        .find(|(held, _)| held == name)
+        .map(|(_, value)| value)
+}
+
+/// The wire error code of an error response: restJson1 carries it as the body's `__type`.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The message an error response carries (`ValidationError$Message`, which restJson1
+/// serialises under that name; the framework's own refusals use the lowercase spelling).
+fn message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// How `UpdateRecord` states a request-stated `TtlDuration` with no `EventTime` beside it:
+/// fixed text, as the service words this error class.
+const EVENT_TIME_REQUIRED_FOR_TTL: &str =
+    "Validation Error: EventTime is required when TtlDuration is specified or when the feature \
+     group has a default TTL configured. Include the EventTime feature in the Features list.";
+
+/// One row of the omitted-`EventTime` table: the case name, the feature group's default TTL
+/// in seconds, the `TtlDuration` the record was INGESTED under and the seconds that is,
+/// whether the record's event time is spelled ISO-8601 (rather than epoch seconds), and the
+/// `(feature, value)` pairs the update posts.
+type KeptEventTimeRow<'a> = (
+    &'a str,
+    Option<f64>,
+    Option<Value>,
+    Option<f64>,
+    bool,
+    Vec<(&'a str, &'a str)>,
+);
+
+#[tokio::test]
+async fn an_update_stating_no_ttl_duration_applies_with_the_records_own_event_time() {
+    // The class the rule spans: whether a TTL is in force through the feature group's
+    // DEFAULT, through the record's OWN duration, through both or through neither, crossed
+    // with the two accepted event-time spellings and how many features the update posts —
+    // none of which is a reason to refuse an update that states no `TtlDuration`. The
+    // durations are the model's own `TtlDurationUnit` spans (see `DEFAULT_TTL_ROWS`), as
+    // the seconds the control plane records them in.
+    let rows: Vec<KeptEventTimeRow<'_>> = vec![
+        (
+            "no TTL anywhere",
+            None,
+            None,
+            None,
+            true,
+            vec![("city", "Portland")],
+        ),
+        (
+            "a group default in seconds",
+            Some(45.0),
+            None,
+            None,
+            true,
+            vec![("city", "Portland")],
+        ),
+        (
+            "a group default in minutes, an epoch event time",
+            Some(900.0),
+            None,
+            None,
+            false,
+            vec![("city", "Portland")],
+        ),
+        (
+            "a group default in hours",
+            Some(129_600.0),
+            None,
+            None,
+            true,
+            vec![("city", "Portland")],
+        ),
+        (
+            "a group default in days, two posted features",
+            Some(172_800.0),
+            None,
+            None,
+            true,
+            vec![("city", "Portland"), ("tier", "gold")],
+        ),
+        (
+            "a group default in weeks, a feature the record does not carry yet",
+            Some(2_419_200.0),
+            None,
+            None,
+            false,
+            vec![("segment", "appended")],
+        ),
+        (
+            "a record-level TTL over a group default",
+            Some(3_600.0),
+            Some(json!({ "Unit": "Weeks", "Value": 1 })),
+            Some(604_800.0),
+            true,
+            vec![("city", "Portland")],
+        ),
+        (
+            "a record-level TTL with no group default",
+            None,
+            Some(json!({ "Unit": "Days", "Value": 2 })),
+            Some(172_800.0),
+            false,
+            vec![("city", "Portland")],
+        ),
+    ];
+
+    for (index, (case, default_ttl, record_ttl, record_ttl_secs, iso_event_time, posted)) in
+        rows.into_iter().enumerate()
+    {
+        // Each row needs its own feature group: the default TTL is the GROUP's.
+        let emulator = Emulator::new();
+        let group = format!("keptevent{index}");
+        emulator.create_feature_group(&group, default_ttl);
+
+        // The record is ingested with an event time a day out, in whichever spelling the
+        // row names, so it is still live under every TTL in the table.
+        let event_time = if iso_event_time {
+            tomorrow_iso()
+        } else {
+            tomorrow_epoch()
+        };
+        let mut seed = json!({ "Record": [
+            feature(IDENTIFIER_FEATURE, "C-kept"),
+            feature(EVENT_TIME_FEATURE, &event_time),
+            feature("city", "Seattle"),
+            feature("tier", "silver")
+        ] });
+        if let Some(ttl) = record_ttl {
+            seed["TtlDuration"] = ttl;
+        }
+        let (status, body) = emulator.put_record(&group, seed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the seeding PutRecord to answer 200, got {status} ({body})"
+        );
+
+        // The update posts only the features it changes: no `TtlDuration` member, and not
+        // the group's event-time feature.
+        let (status, body) = emulator
+            .update_record(
+                &group,
+                json!({
+                    "RecordIdentifierValueAsString": "C-kept",
+                    "Features": posted
+                        .iter()
+                        .map(|(name, value)| feature(name, value))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected an update that states no TtlDuration and omits the \
+             EventTime to answer 200, got {status} ({body})"
+        );
+
+        let (status, served) = emulator.get_record(&group, "C-kept").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetRecord 200, got {status} ({served})"
+        );
+
+        // The merge was applied…
+        for (name, value) in &posted {
+            let actual = served_value(&served, name);
+            assert_eq!(
+                actual.as_deref(),
+                Some(*value),
+                "case {case:?}: expected the posted feature {name:?} to read back as {value:?}, \
+                 got {actual:?}"
+            );
+        }
+        // …every feature the update did not name keeps its stored value…
+        for (name, value) in [("city", "Seattle"), ("tier", "silver")] {
+            if posted.iter().any(|(posted_name, _)| *posted_name == name) {
+                continue;
+            }
+            let actual = served_value(&served, name);
+            assert_eq!(
+                actual.as_deref(),
+                Some(value),
+                "case {case:?}: expected the unposted feature {name:?} to keep {value:?}, got \
+                 {actual:?}"
+            );
+        }
+        // …the record keeps its own EventTime, in the spelling it was stored in…
+        let kept = served_value(&served, EVENT_TIME_FEATURE);
+        assert_eq!(
+            kept.as_deref(),
+            Some(event_time.as_str()),
+            "case {case:?}: expected the record to keep its EventTime {event_time:?}, got \
+             {kept:?}"
+        );
+        // …and `ExpiresAt` is re-derived from that kept event time under the TTL the record
+        // already stands under: its own duration where it has one, and the group's default
+        // otherwise.
+        assert_expiry(
+            case,
+            &served,
+            &event_time,
+            record_ttl_secs.or(default_ttl),
+        );
+    }
+}
+
+/// One row of the request-`TtlDuration` table: the case name, the feature group's default
+/// TTL in seconds, the `TtlDuration` the update states and the seconds that is, whether the
+/// update carries an `EventTime`, and the status it must answer.
+type StatedTtlRow<'a> = (&'a str, Option<f64>, Value, f64, bool, u16);
+
+#[tokio::test]
+async fn an_update_stating_a_ttl_duration_needs_an_event_time_beside_it() {
+    // The class the rule spans: a request-level `TtlDuration` in several of the model's
+    // units, with and without a default TTL on the feature group, crossed with whether the
+    // update carries the group's event-time feature. Only the last decides the verdict.
+    let rows: Vec<StatedTtlRow<'_>> = vec![
+        (
+            "a request TtlDuration in minutes, no group default, no EventTime",
+            None,
+            json!({ "Unit": "Minutes", "Value": 30 }),
+            1_800.0,
+            false,
+            400,
+        ),
+        (
+            "a request TtlDuration in minutes, a group default, no EventTime",
+            Some(3_600.0),
+            json!({ "Unit": "Minutes", "Value": 30 }),
+            1_800.0,
+            false,
+            400,
+        ),
+        (
+            "a request TtlDuration in weeks, a group default, no EventTime",
+            Some(3_600.0),
+            json!({ "Unit": "Weeks", "Value": 2 }),
+            1_209_600.0,
+            false,
+            400,
+        ),
+        (
+            "a request TtlDuration in days, a group default, with an EventTime",
+            Some(3_600.0),
+            json!({ "Unit": "Days", "Value": 1 }),
+            86_400.0,
+            true,
+            200,
+        ),
+        (
+            "a request TtlDuration in seconds, no group default, with an EventTime",
+            None,
+            json!({ "Unit": "Seconds", "Value": 600 }),
+            600.0,
+            true,
+            200,
+        ),
+    ];
+
+    for (index, (case, default_ttl, ttl, ttl_secs, with_event_time, expected_status)) in
+        rows.into_iter().enumerate()
+    {
+        let emulator = Emulator::new();
+        let group = format!("statedttl{index}");
+        emulator.create_feature_group(&group, default_ttl);
+        let event_time = tomorrow_iso();
+        let (status, body) = emulator
+            .put_record(
+                &group,
+                json!({ "Record": [
+                    feature(IDENTIFIER_FEATURE, "C-stated"),
+                    feature(EVENT_TIME_FEATURE, &event_time),
+                    feature("city", "Seattle")
+                ] }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the seeding PutRecord to answer 200, got {status} ({body})"
+        );
+        let (_, before) = emulator.get_record(&group, "C-stated").await;
+        let before_pairs = record_pairs(&before);
+
+        let mut features = vec![feature("city", "Portland")];
+        if with_event_time {
+            features.push(feature(EVENT_TIME_FEATURE, &event_time));
+        }
+        let (status, answered) = emulator
+            .update_record(
+                &group,
+                json!({
+                    "RecordIdentifierValueAsString": "C-stated",
+                    "Features": features,
+                    "TtlDuration": ttl
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} ({answered})"
+        );
+
+        let (_, served) = emulator.get_record(&group, "C-stated").await;
+        if expected_status == 200 {
+            // The duration the request states replaces the one the record stood under, and
+            // the expiry is re-derived from the event time beside it.
+            assert_expiry(case, &served, &event_time, Some(ttl_secs));
+            continue;
+        }
+
+        let code = error_code(&answered);
+        let stated = message(&answered);
+        assert_eq!(
+            (code.as_str(), stated.as_str()),
+            ("ValidationError", EVENT_TIME_REQUIRED_FOR_TTL),
+            "case {case:?}: expected ValidationError stating \
+             {EVENT_TIME_REQUIRED_FOR_TTL:?}, got {code:?} with {stated:?}"
+        );
+        // A refused update changes nothing: the record is as it was, under the TTL it was
+        // ingested beneath.
+        let after_pairs = record_pairs(&served);
+        assert_eq!(
+            after_pairs, before_pairs,
+            "case {case:?}: expected the refused update to leave the record as it was \
+             ({before_pairs:?}), got {after_pairs:?}"
+        );
+        assert_expiry(case, &served, &event_time, default_ttl);
     }
 }
 

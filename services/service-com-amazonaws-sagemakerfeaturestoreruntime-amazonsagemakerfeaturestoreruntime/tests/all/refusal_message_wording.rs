@@ -19,10 +19,10 @@
 //! * `UpdateRecord`'s stale-`EventTime` conflict states the verdict and the fact a retry
 //!   path keys on — that the record was not modified — and names no value from the
 //!   request, because the verdict is on the ordering alone.
-//! * An update made under a TTL (the request's own `TtlDuration`, or the DEFAULT one the
-//!   feature group's `OnlineStoreConfig` configures) must carry an `EventTime`, since the
-//!   record's expiry is derived from it; the refusal states that rule and nothing of this
-//!   request.
+//! * An update that states a `TtlDuration` of its own must carry an `EventTime`, since the
+//!   two together state the instant the record expires at; the refusal states that rule and
+//!   nothing of this request. An update that states no `TtlDuration` carries no such
+//!   requirement, whatever TTL the record already stands under.
 //! * A value outside a modelled constraint is refused with a message BUILT FROM THE
 //!   REQUEST, and for a `@length` broken by a LIST member the value the clause states is
 //!   the list itself, rendered as a list of the modelled structure renders.
@@ -596,19 +596,21 @@ async fn a_stale_event_time_states_the_conflict_and_leaves_the_record_standing()
 type TtlRow<'a> = (&'a str, Option<f64>, Option<Value>, bool, u16);
 
 #[tokio::test]
-async fn an_update_under_a_ttl_requires_an_event_time_and_states_the_whole_rule() {
-    // The rule's fixed text: it names the two ways a TTL comes to be in force and the
-    // feature a request carries an event time in, and nothing of this request or this
-    // feature group.
+async fn an_update_stating_a_ttl_duration_requires_an_event_time_and_states_the_whole_rule() {
+    // The rule's fixed text, as the service words this error class: it names the two
+    // members the rule is about, the way a TTL can also be in force without the request
+    // naming one, and the feature a request carries an event time in — and nothing of this
+    // request or this feature group.
     let expected = "Validation Error: EventTime is required when TtlDuration is specified or when \
                     the feature group has a default TTL configured. Include the EventTime feature \
                     in the Features list.";
 
-    // The class the rule spans: whether a TTL is in force through the REQUEST, through the
-    // feature group's DEFAULT, through both or through neither, crossed with whether the
-    // update carries an EventTime. The TTL units are the model's own `TtlDurationUnit`
-    // values (`smithy_query(query="shape", shape="TtlDurationUnit")`: Seconds, Minutes,
-    // Hours, Days, Weeks).
+    // The class the rule spans: whether the REQUEST states a `TtlDuration`, crossed with
+    // whether the feature group carries a default TTL and whether the update carries an
+    // EventTime — only the request's own `TtlDuration` decides the refusal. The TTL units
+    // are the model's own `TtlDurationUnit` values
+    // (`smithy_query(query="shape", shape="TtlDurationUnit")`: Seconds, Minutes, Hours,
+    // Days, Weeks).
     //
     // (case, the group's default TTL in seconds, the request's TtlDuration, whether the
     // update carries an EventTime, expected status)
@@ -648,12 +650,22 @@ async fn an_update_under_a_ttl_requires_an_event_time_and_states_the_whole_rule(
             false,
             400,
         ),
+        // The feature group's DEFAULT TTL is not a request-stated `TtlDuration`: an update
+        // that states none keeps the record's own event time, from which the expiry is
+        // re-derived, so it applies.
         (
             "a default TTL on the feature group, no EventTime",
             Some(3_600.0),
             None,
             false,
-            400,
+            200,
+        ),
+        (
+            "a default TTL in weeks on the feature group, no EventTime",
+            Some(1_209_600.0),
+            None,
+            false,
+            200,
         ),
         (
             "a default TTL on the feature group, with an EventTime",
