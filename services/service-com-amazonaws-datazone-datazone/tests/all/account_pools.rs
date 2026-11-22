@@ -20,8 +20,13 @@
 //!    and be available, and a pool nothing created is not found.
 //! 5. A request outside a modelled constraint is refused with the modelled validation
 //!    error, not stored.
+//! 6. `DeleteAccountPool` removes the pool it names from the domain that holds it, so
+//!    the pool's readers (`GetAccountPool`, `ListAccountPools`) stop reporting it and
+//!    every other pool of the domain is left alone; an id the addressed domain does not
+//!    hold — one nothing created, one of another domain, one an earlier delete removed —
+//!    is refused as not found, and a domain this store serves none of denies the call.
 
-use crate::harness::{accounts, Emulator, SETTLED};
+use crate::harness::{accounts, Emulator};
 use serde_json::{json, Value};
 // The one `ResolutionStrategy` member as the service stores it, so a drift between the
 // constant and the value on the wire fails here.
@@ -142,10 +147,11 @@ async fn available_domain_with_root(dz: &Emulator, name: &str) -> (String, Strin
         "creating domain {name:?}: expected 201, got {} {:?}",
         created.status, created.body
     );
-    // Wait out the chosen lifecycle span, plus slack, so the domain has settled to
-    // AVAILABLE and can take an account pool.
-    tokio::time::sleep(SETTLED).await;
-    (created.s("id"), created.s("rootDomainUnitId"))
+    // Look again until the domain has settled to AVAILABLE and can take an account
+    // pool: the CONDITION the clock owes, never a fixed wait.
+    let id = created.s("id");
+    dz.await_domain_status(&id, "AVAILABLE").await;
+    (id, created.s("rootDomainUnitId"))
 }
 
 /// The members a pool's create and get answers must agree on with the request.
@@ -552,4 +558,229 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
             answer.error_code
         );
     }
+}
+
+/// The pool ids `ListAccountPools` reports for a domain, sorted: the listing's own view
+/// of what the store still holds, so a delete is judged through a second reader as well
+/// as through the pool's own one.
+async fn listed_pool_ids(dz: &Emulator, pools_uri: &str) -> Vec<String> {
+    let listed = dz.call("GET", pools_uri, None).await;
+    assert_eq!(
+        listed.status, 200,
+        "listing the account pools: expected 200, got {} {:?}",
+        listed.status, listed.body
+    );
+    let mut ids: Vec<String> = listed
+        .body
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<absent>")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Assert that `uri` answers 404 `ResourceNotFoundException` with the kind-only wording
+/// this service answers for a pool it cannot find.
+fn assert_pool_absent(label: &str, call: &str, answer: &crate::harness::Answer) {
+    assert_eq!(
+        answer.status, 404,
+        "case {label:?}: {call} must answer 404, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code, "ResourceNotFoundException",
+        "case {label:?}: {call} must answer ResourceNotFoundException, got {:?}",
+        answer.error_code
+    );
+    assert_eq!(
+        answer.s("message"),
+        "Account Pool not found",
+        "case {label:?}: {call} must name the kind alone, got {:?}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_account_pool_removes_it_and_leaves_every_other_pool_alone() {
+    let dz = Emulator::new();
+    let (domain, _) = available_domain_with_root(&dz, "account-pool-deletion").await;
+    let pools_uri = format!("/v2/domains/{domain}/account-pools");
+
+    // Every row of the create table, so the delete is exercised over everything the rule
+    // generalises over: both `AccountSource` members, a static list of 1, 3 and the
+    // modelled maximum of 25 accounts, a description present and absent, and names at
+    // both modelled bounds.
+    let mut remaining: Vec<(&'static str, String)> = Vec::new();
+    for case in pool_cases() {
+        let created = dz.call("POST", &pools_uri, Some(case.body)).await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: creating the pool: expected 201, got {} {:?}",
+            case.label, created.status, created.body
+        );
+        remaining.push((case.label, created.s("id")));
+    }
+
+    // The listing reports every pool that was created, before any of them is deleted.
+    let mut expected: Vec<String> = remaining.iter().map(|(_, id)| id.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        listed_pool_ids(&dz, &pools_uri).await,
+        expected,
+        "the listing must report every created pool before any delete"
+    );
+
+    while let Some((label, id)) = remaining.pop() {
+        let deleted = dz
+            .call("DELETE", &format!("{pools_uri}/{id}"), None)
+            .await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {label:?}: deleting the pool: expected 204, got {} {:?}",
+            deleted.status, deleted.body
+        );
+        assert!(
+            deleted
+                .body
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "case {label:?}: the modelled output has no members, got {:?}",
+            deleted.body
+        );
+
+        // The pool's own reader stops reporting it: the delete was persisted, not
+        // reported.
+        let gone = dz.call("GET", &format!("{pools_uri}/{id}"), None).await;
+        assert_pool_absent(label, "GetAccountPool after the delete", &gone);
+        // Deleting it again addresses an id the domain no longer holds, so it is as
+        // absent as one nothing ever created.
+        let again = dz
+            .call("DELETE", &format!("{pools_uri}/{id}"), None)
+            .await;
+        assert_pool_absent(label, "a repeated DeleteAccountPool", &again);
+
+        // The listing drops exactly that pool and keeps every one not yet deleted.
+        let mut still_there: Vec<String> = remaining.iter().map(|(_, id)| id.clone()).collect();
+        still_there.sort();
+        assert_eq!(
+            listed_pool_ids(&dz, &pools_uri).await,
+            still_there,
+            "case {label:?}: the listing must drop only the deleted pool"
+        );
+        // And each of those is still readable in full.
+        for (other_label, other) in &remaining {
+            let read_back = dz.call("GET", &format!("{pools_uri}/{other}"), None).await;
+            assert_eq!(
+                read_back.status, 200,
+                "case {other_label:?}: a pool no delete named must stay readable, got {} {:?}",
+                read_back.status, read_back.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delete_needs_a_domain_and_a_pool_the_store_holds() {
+    let dz = Emulator::new();
+    let (domain, _) = available_domain_with_root(&dz, "account-pool-delete-prerequisites").await;
+    let (elsewhere, _) = available_domain_with_root(&dz, "account-pool-delete-other").await;
+    let pools_uri = format!("/v2/domains/{domain}/account-pools");
+
+    let created = dz
+        .call("POST", &pools_uri, Some(pool_cases().swap_remove(0).body))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "creating the pool: expected 201, got {} {:?}",
+        created.status, created.body
+    );
+    let pool = created.s("id");
+
+    // A well-formed domain id nothing created: a permission is held ON a domain, so the
+    // caller holds none here and authorization decides the delete before any lookup.
+    let denied = dz
+        .call(
+            "DELETE",
+            &format!("/v2/domains/dzd_nosuchdomain000/account-pools/{pool}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        denied.status, 403,
+        "a domain nothing created must deny the delete, got {} {:?}",
+        denied.status, denied.body
+    );
+    assert_eq!(
+        denied.error_code, "AccessDeniedException",
+        "expected AccessDeniedException, got {:?}",
+        denied.error_code
+    );
+    assert_eq!(
+        denied.s("message"),
+        "User is not permitted to perform operation: DeleteAccountPool",
+        "the denial must carry the recorded wording, got {:?}",
+        denied.body
+    );
+
+    // A pool id nothing created, in a domain that does exist: the ids span the modelled
+    // `AccountPoolId` pattern `^[a-zA-Z0-9_-]{1,36}$` (smithy_query shape="AccountPoolId")
+    // at its minimum length, its maximum and in between.
+    for id in ["nosuchpool", "0", &"z".repeat(36)] {
+        let missing = dz.call("DELETE", &format!("{pools_uri}/{id}"), None).await;
+        assert_pool_absent(id, "DeleteAccountPool on an id nothing created", &missing);
+    }
+
+    // A pool is deletable only through its OWN domain: the same id addressed through
+    // another domain is as absent as one that was never created, and the pool itself
+    // survives the refusal.
+    let cross = dz
+        .call(
+            "DELETE",
+            &format!("/v2/domains/{elsewhere}/account-pools/{pool}"),
+            None,
+        )
+        .await;
+    assert_pool_absent(&pool, "DeleteAccountPool through another domain", &cross);
+    let survived = dz.call("GET", &format!("{pools_uri}/{pool}"), None).await;
+    assert_eq!(
+        survived.status, 200,
+        "a refused delete must leave the pool readable, got {} {:?}",
+        survived.status, survived.body
+    );
+
+    // Once the domain itself is gone the caller holds nothing on its identifier, so the
+    // delete is denied rather than answered as a miss.
+    let domain_deleted = dz
+        .call("DELETE", &format!("/v2/domains/{domain}"), None)
+        .await;
+    assert_eq!(
+        domain_deleted.status, 202,
+        "deleting the domain: expected 202, got {} {:?}",
+        domain_deleted.status, domain_deleted.body
+    );
+    dz.await_domain_gone(&domain).await;
+    let orphaned = dz
+        .call("DELETE", &format!("{pools_uri}/{pool}"), None)
+        .await;
+    assert_eq!(
+        orphaned.status, 403,
+        "a pool whose domain is gone must deny the delete, got {} {:?}",
+        orphaned.status, orphaned.body
+    );
+    assert_eq!(
+        orphaned.error_code, "AccessDeniedException",
+        "expected AccessDeniedException, got {:?}",
+        orphaned.error_code
+    );
 }
