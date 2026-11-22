@@ -29,7 +29,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{
-    NONEXISTENT_ITEM_MESSAGE, SCOPE_CLOUDFRONT, SCOPE_REGIONAL,
+    resource_arn, IP_SET_ARN_KIND, NONEXISTENT_ITEM_MESSAGE, RULE_GROUP_ARN_KIND, SCOPE_CLOUDFRONT,
+    SCOPE_REGIONAL,
 };
 
 use crate::managed_rule_sets::provision_managed_rule_set;
@@ -1068,4 +1069,204 @@ async fn each_write_judges_its_target_and_its_references_in_wafs_order() {
         (&json!({}), Some(set_lock.as_str())),
         "a refused publish must leave the set and its token alone, got {read_set}"
     );
+}
+
+/// A token outside the form the model pins for a `LockToken`.
+///
+/// `LockToken` is `@length(1..36)` with `@pattern(^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$)`
+/// (`smithy_query(query="shape",shape="LockToken")`), and this value satisfies the pattern
+/// of neither — a reference the put cannot use is still what the put is told about.
+const MALFORMED_LOCK_TOKEN: &str = "stale-token";
+
+/// An account id that is not this emulator's own, for an ARN of another account.
+const FOREIGN_ACCOUNT: &str = "123456789012";
+
+/// A region that is neither namespace's own, for an ARN of another region.
+const FOREIGN_REGION: &str = "eu-central-1";
+
+/// Every way an `AssociatedRuleGroupArn` can be one WAF cannot use for a published
+/// version, given the namespace and the identity the put addresses: the case name and
+/// the value to send.
+///
+/// The rows differ along what the rule generalises over — the ARN's partition, its
+/// account, its region, its resource kind, its service, and whether it is an ARN at
+/// all — and the first row is the form WAF's own ARN builder mints for the
+/// `(Scope, Name, Id)` the put addresses (`state::resource_arn`), which on an account
+/// that has minted no rule group resolves to nothing. The first four rows are
+/// well-formed rule-group ARNs that only the STORE can tell from a usable reference;
+/// the last three need no store at all.
+fn references_a_fresh_account_cannot_use(
+    scope: &str,
+    region: &str,
+    name: &str,
+    id: &str,
+) -> Vec<(String, String)> {
+    // The first resource segment of a wafv2 ARN, as `state::resource_arn` lays it out:
+    // `global` for the CLOUDFRONT namespace, `regional` for the other.
+    let namespace = if scope == SCOPE_CLOUDFRONT {
+        "global"
+    } else {
+        "regional"
+    };
+    let arn_region = if scope == SCOPE_CLOUDFRONT {
+        CLOUDFRONT_ENDPOINT_REGION
+    } else {
+        region
+    };
+    let account = ::engine::emulator_account_id();
+    let arn_of = |partition: &str, account: &str, arn_region: &str, kind: &str| {
+        format!("arn:{partition}:wafv2:{arn_region}:{account}:{namespace}/{kind}/{name}/{id}")
+    };
+    vec![
+        (
+            "WAF's own rule-group ARN form for the identity the put addresses".to_string(),
+            resource_arn(scope, region, RULE_GROUP_ARN_KIND, name, id),
+        ),
+        (
+            "a rule-group ARN of another account".to_string(),
+            arn_of("aws", FOREIGN_ACCOUNT, arn_region, RULE_GROUP_ARN_KIND),
+        ),
+        (
+            "a rule-group ARN of another region".to_string(),
+            arn_of("aws", account, FOREIGN_REGION, RULE_GROUP_ARN_KIND),
+        ),
+        (
+            "a rule-group ARN of another partition".to_string(),
+            arn_of("aws-cn", account, arn_region, RULE_GROUP_ARN_KIND),
+        ),
+        (
+            "a wafv2 ARN of another resource kind".to_string(),
+            arn_of("aws", account, arn_region, IP_SET_ARN_KIND),
+        ),
+        (
+            "another service's ARN".to_string(),
+            "arn:aws:s3:::aws-waf-logs-vendor-bucket".to_string(),
+        ),
+        (
+            // Past `ResourceArn`'s own modelled length floor of 20, so the value
+            // reaches the service rather than the request boundary.
+            "a value that is no ARN".to_string(),
+            "not-an-arn-at-all-but-long-enough".to_string(),
+        ),
+    ]
+}
+
+/// Rule 3 on an account that owns NOTHING — the state a vendor's first publish call meets:
+/// a `VersionsToPublish` reference WAF cannot use for a published version is the
+/// RESOURCE_ARN invalid-parameter refusal naming that reference, carrying `Field`,
+/// `Parameter`, `Reason` and the message WAF composes from the three, and it outranks both
+/// the lock token's own modelled form and the managed rule set the put addresses; a body
+/// WAF CAN use is what the missing target is reported for. Nothing is published either way.
+///
+/// The rows cross both namespaces with every way a reference fails to be one WAF can use
+/// (see [`references_a_fresh_account_cannot_use`]) and with the lock token (a value outside
+/// `LockToken`'s modelled form, and one inside it that no set carries), and the version key
+/// the put publishes under varies across the rows — so a refusal keyed to one ARN form, one
+/// token or one key form shows up as a difference between the rows. No resource is created
+/// first: the store holds no rule group to resolve a reference against and no managed rule
+/// set to address, which is what the recorded vendor call met.
+#[tokio::test]
+async fn a_publish_on_an_account_that_owns_nothing_reports_the_reference_it_cannot_use() {
+    // Vendor-plausible version keys, both inside `VersionKeyString`'s
+    // `@pattern(^[\w#:\.\-/]+$)` (`smithy_query(query="shape",shape="VersionKeyString")`).
+    let version_keys = ["Version_1.0", "1.0"];
+
+    for scope in [SCOPE_REGIONAL, SCOPE_CLOUDFRONT] {
+        let waf = Waf::new();
+        let region = if scope == SCOPE_CLOUDFRONT {
+            CLOUDFRONT_ENDPOINT_REGION
+        } else {
+            TEST_REGION
+        };
+        // The identity the put addresses: no managed rule set of this account carries
+        // it, because this account carries none at all.
+        let set_name = "never-provisioned";
+        let set_id = WELL_FORMED_UUID;
+
+        for (index, (reference, arn)) in
+            references_a_fresh_account_cannot_use(scope, region, set_name, set_id)
+                .into_iter()
+                .enumerate()
+        {
+            let version = version_keys[index % version_keys.len()];
+            for (token_case, token) in [
+                ("a token outside LockToken's form", MALFORMED_LOCK_TOKEN),
+                ("a token no set carries", WELL_FORMED_UUID),
+            ] {
+                let case = format!("{scope}, {reference}, {token_case}, under {version}");
+                let (status, body) = waf
+                    .call(
+                        "PutManagedRuleSetVersions",
+                        json!({
+                            "Name": set_name,
+                            "Scope": scope,
+                            "Id": set_id,
+                            "LockToken": token,
+                            "RecommendedVersion": version,
+                            "VersionsToPublish": {
+                                version: {
+                                    "AssociatedRuleGroupArn": &arn,
+                                    "ForecastedLifetime": 90,
+                                },
+                            },
+                        }),
+                    )
+                    .await;
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected the ARN refusal, got status {status} and \
+                     body {body}"
+                );
+                assert_invalid_parameter(&body, FIELD_RESOURCE_ARN, &arn, ARN_NOT_VALID, &case);
+                assert!(
+                    !body.to_string().contains("lockToken"),
+                    "case {case:?}: the answer must name the reference, not the token, \
+                     got {body}"
+                );
+            }
+        }
+
+        // The discriminating control: a body carrying no reference at all is one WAF can
+        // use, so the SAME identity on the SAME empty account reports the missing target
+        // instead — whatever the token's form, because the target is resolved before the
+        // token is judged. This is what shows the rows above reported the reference rather
+        // than only ever reporting one refusal.
+        for token in [MALFORMED_LOCK_TOKEN, WELL_FORMED_UUID] {
+            let case = format!("{scope}, nothing to publish, LockToken {token:?}");
+            let (status, body) = waf
+                .call(
+                    "PutManagedRuleSetVersions",
+                    json!({
+                        "Name": set_name,
+                        "Scope": scope,
+                        "Id": set_id,
+                        "LockToken": token,
+                    }),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&body)),
+                (400, "WAFNonexistentItemException"),
+                "case {case:?}: a body WAF can use must report the missing target, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                NONEXISTENT_ITEM_MESSAGE,
+                "case {case:?}: expected WAF's own sentence, got {body}"
+            );
+        }
+
+        // Nothing any refusal above published: the account still owns no managed rule set.
+        let (status, listed) = waf.call("ListManagedRuleSets", json!({ "Scope": scope })).await;
+        let summaries = listed["ManagedRuleSets"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            (status, summaries.len()),
+            (200, 0),
+            "case {scope:?}: a refused publish must leave the account owning nothing, \
+             got {listed}"
+        );
+    }
 }
