@@ -818,6 +818,17 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 describe_graph_snapshot(ctx, region, physical_resource_id).await
             }
+            // Amazon Redshift Serverless' own reads of the namespace, the workgroup and the
+            // snapshot, each by the name the stack published for the resource.
+            Self::RedshiftServerlessNamespace => {
+                describe_redshift_serverless_namespace(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessWorkgroup => {
+                describe_redshift_serverless_workgroup(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                describe_redshift_serverless_snapshot(ctx, region, physical_resource_id).await
+            }
             // Backup Gateway's own read of the hypervisor, by the ARN it minted for it.
             Self::BackupGatewayHypervisor => {
                 describe_backup_gateway_hypervisor(ctx, region, physical_resource_id).await

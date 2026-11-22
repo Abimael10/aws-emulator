@@ -264,6 +264,47 @@ pub fn port_in_documented_range(port: i32) -> bool {
         .any(|(low, high)| (*low..=*high).contains(&port))
 }
 
+/// The two TINY base capacities a workgroup may be given, in Redshift Processing Units.
+///
+/// Amazon Redshift Serverless publishes its base capacity in units of 8 RPUs from the smallest
+/// standard size upwards, and — below that smallest standard size, the range this service calls
+/// the tiny RPU range — exactly these two sizes. So a base capacity in the tiny range that is
+/// neither of them names no size the service serves.
+pub const TINY_BASE_CAPACITIES: [i32; 2] = [2, 4];
+
+/// The smallest STANDARD base capacity, which is where the tiny RPU range ends.
+pub const SMALLEST_STANDARD_BASE_CAPACITY: i32 = 8;
+
+/// How this service states that a base capacity in the tiny RPU range is neither of the two
+/// sizes it serves there ([`TINY_BASE_CAPACITIES`]).
+///
+/// `baseCapacity`'s valid sizes are documented on the member rather than modelled as a
+/// constraint, so the boundary validator cannot have refused one: this is the sentence the
+/// service words for that refusal, which a resource provider relaying it quotes verbatim.
+pub fn base_capacity_outside_tiny_range() -> String {
+    "The base capacity must be 2 or 4 in tiny RPU range.".to_string()
+}
+
+/// Why `base_capacity` is no size this service serves, or `None` for one it does.
+///
+/// The one reading of that rule, so `CreateWorkgroup` and `UpdateWorkgroup` cannot refuse the
+/// same size differently: a value BELOW [`SMALLEST_STANDARD_BASE_CAPACITY`] is in the tiny RPU
+/// range, where only [`TINY_BASE_CAPACITIES`] are served.
+///
+/// A size AT OR ABOVE that smallest standard one is accepted here UNVALIDATED, deliberately: the
+/// standard sizes go up in units of 8 to a published ceiling, so this service does refuse some of
+/// them, but the sentence it words for such a size is not one this emulator has recorded — and a
+/// refusal worded differently from the service's own is worse than none, because a resource
+/// provider relaying it quotes it verbatim. That half of the rule belongs with the recording that
+/// grounds its wording.
+pub fn base_capacity_refusal(base_capacity: i32) -> Option<String> {
+    let in_tiny_range = base_capacity < SMALLEST_STANDARD_BASE_CAPACITY;
+    if in_tiny_range && !TINY_BASE_CAPACITIES.contains(&base_capacity) {
+        return Some(base_capacity_outside_tiny_range());
+    }
+    None
+}
+
 /// The HTTP status this service answers a resource-NAME refusal with — a name already
 /// taken, or one that resolves to nothing — whatever the modelled error's `@httpError`
 /// names. From the recorded `CreateNamespace` / `GetNamespace` / `GetWorkgroup` refusals,
@@ -286,11 +327,11 @@ pub fn namespace_not_found(name: &str) -> String {
 
 /// How this service states that a workgroup name resolves to nothing: the same
 /// [`RESOURCE_NAME_REFUSAL_STATUS`] carrying the same modelled `ResourceNotFoundException`
-/// shape as [`namespace_not_found`], because a workgroup is addressed by NAME exactly as a
-/// namespace is. Every operation that addresses a workgroup by name refuses a miss this
-/// way, so the sentence lives here once.
+/// shape as [`namespace_not_found`], and worded the same way, because a workgroup is
+/// addressed by NAME exactly as a namespace is. Every operation that addresses a workgroup by
+/// name refuses a miss this way, so the sentence lives here once.
 pub fn workgroup_not_found(name: &str) -> String {
-    format!("no workgroup named {name}")
+    format!("Serverless workgroup {name} not found.")
 }
 
 /// How this service states that a namespace name is already taken: HTTP **400** carrying

@@ -715,6 +715,24 @@ impl Provisioner {
             Self::NeptuneGraphGraph => update_neptune_graph(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateNamespace` reconfigures the namespace the stack created, by the name it was
+            // created under, taking the admin credentials, the encryption keys, the IAM roles
+            // and the log exports; `UpdateWorkgroup` reconfigures the workgroup the same way,
+            // taking its compute, its ceiling, its port, its two flags, its subnets, its
+            // security groups, its database settings and its price-performance target. So a
+            // changed declaration of one of those reaches the resource rather than replacing
+            // it. (A SNAPSHOT has no arm: that service's own `UpdateSnapshot` is not served
+            // here, so a changed retention replaces the snapshot, whose create carries it.)
+            Self::RedshiftServerlessNamespace => {
+                update_redshift_serverless_namespace(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
+            Self::RedshiftServerlessWorkgroup => {
+                update_redshift_serverless_workgroup(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateDestination` "updates the specified destination of the specified
             // Firehose stream", and "the target Firehose stream remains active while the
             // configurations are updated" — so a declaration stating the stream's

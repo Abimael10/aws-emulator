@@ -1487,6 +1487,28 @@ pub(super) enum Provisioner {
     /// (`^gs-[a-z0-9]{10}$`), which is the identity a `Ref` resolves to, and publishes no call
     /// that changes a snapshot that exists — so a changed declaration replaces it.
     NeptuneGraphGraphSnapshot,
+    /// `AWS::RedshiftServerless::Namespace`: the collection of databases and users Amazon
+    /// Redshift Serverless' own `CreateNamespace` makes under the name the template states,
+    /// `UpdateNamespace` reconfigures and `DeleteNamespace` removes. That name IS the handle
+    /// every call of that service on a namespace takes, so it is the physical id the naming
+    /// rules already compute for the type, and the values the type publishes — the id and ARN
+    /// that service minted, the secret ARN of its managed credentials, the instant it recorded
+    /// and the status it reports — are read off its own answer ([`redshift_serverless`]).
+    RedshiftServerlessNamespace,
+    /// `AWS::RedshiftServerless::Workgroup`: the compute such a namespace serves its databases
+    /// through, which that service's own `CreateWorkgroup` makes under the name the template
+    /// states, `UpdateWorkgroup` reconfigures and `DeleteWorkgroup` removes. The name is the
+    /// handle every call on a workgroup takes, and the create leaves the workgroup `CREATING` —
+    /// in which it serves no connection and publishes no reachable endpoint — so the resource's
+    /// creation is held open on that service's own report of it.
+    RedshiftServerlessWorkgroup,
+    /// `AWS::RedshiftServerless::Snapshot`: the backup of such a namespace that service's own
+    /// `CreateSnapshot` takes under the name the template states and `DeleteSnapshot` removes.
+    /// The create leaves the snapshot `CREATING`, in which there is nothing to restore from, so
+    /// the resource's creation is held open the same way; that service's `UpdateSnapshot` is not
+    /// served here, so a declaration restating the retention replaces the snapshot
+    /// ([`super::template::replacement_properties`]).
+    RedshiftServerlessSnapshot,
     /// `AWS::BackupGateway::Hypervisor`: the on-premises hypervisor Backup Gateway's own
     /// `ImportHypervisorConfiguration` connects to, `UpdateHypervisor` reconfigures and
     /// `DeleteHypervisor` removes. That service MINTS the `HypervisorArn` — the import takes no
@@ -1799,6 +1821,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CUSTOMER_PROFILES_DOMAIN => Some(Provisioner::CustomerProfilesDomain),
         NEPTUNE_GRAPH_GRAPH => Some(Provisioner::NeptuneGraphGraph),
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
+        REDSHIFT_SERVERLESS_NAMESPACE => Some(Provisioner::RedshiftServerlessNamespace),
+        REDSHIFT_SERVERLESS_WORKGROUP => Some(Provisioner::RedshiftServerlessWorkgroup),
+        REDSHIFT_SERVERLESS_SNAPSHOT => Some(Provisioner::RedshiftServerlessSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
         DLM_LIFECYCLE_POLICY => Some(Provisioner::DlmLifecyclePolicy),
         // Each AWS Network Security Manager entity names which of the four it is, so the one
@@ -2845,6 +2870,19 @@ impl Provisioner {
             }
             Self::NeptuneGraphGraphSnapshot => {
                 create_graph_snapshot(ctx, region, resource, propagated).await
+            }
+            // All three `AWS::RedshiftServerless::*` types publish `Tags`, and each of their
+            // creates takes a `TagList` of its own, so a namespace, a workgroup and a snapshot
+            // a stack creates each carry the tags CloudFormation gives them beside the ones
+            // their declaration asks for.
+            Self::RedshiftServerlessNamespace => {
+                create_redshift_serverless_namespace(ctx, region, resource, propagated).await
+            }
+            Self::RedshiftServerlessWorkgroup => {
+                create_redshift_serverless_workgroup(ctx, region, resource, propagated).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                create_redshift_serverless_snapshot(ctx, region, resource, propagated).await
             }
             // `AWS::BackupGateway::Hypervisor` publishes `Tags`, and
             // `ImportHypervisorConfiguration` takes a `Tags` list of its own, so a hypervisor a
@@ -4037,6 +4075,18 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 delete_graph_snapshot(ctx, region, physical_resource_id).await
             }
+            // Each delete addresses its resource by the NAME it was created under, which is
+            // this resource's physical id. The namespace's takes the whole record because the
+            // snapshot it is captured into on the way out is a property of the declaration.
+            Self::RedshiftServerlessNamespace => {
+                delete_redshift_serverless_namespace(ctx, region, resource).await
+            }
+            Self::RedshiftServerlessWorkgroup => {
+                delete_redshift_serverless_workgroup(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                delete_redshift_serverless_snapshot(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the hypervisor by the ARN Backup Gateway minted for it,
             // which is this resource's physical id.
             Self::BackupGatewayHypervisor => {
@@ -4182,6 +4232,13 @@ pub(in crate::state) mod network_security_manager;
 /// snapshot of one an `AWS::NeptuneGraph::GraphSnapshot` declares, created in the service that
 /// owns them so a client's own reads resolve the identities the stack publishes.
 mod neptune_graphs;
+/// The Amazon Redshift Serverless arms: the namespace an `AWS::RedshiftServerless::Namespace`
+/// declares, the compute of one an `AWS::RedshiftServerless::Workgroup` declares and the backup
+/// of one an `AWS::RedshiftServerless::Snapshot` declares, each created in the service that owns
+/// it so a client's own `GetNamespace`, `GetWorkgroup` and `GetSnapshot` resolve the names the
+/// stack publishes. Visible to the rest of this service's state because the three types' own
+/// NAMES and the attributes each publishes live here, beside the arms that provision them.
+pub(in crate::state) mod redshift_serverless;
 /// The AWS Glue TABLE OPTIMIZER arms: the optimizer an `AWS::Glue::TableOptimizer` declares
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
@@ -4415,6 +4472,7 @@ use rbin_rules::*;
 use dlm_lifecycle_policies::*;
 use network_security_manager::*;
 use neptune_graphs::*;
+use redshift_serverless::*;
 use glue_table_optimizers::*;
 use glue_triggers::*;
 use mediaconvert_certificates::*;

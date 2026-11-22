@@ -291,6 +291,17 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 graph_snapshot_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateWorkgroup` answers the workgroup `CREATING` — in which it serves no
+            // connection and publishes no reachable endpoint — and `CreateSnapshot` answers the
+            // snapshot `CREATING`, in which there is nothing to restore from, so each resource
+            // is held open until Amazon Redshift Serverless reports it `AVAILABLE`. (A
+            // NAMESPACE is answered `AVAILABLE` by its own create, so it needs no arm.)
+            Self::RedshiftServerlessWorkgroup => {
+                workgroup_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                redshift_serverless_snapshot_readiness(ctx, region, physical_resource_id).await
+            }
             // `CreateCollection` answers the collection `CREATING` — in which it publishes
             // no reachable endpoint and takes no index — so the resource's creation is
             // finished once OpenSearch Serverless reports it `ACTIVE`, which is also what
@@ -457,6 +468,18 @@ impl Provisioner {
             // snapshot publishes no attribute at all, so it needs no arm.)
             Self::NeptuneGraphGraph => {
                 neptune_graph_ready_attributes(ctx, region, physical_resource_id).await
+            }
+            // A workgroup still `CREATING` has no endpoint a client can reach — that address is
+            // what Amazon Redshift Serverless publishes once the workgroup is serving — and a
+            // snapshot still `CREATING` carries none of the sizes that service measures, so
+            // each type's attributes are read off the resource again once it reports it
+            // `AVAILABLE`.
+            Self::RedshiftServerlessWorkgroup => {
+                workgroup_ready_attributes(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                redshift_serverless_snapshot_ready_attributes(ctx, region, physical_resource_id)
+                    .await
             }
             // A cache cluster has no endpoint while it is `creating`: the address a client
             // connects to is one Amazon ElastiCache fills in as it provisions the cluster,
@@ -629,6 +652,17 @@ impl Provisioner {
             }
             Self::NeptuneGraphGraphSnapshot => {
                 graph_snapshot_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteWorkgroup` answers the workgroup it removed, and the endpoint network
+            // interfaces it had placed in the stack's own subnets go back with it — so the
+            // deletion is finished once Amazon Redshift Serverless no longer holds the
+            // workgroup, which is what keeps a stack from deleting those subnets while the
+            // workgroup is still in them. A SNAPSHOT is read back the same way.
+            Self::RedshiftServerlessWorkgroup => {
+                workgroup_removal(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftServerlessSnapshot => {
+                redshift_serverless_snapshot_removal(ctx, region, physical_resource_id).await
             }
             // `DeleteAutoScalingGroup` with `ForceDelete` terminates the instances the group
             // was holding as it answers, and a termination is not instant: each of those

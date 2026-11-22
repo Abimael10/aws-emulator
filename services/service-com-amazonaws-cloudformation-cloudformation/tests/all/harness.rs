@@ -334,6 +334,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // Amazon Redshift Serverless, for the `AWS::RedshiftServerless::Namespace`, the
+    // `::Workgroup` of one and the `::Snapshot` of one a stack really creates there, so a suite
+    // that deploys the estate reads every one of them back through that service's own wire, by
+    // the names the stack publishes.
+    router.register_service(
+        service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // CloudWatch Application Signals, for the
     // `AWS::ApplicationSignals::ServiceLevelObjective`, the
     // `AWS::ApplicationSignals::GroupingConfiguration` and the

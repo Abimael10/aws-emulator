@@ -212,6 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `baseCapacity`'s valid sizes are documented on the member rather than modelled as a
+        // constraint either, so the boundary validator cannot have refused a size this service
+        // does not serve; see [`crate::state::base_capacity_refusal`].
+        if let Some(message) = input
+            .base_capacity
+            .and_then(crate::state::base_capacity_refusal)
+        {
+            return Err(UpdateWorkgroupErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateWorkgroupErrorModeled::InternalServerException(
                 InternalServerException {

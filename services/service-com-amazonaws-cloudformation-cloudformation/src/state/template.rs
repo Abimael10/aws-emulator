@@ -3107,6 +3107,14 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // `Ref` is the id that service minted for it.
     NEPTUNE_GRAPH_GRAPH,
     NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
+    // The three Amazon Redshift Serverless types, each publishing the values that service
+    // reports for the resource under the prefix its own "Return values" section names: the
+    // namespace's id, ARN, managed-credential secret, instant and status; the workgroup's id,
+    // ARN, configuration, endpoint and status; and the snapshot's ARN, sizes, instants and
+    // status.
+    crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE,
+    crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP,
+    crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
     EC2_INTERNET_GATEWAY,

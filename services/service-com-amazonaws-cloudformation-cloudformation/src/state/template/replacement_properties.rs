@@ -276,6 +276,35 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // `CreateGraphSnapshot`, and that service publishes no call that changes a snapshot at
         // all, so a declaration naming another graph asks for a different snapshot.
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => &["GraphIdentifier"],
+        // An Amazon Redshift Serverless NAMESPACE keeps the first database it was made with and
+        // the IAM Identity Center application it was registered against: `dbName` and
+        // `redshiftIdcApplicationArn` are members of `CreateNamespace` and of no member of
+        // `UpdateNamespace` (which takes the admin credentials, the encryption keys, the IAM
+        // roles and the log exports), so a declaration restating one asks for a different
+        // namespace. Its `Tags` are here because that service's own `UntagResource` is not
+        // served in this emulator, so a changed tag set is applied by replacing the namespace —
+        // whose create carries the tags — rather than reported as applied by nothing; a tag arm
+        // retires that entry. (Its NAME is create-only through [`name_is_create_only`]: no call
+        // of that service renames a namespace.)
+        crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE => {
+            &["DbName", "RedshiftIdcApplicationArn", "Tags"]
+        }
+        // A WORKGROUP is the compute of ONE namespace: `namespaceName` is a member of
+        // `CreateWorkgroup` and of no member of `UpdateWorkgroup`, and that service publishes no
+        // call that moves a workgroup to another namespace, so a declaration naming another one
+        // asks for a different workgroup. Its `Tags` are here for the reason the namespace's
+        // are.
+        crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP => {
+            &["NamespaceName", "Tags"]
+        }
+        // A SNAPSHOT is the capture of ONE namespace, and nothing about it is changed in place
+        // here: `namespaceName` is a member of `CreateSnapshot` alone, and that service's own
+        // `UpdateSnapshot` — the one call that re-values a snapshot's retention — is not served
+        // in this emulator, so a declaration restating the retention or the tag set is applied
+        // by taking the snapshot again. An `UpdateSnapshot` arm retires the retention entry.
+        crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT => {
+            &["NamespaceName", "RetentionPeriod", "Tags"]
+        }
         // A Cloud Map SERVICE lives in the namespace its `NamespaceId` names, is of the kind
         // its `Type` states and has the custom health check its create configured: each is a
         // member of `CreateService` and of no member of `ServiceChange` (`UpdateService` takes

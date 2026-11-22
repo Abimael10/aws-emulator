@@ -37,6 +37,12 @@ pub(super) use crate::state::provisioner::lake_formation_permissions::{
     LAKEFORMATION_PERMISSIONS, LAKEFORMATION_PRINCIPAL_PERMISSIONS,
 };
 
+// The three Amazon Redshift Serverless types: their own NAMES and the attributes each
+// publishes live beside the arms that provision them
+// ([`crate::state::provisioner::redshift_serverless`]), so this catalogue and the provisioner
+// cannot name the same attribute differently.
+pub(super) use crate::state::provisioner::redshift_serverless;
+
 /// A DNS name with its terminal dot dropped, which is how CloudFormation reports the name of
 /// a resource whose return value IS a DNS record name.
 ///
@@ -384,6 +390,20 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service produces for it.
         NEPTUNE_GRAPH_GRAPH => NEPTUNE_GRAPH_GRAPH_ATTRIBUTES,
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => NEPTUNE_GRAPH_SNAPSHOT_ATTRIBUTES,
+        // Each Amazon Redshift Serverless resource publishes the values that service reports
+        // for it, under the prefix its own "Return values" section names — the catalogue living
+        // beside the arms that read them off that service's answers
+        // ([`crate::state::provisioner::redshift_serverless`]), so the two cannot name the same
+        // attribute differently.
+        redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE => {
+            redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE_ATTRIBUTE_NAMES
+        }
+        redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP => {
+            redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP_ATTRIBUTE_NAMES
+        }
+        redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT => {
+            redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT_ATTRIBUTE_NAMES
+        }
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
         // A hosted configuration version publishes the version number AppConfig minted for the

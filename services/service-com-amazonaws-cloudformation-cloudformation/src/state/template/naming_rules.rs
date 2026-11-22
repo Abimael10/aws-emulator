@@ -517,6 +517,16 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         NEPTUNE_GRAPH_GRAPH | NEPTUNE_GRAPH_GRAPH_SNAPSHOT => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
+        // Amazon Redshift Serverless `CreateNamespace.namespaceName` (`NamespaceName`) and
+        // `CreateWorkgroup.workgroupName` (`WorkgroupName`): each `@length(min: 3, max: 64)`
+        // with pattern `^[a-z0-9-]+$` (that service's own Smithy model), which admits no upper
+        // case and no character a generated name carries beyond letters, digits and the hyphen.
+        // (A SNAPSHOT's name is a plain `String` on that service's own `CreateSnapshot`, with
+        // neither bound nor pattern, so a generated name needs no fitting at all.)
+        crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE
+        | crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP => {
+            rules(64, Characters::LowercaseAlphanumeric)
+        }
         _ => None,
     }
 }

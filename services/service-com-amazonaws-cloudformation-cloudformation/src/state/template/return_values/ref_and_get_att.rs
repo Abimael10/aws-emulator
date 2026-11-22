@@ -2432,6 +2432,47 @@ pub(crate) fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // Amazon Redshift Serverless' own control plane: the namespace an
+        // `AWS::RedshiftServerless::Namespace` declares, the compute of one an
+        // `AWS::RedshiftServerless::Workgroup` declares and the backup of one an
+        // `AWS::RedshiftServerless::Snapshot` declares. Each type's "Ref returns" the resource's
+        // NAME — the `namespaceName`, `workgroupName` and `snapshotName` every call of that
+        // service on the resource takes — which is the physical id these naming rules already
+        // computed, so that is what each arm answers.
+        //
+        // Everything each type publishes beside that name is a value only that service can
+        // produce: the ids and ARNs it mints, the endpoint it serves a workgroup on, the sizes
+        // it measures for a snapshot, the instants of its clock and the status it reports the
+        // resource in. So every one of them is a STAND-IN here
+        // ([`service_assigned_document`]), which `super::provisioning` re-points at what the
+        // create — and that service's own report of the resource once it is up — really
+        // answered ([`super::provisioner::Provisioner::RedshiftServerlessNamespace`] and its
+        // two siblings). The one exception is the attribute that carries the resource's own
+        // NAME, which IS the name the declaration asked for.
+        redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE => (
+            name.to_string(),
+            redshift_serverless_attributes(
+                name,
+                redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE_ATTRIBUTE_NAMES,
+                "Namespace.NamespaceName",
+            ),
+        ),
+        redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP => (
+            name.to_string(),
+            redshift_serverless_attributes(
+                name,
+                redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP_ATTRIBUTE_NAMES,
+                "Workgroup.WorkgroupName",
+            ),
+        ),
+        redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT => (
+            name.to_string(),
+            redshift_serverless_attributes(
+                name,
+                redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT_ATTRIBUTE_NAMES,
+                "Snapshot.SnapshotName",
+            ),
+        ),
         // AWS Amplify's own control plane: the app an `AWS::Amplify::App` declares. "Ref
         // returns the ARN of the app"; `Fn::GetAtt` reads [`AMPLIFY_APP_ATTRIBUTES`]. Every
         // one of those is a value only that service can produce — the `appId` it mints, the
@@ -3220,4 +3261,29 @@ pub(crate) fn return_values(
         }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// The stand-in attributes one Amazon Redshift Serverless resource publishes before the owning
+/// service has made it: every attribute the type publishes, each a value only that service can
+/// produce ([`service_assigned_document`]) except `own_name`, the one that carries the
+/// resource's own name — which IS the name the declaration asked for.
+///
+/// Written once for the three types, so no two of them stand in for the same kind of value
+/// differently; `super::provisioning` re-points each at what the owning service really
+/// answered.
+fn redshift_serverless_attributes(
+    name: &str,
+    published: &[&str],
+    own_name: &str,
+) -> BTreeMap<String, String> {
+    published
+        .iter()
+        .map(|attribute| {
+            let value = match *attribute == own_name {
+                true => name.to_string(),
+                false => service_assigned_document(name, attribute),
+            };
+            ((*attribute).to_string(), value)
+        })
+        .collect()
 }

@@ -11584,6 +11584,7 @@ dependencies = [
  "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "service-com-amazonaws-rbin-amazonrecyclebin",
  "service-com-amazonaws-rds-amazonrdsv19",
+ "service-com-amazonaws-redshiftserverless-redshiftserverless",
  "service-com-amazonaws-route53-awsdnsv20130401",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-s3tables-s3tablebuckets",
@@ -19307,6 +19308,7 @@ dependencies = [
 name = "service-com-amazonaws-redshiftserverless-redshiftserverless"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

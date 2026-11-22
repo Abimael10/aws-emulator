@@ -48,6 +48,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `tests/all/main.rs` declares one suite module per `tests/all/<name>.rs`, so a new suite is a
+# new file and nothing lists it.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # The workgroup-endpoint suite mounts Amazon EC2 beside Redshift Serverless on one engine,
 # because the VPC, the subnets and the endpoint network interfaces a workgroup's managed VPC

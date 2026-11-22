@@ -82,6 +82,9 @@ use super::provisioner::client_vpn::{
     EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
 };
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
+use super::provisioner::redshift_serverless::{
+    REDSHIFT_SERVERLESS_NAMESPACE, REDSHIFT_SERVERLESS_SNAPSHOT, REDSHIFT_SERVERLESS_WORKGROUP,
+};
 use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
@@ -891,6 +894,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Redshift::ClusterSecurityGroup",
     "AWS::Redshift::ClusterSubnetGroup",
     REDSHIFT_SNAPSHOT_COPY_GRANT,
+    // Amazon Redshift Serverless — a different service from Amazon Redshift above, reached by
+    // the `redshift-serverless` signing name. All three types are created in the owning
+    // service (`super::provisioner`), through that service's own `CreateNamespace`,
+    // `CreateWorkgroup` and `CreateSnapshot`.
+    REDSHIFT_SERVERLESS_NAMESPACE,
+    REDSHIFT_SERVERLESS_WORKGROUP,
+    REDSHIFT_SERVERLESS_SNAPSHOT,
     // Amazon Rekognition
     "AWS::Rekognition::Collection",
     crate::state::provisioner::rekognition_resources::REKOGNITION_DATASET,

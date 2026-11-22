@@ -795,44 +795,6 @@ fn vector_search_member(properties: &Map<String, Value>) -> Option<Value> {
     ))
 }
 
-/// Copy the NUMERIC members `pairs` names out of a declaration into `request`, each in the one
-/// spelling a number is carried in ([`declared_number`]). A value that is neither spelling of
-/// a number is sent as it came, so the owning operation's own validation refuses it rather
-/// than this dropping it.
-fn copy_numeric_members(
-    properties: &Map<String, Value>,
-    pairs: &[(&str, &str)],
-    request: &mut Map<String, Value>,
-) {
-    for (property, member) in pairs {
-        if let Some(value) = properties.get(*property) {
-            request.insert(
-                (*member).to_string(),
-                declared_number(value).unwrap_or_else(|| value.clone()),
-            );
-        }
-    }
-}
-
-/// Copy the BOOLEAN members `pairs` names out of a declaration into `request`, each in either
-/// spelling a template gives one ([`declared_flag`]) — and as it came for a value that is no
-/// boolean at all, for the same reason the numeric half above sends one.
-fn copy_flag_members(
-    properties: &Map<String, Value>,
-    pairs: &[(&str, &str)],
-    request: &mut Map<String, Value>,
-) {
-    for (property, member) in pairs {
-        let Some(value) = properties.get(*property) else {
-            continue;
-        };
-        let carried = declared_flag(properties, property)
-            .map(Value::Bool)
-            .unwrap_or_else(|| value.clone());
-        request.insert((*member).to_string(), carried);
-    }
-}
-
 /// The URI one graph is addressed at: the collection and the `graphIdentifier` `@httpLabel`
 /// escaped as a single path segment ([`percent_encoded`]), so a value outside that member's
 /// own pattern is refused by that service's validation rather than addressing another path.

@@ -300,6 +300,21 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // it evidences the envelope the shape opens with and says nothing about what follows the
     // call's id — where the reasons above state the count explicitly.
     ("rds", "Rds", SdkDiagnostic::Attempts),
+    // Amazon Redshift Serverless' SDK names it `RedshiftServerless` — that model's own `sdkId`
+    // (`Redshift Serverless`) written as one word, exactly as Neptune Analytics' above is —
+    // and words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an
+    // `AWS::RedshiftServerless::Workgroup` whose declared base capacity that service refuses
+    // carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__ec2__redshift-serverless.\
+    // deploy-redshift-serverless-workgroup-invalid-base-capacity-rejected`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service:
+    // RedshiftServerless, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
+    (
+        crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_SIGNING_NAME,
+        "RedshiftServerless",
+        SdkDiagnostic::Attempts,
+    ),
     // Recycle Bin's SDK names it `Rbin` — that model's own `sdkId` (`rbin`) with the initial
     // capitalised, exactly as Amazon RDS's above is — and words the ATTEMPT-counting shape, as
     // the recorded `ResourceStatusReason` of an `AWS::Rbin::Rule` whose retention period is

@@ -3347,6 +3347,48 @@ pub(super) fn reported_text(answered: &Value, member: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Copy the NUMERIC members `pairs` names — as `(property, member)` — out of a declared
+/// property document into `request`, each in the one spelling a number is carried in
+/// ([`declared_number`]).
+///
+/// A value that is neither spelling of a number is sent AS IT CAME, so the owning operation's
+/// own validation is what refuses it rather than this dropping it. Beside
+/// [`copy_members`](super::copy_members), which copies a member verbatim, and
+/// [`copy_flag_members`] below: two arms that carry a number the same way read it here once.
+pub(super) fn copy_numeric_members(
+    properties: &Map<String, Value>,
+    pairs: &[(&str, &str)],
+    request: &mut Map<String, Value>,
+) {
+    for (property, member) in pairs {
+        if let Some(value) = properties.get(*property) {
+            request.insert(
+                (*member).to_string(),
+                declared_number(value).unwrap_or_else(|| value.clone()),
+            );
+        }
+    }
+}
+
+/// Copy the BOOLEAN members `pairs` names out of a declared property document into `request`,
+/// in either spelling a template gives one ([`declared_flag`]) — and as it came for a value
+/// that is no boolean at all, for the same reason [`copy_numeric_members`] sends one.
+pub(super) fn copy_flag_members(
+    properties: &Map<String, Value>,
+    pairs: &[(&str, &str)],
+    request: &mut Map<String, Value>,
+) {
+    for (property, member) in pairs {
+        let Some(value) = properties.get(*property) else {
+            continue;
+        };
+        let carried = declared_flag(properties, property)
+            .map(Value::Bool)
+            .unwrap_or_else(|| value.clone());
+        request.insert((*member).to_string(), carried);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AWS X-Ray: AWS::XRay::SamplingRule
 // ---------------------------------------------------------------------------

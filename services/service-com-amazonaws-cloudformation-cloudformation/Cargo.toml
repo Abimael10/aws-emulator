@@ -299,6 +299,12 @@ service-com-amazonaws-eks-awswesleyfrontend = { workspace = true }
 # the graph and the snapshot the stack published are read back through that service's own
 # wire.
 service-com-amazonaws-neptunegraph-amazonneptunegraph = { workspace = true }
+# Amazon Redshift Serverless, for the `AWS::RedshiftServerless::Namespace`, `::Workgroup` and
+# `::Snapshot` a stack really creates there (`state::provisioner::redshift_serverless`): a suite
+# that deploys one must have its owning service mounted beside CloudFormation, or the create is
+# refused and the stack fails — and the namespace, the workgroup and the snapshot the stack
+# published are read back through that service's own wire.
+service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
 # CloudWatch Application Signals, for the `AWS::ApplicationSignals::ServiceLevelObjective`,
 # `::GroupingConfiguration` and `::InstrumentationConfig` a stack really creates there
 # (`state::provisioner::application_signals`): a suite that deploys one must have its owning

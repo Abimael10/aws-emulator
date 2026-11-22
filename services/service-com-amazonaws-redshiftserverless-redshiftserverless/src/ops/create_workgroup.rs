@@ -15,6 +15,10 @@
 //! compute already exists — a namespace carries ONE workgroup — is
 //! [`crate::state::namespace_already_has_workgroup`], which names the resident workgroup.
 //!
+//! A `baseCapacity` the service does not serve is refused with the sentence it words for that
+//! size ([`crate::state::base_capacity_refusal`]) — the valid sizes are documented on the
+//! member rather than modelled, so the boundary validator cannot have refused one.
+//!
 //! The workgroup is created in `CREATING` status — one of the four `WorkgroupStatus`
 //! values — and reaches `AVAILABLE` on its own a moment later, with nobody calling; see
 //! [`crate::state::WorkgroupRecord::settle`].
@@ -233,6 +237,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // `baseCapacity`'s valid sizes are documented on the member rather than modelled as a
+        // constraint either, so the boundary validator cannot have refused a size this service
+        // does not serve; see [`crate::state::base_capacity_refusal`].
+        if let Some(message) = input
+            .base_capacity
+            .and_then(crate::state::base_capacity_refusal)
+        {
+            return Err(CreateWorkgroupErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
