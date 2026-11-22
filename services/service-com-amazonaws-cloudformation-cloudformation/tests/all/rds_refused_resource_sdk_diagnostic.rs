@@ -6,11 +6,12 @@
 //! RULE under test: **a resource provider reports a refused call as the exception its SDK
 //! raised — the owning service's own sentence followed by that SDK's diagnostic of the call,
 //! naming the service as its SDK names it and the HTTP status that service answered beside
-//! the id of the call — so the failure is attributed to the service that refused it, whatever
-//! type of that service failed and whichever of its calls was refused. What FOLLOWS that
-//! envelope belongs to the PROVIDER that made the call rather than to the service, so two
-//! types of one service can report two shapes. A service whose reported wording this emulator
-//! has no record of has no diagnostic invented for it.**
+//! the id of the call and the attempts that SDK made at it — so the failure is attributed to
+//! the service that refused it, whatever type of that service failed and whichever of its
+//! calls was refused. What FOLLOWS that envelope belongs to the SDK the provider was built
+//! against, and for this service every recorded provider words the same attempt count. A
+//! service whose reported wording this emulator has no record of has no diagnostic invented
+//! for it.**
 //!
 //! Why it matters: a client reading a rolled-back deployment diagnoses it from the failed
 //! resource's `ResourceStatusReason`. Without the attribution it cannot tell a refusal the
@@ -20,8 +21,9 @@
 //! and a refusal-taxonomy check that keys on the originating service cannot see it at all.
 //!
 //! The rows differ along what the rule generalises over: WHICH type of the owning service
-//! failed (a DB subnet group and a DB instance), which call of it was refused, the SHAPE that
-//! type's provider words past the envelope, and the HTTP
+//! failed (a DB subnet group and a DB instance), which call of it was refused, WHY that
+//! service refused it (the Availability Zones its subnets cover, the subnets' VPCs, the
+//! identifiers themselves) and the HTTP
 //! STATUS that service answered (400 for a declaration it will not take, 404 for a resource
 //! it does not hold — each from the fault's own `httpError` in RDS's model,
 //! `smithy_query(query="operation",operation="CreateDBSubnetGroup,CreateDBInstance")`:
@@ -30,7 +32,10 @@
 //! emulator has recorded no SDK wording for, whose refusal is therefore reported exactly as
 //! that service worded it.
 
-use crate::harness::{assert_sdk_diagnostic, failed_resource_reason, quoted_and_class};
+use crate::harness::{
+    assert_sdk_diagnostic_with_attempts, call_in, failed_resource_reason, member,
+    quoted_and_class, xml_blocks, xml_text,
+};
 use crate::stack_lifecycle::{create_stack, router, wait_for_the_transition, REGION};
 
 /// The SDK's own name for Amazon RDS, as the exception its SDK raises states it.
@@ -50,10 +55,6 @@ struct Row {
     /// whose owning service has no recorded SDK wording — which must then carry no
     /// diagnostic at all.
     diagnostic: Option<(&'static str, u16)>,
-    /// Whether this type's provider words the attempt count the SDK appends past the
-    /// envelope's closing parenthesis, which is the shape its DB instance's provider words
-    /// where the DB subnet group's words the bare envelope.
-    attempts: bool,
     /// A fragment of the owning service's OWN sentence the quoted message must open with, or
     /// `None` for a row whose only subject is the diagnostic FORM: the sentence that service
     /// words for the refusal is then not what this suite is about, so it is not frozen here.
@@ -95,6 +96,23 @@ const MALFORMED_SUBNETS_TEMPLATE: &str = r#"{"Resources":{
       "DBSubnetGroupDescription":"a group over values that name no subnet",
       "SubnetIds":["not-a-subnet-id","also-not-a-subnet-id"]}}}}"#;
 
+/// The same type over two subnets of two DIFFERENT VPCs: a DB subnet group is a set of
+/// subnets of ONE VPC, so that list makes up no group, and the refusal names the two VPCs the
+/// declared subnets straddle.
+const CROSS_VPC_TEMPLATE: &str = r#"{"Resources":{
+    "VpcA":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.20.0.0/16"}},
+    "VpcB":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.21.0.0/16"}},
+    "SubnetA":{"Type":"AWS::EC2::Subnet","Properties":{
+      "VpcId":{"Ref":"VpcA"},"CidrBlock":"10.20.1.0/24",
+      "AvailabilityZone":{"Fn::Select":[0,{"Fn::GetAZs":""}]}}},
+    "SubnetB":{"Type":"AWS::EC2::Subnet","Properties":{
+      "VpcId":{"Ref":"VpcB"},"CidrBlock":"10.21.1.0/24",
+      "AvailabilityZone":{"Fn::Select":[1,{"Fn::GetAZs":""}]}}},
+    "SubnetGroup":{"Type":"AWS::RDS::DBSubnetGroup","Properties":{
+      "DBSubnetGroupName":"rds-diag-cross-vpc",
+      "DBSubnetGroupDescription":"subnets of two VPCs",
+      "SubnetIds":[{"Ref":"SubnetA"},{"Ref":"SubnetB"}]}}}}"#;
+
 /// Another of that service's types, whose create names a DB subnet group Amazon RDS does not
 /// hold: the same service, a different call, and the status it answers for a resource that is
 /// not there.
@@ -124,7 +142,6 @@ const ROWS: &[Row] = &[
         template: SINGLE_ZONE_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
-        attempts: false,
         sentence: Some("Availability Zone (AZ) coverage requirement"),
         class: INVALID_REQUEST,
     },
@@ -134,7 +151,6 @@ const ROWS: &[Row] = &[
         template: ABSENT_SUBNETS_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
-        attempts: false,
         sentence: Some("are invalid."),
         class: INVALID_REQUEST,
     },
@@ -144,10 +160,18 @@ const ROWS: &[Row] = &[
         template: MALFORMED_SUBNETS_TEMPLATE,
         logical_id: "SubnetGroup",
         diagnostic: Some((RDS_SERVICE, 400)),
-        attempts: false,
         // Only the diagnostic: how the owning service words a refusal of the id's FORM is
         // that service's own concern, and not something this suite should pin.
         sentence: None,
+        class: INVALID_REQUEST,
+    },
+    Row {
+        case: "a DB subnet group over subnets of two different VPCs",
+        stack: "rds-diag-cross-vpc",
+        template: CROSS_VPC_TEMPLATE,
+        logical_id: "SubnetGroup",
+        diagnostic: Some((RDS_SERVICE, 400)),
+        sentence: Some("Subnet has different VPC Id: "),
         class: INVALID_REQUEST,
     },
     Row {
@@ -156,9 +180,6 @@ const ROWS: &[Row] = &[
         template: ABSENT_GROUP_TEMPLATE,
         logical_id: "Database",
         diagnostic: Some((RDS_SERVICE, 404)),
-        // This type's provider words the attempt count, where the subnet group's above does
-        // not: the shape is the provider's, not the service's.
-        attempts: true,
         sentence: Some("rds-diag-no-such-group"),
         class: NOT_FOUND,
     },
@@ -168,7 +189,6 @@ const ROWS: &[Row] = &[
         template: REFUSED_REPOSITORY_TEMPLATE,
         logical_id: "Registry",
         diagnostic: None,
-        attempts: false,
         // That service's own sentence names the MEMBER the declaration got wrong, which is
         // what reaches the reason when no diagnostic is appended to it.
         sentence: Some("at 'repositoryName' failed to satisfy constraint"),
@@ -215,12 +235,9 @@ async fn a_refused_resource_is_attributed_to_the_service_that_refused_it() {
         );
         match row.diagnostic {
             Some((service, status)) => {
-                let envelope = if row.attempts {
-                    attempts_stripped(row.case, &quoted)
-                } else {
-                    quoted.clone()
-                };
-                assert_sdk_diagnostic(row.case, &envelope, service, status);
+                // Amazon RDS's SDK words the ATTEMPT-counting shape, so the quoted exception
+                // carries the envelope and the attempts it made at the call.
+                assert_sdk_diagnostic_with_attempts(row.case, &quoted, service, status);
             }
             None => assert!(
                 !quoted.contains("(Service:"),
@@ -230,23 +247,6 @@ async fn a_refused_resource_is_attributed_to_the_service_that_refused_it() {
             ),
         }
     }
-}
-
-/// The quoted message with the SDK's attempt count taken off the end, held to the FORM that
-/// count carries — at least one attempt, as a refusal the SDK saw took one.
-fn attempts_stripped(case: &str, quoted: &str) -> String {
-    const ATTEMPTS: &str = ") (SDK Attempt Count: ";
-    let (envelope, attempts) = quoted.rsplit_once(ATTEMPTS).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the attempts the SDK made, got {quoted:?}")
-    });
-    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
-    });
-    assert!(
-        attempts.parse::<u32>().is_ok_and(|made| made >= 1),
-        "case {case:?}: expected the attempts the SDK made, got {attempts:?}"
-    );
-    format!("{envelope})")
 }
 
 #[tokio::test]
@@ -289,5 +289,92 @@ async fn the_refusal_names_the_zone_coverage_the_declared_subnets_add_up_to() {
     assert!(
         !covered.contains(','),
         "case {case:?}: expected the ONE zone both subnets lie in, got {covered:?}"
+    );
+}
+
+/// The `PhysicalResourceId` the stack recorded on `logical_id`'s own event in
+/// `resource_status` — how a resource of a ROLLED-BACK stack is still identified, which is
+/// what lets the refusal below be compared against the VPCs the stack really created.
+async fn event_physical_id(
+    case: &str,
+    router: &smithy_server_runtime::MultiServiceRouter,
+    stack: &str,
+    logical_id: &str,
+    resource_status: &str,
+) -> String {
+    let (status_code, body) = call_in(
+        router,
+        REGION,
+        "DescribeStackEvents",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: DescribeStackEvents({stack}) must answer 200, got {status_code} {body}"
+    );
+    xml_blocks(&body, "member")
+        .iter()
+        .find(|entry| {
+            xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id)
+                && xml_text(entry, "ResourceStatus").as_deref() == Some(resource_status)
+        })
+        .and_then(|entry| xml_text(entry, "PhysicalResourceId"))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected {stack} to have recorded a {resource_status} \
+                 PhysicalResourceId for {logical_id}, got {body}"
+            )
+        })
+}
+
+#[tokio::test]
+async fn the_cross_vpc_refusal_names_the_two_vpcs_the_declared_subnets_lie_in() {
+    // The variable parts of that service's sentence come from the state of the subnets the
+    // declaration named: the VPC each one lies in, which is the service that owns subnets'
+    // own fact. The two VPCs are named in the order the declared subnets introduce them.
+    let case = "one subnet of each of two VPCs";
+    let stack = "rds-diag-cross-vpc-named";
+    let router = router();
+    let (status_code, created) = create_stack(&router, stack, CROSS_VPC_TEMPLATE, &[]).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: CreateStack must answer 200, got {status_code} {created}"
+    );
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+
+    let reason =
+        failed_resource_reason(case, &router, REGION, stack, "SubnetGroup", CREATE_FAILED).await;
+    let (quoted, _) = quoted_and_class(case, &reason);
+    const OPENS: &str = "Subnet has different VPC Id: ";
+    const THAN: &str = " than ";
+    let (named_first, named_second) = quoted
+        .strip_prefix(OPENS)
+        .and_then(|rest| rest.split_once(THAN))
+        .map(|(named_first, rest)| {
+            let named_second = rest
+                .split_once(" (Service: ")
+                .map(|(named_second, _)| named_second)
+                .unwrap_or(rest);
+            (named_first.to_string(), named_second.to_string())
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected {OPENS:?} and {THAN:?}, got {quoted:?}")
+        });
+
+    // Each named VPC is one the stack created, and they are the two the declared subnets
+    // really lie in — in the order the declaration's own subnets introduce them.
+    let first_vpc = event_physical_id(case, &router, stack, "VpcA", "CREATE_COMPLETE").await;
+    let second_vpc = event_physical_id(case, &router, stack, "VpcB", "CREATE_COMPLETE").await;
+    assert_ne!(
+        first_vpc, second_vpc,
+        "case {case:?}: the two declared VPCs must be two VPCs, got {first_vpc:?}"
+    );
+    assert_eq!(
+        (named_first.as_str(), named_second.as_str()),
+        (first_vpc.as_str(), second_vpc.as_str()),
+        "case {case:?}: expected the VPCs of the declared subnets in the order those subnets \
+         name them, got {quoted:?}"
     );
 }

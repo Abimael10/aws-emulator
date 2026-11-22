@@ -1057,6 +1057,29 @@ pub(crate) const DB_SUBNET_GROUP_NOT_FOUND: &str = "DBSubnetGroupNotFoundFault";
 /// for both group kinds, since both levels' operations model that same error shape.
 pub(crate) const DB_PARAMETER_GROUP_NOT_FOUND: &str = "DBParameterGroupNotFound";
 
+/// The identifier the OWNING service answered that it created the resource under, read off
+/// `answered` as the member `name_member` names it — or `None` where it reported none.
+///
+/// This is the resource's physical id, and so what its `Ref` resolves to: a service that
+/// NORMALISES the identifier it stores holds the resource under the spelling IT answered
+/// rather than under the one the declaration wrote, and a client that feeds a `Ref` back into
+/// that service has to be handed the identifier that service really has. Every Amazon RDS
+/// resource a stack creates is named under a member whose own documentation says "This value
+/// is stored as a lowercase string" (`CreateDBInstance.DBInstanceIdentifier`,
+/// `CreateDBCluster.DBClusterIdentifier`, `CreateDBSubnetGroup.DBSubnetGroupName`,
+/// `CreateDBParameterGroup.DBParameterGroupName`,
+/// `CreateDBClusterParameterGroup.DBClusterParameterGroupName`;
+/// `smithy_query(query="doc", shape="CreateDBSubnetGroupMessage",
+/// member="DBSubnetGroupName")` on that service's model), so a declaration that names the
+/// resource in mixed case is held under the folded spelling.
+///
+/// A name CloudFormation GENERATED is already of the form that service stores
+/// ([`super::super::template::naming_rules`]), so for one of those this adopts the very value
+/// the id already carries and changes nothing.
+pub(crate) fn stored_identity(answered: &str, name_member: &str) -> Option<String> {
+    xml_element(answered, name_member).filter(|identity| !identity.is_empty())
+}
+
 /// How one member of a create reaches an awsQuery form body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryMember {
@@ -1307,8 +1330,8 @@ pub(crate) const PARAMETERS_PER_MODIFY: usize = 20;
 /// What the create ANSWERS replaces the identifiers CloudFormation's naming rules had
 /// computed for the resource: the ARN, the `DbiResourceId` and the endpoint are Amazon
 /// RDS's to assign, and the whole point of provisioning the instance is that the handle the
-/// stack publishes addresses the database RDS really holds. The identifier itself is not
-/// replaced — it is the one the instance was created under.
+/// stack publishes addresses the database RDS really holds. The identifier itself is the one
+/// the instance was created UNDER, as that service answered it ([`stored_identity`]).
 pub(crate) async fn create_db_instance(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1364,7 +1387,10 @@ pub(crate) async fn create_db_instance(
         }
     }
     push_master_user_secret_attribute(&answered, &mut attributes);
-    Ok(Created::attributes(attributes))
+    Ok(Created {
+        physical_resource_id: stored_identity(&answered, "DBInstanceIdentifier"),
+        attributes,
+    })
 }
 
 /// Delete the DB instance a stack created, addressed by its identifier — this resource's
@@ -2346,7 +2372,8 @@ pub(crate) async fn describe_cluster_subnet_group(
 /// arm the way the DB instance's are. The group is what a DB instance's
 /// `DBSubnetGroupName` names, and Amazon RDS resolves that name before it will create an
 /// instance (`DBSubnetGroupNotFoundFault`), so a stack that declares both has to create
-/// this one for real too.
+/// this one for real too — under the name that service answered it stored the group as
+/// ([`stored_identity`]), which is this resource's physical id.
 pub(crate) async fn create_db_subnet_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -2387,7 +2414,10 @@ pub(crate) async fn create_db_subnet_group(
         // ([`super::template::arn_attributes`]).
         attributes.extend(super::template::arn_attributes(RDS_DB_SUBNET_GROUP, &arn));
     }
-    Ok(Created::attributes(attributes))
+    Ok(Created {
+        physical_resource_id: stored_identity(&answered, "DBSubnetGroupName"),
+        attributes,
+    })
 }
 
 /// Delete the DB subnet group a stack created, addressed by its name — this resource's
@@ -2457,8 +2487,9 @@ pub(crate) async fn describe_db_subnet_group(
 ///
 /// The type's properties are its create's own members ([`ParameterGroupCalls`]) but for the
 /// one Amazon RDS spells differently ([`PARAMETER_GROUP_RENAMED_PROPERTIES`]), with the name
-/// CloudFormation decides — what this type's `Ref` returns, this resource's physical id —
-/// and the merged tag list pushed by this arm the way the two types above push theirs.
+/// CloudFormation decides — what this type's `Ref` returns, this resource's physical id,
+/// which becomes the name that service answered it stored the group as ([`stored_identity`])
+/// — and the merged tag list pushed by this arm the way the two types above push theirs.
 ///
 /// The declared `Parameters` are a SECOND call ([`modify_parameters`]), the same pair a
 /// client makes: a group is created carrying none of its own parameters, and the values a
@@ -2515,7 +2546,10 @@ pub(crate) async fn create_parameter_group(
         // CloudFormation minted — an identifier that service does not know.
         attributes.extend(super::template::arn_attributes(calls.resource_type, &arn));
     }
-    Ok(Created::attributes(attributes))
+    Ok(Created {
+        physical_resource_id: stored_identity(&answered, calls.name_member),
+        attributes,
+    })
 }
 
 /// Write the parameter settings a declaration carries into the group named

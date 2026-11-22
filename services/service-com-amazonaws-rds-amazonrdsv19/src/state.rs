@@ -3256,6 +3256,10 @@ pub fn check_db_subnet_group_subnets_exist(
 /// common VPC" — and a DB subnet group is a set of subnets of one VPC, which is the VPC the
 /// group reports.
 ///
+/// The refusal NAMES the two VPCs the list straddles
+/// ([`subnets_in_different_vpcs_message`]), which is what a caller needs to tell WHICH of the
+/// subnets it named is the one in the wrong place.
+///
 /// The VPC of each subnet is Amazon EC2's answer for the request's own identifiers
 /// ([`subnet_zones`]), so a list asked about where the owner of subnets could not be reached
 /// names no VPC at all and is refused on nothing.
@@ -3263,19 +3267,24 @@ pub fn check_db_subnet_group_common_vpc(
     subnet_ids: &[String],
     zones: &SubnetZones,
 ) -> Result<(), SubnetListRejection> {
-    if zones.vpcs(subnet_ids.iter().map(String::as_str)).len() < 2 {
+    let Some((first_vpc_id, second_vpc_id)) = zones.straddled_vpcs(subnet_ids) else {
         return Ok(());
-    }
+    };
     Err(SubnetListRejection::NotInOneVpc(
-        SUBNETS_NOT_IN_ONE_VPC_MESSAGE.to_string(),
+        subnets_in_different_vpcs_message(&first_vpc_id, &second_vpc_id),
     ))
 }
 
-/// What a `SubnetIds` list whose subnets lie in more than one VPC is refused with: the
-/// sentence the `InvalidSubnet` fault states for that condition itself.
-pub const SUBNETS_NOT_IN_ONE_VPC_MESSAGE: &str =
-    "The requested subnet is invalid, or multiple subnets were requested that are not all \
-     in a common VPC.";
+/// What a `SubnetIds` list whose subnets lie in more than one VPC is refused with: Amazon RDS
+/// states that a subnet is in a different VPC than another, naming the two VPCs the list
+/// straddles in the order its subnets introduce them ([`SubnetZones::straddled_vpcs`]).
+///
+/// Both values come from the subnets the request named, as the service that owns them reports
+/// their VPC; the text around them is fixed.
+#[must_use]
+pub fn subnets_in_different_vpcs_message(first_vpc_id: &str, second_vpc_id: &str) -> String {
+    format!("Subnet has different VPC Id: {first_vpc_id} than {second_vpc_id}")
+}
 
 /// Refuse a `SubnetIds` list naming subnets of a VPC OTHER than `vpc_id`, the VPC the DB
 /// subnet group a modification addresses is in.

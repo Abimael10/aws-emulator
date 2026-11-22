@@ -32,7 +32,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 
-use crate::harness::{assert_sdk_diagnostic, failed_resource_reason, quoted_and_class};
+use crate::harness::{
+    assert_sdk_diagnostic, assert_sdk_diagnostic_with_attempts, failed_resource_reason,
+    quoted_and_class,
+};
 use crate::stack_lifecycle::{create_stack, router, settled_stack, xml_text, REGION};
 
 /// The SDK's own name for Amazon API Gateway v2, as the exception its SDK raises states it:
@@ -180,27 +183,11 @@ fn template(resources: Value) -> String {
 /// and the attempts the SDK made at it — each of the FORM that SDK words rather than one
 /// recorded value.
 ///
-/// The ENVELOPE inside it is the shape every SDK that words one appends, so it is held to the
-/// one assertion this target has for it ([`assert_sdk_diagnostic`]); what is added here is the
-/// attempt count that follows it, which is this SDK's own shape.
+/// The whole reading is the shape every SDK that counts its attempts words, so it is held to
+/// the one assertion this target has for it
+/// ([`assert_sdk_diagnostic_with_attempts`]) under this service's own name.
 fn assert_apigatewayv2_diagnostic(case: &str, quoted: &str, status: u16) {
-    const ATTEMPTS: &str = ") (SDK Attempt Count: ";
-    let (envelope, attempts) = quoted.split_once(ATTEMPTS).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the attempts the SDK made, got {quoted:?}")
-    });
-    assert_sdk_diagnostic(
-        case,
-        &format!("{envelope})"),
-        APIGATEWAYV2_SERVICE,
-        status,
-    );
-    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
-    });
-    assert!(
-        attempts.parse::<u32>().is_ok_and(|made| made >= 1),
-        "case {case:?}: expected the attempts the SDK made, got {attempts:?}"
-    );
+    assert_sdk_diagnostic_with_attempts(case, quoted, APIGATEWAYV2_SERVICE, status);
 }
 
 /// Deploy `stack`, wait for it to settle rolled back, and answer the quoted provider message

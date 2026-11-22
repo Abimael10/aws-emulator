@@ -438,8 +438,10 @@ struct ParameterGroupCase<'a> {
     /// The action that reports the group itself, and the one that reports its parameters.
     group_describe: &'a str,
     parameters_describe: &'a str,
-    /// The name the stack must report for the group: `Some` where the template NAMES it,
-    /// `None` where CloudFormation generates the name.
+    /// The name the stack must report for the group: `Some` where the template NAMES it — the
+    /// name Amazon RDS STORES for it, which is the declared name folded to lower case, since
+    /// `DBParameterGroupName` "is stored as a lowercase string" — and `None` where
+    /// CloudFormation generates the name.
     declared_name: Option<&'a str>,
     /// `DBParameterGroupFamily` Amazon RDS must report for the group.
     family: &'a str,
@@ -568,7 +570,9 @@ async fn a_parameter_group_a_stack_declares_exists_in_rds_with_the_parameters_it
             name_member: "DBParameterGroupName",
             group_describe: "DescribeDBParameterGroups",
             parameters_describe: "DescribeDBParameters",
-            declared_name: Some("CFN-Probe-Params"),
+            // Amazon RDS stores the name as a lowercase string, so the identifier the stack
+            // publishes for the group is the declared name folded.
+            declared_name: Some("cfn-probe-params"),
             family: "aurora-mysql8.0",
             description: "a mixed-case probe group",
             parameters: &[("max_connections", "64")],
@@ -637,7 +641,8 @@ async fn a_parameter_group_a_stack_declares_exists_in_rds_with_the_parameters_it
         if let Some(declared) = case.declared_name {
             assert_eq!(
                 group, declared,
-                "case {:?}: the template named the group, so that name is its physical id",
+                "case {:?}: the template named the group, so its physical id is the name \
+                 Amazon RDS stored that name under",
                 case.case
             );
         }

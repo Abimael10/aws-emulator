@@ -27,7 +27,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 
-use crate::harness::{assert_sdk_diagnostic, failed_resource_reason, quoted_and_class};
+use crate::harness::{
+    assert_sdk_diagnostic_with_attempts, failed_resource_reason, quoted_and_class,
+};
 use crate::stack_lifecycle::{
     autoscaling, call, create_stack, member, router, settled_stack, xml_text, xml_texts, REGION,
 };
@@ -139,28 +141,11 @@ fn row_template(row: &Row) -> String {
 /// of the call and the attempts the SDK made — each of the FORM that SDK words rather than one
 /// recorded value.
 ///
-/// The ENVELOPE inside it is the shape every SDK that words one appends, so it is held to the
-/// one assertion this target has for it ([`assert_sdk_diagnostic`]) rather than to a second
-/// reading of the same fragments; what is added here is the attempt count that follows it,
-/// which is this SDK's shape.
+/// The whole reading is the shape every SDK that counts its attempts words, so it is held to
+/// the one assertion this target has for it
+/// ([`assert_sdk_diagnostic_with_attempts`]) under this service's own name and status.
 fn assert_auto_scaling_diagnostic(case: &str, quoted: &str) {
-    const ATTEMPTS: &str = ") (SDK Attempt Count: ";
-    let (envelope, attempts) = quoted.split_once(ATTEMPTS).unwrap_or_else(|| {
-        panic!("case {case:?}: expected the attempts the SDK made, got {quoted:?}")
-    });
-    assert_sdk_diagnostic(
-        case,
-        &format!("{envelope})"),
-        AUTO_SCALING_SERVICE,
-        REFUSED_STATUS,
-    );
-    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
-    });
-    assert!(
-        attempts.parse::<u32>().is_ok_and(|made| made >= 1),
-        "case {case:?}: expected the attempts the SDK made, got {attempts:?}"
-    );
+    assert_sdk_diagnostic_with_attempts(case, quoted, AUTO_SCALING_SERVICE, REFUSED_STATUS);
 }
 
 /// The group names Amazon EC2 Auto Scaling answers for the one it is asked about.

@@ -209,14 +209,19 @@ async fn a_subnet_the_account_does_not_hold_is_refused_on_create_and_on_modify()
 }
 
 /// The sentence a `SubnetIds` list whose subnets lie in more than one VPC is refused with:
-/// the condition the `InvalidSubnet` fault states itself.
+/// Amazon RDS names the two VPCs the list straddles, in the order its subnets introduce them
+/// — the VPC of the first subnet named, then the VPC of the first subnet named in a different
+/// one — with fixed text around the two.
 ///
-/// Source: `smithy_query(query="doc",shape="InvalidSubnet")` on this service's model.
-const SUBNETS_NOT_IN_ONE_VPC: &str = "The requested subnet is invalid, or multiple subnets \
-                                      were requested that are not all in a common VPC.";
+/// Spelled out here rather than read from the code under test, so the assertion is made
+/// against the wording and not against the emulator's own helper.
+fn subnets_in_different_vpcs(first_vpc_id: &str, second_vpc_id: &str) -> String {
+    format!("Subnet has different VPC Id: {first_vpc_id} than {second_vpc_id}")
+}
 
 /// RULE: a DB subnet group is a set of subnets of ONE VPC — the VPC it reports — so a list
-/// whose subnets lie in several makes up no group (`InvalidSubnet`), and a modification can
+/// whose subnets lie in several makes up no group (`InvalidSubnet`, whose message names the
+/// two VPCs the list straddles), and a modification can
 /// only name subnets of the VPC the group it addresses is in; one naming a subnet of another
 /// VPC names a subnet this group cannot be made of, which is refused the way an identifier
 /// the account holds no subnet for is.
@@ -243,18 +248,29 @@ async fn the_subnets_of_a_group_are_subnets_of_one_vpc() {
     ];
 
     // A create whose subnets straddle the two VPCs: the list makes up no group at all, and
-    // the modelled fault for that is `InvalidSubnet`.
-    let straddling: [(&str, Vec<String>); 2] = [
+    // the modelled fault for that is `InvalidSubnet`. The rows differ along how many subnets
+    // the list names, how many of them lie in each VPC and WHICH VPC the first named subnet
+    // is in — which is what decides which of the two the message names first.
+    let straddling: [(&str, Vec<String>, String); 3] = [
         (
             "one subnet of each VPC",
             vec![held[0].clone(), other[1].clone()],
+            subnets_in_different_vpcs(&network.vpc, &other_vpc),
         ),
         (
             "two of one VPC and one of the other",
             vec![held[0].clone(), held[1].clone(), other[0].clone()],
+            subnets_in_different_vpcs(&network.vpc, &other_vpc),
+        ),
+        (
+            // The same two VPCs the other way round: the VPCs are named in the order the
+            // request's subnets introduce them, so this list names them the other way too.
+            "a subnet of the other VPC named first",
+            vec![other[0].clone(), held[1].clone()],
+            subnets_in_different_vpcs(&other_vpc, &network.vpc),
         ),
     ];
-    for (index, (case, subnets)) in straddling.into_iter().enumerate() {
+    for (index, (case, subnets, expected)) in straddling.into_iter().enumerate() {
         let name = format!("emu-subnet-vpcs-{index}");
         let body = expect_error(
             case,
@@ -264,8 +280,14 @@ async fn the_subnets_of_a_group_are_subnets_of_one_vpc() {
         );
         let message = text(&body, "Message");
         assert_eq!(
-            message, SUBNETS_NOT_IN_ONE_VPC,
-            "case {case:?}: expected {SUBNETS_NOT_IN_ONE_VPC:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        // Nothing was stored for the refused name: the group does not exist.
+        let (status, body) = network.account.describe_group(&name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: the refused group must not exist, got {status} with {body}"
         );
     }
 

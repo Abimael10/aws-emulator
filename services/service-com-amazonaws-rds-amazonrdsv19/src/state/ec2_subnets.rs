@@ -199,6 +199,33 @@ impl SubnetZones {
             .collect()
     }
 
+    /// The two VPCs a `SubnetIds` list STRADDLES, in the order its subnets introduce them:
+    /// the VPC EC2 reports for the first subnet of the list it holds one for, and the VPC of
+    /// the first subnet after it that lies somewhere else.
+    ///
+    /// `None` where every subnet EC2 reported a VPC for lies in ONE VPC — and for a list asked
+    /// about where the owner of subnets could not be reached, which names no VPC at all.
+    #[must_use]
+    pub fn straddled_vpcs(&self, subnet_ids: &[String]) -> Option<(String, String)> {
+        let mut first: Option<&str> = None;
+        for subnet_id in subnet_ids {
+            // A subnet EC2 named no VPC for is no evidence of a subnet in another VPC, so it
+            // neither introduces a VPC nor straddles one.
+            let Some(owner) = self.vpc_by_id.get(subnet_id.as_str()) else {
+                continue;
+            };
+            let owner = owner.as_str();
+            match first {
+                None => first = Some(owner),
+                Some(first) if first != owner => {
+                    return Some((first.to_string(), owner.to_string()))
+                }
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
     /// The distinct VPCs EC2 reported for `subnet_ids`, in id order.
     #[must_use]
     pub fn vpcs<'ids>(&self, subnet_ids: impl IntoIterator<Item = &'ids str>) -> BTreeSet<String> {

@@ -263,17 +263,30 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
     ("neptune-graph", "NeptuneGraph", SdkDiagnostic::Attempts),
     // Amazon RDS's SDK names it by that model's own `sdkId` (`RDS`) written as one word with
-    // a capital initial, and words the bare ENVELOPE — the service, the status and the call's
-    // id, with nothing after it — as the recorded `ResourceStatusReason` of an
-    // `AWS::RDS::DBSubnetGroup` whose subnets cover too few Availability Zones carries it (in
-    // the behavioral corpus, check
-    // `cloudformation__ec2__rds.cfn-rds-db-subnet-group-single-az-rejected-negative`, whose
-    // reason reads `Resource handler returned message: "<the service's sentence> (Service:
-    // Rds, Status Code: 400, Request ID: …)" (RequestToken: …, HandlerErrorCode:
-    // InvalidRequest)`). Its DB instance and its two parameter-group types are provisioned by
-    // providers that word the ATTEMPT-counting shape, which is recorded per provider
+    // a capital initial, and words the ATTEMPT-counting shape — the envelope and then how many
+    // attempts the SDK made at the call — which is what the recorded `ResourceStatusReason` of
+    // every one of its refused types reads (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`): an `AWS::RDS::DBSubnetGroup` whose subnets lie in two
+    // different VPCs (check
+    // `cloudformation__ec2__rds.deploy-cfn-rds-db-subnet-group-cross-vpc-subnets-rejected`), an
+    // `AWS::RDS::DBInstance` declaring an engine version that service publishes none of (check
+    // `cloudformation__rds.cfn-rds-instance-invalid-engine-version-rejected-and-rolled-back`)
+    // and a parameter group of either level whose declared family is none it publishes (checks
+    // `cloudformation__rds.deploy-cfn-rds-db-parameter-group-invalid-family-rejected-and-\
+    // rolled-back` and
+    // `cloudformation__rds.deploy-rds-db-cluster-parameter-group-invalid-family-rejected`),
+    // each reading `<the service's sentence> (Service: Rds, Status Code: 400, Request ID: …)
+    // (SDK Attempt Count: …)`. So this is the shape every RECORDED provider of this service
+    // words, which is why it is the service's entry rather than a row per provider
     // ([`SDK_PROVIDER_SHAPES`]).
-    ("rds", "Rds", SdkDiagnostic::Envelope),
+    //
+    // The DB subnet group's own reason is what this entry read `SdkDiagnostic::Envelope` from
+    // before, through the single-AZ check beside it
+    // (`cloudformation__ec2__rds.cfn-rds-db-subnet-group-single-az-rejected-negative`): that
+    // check asserts only that the reason CONTAINS `(Service: Rds` and the coverage sentence, so
+    // it evidences the envelope the shape opens with and says nothing about what follows the
+    // call's id — where the reasons above state the count explicitly.
+    ("rds", "Rds", SdkDiagnostic::Attempts),
     // Recycle Bin's SDK names it `Rbin` — that model's own `sdkId` (`rbin`) with the initial
     // capitalised, exactly as Amazon RDS's above is — and words the ATTEMPT-counting shape, as
     // the recorded `ResourceStatusReason` of an `AWS::Rbin::Rule` whose retention period is
@@ -609,59 +622,12 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "DescribeListenerCertificates",
         SdkDiagnostic::Proxied,
     ),
-    // The Amazon RDS DB INSTANCE and the two PARAMETER-GROUP types are provisioned by
-    // providers that word the ATTEMPT-counting shape, where that service's entry above carries
-    // the bare envelope its DB subnet group's provider words. Read from the recorded
-    // `ResourceStatusReason` of an `AWS::RDS::DBInstance` declaring an engine version that
-    // service publishes no such version for, and of a parameter group of either level whose
-    // declared family is none it publishes (in the behavioral corpus
-    // `simparity-behavioral-aws-v1`, checks
-    // `cloudformation__rds.cfn-rds-instance-invalid-engine-version-rejected-and-rolled-back`,
-    // `cloudformation__rds.deploy-cfn-rds-db-parameter-group-invalid-family-rejected-and-\
-    // rolled-back` and `cloudformation__rds.deploy-rds-db-cluster-parameter-group-invalid-\
-    // family-rejected`, whose reasons read `<the service's sentence> (Service: Rds, Status
-    // Code: 400, Request ID: …) (SDK Attempt Count: …)`). Those are the reasons RECORDED for
-    // these providers; the rows beside each create are the same provider's other calls, which
-    // word the shape it words — a recording of one of them is what would correct them.
-    ("rds", "CreateDBInstance", SdkDiagnostic::Attempts),
-    ("rds", "ModifyDBInstance", SdkDiagnostic::Attempts),
-    ("rds", "DeleteDBInstance", SdkDiagnostic::Attempts),
-    ("rds", "DescribeDBInstances", SdkDiagnostic::Attempts),
-    ("rds", "AddRoleToDBInstance", SdkDiagnostic::Attempts),
-    ("rds", "CreateDBParameterGroup", SdkDiagnostic::Attempts),
-    ("rds", "ModifyDBParameterGroup", SdkDiagnostic::Attempts),
-    ("rds", "DeleteDBParameterGroup", SdkDiagnostic::Attempts),
-    (
-        "rds",
-        "DescribeDBParameterGroups",
-        SdkDiagnostic::Attempts,
-    ),
-    ("rds", "DescribeDBParameters", SdkDiagnostic::Attempts),
-    (
-        "rds",
-        "CreateDBClusterParameterGroup",
-        SdkDiagnostic::Attempts,
-    ),
-    (
-        "rds",
-        "ModifyDBClusterParameterGroup",
-        SdkDiagnostic::Attempts,
-    ),
-    (
-        "rds",
-        "DeleteDBClusterParameterGroup",
-        SdkDiagnostic::Attempts,
-    ),
-    (
-        "rds",
-        "DescribeDBClusterParameterGroups",
-        SdkDiagnostic::Attempts,
-    ),
-    (
-        "rds",
-        "DescribeDBClusterParameters",
-        SdkDiagnostic::Attempts,
-    ),
+    // Amazon RDS has NO row here: its DB instance's and its two parameter-group types'
+    // providers were recorded wording the ATTEMPT-counting shape while that service's entry
+    // carried the bare envelope, and the DB subnet group's provider — the one that envelope was
+    // read from — is now recorded wording the same count, so every recorded provider of that
+    // service words one shape and it belongs to the service's own entry
+    // ([`SDK_SERVICE_NAMES`]), which cites all four reasons.
 ];
 
 /// The SDK NAME a provider reports the service it called under, where that differs from the name

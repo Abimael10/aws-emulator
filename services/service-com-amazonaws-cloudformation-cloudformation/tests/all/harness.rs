@@ -882,6 +882,28 @@ pub fn assert_sdk_diagnostic(case: &str, quoted: &str, service: &str, status: u1
     );
 }
 
+/// Hold one quoted exception to the diagnostic an SDK that COUNTS ATTEMPTS appends: the
+/// envelope [`assert_sdk_diagnostic`] reads, and then how many attempts that SDK made at the
+/// call — each of the FORM that SDK words rather than one recorded value.
+///
+/// Shared for the same reason the envelope reading is: the attempt count belongs to the SHAPE
+/// an SDK words rather than to any one service, so every suite over a service whose SDK words
+/// it asks this same question with another name and status.
+pub fn assert_sdk_diagnostic_with_attempts(case: &str, quoted: &str, service: &str, status: u16) {
+    const ATTEMPTS: &str = ") (SDK Attempt Count: ";
+    let (envelope, attempts) = quoted.split_once(ATTEMPTS).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the attempts the SDK made, got {quoted:?}")
+    });
+    assert_sdk_diagnostic(case, &format!("{envelope})"), service, status);
+    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the diagnostic to close, got {quoted:?}")
+    });
+    assert!(
+        attempts.parse::<u32>().is_ok_and(|made| made >= 1),
+        "case {case:?}: expected the attempts the SDK made, got {attempts:?}"
+    );
+}
+
 /// Whether `value` has the 8-4-4-4-12 lowercase-hexadecimal form an AWS request id carries.
 pub fn is_a_request_id(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();

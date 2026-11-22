@@ -195,8 +195,9 @@ pub(crate) const DB_CLUSTER_PROPERTIES_NOT_SENT: &[&str] = &[
 ///
 /// What the create ANSWERS replaces the identifiers CloudFormation's naming rules had
 /// computed for the resource: the ARN and the cluster's resource id are Amazon RDS's to
-/// assign, and the whole point of provisioning the cluster is that the handles the stack
-/// publishes address the cluster RDS really holds. The ENDPOINTS are not read here — a
+/// assign, the identifier is the one that service answered it stored the cluster under
+/// ([`stored_identity`]), and the whole point of provisioning the cluster is that the handles
+/// the stack publishes address the cluster RDS really holds. The ENDPOINTS are not read here — a
 /// cluster that is still `creating` publishes none it serves on — so they are read once RDS
 /// reports it up ([`super::rds_published_endpoints::db_cluster_ready_attributes`]).
 pub(crate) async fn create_db_cluster(
@@ -245,7 +246,10 @@ pub(crate) async fn create_db_cluster(
         attributes.insert("DBClusterResourceId".to_string(), resource_id);
     }
     push_master_user_secret_attribute(&answered, &mut attributes);
-    Ok(Created::attributes(attributes))
+    Ok(Created {
+        physical_resource_id: stored_identity(&answered, "DBClusterIdentifier"),
+        attributes,
+    })
 }
 
 /// Publish the managed master-user secret of the DB resource the owning service answered
