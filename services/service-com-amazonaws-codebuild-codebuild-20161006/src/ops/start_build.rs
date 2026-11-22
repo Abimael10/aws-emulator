@@ -362,6 +362,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Where every build of this store now stands, performed BEFORE the lock is taken,
+        // from here, where the object store those runs reach can be reached: the count of
+        // builds this project holds in flight is a precondition of starting another one
+        // below, so it is taken against the builds the clock already owes a transition to
+        // rather than against records that are only waiting to be read
+        // (`crate::state::build_run::settle_due_builds`).
+        crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
+
         // READ PASS: take the shared lock only long enough to copy the project and
         // settle the idempotency question, then release it so none of the
         // caller-driven resolution below runs inside the critical section every other
@@ -566,6 +574,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(|_| parameter_mismatch())?
             {
                 return Ok(StartBuildOutput { build: Some(build) });
+            }
+            // How many of its builds a project may have in flight at once is its own
+            // setting, and it is a precondition of MINTING one
+            // (`crate::state::concurrent_build_limit_reached`): asked under this guard, so
+            // two requests that arrive together cannot both take the last slot, after the
+            // token — a replay mints no build and so needs no slot — and before the build
+            // number is allocated, so a refused request spends neither a number nor an id on
+            // a build that was never created.
+            if let Some(limit) = guard.concurrent_build_limit_reached(&input.project_name) {
+                return Err(StartBuildErrorModeled::AccountLimitExceededException(
+                    AccountLimitExceededException {
+                        message: Some(crate::state::concurrent_build_limit_message(limit)),
+                    },
+                )
+                .into());
             }
             let build_number = guard.allocate_build_number(&input.project_name);
             let id = format!(

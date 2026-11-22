@@ -275,6 +275,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Ok(RetryBuildOutput { build: Some(build) });
             }
 
+            // A retry is a new build of that project, so the project's own cap on how many
+            // of its builds may be in flight is a precondition of minting it
+            // (`crate::state::concurrent_build_limit_reached`). Asked AFTER the token,
+            // because a replay of a request this service already answered mints no build and
+            // so needs no slot, and BEFORE the build number is allocated, so a refused
+            // request spends neither a number nor an id on a build that was never created.
+            if let Some(limit) = guard.concurrent_build_limit_reached(&project_name) {
+                return Err(RetryBuildErrorModeled::AccountLimitExceededException(
+                    AccountLimitExceededException {
+                        message: Some(crate::state::concurrent_build_limit_message(limit)),
+                    },
+                )
+                .into());
+            }
+
             let build_number = guard.allocate_build_number(&project_name);
             let id = format!(
                 "{project_name}:{}",

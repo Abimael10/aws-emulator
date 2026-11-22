@@ -60,6 +60,9 @@ mod batch_fan_out;
 mod batchspec;
 /// The cache one project carries from one of its builds into the next.
 mod build_cache;
+/// How many builds of ONE project may be in flight at a time, and the refusal a request
+/// that would start one more gets.
+mod build_concurrency;
 /// The EventBridge events a build's own state changes are published as.
 mod build_events;
 /// The IMAGE a build runs in: the variable naming it and the filesystem it presents.
@@ -112,6 +115,7 @@ pub use artifacts::*;
 pub use batch_fan_out::*;
 pub use batchspec::*;
 pub use build_cache::*;
+pub use build_concurrency::*;
 pub use build_events::*;
 pub use build_image::*;
 pub use build_logs::*;
