@@ -12512,9 +12512,11 @@ dependencies = [
  "csv",
  "data-encoding",
  "hex",
+ "hkdf",
  "hmac 0.12.1",
  "http",
  "ipnet",
+ "num-bigint 0.4.8",
  "pkcs1",
  "rcgen",
  "regex",
@@ -12531,6 +12533,8 @@ dependencies = [
  "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",
  "sha1 0.10.7",
+ "sha2 0.10.9",
+ "srp",
  "subtle",
  "time",
  "tokio",
@@ -22858,6 +22862,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "srp"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cdd40049b29ab1315ccba7ffcf1eece8162982eab14edfac3cf2c2ffab18193"
+dependencies = [
+ "digest 0.10.7",
+ "generic-array",
+ "lazy_static",
+ "num-bigint 0.4.8",
+ "subtle",
 ]
 
 [[package]]

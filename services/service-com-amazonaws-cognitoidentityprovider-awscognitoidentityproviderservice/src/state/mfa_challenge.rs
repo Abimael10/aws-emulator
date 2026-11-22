@@ -155,6 +155,10 @@ pub enum SecondFactor {
     /// Several activated factors and no preference among them, so the caller
     /// chooses which to present.
     Select { settings: Vec<String> },
+    /// The DEVICE the sign-in presented stands in for the user's factors, and
+    /// owes the proof of possession that authenticates it
+    /// ([`UserPool::authenticating_device`]).
+    DeviceAuthentication { device_key: String },
 }
 
 /// One started MFA challenge: the `ChallengeNameType` it is outstanding under,
@@ -206,6 +210,15 @@ impl UserPool {
     /// of this user is what bypasses it — and a key naming any other device,
     /// one this user does not hold or one it no longer remembers, bypasses
     /// nothing.
+    ///
+    /// On a pool that asks a remembered device to AUTHENTICATE itself —
+    /// `ChallengeRequiredOnNewDevice` is "When true, a remembered device can
+    /// sign in with device authentication instead of SMS and time-based
+    /// one-time password (TOTP) factors for multi-factor authentication (MFA)"
+    /// (this service's model) — what stands in place of those factors is that
+    /// device authentication rather than the key itself: the sign-in owes the
+    /// device's own exchange ([`UserPool::authenticating_device`]) and is signed
+    /// in only once the device has proved it holds its device password.
     pub fn second_factor(
         &self,
         user: &User,
@@ -222,7 +235,19 @@ impl UserPool {
                 SecondFactor::Complete
             };
         }
-        if presented_device_key
+        if self.requires_device_authentication() {
+            // The pool asks a remembered device to AUTHENTICATE itself, so what
+            // stands in place of the factor is that authentication and not the
+            // key: a device that can give the proof owes it, and one that cannot
+            // — a key naming no device of this user, a device the user does not
+            // remember, or one whose confirmation registered no usable
+            // credentials — bypasses nothing and presents the user's own factor.
+            if let Some(device) = self.authenticating_device(user, presented_device_key) {
+                return SecondFactor::DeviceAuthentication {
+                    device_key: device.device_key.clone(),
+                };
+            }
+        } else if presented_device_key
             .and_then(|device_key| user.remembered_device(device_key))
             .is_some()
         {
@@ -316,6 +341,15 @@ pub fn second_factor_challenge(
             challenge.challenge_name.clone(),
             mfa_challenge_parameters(username, challenge),
             challenge.code.clone(),
+        )),
+        // The device authenticates itself through the exchange the two device
+        // challenges run, which starts at `DEVICE_SRP_AUTH`; that challenge is
+        // answered with a claim the device signs, so nothing is delivered for
+        // it.
+        SecondFactor::DeviceAuthentication { device_key } => Some((
+            DEVICE_SRP_AUTH_CHALLENGE.to_string(),
+            device_srp_auth_challenge_parameters(username, device_key),
+            None,
         )),
     }
 }

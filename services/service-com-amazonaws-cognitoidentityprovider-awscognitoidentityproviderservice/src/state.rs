@@ -84,12 +84,17 @@ mod new_password_challenge;
 /// The second factor a sign-in presents: which MFA challenge a user owes, what
 /// answers it, and what satisfying it leaves behind.
 mod mfa_challenge;
+/// The proof of possession a remembered device owes before it stands in for the
+/// user's second factor: the device SRP exchange and the credentials it runs
+/// over.
+mod device_auth;
 mod feature_plan;
 /// Why a value presented as an `AccessToken` that no issuance record resolves is
 /// refused: whether its signature fails to check out against the key set the pool it
 /// names publishes, or it is no signed token of this service at all.
 mod access_token_signature;
 pub use access_token_signature::*;
+pub use device_auth::*;
 pub use feature_plan::*;
 pub use attributes::*;
 pub use client_preconditions::*;
@@ -1605,6 +1610,14 @@ pub struct ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceS
     pub user_pools: HashMap<String, UserPool>,
     /// Challenge sessions, keyed by the opaque `Session` token handed to the caller.
     pub auth_sessions: HashMap<String, AuthSession>,
+    /// The server half of the device-authentication exchanges in flight
+    /// ([`DeviceSrpExchange`]), keyed by the `Session` token of the
+    /// `DEVICE_PASSWORD_VERIFIER` challenge each was served with: the claim is
+    /// answerable exactly while that session lasts, so an exchange is held
+    /// against the session rather than against the device
+    /// ([`Self::start_device_auth_exchange`] drops the ones whose session is
+    /// gone).
+    pub device_auth_exchanges: HashMap<String, DeviceSrpExchange>,
     /// Every token this emulator issued, keyed by the token string, so a later
     /// operation can resolve a token back to the stored user.
     pub issued_tokens: HashMap<String, TokenRecord>,
@@ -2098,6 +2111,9 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             Some(refresh_token),
             None,
             overrides,
+            // This sign-in authenticated no device of its own, so its access
+            // token states none.
+            None,
         )
     }
 
@@ -2128,6 +2144,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             Some(refresh_token),
             lineage,
             overrides,
+            None,
         )
     }
 
@@ -2159,6 +2176,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             None,
             lineage,
             overrides,
+            None,
         )
     }
 
@@ -2293,6 +2311,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// id render, so a token announces the same issuer however its holder
     /// addressed this emulator, and that issuer is the discovery root a verifier
     /// resolves the pool's key set from.
+    /// `device_key` is the device whose own proof of possession completed this
+    /// sign-in ([`Self::issue_tokens_for_device`]), which the access token
+    /// states as its `device_key` claim, and `None` for a sign-in no device
+    /// authenticated.
     #[allow(clippy::too_many_arguments)]
     fn mint_tokens(
         &mut self,
@@ -2303,6 +2325,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         refresh_token: Option<String>,
         lineage: Option<String>,
         overrides: &lambda_triggers::TokenOverrides,
+        device_key: Option<&str>,
     ) -> Option<AuthenticationResultType> {
         let TokenInputs {
             issuer,
@@ -2460,6 +2483,19 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 members.insert(
                     "cognito:preferred_role".to_string(),
                     serde_json::Value::String(preferred_role),
+                );
+            }
+        }
+
+        // The DEVICE this sign-in was authenticated by, where one proved itself
+        // for it: the access token of a device-authenticated sign-in states the
+        // device it came from, so a resource server reading that token knows
+        // which device holds it.
+        if let Some(device_key) = device_key {
+            if let Some(members) = access_claims.as_object_mut() {
+                members.insert(
+                    "device_key".to_string(),
+                    serde_json::Value::String(device_key.to_string()),
                 );
             }
         }

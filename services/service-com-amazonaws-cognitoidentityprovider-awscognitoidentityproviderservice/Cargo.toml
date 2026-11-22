@@ -101,6 +101,22 @@ csv = "1.3"
 # tree does, rather than scanning the authority by hand. At 2.5.9 or newer, where
 # `Url::origin()` no longer recurses once per `blob:` prefix of a caller-supplied URL.
 url = "2.5.9"
+# The device-authentication exchange of a remembered device (`src/state/device_auth.rs`)
+# is Secure Remote Password over the 3072-bit group, so:
+# `srp`: the group itself (its prime and generator), taken from the library that defines
+# the SRP groups rather than written out here.
+srp = "0.6"
+# `num-bigint`: the modular exponentiation that computes the server's public value and
+# the shared secret over that group.
+num-bigint = "0.4"
+# `sha2` and `hkdf`: the SHA-256 digests of the SRP key schedule and the HKDF-SHA256
+# expansion that turns its shared secret into the key the device's password claim is
+# signed under.
+sha2 = "0.10"
+hkdf = "0.12"
+# `hex`: the SRP values travel as hexadecimal in `ChallengeParameters`, read and written
+# with the codec this tree already encodes hexadecimal with.
+hex = { workspace = true }
 # `ipnet`: reads the CIDR notation a pool's threat-protection address exceptions are
 # "displayed and set in" and decides whether a request's address lies in one of those
 # blocks (`src/state/risk_exceptions.rs`).

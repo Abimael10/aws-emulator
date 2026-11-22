@@ -17,7 +17,10 @@
 //!
 //! On a user pool that carries a `DeviceConfiguration`, a completed password sign-in
 //! also records the device it came from and answers with that device's
-//! `NewDeviceMetadata` when the pool did not recognise it.
+//! `NewDeviceMetadata` when the pool did not recognise it. A pool that asks a remembered
+//! device to authenticate itself answers a sign-in presenting such a device's `DEVICE_KEY`
+//! with the `DEVICE_SRP_AUTH` challenge instead of the user's second factor
+//! ([`crate::state::device_auth`]): the key alone signs nobody in.
 //!
 //! A pool whose `LambdaConfig` names a `PreAuthentication` function has that function
 //! gate the password sign-in, and one that names a pre-token-generation function has it

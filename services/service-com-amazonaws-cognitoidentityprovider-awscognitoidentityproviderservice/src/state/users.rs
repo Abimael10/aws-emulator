@@ -1020,8 +1020,9 @@ pub struct Device {
     /// The device's attributes keyed by name, ordered so a read is stable.
     pub attributes: BTreeMap<String, String>,
     /// The SRP verifier `ConfirmDevice` registered for this device, when it
-    /// carried one. Stored because it is what the device's own authentication
-    /// would check; no operation implemented here reads it yet.
+    /// carried one. It is what the device's own authentication checks: the
+    /// proof of possession a remembered device owes runs over it
+    /// ([`crate::state::device_auth`]).
     pub secret_verifier: Option<DeviceSecretVerifierConfigType>,
     /// Whether `ConfirmDevice` has confirmed this device, which is what makes it
     /// a device the user pool reports.

@@ -16,6 +16,11 @@
 //! A pool whose `LambdaConfig` names a pre-token-generation function has that function
 //! gate the tokens the answered challenge mints ([`crate::state::lambda_triggers`]).
 //!
+//! A sign-in a remembered DEVICE has to authenticate for is answered here too, by the same
+//! exchange the client-side challenge response serves: `DEVICE_SRP_AUTH` starts it and
+//! `DEVICE_PASSWORD_VERIFIER` carries the claim the credentials `ConfirmDevice` registered
+//! check ([`crate::state::device_auth`]).
+//!
 //! Answering the challenge is what TERMINATES the sign-in attempt it belongs to, so this
 //! call is also the OBSERVATION of that attempt's outcome, published into the pool's
 //! `AWS/Cognito` sign-in series ([`crate::state::auth_metrics`]).
@@ -574,6 +579,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 break 'answered Answered::Completed {
                     username,
                     generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                    // The factor was presented by the user, not by a device.
+                    device_key: None,
                 };
             }
             if session.challenge_name == crate::state::MFA_SETUP_CHALLENGE {
@@ -603,6 +610,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 break 'answered Answered::Completed {
                     username,
                     generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                    // The setup was completed by the user, not by a device.
+                    device_key: None,
                 };
             }
             if session.challenge_name == crate::state::SELECT_MFA_TYPE_CHALLENGE {
@@ -664,6 +673,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                     delivered: delivered.map(|(code, attribute)| (username, code, attribute)),
                 };
             }
+            // The two challenges of device authentication: `DEVICE_SRP_AUTH` is
+            // answered by starting the device's own exchange, and
+            // `DEVICE_PASSWORD_VERIFIER` by the claim that exchange's stored
+            // state checks — both held to the one rule both response operations
+            // ask ([`crate::state::DeviceAuthRefusal`]), over the credentials
+            // `ConfirmDevice` registered for the device.
+            if session.challenge_name == crate::state::DEVICE_SRP_AUTH_CHALLENGE {
+                // The user the session names may have been disabled, reset or
+                // deleted since the challenge was started, so the sign-in is
+                // refused on the stored user's own state before the response
+                // decides anything.
+                let username = usable_session_user(guard, &session)?;
+                let served = guard
+                    .answer_device_srp_auth(&session, &responses)
+                    .map_err(device_auth_refused)?;
+                let validity = guard
+                    .pool(&input.user_pool_id)
+                    .and_then(|pool| pool.clients.get(&input.client_id))
+                    .map_or(session.expires_at, |client| {
+                        now + client.auth_session_validity()
+                    });
+                let next = guard.start_session(
+                    now,
+                    crate::state::AuthSession {
+                        user_pool_id: input.user_pool_id.clone(),
+                        client_id: input.client_id.clone(),
+                        username: username.clone(),
+                        challenge_name: crate::state::DEVICE_PASSWORD_VERIFIER_CHALLENGE
+                            .to_string(),
+                        expires_at: validity,
+                        // Outstanding: this session has answered nothing yet.
+                        spent: false,
+                        // This challenge is answered with a claim the device
+                        // signs, not with a code anything delivered.
+                        code: None,
+                        // A response to one of the sign-in's challenges is what
+                        // handed it out.
+                        issued_by: crate::state::SessionIssuer::SignIn,
+                    },
+                );
+                // The exchange this answer served is bound to the session that
+                // carries the challenge it is answered on, so the claim is
+                // checked against the values THIS exchange served.
+                guard.start_device_auth_exchange(&next, served.exchange);
+                // The response answered the challenge it was outstanding for, so
+                // that session is spent and the device's claim is outstanding on
+                // a session of its own.
+                guard.end_session(&session_token);
+                break 'answered Answered::Next {
+                    output: Box::new(AdminRespondToAuthChallengeOutput {
+                        challenge_name: Some(
+                            crate::state::DEVICE_PASSWORD_VERIFIER_CHALLENGE.to_string(),
+                        ),
+                        session: Some(next),
+                        challenge_parameters: Some(served.challenge_parameters),
+                        authentication_result: None,
+                        available_challenges: None,
+                    }),
+                    delivered: None,
+                };
+            }
+            if session.challenge_name == crate::state::DEVICE_PASSWORD_VERIFIER_CHALLENGE {
+                let username = usable_session_user(guard, &session)?;
+                let device_key = guard
+                    .answer_device_password_verifier(&session_token, &session, &responses, now)
+                    .map_err(device_auth_refused)?;
+                // The device proved it holds its device password, so the
+                // challenge is answered and its session is spent: the same claim
+                // cannot complete a second sign-in.
+                guard.end_session(&session_token);
+                break 'answered Answered::Completed {
+                    username,
+                    generation: crate::state::lambda_triggers::TokenGeneration::Authentication,
+                    // The sign-in was completed BY this device, which is what its
+                    // access token states.
+                    device_key: Some(device_key),
+                };
+            }
             if session.challenge_name != NEW_PASSWORD_REQUIRED {
                 // No other challenge is started with a session yet, so no stored
                 // state could decide whether a response to it is right.
@@ -695,14 +782,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
             Answered::Completed {
                 username,
                 generation: crate::state::lambda_triggers::TokenGeneration::NewPasswordChallenge,
+                // This challenge is answered by the user, not by a device.
+                device_key: None,
             }
         };
 
-        let (username, generation) = match answered {
+        let (username, generation, device_key) = match answered {
             Answered::Completed {
                 username,
                 generation,
-            } => (username, generation),
+                device_key,
+            } => (username, generation, device_key),
             Answered::Next { output, delivered } => {
                 // A pool that routes a medium's messages to a custom sender delivers the
                 // one-time password of the challenge this answer STARTED by handing it to
@@ -748,16 +838,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
         .map_err(trigger_failed)?;
 
         let guard = &mut *state.lock();
-        let mut authentication_result = guard
-            .issue_tokens(
+        // A sign-in a DEVICE authenticated states that device in its access
+        // token, which is the one thing the two issuances differ in.
+        let mut authentication_result = match device_key.as_deref() {
+            Some(device_key) => guard.issue_tokens_for_device(
+                &input.user_pool_id,
+                &input.client_id,
+                &username,
+                device_key,
+                now,
+                ctx.credential_store(),
+                &overrides,
+            ),
+            None => guard.issue_tokens(
                 &input.user_pool_id,
                 &input.client_id,
                 &username,
                 now,
                 ctx.credential_store(),
                 &overrides,
-            )
-            .ok_or_else(internal_error)?;
+            ),
+        }
+        .ok_or_else(internal_error)?;
         // The sign-in this response completed came from a device, so on a pool that
         // remembers devices that device is now part of this user's state and the key of one
         // the pool did not recognise is what the caller needs to confirm it:
@@ -789,6 +891,11 @@ enum Answered {
     Completed {
         username: String,
         generation: crate::state::lambda_triggers::TokenGeneration,
+        /// The device whose own proof of possession completed the sign-in, for a
+        /// response that answered a device-authentication challenge, and `None`
+        /// for every other challenge: the access token of a sign-in a device
+        /// authenticated states that device.
+        device_key: Option<String>,
     },
     /// The answer satisfied one challenge and left the NEXT one outstanding, so
     /// the caller gets that challenge rather than tokens — beside the one-time
@@ -1008,6 +1115,38 @@ fn not_authorized(message: &str) -> AdminRespondToAuthChallengeError {
 /// request did not carry.
 fn missing_parameter(parameter: &str) -> AdminRespondToAuthChallengeError {
     invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// What a response that does not answer a device-authentication challenge is
+/// reported as by THIS operation ([`crate::state::DeviceAuthRefusal`]): the
+/// modelled error each refusal amounts to, carrying the one sentence it owes —
+/// the same reading the client-side challenge response gives such a response, so
+/// the two surfaces cannot refuse one claim differently.
+///
+/// A claim that does not verify against the device's stored verifier is the
+/// refusal a credential that does not check out earns anywhere in this API —
+/// `NotAuthorizedException` with [`crate::state::INCORRECT_CREDENTIALS_MESSAGE`]
+/// — and it carries no `AuthenticationResult`, since nothing was authenticated.
+fn device_auth_refused(
+    refusal: crate::state::DeviceAuthRefusal,
+) -> AdminRespondToAuthChallengeError {
+    match refusal {
+        crate::state::DeviceAuthRefusal::MissingResponse(entry) => missing_parameter(entry),
+        crate::state::DeviceAuthRefusal::UnknownDevice => device_not_found(),
+        crate::state::DeviceAuthRefusal::ClaimNotVerified => {
+            not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
+        }
+    }
+}
+
+/// This operation's `ResourceNotFoundException` for a response answering for a
+/// device this pool holds no proof-of-possession credentials of for the user its
+/// session was started for. The sentence names no value from the request.
+fn device_not_found() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// This operation's `InvalidPasswordException`, carrying `message`.
