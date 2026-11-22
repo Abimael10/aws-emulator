@@ -216,8 +216,11 @@ async fn delete_theme_without_a_version_removes_every_version() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!("Theme with ID {} not found.", row.theme_id)),
-            "case {case:?}: the refusal must name the theme: {body}"
+            json!(format!(
+                "Theme {} is not found",
+                theme_arn(row.account, row.theme_id)
+            )),
+            "case {case:?}: the refusal must name the theme by its ARN: {body}"
         );
     }
 }

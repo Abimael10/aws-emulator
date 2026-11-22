@@ -13,8 +13,11 @@
 //! miss, which the service words its own way, is `"Folder: <arn> not found"`) — with
 //! the ARN assembled from the region the request was signed for and the request's own
 //! path labels; a group, which the identity path serves, is named by its name together
-//! with the account that holds it. The same template serves every operation of a
-//! resource, so the wording does not depend on which call a client made.
+//! with the account that holds it; a namespace is named by the name the request carried,
+//! and a namespace WRITE closes its refusal with a clause naming the call that failed,
+//! `"Failed to <verb> namespace <Namespace> for account <AwsAccountId>. "`. The same
+//! template serves every operation of a resource, so the wording does not depend on
+//! which call a client made.
 //!
 //! So the rows below vary what the rule generalises over — the resource kind, the
 //! operation that refuses, the account, the region, and the form and length of the id
@@ -23,7 +26,8 @@
 use serde_json::{json, Value};
 
 use super::data_source_data_set_lifecycle::Harness;
-use super::namespace_lifecycle::create_namespace_in;
+use super::delete_namespace::{delete_namespace, settle_deletion};
+use super::namespace_lifecycle::{create_namespace_in, describe_namespace_in};
 
 /// The account most rows use.
 const ACCOUNT: &str = "000000000000";
@@ -470,5 +474,316 @@ async fn every_data_source_operation_reports_a_source_it_cannot_find_by_its_arn(
     assert_eq!(
         status, 200,
         "the refusals must leave the stored source readable, got {status} with {body}"
+    );
+}
+
+/// `CreateTheme`: `POST /accounts/{AwsAccountId}/themes/{ThemeId}`.
+/// Source: smithy_query(query="operation", operation="CreateTheme").
+async fn create_theme(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    theme_id: &str,
+) -> (u16, Value) {
+    harness
+        .call_in_region(
+            region,
+            "POST",
+            &format!("/accounts/{account}/themes/{theme_id}"),
+            Some(json!({
+                "Name": "a theme",
+                "BaseThemeId": "MIDNIGHT",
+                "Configuration": { "DataColorPalette": { "Colors": ["#37BFF5", "#8E6E9B"] } },
+            })),
+        )
+        .await
+}
+
+/// The implemented operations keyed on a `(AwsAccountId, ThemeId)` theme: the read, the
+/// delete, the two alias calls addressed through the theme and the two permission calls.
+/// The theme's remaining operations are still stubs and answer 501, so they report no
+/// miss to assert.
+/// Source: smithy_query(query="operation", operation="DescribeTheme,DeleteTheme,
+/// CreateThemeAlias,DescribeThemeAlias,DescribeThemePermissions,UpdateThemePermissions").
+const THEME_CALLS: [&str; 6] = [
+    "DescribeTheme",
+    "DeleteTheme",
+    "CreateThemeAlias",
+    "DescribeThemeAlias",
+    "DescribeThemePermissions",
+    "UpdateThemePermissions",
+];
+
+/// One of [`THEME_CALLS`], addressed to `(account, theme_id)` and signed for `region`.
+/// Each request carries the members its own shape requires, so the miss is what refuses
+/// it rather than a missing member.
+async fn call_theme(
+    harness: &Harness,
+    operation: &str,
+    region: &str,
+    account: &str,
+    theme_id: &str,
+) -> (u16, Value) {
+    let base = format!("/accounts/{account}/themes/{theme_id}");
+    match operation {
+        "DescribeTheme" => harness.call_in_region(region, "GET", &base, None).await,
+        "DeleteTheme" => harness.call_in_region(region, "DELETE", &base, None).await,
+        "CreateThemeAlias" => {
+            harness
+                .call_in_region(
+                    region,
+                    "POST",
+                    &format!("{base}/aliases/POSTDELETE"),
+                    Some(json!({ "ThemeVersionNumber": 1 })),
+                )
+                .await
+        }
+        "DescribeThemeAlias" => {
+            harness
+                .call_in_region(region, "GET", &format!("{base}/aliases/POSTDELETE"), None)
+                .await
+        }
+        "DescribeThemePermissions" => {
+            harness
+                .call_in_region(region, "GET", &format!("{base}/permissions"), None)
+                .await
+        }
+        _ => {
+            harness
+                .call_in_region(
+                    region,
+                    "PUT",
+                    &format!("{base}/permissions"),
+                    Some(json!({ "GrantPermissions": [] })),
+                )
+                .await
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_theme_operation_reports_a_theme_it_cannot_find_by_its_arn() {
+    let harness = Harness::new();
+    let held = "held-theme";
+    let (status, body) = create_theme(&harness, WEST, ACCOUNT, held).await;
+    assert_eq!(status, 200, "fixture create: got {status} with {body}");
+
+    // The recorded case generalised: a theme that was created and then deleted is as
+    // absent as one that never existed, so it is one row among the others.
+    let deleted = "deleted-theme";
+    let (status, body) = create_theme(&harness, WEST, ACCOUNT, deleted).await;
+    assert_eq!(status, 200, "fixture create: got {status} with {body}");
+    let (status, body) = call_theme(&harness, "DeleteTheme", WEST, ACCOUNT, deleted).await;
+    assert_eq!(status, 200, "fixture delete: got {status} with {body}");
+
+    // Rows: an id nothing created, the deleted id, an id held only by another account,
+    // an id differing only in case, the id's form and length, and the region the call is
+    // signed for. `ThemeId` is len 1..512 over `^[\w\-]+$`.
+    // Source: smithy_query(query="operation", operation="DescribeTheme").
+    let rows: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "an id nothing created",
+            WEST,
+            ACCOUNT,
+            "absent-theme".to_string(),
+        ),
+        ("a deleted id", WEST, ACCOUNT, deleted.to_string()),
+        (
+            "an id held by another account",
+            WEST,
+            OTHER_ACCOUNT,
+            held.to_string(),
+        ),
+        (
+            "an id differing only in case",
+            WEST,
+            ACCOUNT,
+            "HELD-THEME".to_string(),
+        ),
+        (
+            "an id holding the separators the pattern admits",
+            WEST,
+            ACCOUNT,
+            "Theme_7-ID".to_string(),
+        ),
+        (
+            "the shortest id the model admits",
+            WEST,
+            OTHER_ACCOUNT,
+            "t".to_string(),
+        ),
+        (
+            "the longest id the model admits",
+            WEST,
+            ACCOUNT,
+            "t".repeat(512),
+        ),
+        (
+            "an account holding nothing at all, in the other region",
+            EAST,
+            THIRD_ACCOUNT,
+            held.to_string(),
+        ),
+        // The ARN a refusal names is scoped to the region the request was signed for,
+        // so the same absent id read from the other region is named by another ARN.
+        (
+            "an id nothing created, in the other region",
+            EAST,
+            ACCOUNT,
+            "absent-theme".to_string(),
+        ),
+    ];
+
+    for (case, region, account, theme_id) in rows {
+        let expected = format!(
+            "Theme {} is not found",
+            quicksight_arn(region, account, &format!("theme/{theme_id}"))
+        );
+        // One template per resource, not per operation: the read, the delete, the alias
+        // calls and the permission calls all report the same miss the same way.
+        for operation in THEME_CALLS {
+            let (status, body) = call_theme(&harness, operation, region, account, &theme_id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{operation}: expected 404 for a theme nothing holds, got \
+                 {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ResourceNotFoundException"),
+                "case {case:?}/{operation}: expected ResourceNotFoundException, got {body}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(expected),
+                "case {case:?}/{operation}: expected Message {expected:?}, got {body}"
+            );
+            assert_eq!(
+                body["ResourceType"],
+                Value::Null,
+                "case {case:?}/{operation}: the modelled enum has no theme member, so the \
+                 refusal reports none, got {body}"
+            );
+        }
+    }
+
+    // The theme the refusals addressed by the wrong id is still readable, so none of
+    // them disturbed the store.
+    let (status, body) = call_theme(&harness, "DescribeTheme", WEST, ACCOUNT, held).await;
+    assert_eq!(
+        status, 200,
+        "the refusals must leave the stored theme readable, got {status} with {body}"
+    );
+}
+
+/// The reason a namespace lookup fails: the namespace by the name the request carried,
+/// with no trailing period.
+fn namespace_miss_reason(namespace: &str) -> String {
+    format!("Namespace {namespace} not found")
+}
+
+#[tokio::test]
+async fn deleting_a_namespace_nothing_holds_names_the_delete_that_failed() {
+    let harness = Harness::new();
+
+    // One namespace IS held, so the rows below are about names that address no namespace
+    // rather than about an empty store.
+    let held = "held-namespace";
+    let (status, body) = create_namespace_in(
+        &harness,
+        WEST,
+        ACCOUNT,
+        json!({ "Namespace": held, "IdentityStore": "QUICKSIGHT" }),
+    )
+    .await;
+    assert_eq!(status, 200, "fixture create: got {status} with {body}");
+
+    // The recorded case generalised: a namespace created and then deleted is as absent as
+    // one that never existed, so it is one row among the others. Its removal is what the
+    // delete asked for and the clock owes a span later: bring that instant forward rather
+    // than wait for it.
+    let deleted = "deleted.namespace";
+    let (status, body) = create_namespace_in(
+        &harness,
+        WEST,
+        ACCOUNT,
+        json!({ "Namespace": deleted, "IdentityStore": "QUICKSIGHT" }),
+    )
+    .await;
+    assert_eq!(status, 200, "fixture create: got {status} with {body}");
+    let (status, body) = delete_namespace(&harness, ACCOUNT, deleted).await;
+    assert_eq!(status, 200, "fixture delete: got {status} with {body}");
+    settle_deletion(&harness, ACCOUNT, deleted);
+
+    // Rows: a name nothing created, the deleted name, a name held only by another
+    // account, a name differing only in case, and the name's form and length.
+    // `Namespace` is len 0..64 over `^[a-zA-Z0-9._-]*$`.
+    // Source: smithy_query(query="operation", operation="DeleteNamespace").
+    let rows: Vec<(&str, &str, String)> = vec![
+        ("a name nothing created", ACCOUNT, "absent-ns".to_string()),
+        ("a deleted name", ACCOUNT, deleted.to_string()),
+        ("a name held by another account", OTHER_ACCOUNT, held.to_string()),
+        ("a name differing only in case", ACCOUNT, "HELD-NAMESPACE".to_string()),
+        (
+            "a name holding the punctuation the pattern admits",
+            ACCOUNT,
+            "sales.archive_2026-Q1".to_string(),
+        ),
+        ("the shortest name the model admits", THIRD_ACCOUNT, "n".to_string()),
+        ("the longest name the model admits", ACCOUNT, "n".repeat(64)),
+    ];
+
+    for (case, account, namespace) in rows {
+        // The delete names the namespace, then the call that failed and the account it
+        // addressed: the namespace travels twice and the message ends in a period and a
+        // space.
+        let expected = format!(
+            "{} Failed to delete namespace {namespace} for account {account}. ",
+            namespace_miss_reason(&namespace)
+        );
+        let (status, body) = delete_namespace(&harness, account, &namespace).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 for a namespace nothing holds, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(expected),
+            "case {case:?}: expected Message {expected:?}, got {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!("NAMESPACE"),
+            "case {case:?}: the refusal is about a namespace, got {body}"
+        );
+
+        // The read of the same namespace reports the reason alone: the clause belongs to
+        // the write that failed, not to the lookup.
+        let reason = namespace_miss_reason(&namespace);
+        let (status, body) = describe_namespace_in(&harness, WEST, account, &namespace).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 reading a namespace nothing holds, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(reason),
+            "case {case:?}: expected Message {reason:?}, got {body}"
+        );
+    }
+
+    // The namespace the refusals addressed by the wrong name is still readable, so none
+    // of them disturbed the store.
+    let (status, body) = describe_namespace_in(&harness, WEST, ACCOUNT, held).await;
+    assert_eq!(
+        status, 200,
+        "the refusals must leave the stored namespace readable, got {status} with {body}"
     );
 }

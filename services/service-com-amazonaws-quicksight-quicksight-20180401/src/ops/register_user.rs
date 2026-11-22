@@ -298,9 +298,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(RegisterUserErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Namespace {} not found in account {}.",
-                            input.namespace, input.aws_account_id
+                        message: Some(crate::state::namespace_not_found_message(
+                            &input.namespace,
                         )),
                         resource_type: Some(
                             crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),

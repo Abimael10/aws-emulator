@@ -188,12 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.namespaces.get_mut(&key) else {
             return Err(DeleteNamespaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // The wording the namespace handlers beside this one answer a
-                    // namespace nobody holds with: one template for the refusal, so a
-                    // caller reads the same sentence whichever of them it called.
-                    message: Some(format!(
-                        "Namespace {} not found in account {}.",
-                        input.namespace, input.aws_account_id
+                    // The namespace path words the refusal of a write the way the
+                    // service does: the lookup's reason, then the clause naming the
+                    // delete that failed and the namespace and account it addressed.
+                    message: Some(crate::state::namespace_delete_not_found_message(
+                        &input.namespace,
+                        &input.aws_account_id,
                     )),
                     resource_type: Some(
                         crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),

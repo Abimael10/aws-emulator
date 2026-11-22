@@ -546,7 +546,7 @@ async fn a_group_needs_a_namespace_the_account_holds() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!("Namespace {namespace} not found in account {account}.")),
+            json!(format!("Namespace {namespace} not found")),
             "case {case:?}: the refusal must name the namespace: {body}"
         );
         assert_eq!(
@@ -998,7 +998,7 @@ async fn a_membership_needs_the_group_and_the_user_it_joins() {
             "Members".to_string(),
             "member-1".to_string(),
             "NAMESPACE",
-            format!("Namespace no-such-ns not found in account {ACCOUNT}."),
+            "Namespace no-such-ns not found".to_string(),
         ),
     ];
 
@@ -1855,9 +1855,7 @@ async fn removing_a_group_from_a_role_takes_it_out_of_the_listing() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!(
-                "Namespace {missing} not found in account {ACCOUNT}."
-            )),
+            json!(format!("Namespace {missing} not found")),
             "case {call}: the refusal must name the namespace: {body}"
         );
     }

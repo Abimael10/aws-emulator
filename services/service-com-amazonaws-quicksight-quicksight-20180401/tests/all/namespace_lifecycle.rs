@@ -371,9 +371,7 @@ async fn namespace_identity_is_the_account_and_the_name() {
     );
     assert_eq!(
         body["Message"],
-        json!(format!(
-            "Namespace {shared} not found in account {EMPTY_ACCOUNT}."
-        )),
+        json!(format!("Namespace {shared} not found")),
         "the refusal must name the namespace that was not found: {body}"
     );
     assert_eq!(

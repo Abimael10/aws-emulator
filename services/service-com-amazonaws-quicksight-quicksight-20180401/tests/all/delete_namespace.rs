@@ -98,7 +98,10 @@ fn deletion_due(harness: &Harness, account: &str, namespace: &str) -> Option<Sys
 
 /// Bring the removal the clock owes this namespace forward, so a case can observe the
 /// deletion completing without sleeping for the span.
-fn settle_deletion(harness: &Harness, account: &str, namespace: &str) {
+///
+/// `pub(crate)` so a sibling suite that needs a namespace that is already gone settles
+/// its removal the same way this one does.
+pub(crate) fn settle_deletion(harness: &Harness, account: &str, namespace: &str) {
     let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
     let mut store = state.lock();
     let record = store
@@ -266,10 +269,8 @@ async fn delete_namespace_takes_the_namespace_and_its_groups() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!(
-                "Namespace {namespace} not found in account {account}."
-            )),
-            "case {case:?}: the refusal must name the namespace and its account: {body}"
+            json!(format!("Namespace {namespace} not found")),
+            "case {case:?}: the read's refusal must name the namespace: {body}"
         );
 
         // So deleting it again finds nothing to delete, and its name is free to create
@@ -486,9 +487,11 @@ async fn deleting_a_namespace_no_account_holds_is_not_found() {
         assert_eq!(
             body["Message"],
             json!(format!(
-                "Namespace {namespace} not found in account {account}."
+                "Namespace {namespace} not found Failed to delete namespace {namespace} \
+                 for account {account}. "
             )),
-            "case {case:?}: the refusal must name the namespace and its account: {body}"
+            "case {case:?}: the refusal must name the namespace, the delete that failed \
+             and the account: {body}"
         );
         assert_eq!(
             body["ResourceType"],

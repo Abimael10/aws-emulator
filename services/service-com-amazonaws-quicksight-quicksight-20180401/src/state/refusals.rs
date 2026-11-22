@@ -12,8 +12,11 @@
 //!   `"<Kind> <arn> is not found"` for a miss, neither ending in a period; a folder,
 //!   whose miss the service words differently, is named by its ARN after a colon —
 //!   `"Folder: <arn> not found"`;
-//! * a namespace, whose create is refused by the status the namespace already holding
-//!   the name is in, is named together with that status and the account it belongs to;
+//! * a namespace is named by the name the request carried; the refusal a namespace WRITE
+//!   reports closes with a clause naming the call that failed — its operation's verb, the
+//!   namespace and the account — so a client can tell which call failed apart from a plain
+//!   lookup miss, and a create refused by the status the namespace already holding the
+//!   name is in states that status before it;
 //! * a group or a user, which QuickSight's identity path serves, is named by its name
 //!   together with the account it belongs to, and a refusal the account's own
 //!   configuration causes is named by that account too — each of them closed by the
@@ -256,17 +259,53 @@ pub fn role_membership_not_authorized_message(
     )
 }
 
+/// The clause a namespace write closes its refusal with: the call that failed, named by
+/// the verb of the operation, the namespace it addressed and the account it addressed it
+/// in — both as the request carried them — ending in a period and a space.
+///
+/// The reason the write failed is a sentence of its own before this clause, carrying
+/// whatever punctuation it ends in, and the two are joined by a single space.
+fn namespace_operation_failure(verb: &str, namespace: &str, aws_account_id: &str) -> String {
+    format!("Failed to {verb} namespace {namespace} for account {aws_account_id}. ")
+}
+
+/// The verb the clause of a refused `CreateNamespace` names its call by.
+const CREATE: &str = "create";
+
+/// The verb the clause of a refused `DeleteNamespace` names its call by.
+const DELETE: &str = "delete";
+
 /// The conflict `CreateNamespace` reports for a `Namespace` the account already holds.
 ///
 /// What forbids the create is the status the namespace holding that name is in, so the
 /// sentence states that status — whichever `NamespaceStatus` the existing namespace
 /// reports as of this call, not a constant — and the clause after it names the create
-/// that failed: the requested name and the account it was requested in, both as the
-/// request carried them. The message ends in a period and a space.
+/// that failed ([`namespace_operation_failure`]).
 pub fn namespace_exists_message(status: &str, namespace: &str, aws_account_id: &str) -> String {
     format!(
-        "Cannot create a namespace when status is {status}. Failed to create namespace \
-         {namespace} for account {aws_account_id}. "
+        "Cannot create a namespace when status is {status}. {}",
+        namespace_operation_failure(CREATE, namespace, aws_account_id)
+    )
+}
+
+/// The miss any operation keyed on a namespace the account holds no record of reports:
+/// the namespace by the name the request carried. No trailing period.
+///
+/// This is the reason a namespace lookup fails, so it is also the sentence a namespace
+/// write puts before the clause naming the call that failed
+/// ([`namespace_delete_not_found_message`]).
+pub fn namespace_not_found_message(namespace: &str) -> String {
+    format!("Namespace {namespace} not found")
+}
+
+/// The miss `DeleteNamespace` reports for a `Namespace` the account holds no record of:
+/// the lookup's own reason, then the clause naming the delete that failed — so the
+/// namespace is named twice and the message ends in a period and a space.
+pub fn namespace_delete_not_found_message(namespace: &str, aws_account_id: &str) -> String {
+    format!(
+        "{} {}",
+        namespace_not_found_message(namespace),
+        namespace_operation_failure(DELETE, namespace, aws_account_id)
     )
 }
 

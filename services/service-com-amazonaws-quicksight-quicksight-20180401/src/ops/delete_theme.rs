@@ -162,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteThemeErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -174,13 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let request_id = crate::state::next_request_id();
+        let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
         let key = (input.aws_account_id, input.theme_id);
         let mut store = state.lock();
         let Some(record) = store.themes.get_mut(&key) else {
             return Err(DeleteThemeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Theme with ID {} not found.", key.1)),
+                    // A theme is addressed by its ARN, so the miss names the theme the
+                    // request addressed by that ARN — the same wording every theme
+                    // handler beside this one reports it with.
+                    message: Some(crate::state::theme_not_found_message(
+                        &region, &key.0, &key.1,
+                    )),
                     // `ExceptionResourceType` declares no member for a theme, so this
                     // refusal reports none rather than an unmodelled value.
                     resource_type: None,

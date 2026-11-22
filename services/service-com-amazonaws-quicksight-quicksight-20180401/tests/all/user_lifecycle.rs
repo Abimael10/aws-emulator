@@ -757,7 +757,7 @@ async fn a_user_needs_a_namespace_the_account_holds() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!("Namespace {namespace} not found in account {account}.")),
+            json!(format!("Namespace {namespace} not found")),
             "case {case:?}: the refusal must name the namespace: {body}"
         );
         assert_eq!(

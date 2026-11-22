@@ -255,17 +255,16 @@ async fn describe_addresses_one_exact_name_in_one_account() {
             json!("ResourceNotFoundException"),
             "case {case:?}: the modelled refusal is ResourceNotFoundException: {body}"
         );
-        // The variable parts of the refusal come from the REQUEST — the namespace and
-        // the account it addressed — which is what distinguishes one near miss from
-        // another. The fixed text around them is asserted once, in
-        // `namespace_lifecycle`.
-        let message = body["Message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no Message: {body}"));
-        assert!(
-            message.contains(row.namespace) && message.contains(row.account),
-            "case {case:?}: the refusal must name the namespace and the account the \
-             request addressed, got {message:?}"
+        // The variable part of the refusal comes from the REQUEST — the namespace it
+        // addressed — which is what distinguishes one near miss from another. The
+        // account travels in the clause a namespace WRITE closes its refusal with, not
+        // in the reason a lookup reports, so the whole sentence is this one, asserted
+        // here exactly rather than searched for inside it.
+        let expected = format!("Namespace {} not found", row.namespace);
+        assert_eq!(
+            body["Message"],
+            json!(expected),
+            "case {case:?}: expected Message {expected:?}, got {body}"
         );
         assert_eq!(
             body["ResourceType"],

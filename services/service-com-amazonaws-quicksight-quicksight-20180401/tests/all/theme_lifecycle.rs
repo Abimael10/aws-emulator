@@ -425,8 +425,11 @@ async fn theme_identity_is_the_account_and_the_theme_id() {
     );
     assert_eq!(
         body["Message"],
-        json!(format!("Theme with ID {shared_id} not found.")),
-        "the refusal must name the theme that was not found: {body}"
+        json!(format!(
+            "Theme {} is not found",
+            theme_arn("123456789012", shared_id)
+        )),
+        "the refusal must name the theme that was not found by its ARN: {body}"
     );
 }
 
