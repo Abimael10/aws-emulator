@@ -165,31 +165,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // A build the clock already finished keeps the outcome it reached: stopping
             // is only possible while it is still in progress, and the run the clock owed it
-            // was performed above.
+            // was performed above. The stop itself is the store's
+            // (`crate::state::StoredBuild::stop`): it ends the build where it STANDS, so the
+            // phase that was in flight is the one carrying `STOPPED` and the phases the build
+            // had already finished keep the outcomes they reached.
             let now = crate::state::now_millis();
-            let mut stopped = None;
-            if !stored.build.build_complete {
-                stored.build.build_status = Some("STOPPED".to_string());
-                stored.build.current_phase = Some("COMPLETED".to_string());
-                stored.build.build_complete = true;
-                stored.build.end_time = Some(crate::state::datetime(now));
-                stored.build.phases =
-                    Some(crate::state::stopped_phases(stored.start_millis, now));
-                stopped = Some(stored.completed_build(
-                    // A build is keyed by `<projectName>:<uuid>`, so the project it belongs
-                    // to is known from the key even for a record that states none.
-                    &stored
-                        .build
-                        .project_name
-                        .clone()
-                        .or_else(|| {
-                            crate::state::project_name_from_resource_id(&input.id)
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_default(),
-                    now,
-                ));
-            }
+            // A build is keyed by `<projectName>:<uuid>`, so the project it belongs to is
+            // known from the key even for a record that states none.
+            let project_name = stored
+                .build
+                .project_name
+                .clone()
+                .or_else(|| {
+                    crate::state::project_name_from_resource_id(&input.id).map(str::to_string)
+                })
+                .unwrap_or_default();
+            let stopped = stored.stop(&project_name, now);
             (stored.build.clone(), stopped)
         };
         // The metrics this stopped build is counted in are published with the store's guard

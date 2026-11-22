@@ -134,6 +134,11 @@ const COMPLETED_PHASE: &str = "COMPLETED";
 /// build whose queue window ran out carries.
 const TIMED_OUT_PHASE_STATUS: &str = "TIMED_OUT";
 
+/// The `StatusType` a build the caller STOPPED reports, and the status carried by the one
+/// phase of it the stop interrupted (`StatusType`: SUCCEEDED, FAILED, FAULT, TIMED_OUT,
+/// IN_PROGRESS, STOPPED).
+pub const BUILD_STATUS_STOPPED: &str = "STOPPED";
+
 /// What one build's run came to, held while the build is still EXECUTING.
 ///
 /// A build's run is performed in process at the instant the build is admitted onto a
@@ -348,6 +353,61 @@ fn queue_timed_out_message(minutes: i32) -> String {
         "The build was not started within the queue timeout of {minutes} minutes, so AWS \
          CodeBuild ended it"
     )
+}
+
+/// The phases a build STOPPED while it was still in progress reports: the phases it had
+/// already finished, exactly as it had reported them, then the phase that was IN FLIGHT when
+/// the stop arrived — carrying [`BUILD_STATUS_STOPPED`] and closed at that instant — and
+/// then the terminal `COMPLETED` marker.
+///
+/// `timeline` is the phase sequence the build is going through (the windows its own run
+/// answered for a build that is executing, and the submitted/queued pair of one still
+/// waiting for a machine), and `stopped_millis` is the instant the stop arrived at on the
+/// BUILD's own clock, which is where that sequence is cut: a phase whose window had closed
+/// by then is reported as it stands, the phase the instant falls inside is the one that
+/// absorbed the stop, and every phase after it is work the build never attempted, so none of
+/// them is reported — the rule [`super::buildspec`] states for the phases after one that
+/// ended a build.
+fn stopped_phases(timeline: &[BuildPhase], stopped_millis: i64) -> Vec<BuildPhase> {
+    let mut phases: Vec<BuildPhase> = Vec::new();
+    for phase in timeline {
+        let Some(started) = phase.start_time.as_ref().and_then(|at| at.to_millis().ok()) else {
+            break;
+        };
+        if started > stopped_millis {
+            break;
+        }
+        let phase_type = phase.phase_type.as_deref().unwrap_or(QUEUED_PHASE);
+        // The terminal marker is not a phase a build can be stopped IN: a build that has
+        // reached it has ended, and an ended build keeps the outcome it reached.
+        if phase_type == COMPLETED_PHASE {
+            break;
+        }
+        let ended = phase.end_time.as_ref().and_then(|at| at.to_millis().ok());
+        if phase.phase_status.is_some() && ended.is_some_and(|ended| ended <= stopped_millis) {
+            phases.push(phase.clone());
+            continue;
+        }
+        // The phase the stop interrupted: it ran from where it began until the stop, and
+        // that span is the duration it reports.
+        phases.push(finished_phase(
+            phase_type,
+            BUILD_STATUS_STOPPED,
+            started,
+            stopped_millis.max(started),
+            None,
+        ));
+        break;
+    }
+    // `COMPLETED` opens where the stopped phase closed, so the phases a stopped build
+    // reports still partition its own window.
+    let ended_millis = phases
+        .last()
+        .and_then(|phase| phase.end_time.as_ref())
+        .and_then(|at| at.to_millis().ok())
+        .unwrap_or(stopped_millis);
+    phases.push(open_phase(COMPLETED_PHASE, ended_millis));
+    phases
 }
 
 /// The phases of a build that is still running: the ones whose window has CLOSED by
@@ -761,6 +821,42 @@ impl StoredBuild {
             minutes,
         ));
         self.completed_build(project_name, deadline_millis)
+    }
+
+    /// STOP this build where it stands: `buildComplete` true, `buildStatus`
+    /// [`BUILD_STATUS_STOPPED`] and `currentPhase` `COMPLETED`, with the phase that was in
+    /// flight carrying `STOPPED` and the phases it had already finished kept as they were
+    /// ([`stopped_phases`]).
+    ///
+    /// Where the build stands is read off its own clock: a build that is EXECUTING is as far
+    /// through its phases as the span it has been held for says ([`ExecutingRun`]), and one
+    /// still waiting for a machine stands at `now_millis`. That instant is where the stopped
+    /// phase ends, and it is the instant the build reports as its `endTime` — so the window
+    /// the record reports is the window the build really occupied, which is also the window
+    /// its machine was taken for ([`occupancy_end_millis`]).
+    ///
+    /// The run this build was holding is dropped: the record it would have become is what the
+    /// build would have reported had it been left alone. Answers the build this ended, for the
+    /// metrics it is metered by — `None` for a build that had already ended, whose outcome
+    /// stands.
+    pub fn stop(&mut self, project_name: &str, now_millis: i64) -> Option<CompletedBuild> {
+        if self.build.build_complete {
+            return None;
+        }
+        let stopped_millis = self
+            .executing
+            .as_ref()
+            .map_or(now_millis, |executing| executing.reported_millis(now_millis));
+        let timeline = match self.executing.take() {
+            Some(executing) => executing.finished.phases.unwrap_or_default(),
+            None => self.build.phases.clone().unwrap_or_default(),
+        };
+        self.build.build_status = Some(BUILD_STATUS_STOPPED.to_string());
+        self.build.current_phase = Some(COMPLETED_PHASE.to_string());
+        self.build.build_complete = true;
+        self.build.end_time = Some(datetime(stopped_millis));
+        self.build.phases = Some(stopped_phases(&timeline, stopped_millis));
+        Some(self.completed_build(project_name, stopped_millis))
     }
 
     /// What this build, now that it has ENDED, is metered by ([`build_metrics`]): the

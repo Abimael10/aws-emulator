@@ -3870,8 +3870,8 @@ fn ended_session_phases(
 }
 
 /// The phases of a sandbox session that ended before it was ever provisioned: the
-/// queue is the phase that takes the ending status, exactly as [`stopped_phases`]
-/// reports it for a build stopped while queued.
+/// queue is the phase that takes the ending status, exactly as a build stopped while it
+/// was still queued reports it ([`StoredBuild::stop`]).
 fn left_the_queue_session_phases(
     requested_millis: i64,
     ended_millis: i64,
@@ -3927,16 +3927,6 @@ pub fn in_progress_phases(start_millis: i64) -> Vec<BuildPhase> {
     vec![
         finished_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
         open_phase("QUEUED", start_millis),
-    ]
-}
-
-/// The phases of a build that was stopped while in progress: it leaves the queue
-/// with the same status the build took.
-pub fn stopped_phases(start_millis: i64, stopped_millis: i64) -> Vec<BuildPhase> {
-    vec![
-        finished_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
-        finished_phase("QUEUED", "STOPPED", start_millis, stopped_millis, None),
-        open_phase("COMPLETED", stopped_millis),
     ]
 }
 
@@ -4069,7 +4059,9 @@ fn terminal_batch_phases(
 
 /// The phases of a batch build that was stopped while it was still running: it
 /// leaves the phase it sat in with the same status the batch took, under
-/// [`stopped_phases`]' rule applied to `BuildBatchPhaseType`.
+/// [`StoredBuild::stop`]'s rule applied to `BuildBatchPhaseType` — a running batch
+/// reports `DOWNLOAD_BATCHSPEC` as the phase it is in, so that is the phase the stop
+/// is stamped on.
 pub fn stopped_batch_phases(start_millis: i64, stopped_millis: i64) -> Vec<BuildBatchPhase> {
     vec![
         finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),

@@ -4,24 +4,71 @@
 //! (`POST /` with `X-Amz-Target: CodeBuild_20161006.BatchDeleteBuilds` on awsJson1_1)
 //! through the harness in `project_build_lifecycle`.
 //!
-//! RULE under test: `BatchDeleteBuilds` answers for the state it LEAVES, so deleting is
-//! idempotent — it removes every build the request names, whatever status that build
-//! carries, and reports each named build exactly once in `buildsDeleted`, in the build-ARN
-//! form this service names a build by, whether or not a record was held under that id.
-//! `buildsNotDeleted` is "information about any builds that could not be successfully
-//! deleted", and nothing here cannot be deleted, so it is reported `[]`. A removed build
-//! is gone from every later read.
+//! RULE under test: `BatchDeleteBuilds` PARTITIONS the ids it is given on the state each
+//! build is in. A build that has reached a terminal state is removed and reported in
+//! `buildsDeleted`; a build that is still IN PROGRESS is withheld — it keeps running, and it
+//! is reported in `buildsNotDeleted` as a `BuildNotDeleted` carrying its identifier and a
+//! `statusCode` saying why — and the same call deletes it once it has ended. Both halves name
+//! a build in the build-ARN form this service names a build by, and each named build is
+//! reported exactly once. An id naming no build is reported deleted, because the state the
+//! caller asked for is the state the account is already in, which is what makes a repeated
+//! delete answer as the first one did. A removed build is gone from every later read.
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::project_build_lifecycle::{
-    call, create_project, emulator, error_type, expected_arn, start_build, PAST_THE_SETTLE_SPAN,
+    call, create_project, emulator, error_type, expected_arn, start_build,
 };
 
+/// How long a wait below gives the transition the clock owes a started build. Generous on
+/// purpose: the wait ends on the CONDITION, and the deadline is only there so a build that
+/// never ends fails the test instead of hanging it.
+const COMPLETE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a wait below leaves before looking again.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
+
+/// A buildspec whose `build` phase states it takes a minute, for the rows whose build has to
+/// still be RUNNING when the delete arrives.
+///
+/// Its commands are performed in process and spend none of the host's clock, so this is the
+/// time the build STATES it took; how soon its outcome may be READ is a shorter, compressed
+/// span, which is what makes a started build observably in progress at all.
+const RUNNING_BUILDSPEC: &str =
+    "version: 0.2\nphases:\n  build:\n    commands:\n      - sleep 60\n";
+
+/// Read one build back through `BatchGetBuilds`.
+async fn read_build(router: &MultiServiceRouter, id: &str) -> Value {
+    let (status, body) = call(router, "BatchGetBuilds", json!({"ids": [id]})).await;
+    assert_eq!(
+        status, 200,
+        "BatchGetBuilds {id:?}: expected 200, got {status} with {body}"
+    );
+    body["builds"][0].clone()
+}
+
+/// Look again at `id` until it reports itself complete — the state a build has to have
+/// reached before this operation deletes it rather than withholding it.
+async fn poll_until_complete(router: &MultiServiceRouter, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + COMPLETE_DEADLINE;
+    loop {
+        let build = read_build(router, id).await;
+        if build["buildComplete"] == json!(true) {
+            return build;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "build {id}: expected it to reach a terminal state, last read {build}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
 /// How a row leaves a build before the delete call: the three states a stored build
-/// can be in here — still inside its settle span, finished by the clock, or stopped by
-/// the caller.
+/// can be in here — still running, finished by the clock, or stopped by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Left {
     InProgress,
@@ -84,9 +131,10 @@ async fn set_up(router: &MultiServiceRouter, case: &Case) -> (Vec<String>, Vec<u
     let mut ids = vec![String::new(); case.builds.len()];
     let mut start_order = Vec::new();
 
-    // The builds the clock must have finished are started first and the settle span
-    // waited out once; the rest are started after it, so a single clock can leave
-    // different rows of one request in different states.
+    // The builds the clock must have finished are started first and waited for on the
+    // CONDITION they are waited for — their own records reporting themselves complete; the
+    // rest are started after that, so one clock can leave different rows of one request in
+    // different states.
     for (index, left) in case.builds.iter().enumerate() {
         if *left == Left::Settled {
             let build = start_build(router, json!({"projectName": case.project})).await;
@@ -94,14 +142,26 @@ async fn set_up(router: &MultiServiceRouter, case: &Case) -> (Vec<String>, Vec<u
             start_order.push(index);
         }
     }
-    if case.builds.contains(&Left::Settled) {
-        tokio::time::sleep(PAST_THE_SETTLE_SPAN).await;
+    for (index, left) in case.builds.iter().enumerate() {
+        if *left == Left::Settled {
+            poll_until_complete(router, &ids[index]).await;
+        }
     }
     for (index, left) in case.builds.iter().enumerate() {
         if *left == Left::Settled {
             continue;
         }
-        let build = start_build(router, json!({"projectName": case.project})).await;
+        // A build that must still be RUNNING when the delete arrives is started with a
+        // buildspec that states it takes a minute, so the row's state is the build's own
+        // and not a race against the span every build spends in the queue.
+        let mut request = json!({"projectName": case.project});
+        if let (Value::Object(target), Left::InProgress) = (&mut request, *left) {
+            target.insert(
+                "buildspecOverride".to_string(),
+                json!(RUNNING_BUILDSPEC),
+            );
+        }
+        let build = start_build(router, request).await;
         let id = build["id"].as_str().unwrap_or_default().to_string();
         if *left == Left::Stopped {
             let (status, body) = call(router, "StopBuild", json!({"id": id.clone()})).await;
@@ -182,16 +242,17 @@ fn deduped(items: &[String]) -> Vec<String> {
     out
 }
 
-/// RULE: every id the request names is removed and reported once in `buildsDeleted`, in
-/// the build-ARN form, whether or not a record was held under it, and `buildsNotDeleted`
-/// is `[]` because nothing here cannot be deleted. The table varies the build's status,
-/// the number of ids, the mix of held and unheld ids, the request order, a repeated id
-/// and the form the ids are sent in.
+/// RULE: the request is partitioned on the state each named build is in — a build in a
+/// terminal state is removed and reported once in `buildsDeleted`, a build still in progress
+/// is withheld and reported in `buildsNotDeleted`, and an id naming no build is reported
+/// deleted — with both halves naming a build by its ARN. The table varies the build's state,
+/// the number of ids, the mix of held and unheld ids, the request order, a repeated id and the
+/// form the ids are sent in.
 #[tokio::test]
-async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
+async fn batch_delete_builds_partitions_the_request_on_each_builds_state() {
     let cases: &[Case] = &[
         Case {
-            name: "one build still inside its settle span",
+            name: "one build that is still running",
             project: "del-in-progress",
             builds: &[Left::InProgress],
             named: &[0],
@@ -283,12 +344,31 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
         let router = emulator();
         let (started, start_order) = set_up(&router, case).await;
         let requested = requested_ids(case, &started);
-        // Every named build, once, in the form the answer reports it in.
-        let expected_deleted: Vec<String> =
-            deduped(&requested).iter().map(|id| deleted_form(id)).collect();
+        // Which named ids address a build that is still RUNNING: those are the ones the
+        // call has to withhold, and every other id — a build in a terminal state, and an id
+        // naming no build at all — is one it deletes.
+        let withheld = |sent: &String| -> bool {
+            started
+                .iter()
+                .position(|id| id.as_str() == addressed_id(sent))
+                .is_some_and(|index| case.builds[index] == Left::InProgress)
+        };
+        // Every named build the call deletes, once, in the form the answer reports it in.
+        let expected_deleted: Vec<String> = deduped(&requested)
+            .iter()
+            .filter(|sent| !withheld(sent))
+            .map(|id| deleted_form(id))
+            .collect();
+        // And the other half of the partition, in the same form and the same order.
+        let expected_withheld: Vec<String> = deduped(&requested)
+            .iter()
+            .filter(|sent| withheld(sent))
+            .map(|id| deleted_form(id))
+            .collect();
         // The builds the account held and this call removed, by store id.
         let gone: Vec<String> = deduped(&requested)
             .iter()
+            .filter(|sent| !withheld(sent))
             .map(|sent| addressed_id(sent).to_string())
             .filter(|id| started.contains(id))
             .collect();
@@ -315,8 +395,8 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             .unwrap_or_default();
         assert_eq!(
             deleted, expected_deleted,
-            "case {:?}: buildsDeleted must report each named id once, as a build ARN, in \
-             request order; got {body}",
+            "case {:?}: buildsDeleted must report each deletable named id once, as a build \
+             ARN, in request order; got {body}",
             case.name
         );
         for reported in &deleted {
@@ -327,14 +407,34 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             );
         }
 
-        // Nothing here cannot be deleted, so the other half of the partition is the
-        // empty list — stated, because `BuildsNotDeleted` carries no `@length`.
+        // The other half of the partition: one entry per build that was still running,
+        // naming it the same way and saying why it was not deleted. The member is always
+        // stated, `[]` when nothing was withheld, because `BuildsNotDeleted` carries no
+        // `@length`.
+        let not_deleted: Vec<Value> = body["buildsNotDeleted"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let not_deleted_ids: Vec<String> = not_deleted
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap_or_default().to_string())
+            .collect();
         assert_eq!(
-            body["buildsNotDeleted"],
-            json!([]),
-            "case {:?}: buildsNotDeleted is stated empty, got {body}",
+            not_deleted_ids, expected_withheld,
+            "case {:?}: buildsNotDeleted must report every build that was still running, by \
+             its ARN; got {body}",
             case.name
         );
+        for entry in &not_deleted {
+            assert!(
+                entry["statusCode"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty()),
+                "case {:?}: a withheld build states why it was not deleted, got {entry} in \
+                 {body}",
+                case.name
+            );
+        }
 
         // Every later read is computed from the store the delete wrote: the deleted
         // builds are gone and the survivors are untouched.
@@ -364,7 +464,8 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
         for id in &survivors {
             assert!(
                 reported.contains(id),
-                "case {:?}: {id} was not named, so it must still be readable; got {after}",
+                "case {:?}: {id} was withheld or never named, so it must still be readable; \
+                 got {after}",
                 case.name
             );
         }
@@ -416,6 +517,47 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             "case {:?}: the project must list only the builds that survived, newest first; got {listed}",
             case.name
         );
+
+        // A withheld build is not refused forever: it was left RUNNING by the call above,
+        // and the very same call deletes it once it has reached a terminal state.
+        if !expected_withheld.is_empty() {
+            let still_running: Vec<String> = started
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| case.builds[*index] == Left::InProgress)
+                .map(|(_, id)| id.clone())
+                .collect();
+            for id in &still_running {
+                poll_until_complete(&router, id).await;
+            }
+            let (status, again) = call(
+                &router,
+                "BatchDeleteBuilds",
+                json!({"ids": still_running.clone()}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the delete of the withheld builds: expected 200, got {status} \
+                 with {again}",
+                case.name
+            );
+            assert_eq!(
+                again["buildsDeleted"],
+                json!(still_running
+                    .iter()
+                    .map(|id| expected_arn(&format!("build/{id}")))
+                    .collect::<Vec<String>>()),
+                "case {:?}: a build that has ended is deletable by the same call; got {again}",
+                case.name
+            );
+            assert_eq!(
+                again["buildsNotDeleted"],
+                json!([]),
+                "case {:?}: nothing is withheld once every named build has ended; got {again}",
+                case.name
+            );
+        }
     }
 }
 
@@ -438,6 +580,11 @@ async fn deleting_a_build_neither_rewinds_the_build_number_nor_differs_when_repe
             "build {expected}: expected buildNumber {expected}, got {build}"
         );
         ids.push(build["id"].as_str().unwrap_or_default().to_string());
+    }
+    // Every one of them has to have ENDED before it can be deleted, so each is waited for
+    // on that condition.
+    for id in &ids {
+        poll_until_complete(&router, id).await;
     }
 
     let (status, body) = call(
@@ -530,6 +677,7 @@ async fn the_ids_list_is_held_to_its_declared_length_bounds() {
     create_project(&router, "del-bounds", json!({})).await;
     let build = start_build(&router, json!({"projectName": "del-bounds"})).await;
     let held = build["id"].as_str().unwrap_or_default().to_string();
+    poll_until_complete(&router, &held).await;
 
     // At the minimum: one id.
     let (status, body) = call(&router, "BatchDeleteBuilds", json!({"ids": [held.clone()]})).await;
@@ -546,6 +694,7 @@ async fn the_ids_list_is_held_to_its_declared_length_bounds() {
     // At the maximum: 100 ids, one of them held.
     let second = start_build(&router, json!({"projectName": "del-bounds"})).await;
     let second_id = second["id"].as_str().unwrap_or_default().to_string();
+    poll_until_complete(&router, &second_id).await;
     let mut at_max: Vec<String> = vec![second_id.clone()];
     while at_max.len() < 100 {
         at_max.push(unknown_id("del-bounds", at_max.len()));
