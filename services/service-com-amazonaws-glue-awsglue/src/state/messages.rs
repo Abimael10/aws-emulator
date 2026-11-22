@@ -1227,18 +1227,33 @@ pub const CONNECTION_NOT_FOUND_FOR_DELETE: &str = "Connection not found";
 /// recorded `CreateDatabase` duplicate does for its own resource.
 pub const CONNECTION_ALREADY_EXISTS: &str = "Connection already exists.";
 
-/// `TestConnection` of a connection whose `ConnectionType` is one of the LEGACY kinds
-/// ([`super::LEGACY_CONNECTION_TYPES`]) rather than a unified connection's.
+/// `TestConnection` carrying an INLINE `TestConnectionInput` whose `ConnectionType` is one of
+/// the LEGACY kinds ([`super::LEGACY_CONNECTION_TYPES`]) rather than a unified connection's.
 ///
 /// RECORDED constant, and the whole message: its SUBJECT is the operation the restriction is
 /// a restriction on, named as the API names it, and it states which connections that
 /// operation supports; nothing else of the request reaches it — not the type it was handed,
-/// not the connection addressed — so one wording answers every kind outside the unified
-/// surface. It carries no trailing period, as recorded. The refusal is a 400
-/// `ValidationException` — a class this operation's own `errors` list omits and the SERVICE
-/// models, so the handler widens that shape in rather than inventing one.
-pub const TEST_CONNECTION_UNIFIED_ONLY: &str =
+/// not the properties it carries. It has no trailing period, as recorded. The refusal is a
+/// 400 `ValidationException` — a class this operation's own `errors` list omits and the
+/// SERVICE models, so the handler widens that shape in rather than inventing one.
+///
+/// The service words this one restriction with TWO sentences, one per request form, so this
+/// constant answers the inline form only and
+/// [`TEST_CONNECTION_STORED_UNIFIED_ONLY`] answers a stored connection addressed by name.
+pub const TEST_CONNECTION_INPUT_UNIFIED_ONLY: &str =
     "TestConnection is only supported for the Unified Connections";
+
+/// `TestConnection` addressing a STORED connection by `ConnectionName` whose
+/// `ConnectionType` is one of the LEGACY kinds ([`super::LEGACY_CONNECTION_TYPES`]).
+///
+/// RECORDED constant, and the whole message: the same restriction as
+/// [`TEST_CONNECTION_INPUT_UNIFIED_ONLY`], worded with the GENERIC subject rather than the
+/// operation's name, and like it carrying nothing of the request — not the connection's name,
+/// not its type — and no trailing period. The refusal is the same 400 `ValidationException`,
+/// so the two forms are told apart by this sentence alone, which is why each form renders its
+/// own and neither can be served by the other's.
+pub const TEST_CONNECTION_STORED_UNIFIED_ONLY: &str =
+    "This operation is only supported for the Unified Connections";
 
 /// `TestConnection` whose inline `TestConnectionInput` states an `AuthenticationType`
 /// without the member its credentials live in

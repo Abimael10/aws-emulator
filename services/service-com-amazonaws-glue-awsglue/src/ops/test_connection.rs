@@ -11,7 +11,10 @@
 //! holds (`crate::state::connection_tests`): only a UNIFIED connection can be tested at
 //! all, and an inline configuration has to carry the credentials its `AuthenticationType`
 //! needs. The two refusals are deliberately different classes, so a caller can tell a
-//! restriction on the kind of connection from a field it left out.
+//! restriction on the kind of connection from a field it left out, and the restriction on the
+//! kind is worded by the form the definition under test arrived in — the operation's own name
+//! for an inline definition, the generic subject for a stored connection
+//! (`crate::state::messages`).
 //!
 //! Past both, the test is an attempt to reach the data source the definition points at. That
 //! source is outside this emulator, which opens no connection to anything outside itself —
@@ -225,12 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `@required`, so what is left to read is the authentication configuration.
             (None, Some(inline)) => {
                 // The restriction on the KIND is answered first: a connection the operation
-                // does not support is refused whatever its configuration carries.
+                // does not support is refused whatever its configuration carries. The
+                // sentence is the one this service words for a definition handed to the call
+                // inline, which names the operation the restriction is on.
                 if !crate::state::is_unified_connection_type(&inline.connection_type) {
                     return Err(TestConnectionErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(
-                                crate::state::messages::TEST_CONNECTION_UNIFIED_ONLY.to_string(),
+                                crate::state::messages::TEST_CONNECTION_INPUT_UNIFIED_ONLY
+                                    .to_string(),
                             ),
                         },
                     )
@@ -325,7 +331,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(TestConnectionErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(
-                                crate::state::messages::TEST_CONNECTION_UNIFIED_ONLY.to_string(),
+                                crate::state::messages::TEST_CONNECTION_STORED_UNIFIED_ONLY
+                                    .to_string(),
                             ),
                         },
                     )

@@ -9,8 +9,9 @@
 //! RULE under test: the operation tests ONE connection — the definition the request carries
 //! inline or the stored one its `ConnectionName` addresses, never both and never neither —
 //! and it supports only a UNIFIED connection, so a connection of one of the legacy kinds is
-//! refused with a `ValidationException` naming that restriction whichever form the definition
-//! arrived in. An inline definition is then read field by field: an `AuthenticationType` whose
+//! refused with a `ValidationException` stating that restriction whichever form the definition
+//! arrived in, in the sentence this service words for that form. An inline definition is then
+//! read field by field: an `AuthenticationType` whose
 //! credentials member is missing is the modelled `InvalidInputException` naming that member
 //! path — a DIFFERENT class from the restriction above, which is what lets a caller tell the
 //! two apart. A `ConnectionName` the addressed catalog holds nothing under is the same miss a
@@ -113,7 +114,7 @@ async fn a_test_of_a_legacy_connection_kind_is_refused_as_unsupported() {
         );
         assert_eq!(
             error_message(&body),
-            messages::TEST_CONNECTION_UNIFIED_ONLY,
+            messages::TEST_CONNECTION_INPUT_UNIFIED_ONLY,
             "case inline {connection_type}: expected the unified-only refusal, got {body}"
         );
     }
@@ -135,7 +136,7 @@ async fn a_test_of_a_legacy_connection_kind_is_refused_as_unsupported() {
         );
         assert_eq!(
             error_message(&body),
-            messages::TEST_CONNECTION_UNIFIED_ONLY,
+            messages::TEST_CONNECTION_STORED_UNIFIED_ONLY,
             "case stored {connection_type}: expected the unified-only refusal, got {body}"
         );
     }

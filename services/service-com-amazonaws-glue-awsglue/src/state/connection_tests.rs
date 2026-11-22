@@ -20,9 +20,11 @@ use super::*;
 /// connector, and the two view-validation kinds — and, beside them, the per-source connectors
 /// of the UNIFIED connection surface (`SALESFORCE`, `SERVICENOW`, `BIGQUERY`, `POSTGRESQL`,
 /// one per source). RECORDED behaviour: a test of a connection of a legacy kind is refused
-/// with [`messages::TEST_CONNECTION_UNIFIED_ONLY`] — "TestConnection is only supported for
-/// the Unified Connections" — which is a restriction on the KIND and so is read off this one
-/// list wherever the definition under test came from.
+/// with the unified-only `ValidationException`, which is a restriction on the KIND and so is
+/// read off this one list wherever the definition under test came from — while the SENTENCE
+/// it is reported with is the one the service words for that request form
+/// ([`messages::TEST_CONNECTION_INPUT_UNIFIED_ONLY`] for an inline definition,
+/// [`messages::TEST_CONNECTION_STORED_UNIFIED_ONLY`] for a stored connection).
 pub const LEGACY_CONNECTION_TYPES: [&str; 9] = [
     "JDBC",
     "SFTP",
