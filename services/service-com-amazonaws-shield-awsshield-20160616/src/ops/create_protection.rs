@@ -177,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateProtectionErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -189,6 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "Enables Shield Advanced for a specific Amazon Web Services resource": the ARN
+        // has to NAME one, and only the service that owns that resource can say whether it
+        // does, so it is resolved there ([`crate::state::target_resources`]) before
+        // anything about this account is consulted — a caller that sent a stale or wrong
+        // ARN is told about its ARN rather than about a subscription.
+        if let Some(message) =
+            crate::state::unresolvable_protected_resource(ctx, &input.resource_arn).await
+        {
+            return Err(CreateProtectionErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
         let now = ::std::time::SystemTime::now();

@@ -1513,6 +1513,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-elasticloadbalancing"
+version = "1.124.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd5d233b186f49a2c99163c62c868255f3a26285d5627ca5beb1ca0102154a19"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-elasticloadbalancingv2"
 version = "1.138.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1584,6 +1610,29 @@ dependencies = [
  "bytes",
  "fastrand",
  "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-globalaccelerator"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a6dc4f735d33bee958ae283e836a6e588a709bd926f9fb0deaf1522ac8f6667"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
  "regex-lite",
  "tracing",
 ]
@@ -20911,6 +20960,12 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudfront",
+ "aws-sdk-ec2",
+ "aws-sdk-elasticloadbalancing",
+ "aws-sdk-elasticloadbalancingv2",
+ "aws-sdk-globalaccelerator",
+ "aws-sdk-route53",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -20918,6 +20973,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

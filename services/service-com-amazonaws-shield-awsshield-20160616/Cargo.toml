@@ -24,6 +24,19 @@ tracing = { workspace = true }
 # Hex codec for the opaque `NextToken` ListProtections issues and parses back, and for
 # rendering the 36-character ProtectionId this service mints.
 hex = { workspace = true }
+# `arn`: the ONE reading of a caller-supplied resource ARN — which vendor and resource
+# type it addresses, and whether its Region field is a label an endpoint can be reached at.
+service-common = { path = "../common" }
+# `CreateProtection` resolves the resource its `ResourceArn` names against the service that
+# OWNS that resource, over the in-process callback: one client per protectable resource
+# class the model documents (an Elastic IP allocation, the two load balancer classes, a
+# CloudFront distribution, a Global Accelerator accelerator and a Route 53 hosted zone).
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-elasticloadbalancing = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-cloudfront = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-globalaccelerator = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-route53 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

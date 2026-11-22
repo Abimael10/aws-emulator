@@ -26,6 +26,12 @@ use crate::ops::types::{
     SubscriptionLimits, SummarizedCounter, Tag, PROTECTED_RESOURCE_TYPE_VALUES,
 };
 
+/// Whether the resource a protection is asked for exists at all — a fact the service that
+/// OWNS that resource holds rather than this one, so it is its own concern; its names are
+/// re-exported so every caller keeps reaching them through `crate::state`.
+pub mod target_resources;
+pub use target_resources::*;
+
 /// The `SubscriptionState` an account with a live Shield Advanced subscription is in.
 pub const SUBSCRIPTION_STATE_ACTIVE: &str = "ACTIVE";
 /// The `SubscriptionState` an account without a live subscription is in.
