@@ -185,24 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // RDS is regional: only the region the request was signed for is in scope. An
         // instance that has not finished being created is not reachable through log
-        // access at all — see the module docs. The two misses are worded the way the
-        // service words them: an instance that is there but not yet reachable names
-        // itself first, while an identifier this service holds no record of is reported as
-        // a name that resolves to nothing.
+        // access at all — see the module docs. Either miss is ONE error class, so both
+        // carry the single sentence this service words that class with, and an identifier
+        // that resolves to no instance is never served a list of another instance's files
+        // ([`crate::state::db_instance_not_found_message`]).
         let instance = match store.db_instances.get(&(region, identifier.clone())) {
             Some(instance) if instance.status != "creating" => instance,
-            Some(_) => {
+            _ => {
                 return Err(DescribeDBLogFilesErrorModeled::DBInstanceNotFoundFault(
                     DBInstanceNotFoundFault {
-                        message: Some(format!("DBInstance {identifier} not found.")),
-                    },
-                )
-                .into())
-            }
-            None => {
-                return Err(DescribeDBLogFilesErrorModeled::DBInstanceNotFoundFault(
-                    DBInstanceNotFoundFault {
-                        message: Some(format!("DBInstance not found: {identifier}")),
+                        message: Some(crate::state::db_instance_not_found_message(
+                            &input.db_instance_identifier,
+                        )),
                     },
                 )
                 .into())

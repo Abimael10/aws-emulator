@@ -138,8 +138,24 @@ pub(crate) async fn read_instance(
     router: &MultiServiceRouter,
     identifier: &str,
 ) -> (u16, String) {
-    call(
+    read_instance_in(router, REGION, identifier).await
+}
+
+/// [`read_instance`] against the region named, for a loop that polls an instance of a
+/// region other than [`REGION`] — Amazon RDS is regional, so WHICH region a report is
+/// signed for is part of what it reads.
+///
+/// `pub(crate)` for the same reason [`read_instance`] is, and a function rather than a
+/// closure body so the future it answers OWNS the parameters it was built from and a poll
+/// loop can call it again.
+pub(crate) async fn read_instance_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+) -> (u16, String) {
+    call_in(
         router,
+        region,
         "DescribeDBInstances",
         &params!["DBInstanceIdentifier" => identifier],
     )

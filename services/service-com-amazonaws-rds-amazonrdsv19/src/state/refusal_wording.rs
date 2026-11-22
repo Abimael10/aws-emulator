@@ -197,6 +197,22 @@ pub fn db_cluster_backtrack_not_found_message(named: &str) -> String {
     format!("DBClusterBacktrack {named} not found.")
 }
 
+/// The message a `DBInstanceNotFoundFault` carries where a call RESOLVES a DB instance it
+/// reads something out of and the identifier names none: the `<resource type> <id> not
+/// found.` wording this front door answers a named resource it cannot resolve with, the
+/// same form a DB cluster's ([`db_cluster_not_found_message`]) and a DB shard group's
+/// ([`db_shard_group_not_found_message`]) take.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to, so a caller
+/// matching the message against what it sent finds it there.
+///
+/// One reader for the sentence, so the reads that resolve an instance cannot drift from each
+/// other — nor word one miss of the class differently from another, which an identifier that
+/// names nothing and one whose instance is not reachable yet both are.
+pub fn db_instance_not_found_message(named: &str) -> String {
+    format!("DBInstance {named} not found.")
+}
+
 /// What `RebootDBCluster` refuses an AURORA DB cluster with.
 ///
 /// "Use this operation only for a non-Aurora Multi-AZ DB cluster": Amazon RDS words this
