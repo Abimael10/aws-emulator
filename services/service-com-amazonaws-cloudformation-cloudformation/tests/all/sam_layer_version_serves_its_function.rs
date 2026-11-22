@@ -220,7 +220,11 @@ fn template(row: &Row) -> String {
 /// Every transition this store owes is pulled into the past and an ordinary read materialises
 /// it, so the loop waits for the CONDITION — a settled status — rather than for a span of the
 /// clock.
-async fn settled(
+///
+/// `pub(crate)` because the sibling suite that drives a RETAINED version into a later stack's
+/// function (`retained_layer_version_serves_a_later_stack.rs`) waits for each of its stacks
+/// through this one spelling of the wait rather than a copy of it.
+pub(crate) async fn settled(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
