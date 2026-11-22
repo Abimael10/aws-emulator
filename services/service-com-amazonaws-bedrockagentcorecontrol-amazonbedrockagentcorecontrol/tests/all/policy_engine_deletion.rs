@@ -21,6 +21,10 @@
 //! The rows differ along what the rule generalises over: the shape and the length of the
 //! engine's name, whether a description and an encryption key are supplied, and whether the
 //! engine is still `CREATING` or already `ACTIVE` when the deletion arrives.
+//!
+//! The request harness and the refusal wording below are `pub` because the
+//! `policy_engine_deletion_scope` suite drives the same operations with them: one copy, so
+//! two suites cannot drift apart over how a request is signed or how a missing engine reads.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +44,7 @@ const REGION: &str = "us-east-1";
 const POLL_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-fn router() -> MultiServiceRouter {
+pub fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
@@ -56,9 +60,9 @@ fn authorization() -> String {
 }
 
 /// One answer: the HTTP status and the parsed body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub struct Answer {
+    pub status: u16,
+    pub body: Value,
 }
 
 async fn send(
@@ -91,7 +95,7 @@ async fn send(
 }
 
 /// The error code `restJson1` puts in the body's `__type`.
-fn error_code(body: &Value) -> String {
+pub fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -101,22 +105,22 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn text(body: &Value, member: &str) -> String {
+pub fn text(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
 }
 
-async fn create_policy_engine(router: &MultiServiceRouter, body: &Value) -> Answer {
+pub async fn create_policy_engine(router: &MultiServiceRouter, body: &Value) -> Answer {
     send(router, "POST", "/policy-engines", Some(body)).await
 }
 
-async fn get_policy_engine(router: &MultiServiceRouter, policy_engine: &str) -> Answer {
+pub async fn get_policy_engine(router: &MultiServiceRouter, policy_engine: &str) -> Answer {
     send(router, "GET", &format!("/policy-engines/{policy_engine}"), None).await
 }
 
-async fn delete_policy_engine(router: &MultiServiceRouter, policy_engine: &str) -> Answer {
+pub async fn delete_policy_engine(router: &MultiServiceRouter, policy_engine: &str) -> Answer {
     send(
         router,
         "DELETE",
@@ -126,7 +130,11 @@ async fn delete_policy_engine(router: &MultiServiceRouter, policy_engine: &str) 
     .await
 }
 
-async fn create_policy(router: &MultiServiceRouter, policy_engine: &str, body: &Value) -> Answer {
+pub async fn create_policy(
+    router: &MultiServiceRouter,
+    policy_engine: &str,
+    body: &Value,
+) -> Answer {
     send(
         router,
         "POST",
@@ -136,7 +144,7 @@ async fn create_policy(router: &MultiServiceRouter, policy_engine: &str, body: &
     .await
 }
 
-async fn get_policy(router: &MultiServiceRouter, policy_engine: &str, policy: &str) -> Answer {
+pub async fn get_policy(router: &MultiServiceRouter, policy_engine: &str, policy: &str) -> Answer {
     send(
         router,
         "GET",
@@ -159,7 +167,7 @@ async fn delete_policy(router: &MultiServiceRouter, policy_engine: &str, policy:
 /// Look at `GET /policy-engines/{id}` again until `accept` holds for the answer, and report
 /// that answer. The wait is on the CONDITION the clock owes, bounded by a generous
 /// deadline, so nothing here depends on how fast the host runs.
-async fn poll_policy_engine_until(
+pub async fn poll_policy_engine_until(
     router: &MultiServiceRouter,
     policy_engine: &str,
     case: &str,
@@ -184,7 +192,7 @@ async fn poll_policy_engine_until(
 
 /// A Cedar definition: `CedarPolicy$statement` is 35..10000 characters
 /// (`smithy_query(query="shape",shape="CedarPolicy")`).
-fn cedar_definition(action: &str) -> Value {
+pub fn cedar_definition(action: &str) -> Value {
     json!({"cedar": {
         "statement": format!("permit(principal, action == Action::\"{action}\", resource);"),
     }})
@@ -193,7 +201,7 @@ fn cedar_definition(action: &str) -> Value {
 /// The sentence this service refuses with when the path names no policy engine of this
 /// account. The fixed text is the service's; the only variable part is the id the path
 /// carried.
-fn engine_not_found_message(policy_engine_id: &str) -> String {
+pub fn engine_not_found_message(policy_engine_id: &str) -> String {
     format!("Policy engine with ID {policy_engine_id} not found")
 }
 
