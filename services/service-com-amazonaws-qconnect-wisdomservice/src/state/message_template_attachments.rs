@@ -31,6 +31,13 @@ pub const CONTENT_DISPOSITION_ATTACHMENT: &str = "ATTACHMENT";
 /// hold, worded as this endpoint words the other not-found resources of this family
 /// ([`MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND`]), with the resource token spelled as the API
 /// itself names the resource.
+///
+/// `DeleteMessageTemplateAttachment` carries it in the CONFLICT class rather than the
+/// not-found one: the message template the route names exists, and it is the state that
+/// template is in — holding no file under the id — that the request cannot be processed
+/// against, which is what `ConflictException` states ("The request could not be processed
+/// because of conflict in the current state of the resource",
+/// `smithy_query(query="shape",shape="ConflictException")`).
 pub const MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_NOT_FOUND: &str =
     "Message template attachment does not exist.";
 
@@ -254,6 +261,22 @@ impl MessageTemplate {
             .find(|attachment| attachment.attachment_id == attachment_id)
     }
 
+    /// Remove the attachment this template's working copy holds under `attachment_id`,
+    /// answering whether it held one at all.
+    ///
+    /// `DeleteMessageTemplateAttachment` deletes the file "from the Amazon Q in Connect
+    /// message template that is referenced by $LATEST qualifier"
+    /// (`smithy_query(query="doc",shape="DeleteMessageTemplateAttachment")`), so this
+    /// reaches the working copy ALONE: a version's snapshot is a separate record and keeps
+    /// the attachments it was published with. The remaining attachments keep the order they
+    /// were uploaded in, which is the order every read reports them in.
+    pub fn remove_attachment(&mut self, attachment_id: &str) -> bool {
+        let before = self.attachments.len();
+        self.attachments
+            .retain(|attachment| attachment.attachment_id != attachment_id);
+        self.attachments.len() != before
+    }
+
     /// Whether this template's working copy already holds an attachment under `name`.
     ///
     /// The operation's own documentation states the rule — "The name of the message
@@ -317,6 +340,32 @@ impl ComAmazonawsQconnectWisdomserviceState {
     ) -> Option<&MessageTemplateAttachmentFile> {
         self.message_template(knowledge_base_id, message_template_id)?
             .attachment(attachment_id)
+    }
+
+    /// The attachment file one `attachmentId` names in ANY record this store holds of that
+    /// message template: its working copy, or a version it published.
+    ///
+    /// What the DOWNLOAD plane resolves a published locator through.
+    /// `DeleteMessageTemplateAttachment` removes a file from the working copy alone and
+    /// states that "attachments on available message template versions will remain
+    /// unchanged" (`smithy_query(query="doc",shape="DeleteMessageTemplateAttachment")`), so
+    /// a file a published snapshot still carries is still a file this store holds and its
+    /// locator still serves it. The working copy is preferred, so while both records carry
+    /// the id the current file is what is served.
+    pub fn stored_message_template_attachment(
+        &self,
+        knowledge_base_id: &str,
+        message_template_id: &str,
+        attachment_id: &str,
+    ) -> Option<&MessageTemplateAttachmentFile> {
+        // The template is reached through the knowledge base the locator names first: a
+        // snapshot is reachable only through the template that published it.
+        let message_template = self.message_template(knowledge_base_id, message_template_id)?;
+        message_template.attachment(attachment_id).or_else(|| {
+            self.message_template_versions_of(message_template_id)
+                .iter()
+                .find_map(|version| version.snapshot.attachment(attachment_id))
+        })
     }
 
     /// The attachment bytes this store holds across every message template — what the

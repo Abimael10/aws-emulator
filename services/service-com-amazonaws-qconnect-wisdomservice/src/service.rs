@@ -397,7 +397,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 
     /// Whether this request FOLLOWS an attachment URL this service handed out: its path is
-    /// one the attachment plane publishes and it names an attachment THIS store holds.
+    /// one the attachment plane publishes and it names an attachment THIS store holds — on
+    /// the template's working copy or in a version it published, which is every record a
+    /// locator this service handed out can still address.
     ///
     /// The same rule as [`Self::holds_content_upload`], and for the same reason: the
     /// minted attachment id in the path is the receipt, so exactly the view that handed
@@ -413,7 +415,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
         let message_template_id = crate::state::resolve_id(&target.message_template_label);
         store
-            .message_template_attachment(
+            .stored_message_template_attachment(
                 knowledge_base_id,
                 message_template_id,
                 &target.attachment_id,
@@ -428,7 +430,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// changes nothing — and is refused when the attachment's `urlExpiry` has passed. The
     /// attachment, the template that holds it and the knowledge base that holds the
     /// template must all agree: a path that crosses one template with another's attachment
-    /// names nothing.
+    /// names nothing. A file only a published version still carries is served too, since
+    /// `DeleteMessageTemplateAttachment` leaves every published version's attachments as
+    /// they were.
     fn serve_message_template_attachment(
         &self,
         req: &RtRequest,
@@ -452,7 +456,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let store = state.lock();
         let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
         let message_template_id = crate::state::resolve_id(&target.message_template_label);
-        let Some(attachment) = store.message_template_attachment(
+        let Some(attachment) = store.stored_message_template_attachment(
             knowledge_base_id,
             message_template_id,
             &target.attachment_id,
