@@ -592,7 +592,9 @@ pub fn legacy_operands(condition: &Condition) -> &[AttributeValue] {
 }
 
 /// The comparator whose operand count the REQUEST chooses, which is the one a read
-/// indexes before it walks any item ([`LegacyMembership`]).
+/// indexes before it walks any item ([`LegacyMembership`]) — and the word the expression
+/// language spells that same membership test with, which is what its refusals name
+/// ([`non_distinct_operands`]).
 pub(super) const IN_OPERATOR: &str = "IN";
 
 /// The membership tests of one legacy condition map, indexed ONCE per request.

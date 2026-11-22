@@ -398,6 +398,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let consistent_read = requested_keys.consistent_read.unwrap_or(false);
             let table = store.active_table_mut(&region, &name, now).map_err(lift)?;
+            // The one rule about this entry's PROJECTION that the table settles: a key
+            // attribute is declared as a scalar, so a path that reaches inside one
+            // addresses no location this table can hold
+            // ([`crate::state::check_scalar_key_paths`]). Every rule about the
+            // projection's own text was settled above, before any table was looked up.
+            if let Some(projected) = projections.get(table_name) {
+                crate::state::check_scalar_key_paths(table, projected).map_err(lift)?;
+            }
             // A table the policies in force do not let this caller read answers the
             // denial, not its items — decided against the partitions these keys address
             // and the attributes this entry asks for.

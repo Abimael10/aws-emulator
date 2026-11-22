@@ -129,6 +129,21 @@ pub enum Selection {
     Count,
 }
 
+impl Selection {
+    /// The document paths this read REPORTS by, or none at all for a read that reports
+    /// whole items or only a count.
+    ///
+    /// What they are for: the paths of a projection are held to the addressed table's key
+    /// schema once it is resolved ([`check_scalar_key_paths`]), which is the one path rule
+    /// that cannot be settled where the member is read.
+    pub fn projected_paths(&self) -> &[DocumentPath] {
+        match self {
+            Self::Specific(paths) => paths,
+            Self::AllAttributes | Self::AllProjected | Self::Count => &[],
+        }
+    }
+}
+
 /// How a refusal of the `Select`/projection pair names what was asked for: `COUNT`
 /// "returns the number of matching items, rather than the matching items themselves"
 /// (`Query$Select`), which AWS's sentence words as the count itself; every other value

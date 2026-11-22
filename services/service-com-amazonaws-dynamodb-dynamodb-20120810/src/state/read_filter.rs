@@ -18,8 +18,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ops::types::Condition;
 use crate::state::{
-    check_legacy_conditions, expression_conflict, legacy_conditions_match, Item, LegacyMembership,
-    ParsedCondition, RequestError, Substitutions,
+    check_legacy_conditions, expression_conflict, legacy_conditions_match, DocumentPath, Item,
+    LegacyMembership, ParsedCondition, RequestError, Substitutions,
 };
 
 /// The member a `FilterExpression` arrives in, which is what its refusals name.
@@ -181,6 +181,20 @@ impl<'a> ReadFilter<'a> {
             Self::Unfiltered => BTreeSet::new(),
             Self::Expression(condition) => condition.attribute_reads().into_keys().collect(),
             Self::Legacy { conditions, .. } => conditions.keys().cloned().collect(),
+        }
+    }
+
+    /// Every document path this filter addresses, which is what the addressed table's key
+    /// schema holds the filter to once it is resolved
+    /// ([`crate::state::check_scalar_key_paths`]).
+    ///
+    /// A LEGACY filter map addresses no paths: its keys are attribute NAMES — "the name of
+    /// an attribute" is what one entry is keyed by — so no entry of it can reach inside an
+    /// attribute at all.
+    pub fn document_paths(&self) -> Vec<&DocumentPath> {
+        match self {
+            Self::Unfiltered | Self::Legacy { .. } => Vec::new(),
+            Self::Expression(condition) => condition.document_paths(),
         }
     }
 }

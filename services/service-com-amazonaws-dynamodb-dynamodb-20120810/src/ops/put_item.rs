@@ -507,6 +507,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // fault is reported and NOTHING is written
             // ([`crate::state::check_table_key_accessible`]).
             crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
+            // The one fact of this write's CONDITION that the table settles: a key
+            // attribute is declared as a scalar, so a path reaching inside one addresses no
+            // location this table can hold
+            // ([`crate::state::check_scalar_condition_key_paths`]). Every rule about the
+            // condition's own text was settled before the lookup.
+            crate::state::check_scalar_condition_key_paths(
+                input.condition_expression.as_deref(),
+                substitutions,
+                table,
+            )
+            .map_err(lift)?;
             // The key attributes are bounded by the documented key-value limits, for
             // this table's own key schema (inside `key_of_item`) and for every index
             // key the item would be projected into — which is also where an index key

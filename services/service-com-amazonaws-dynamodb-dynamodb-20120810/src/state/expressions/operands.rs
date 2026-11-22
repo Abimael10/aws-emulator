@@ -119,41 +119,54 @@ pub(super) fn check_operand_kind(
     }
 }
 
-/// Hold `contains` to the one rule the reference states about its operands beyond the kind
-/// each position takes: "contains (path, operand) ... The path and the operand must be
+/// Whether ONE operator or function breaks the rule that its first operand is distinct
+/// from the remaining ones — the first operand, when it does — the rule the reference
+/// states of `contains`: "contains (path, operand) ... The path and the operand must be
 /// distinct; for example, contains (a, a) returns an error" (the `ConditionExpression`
 /// function reference).
 ///
-/// A call whose operand reads the very location the first operand searches asks whether a
-/// value holds itself, which selects every item carrying the attribute whatever it holds,
-/// so the doc makes it the caller's mistake rather than a condition. AWS states the rule
-/// over the OPERATOR and the first operand, rendered as the token list its refusals print a
-/// document path as ([`DocumentPath::render_tokens`]). Two DIFFERENT locations are compared,
-/// so that call is read against the item like any other.
+/// An operand that reads the very location the first operand reads asks whether a value
+/// relates to ITSELF, which is settled by the expression's own text rather than by any
+/// item: `=` holds for every item carrying the attribute, `<` for none, and `contains` for
+/// every item whose collection holds its own value. AWS states that as one rule over every
+/// OPERATOR AND FUNCTION that takes a first operand and remaining ones — the sentence
+/// names "this operator or function" — so each of them is read for it where its operands
+/// are read.
 ///
 /// The rule is about two operands naming ONE LOCATION, so it is asked only where both of
-/// them name one: a call searching a collection the request carried has no path to be
-/// distinct from, and the values it compares are the request's own rather than the same
-/// attribute read twice.
-pub(super) fn check_contains_operands(
-    member: &str,
-    searched: &Operand,
-    operand: &Operand,
-) -> Result<(), RequestError> {
-    let Operand::Path(path) = searched else {
-        return Ok(());
+/// them name one: a literal the request carried has no path to be distinct from, and the
+/// values it compares are the request's own rather than one attribute read twice.
+///
+/// The defect is REPORTED once the whole expression has parsed
+/// ([`ExprParser::check_distinct_first_operands`]), beside the other rules about an
+/// expression AWS states only of text its grammar accepts.
+pub(super) fn non_distinct_first_operand<'o>(
+    first: &'o Operand,
+    rest: &[&Operand],
+) -> Option<&'o DocumentPath> {
+    let Operand::Path(path) = first else {
+        return None;
     };
-    if matches!(operand, Operand::Path(other) if other == path) {
-        return Err(invalid_expression_member(
-            member,
-            &format!(
-                "The first operand must be distinct from the remaining operands for this \
-                 operator or function; operator: contains, first operand: {}",
-                path.render_tokens()
-            ),
-        ));
-    }
-    Ok(())
+    rest.iter()
+        .any(|operand| matches!(operand, Operand::Path(other) if other == path))
+        .then_some(path)
+}
+
+/// How that defect is refused: the operator or function as the EXPRESSION writes it, and
+/// the first operand rendered as the token list AWS's refusals print a document path as
+/// ([`DocumentPath::render_tokens`]).
+pub(super) fn non_distinct_operands(
+    member: &str,
+    operator: &str,
+    first_operand: &str,
+) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "The first operand must be distinct from the remaining operands for this operator \
+             or function; operator: {operator}, first operand: {first_operand}"
+        ),
+    )
 }
 
 /// Hold one operand of an ORDERING comparison to the types DynamoDB orders, where the

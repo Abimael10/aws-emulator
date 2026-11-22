@@ -281,6 +281,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map_err(lift)?;
             }
             let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // The one rule about this element's PROJECTION that the table settles: a key
+            // attribute is declared as a scalar, so a path that reaches inside one
+            // addresses no location this table can hold
+            // ([`crate::state::check_scalar_key_paths`]). Every rule about the
+            // projection's own text was settled above, before any table was looked up.
+            crate::state::check_scalar_key_paths(table, projected.iter().flatten())
+                .map_err(lift)?;
             // A table the policies in force do not let this caller read answers the
             // denial, not its items: a transactional get performs `dynamodb:GetItem`,
             // decided against the partition this get addresses and the attributes it asks

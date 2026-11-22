@@ -487,6 +487,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
+        // The one rule about the paths this scan names that the table settles: a key
+        // attribute is declared as a scalar, so a path that reaches inside one addresses
+        // no location this table can hold ([`crate::state::check_scalar_key_paths`]).
+        // Asked of the projection and of the filter, the two members this scan addresses
+        // document paths through, before anything else is decided about them.
+        crate::state::check_scalar_key_paths(table, selection.projected_paths()).map_err(lift)?;
+        crate::state::check_scalar_key_paths(table, filter.document_paths()).map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
         // not its items: it is decided before anything is read. A scan addresses no
         // partition of its own, and asks for the attributes its selection names. A scan

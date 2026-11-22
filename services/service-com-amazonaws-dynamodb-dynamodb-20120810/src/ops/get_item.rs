@@ -286,6 +286,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let (item, size) = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // The one rule about this read's PROJECTION that the table settles: a key
+            // attribute is declared as a scalar, so a path that reaches inside one
+            // addresses no location this table can hold
+            // ([`crate::state::check_scalar_key_paths`]). Asked here, where the table's key
+            // schema is in hand, while every rule about the projection's own text was
+            // settled before the lookup — and before the decisions below, because a
+            // request whose projection addresses nothing is the malformed request it is
+            // whoever sent it.
+            crate::state::check_scalar_key_paths(table, projected.iter().flatten())
+                .map_err(lift)?;
             // A table the policies in force do not let this caller read answers the
             // denial, not the item: it is decided before anything is read, against the
             // partition this read addresses and the attributes it asks for.

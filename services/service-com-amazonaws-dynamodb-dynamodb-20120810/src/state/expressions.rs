@@ -13,6 +13,8 @@
 
 use super::*;
 use std::collections::HashSet;
+mod key_paths;
+pub use key_paths::*;
 mod operands;
 pub use operands::*;
 mod request_shape;
@@ -536,8 +538,60 @@ fn reserved_attribute_name(member: &str, word: &str) -> RequestError {
 /// The refusal for a pair of parentheses that groups what is already grouped: fixed text
 /// with no variable part — the sentence names neither the position of the pair nor the
 /// expression, because the whole expression is the mistake.
-fn redundant_parentheses(member: &str) -> RequestError {
+pub fn redundant_parentheses(member: &str) -> RequestError {
     invalid_expression_member(member, "The expression has redundant parentheses;")
+}
+
+/// One token of an expression, as the REDUNDANT-PARENTHESIS rule reads it
+/// ([`states_redundant_parentheses`]): the rule is about grouping alone, so every token
+/// that neither opens nor closes a group is the same token to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupToken {
+    Open,
+    Close,
+    Other,
+}
+
+/// Whether a token stream holds a pair of parentheses that groups what is already
+/// grouped.
+///
+/// A pair that wraps nothing but another pair states nothing about how the expression is
+/// read, and DynamoDB refuses it rather than reading past it. Stated over the GROUPING
+/// alone, so the condition and filter grammar and the `KeyConditionExpression` grammar —
+/// which tokenize their own text and share no parser — are held to one reading of the rule
+/// rather than two.
+///
+/// The parentheses of a function CALL carry its arguments and are never redundant, which
+/// the walk gets for free: a call's `(` follows the word that names it, so the group it
+/// opens does not begin where the group around it begins.
+pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
+    // The index of the `(` each `)` closes, filled in as the walk closes each group, so
+    // the group that ends just before a `)` is known when that `)` is reached.
+    let mut opened_by: Vec<Option<usize>> = vec![None; tokens.len()];
+    let mut open_groups: Vec<usize> = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        match token {
+            GroupToken::Open => open_groups.push(at),
+            GroupToken::Close => {
+                // A `)` closing nothing is unbalanced, which the grammar states on its
+                // own: there is no group here to call redundant.
+                let Some(open) = open_groups.pop() else {
+                    return false;
+                };
+                opened_by[at] = Some(open);
+                // This group's content is exactly one group of its own: it begins where
+                // that group begins and ends where it ends.
+                if at > 0
+                    && matches!(tokens.get(at - 1), Some(GroupToken::Close))
+                    && opened_by[at - 1] == Some(open + 1)
+                {
+                    return true;
+                }
+            }
+            GroupToken::Other => {}
+        }
+    }
+    false
 }
 
 /// The refusal for a function name the expression languages do not have.
@@ -755,12 +809,6 @@ pub fn tokenize_expression_spanned(
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
     while at < characters.len() {
-        if tokens.len() >= MAX_EXPRESSION_TOKENS {
-            return Err(RequestError::Validation(expression_clause(
-                member,
-                &format!("an expression may hold at most {MAX_EXPRESSION_TOKENS} tokens"),
-            )));
-        }
         let character = characters[at];
         let opened = tokens.len();
         let start = at;
@@ -861,9 +909,22 @@ pub fn tokenize_expression_spanned(
     // How much the expression ASKS FOR, as the documented quota counts it: the operators and
     // functions it states ([`MAX_EXPRESSION_OPERATORS`]). Held here, where every expression
     // member is read, and before any of them is parsed — the count is a fact of the text.
+    //
+    // It is read off the WHOLE token stream, and so before this emulator's own ceiling on
+    // how many tokens it keeps: the operator quota is the documented rule a caller is
+    // answered by, and it REPORTS the count the expression stated, which an expression cut
+    // short at the ceiling could not say. The walk above is bounded whatever the ceiling is
+    // — a token costs at least one character of a text already held to
+    // [`MAX_EXPRESSION_BYTES`] — so nothing unbounded is read to count them.
     let operators = stated_operators(&tokens);
     if operators > MAX_EXPRESSION_OPERATORS {
         return Err(too_many_expression_operators(member, operators));
+    }
+    if tokens.len() > MAX_EXPRESSION_TOKENS {
+        return Err(RequestError::Validation(expression_clause(
+            member,
+            &format!("an expression may hold at most {MAX_EXPRESSION_TOKENS} tokens"),
+        )));
     }
     Ok(TokenizedExpression {
         tokens,
@@ -1898,6 +1959,25 @@ fn overlapping_paths(member: &str, one: &str, two: &str) -> RequestError {
     )
 }
 
+/// The refusal for two document paths that disagree about the KIND of container one
+/// location is: one steps into it by NAME and the other by INDEX.
+///
+/// A map lookup reads a map and a list index reads a list, so two paths that step through
+/// the same location in both ways cannot both be about one item — the location is a map or
+/// a list and not both — and DynamoDB refuses the pair rather than reading one of them
+/// against a value of the other kind. The two paths are stated WHOLE and in the order the
+/// expression states them, exactly as the overlap sentence beside this one states them
+/// ([`overlapping_paths`]).
+fn conflicting_paths(member: &str, one: &str, two: &str) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "Two document paths conflict with each other; must remove or rewrite one of these \
+             paths; path one: {one}, path two: {two}"
+        ),
+    )
+}
+
 /// Refuse a list of document paths in which one path addresses a location inside — or
 /// the same as — another's, in the order the expression stated them.
 ///
@@ -1908,6 +1988,10 @@ fn overlapping_paths(member: &str, one: &str, two: &str) -> RequestError {
 /// exactly when one is a step-prefix of the other, so each path only has to look its own
 /// prefixes up. The index keeps each path's POSITION in the expression, because that is
 /// what orders the two paths in the refusal ([`overlapping_paths`]).
+///
+/// Two paths that are neither one inside the other can still DISAGREE about one location,
+/// where they step through it in two ways — a name step into a map and an index step into
+/// a list — which is the second rule a pair of paths is held to ([`check_paths_agree`]).
 pub(super) fn check_paths_disjoint(
     member: &'static str,
     paths: &[&DocumentPath],
@@ -1935,6 +2019,41 @@ pub(super) fn check_paths_disjoint(
                     (whole, prefix)
                 };
                 return Err(overlapping_paths(member, &one, &two));
+            }
+        }
+    }
+    check_paths_agree(member, paths)
+}
+
+/// Refuse a list of document paths two of which step through ONE location in two
+/// different ways: by attribute name, which reads a map, and by index, which reads a list.
+///
+/// The paths are indexed by the location each step reaches rather than compared pairwise:
+/// the prefix of steps BEFORE a step is the location that step reads, so a location two
+/// paths disagree about is found by keeping, per prefix, the kind of the step the first
+/// path took from it ([`conflicting_paths`] states the pair). Each path contributes at most
+/// one entry per step, and a path carries at most [`MAX_ATTRIBUTE_DEPTH`] steps.
+fn check_paths_agree(member: &'static str, paths: &[&DocumentPath]) -> Result<(), RequestError> {
+    // Per location — the steps that lead to it — the first path that stepped from it, and
+    // whether it stepped by INDEX. The path stated EARLIER in the expression is `path one`,
+    // which is the one kept here.
+    let mut stepped: BTreeMap<&[PathStep], (&DocumentPath, bool)> = BTreeMap::new();
+    for path in paths {
+        for (steps, step) in path.0.iter().enumerate() {
+            let indexed = matches!(step, PathStep::Index(_));
+            let reached = &path.0[..steps];
+            match stepped.get(reached) {
+                Some((first, stepped_indexed)) if *stepped_indexed != indexed => {
+                    return Err(conflicting_paths(
+                        member,
+                        &first.render_tokens(),
+                        &path.render_tokens(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    stepped.insert(reached, (path, indexed));
+                }
             }
         }
     }
@@ -2470,8 +2589,9 @@ impl ParsedCondition {
         if !parser.at_end() {
             return Err(parser.syntax());
         }
-        parser.check_no_reserved_name()?;
         parser.check_no_redundant_parentheses()?;
+        parser.check_distinct_first_operands()?;
+        parser.check_no_reserved_name()?;
         Ok(Self { node })
     }
 
@@ -3285,6 +3405,10 @@ pub(crate) struct ExprParser<'a> {
     /// The first word a name position held that is one of DynamoDB's reserved words,
     /// kept rather than refused on the spot — see [`Self::check_no_reserved_name`].
     reserved: Option<String>,
+    /// The first operator or function whose first operand is not distinct from the rest,
+    /// as the operator the expression wrote and that operand rendered — kept rather than
+    /// refused on the spot, see [`Self::check_distinct_first_operands`].
+    non_distinct: Option<(String, String)>,
     /// The expression's own characters and the span of each token in them, when the
     /// caller read the expression through [`tokenize_expression_spanned`]: what lets a
     /// refusal quote the text the request sent.
@@ -3304,6 +3428,7 @@ impl<'a> ExprParser<'a> {
             depth: 0,
             substitutions,
             reserved: None,
+            non_distinct: None,
             source: None,
         }
     }
@@ -3322,7 +3447,10 @@ impl<'a> ExprParser<'a> {
     }
 
     /// The refusal a reserved word written out as an attribute name earns, raised ONCE
-    /// THE EXPRESSION HAS PARSED.
+    /// THE EXPRESSION HAS PARSED, and after the two rules above it: a name is the LAST
+    /// thing an expression is read for, so a pair of parentheses that groups what is
+    /// already grouped and an operator whose operands relate one location to itself are
+    /// each the mistake whatever the names inside them are.
     ///
     /// A reserved word is a keyword of the expression language, so in an expression that
     /// does not parse it is not yet an attribute name at all: the parse stops where the
@@ -3335,6 +3463,35 @@ impl<'a> ExprParser<'a> {
     pub(crate) fn check_no_reserved_name(&self) -> Result<(), RequestError> {
         match &self.reserved {
             Some(word) => Err(reserved_attribute_name(self.member, word)),
+            None => Ok(()),
+        }
+    }
+
+    /// Note that one operator or function states a first operand that is not distinct from
+    /// its remaining ones ([`non_distinct_first_operand`]), keeping the FIRST such defect
+    /// the expression states.
+    fn note_non_distinct(&mut self, operator: &str, first: &Operand, rest: &[&Operand]) {
+        if self.non_distinct.is_some() {
+            return;
+        }
+        if let Some(path) = non_distinct_first_operand(first, rest) {
+            self.non_distinct = Some((operator.to_string(), path.render_tokens()));
+        }
+    }
+
+    /// The refusal an operator or function whose first operand is not distinct from the
+    /// remaining ones earns, raised ONCE THE EXPRESSION HAS PARSED.
+    ///
+    /// Asked after the parentheses and before the names, for the same reason both of those
+    /// are asked after the parse: AWS states a rule about an expression's OPERANDS only of
+    /// text whose grammar it accepts and whose parentheses say something — an expression
+    /// the parse cannot complete is the syntax error it is, and one that groups what is
+    /// already grouped is refused for those parentheses whatever its operands then relate.
+    pub(crate) fn check_distinct_first_operands(&self) -> Result<(), RequestError> {
+        match &self.non_distinct {
+            Some((operator, first_operand)) => {
+                Err(non_distinct_operands(self.member, operator, first_operand))
+            }
             None => Ok(()),
         }
     }
@@ -3352,32 +3509,22 @@ impl<'a> ExprParser<'a> {
     /// that grammar is parsed ([`ParsedCondition::parse`]) — the parentheses of a function
     /// call carry its arguments and are never redundant, which is why a group around a
     /// whole call (`(attribute_exists(a))`) is not one.
+    ///
+    /// The rule itself is stated once for every grammar of this service that groups with
+    /// parentheses ([`states_redundant_parentheses`]); this is where this grammar's tokens
+    /// are read as grouping.
     pub(crate) fn check_no_redundant_parentheses(&self) -> Result<(), RequestError> {
-        // The index of the `(` each `)` closes, filled in as the walk closes each group,
-        // so the group that ends just before a `)` is known when that `)` is reached.
-        let mut opened_by: Vec<Option<usize>> = vec![None; self.tokens.len()];
-        let mut open_groups: Vec<usize> = Vec::new();
-        for (at, token) in self.tokens.iter().enumerate() {
-            match token {
-                ExprToken::Open => open_groups.push(at),
-                ExprToken::Close => {
-                    // A `)` closing nothing is unbalanced, which the grammar states on its
-                    // own: there is no group here to call redundant.
-                    let Some(open) = open_groups.pop() else {
-                        return Ok(());
-                    };
-                    opened_by[at] = Some(open);
-                    // This group's content is exactly one group of its own: it begins where
-                    // that group begins and ends where it ends.
-                    if at > 0
-                        && matches!(self.tokens.get(at - 1), Some(ExprToken::Close))
-                        && opened_by[at - 1] == Some(open + 1)
-                    {
-                        return Err(redundant_parentheses(self.member));
-                    }
-                }
-                _ => {}
-            }
+        let grouping: Vec<GroupToken> = self
+            .tokens
+            .iter()
+            .map(|token| match token {
+                ExprToken::Open => GroupToken::Open,
+                ExprToken::Close => GroupToken::Close,
+                _ => GroupToken::Other,
+            })
+            .collect();
+        if states_redundant_parentheses(&grouping) {
+            return Err(redundant_parentheses(self.member));
         }
         Ok(())
     }
@@ -3667,6 +3814,10 @@ impl<'a> ExprParser<'a> {
             for operand in [&left, &low, &high] {
                 check_orderable_operand(self.member, BETWEEN_OPERATOR, operand)?;
             }
+            // And the range it states is a range BETWEEN its bounds, so neither bound may
+            // be the location it is measured against
+            // ([`Self::check_distinct_first_operands`]).
+            self.note_non_distinct(BETWEEN_OPERATOR, &left, &[&low, &high]);
             check_between_operands(self.member, &low, &high)?;
             return Ok(ConditionNode::Between(left, low, high));
         }
@@ -3691,6 +3842,14 @@ impl<'a> ExprParser<'a> {
                     ),
                 ));
             }
+            // A membership test asks whether the first operand is one of the rest, so the
+            // rest may not name the location it reads
+            // ([`Self::check_distinct_first_operands`]).
+            self.note_non_distinct(
+                IN_OPERATOR,
+                &left,
+                &candidates.iter().collect::<Vec<&Operand>>(),
+            );
             return Ok(ConditionNode::In(left, candidates));
         }
         match self.token_here()? {
@@ -3702,6 +3861,9 @@ impl<'a> ExprParser<'a> {
                         check_orderable_operand(self.member, operator.as_str(), operand)?;
                     }
                 }
+                // A comparison relates two operands, so the second may not name the
+                // location the first reads ([`Self::check_distinct_first_operands`]).
+                self.note_non_distinct(operator.as_str(), &left, &[&right]);
                 Ok(ConditionNode::Compare(left, operator, right))
             }
             _ => Err(self.syntax()),
@@ -3737,6 +3899,9 @@ impl<'a> ExprParser<'a> {
                 self.expect(&ExprToken::Comma)?;
                 let prefix = self.function_operand(name, signature, 1)?;
                 check_begins_with_prefix(self.member, &prefix)?;
+                // A prefix read from the very location it is tested against is no prefix
+                // test ([`Self::check_distinct_first_operands`]).
+                self.note_non_distinct(name, &value, &[&prefix]);
                 ConditionNode::BeginsWith(value, prefix)
             }
             // The closed set above holds nothing else: `contains`, whose searched operand
@@ -3747,8 +3912,8 @@ impl<'a> ExprParser<'a> {
                 self.expect(&ExprToken::Comma)?;
                 let needle = self.function_operand(name, signature, 1)?;
                 // The one rule beyond the operand kinds: the two operands address
-                // different locations ([`check_contains_operands`]).
-                check_contains_operands(self.member, &searched, &needle)?;
+                // different locations ([`Self::check_distinct_first_operands`]).
+                self.note_non_distinct(name, &searched, &[&needle]);
                 ConditionNode::Contains(searched, needle)
             }
         };

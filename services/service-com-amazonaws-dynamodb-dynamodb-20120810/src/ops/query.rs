@@ -508,6 +508,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
+        // The one rule about the paths this query names that the table settles: a key
+        // attribute is declared as a scalar, so a path that reaches inside one addresses
+        // no location this table can hold ([`crate::state::check_scalar_key_paths`]).
+        // Asked of the PROJECTION here, where the table's key schema is in hand; the
+        // filter's own paths are held to it below, after the rule about which attributes
+        // THAT member may speak of at all.
+        crate::state::check_scalar_key_paths(table, selection.projected_paths()).map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
         // not its items — decided against the partition the key condition selects and the
         // attributes this query asks for. The partition attribute is the TABLE's, which is
@@ -584,6 +591,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 filter.stated_member()
             )));
         }
+        // What is left of the filter's paths is then held to the key schema like the
+        // projection's above: a path reaching inside a key attribute of an INDEX this query
+        // does not read through addresses no location either
+        // ([`crate::state::check_scalar_key_paths`]).
+        crate::state::check_scalar_key_paths(table, filter.document_paths()).map_err(lift)?;
         // "If you query or scan a global secondary index, you can only request
         // attributes that are projected into the index. Global secondary index queries
         // cannot fetch attributes from the parent table" (`Query$Select`): a query of a
@@ -692,6 +704,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it falls outside ([`KeyCondition::starts_within`]).
             if let Some(message) = condition.starts_within(table, start).map_err(lift)? {
                 return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+            // A condition that pins the WHOLE key of the TABLE names one item — "the
+            // primary key uniquely identifies each item in the table" — so this query
+            // evaluates at most one item and reports no page to resume: the member states a
+            // resume point there is none of ([`START_KEY_ON_ONE_KEY_QUERY_MESSAGE`]). It is
+            // asked of a base-table query alone, because a SECONDARY INDEX's key is not
+            // unique: many items may carry one `gpk`/`gsk` pair, so a fully pinned
+            // condition over an index still walks a page of entries and resumes from the
+            // token this handler itself reported. Asked after the boundary sentences above,
+            // which are about a token the condition does NOT select — a token outside what
+            // this query reads is refused by the half of the condition it falls outside
+            // whatever that condition then selects — so what reaches here is the one key the
+            // condition does select, with nothing past it to resume at.
+            if index.is_none() && condition.selects_one_key() {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    START_KEY_ON_ONE_KEY_QUERY_MESSAGE,
+                ));
             }
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Query$LastEvaluatedKey`): resume strictly after the key
@@ -948,6 +977,23 @@ const START_KEY_OUTSIDE_QUERY_BOUNDARIES_MESSAGE: &str =
 /// the refusal. Fixed text again, naming neither the token nor the comparison.
 const START_KEY_OUTSIDE_RANGE_PREDICATE_MESSAGE: &str =
     "The provided starting key does not match the range key predicate";
+
+/// How a `Query` that pins the whole PRIMARY key of the table it reads, and still carries
+/// an `ExclusiveStartKey`, is refused.
+///
+/// "The primary key of the first item that this operation will evaluate"
+/// (`Query$ExclusiveStartKey`) resumes a walk: "the primary key uniquely identifies each
+/// item in the table", so a condition pinning the whole primary key names ONE item — the
+/// query evaluates at most that one and reports no `LastEvaluatedKey`. There is no page for
+/// a token to resume, and the member is invalid rather than a boundary the one key does or
+/// does not fall inside. AWS's sentence is fixed and names the member, and it is neither of
+/// the boundary sentences above nor the invalid-token sentence a token that is no key of the
+/// schema earns ([`crate::state::START_KEY_INVALID_MESSAGE`]).
+///
+/// A SECONDARY INDEX's key is not unique, so the same condition over an index selects a page
+/// of entries rather than one: this sentence is the base table's
+/// ([`KeyCondition::selects_one_key`] answers only what the condition pins).
+const START_KEY_ON_ONE_KEY_QUERY_MESSAGE: &str = "The provided exclusive start key is invalid";
 
 /// A comparison one key condition makes against one attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1493,6 +1539,46 @@ impl KeyCondition {
             return Ok(None);
         }
         Ok(Some(START_KEY_OUTSIDE_RANGE_PREDICATE_MESSAGE))
+    }
+
+    /// Whether this condition pins EVERY key attribute of the schema it reads to ONE
+    /// value, which — for a schema whose keys are UNIQUE — names one key of it and so at
+    /// most one item.
+    ///
+    /// The partition value is always an equality, so what decides it is whether every
+    /// RANGE key attribute the schema declares is pinned too — by one of the leading
+    /// equalities, or by the comparison on the last attribute the condition constrains
+    /// where that comparison is `=`. A schema the condition leaves a range key attribute
+    /// free in selects a RANGE of keys, which is what a page walks.
+    ///
+    /// UNIQUENESS is the caller's to establish, which is why this answers only what the
+    /// CONDITION pins: a table's own primary key identifies one item ("the primary key
+    /// uniquely identifies each item in the table"), while a secondary index's key is not
+    /// unique — many items may carry the same `gpk`/`gsk` pair — so a fully pinned
+    /// condition over an index still selects a page of entries
+    /// ([`START_KEY_ON_ONE_KEY_QUERY_MESSAGE`] is stated for the base table alone).
+    ///
+    /// A schema declaring NO range key is left out: the first guard below is what leaves it
+    /// out, since the `all` beneath it is vacuously satisfied there. Such a condition pins
+    /// one key too, and AWS's answer to a resume token beside it is not recorded, so the
+    /// sentence is stated for the schema whose SORT key the condition pins — the shape the
+    /// recording covers — and a hash-only schema keeps the behaviour it had.
+    fn selects_one_key(&self) -> bool {
+        if !self
+            .sort
+            .as_ref()
+            .is_some_and(|sort| sort.operator == Operator::Equal)
+        {
+            return false;
+        }
+        self.key_names.iter().all(|name| {
+            *name == self.partition_name
+                || self.equalities.iter().any(|(pinned, _)| pinned == name)
+                || self
+                    .sort
+                    .as_ref()
+                    .is_some_and(|sort| sort.name == *name && sort.operator == Operator::Equal)
+        })
     }
 
     /// Whether `attribute` is a key attribute of the schema this query reads, which is
@@ -2095,10 +2181,33 @@ fn parse_key_condition_expression(
     // at all, so the parse defect is what such a request earns. The rule itself is the
     // one every expression member of this service states
     // ([`crate::state::check_reserved_attribute_name`]).
+    //
+    // After the parentheses, like the condition and filter grammar beside it
+    // ([`crate::state::ParsedCondition::parse`]): parentheses that group what is already
+    // grouped are the mistake whatever the names inside them are. Parentheses GROUP in
+    // this member's grammar too — "each optionally parenthesised" is how its comparisons
+    // are joined — so the rule is the one every grammar of this service that groups with
+    // parentheses states ([`crate::state::states_redundant_parentheses`]).
+    if crate::state::states_redundant_parentheses(&grouping_of(&tokens)) {
+        return Err(crate::state::redundant_parentheses(KEY_CONDITION_MEMBER));
+    }
     if let Some(word) = &parser.reserved {
         crate::state::check_reserved_attribute_name(KEY_CONDITION_MEMBER, word)?;
     }
     Ok(comparisons)
+}
+
+/// This grammar's tokens as the redundant-parenthesis rule reads them: what opens a group,
+/// what closes one, and everything else ([`crate::state::GroupToken`]).
+fn grouping_of(tokens: &[Token]) -> Vec<crate::state::GroupToken> {
+    tokens
+        .iter()
+        .map(|token| match token {
+            Token::Open => crate::state::GroupToken::Open,
+            Token::Close => crate::state::GroupToken::Close,
+            _ => crate::state::GroupToken::Other,
+        })
+        .collect()
 }
 
 /// Hold every `BETWEEN` of a key condition to the order its two bounds have to be in.

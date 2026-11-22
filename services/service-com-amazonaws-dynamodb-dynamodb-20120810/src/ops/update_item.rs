@@ -485,6 +485,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is reported and NOTHING is written
             // ([`crate::state::check_table_key_accessible`]).
             crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
+            // The one fact of this update's CONDITION that the table settles: a key
+            // attribute is declared as a scalar, so a path reaching inside one addresses no
+            // location this table can hold
+            // ([`crate::state::check_scalar_condition_key_paths`]); the paths the UPDATE
+            // states are held to the same rule below, after the rule a path into the
+            // table's own key breaks.
+            crate::state::check_scalar_condition_key_paths(
+                input.condition_expression.as_deref(),
+                substitutions,
+                table,
+            )
+            .map_err(lift)?;
             (
                 table.key_of_key_map(&input.key).map_err(lift)?,
                 table.partition_key_name().to_string(),
@@ -534,8 +546,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An update of a key that holds no item starts from the key itself, so the
         // created item carries the primary key the request addressed it by.
         let mut item = before.clone().unwrap_or_else(|| input.key.clone());
-        let touched = update.apply(&mut item).map_err(lift)?;
-        for attribute in touched.attributes() {
+        // "You cannot use UpdateItem to update any primary key attributes": an action that
+        // ADDRESSES a key attribute is refused whatever it would have done to it, so the
+        // refusal is read off the attributes the update STATES rather than off what
+        // applying it changed ([`crate::state::ParsedUpdate::stated_attributes`]) — and
+        // before it is applied, because a path that reaches INSIDE a key attribute
+        // addresses no location a scalar key can hold, and the caller is told about the key
+        // it tried to write rather than about the path that could not be walked.
+        for attribute in update.stated_attributes() {
             if attribute.as_str() == partition_key.as_str()
                 || Some(attribute.as_str()) == sort_key.as_deref()
             {
@@ -545,6 +563,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // And the paths the update states are held to the key schema the table declares:
+        // a key attribute is a scalar, so a path reaching inside one addresses no location
+        // this table can hold ([`crate::state::check_scalar_key_paths`]). Asked after the
+        // rule above, which is the one a path into the table's OWN key breaks — the caller
+        // is told it cannot write that key — so what reaches here is a path into a key
+        // attribute of one of this table's secondary indexes.
+        crate::state::check_scalar_key_paths(
+            store.active_table(&region, &name, now).map_err(lift)?,
+            update.stated_paths(),
+        )
+        .map_err(lift)?;
+        let touched = update.apply(&mut item).map_err(lift)?;
         // "Edits an existing item's attributes, OR ADDS A NEW ITEM to the table if it
         // does not already exist" (this operation's doc): an update that STATES clauses
         // adds the item at its key only where one of those clauses gave it a value, so an
