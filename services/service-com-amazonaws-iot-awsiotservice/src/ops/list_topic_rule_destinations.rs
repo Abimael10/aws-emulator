@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTopicRuleDestinations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTopicRuleDestinations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTopicRuleDestinations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the account's TOPIC RULE DESTINATIONS
+//! (`crate::state::ComAmazonawsIotAwsiotserviceState::topic_rule_destinations`), in ARN
+//! order: every entry is projected from the record `CreateTopicRuleDestination` persisted
+//! (`crate::state::RegisteredTopicRuleDestination::summary`), so what this reports and what
+//! `GetTopicRuleDestination` reads are one value. See
+//! `crate::state::topic_rule_destinations` for the state machine the destination operations
+//! share.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +146,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTopicRuleDestinations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTopicRuleDestinationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTopicRuleDestinations"))
+        // `ctx` carries request metadata only; this listing needs none of it.
+        let _ = ctx;
+
+        // The continuation token is resolved BEFORE the store is reached: a request whose
+        // `nextToken` is not one THIS listing issued is refused whatever the store holds.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, LISTING_SCOPE)?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTopicRuleDestinationsErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `maxResults` is "The maximum number of results to return at one time", modelled
+        // `range 1..1000` and so refused outside that before this handler runs; a request
+        // that names none asks for every destination the account holds. The clamp is
+        // defensive rather than load-bearing: it keeps the page size inside the modelled
+        // range without depending on a validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        let mut store = state.lock();
+        // A status the clock already owes is materialised before the read, so a listing
+        // reports each destination's CURRENT status and not the one it held when the
+        // confirming call returned. Nothing else is written: this is a reporting operation,
+        // and `GetTopicRuleDestination` materialises the same transition the same way.
+        crate::state::settle_destinations(
+            &mut store.topic_rule_destinations,
+            ::std::time::SystemTime::now(),
+        );
+
+        // "Lists all the topic rule destinations in your Amazon Web Services account", so
+        // every record the account holds is a row of this listing. The store is keyed by
+        // ARN, so iteration is already the listing's total order and "the destinations whose
+        // ARN sorts after the last one emitted" is a well-defined resume point even if that
+        // destination has since been deleted.
+        let rows: Vec<String> = store.topic_rule_destinations.keys().cloned().collect();
+
+        // One page of that order, resumed after the position the caller's own token names
+        // (`crate::state::page_of`) — the same paging every other listing of this service
+        // uses, so a token is issued and read one way.
+        let (page, next_token) =
+            crate::state::page_of(rows, LISTING_SCOPE, resume_after.as_deref(), page_size);
+
+        Ok(ListTopicRuleDestinationsOutput {
+            // `TopicRuleDestinationSummaries` carries no length constraint, so an account
+            // holding no destination answers with an EMPTY list rather than an absent
+            // member: "the account holds none" is an answer, not a missing one.
+            destination_summaries: Some(
+                page.iter()
+                    .filter_map(|arn| store.topic_rule_destinations.get(arn))
+                    .map(crate::state::RegisteredTopicRuleDestination::summary)
+                    .collect(),
+            ),
+            // `nextToken` is "The token to use to get the next set of results, or null if
+            // there are no additional results."
+            next_token,
+        })
     }
+}
+
+/// `TopicRuleDestinationMaxResults`'s modelled maximum (`range 1..1000`), which is also the
+/// most destinations one page may carry.
+const MAX_PAGE_SIZE: i32 = 1_000;
+
+/// The LISTING a continuation token belongs to. This operation takes no filter, so every
+/// request walks the same single listing of the account's destinations and one scope names
+/// it — which is what keeps a token issued by another of this service's listings from
+/// resuming this one.
+const LISTING_SCOPE: &str = "topicRuleDestinations";
+
+/// The position a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400, "The
+/// request is not valid") when the token is not one this listing issued.
+///
+/// The decoding is the one every listing of this service shares
+/// (`crate::state::decode_page_marker`) and every step of it is fallible on purpose: the
+/// token is caller-supplied, so nothing read out of it may panic the handler.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListTopicRuleDestinationsError> {
+    crate::state::decode_page_marker(token, scope).ok_or_else(|| {
+        ListTopicRuleDestinationsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    })
 }

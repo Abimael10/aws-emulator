@@ -45,7 +45,10 @@ use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_runtime_api::client::http::{HttpConnector, SharedHttpConnector};
 
-use crate::ops::types::{HttpAction, HttpUrlDestinationProperties, TopicRuleDestination};
+use crate::ops::types::{
+    HttpAction, HttpUrlDestinationProperties, HttpUrlDestinationSummary, TopicRuleDestination,
+    TopicRuleDestinationSummary,
+};
 
 /// `TopicRuleDestinationStatus$IN_PROGRESS`: created, and not confirmed.
 pub const DESTINATION_IN_PROGRESS: &str = "IN_PROGRESS";
@@ -401,6 +404,29 @@ impl RegisteredTopicRuleDestination {
             }),
             vpc_properties: None,
             influx_db_properties: None,
+        }
+    }
+
+    /// This destination as the modelled `TopicRuleDestinationSummary` one page of
+    /// `ListTopicRuleDestinations` carries.
+    ///
+    /// Every member is read off the SAME record [`Self::view`] reports, so a listing and a
+    /// `GetTopicRuleDestination` of one destination cannot disagree about its status, its
+    /// reason, its instants or the URL it confirms. `vpcDestinationSummary` and
+    /// `influxDBSummary` are the other destination kinds' and are left out rather than
+    /// reported empty.
+    pub fn summary(&self) -> TopicRuleDestinationSummary {
+        TopicRuleDestinationSummary {
+            arn: Some(self.arn.clone()),
+            status: Some(self.status.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+            status_reason: self.status_reason.clone(),
+            http_url_summary: Some(HttpUrlDestinationSummary {
+                confirmation_url: Some(self.confirmation_url.clone()),
+            }),
+            vpc_destination_summary: None,
+            influx_db_summary: None,
         }
     }
 }
