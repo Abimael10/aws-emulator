@@ -24,7 +24,8 @@ use super::*;
 use crate::ops::types::{
     EbsCardInfo, FpgaDeviceInfo, FpgaDeviceMemoryInfo, FpgaInfo, GpuDeviceInfo,
     GpuDeviceMemoryInfo, GpuInfo, InferenceAcceleratorInfo, InferenceDeviceInfo,
-    InferenceDeviceMemoryInfo,
+    InferenceDeviceMemoryInfo, NeuronDeviceCoreInfo, NeuronDeviceInfo, NeuronDeviceMemoryInfo,
+    NeuronInfo,
 };
 
 mod amd_epyc_rows;
@@ -36,6 +37,8 @@ mod general_purpose_nvme_rows;
 mod gpu_rows;
 mod intel_nvme_compute_rows;
 mod network_optimized_rows;
+mod neuron_accelerated_rows;
+mod newest_generation_graviton_rows;
 mod previous_generation_rows;
 mod storage_optimized_graviton_rows;
 
@@ -202,6 +205,50 @@ impl PublishedInferenceDevices {
                 }),
             }]),
             total_inference_memory_in_mi_b: Some(self.memory_mib_each.saturating_mul(self.count)),
+        }
+    }
+}
+
+/// The Neuron devices of one instance type — "describes the Neuron accelerator settings for
+/// the instance type" (`InstanceTypeInfo$NeuronInfo`).
+///
+/// Like the inventories above, the devices of one instance are identical, so the whole
+/// inventory is one device description and a count. What a Neuron device publishes BESIDE its
+/// memory is the NeuronCores it carries and which version of the core those are
+/// (`NeuronDeviceCoreInfo`), which is the half of the fact an Inference accelerator inventory
+/// does not carry; the total device memory is one device's memory times the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedNeuronDevices {
+    /// How many Neuron devices the instance carries.
+    pub count: i32,
+    /// The device's name, as `NeuronDeviceInfo$Name` publishes it.
+    pub name: &'static str,
+    /// The NeuronCores ONE device carries (`NeuronDeviceCoreInfo$Count`).
+    pub cores_each: i32,
+    /// The version of those cores (`NeuronDeviceCoreInfo$Version`).
+    pub core_version: i32,
+    /// The memory of ONE device, in MiB.
+    pub memory_mib_each: i32,
+}
+
+impl PublishedNeuronDevices {
+    /// This inventory as the modelled `NeuronInfo`.
+    pub fn to_neuron_info(self) -> NeuronInfo {
+        NeuronInfo {
+            neuron_devices: Some(vec![NeuronDeviceInfo {
+                count: Some(self.count),
+                name: Some(self.name.to_string()),
+                core_info: Some(NeuronDeviceCoreInfo {
+                    count: Some(self.cores_each),
+                    version: Some(self.core_version),
+                }),
+                memory_info: Some(NeuronDeviceMemoryInfo {
+                    size_in_mi_b: Some(self.memory_mib_each),
+                }),
+            }]),
+            total_neuron_device_memory_in_mi_b: Some(
+                self.memory_mib_each.saturating_mul(self.count),
+            ),
         }
     }
 }
@@ -409,6 +456,8 @@ pub struct PublishedInstanceTypeFacts {
     pub gpu_devices: Option<PublishedGpuDevices>,
     /// Its Inference accelerators.
     pub inference_devices: Option<PublishedInferenceDevices>,
+    /// Its Neuron devices, where it carries any.
+    pub neuron_devices: Option<PublishedNeuronDevices>,
 }
 
 impl PublishedInstanceTypeFacts {
@@ -460,6 +509,7 @@ impl PublishedInstanceTypeFacts {
             fpga_devices: None,
             gpu_devices: None,
             inference_devices: None,
+            neuron_devices: None,
         }
     }
 
@@ -842,6 +892,26 @@ impl PublishedInstanceTypeFacts {
             count,
             name,
             manufacturer,
+            memory_mib_each,
+        });
+        self
+    }
+
+    /// The type's Neuron devices: `count` devices named `name`, each carrying `cores_each`
+    /// NeuronCores of version `core_version` and `memory_mib_each` MiB of memory.
+    const fn neurons(
+        mut self,
+        count: i32,
+        name: &'static str,
+        cores_each: i32,
+        core_version: i32,
+        memory_mib_each: i32,
+    ) -> Self {
+        self.neuron_devices = Some(PublishedNeuronDevices {
+            count,
+            name,
+            cores_each,
+            core_version,
             memory_mib_each,
         });
         self
@@ -4684,9 +4754,10 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// previous generation ones, the burstable families on Nitro and the one on pre-Nitro
 /// hardware, the dense HDD storage ones, the eighth generation Intel compute optimized ones,
 /// those of them that carry local NVMe devices, the general purpose families with local
-/// NVMe devices, and the storage optimized Graviton ones. A row is reached by its instance type
-/// alone, so which table it is written in is nothing but where the figures of one group of
-/// families are kept together.
+/// NVMe devices, the families whose accelerators are Neuron devices, the compute optimized
+/// families on the newest AWS Graviton hardware, and the storage optimized Graviton ones. A row
+/// is reached by its instance type alone, so which table it is written in is nothing but where
+/// the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
@@ -4695,6 +4766,10 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(gpu_rows::GPU_INSTANCE_TYPE_FACTS)
         .chain(intel_nvme_compute_rows::INTEL_NVME_COMPUTE_INSTANCE_TYPE_FACTS)
         .chain(network_optimized_rows::NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS)
+        .chain(neuron_accelerated_rows::NEURON_ACCELERATED_INSTANCE_TYPE_FACTS)
+        .chain(
+            newest_generation_graviton_rows::NEWEST_GENERATION_GRAVITON_INSTANCE_TYPE_FACTS,
+        )
         .chain(previous_generation_rows::PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS)
         .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)

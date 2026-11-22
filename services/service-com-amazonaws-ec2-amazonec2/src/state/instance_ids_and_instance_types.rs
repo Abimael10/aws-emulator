@@ -3001,7 +3001,7 @@ pub(super) fn maximum_ebs_attachments(nitro: bool, instance_store_disks: i32) ->
 /// host features it is offered with. Those are facts AWS publishes per instance type, held
 /// row by row in [`published_instance_type_facts`], and this reports what the type's row
 /// carries wherever it carries it. A member neither the row nor the derivation answers (the
-/// media and Neuron device inventories) is reported absent rather than
+/// media device inventory) is reported absent rather than
 /// invented, and a filter naming one therefore selects nothing.
 pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
     let name = InstanceTypeName::parse(instance_type)?;
@@ -3369,7 +3369,14 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             supported_versions: Some(vec![NITRO_TPM_VERSION.to_string()]),
         }),
         media_accelerator_info: None,
-        neuron_info: None,
+        // "Describes the Neuron accelerator settings for the instance type"
+        // (`InstanceTypeInfo$NeuronInfo`): the Neuron devices the catalog publishes for the
+        // type — how many, how many NeuronCores each carries and of which version, and the
+        // memory of one — and nothing at all for a type that carries none, which is what AWS
+        // reports for one.
+        neuron_info: facts
+            .and_then(|facts| facts.neuron_devices)
+            .map(PublishedNeuronDevices::to_neuron_info),
         // "Indicates whether a local Precision Time Protocol (PTP) hardware clock (PHC) is
         // supported" (`$PhcSupport`): the clock the type's own hardware carries where the
         // catalog publishes it, else a clock of the Nitro hardware generation named by

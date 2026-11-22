@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The published rows of the eighth generation Intel network optimized compute family, of the
+//! The published rows of the eighth generation Intel network optimized compute families, of the
 //! Ice Lake high-memory family with local NVMe devices and of the Ice Lake network optimized
-//! general purpose family — C8in, X2idn and M6in — read through
+//! general purpose family — C8in, C8ine, X2idn and M6in — read through
 //! [`super::published_instance_type_facts`] like every other row of the catalog.
 //!
 //! Each carries the `n` capability letter, "network and EBS optimized" (the instance type naming
@@ -404,5 +404,94 @@ pub(super) static NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS: &[PublishedInstanceType
         .auto_recovery(true)
         .host_features(true, false)
         .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .ipv4_per_secondary_interface(0),
+    // C8ine — compute optimized built for the network on the same eighth generation Intel
+    // hardware as the C8in family above, at the same sustained 3.9 GHz, and reading the same
+    // rows of "Amazon EBS optimized instance types": 650 Mbps and 3,600 IOPS on its narrowest
+    // size, then the ladder's 1,250 Mbps and 6,000 IOPS per `xlarge` of width, a baseline the
+    // sizes below the `8xlarge` burst above up to 10,000 Mbps and 40,000 IOPS, and dedicated
+    // bandwidth from that size up — the recorded `12xlarge` row being that ladder's 15,000
+    // Mbps and 60,000 IOPS. Its volumes are attached to EBS hardware of the type's own rather
+    // than out of the pool shared with its interfaces and its devices, so the limit it reports
+    // is the type's own 32 volumes of the `dedicated` kind at every size. Its connection
+    // tracking holds an established TCP connection for the 350 s of this hardware generation;
+    // ENA Express is offered at NO size of the family, the published list of the types whose
+    // adapter carries that transport leaving it out; the packets of a session cannot be copied
+    // under its guest and it carries no local PTP hardware clock, while an instance IS migrated
+    // on a user-initiated reboot; it takes no interface attachment from a secondary network, so
+    // no private address at all is available on one; and the family is offered neither on a
+    // Dedicated Host nor with hibernation, which the published prerequisites name its sibling
+    // compute families for and not this one.
+    PublishedInstanceTypeFacts::of("c8ine.large")
+        .ebs(650, 3_600, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c8ine.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c8ine.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c8ine.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c8ine.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c8ine.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .dedicated_ebs_attachments(32)
+        .ena_srd(false)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .dedicated_hosts(false)
+        .hibernation(false)
+        .host_features(true, false)
+        .traffic_mirroring(false)
+        .secondary_network(false)
         .ipv4_per_secondary_interface(0),
 ];
