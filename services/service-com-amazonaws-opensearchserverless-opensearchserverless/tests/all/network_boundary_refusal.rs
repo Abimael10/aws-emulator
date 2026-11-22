@@ -21,7 +21,10 @@
 //! request body, under five methods), why no policy admits the request (none stored at all,
 //! one naming another collection, one whose only rule is about another resource type), and —
 //! for the second suite — the control-plane writer that takes the policy away and puts it
-//! back while the collection stays live.
+//! back while the collection stays live. A further suite reads that refusal REPEATEDLY, as a
+//! client of an endpoint that has stopped answering does: every round of every probe reads the
+//! same status, the same absence of bytes and the same absence of a media type, and none of
+//! the writes it refused is applied.
 //!
 //! The last two suites are about the other half of the same decision: the SOURCES a covering
 //! statement states. A collection answers only a request from a source one of its covering
@@ -40,10 +43,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::collection_endpoint_authorization::{
     active_collection, create_access_policy, create_security_policy, data_policy, emulator,
-    endpoint_host, iam_user, knn_index_body, network_policy, rest, rest_bytes,
+    endpoint_host, iam_user, knn_index_body, network_policy, rest, rest_bytes, rest_parts,
     AMBIENT_ACCESS_KEY_ID,
 };
-use crate::collection_lifecycle::{at, call, text};
+use crate::collection_lifecycle::{at, call, text, CLIENT_ERROR};
 
 /// The collection every case is made in. One router per case, so one name serves them all.
 const COLLECTION: &str = "net-boundary";
@@ -625,6 +628,176 @@ async fn assert_every_route_is_answered(router: &MultiServiceRouter, case: &str,
                 route.case
             );
         }
+    }
+}
+
+/// How many consecutive rounds the refusal of a collection whose only network policy was
+/// deleted is read over. A client that finds its endpoint refusing probes it again, so the
+/// answer is read repeatedly rather than once: the refusal is the policy state the control
+/// plane holds, not a one-off answer, and asking for it changes nothing.
+const PROBE_ROUNDS: usize = 3;
+
+/// The media type an answer carrying a document is sent under, which the front door's
+/// refusal announces none of: there are no bytes for a client to parse it as.
+const JSON_MEDIA_TYPE: &str = "application/json";
+
+/// RULE: the network front door's refusal is the same answer however often a client asks for
+/// it and whichever route asks — the status alone, with no bytes and no media type announced
+/// for a body that is not there — and it PERFORMS nothing: a write it refuses leaves the
+/// collection's documents exactly as the last admitted request left them.
+///
+/// The rows span the probes a client of a collection taken out of service re-issues: the read
+/// that was served a moment ago, a write to a document id the collection does not hold, and
+/// an overwrite of the document that WAS written — each one repeated over
+/// [`PROBE_ROUNDS`] rounds, so a refusal that was computed once and then drifted (into the
+/// authorization layer's document, or into applying the write it refused) fails a later round.
+#[tokio::test]
+async fn a_network_refusal_is_the_same_answer_every_round_and_performs_nothing() {
+    let policy_name = "net-policy";
+    let policy = network_policy(&[format!("collection/{COLLECTION}").as_str()]);
+    let router = emulator();
+    create_security_policy(&router, "network", policy_name, &policy).await;
+    let collection = active_collection(&router, COLLECTION).await;
+    let host = endpoint_host(&collection);
+
+    // Live: the index is created and one document written through the published address.
+    let source = json!({ "vector": [1.0, 0.0, 0.0, 0.0], "label": "before-the-outage" });
+    let read_path = format!("/{INDEX}/_doc/{DOCUMENT}");
+    for (case, method, path, body) in [
+        (
+            "the index create",
+            "PUT",
+            format!("/{INDEX}"),
+            Some(knn_index_body(4)),
+        ),
+        (
+            "the document write",
+            "PUT",
+            read_path.clone(),
+            Some(source.clone()),
+        ),
+    ] {
+        let (status, answer) = rest(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            method,
+            &path,
+            body.as_ref(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "case {case}: expected the live endpoint to serve {method} {path}, got {status} \
+             with {answer}"
+        );
+    }
+
+    // The control plane takes the only policy that names the collection away, and the read
+    // of it then answers that there is none.
+    let (status, code, deleted) = call(
+        &router,
+        "DeleteSecurityPolicy",
+        json!({ "type": "network", "name": policy_name }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case DeleteSecurityPolicy(network/{policy_name}): got {status} {code} with {deleted}"
+    );
+    // The read of the deleted pair answers the error shape for a resource that is not
+    // there, under the one client-error status this `awsJson1_0` service answers every
+    // modelled client error with (`tests/all/client_error_status.rs`).
+    let (status, code, read) = call(
+        &router,
+        "GetSecurityPolicy",
+        json!({ "type": "network", "name": policy_name }),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (CLIENT_ERROR, "ResourceNotFoundException"),
+        "case GetSecurityPolicy(network/{policy_name}) after the delete: expected the policy \
+         to be gone, got {status} {code} with {read}"
+    );
+
+    // Every probe of every round reads the SAME refusal: the status, no bytes, and no media
+    // type announced for them.
+    let during = json!({ "vector": [0.0, 1.0, 0.0, 0.0], "label": "during-the-outage" });
+    let mut refused_writes = Vec::new();
+    for round in 0..PROBE_ROUNDS {
+        let unheld_path = format!("/{INDEX}/_doc/stop-probe-{round}");
+        refused_writes.push(unheld_path.clone());
+        let probes = [
+            ("the document read", "GET", read_path.clone(), None),
+            (
+                "a write to a document the collection does not hold",
+                "PUT",
+                unheld_path,
+                Some(during.clone()),
+            ),
+            (
+                "an overwrite of the document that was served",
+                "PUT",
+                read_path.clone(),
+                Some(during.clone()),
+            ),
+        ];
+        for (probe, method, path, body) in probes {
+            let (status, media_type, payload) = rest_parts(
+                &router,
+                &host,
+                AMBIENT_ACCESS_KEY_ID,
+                method,
+                &path,
+                body.as_ref(),
+            )
+            .await;
+            let served = String::from_utf8_lossy(&payload).to_string();
+            assert_eq!(
+                (status, payload.len(), media_type.clone()),
+                (NETWORK_REFUSAL, 0, None),
+                "case {probe} in round {round}: expected {NETWORK_REFUSAL} with no bytes and \
+                 no media type, got {status} as {media_type:?} with {served:?}"
+            );
+        }
+    }
+
+    // The byte-identical policy goes back: the endpoint answers again, and what it answers
+    // shows that not one of the refused writes was applied — the document reads back as the
+    // last ADMITTED write left it, and every id a refused write addressed is held by nothing.
+    create_security_policy(&router, "network", policy_name, &policy).await;
+    let (status, answer) = rest(
+        &router,
+        &host,
+        AMBIENT_ACCESS_KEY_ID,
+        "GET",
+        &read_path,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, at(&answer, "_source").clone()),
+        (200, source),
+        "case the document read with the policy restored: expected the pre-outage source \
+         unchanged, got {status} with {answer}"
+    );
+    for path in &refused_writes {
+        let (status, media_type, payload) =
+            rest_parts(&router, &host, AMBIENT_ACCESS_KEY_ID, "GET", path, None).await;
+        let served = String::from_utf8_lossy(&payload).to_string();
+        let document: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+        assert_eq!(
+            (
+                status,
+                media_type.as_deref(),
+                at(&document, "found").as_bool()
+            ),
+            (404, Some(JSON_MEDIA_TYPE), Some(false)),
+            "case the read of {path} with the policy restored: a write refused at the front \
+             door created nothing, so the collection answers its own not-found document, got \
+             {status} with {served:?}"
+        );
     }
 }
 

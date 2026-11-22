@@ -277,6 +277,35 @@ async fn rest_scoped_bytes(
     path: &str,
     body: Option<&Value>,
 ) -> (u16, Vec<u8>) {
+    let (status, _content_type, payload) =
+        rest_scoped_parts(router, host, akid, signing_name, method, path, body).await;
+    (status, payload)
+}
+
+/// [`rest_bytes`] with the media type the answer was sent under beside its bytes, `None`
+/// where it was sent under none: what a client has to go on when it classifies an answer
+/// that carries no document at all ([`rest_parts`]).
+pub(crate) async fn rest_parts(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Option<String>, Vec<u8>) {
+    rest_scoped_parts(router, host, akid, SIGNING_NAME, method, path, body).await
+}
+
+/// [`rest_scoped_bytes`] with the media type the answer was sent under beside its bytes.
+async fn rest_scoped_parts(
+    router: &MultiServiceRouter,
+    host: &str,
+    akid: &str,
+    signing_name: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Option<String>, Vec<u8>) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -295,7 +324,12 @@ async fn rest_scoped_bytes(
         .expect("a well-formed data-plane request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    (status, response.body().to_vec())
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    (status, content_type, response.body().to_vec())
 }
 
 /// One OpenSearch REST request signed for `signing_name` ([`rest_scoped_bytes`]), whose
