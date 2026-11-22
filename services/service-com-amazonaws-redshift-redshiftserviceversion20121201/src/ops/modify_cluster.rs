@@ -5,7 +5,9 @@
 //! Applies the modifiable settings the request carries to the stored cluster and
 //! reports the cluster back. `NewClusterIdentifier` re-keys the stored record and
 //! moves its endpoint hostname; the namespace ARN is the cluster's identity and
-//! survives the rename unchanged.
+//! survives the rename unchanged. A change to the cluster's SHAPE is a resize —
+//! work done TO a serving cluster — so it leaves the cluster reporting work in
+//! progress until that work's span has passed.
 //!
 //! ## Shape of an operation
 //!
@@ -626,6 +628,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
                 // rebuilds it on new nodes, which is the classic resize.
                 st::RESIZE_TYPE_CLASSIC,
             ));
+            // A resize is work the service does TO a serving cluster, so the
+            // cluster stops serving while it runs: it reports work in progress
+            // from this call's own answer until the span that work takes has
+            // passed, exactly as the operation whose whole job is a resize
+            // (`ResizeCluster`) leaves it. That is also what makes the
+            // precondition every operation needing a running cluster checks
+            // reachable, so a second mutation of the same cluster is refused
+            // while this one is applying rather than interleaved with it. A
+            // cluster the service is ALREADY working on keeps the status and the
+            // due instant that work recorded: this call joins it rather than
+            // restarting it.
+            if stored.cluster.cluster_status.as_deref() == Some(st::STATUS_AVAILABLE) {
+                stored.cluster.cluster_status = Some(st::STATUS_MODIFYING.to_string());
+                stored.available_at = now + st::PROVISIONING_SPAN;
+            }
         }
         if let Some(value) = input.automated_snapshot_retention_period {
             stored.cluster.automated_snapshot_retention_period = Some(value);

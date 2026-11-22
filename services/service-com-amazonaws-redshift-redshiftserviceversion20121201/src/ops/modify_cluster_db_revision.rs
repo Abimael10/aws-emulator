@@ -3,13 +3,18 @@
 //! @op ModifyClusterDbRevision
 //! Moves one stored cluster onto another revision of its database — or says why
 //! it cannot be moved: the cluster this account does not hold, the cluster the
-//! service is already working on, and the cluster that already runs the latest
-//! revision this service publishes a target of
+//! service is already working on, the cluster that already runs the revision the
+//! request names, and the revision the cluster is not offered
 //! ([`crate::state::cluster_db_revision`]'s `RevisionTargets`).
 //!
 //! The cluster is resolved FIRST, before the revision the request names is
 //! looked at at all, so a client that branches on `ClusterNotFound` to decide
-//! "create it" rather than "patch it" can branch.
+//! "create it" rather than "patch it" can branch. The two revision refusals are
+//! disjoint classes and stay apart: the revision the cluster RUNS is
+//! `ClusterOnLatestRevision` ("nothing to do"), and any other revision the
+//! cluster is not offered is `InvalidParameterValue` ("read the next reachable
+//! target"), because a caller decides whether to stop or to re-read from which
+//! of the two it gets.
 //!
 //! ## Shape of an operation
 //!
@@ -214,51 +219,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterDbRe
             .clone()
             .unwrap_or_default();
         if cluster_status != st::STATUS_AVAILABLE {
+            // The cluster is not serving, so the service is working on it
+            // already — an in-flight change, a cluster still coming up, or a
+            // cluster whose compute is suspended. One sentence for all of them,
+            // because what the caller does about it is the same: read the
+            // cluster's status and call again once it is available.
             return Err(
                 ModifyClusterDbRevisionErrorModeled::InvalidClusterStateFault(
                     InvalidClusterStateFault {
-                        message: Some(st::invalid_cluster_state_message(
-                            &input.cluster_identifier,
-                            &cluster_status,
-                        )),
+                        message: Some(
+                            st::DB_REVISION_MODIFY_REQUIRES_AVAILABLE_CLUSTER.to_string(),
+                        ),
                     },
                 )
                 .into(),
             );
         }
 
-        // Which revisions this cluster can be moved onto is the cluster's own
-        // `RevisionTargets`, read through the same rule
-        // `DescribeClusterDbRevisions` reports — "you can retrieve this value
-        // from the response to the DescribeClusterDbRevisions request" is where
-        // the request's `RevisionTarget` comes from, so the two cannot disagree.
-        let targets = st::cluster_db_revision(&store.clusters[position].cluster)
-            .revision_targets
-            .unwrap_or_default();
+        // What the request may name is read off the cluster's own db-revision
+        // record, the SAME one `DescribeClusterDbRevisions` reports — "you can
+        // retrieve this value from the response to the
+        // DescribeClusterDbRevisions request" is where the request's
+        // `RevisionTarget` comes from, so the two cannot disagree. The record
+        // carries both halves of the comparison: the revision the cluster RUNS
+        // (`CurrentDatabaseRevision`) and the revisions it is OFFERED
+        // (`RevisionTargets`).
+        let published = st::cluster_db_revision(&store.clusters[position].cluster);
+        let current = published.current_database_revision.clone();
+        let targets = published.revision_targets.unwrap_or_default();
+
+        // The revision the cluster is already on: there is nothing to move, so
+        // the move is SKIPPED rather than attempted — the one fault the model
+        // words for exactly that, and a class of its own, kept apart from a
+        // target the cluster cannot reach below.
+        if current.as_deref() == Some(input.revision_target.as_str()) {
+            return Err(
+                ModifyClusterDbRevisionErrorModeled::ClusterOnLatestRevisionFault(
+                    ClusterOnLatestRevisionFault {
+                        message: Some(st::CLUSTER_ALREADY_ON_REQUESTED_REVISION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Any other revision has to be one the cluster is offered. A target
+        // outside that list is a parameter value this service cannot honour —
+        // the caller has to read the next reachable target rather than wait, so
+        // it is NOT the already-on-latest class and must not be answered as
+        // one.
         let Some(target) = targets.iter().find(|target| {
             target.database_revision.as_deref() == Some(input.revision_target.as_str())
         }) else {
-            // A cluster with no later revision published for it IS on its
-            // latest one, which is the fault the model words for exactly that;
-            // a cluster that has targets but not this one was asked for a
-            // revision value this service cannot honour.
-            return Err(if targets.is_empty() {
-                ModifyClusterDbRevisionErrorModeled::ClusterOnLatestRevisionFault(
-                    ClusterOnLatestRevisionFault {
-                        message: Some(st::cluster_on_latest_revision_message(
-                            &input.cluster_identifier,
-                        )),
-                    },
-                )
-                .into()
-            } else {
-                crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    st::unknown_revision_target_message(
-                        &input.cluster_identifier,
-                        &input.revision_target,
-                    ),
-                )
-            });
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::REVISION_TARGET_NEEDS_INTERMEDIATE_UPGRADE,
+            ));
         };
         let revision = target.database_revision.clone();
 

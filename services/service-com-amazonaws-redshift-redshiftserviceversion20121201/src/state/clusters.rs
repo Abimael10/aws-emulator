@@ -676,31 +676,53 @@ pub fn cluster_db_revision(cluster: &Cluster) -> ClusterDbRevision {
     }
 }
 
-/// Why a request to move a cluster onto another database revision is refused
-/// when the cluster runs the latest one this service publishes, naming the
-/// cluster the request asked about.
+/// Why a request to move a cluster onto the database revision it ALREADY runs
+/// is refused.
 ///
-/// The fixed text is what the model states the fault is
-/// (`smithy_query(query="shape", shape="ClusterOnLatestRevisionFault")` —
-/// "Cluster is already on the latest database revision"), with the cluster it is
-/// about named in it; which revisions a cluster can be moved onto is
-/// [`cluster_db_revision`]'s `RevisionTargets`.
-pub fn cluster_on_latest_revision_message(cluster_identifier: &str) -> String {
-    format!("Cluster {cluster_identifier} is already on the latest database revision.")
-}
+/// Recorded Amazon Redshift wording for this operation's
+/// `ClusterOnLatestRevisionFault` (awsQuery code `ClusterOnLatestRevision`,
+/// which the model states as "Cluster is already on the latest database
+/// revision"): fixed text with no variable part — the refusal names neither the
+/// cluster nor the revision, and says that the modification was SKIPPED, so a
+/// caller reads it as "nothing to do" rather than as a failure to apply
+/// something. Like [`PAUSE_REQUIRES_ACTIVE_CLUSTER`] it is one sentence for
+/// every cluster the class covers.
+///
+/// Which revision a cluster runs is [`cluster_db_revision`]'s
+/// `CurrentDatabaseRevision`, and the revisions it can be moved onto are that
+/// same record's `RevisionTargets`.
+pub const CLUSTER_ALREADY_ON_REQUESTED_REVISION: &str =
+    "Modification of cluster-db-revision was skipped. The cluster is already on the requested \
+     db-revision.";
 
-/// Why a `RevisionTarget` that names no revision the cluster can be moved onto
-/// is refused, naming the target the request sent and the cluster it asked
-/// about.
+/// Why a `RevisionTarget` that is neither the revision the cluster runs nor one
+/// of the revisions it is offered is refused.
 ///
 /// A target outside [`cluster_db_revision`]'s `RevisionTargets` is a parameter
 /// value this service cannot honour, which is the `InvalidParameterValue` code
-/// Amazon Redshift answers such a request with.
-pub fn unknown_revision_target_message(cluster_identifier: &str, revision_target: &str) -> String {
-    format!(
-        "Invalid value for RevisionTarget: '{revision_target}'. Cluster {cluster_identifier} cannot be updated to that database revision."
-    )
-}
+/// Amazon Redshift answers such a request with — a DIFFERENT class from
+/// [`CLUSTER_ALREADY_ON_REQUESTED_REVISION`], which is reserved for the revision
+/// the cluster is already on. Recorded wording: fixed text with no variable
+/// part, pointing the caller at the read that reports which target is reachable
+/// next ("You can retrieve this value from the response to the
+/// DescribeClusterDbRevisions request", `smithy_query(query="doc",
+/// shape="ModifyClusterDbRevisionMessage", member="RevisionTarget")`).
+pub const REVISION_TARGET_NEEDS_INTERMEDIATE_UPGRADE: &str =
+    "The requested database revision requires an intermediate upgrade. Use \
+     DescribeClusterDbRevisions to get the next available revision target.";
+
+/// Why a request to move a cluster onto another database revision is refused
+/// while the service is already working on that cluster.
+///
+/// Recorded Amazon Redshift wording for this operation's
+/// `InvalidClusterStateFault` (awsQuery code `InvalidClusterState`): fixed text
+/// with no variable part, naming the work in flight and the state to retry
+/// from rather than the cluster — so it says more than the shared
+/// [`invalid_cluster_state_message`] does and, like the restart's own sentence,
+/// keeps a wording of its own.
+pub const DB_REVISION_MODIFY_REQUIRES_AVAILABLE_CLUSTER: &str =
+    "Cannot modify the cluster-db-revision right now because another operation is running. Check \
+     the cluster's status and retry when the cluster is available.";
 
 /// Resolve the `ClusterType` / `NumberOfNodes` pair a request asks for, or say
 /// why the pair cannot hold.
