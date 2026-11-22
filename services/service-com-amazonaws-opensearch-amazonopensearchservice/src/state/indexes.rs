@@ -284,13 +284,17 @@ pub struct IsmPolicy {
     pub updated_at: SystemTime,
 }
 
-/// Whether an implicit index creation is permitted, and why not when it is refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Whether an implicit index creation is permitted.
+///
+/// The refusal carries NO sentence of its own: whichever form of the setting would not
+/// create it, the index the write named is not on the cluster, and that one condition has
+/// one wording ([`super::ingest::no_such_index`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoCreate {
     /// The setting permits creating this index.
     Allowed,
-    /// It does not: the sentence the engine refuses the write with.
-    Refused(String),
+    /// It does not, so the write met an index the cluster does not hold.
+    Refused,
 }
 
 /// Whether `action.auto_create_index` as the cluster holds it lets a write CREATE the index
@@ -302,10 +306,6 @@ pub enum AutoCreate {
 /// matches decides, a bare pattern being an allow, and a name no pattern matches is
 /// blocked. A cluster holding no value for the setting permits every index, which is its
 /// documented default.
-///
-/// The refusal sentences are the engine's own for the two cases it distinguishes — the
-/// setting switched off, and a name its patterns do not match — each naming the index asked
-/// for and, for the pattern case, the value that refused it.
 pub fn auto_create_index(settings: Option<&str>, index_name: &str) -> AutoCreate {
     let Some(value) = settings else {
         return AutoCreate::Allowed;
@@ -313,11 +313,7 @@ pub fn auto_create_index(settings: Option<&str>, index_name: &str) -> AutoCreate
     let value = value.trim();
     match value {
         "true" => return AutoCreate::Allowed,
-        "false" => {
-            return AutoCreate::Refused(format!(
-                "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] is [false]"
-            ))
-        }
+        "false" => return AutoCreate::Refused,
         _ => {}
     }
     for pattern in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -329,17 +325,11 @@ pub fn auto_create_index(settings: Option<&str>, index_name: &str) -> AutoCreate
             return if allowed {
                 AutoCreate::Allowed
             } else {
-                AutoCreate::Refused(format!(
-                    "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] contains \
-                     [-{pattern}] which forbids automatic creation of the index"
-                ))
+                AutoCreate::Refused
             };
         }
     }
-    AutoCreate::Refused(format!(
-        "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] ([{value}]) doesn't \
-         match"
-    ))
+    AutoCreate::Refused
 }
 
 /// The `IndexSchema` section an index's field mappings live in: `UpdateIndex`
@@ -775,19 +765,43 @@ pub fn index_settings(
 fn expanded_settings(
     settings: ::serde_json::Map<String, ::serde_json::Value>,
 ) -> ::serde_json::Map<String, ::serde_json::Value> {
+    expanded_settings_below(settings, 0)
+}
+
+/// [`expanded_settings`] for a section `depth` levels below the settings section.
+///
+/// [`INDEX_SCHEMA_MAX_DEPTH`] bounds BOTH halves of this walk, so neither the stack it
+/// costs nor the structure it builds is set by the document it reads: a section past the
+/// bound is carried as it is held rather than walked into, and a NAME that names more
+/// sections than that is kept as the one member it was written as rather than expanded into
+/// nesting past the bound. Expanding it is what a reader of the setting needs, and a name
+/// deeper than a schema may nest names no setting this cluster holds — so the expansion
+/// stops where the bound does instead of synthesising from a name what a document may not
+/// carry.
+fn expanded_settings_below(
+    settings: ::serde_json::Map<String, ::serde_json::Value>,
+    depth: usize,
+) -> ::serde_json::Map<String, ::serde_json::Value> {
     use ::serde_json::{Map, Value};
 
     let mut expanded = Map::new();
     for (name, value) in settings {
         let value = match value {
-            Value::Object(members) => Value::Object(expanded_settings(members)),
+            Value::Object(members) if depth < INDEX_SCHEMA_MAX_DEPTH => {
+                Value::Object(expanded_settings_below(members, depth + 1))
+            }
             other => other,
         };
-        let path: Vec<&str> = index_setting_name(&name)
+        let sections: Vec<&str> = index_setting_name(&name)
             .split('.')
             .filter(|section| !section.is_empty())
             .collect();
-        written_setting(&mut expanded, &path, value);
+        let path: &[&str] = if depth + sections.len() > INDEX_SCHEMA_MAX_DEPTH {
+            &[name.as_str()]
+        } else {
+            &sections
+        };
+        written_setting(&mut expanded, path, value, depth);
     }
     expanded
 }
@@ -795,10 +809,16 @@ fn expanded_settings(
 /// Write `value` at `path` in `settings`, as [`expanded_settings`]'s one step: the sections
 /// above it are created where they are not there, and a section both the existing value and
 /// the new one are a set of members of keeps the members of each.
+///
+/// `depth` is how far below the settings section `settings` itself stands, and
+/// [`INDEX_SCHEMA_MAX_DEPTH`] bounds the merge below it for the reason the walk above is
+/// bounded: past the bound the value written STANDS, rather than being merged member by
+/// member into nesting no schema may carry.
 fn written_setting(
     settings: &mut ::serde_json::Map<String, ::serde_json::Value>,
     path: &[&str],
     value: ::serde_json::Value,
+    depth: usize,
 ) {
     use ::serde_json::{Map, Value};
 
@@ -821,9 +841,11 @@ fn written_setting(
     match (node.get_mut(*name), value) {
         // Two names that name the same section — one of them written flattened — are the
         // same section, so the members of both stand.
-        (Some(Value::Object(held)), Value::Object(members)) => {
+        (Some(Value::Object(held)), Value::Object(members))
+            if depth + ancestors.len() < INDEX_SCHEMA_MAX_DEPTH =>
+        {
             for (name, value) in members {
-                written_setting(held, &[name.as_str()], value);
+                written_setting(held, &[name.as_str()], value, depth + ancestors.len() + 1);
             }
         }
         (_, value) => {
@@ -841,15 +863,25 @@ fn written_setting(
 /// already held come along as the one section [`index_settings`] reads them as, so an
 /// update cannot leave the same setting stored under two spellings; every other section
 /// of the schema — the mappings above all — is left exactly as it was.
+///
+/// `Err` is how many sections ONE update's name names, where that is past
+/// [`INDEX_SCHEMA_MAX_DEPTH`]: a setting's name is as deep as its DOTS say, and the schema
+/// it would be written into nests one level per section — so the bound is checked BEFORE any
+/// structure is built, rather than measured on a document this would have synthesised from
+/// a name. The caller refuses such an update, which is why nothing past the bound is ever
+/// stored or walked.
 pub fn with_index_settings(
     schema: &::aws_smithy_types::Document,
     updates: &[(String, Option<::serde_json::Value>)],
-) -> ::aws_smithy_types::Document {
+) -> Result<::aws_smithy_types::Document, usize> {
     use ::serde_json::Value;
 
     let mut settings = document_from_json(&Value::Object(index_settings(schema)));
     for (name, value) in updates {
         let path: Vec<&str> = name.split('.').filter(|part| !part.is_empty()).collect();
+        if path.len() > INDEX_SCHEMA_MAX_DEPTH {
+            return Err(path.len());
+        }
         match value {
             Some(value) => write_member(&mut settings, &path, document_from_json(value)),
             None => remove_member(&mut settings, &path),
@@ -871,7 +903,7 @@ pub fn with_index_settings(
             section.retain(|name, _| name == SETTINGS_INDEX_SECTION);
         }
     }
-    updated
+    Ok(updated)
 }
 
 /// The name the setting `written` names has below [`SETTINGS_INDEX_SECTION`]: an index

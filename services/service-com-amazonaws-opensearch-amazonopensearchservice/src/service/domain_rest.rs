@@ -1999,7 +1999,7 @@ impl Refusal {
         Self {
             status: 404,
             error_type: ingest::INDEX_NOT_FOUND_EXCEPTION.to_string(),
-            reason: format!("no such index [{index_name}]"),
+            reason: ingest::no_such_index(index_name),
         }
     }
 
@@ -2374,11 +2374,12 @@ fn cluster_settings_request(domain: &mut Domain, request: &Request<'_>) -> RtRes
 
 /// Apply the settings update the request's body asks for.
 ///
-/// "Settings can be specified in a flattened or expanded format": either spelling names the
-/// same setting, so a nested object is FLATTENED to the dotted name the setting has and one
-/// spelling is stored. A setting written `null` is REMOVED from its scope, which is how a
-/// client resets one, and a scope the request does not name is left exactly as it was: an
-/// update is of the settings it names.
+/// The MANAGED service takes a setting in its FLAT form only — the dotted name the setting
+/// has — and answers a body that spells one as nested objects with its own refusal
+/// ([`payload_not_allowed`]), so a client that sends the expanded form stores nothing. A
+/// setting written `null` is REMOVED from its scope, which is how a client resets one, and a
+/// scope the request does not name is left exactly as it was: an update is of the settings
+/// it names.
 fn update_cluster_settings(domain: &mut Domain, request: &Request<'_>) -> RtResponse {
     let body = match request.json() {
         Ok(Some(Value::Object(members))) => members,
@@ -2414,7 +2415,7 @@ fn update_cluster_settings(domain: &mut Domain, request: &Request<'_>) -> RtResp
             );
         };
         let mut flattened = Vec::new();
-        if let Err(refusal) = flatten_settings(written, &mut String::new(), &mut flattened) {
+        if let Err(refusal) = written_settings(written, request, &mut flattened) {
             return *refusal;
         }
         // The cluster holds its settings as TEXT, so each value an update wrote is read
@@ -2524,17 +2525,19 @@ type ScopeUpdate = (bool, Vec<SettingUpdate>);
 /// declares.
 const X_CONTENT_PARSE_EXCEPTION: &str = "x_content_parse_exception";
 
-/// Flatten one scope of a settings body to `(the setting's dotted name, its value)` pairs,
-/// `None` for a setting the body resets.
+/// Flatten one settings body to `(the setting's dotted name, its value)` pairs, `None` for a
+/// setting the body resets — the reading an INDEX's own settings API takes, where "settings
+/// can be specified in a flattened or expanded format" and either spelling names the same
+/// setting.
 ///
 /// Iterative in the sense that matters: the recursion is on the body's own nesting, and the
 /// bound is on the NAME the walk composes rather than on that nesting — a setting's name is
 /// as deep as its DOTS say, however the body spelled them, so one key carrying a hundred of
 /// them names a setting exactly as deep as a body nesting a hundred levels does.
 /// [`state::INDEX_SCHEMA_MAX_DEPTH`] bounds both here, so a name past it is refused rather
-/// than stored: that is what keeps the recursion below, and the expansion the report
-/// performs over a stored name ([`reported_settings`]), bounded by a constant instead of by
-/// the body a caller sent.
+/// than stored: that is what keeps the recursion below, and the expansion a report performs
+/// over a stored name ([`reported_settings`]), bounded by a constant instead of by the body a
+/// caller sent.
 fn flatten_settings(
     written: &Map<String, Value>,
     prefix: &mut String,
@@ -2563,6 +2566,58 @@ fn flatten_settings(
         }
     }
     Ok(())
+}
+
+/// Read one scope of a CLUSTER settings body as the settings it names: `(the setting's
+/// dotted name, its value)` pairs, `None` for a setting the body resets.
+///
+/// The MANAGED service takes the FLAT form only, so a member whose value is an OBJECT spells
+/// its setting in the expanded form and the whole request is refused
+/// ([`payload_not_allowed`]) rather than flattened — a client that sent the expanded form is
+/// told its payload is not taken, which is what the service in front of the cluster answers,
+/// and nothing of the body is stored. An INDEX's settings are not under that restriction and
+/// are read by [`flatten_settings`] above.
+///
+/// The bound is the same one, and on the NAME rather than on any nesting: a setting's name is
+/// as deep as its DOTS say, and [`state::INDEX_SCHEMA_MAX_DEPTH`] bounds it, so a name past
+/// it is refused rather than stored.
+fn written_settings(
+    written: &Map<String, Value>,
+    request: &Request<'_>,
+    into: &mut Vec<WrittenSetting>,
+) -> Result<(), Box<RtResponse>> {
+    for (name, value) in written {
+        if value.is_object() {
+            return Err(Box::new(payload_not_allowed(request)));
+        }
+        if name.matches('.').count() > state::INDEX_SCHEMA_MAX_DEPTH {
+            return Err(Box::new(error(
+                400,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &format!("setting [{name}] nests deeper than a setting name may"),
+            )));
+        }
+        match value {
+            Value::Null => into.push((name.clone(), None)),
+            value => into.push((name.clone(), Some(value.clone()))),
+        }
+    }
+    Ok(())
+}
+
+/// What the MANAGED service — rather than the cluster behind it — answers a request whose
+/// body it does not take.
+///
+/// Its own envelope, not the engine's: a `Message` naming the path the request addressed,
+/// with none of the engine's `error` object, because no node of the cluster saw the request.
+/// The status is the one the service refuses such a request with.
+fn payload_not_allowed(request: &Request<'_>) -> RtResponse {
+    rendered(
+        401,
+        &json!({
+            "Message": format!("Your request: '{}' payload is not allowed.", request.path),
+        }),
+    )
 }
 
 /// One scope's settings as a report carries them: EXPANDED into the objects their dotted
@@ -4632,7 +4687,7 @@ fn index_not_found(index_name: &str) -> RtResponse {
     indexed_error(
         404,
         ingest::INDEX_NOT_FOUND_EXCEPTION,
-        &format!("no such index [{index_name}]"),
+        &ingest::no_such_index(index_name),
         index_name,
     )
 }

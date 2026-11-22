@@ -231,7 +231,22 @@ fn updated(domain: &mut Domain, request: &Request<'_>, named: Option<&str>) -> R
         let Some(index) = domain.indexes.get(name) else {
             continue;
         };
-        let schema = state::with_index_settings(&index.schema, &updates);
+        // A name that names more sections than a schema may nest names a setting deeper
+        // than one nests, so it is refused on the name rather than on a document built
+        // from it — the same refusal the merged schema's own depth earns below.
+        let schema = match state::with_index_settings(&index.schema, &updates) {
+            Ok(schema) => schema,
+            Err(sections) => {
+                return error(
+                    400,
+                    ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                    &format!(
+                        "index schema nests {sections} levels, past the maximum this cluster \
+                         takes"
+                    ),
+                )
+            }
+        };
         let depth = state::index_schema_depth(&schema);
         if depth > state::INDEX_SCHEMA_MAX_DEPTH {
             return error(

@@ -12,11 +12,11 @@
 //!   configured role, the engine release and the Availability Zone and nothing else. The
 //!   rows span the node roles a configuration provisions (data only, dedicated masters,
 //!   warm nodes, zone awareness);
-//! * **a cluster setting is written by its NAME, however the request spells it, and read
-//!   back from the scope it was written in** — "settings can be specified in a flattened or
-//!   expanded format", a transient value overrides the persistent one for the same setting,
-//!   and a setting written `null` is reset. The rows span both spellings, both scopes and
-//!   the reset;
+//! * **a cluster setting is written by the flat NAME it has and read back from the scope it
+//!   was written in** — the managed service takes the flat form only and answers a body that
+//!   spells a setting as nested objects with its own refusal, a transient value overrides
+//!   the persistent one for the same setting, and a setting written `null` is reset. The rows
+//!   span both forms, both scopes and the reset;
 //! * **`action.auto_create_index` decides whether a write to an index the cluster does not
 //!   hold CREATES it** — `true` permits every index, `false` none, and a pattern list is
 //!   decided by the first pattern the name matches, a bare pattern being an allow. The rows
@@ -49,6 +49,16 @@ use serde_json::{json, Value};
 
 use super::domain_lifecycle::Emulator;
 use super::domain_rest_data_plane::{error_type, rest_prefixed};
+
+/// WHAT the cluster says about an index `action.auto_create_index` would not have it create
+/// for a write: the status, the error type and the sentence, measured against the ones a
+/// read of an index the cluster does not hold is refused with.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "cluster_apis/implicit_index_creation_refusal.rs"]
+mod implicit_index_creation_refusal;
 
 /// `CreateDomain` with the cluster configuration a row asks for, asserting it was accepted.
 async fn given_domain(emulator: &Emulator, name: &str, cluster: Option<Value>) {
@@ -430,11 +440,14 @@ async fn the_nodes_apis_report_the_processors_and_the_volume_of_each_node() {
     }
 }
 
-/// One settings update to apply: the body it is written with, and what the cluster reports
-/// afterwards for the two scopes.
+/// One settings update to apply: the body it is written with, whether the service takes it,
+/// and what the cluster reports afterwards for the two scopes.
 struct SettingsRow {
     case: &'static str,
     body: Value,
+    /// Whether the managed service REFUSES this body rather than applying it — what the
+    /// expanded form earns.
+    refused: bool,
     /// The `persistent` scope as the report carries it, expanded.
     persistent: Value,
     /// The `transient` scope as the report carries it, expanded.
@@ -443,54 +456,69 @@ struct SettingsRow {
     resolved: Option<&'static str>,
 }
 
-/// The table: both spellings of a setting name, both scopes, the transient override and the
-/// reset.
+/// The table: the flat form in both scopes, the expanded form in each of them, the transient
+/// override and the reset.
 fn settings_rows() -> Vec<SettingsRow> {
     vec![
         SettingsRow {
             case: "the flat form, persistent",
             body: json!({ "persistent": { "action.auto_create_index": "false" } }),
+            refused: false,
             persistent: json!({ "action": { "auto_create_index": "false" } }),
             transient: json!({}),
             resolved: Some("false"),
         },
         SettingsRow {
-            case: "the expanded form names the same setting",
+            case: "the expanded form is not a payload the service takes, persistent",
             body: json!({ "persistent": { "action": { "auto_create_index": "true" } } }),
-            persistent: json!({ "action": { "auto_create_index": "true" } }),
+            refused: true,
+            // Unchanged: a refused payload stores nothing.
+            persistent: json!({ "action": { "auto_create_index": "false" } }),
             transient: json!({}),
-            resolved: Some("true"),
+            resolved: Some("false"),
+        },
+        SettingsRow {
+            case: "the expanded form in the transient scope is refused too",
+            body: json!({ "transient": { "action": { "auto_create_index": "true" } } }),
+            refused: true,
+            persistent: json!({ "action": { "auto_create_index": "false" } }),
+            transient: json!({}),
+            resolved: Some("false"),
         },
         SettingsRow {
             case: "a transient value overrides the persistent one",
-            body: json!({ "transient": { "action.auto_create_index": "false" } }),
-            persistent: json!({ "action": { "auto_create_index": "true" } }),
-            transient: json!({ "action": { "auto_create_index": "false" } }),
-            resolved: Some("false"),
+            body: json!({ "transient": { "action.auto_create_index": "true" } }),
+            refused: false,
+            persistent: json!({ "action": { "auto_create_index": "false" } }),
+            transient: json!({ "action": { "auto_create_index": "true" } }),
+            resolved: Some("true"),
         },
         SettingsRow {
             case: "a second setting lands beside the first",
             body: json!({ "persistent": { "cluster.max_shards_per_node": 1000 } }),
+            refused: false,
             persistent: json!({
-                "action": { "auto_create_index": "true" },
+                "action": { "auto_create_index": "false" },
                 "cluster": { "max_shards_per_node": "1000" },
             }),
-            transient: json!({ "action": { "auto_create_index": "false" } }),
-            resolved: Some("false"),
+            transient: json!({ "action": { "auto_create_index": "true" } }),
+            resolved: Some("true"),
         },
         SettingsRow {
             case: "a null resets the setting in its own scope",
             body: json!({ "transient": { "action.auto_create_index": Value::Null } }),
+            refused: false,
             persistent: json!({
-                "action": { "auto_create_index": "true" },
+                "action": { "auto_create_index": "false" },
                 "cluster": { "max_shards_per_node": "1000" },
             }),
             transient: json!({}),
-            resolved: Some("true"),
+            resolved: Some("false"),
         },
         SettingsRow {
             case: "and in the persistent scope too",
             body: json!({ "persistent": { "action.auto_create_index": Value::Null } }),
+            refused: false,
             persistent: json!({ "cluster": { "max_shards_per_node": "1000" } }),
             transient: json!({}),
             resolved: None,
@@ -498,8 +526,10 @@ fn settings_rows() -> Vec<SettingsRow> {
     ]
 }
 
-/// RULE: a cluster setting is written by its NAME, however the request spells it, read back
-/// from the scope it was written in, and a transient value overrides the persistent one.
+/// RULE: a cluster setting is written by the flat NAME it has — the managed service takes no
+/// body that spells one as nested objects, and refuses it in its OWN envelope without storing
+/// anything — read back from the scope it was written in, and a transient value overrides the
+/// persistent one.
 #[tokio::test]
 async fn a_cluster_setting_is_written_by_its_name_and_read_back_from_its_scope() {
     let emulator = Emulator::new();
@@ -525,22 +555,44 @@ async fn a_cluster_setting_is_written_by_its_name_and_read_back_from_its_scope()
             Some(row.body.clone()),
         )
         .await;
-        assert_eq!(
-            applied.status, 200,
-            "case {case:?}: expected 200 from PUT /_cluster/settings, got {} with {:?}",
-            applied.status, applied.body
-        );
-        assert_eq!(
-            applied.body["acknowledged"].as_bool(),
-            Some(true),
-            "case {case:?}: expected the update to be acknowledged, got {:?}",
-            applied.body
-        );
+        if row.refused {
+            // The refusal is the SERVICE's own, not a cluster answer: its `Message` names the
+            // path the request addressed, and the engine's `error` object is absent because
+            // no node of the cluster saw the body.
+            assert_eq!(
+                (applied.status, &applied.body),
+                (
+                    401,
+                    &json!({
+                        "Message": "Your request: '/_cluster/settings' payload is not allowed.",
+                    })
+                ),
+                "case {case:?}: expected the expanded form to be refused, got {} with {:?}",
+                applied.status,
+                applied.body
+            );
+        } else {
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?}: expected 200 from PUT /_cluster/settings, got {} with {:?}",
+                applied.status, applied.body
+            );
+            assert_eq!(
+                applied.body["acknowledged"].as_bool(),
+                Some(true),
+                "case {case:?}: expected the update to be acknowledged, got {:?}",
+                applied.body
+            );
+        }
 
         // The update's own answer and a later read report the same settings: what the
-        // cluster holds, not what the request said.
+        // cluster holds, not what the request said. A refused body is reported by the read
+        // alone, which is where it shows that nothing of it was stored.
         let read = rest_prefixed(&emulator, domain, "GET", "/_cluster/settings", None).await;
         for (reader, body) in [("PUT", &applied.body), ("GET", &read.body)] {
+            if row.refused && reader == "PUT" {
+                continue;
+            }
             assert_eq!(
                 (&body["persistent"], &body["transient"]),
                 (&row.persistent, &row.transient),
@@ -895,16 +947,20 @@ async fn auto_create_index_decides_whether_a_write_mints_the_index_it_names() {
                 written.status,
                 written.body
             );
-            // The refusal names the index asked for and the setting that refused it.
+            // The refusal names the index asked for, and nothing else: whichever form of
+            // the setting would not create it, the condition the write met is an index the
+            // cluster does not hold. The sentence itself is pinned, against the one a read
+            // of a missing index is refused with, by
+            // [`implicit_index_creation_refusal`].
             let reason = written.body["error"]["reason"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            assert!(
-                reason.contains(&format!("no such index [{}]", row.index))
-                    && reason.contains("action.auto_create_index"),
-                "case {case:?}: expected the reason to name the index and the setting, got \
-                 {reason:?}"
+            assert_eq!(
+                reason,
+                format!("no such index [{}]", row.index),
+                "case {case:?}: expected the reason to name the index the write could not \
+                 create, got {reason:?}"
             );
 
             // An index the cluster HOLDS takes the write: the setting governs creation only.

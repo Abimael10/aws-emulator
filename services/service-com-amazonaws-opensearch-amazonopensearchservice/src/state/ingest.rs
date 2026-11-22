@@ -206,6 +206,19 @@ pub const SECURITY_EXCEPTION: &str = "security_exception";
 /// write the cluster may not create it for ([`super::auto_create_index`]).
 pub const INDEX_NOT_FOUND_EXCEPTION: &str = "index_not_found_exception";
 
+/// The sentence the engine states about an index the cluster does not hold, naming that
+/// index and nothing else.
+///
+/// ONE wording for the condition, whichever request met it: a read addressed to an index
+/// that is not there, and a write the cluster may not create one for, met the same missing
+/// index — so neither carries a clause the other does not, and in particular the setting
+/// that forbade the creation is no part of what the engine says
+/// ([`super::auto_create_index`]).
+#[must_use]
+pub fn no_such_index(index_name: &str) -> String {
+    format!("no such index [{index_name}]")
+}
+
 /// The engine's error type for a document carrying a field the mappings do not carry,
 /// where they are `strict`.
 pub const STRICT_DYNAMIC_MAPPING_EXCEPTION: &str = "strict_dynamic_mapping_exception";
@@ -556,12 +569,14 @@ fn index_for<'d>(
     if !domain.indexes.contains_key(index_name) {
         // A write to an index the cluster does not hold CREATES it only while
         // `action.auto_create_index` lets it: the setting is what a client turns implicit
-        // creation off with, and a write it forbids is refused rather than minting the
-        // index ([`super::auto_create_index`]).
-        if let super::AutoCreate::Refused(reason) = domain.auto_creates_index(index_name) {
+        // creation off with, and a write it forbids met an index the cluster does not hold
+        // — refused with the engine's sentence for exactly that ([`no_such_index`]), which
+        // names the index and not the setting that would not create it
+        // ([`super::auto_create_index`]).
+        if domain.auto_creates_index(index_name) == super::AutoCreate::Refused {
             return Err(WriteRefusal::Rejected {
                 error_type: INDEX_NOT_FOUND_EXCEPTION,
-                message: reason,
+                message: no_such_index(index_name),
             });
         }
         if domain.indexes.len() >= super::INDEX_QUOTA {

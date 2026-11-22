@@ -434,7 +434,9 @@ async fn an_index_settings_put_changes_every_index_the_path_names_and_nothing_el
 /// RULE: a setting's name is as deep as its DOTS say, however the body spelled them, so one
 /// key carrying them is bounded exactly as a body nesting that far is — a name past the
 /// maximum is refused and stored by nothing, whichever spelling it arrived in, while a name
-/// the bound admits is written and reported as before.
+/// the bound admits is written and reported as before. On the CLUSTER's own settings the
+/// nested spelling never reaches that bound: the managed service takes the flat form only
+/// and refuses the body itself.
 ///
 /// The rows span the two spellings the same depth arrives in (one dotted key and a nested
 /// body) and a name far past the bound, each over the index-settings route and the cluster's
@@ -482,22 +484,32 @@ async fn a_setting_name_deeper_than_the_maximum_is_refused_in_either_spelling() 
     struct Case {
         case: &'static str,
         body: Value,
+        /// Whether the body spells the name as NESTED objects rather than as one dotted key.
+        nested_form: bool,
     }
     let rows = [
         Case {
             case: "one dotted key one past the maximum",
             body: json!({ dotted(MAX_DOTS + 1): "x" }),
+            nested_form: false,
         },
         Case {
             case: "a nested body one past the maximum",
             body: nested(MAX_DOTS + 1),
+            nested_form: true,
         },
         Case {
             case: "one dotted key far past the maximum",
             body: json!({ dotted(MAX_DOTS * 10): "x" }),
+            nested_form: false,
         },
     ];
-    for Case { case, body } in rows {
+    for Case {
+        case,
+        body,
+        nested_form,
+    } in rows
+    {
         for (route, path) in [
             ("the index settings", format!("/{INDEX}/_settings")),
             (
@@ -514,6 +526,27 @@ async fn a_setting_name_deeper_than_the_maximum_is_refused_in_either_spelling() 
             };
             let answered =
                 rest(&emulator, DEFAULT_ACCESS_KEY_ID, &host, "PUT", &path, Some(sent)).await;
+            // The CLUSTER's settings are taken in the flat form only, so a nested body on
+            // that route is refused by the service before any name is read — what the depth
+            // bound refuses there is a dotted name, and on an index's own settings it
+            // refuses both spellings.
+            if nested_form && route.starts_with("the cluster") {
+                assert_eq!(
+                    (answered.status, &answered.body),
+                    (
+                        401,
+                        &json!({
+                            "Message":
+                                "Your request: '/_cluster/settings' payload is not allowed.",
+                        })
+                    ),
+                    "case {case:?} on {route}: expected the service's own refusal of the \
+                     expanded form, got {} with {:?}",
+                    answered.status,
+                    answered.body
+                );
+                continue;
+            }
             assert_eq!(
                 (answered.status, error_type(&answered)),
                 (400, "illegal_argument_exception".to_string()),
@@ -576,6 +609,83 @@ async fn a_setting_name_deeper_than_the_maximum_is_refused_in_either_spelling() 
         settings.get("a").is_none(),
         "case \"a refused name\": expected nothing of it to be stored, got {settings:?}"
     );
+}
+
+/// How deeply `value` nests: 1 for a scalar, one more for each level of nesting under it.
+/// Iterative, so measuring a deep document costs the measurement no stack.
+fn nesting(value: &Value) -> usize {
+    let mut deepest = 0_usize;
+    let mut pending = vec![(1_usize, value)];
+    while let Some((depth, value)) = pending.pop() {
+        deepest = deepest.max(depth);
+        match value {
+            Value::Object(members) => {
+                pending.extend(members.values().map(|member| (depth + 1, member)));
+            }
+            Value::Array(elements) => {
+                pending.extend(elements.iter().map(|element| (depth + 1, element)));
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// RULE: the sections a setting's NAME names are bounded exactly as the nesting of a document
+/// a request carries is, so no name can make this cluster build or report a schema deeper than
+/// it takes — a name past the bound is carried as the one member it was written as, and the
+/// index goes on answering for its settings.
+///
+/// The create path takes a document the bound admits, so a name of many sections is a SHALLOW
+/// document that is accepted: what this pins is that reading it back does not expand that name
+/// into the nesting the document itself may not carry.
+#[tokio::test]
+async fn a_setting_name_naming_more_sections_than_a_schema_nests_is_not_expanded_into_them() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "settings-sections").await;
+    let host = endpoint_of(&emulator, "settings-sections");
+
+    /// How many sections the name below names — past `state::INDEX_SCHEMA_MAX_DEPTH` (100),
+    /// stated here independently of the constant the implementation reads it from.
+    const SECTIONS: usize = 150;
+
+    let name = vec!["a"; SECTIONS].join(".");
+    let created = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "PUT",
+        &format!("/{INDEX}"),
+        Some(json!({ "settings": { name.clone(): "1" } })),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"a create carrying a name of {SECTIONS} sections\": expected the shallow \
+         document to be taken, got {} with {:?}",
+        created.status, created.body
+    );
+
+    for (case, path) in [
+        ("the nested report", format!("/{INDEX}/_settings")),
+        (
+            "the flat report",
+            format!("/{INDEX}/_settings?flat_settings=true"),
+        ),
+    ] {
+        let reported = rest(&emulator, DEFAULT_ACCESS_KEY_ID, &host, "GET", &path, None).await;
+        assert_eq!(
+            reported.status, 200,
+            "case {case:?}: expected the index to answer for its settings, got {} with {:?}",
+            reported.status, reported.body
+        );
+        let nested = nesting(&reported.body);
+        assert!(
+            nested < SECTIONS,
+            "case {case:?}: expected the report not to nest one level per section of the \
+             name, got {nested} levels"
+        );
+    }
 }
 
 /// One row of the REPORTING-FORM table: how one setting is written, the full name the
