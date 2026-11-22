@@ -4,8 +4,9 @@
 //! IMPLEMENTED: pages the output the named execution's run wrote — the column labels
 //! first for a DML query, then the rows, with the flattened view of the same page beside
 //! the modelled one, the statement's result output text beside both, and the empty result
-//! set of a statement whose result is the engine's text output — and refuses an execution
-//! that wrote no output at all.
+//! set of a statement whose result is the engine's text output — or, for a request that asks
+//! for `DATA_MANIFEST`, the objects a statement that WROTE its output stored, one row each;
+//! and refuses an execution that wrote no output at all, or no manifest.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // "If set to DATA_MANIFEST, it returns the manifest file in rows" — and no
-        // query here writes one (`DataManifestLocation` is reported for none), so there
-        // is no manifest to page rather than an empty one to invent.
-        if input.query_result_type.as_deref() == Some(QUERY_RESULT_TYPE_DATA_MANIFEST) {
-            return Err(invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                format!(
-                    "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not available: this \
-                     query wrote no data manifest"
-                ),
-            ));
-        }
         // "The maximum number of results (rows) to return in this request", bounded by
         // the modelled maximum so a request that names none still pages.
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_ROWS))
@@ -213,13 +202,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the modelled `GetQueryResultsOutput` does not declare but the service publishes:
         // the text output the run wrote, which for a statement the engine reported in error
         // is its diagnostic, and which is empty for one whose results are the rows.
-        let Some(result) = record.readable_result_at(now) else {
-            // The refusal's cause is the STATE the execution is in rather than anything
-            // the request got wrong, which is the class the code reports.
-            return Err(invalid_request(
-                crate::state::ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
-                crate::state::results_not_readable(state_name),
-            ));
+        // WHAT this read pages: the statement's own result set, or — where the request asked
+        // for it — the DATA MANIFEST, "the manifest file in rows", which is the objects the
+        // statement wrote. A statement that wrote no manifest at all has none to page,
+        // whatever state its execution is in: the request asked for something that query
+        // does not have rather than for results that are not readable yet.
+        let manifest = match input.query_result_type.as_deref() {
+            Some(QUERY_RESULT_TYPE_DATA_MANIFEST) => match record.data_manifest_at(now) {
+                Some(manifest) => Some(manifest),
+                // A query that WILL have a manifest and has not reached a terminal state
+                // yet is reported by the state it is in, exactly as a read of its rows is;
+                // one whose run wrote no output has no manifest to page whatever state it
+                // is in, which is a refusal of the request rather than of the state.
+                None if record.writes_a_data_manifest() => {
+                    return Err(invalid_request(
+                        crate::state::ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
+                        crate::state::results_not_readable(state_name),
+                    ))
+                }
+                None => {
+                    return Err(invalid_request(
+                        crate::state::ERROR_CODE_INVALID_INPUT,
+                        format!(
+                            "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not \
+                             available: this query wrote no data manifest"
+                        ),
+                    ))
+                }
+            },
+            _ => None,
+        };
+        let result = match &manifest {
+            Some(manifest) => manifest,
+            None => {
+                let Some(result) = record.readable_result_at(now) else {
+                    // The refusal's cause is the STATE the execution is in rather than
+                    // anything the request got wrong, which is the class the code reports.
+                    return Err(invalid_request(
+                        crate::state::ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
+                        crate::state::results_not_readable(state_name),
+                    ));
+                };
+                result
+            }
         };
 
         let position = match input.next_token.as_deref() {
@@ -240,9 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A DML query's results are read as the data files Athena wrote them to, whose
         // first line is the column labels — so the first row of the FIRST page carries
         // the labels and the data rows follow it. A query that defines or describes
-        // something writes no such header.
+        // something writes no such header, and neither does a read of the data manifest:
+        // its rows are the objects the statement wrote rather than a result set of its own.
         let labels = usize::from(
-            record.statement_type.as_deref() == Some(crate::state::query_engine::STATEMENT_TYPE_DML)
+            manifest.is_none()
+                && record.statement_type.as_deref()
+                    == Some(crate::state::query_engine::STATEMENT_TYPE_DML)
                 && !result.column_info.is_empty(),
         );
         let total = labels.saturating_add(result.rows.len());

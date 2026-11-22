@@ -6,7 +6,12 @@
 //! `EXECUTE <statement_name> USING <arguments>` submission, the query statement the named
 //! workgroup's prepared statement holds, with those arguments bound to its placeholders —
 //! persists the execution and the result set it produced, and answers with the id it minted —
-//! the same id, and no second execution, for a repeated `ClientRequestToken`. The metadata
+//! the same id, and no second execution, for a repeated `ClientRequestToken`. A statement whose
+//! result is OBJECTS rather than rows (`CREATE TABLE … AS <query>`, `UNLOAD (<query>) TO …`)
+//! has the rows its query produced WRITTEN into the object store under the location it names,
+//! in the format its `format` property names and partitioned as its `partitioned_by` asks,
+//! with the table registered in the Data Catalog over them and a data manifest of those
+//! objects saved beside the results (`crate::state::catalog_sql::query_output`). The metadata
 //! the statement needs of the AWS Glue Data Catalog is reached with the CALLER's identity,
 //! so a submission whose catalog actions the caller's policies do not allow is taken and
 //! settles FAILED carrying that refusal (`crate::state::catalog_authorization`). The state the
@@ -495,6 +500,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let result_write_refusal = result_write_refusal.or(encryption_refusal);
 
+        // The execution's own id and the results location it resolved, which the run needs:
+        // the objects a statement that WRITES its output stores are named after the
+        // execution, and a table it defines with no location of its own is written under
+        // that results location. Taken before the record below is built out of them.
+        let execution_id = id.clone();
+        let resolved_output_location = result_configuration.output_location.clone();
+
         // Everything that reads or writes the registry happens here, and the lock is
         // released before the engine is asked to run anything: a query running on one
         // database must not serialise every other Athena request behind it. The
@@ -658,6 +670,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let sql = statement_sql.clone();
                     let parameters = bound_parameters.clone();
                     let engine = ::std::sync::Arc::clone(&self.engine);
+                    // The encryption every object this execution stores is written under,
+                    // which the run needs for the DATA a statement that writes its output
+                    // stores — the same configuration the results beside it are saved under.
+                    let encryption = result_encryption.clone();
                     // The statement runs on a blocking thread: the catalog's store, the
                     // object store and the SQL engine are all synchronous, and the engine is
                     // CPU-bound, so none of that work belongs on an async worker. The bounds
@@ -669,11 +685,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &sql,
                             reading,
                             &catalog_sql::Submission {
+                                id: &execution_id,
                                 context: &query_context,
                                 parameters: &parameters,
                                 access: &access,
                                 now: SystemTime::now(),
                                 scan_cutoff,
+                                output_location: resolved_output_location.as_deref(),
+                                encryption: &encryption,
                             },
                         )
                     })

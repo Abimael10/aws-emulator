@@ -45,7 +45,7 @@
 use ::service_common::iam_authorization as iam;
 
 use super::authorization::{self, RefusedBy};
-use super::catalog_sql::statement::{CatalogStatement, Plan, Reading, Relation};
+use super::catalog_sql::statement::{self, CatalogStatement, Plan, Reading, Relation};
 
 /// The IAM action prefix of the AWS Glue Data Catalog, which is also the namespace every
 /// Glue ARN carries.
@@ -77,6 +77,13 @@ const CREATE_TABLE: &str = "CreateTable";
 
 /// The Glue action that removes a table, which `DROP TABLE` and `DROP VIEW` are.
 const DELETE_TABLE: &str = "DeleteTable";
+
+/// The Glue action that LISTS one table's partitions, which `SHOW PARTITIONS` is.
+const GET_PARTITIONS: &str = "GetPartitions";
+
+/// The Glue action that writes the partitions of a table, which a statement that writes a
+/// PARTITIONED table's data registers them with.
+const BATCH_CREATE_PARTITION: &str = "BatchCreatePartition";
 
 /// The resource portion of the ARN of the catalog itself.
 const CATALOG_RESOURCE: &str = "catalog";
@@ -148,27 +155,19 @@ fn needed<Eng: Send + Sync + 'static>(
         // nothing the catalog holds, reach no catalog.
         Plan::Engine => {}
         Plan::Relations(relational) => {
-            for relation in &relational.relations {
-                // The catalog's own reporting schema is not a catalog entry: a statement
-                // reads it to be told what the catalog holds, and what it is shown is each
-                // database and table the reads below are decided on.
-                if relation.is_information_schema() {
-                    continue;
-                }
-                // WHOSE catalog the relation lives in: a statement over a catalog no Glue
-                // Data Catalog serves needs no Glue permission at all.
-                let Some(account) = catalog_account(engine, &relation.catalog) else {
-                    continue;
-                };
-                // Resolving a relation reads the database it names and then the table in it,
-                // which is the order the plan reaches them in.
-                push(
-                    &mut asked,
-                    GET_DATABASE,
-                    database_arns(&account, region, &relation.database),
-                );
-                push(&mut asked, GET_TABLE, table_arns(&account, region, relation));
-            }
+            push_relations(&mut asked, engine, &relational.relations, region);
+        }
+        // A statement that WRITES its output reads the relations its query names exactly as
+        // the read above does, and — where it defines a table — writes that table's own
+        // entry, and the partitions of its data where it is partitioned.
+        Plan::Written(writing) => {
+            push_relations(&mut asked, engine, &writing.query.relations, region);
+            push_destination(
+                &mut asked,
+                ::engine::emulator_account_id(),
+                region,
+                &writing.destination,
+            );
         }
         Plan::Catalog(statement) => {
             let (action, resources) = catalog_statement_action(statement, region);
@@ -176,6 +175,58 @@ fn needed<Eng: Send + Sync + 'static>(
         }
     }
     asked
+}
+
+/// Add the actions resolving each of `relations` performs: the database it names, and then
+/// the table in it, which is the order the plan reaches them in.
+fn push_relations<Eng: Send + Sync + 'static>(
+    asked: &mut Vec<(String, String)>,
+    engine: &Eng,
+    relations: &[Relation],
+    region: &str,
+) {
+    for relation in relations {
+        // The catalog's own reporting schema is not a catalog entry: a statement
+        // reads it to be told what the catalog holds, and what it is shown is each
+        // database and table the reads below are decided on.
+        if relation.is_information_schema() {
+            continue;
+        }
+        // WHOSE catalog the relation lives in: a statement over a catalog no Glue
+        // Data Catalog serves needs no Glue permission at all.
+        let Some(account) = catalog_account(engine, &relation.catalog) else {
+            continue;
+        };
+        push(
+            asked,
+            GET_DATABASE,
+            database_arns(&account, region, &relation.database),
+        );
+        push(asked, GET_TABLE, table_arns(&account, region, relation));
+    }
+}
+
+/// Add the actions a statement that WRITES its output performs on what it DEFINES: a
+/// statement that defines a table writes that table's entry, and the partitions of its data
+/// where it partitions it; one that writes objects and defines nothing reaches no catalog
+/// entry of its own.
+fn push_destination(
+    asked: &mut Vec<(String, String)>,
+    account: &str,
+    region: &str,
+    destination: &statement::WriteDestination,
+) {
+    let statement::WriteDestination::Table(table) = destination else {
+        return;
+    };
+    push(asked, CREATE_TABLE, table_arns(account, region, &table.target));
+    if !table.partitioned_by.is_empty() {
+        push(
+            asked,
+            BATCH_CREATE_PARTITION,
+            table_arns(account, region, &table.target),
+        );
+    }
 }
 
 /// The Glue action one statement the catalog itself performs IS, with the resources it is
@@ -221,6 +272,9 @@ fn catalog_statement_action(
         }
         CatalogStatement::ShowRelations { schema, .. } => {
             (GET_TABLES, database_arns(account, region, &schema.database))
+        }
+        CatalogStatement::ShowPartitions { target } => {
+            (GET_PARTITIONS, table_arns(account, region, target))
         }
     }
 }
@@ -369,21 +423,29 @@ mod tests {
     fn asked_of(account: &str, sql: &str) -> Vec<(String, String)> {
         let reading = statement::read(sql, &context());
         let region = "us-east-1";
+        // The actions resolving one list of relations performs, which both a read and a
+        // statement that writes its output perform.
+        let relation_actions = |relations: &[Relation]| {
+            let mut asked = Vec::new();
+            for relation in relations {
+                if relation.is_information_schema() {
+                    continue;
+                }
+                push(
+                    &mut asked,
+                    GET_DATABASE,
+                    database_arns(account, region, &relation.database),
+                );
+                push(&mut asked, GET_TABLE, table_arns(account, region, relation));
+            }
+            asked
+        };
         match &reading.plan {
             Plan::Engine => Vec::new(),
-            Plan::Relations(relational) => {
-                let mut asked = Vec::new();
-                for relation in &relational.relations {
-                    if relation.is_information_schema() {
-                        continue;
-                    }
-                    push(
-                        &mut asked,
-                        GET_DATABASE,
-                        database_arns(account, region, &relation.database),
-                    );
-                    push(&mut asked, GET_TABLE, table_arns(account, region, relation));
-                }
+            Plan::Relations(relational) => relation_actions(&relational.relations),
+            Plan::Written(writing) => {
+                let mut asked = relation_actions(&writing.query.relations);
+                push_destination(&mut asked, account, region, &writing.destination);
                 asked
             }
             Plan::Catalog(statement) => {

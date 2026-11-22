@@ -82,6 +82,25 @@ pub const SUBSTATEMENT_DROP_VIEW: &str = "DROP_VIEW";
 /// `EXECUTE`, whatever the prepared statement it runs happens to be, and it belongs to the
 /// `StatementType` class that queries or changes data.
 pub const SUBSTATEMENT_EXECUTE: &str = "EXECUTE";
+/// The `SubstatementType` of a statement that WRITES the rows a query produced as objects
+/// of the object store.
+pub const SUBSTATEMENT_UNLOAD: &str = "UNLOAD";
+
+/// The `format` property of a statement that writes its output: which file format the
+/// objects it writes are written in.
+///
+/// Source: the `WITH` property lists of Athena's `CREATE TABLE AS SELECT` and `UNLOAD`,
+/// whose properties are named here so the statement reader and the writer that honours
+/// them spell each one once.
+pub const FORMAT_PROPERTY: &str = "format";
+
+/// The `external_location` property of a `CREATE TABLE AS SELECT`: where the table's data
+/// is written, which is also the location its catalog entry records.
+pub const EXTERNAL_LOCATION_PROPERTY: &str = "external_location";
+
+/// The `partitioned_by` property of a `CREATE TABLE AS SELECT`: the columns the table is
+/// partitioned by, as an array of column names.
+pub const PARTITIONED_BY_PROPERTY: &str = "partitioned_by";
 
 /// The database an `information_schema` relation addresses: the schema every SQL engine
 /// reports its own catalog through, which Athena serves out of the Data Catalog.
@@ -242,6 +261,63 @@ pub enum Plan {
     Catalog(Box<CatalogStatement>),
     /// A statement the engine runs over relations the catalog resolves.
     Relations(Box<RelationalStatement>),
+    /// A statement that WRITES the rows its query produced into the object store: the
+    /// query is run exactly as [`Plan::Relations`] runs one, and what it produced is then
+    /// written rather than answered with.
+    Written(Box<WritingStatement>),
+}
+
+/// A statement whose result is OBJECTS rather than rows: `CREATE TABLE … AS <query>` and
+/// `UNLOAD (<query>) TO '<location>'`.
+#[derive(Debug)]
+pub struct WritingStatement {
+    /// The query whose rows are written, as the statement it is run as: its relations are
+    /// resolved and it is handed to the engine exactly like any other read.
+    pub query: RelationalStatement,
+    /// What is done with the rows it produced.
+    pub destination: WriteDestination,
+}
+
+/// What a statement does with the rows its query produced.
+#[derive(Debug)]
+pub enum WriteDestination {
+    /// `CREATE TABLE <name> WITH (…) AS <query>`: the rows are written at the table's own
+    /// location and the table is registered in the Data Catalog over them.
+    Table(TableAsSelect),
+    /// `UNLOAD (<query>) TO '<location>' WITH (…)`: the rows are written at the location,
+    /// and nothing is registered.
+    Unload(UnloadStatement),
+}
+
+/// A `CREATE TABLE … AS <query>` statement, as its name and properties state it.
+#[derive(Debug, Clone)]
+pub struct TableAsSelect {
+    /// The table it defines.
+    pub target: Relation,
+    /// Whether an existing entry of that name leaves the statement successful.
+    pub if_not_exists: bool,
+    /// The `format` property, as written; `None` where the statement declared none, in
+    /// which case the documented default format is written.
+    pub format: Option<String>,
+    /// The `external_location` property, as written; `None` where the statement declared
+    /// none, in which case the data is written under the query's own result location.
+    pub external_location: Option<String>,
+    /// The `partitioned_by` property: the columns the table is partitioned by, in the
+    /// order the statement listed them and folded the way the catalog folds a column name.
+    pub partitioned_by: Vec<String>,
+}
+
+/// An `UNLOAD (<query>) TO '<location>'` statement, as its destination and properties state
+/// it.
+#[derive(Debug, Clone)]
+pub struct UnloadStatement {
+    /// `TO '<location>'`: where the objects are written.
+    pub location: String,
+    /// The `format` property, as written; `None` where the statement declared none.
+    pub format: Option<String>,
+    /// Where in the submitted text the statement begins, which is where a refusal about
+    /// its properties reports the mistake.
+    pub at: Position,
 }
 
 /// A statement the engine runs once its relations are resolved.
@@ -309,6 +385,11 @@ pub enum CatalogStatement {
         views_only: bool,
         /// The pattern the statement narrows its answer by, if it gave one.
         filter: Option<RelationFilter>,
+    },
+    /// `SHOW PARTITIONS`: lists the partitions the catalog holds for one table.
+    ShowPartitions {
+        /// The table whose partitions are listed.
+        target: Relation,
     },
 }
 
@@ -503,7 +584,7 @@ pub fn read_parsed(
         statement_type: Some(statement_type),
         substatement_type,
         counts_rows,
-        plan: plan_of(statement, context),
+        plan: plan_of(sql, statement, context),
     }
 }
 
@@ -766,7 +847,11 @@ fn statement_type_of(statement: &SqlStatement) -> &'static str {
         | SqlStatement::Insert(..)
         | SqlStatement::Update { .. }
         | SqlStatement::Delete(..)
-        | SqlStatement::Merge { .. } => STATEMENT_TYPE_DML,
+        | SqlStatement::Merge { .. }
+        // `UNLOAD` writes the rows a query produced, which is a statement that manipulates
+        // DATA rather than one that defines an object: Athena documents it among its DML
+        // statements.
+        | SqlStatement::Unload { .. } => STATEMENT_TYPE_DML,
         SqlStatement::CreateTable(..)
         | SqlStatement::CreateView { .. }
         | SqlStatement::CreateIndex(..)
@@ -797,6 +882,7 @@ fn substatement_type_of(statement: &SqlStatement) -> Option<&'static str> {
         SqlStatement::CreateTable(..) => SUBSTATEMENT_CREATE_TABLE,
         SqlStatement::Query(..) => SUBSTATEMENT_SELECT,
         SqlStatement::Insert(..) => SUBSTATEMENT_INSERT_INTO,
+        SqlStatement::Unload { .. } => SUBSTATEMENT_UNLOAD,
         SqlStatement::Update { .. } => "UPDATE",
         SqlStatement::Delete(..) => "DELETE",
         SqlStatement::Merge { .. } => "MERGE",
@@ -825,7 +911,83 @@ fn substatement_type_of(statement: &SqlStatement) -> Option<&'static str> {
 
 /// How one parsed statement runs: what the catalog performs, what it resolves relations
 /// for, and what is the engine's own business.
-fn plan_of(statement: SqlStatement, context: &QueryContext) -> Plan {
+///
+/// A statement whose result is OBJECTS rather than rows is planned as the query it writes
+/// plus the destination it writes to, so the engine is handed a read and the writing is this
+/// layer's own; `sql` is the submitted text, which is where the POSITION such a statement's
+/// own refusals report comes from.
+fn plan_of(sql: &str, statement: SqlStatement, context: &QueryContext) -> Plan {
+    match statement {
+        // `CREATE TABLE … AS <query>`: a table DEFINED by the rows a query produced.
+        SqlStatement::CreateTable(create) if create.query.is_some() => {
+            let target = relation_of(&create.name, context);
+            let query = create.query.clone();
+            let (Some(target), Some(query)) = (target, query) else {
+                // A name that addresses no catalog relation is no table this layer defines,
+                // so the statement is read as whatever else it is.
+                return read_plan(SqlStatement::CreateTable(create), context);
+            };
+            let options = option_list(&create.table_options);
+            let destination = WriteDestination::Table(TableAsSelect {
+                target,
+                if_not_exists: create.if_not_exists,
+                format: string_option(options, FORMAT_PROPERTY),
+                external_location: string_option(options, EXTERNAL_LOCATION_PROPERTY),
+                partitioned_by: array_option(options, PARTITIONED_BY_PROPERTY)
+                    .iter()
+                    .map(|column| glue_state::fold_name(column))
+                    .collect(),
+            });
+            written_over(SqlStatement::Query(query), destination, context)
+        }
+        // `UNLOAD (<query>) TO '<location>'`: the rows of a query, written as objects.
+        SqlStatement::Unload {
+            query: Some(query),
+            to,
+            with,
+            ..
+        } => {
+            let destination = WriteDestination::Unload(UnloadStatement {
+                location: to.value.clone(),
+                format: string_option(&with, FORMAT_PROPERTY),
+                at: statement_start(sql),
+            });
+            written_over(SqlStatement::Query(query), destination, context)
+        }
+        other => read_plan(other, context),
+    }
+}
+
+/// Where the submitted statement BEGINS: the first token the grammar reads of it, which is
+/// the position a refusal about the statement as a whole reports.
+fn statement_start(sql: &str) -> Position {
+    super::grammar::significant_tokens(sql)
+        .first()
+        .map_or(Position::START, super::grammar::position_of)
+}
+
+/// The word a `SHOW PARTITIONS` statement names its subject by, which is how that
+/// statement is told from every other `SHOW <name>` the parser reads the same way.
+const SHOW_PARTITIONS: &str = "PARTITIONS";
+
+/// The plan that runs `query` and writes what it produced to `destination`.
+fn written_over(
+    query: SqlStatement,
+    destination: WriteDestination,
+    context: &QueryContext,
+) -> Plan {
+    let relations = relations_of(&query, context);
+    Plan::Written(Box::new(WritingStatement {
+        query: RelationalStatement {
+            statement: query,
+            relations,
+        },
+        destination,
+    }))
+}
+
+/// How one parsed statement that is not a writing statement runs; see [`plan_of`].
+fn read_plan(statement: SqlStatement, context: &QueryContext) -> Plan {
     match &statement {
         // A database is a CATALOG object: the statement defines, drops or lists the
         // container the catalog holds tables in, and reads no data at all. A `SCHEMA` is
@@ -893,6 +1055,18 @@ fn plan_of(statement: SqlStatement, context: &QueryContext) -> Plan {
                 catalog: context.catalog.clone(),
                 filter: filter_of(show_options),
             }))
+        }
+        // The PARTITIONS of a table are catalog records, so the statement that lists them
+        // is answered from the catalog. The parser reads it as the `SHOW <name>` form it
+        // shares with every other such statement, so which one it is comes off the words
+        // it names ([`partitions_relation`]).
+        SqlStatement::ShowVariable { variable } => {
+            match partitions_relation(variable, context) {
+                Some(target) => {
+                    Plan::Catalog(Box::new(CatalogStatement::ShowPartitions { target }))
+                }
+                None => Plan::Engine,
+            }
         }
         // A table over data that already exists is a CATALOG entry: the statement
         // registers where the data lives and how to read it, and writes no rows.
@@ -1278,14 +1452,80 @@ fn declared_column(column: &ColumnDef) -> DeclaredColumn {
 /// The `TBLPROPERTIES` a statement declared, whichever option list the parser read them
 /// into.
 fn table_properties(options: &CreateTableOptions) -> Vec<(String, String)> {
-    let declared = match options {
+    option_list(options).iter().filter_map(key_value).collect()
+}
+
+/// The entries of one `WITH`-style property list, whichever list the parser read them into.
+fn option_list(options: &CreateTableOptions) -> &[SqlOption] {
+    match options {
         CreateTableOptions::None => &[] as &[SqlOption],
         CreateTableOptions::With(options)
         | CreateTableOptions::Options(options)
         | CreateTableOptions::Plain(options)
         | CreateTableOptions::TableProperties(options) => options.as_slice(),
+    }
+}
+
+/// The value the property `name` states as TEXT, or `None` where the list states no such
+/// property. A property name is matched without regard to case, the way every other name a
+/// statement writes is.
+fn string_option(options: &[SqlOption], name: &str) -> Option<String> {
+    options
+        .iter()
+        .filter_map(key_value_option)
+        .find(|(key, _)| key.value.eq_ignore_ascii_case(name))
+        .map(|(_, value)| literal_text(value))
+}
+
+/// The values the property `name` states as an ARRAY, in the order it listed them: Athena
+/// writes such a property as `ARRAY['<value>', …]`, and a property stating one value
+/// without the array around it states that one value.
+fn array_option(options: &[SqlOption], name: &str) -> Vec<String> {
+    let Some((_, value)) = options
+        .iter()
+        .filter_map(key_value_option)
+        .find(|(key, _)| key.value.eq_ignore_ascii_case(name))
+    else {
+        return Vec::new();
     };
-    declared.iter().filter_map(key_value).collect()
+    match value {
+        Expr::Array(array) => array.elem.iter().map(literal_text).collect(),
+        other => vec![literal_text(other)],
+    }
+}
+
+/// One `key = <value>` option as the pair it states, with the value as the expression it
+/// was written as — which is what a property whose value is not a literal is read from.
+fn key_value_option(option: &SqlOption) -> Option<(&Ident, &Expr)> {
+    match option {
+        SqlOption::KeyValue { key, value } => Some((key, value)),
+        _ => None,
+    }
+}
+
+/// The table a `SHOW PARTITIONS <name>` statement names, or `None` for a `SHOW <name>`
+/// statement that is not one.
+///
+/// The parser reads every `SHOW <name>` statement as the words it names, so the first of
+/// them is what says which statement it is and the ones after it are the table's own
+/// name — a name of one, two or three parts, exactly as a relation is written anywhere
+/// else. The word is matched as a word rather than as a quoted name, so
+/// `SHOW "PARTITIONS"` names a variable and not this statement.
+fn partitions_relation(variable: &[Ident], context: &QueryContext) -> Option<Relation> {
+    let (first, rest) = variable.split_first()?;
+    if first.quote_style.is_some() || !first.value.eq_ignore_ascii_case(SHOW_PARTITIONS) {
+        return None;
+    }
+    if rest.is_empty() || rest.len() > 3 {
+        return None;
+    }
+    let name = ObjectName(
+        rest.iter()
+            .cloned()
+            .map(ObjectNamePart::Identifier)
+            .collect(),
+    );
+    relation_of(&name, context)
 }
 
 /// One `key = 'value'` option, as the pair it states.
@@ -1307,6 +1547,164 @@ fn literal_text(value: &Expr) -> String {
             other => other.to_string(),
         },
         other => other.to_string(),
+    }
+}
+
+/// One EQUALITY constraint a statement's own predicate puts on a column: which column it
+/// filters, and the values that column may hold for a row to satisfy it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnConstraint {
+    /// The relation the column was QUALIFIED by, folded the way the catalog folds a name, or
+    /// `None` where the statement wrote the column on its own.
+    pub qualifier: Option<String>,
+    /// The column, folded the way the catalog folds a column name.
+    pub column: String,
+    /// The values the predicate admits, as the text each literal denotes.
+    pub values: Vec<String>,
+}
+
+/// The equality constraints the submitted statement's own predicate puts on the columns it
+/// filters by — what a read of a PARTITIONED table narrows the partitions it scans by.
+///
+/// Read off the parse, and only where a constraint holds for EVERY row the statement reads:
+/// a statement that reads its rows in more than one place (a set operation, a subquery, a
+/// query inside another) carries no constraint here at all, because a predicate written in
+/// one of those places says nothing about the rows the others read — and narrowing a read by
+/// such a predicate would drop rows the statement asked for. WHICH relation a constraint
+/// belongs to is the caller's to decide (`super::resolved_sql`), which narrows a read only
+/// where the statement reads one relation and nothing else — so what reaches a read is a
+/// sound narrowing or nothing: the engine still evaluates the predicate itself, so a
+/// narrowing that kept too much changes no answer, and one that kept too little would.
+#[must_use]
+pub fn pruning_constraints(statement: &SqlStatement) -> Vec<ColumnConstraint> {
+    let mut reading = OnePredicate::default();
+    let _ = statement.visit(&mut reading);
+    if reading.queries != 1 {
+        return Vec::new();
+    }
+    let Some(predicate) = reading.predicate else {
+        return Vec::new();
+    };
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    split_conjuncts(&predicate, &mut conjuncts);
+    conjuncts.into_iter().filter_map(constraint_of).collect()
+}
+
+/// Reads the ONE predicate a statement filters every row it reads by; see
+/// [`pruning_constraints`].
+#[derive(Debug, Default)]
+struct OnePredicate {
+    /// How many query nodes the statement carries. A statement carrying more than one reads
+    /// its rows in more than one place.
+    queries: usize,
+    /// The `WHERE` clause of the single query, when it has one.
+    predicate: Option<Expr>,
+}
+
+impl Visitor for OnePredicate {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &::sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.queries = self.queries.saturating_add(1);
+        if self.queries == 1 {
+            if let ::sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+                self.predicate = select.selection.clone();
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Split `predicate` into the terms a row has to satisfy ALL of: the operands of its
+/// top-level conjunctions, with the parentheses around one taken off. Every other form —
+/// a disjunction among them — is one term, which no constraint is read from unless it is
+/// one of the forms [`constraint_of`] reads.
+fn split_conjuncts<'p>(predicate: &'p Expr, into: &mut Vec<&'p Expr>) {
+    match predicate {
+        Expr::BinaryOp {
+            left,
+            op: ::sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            split_conjuncts(left, into);
+            split_conjuncts(right, into);
+        }
+        Expr::Nested(inner) => split_conjuncts(inner, into),
+        other => into.push(other),
+    }
+}
+
+/// The constraint one term of a predicate states, or `None` for a term that constrains no
+/// column to a set of values: an equality against a text literal, and a membership of a
+/// list of them, are what a read can narrow by.
+fn constraint_of(term: &Expr) -> Option<ColumnConstraint> {
+    match term {
+        Expr::BinaryOp {
+            left,
+            op: ::sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
+            // Either side may carry the column, so both orders are read.
+            let ((qualifier, column), value) = match (constrained_column(left), text_literal(right))
+            {
+                (Some(column), Some(value)) => (column, value),
+                _ => (constrained_column(right)?, text_literal(left)?),
+            };
+            Some(ColumnConstraint {
+                qualifier,
+                column,
+                values: vec![value],
+            })
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let (qualifier, column) = constrained_column(expr)?;
+            let values: Option<Vec<String>> = list.iter().map(text_literal).collect();
+            Some(ColumnConstraint {
+                qualifier,
+                column,
+                values: values?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The column one side of a term names, with the relation it was qualified by: the LAST part
+/// of a qualified name is the column and the part in front of it names the relation it is
+/// read from. `None` for a side that is not a column reference at all.
+fn constrained_column(side: &Expr) -> Option<(Option<String>, String)> {
+    match side {
+        Expr::Identifier(column) => Some((None, glue_state::fold_name(&column.value))),
+        Expr::CompoundIdentifier(parts) => {
+            let column = parts.last()?;
+            let qualifier = parts
+                .get(parts.len().saturating_sub(2))
+                .filter(|_| parts.len() > 1)
+                .map(|part| glue_state::fold_name(&part.value));
+            Some((qualifier, glue_state::fold_name(&column.value)))
+        }
+        _ => None,
+    }
+}
+
+/// The TEXT a literal denotes, or `None` for an expression that is not a text literal.
+///
+/// Only text: a partition's value is the text its own directory names, so a constraint read
+/// here is compared against that text — and a literal of another type is compared by the
+/// type's own rules, which is not a comparison this reader makes.
+fn text_literal(side: &Expr) -> Option<String> {
+    match side {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text)
+            | Value::DoubleQuotedString(text)
+            | Value::EscapedStringLiteral(text) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1673,6 +2071,31 @@ mod tests {
                 "CREATE TABLE orders (id integer, item varchar)",
                 "engine",
             ),
+            // The statements whose result is OBJECTS rather than rows: the query they write
+            // is planned as the read it is, and the destination comes off their properties.
+            (
+                "a table defined by the rows a query produced",
+                "CREATE TABLE sales.rollup WITH (format = 'PARQUET', \
+                 partitioned_by = ARRAY['day'], external_location = 's3://b/rollup/') \
+                 AS SELECT item, day FROM sales.events",
+                "write table sales.rollup as PARQUET partitioned by day over sales.events",
+            ),
+            (
+                "a table defined by a query that declares no properties at all",
+                "CREATE TABLE sales.copy AS SELECT * FROM sales.events",
+                "write table sales.copy as the default format over sales.events",
+            ),
+            (
+                "the rows of a query, unloaded to an object store prefix",
+                "UNLOAD (SELECT item FROM sales.events) TO 's3://b/out/' \
+                 WITH (format = 'JSON')",
+                "unload to s3://b/out/ as JSON over sales.events",
+            ),
+            (
+                "the partitions of one table",
+                "SHOW PARTITIONS sales.events",
+                "show partitions sales.events",
+            ),
         ];
 
         for (case, sql, expected) in cases {
@@ -1745,10 +2168,41 @@ mod tests {
                             Some(RelationFilter::Other(form)) => format!(" where {form}"),
                         }
                     ),
+                    CatalogStatement::ShowPartitions { target } => {
+                        format!("show partitions {}.{}", target.database, target.table)
+                    }
                 },
                 Plan::Relations(relational) => format!(
                     "relations {}",
                     relational
+                        .relations
+                        .iter()
+                        .map(Relation::local_name)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Plan::Written(writing) => format!(
+                    "{} over {}",
+                    match &writing.destination {
+                        WriteDestination::Table(table) => format!(
+                            "write table {}.{} as {}{}",
+                            table.target.database,
+                            table.target.table,
+                            table.format.as_deref().unwrap_or("the default format"),
+                            if table.partitioned_by.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" partitioned by {}", table.partitioned_by.join(","))
+                            }
+                        ),
+                        WriteDestination::Unload(unload) => format!(
+                            "unload to {} as {}",
+                            unload.location,
+                            unload.format.as_deref().unwrap_or("no format")
+                        ),
+                    },
+                    writing
+                        .query
                         .relations
                         .iter()
                         .map(Relation::local_name)
@@ -1767,7 +2221,8 @@ mod tests {
     /// their types, where the data lives, the delimiter fields are separated by and the
     /// table properties.
     #[test]
-    fn an_external_table_definition_carries_what_the_statement_declared() {        let reading = read(
+    fn an_external_table_definition_carries_what_the_statement_declared() {
+        let reading = read(
             "CREATE EXTERNAL TABLE shop.ddl_tbl (id bigint, name string) \
              PARTITIONED BY (day string) \
              ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t' \

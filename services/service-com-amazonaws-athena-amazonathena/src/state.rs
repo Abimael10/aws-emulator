@@ -1509,6 +1509,29 @@ pub fn result_object_uri(
     Some(format!("{directory}/{id}{suffix}"))
 }
 
+/// The suffix of the DATA MANIFEST object an execution that WROTE objects saves: Athena
+/// "creates a data manifest file" for a statement that writes data, saved to "the Athena
+/// query results location in Amazon S3" and named after the execution, which is the object
+/// `QueryExecutionStatistics$DataManifestLocation` reports.
+pub const DATA_MANIFEST_SUFFIX: &str = "-manifest.csv";
+
+/// The column of the data manifest as a read of it in ROWS reports it: each row carries the
+/// `s3://` path of one object the statement wrote, so the column is named for what it holds.
+const MANIFEST_PATH_COLUMN: &str = "path";
+
+/// The key of the data manifest the execution `id` saves, as the `s3://` URI of the
+/// resolved results directory with that object under it, or `None` for a submission that
+/// resolved no results location.
+///
+/// The ONE place that key is formed, exactly as [`result_object_uri`] is the one place the
+/// results object's is: so the manifest a completed run WRITES
+/// ([`query_results::result_objects`]) and the manifest a read of the execution NAMES
+/// (`DataManifestLocation`) can never be two different keys.
+pub fn data_manifest_uri(output_location: Option<&str>, id: &str) -> Option<String> {
+    let directory = output_location?.trim_end_matches('/');
+    Some(format!("{directory}/{id}{DATA_MANIFEST_SUFFIX}"))
+}
+
 /// How many query executions this emulator retains.
 ///
 /// The EMULATOR's own bound, with no counterpart in the model: each retained execution
@@ -1801,6 +1824,85 @@ impl QueryExecutionRecord {
         )
     }
 
+    /// The objects this execution's statement WROTE into the object store, in the order it
+    /// wrote them — the objects its data manifest lists.
+    ///
+    /// Empty for an execution that wrote none, which is every statement that answers with
+    /// rows rather than writing them, one that wrote its output and produced no rows, and
+    /// one that has not reported yet.
+    pub(crate) fn written_objects(&self) -> &[String] {
+        match self.outcome.as_ref() {
+            Some(query_engine::Outcome::Succeeded {
+                written_objects: Some(written),
+                ..
+            }) => written,
+            _ => &[],
+        }
+    }
+
+    /// The key of the DATA MANIFEST this execution saves, or `None` where it saves none.
+    ///
+    /// Athena "creates a data manifest file" for the statements that WRITE data, so an
+    /// execution of one of those has a manifest from the moment its run succeeded — and an
+    /// execution of any other statement, one that failed and one still running have none
+    /// ([`data_manifest_uri`]).
+    pub(crate) fn data_manifest_uri(&self) -> Option<String> {
+        if !self.writes_a_data_manifest() {
+            return None;
+        }
+        data_manifest_uri(
+            self.result_configuration.output_location.as_deref(),
+            &self.id,
+        )
+    }
+
+    /// Whether this execution's run WROTE its output as objects, which is the class of
+    /// statement Athena creates a data manifest for.
+    ///
+    /// What the RUN did decides it, not the kind of statement submitted: a statement whose
+    /// output was written carries the objects it wrote — none at all where its query
+    /// produced no rows, which is a manifest with nothing in it — and one whose rows the
+    /// engine answered with, or which it performed in its own database, wrote no output of
+    /// its own and has no manifest at all. True from the moment the run reported, which is
+    /// before the execution is terminal: a manifest a query is still owed is not a manifest
+    /// it will never have (see [`Self::data_manifest_at`]).
+    pub(crate) fn writes_a_data_manifest(&self) -> bool {
+        matches!(
+            self.outcome.as_ref(),
+            Some(query_engine::Outcome::Succeeded {
+                written_objects: Some(_),
+                ..
+            })
+        )
+    }
+
+    /// The data manifest as the RESULT SET a read of it pages: one row per object the
+    /// statement wrote, carrying that object's `s3://` URI — "if set to `DATA_MANIFEST`, it
+    /// returns the manifest file in rows". `None` where there is no manifest to page: an
+    /// execution whose run wrote no output of its own, and one whose manifest is not
+    /// readable yet because the query is not terminal — which [`Self::writes_a_data_manifest`]
+    /// tells apart, because the two are different answers to the caller.
+    pub(crate) fn data_manifest_at(
+        &self,
+        now: SystemTime,
+    ) -> Option<query_engine::StoredResultSet> {
+        if !self.is_terminal_at(now) || !self.writes_a_data_manifest() {
+            return None;
+        }
+        Some(query_engine::StoredResultSet {
+            column_info: vec![query_engine::hive_string_column(MANIFEST_PATH_COLUMN)],
+            rows: self
+                .written_objects()
+                .iter()
+                .map(|object| crate::ops::types::Row {
+                    data: Some(vec![crate::ops::types::Datum {
+                        var_char_value: Some(object.clone()),
+                    }]),
+                })
+                .collect(),
+        })
+    }
+
     /// The `ResultConfiguration` a read of this execution reports at `now`: the one the
     /// query ran under, with `OutputLocation` naming the result object once there is one
     /// (see [`Self::result_object_at`]).
@@ -2087,9 +2189,12 @@ impl QueryExecutionRecord {
             // far as a caller can see.
             engine_execution_time_in_millis: Some(engine),
             data_scanned_in_bytes: Some(data_scanned),
-            // Written only when a query's results are written as a manifest, which this
-            // emulator does not do.
-            data_manifest_location: None,
+            // Where the DATA MANIFEST of this execution is, for a statement that WROTE
+            // objects: "Athena creates a data manifest file ... for queries that write
+            // data", listing the objects the statement wrote. Reported from the instant the
+            // query is terminal, like every other statistic, and absent for a statement
+            // that wrote none.
+            data_manifest_location: terminal.then(|| self.data_manifest_uri()).flatten(),
             total_execution_time_in_millis: Some(total),
             query_queue_time_in_millis: Some(queue),
             service_pre_processing_time_in_millis: pre_processing,

@@ -522,6 +522,13 @@ pub enum Outcome {
         /// Counted beside the bytes, because what a run read is reported as a row count
         /// as well as a byte count.
         input_rows: i64,
+        /// The objects the statement WROTE into the object store, as their `s3://` URIs in
+        /// the order they were written — what the execution's data manifest lists. `None`
+        /// for a statement that writes no output of its own at all, which is every
+        /// statement that answers with rows rather than writing them; a statement that DID
+        /// write its output carries the objects it wrote, and none at all where what it
+        /// produced was no rows (see `super::catalog_sql::query_output`).
+        written_objects: Option<Vec<String>>,
     },
     /// The statement did not run to completion, with the message for why.
     Failed {
@@ -746,6 +753,9 @@ pub fn run_over(
                 scanned_bytes
             },
             input_rows,
+            // The engine answers with ROWS: an object of the object store is written by the
+            // statement layer over this run, never by the engine itself.
+            written_objects: None,
         },
         Ok(Produced::Affected(rows)) => Outcome::Succeeded {
             result: StoredResultSet::default(),
@@ -756,6 +766,7 @@ pub fn run_over(
             update_count: counts_rows.then_some(rows),
             data_scanned_bytes: 0,
             input_rows,
+            written_objects: None,
         },
         Err(failure) => Outcome::Failed {
             message: failure.message(),

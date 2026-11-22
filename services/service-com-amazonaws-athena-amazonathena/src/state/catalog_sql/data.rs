@@ -211,6 +211,12 @@ pub struct DataSource {
     /// The boolean SQL expression a row has to satisfy for the reader to see it, when a
     /// Lake Formation grant carries one.
     row_predicate: Option<String>,
+    /// What the statement's own predicate admits for each PARTITION KEY, in key order: the
+    /// values that key may hold for a row the statement reads, or `None` for a key its
+    /// predicate says nothing about. Every entry `None` until the read is narrowed
+    /// ([`Self::pruned`]), which is what makes a filtered read of a partitioned table scan
+    /// only the partitions it can read rows from.
+    partition_filter: Vec<Option<Vec<String>>>,
 }
 
 /// One PARTITION of a catalog table as a read of it addresses it: the values that address
@@ -468,13 +474,17 @@ impl DataSource {
             return Err(Failure::invalid_column_type(&column.name, &column.data_type));
         }
         let location = storage.and_then(|storage| storage.location.clone());
+        let partition_keys = ddl::partition_key_columns(table).len();
         Ok(Self {
             relation: relation.clone(),
             local_name: relation.local_name(),
             // Every column of the table reads, until a Lake Formation grant narrows it.
             visible: (0..columns.len()).collect(),
             row_predicate: None,
-            partition_keys: ddl::partition_key_columns(table).len(),
+            // Every partition of the table is scanned, until the statement's own predicate
+            // narrows which of them can hold a row it reads.
+            partition_filter: vec![None; partition_keys],
+            partition_keys,
             partitions: partition_splits(table, location.as_deref()),
             columns,
             location,
@@ -507,6 +517,49 @@ impl DataSource {
             .collect();
         self.row_predicate = scope.row_predicate();
         self
+    }
+
+    /// This source read under the statement's own `constraints`: the partitions it scans are
+    /// narrowed to the ones that can hold a row the statement reads.
+    ///
+    /// A partitioned table's data lives one directory per partition, so a statement whose
+    /// predicate fixes a partition key's value can only read rows from the partitions that
+    /// carry it — the others hold no row the statement would keep, and are not scanned at
+    /// all, which is what makes such a read scan the data of its own partitions rather than
+    /// of the whole table.
+    ///
+    /// The caller decides whether the statement's constraints can be attributed to this
+    /// source at all (`super::resolved_sql`): they can where the statement reads exactly one
+    /// relation, and a constraint a statement wrote against ANOTHER relation's name is not
+    /// this source's and narrows nothing. Only a key whose declared type is CHARACTER data is
+    /// narrowed by: a partition's value is the text its own directory names, and for every
+    /// other type the comparison the predicate states is the type's own rather than a
+    /// comparison of that text.
+    pub fn pruned(&mut self, constraints: &[statement::ColumnConstraint]) {
+        let keys: Vec<DeclaredColumn> = self
+            .columns
+            .iter()
+            .skip(self.columns.len().saturating_sub(self.partition_keys))
+            .cloned()
+            .collect();
+        self.partition_filter = keys
+            .iter()
+            .map(|key| {
+                if !is_character_type(&key.data_type) {
+                    return None;
+                }
+                constraints
+                    .iter()
+                    .find(|constraint| {
+                        constraint.column == key.name
+                            && constraint
+                                .qualifier
+                                .as_deref()
+                                .is_none_or(|qualifier| qualifier == self.relation.table)
+                    })
+                    .map(|constraint| constraint.values.clone())
+            })
+            .collect();
     }
 
     /// The columns this source reads, in the table's own column order: the ones the
@@ -700,11 +753,29 @@ impl DataSource {
         }
         self.partitions
             .iter()
+            .filter(|partition| self.admits(&partition.values))
             .map(|partition| Scan {
                 location: partition.location.clone(),
                 values: Some(partition.values.clone()),
             })
             .collect()
+    }
+
+    /// Whether a partition addressed by `values` can hold a row the statement reads.
+    ///
+    /// Every key the statement's predicate fixes has to be satisfied, and a key it says
+    /// nothing about admits every value — so a read no predicate narrows scans every
+    /// partition, exactly as it did before it was narrowed ([`Self::pruned`]).
+    fn admits(&self, values: &[String]) -> bool {
+        self.partition_filter
+            .iter()
+            .enumerate()
+            .all(|(key, admitted)| match admitted {
+                None => true,
+                Some(admitted) => values
+                    .get(key)
+                    .is_some_and(|value| admitted.iter().any(|allowed| allowed == value)),
+            })
     }
 
     /// The partition values the object `key` names in its own path: for each declared
@@ -1027,6 +1098,15 @@ fn is_timestamp(data_type: &str) -> bool {
     glue_state::base_hive_type(data_type) == "timestamp"
 }
 
+/// Whether a column of Hive type `data_type` holds CHARACTER data, which is the one class of
+/// type whose values are the text a partition's own directory names ([`DataSource::pruned`]).
+fn is_character_type(data_type: &str) -> bool {
+    matches!(
+        glue_state::base_hive_type(data_type).as_str(),
+        "string" | "varchar" | "char"
+    )
+}
+
 /// How many digits of a second a timestamp carries: Athena's `timestamp` is a value to
 /// the millisecond, and a read of such a column reports every one of those digits — so a
 /// stored value that writes fewer is reported with the rest of them, and one that writes
@@ -1245,7 +1325,15 @@ fn partition_splits(
 /// This is the layout Hive, Athena and every engine that writes a partitioned table use, and
 /// the one [`DataSource::hive_partition_values`] reads a partition's values back out of — so
 /// a partition registered with no location of its own is read where such a writer put it.
-fn hive_partition_location(table_location: &str, keys: &[String], values: &[String]) -> String {
+///
+/// It is also the layout a statement that WRITES a partitioned table lays its objects out in
+/// ([`super::query_output`]), so the directory a write puts a partition's objects in and the
+/// directory a read looks for them under are one rule.
+pub(super) fn hive_partition_location(
+    table_location: &str,
+    keys: &[String],
+    values: &[String],
+) -> String {
     let mut location = table_location.trim_end_matches('/').to_string();
     for (key, value) in keys.iter().zip(values) {
         location.push('/');
@@ -1296,7 +1384,7 @@ pub fn parse_s3_uri(location: &str) -> Option<(String, String)> {
 
 /// Whether `key` names an object AT a table's location: the prefix itself, or anything
 /// under it, including the objects of a nested prefix.
-fn under_prefix(key: &str, prefix: &str) -> bool {
+pub(super) fn under_prefix(key: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
     }

@@ -143,6 +143,9 @@ impl ComAmazonawsAthenaAmazonathenaState {
                         // results that were already there.
                         data_scanned_bytes: 0,
                         input_rows: 0,
+                        // Nothing was WRITTEN either: this execution ran no statement, so
+                        // it wrote no object and has no data manifest of its own.
+                        written_objects: None,
                     },
                 })
             })

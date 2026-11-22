@@ -1036,6 +1036,122 @@ pub fn single_column_result(column: &str, values: Vec<String>) -> StoredResultSe
     }
 }
 
+/// The column a `SHOW PARTITIONS` result set carries, as the Hive DDL engine that answers
+/// that statement names it.
+const PARTITION_COLUMN: &str = "partition";
+
+/// Report the partitions the catalog holds for the table a `SHOW PARTITIONS` names.
+///
+/// One row per partition, each the partition's own Hive SPEC — `<key>=<value>`, joined by
+/// the separator its directories are nested under, which is how Hive, Athena and every
+/// engine that reads such a table names a partition. A table the catalog holds that is
+/// partitioned by nothing, and one whose partitions the catalog holds none of, has no
+/// partition to report and answers with no rows at all; a name the catalog holds nothing
+/// for is the not-found refusal for it, exactly as every other statement over a relation
+/// reports one.
+pub fn show_partitions(
+    store: &glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    target: &Relation,
+) -> Result<StoredResultSet, Failure> {
+    let Some(database) = store.database(catalog_id, &target.database) else {
+        if super::served_without_record(&target.database) {
+            return Err(Failure::table_not_found(target));
+        }
+        return Err(Failure::schema_not_found(target));
+    };
+    let Some(table) = database.tables.get(&target.table) else {
+        return Err(Failure::table_not_found(target));
+    };
+    let keys: Vec<String> = partition_key_columns(table)
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let specs = table
+        .partitions
+        .values()
+        .map(|partition| partition_spec(&keys, &partition.values))
+        .collect();
+    Ok(single_column_result(PARTITION_COLUMN, specs))
+}
+
+/// One partition as its own spec names it: `<key>=<value>` per partition key, in key order
+/// and joined by the separator the partition's directories are nested under.
+fn partition_spec(keys: &[String], values: &[String]) -> String {
+    keys.iter()
+        .zip(values)
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<String>>()
+        .join("/")
+}
+
+/// Register the PARTITIONS a statement wrote the data of, each under the directory its own
+/// values name.
+///
+/// A partition is a catalog record of its table, so these are the same records
+/// `AWSGlue.CreatePartition` writes and the ones every read of the table resolves its data
+/// directories from — a statement that wrote a partition's objects registers the partition
+/// those objects belong to, which is what makes the data it wrote readable and what
+/// `SHOW PARTITIONS` then reports.
+///
+/// The table must already be registered ([`create_external_table`]); each partition carries
+/// the location its objects were written under and the storage the table itself declares, so
+/// a read of one partition decodes its objects exactly as a read of the table does.
+pub fn register_partitions(
+    store: &mut glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    target: &Relation,
+    partitions: &[(Vec<String>, String)],
+    now: SystemTime,
+) -> Result<(), Failure> {
+    if partitions.is_empty() {
+        return Ok(());
+    }
+    let store_has_room = store.can_store_partition();
+    let Some(database) = store.database_mut(catalog_id, &target.database) else {
+        return Err(Failure::hive_database_not_found(&target.database));
+    };
+    let Some(table) = database.tables.get_mut(&target.table) else {
+        return Err(Failure::table_not_found(target));
+    };
+    let storage = table.storage_descriptor.clone();
+    for (values, location) in partitions {
+        let input = ::service_com_amazonaws_glue_awsglue::ops::types::PartitionInput {
+            values: Some(values.clone()),
+            storage_descriptor: storage.clone().map(|mut descriptor| {
+                descriptor.location = Some(location.clone());
+                descriptor
+            }),
+            ..Default::default()
+        };
+        // A partition the table already holds is left exactly as it is: the write that
+        // produced this one wrote its objects under the same directory, so the record is
+        // already the one that addresses them.
+        if table.partition(values).is_some() {
+            continue;
+        }
+        if table
+            .create_partition(&input, now, store_has_room, None)
+            .is_err()
+        {
+            return Err(Failure::emulator(format!(
+                "the Data Catalog did not take the partition {} of {}.{}, so the data \
+                 this statement wrote is not registered",
+                partition_spec(
+                    &partition_key_columns(table)
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<String>>(),
+                    values
+                ),
+                target.database,
+                target.table
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,8 @@ pub mod grammar;
 pub mod hive_database;
 /// Whether a catalog column's declared type names a type, and the name a query reports.
 pub mod hive_types;
+/// The objects a statement WRITES, and the format and layout they are written in.
+pub mod query_output;
 /// What one submitted statement is, and the plan for running it.
 pub mod statement;
 
@@ -54,9 +56,12 @@ use super::query_engine::{
     self, Completion, DatabaseHandle, FailureCause, LocalColumn, LocalObject, LocalTable, Outcome,
     StoredResultSet,
 };
+use super::query_results::ResultEncryption;
 use data::{Budget, DataSource};
+use query_output::{Destination, OutputFormat, Sheet, SheetColumn};
 use statement::{
-    CatalogStatement, Plan, Position, QueryContext, Reading, Relation, RelationalStatement,
+    CatalogStatement, DeclaredColumn, ExternalTable, Plan, Position, QueryContext, Reading,
+    Relation, RelationalStatement, TableAsSelect, WriteDestination, WritingStatement,
 };
 
 /// The `AthenaError$ErrorCategory` of a failure the SERVICE is the cause of: the
@@ -164,6 +169,33 @@ const ICEBERG_WITHOUT_METADATA_LOCATION: &str = "GENERIC_USER_ERROR: Detected Ic
 /// How many levels of view a statement may read through: a view over a view over a table
 /// is resolved, and a chain longer than this is reported rather than followed.
 const MAX_VIEW_DEPTH: usize = 4;
+
+/// What Athena's message for a write whose destination is ALREADY THERE opens with: the
+/// class a statement that would write over data already at its destination belongs to.
+/// Fixed text, and the error code a client reads off the message.
+///
+/// RECORDED behaviour: a wire fixture submits an `UNLOAD` into a prefix that already holds
+/// an object and the execution settles FAILED with this code in front of
+/// [`TARGET_DIRECTORY_EXISTS`] and the destination it named.
+const HIVE_PATH_ALREADY_EXISTS: &str = "HIVE_PATH_ALREADY_EXISTS";
+
+/// What that message says after the code for an `UNLOAD`: fixed text, in front of the
+/// destination the statement named, which is the only variable part. Recorded beside the
+/// code; see [`HIVE_PATH_ALREADY_EXISTS`].
+const TARGET_DIRECTORY_EXISTS: &str = "Target directory already exists";
+
+/// The `AthenaError$ErrorType` Athena publishes for that class: a write this statement
+/// would perform over data that is already at its destination.
+///
+/// RECORDED behaviour, like the code and the wording in front of it: the same fixture's
+/// execution reports this type beside [`ERROR_CATEGORY_USER`].
+pub const ERROR_TYPE_PATH_ALREADY_EXISTS: i32 = 1109;
+
+/// What Athena's message for a TABLE PROPERTY a statement cannot be performed under opens
+/// with: the class a `partitioned_by` that does not match the query's own columns, and a
+/// required property a statement left out, belong to. Fixed text, and the error code a
+/// client reads off the message.
+const INVALID_TABLE_PROPERTY: &str = "INVALID_TABLE_PROPERTY";
 
 /// Whether `database` — folded the way the Data Catalog folds a name — is a database the
 /// catalog SERVES whether or not it holds a record of it.
@@ -517,6 +549,85 @@ impl Failure {
         )
     }
 
+    /// An `UNLOAD` names a destination that already holds objects.
+    ///
+    /// Athena's own class for a write whose target directory is already there: the code is
+    /// the prefix of the message a client reads it off, and what follows it is fixed text in
+    /// front of the destination the statement named — the one variable part. The category and
+    /// the type are that class's own, so a client can branch on them instead of reading the
+    /// message.
+    pub fn target_directory_exists(location: &str) -> Self {
+        Self::classified(
+            format!("{HIVE_PATH_ALREADY_EXISTS}: {TARGET_DIRECTORY_EXISTS}: {location}"),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_PATH_ALREADY_EXISTS,
+        )
+    }
+
+    /// A `CREATE TABLE … AS <query>` names a location that already holds objects.
+    ///
+    /// The same class as [`Self::target_directory_exists`], in the words that class is
+    /// reported in for a statement that defines a TABLE over the directory: the table it
+    /// defines is named as well as the directory it would write.
+    pub fn table_target_directory_exists(target: &Relation, location: &str) -> Self {
+        Self::classified(
+            format!(
+                "{HIVE_PATH_ALREADY_EXISTS}: Target directory for table '{}.{}' already \
+                 exists: {location}",
+                target.database, target.table
+            ),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_PATH_ALREADY_EXISTS,
+        )
+    }
+
+    /// The object store would not take an object a statement wrote at `location`.
+    ///
+    /// Athena's FILESYSTEM class, the same one a read that cannot dereference a location
+    /// reports ([`Self::location_not_readable`]): a destination that is not there is the
+    /// caller's own, and what cannot be done with it is write rather than read.
+    pub fn destination_not_writable(location: &str) -> Self {
+        Self::classified(
+            format!("{HIVE_FILESYSTEM_ERROR}: Failed to write to {location}"),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_LOCATION_NOT_FOUND,
+        )
+    }
+
+    /// A `CREATE TABLE … AS <query>` whose `partitioned_by` names columns that are not the
+    /// LAST columns the query projects, in that order.
+    ///
+    /// Athena's own class for a table property that cannot be honoured, in the words that
+    /// class states the layout rule in: fixed text naming the property, with the columns
+    /// the statement listed after it.
+    pub fn partition_keys_not_last(partitioned_by: &[String]) -> Self {
+        Self::user(format!(
+            "{INVALID_TABLE_PROPERTY}: Partition keys must be the last columns in the \
+             table and in the same order as the table property '{}': [{}]",
+            statement::PARTITIONED_BY_PROPERTY,
+            partitioned_by.join(", ")
+        ))
+    }
+
+    /// An `UNLOAD` that declares no `format` property, which that statement requires.
+    pub fn missing_format_property(at: Position) -> Self {
+        Self::user(format!(
+            "{INVALID_TABLE_PROPERTY}: line {}:{}: Required property '{}' is not set",
+            at.line,
+            at.column,
+            statement::FORMAT_PROPERTY
+        ))
+    }
+
+    /// A statement names a destination that is no Amazon S3 location at all, so there is
+    /// nowhere its output could be written.
+    pub fn invalid_destination(at: Position, location: &str) -> Self {
+        Self::user(format!(
+            "{INVALID_TABLE_PROPERTY}: line {}:{}: Invalid S3 URI: {location}",
+            at.line, at.column
+        ))
+    }
+
     /// This failure as the outcome of a run that produced nothing.
     pub fn outcome(self) -> Outcome {
         // A LIMIT in force on the query stopped the run, which interrupts the query rather
@@ -557,6 +668,9 @@ const HIVE_DATABASE_NOT_EXISTS: i32 = 10_072;
 /// Everything one run of a statement needs beside the statement itself.
 #[derive(Debug, Clone, Copy)]
 pub struct Submission<'r> {
+    /// The `QueryExecutionId` this statement runs under, which is what the objects a
+    /// statement WRITES are named after — so an object says which query produced it.
+    pub id: &'r str,
     /// The catalog and database an unqualified name in the statement resolves against.
     pub context: &'r QueryContext,
     /// The values bound to the statement's placeholders, in order.
@@ -572,6 +686,14 @@ pub struct Submission<'r> {
     /// cutoff: a query that would scan past it is aborted at the cutoff rather than run to
     /// an end (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`).
     pub scan_cutoff: Option<i64>,
+    /// The results location this submission resolved, which is where a statement that
+    /// writes a table and names no location of its own writes it.
+    pub output_location: Option<&'r str>,
+    /// The server-side encryption this submission's resolved result configuration settled
+    /// on, which every object the execution stores is written under — the data a statement
+    /// WRITES as much as the results beside it
+    /// ([`crate::state::query_results::resolved_encryption`]).
+    pub encryption: &'r ResultEncryption,
 }
 
 /// Run the statement `reading` planned, and report what it produced.
@@ -597,6 +719,7 @@ pub fn execute<Eng: Send + Sync + 'static>(
         access,
         now,
         scan_cutoff,
+        ..
     } = *submission;
     match reading.plan {
         Plan::Engine => query_engine::run(handle, sql, reading.counts_rows, parameters),
@@ -606,6 +729,14 @@ pub fn execute<Eng: Send + Sync + 'static>(
         // which is the only way a relation outside the catalog comes to exist here. Decided
         // before the catalog's guard is taken for the drop itself.
         Plan::Catalog(statement) if drops_a_table_of_the_engines_own(engine, &statement) => {
+            query_engine::run(handle, sql, reading.counts_rows, parameters)
+        }
+        // A `CREATE TABLE … AS <query>` that declares NO location, in a database the data
+        // catalog does not hold, defines a table of the ENGINE's own exactly as a
+        // `CREATE TABLE` with no location does: there is no catalog database for it to be
+        // registered in, and nowhere of its own for its data to go. Decided before the
+        // destination is resolved, like the drop above.
+        Plan::Written(writing) if defines_a_table_of_the_engines_own(engine, &writing) => {
             query_engine::run(handle, sql, reading.counts_rows, parameters)
         }
         Plan::Catalog(statement) => {
@@ -618,6 +749,9 @@ pub fn execute<Eng: Send + Sync + 'static>(
                     // A catalog statement names no relation and materialises no object, so
                     // it read no rows of stored data.
                     input_rows: 0,
+                    // It writes NO OUTPUT of its own either: what it changed is the
+                    // catalog's own records, so it has no data manifest at all.
+                    written_objects: None,
                 },
                 Err(failure) => failure.outcome(),
             };
@@ -663,7 +797,421 @@ pub fn execute<Eng: Send + Sync + 'static>(
                 },
             }
         }
+        Plan::Written(writing) => {
+            let started = Instant::now();
+            let WritingStatement { query, destination } = *writing;
+            // WHERE the output goes is resolved BEFORE the query runs: a destination that
+            // already holds objects is refused rather than written over, and nothing about
+            // that refusal depends on the rows the query would produce.
+            let output = match resolved_destination(engine, &destination, submission) {
+                Ok(output) => output,
+                Err(failure) => return refused(failure, started),
+            };
+            match resolved_sql(engine, handle, query, context, access, scan_cutoff) {
+                Ok(prepared) => {
+                    // The query is run exactly as any other read is, and measured the same
+                    // way: its relations are resolved first and the engine is handed SQL
+                    // that names the rows they were materialised as.
+                    let planning_time = started.elapsed();
+                    let mut completion = query_engine::run_over(
+                        handle,
+                        &prepared.objects,
+                        &prepared.sql,
+                        reading.counts_rows,
+                        parameters,
+                        prepared.scanned_bytes,
+                    );
+                    completion.planning_time = planning_time;
+                    classify_unresolvable_name(&mut completion, sql, &prepared.hidden_columns);
+                    // What the query produced is now in hand: it is WRITTEN rather than
+                    // answered with, and what the statement defines over it is registered.
+                    written(engine, &destination, &output, completion, submission)
+                }
+                Err(failure) => refused(failure, started),
+            }
+        }
     }
+}
+
+/// One run that produced nothing because the statement was refused before the engine ran
+/// it: the refusal is what the execution reports, and the span it took is the resolution
+/// that refused it.
+fn refused(failure: Failure, started: Instant) -> Completion {
+    Completion {
+        outcome: failure.outcome(),
+        engine_time: Duration::ZERO,
+        planning_time: started.elapsed(),
+    }
+}
+
+/// Where a statement that writes its output sends it, or why it cannot be written there.
+///
+/// Resolved from what the statement DECLARES: the format its `format` property names, the
+/// location it names (and, for a table that names none, the one Athena writes such a table
+/// under), and whether that location is free — a destination already holding objects is
+/// refused, which is the one rule both statements are held to.
+fn resolved_destination<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    destination: &WriteDestination,
+    submission: &Submission<'_>,
+) -> Result<Destination, Failure> {
+    match destination {
+        WriteDestination::Table(table) => {
+            let format = match table.format.as_deref() {
+                Some(named) => OutputFormat::named(named)?,
+                None => query_output::DEFAULT_TABLE_FORMAT,
+            };
+            let output = Destination::of(
+                &table_location(table, submission)?,
+                format,
+                submission.id,
+                table.target.at,
+            )?;
+            if output.bucket_is_absent(engine) {
+                return Err(Failure::destination_not_writable(&output.written));
+            }
+            if output.is_occupied(engine) {
+                return Err(Failure::table_target_directory_exists(
+                    &table.target,
+                    &output.written,
+                ));
+            }
+            Ok(output)
+        }
+        WriteDestination::Unload(unload) => {
+            // The format an `UNLOAD` writes is REQUIRED of it: the statement says what the
+            // objects it writes are, and one that says nothing writes none.
+            let Some(named) = unload.format.as_deref() else {
+                return Err(Failure::missing_format_property(unload.at));
+            };
+            let output = Destination::of(
+                &unload.location,
+                OutputFormat::named(named)?,
+                submission.id,
+                unload.at,
+            )?;
+            if output.bucket_is_absent(engine) {
+                return Err(Failure::destination_not_writable(&output.written));
+            }
+            if output.is_occupied(engine) {
+                return Err(Failure::target_directory_exists(&output.written));
+            }
+            Ok(output)
+        }
+    }
+}
+
+/// Where the data of the table a `CREATE TABLE … AS <query>` defines is written: the
+/// `external_location` it declared, and otherwise the folder Athena writes a table that
+/// declares none into — "a subfolder of the query result location", named after the
+/// execution, which is what makes the data of two such statements two different folders.
+fn table_location(
+    table: &TableAsSelect,
+    submission: &Submission<'_>,
+) -> Result<String, Failure> {
+    if let Some(declared) = table
+        .external_location
+        .as_deref()
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+    {
+        return Ok(declared.to_string());
+    }
+    let results = submission
+        .output_location
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+        .ok_or_else(|| {
+            Failure::emulator(
+                "this submission resolved no results location, so a table that declares \
+                 no external location of its own has nowhere for its data to go",
+            )
+        })?;
+    Ok(format!(
+        "{}/{TABLES_FOLDER}/{}",
+        results.trim_end_matches('/'),
+        submission.id
+    ))
+}
+
+/// The folder of the query result location Athena writes a table that declared no
+/// `external_location` under.
+const TABLES_FOLDER: &str = "tables";
+
+/// Write what the query produced, and perform what the statement DEFINES over it.
+///
+/// A run that produced no rows to write — one that failed, and one a limit interrupted — is
+/// left exactly as the engine reported it. A run that produced rows reports them as WRITTEN:
+/// the objects it stored, with no result set of its own, because neither statement answers
+/// with rows.
+fn written<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    destination: &WriteDestination,
+    output: &Destination,
+    completion: Completion,
+    submission: &Submission<'_>,
+) -> Completion {
+    let Completion {
+        outcome,
+        engine_time,
+        planning_time,
+    } = completion;
+    match outcome {
+        Outcome::Succeeded {
+            result,
+            data_scanned_bytes,
+            input_rows,
+            ..
+        } => {
+            let outcome = match write_output(engine, destination, output, &result, submission) {
+                Ok(written_objects) => Outcome::Succeeded {
+                    // The rows were WRITTEN, not returned: a read of this execution's
+                    // results reports the empty result set rather than the rows of the
+                    // query that produced the objects.
+                    result: StoredResultSet::default(),
+                    update_count: None,
+                    data_scanned_bytes,
+                    input_rows,
+                    written_objects,
+                },
+                Err(failure) => failure.outcome(),
+            };
+            Completion {
+                outcome,
+                engine_time,
+                planning_time,
+            }
+        }
+        outcome => Completion {
+            outcome,
+            engine_time,
+            planning_time,
+        },
+    }
+}
+
+/// Write the rows `result` holds where `destination` says, and answer the objects written.
+///
+/// The answer is `Some`, even where it is EMPTY: this statement wrote its output, and a
+/// query that produced no rows wrote that output as no objects at all — which is what its
+/// data manifest then lists.
+fn write_output<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    destination: &WriteDestination,
+    output: &Destination,
+    result: &StoredResultSet,
+    submission: &Submission<'_>,
+) -> Result<Option<Vec<String>>, Failure> {
+    match destination {
+        // An `UNLOAD` writes the rows as they were projected, under the destination
+        // itself: it defines no table, so it partitions its output by nothing.
+        WriteDestination::Unload(_) => {
+            let columns = sheet_columns(result);
+            let values = sheet_values(result);
+            if values.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let sheet = Sheet {
+                columns,
+                rows: values,
+            };
+            let directory = query_output::partition_directory(output, &[], &[]);
+            query_output::store(
+                engine,
+                vec![query_output::object_of(output, &directory, &sheet)?],
+                submission.encryption,
+            )
+            .map(Some)
+        }
+        WriteDestination::Table(table) => {
+            written_table(engine, table, output, result, submission).map(Some)
+        }
+    }
+}
+
+/// Write the data of the table a `CREATE TABLE … AS <query>` defines, and register the
+/// table and the partitions that data belongs to.
+///
+/// The PARTITION columns are the last columns the query projects — Athena's own layout rule
+/// for the property, which is what makes a partition's values readable off the directory its
+/// objects live in — so a statement whose `partitioned_by` names anything else is refused
+/// rather than written as if it had named the last ones.
+///
+/// The order is: everything that REFUSES the statement first (the layout rule, and an entry
+/// the catalog already holds), then the objects, then the catalog entry and the partitions of
+/// the data — so a refused statement writes nothing, and the catalog never names a location
+/// the objects were not written to.
+fn written_table<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    table: &TableAsSelect,
+    output: &Destination,
+    result: &StoredResultSet,
+    submission: &Submission<'_>,
+) -> Result<Vec<String>, Failure> {
+    let now = submission.now;
+    let columns = sheet_columns(result);
+    let keys = table.partitioned_by.clone();
+    if !partitions_are_last(&columns, &keys) {
+        return Err(Failure::partition_keys_not_last(&keys));
+    }
+    let data_columns = columns.len().saturating_sub(keys.len());
+    let values = sheet_values(result);
+    let partitions = query_output::partitioned(&values, keys.len())?;
+    let catalog_id = catalog_id_of(engine, &table.target.catalog, table.target.at)?;
+
+    // An entry the catalog ALREADY holds is what decides whether this statement writes at
+    // all: one that tolerates it writes nothing over the table that is there, and one that
+    // does not is refused before a single object is written.
+    match held_table(engine, &catalog_id, &table.target)? {
+        true if table.if_not_exists => return Ok(Vec::new()),
+        true => return Err(Failure::table_already_exists(&table.target)),
+        false => {}
+    }
+
+    let mut objects = Vec::new();
+    let mut directories: Vec<(Vec<String>, String)> = Vec::new();
+    for partition in &partitions {
+        // A partition with no row of its own is no partition of this table: nothing was
+        // written there, so there is no object and no record for it.
+        if partition.rows.is_empty() {
+            continue;
+        }
+        let sheet = Sheet {
+            columns: columns[..data_columns].to_vec(),
+            rows: partition
+                .rows
+                .iter()
+                .filter_map(|at| values.get(*at))
+                .map(|row| row.iter().take(data_columns).copied().collect())
+                .collect(),
+        };
+        let directory = query_output::partition_directory(output, &keys, &partition.values);
+        objects.push(query_output::object_of(output, &directory, &sheet)?);
+        if !partition.values.is_empty() {
+            directories.push((partition.values.clone(), directory));
+        }
+    }
+    let written = query_output::store(engine, objects, submission.encryption)?;
+
+    // The table and the partitions its data belongs to are registered once the objects they
+    // address are really there, under ONE guard of the catalog's store.
+    let definition = table_definition(table, output, &columns[..data_columns], &keys);
+    let Some(state) = glue_state::service_state(engine) else {
+        return Err(Failure::emulator(CATALOG_UNREACHABLE));
+    };
+    let mut store = state.lock();
+    ddl::create_external_table(&mut store, &catalog_id, &definition, now)?;
+    ddl::register_partitions(&mut store, &catalog_id, &table.target, &directories, now)?;
+    Ok(written)
+}
+
+/// Whether the Data Catalog already holds an entry of the name `target` addresses.
+fn held_table<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    catalog_id: &str,
+    target: &Relation,
+) -> Result<bool, Failure> {
+    let Some(state) = glue_state::service_state(engine) else {
+        return Err(Failure::emulator(CATALOG_UNREACHABLE));
+    };
+    let store = state.lock();
+    Ok(store
+        .database(catalog_id, &target.database)
+        .is_some_and(|database| database.tables.contains_key(&target.table)))
+}
+
+/// The catalog entry a `CREATE TABLE … AS <query>` defines: the table declared over the rows
+/// its query produced, at the location they were written to and in the storage format they
+/// were written in.
+fn table_definition(
+    table: &TableAsSelect,
+    output: &Destination,
+    columns: &[SheetColumn<'_>],
+    keys: &[String],
+) -> ExternalTable {
+    ExternalTable {
+        target: table.target.clone(),
+        if_not_exists: table.if_not_exists,
+        // The columns the OBJECTS carry, and then the partition keys: each column with the
+        // Hive type its own Athena type is recorded as.
+        columns: columns.iter().map(declared_column).collect(),
+        partition_columns: keys
+            .iter()
+            .map(|key| DeclaredColumn {
+                name: key.clone(),
+                data_type: HIVE_PARTITION_KEY_TYPE.to_string(),
+                comment: None,
+            })
+            .collect(),
+        location: Some(output.location.clone()),
+        serde_library: None,
+        serde_parameters: Vec::new(),
+        table_properties: Vec::new(),
+        storage: Some(output.format.storage()),
+        comment: None,
+    }
+}
+
+/// The Hive type a PARTITION KEY of a table written by one of these statements is recorded
+/// with.
+///
+/// A partition key's values are the ones the directory its objects live under names, which
+/// is text — the key is read back off that path, so what the catalog records for it is the
+/// unbounded character type whatever the query's own column was.
+const HIVE_PARTITION_KEY_TYPE: &str = "string";
+
+/// One column of the rows a statement writes as the catalog declares it: the name it is
+/// written under, and the Hive DDL name of the type the result reports for it.
+fn declared_column(column: &SheetColumn<'_>) -> DeclaredColumn {
+    DeclaredColumn {
+        name: glue_state::fold_name(column.name),
+        data_type: hive_types::declared_type(column.data_type),
+        comment: None,
+    }
+}
+
+/// Whether `keys` are the LAST columns of `columns`, in that order — the layout a
+/// partitioned table's columns have to be in.
+///
+/// A statement that names no partition key satisfies it trivially. The comparison is the one
+/// the catalog makes between two column names, which is case-insensitive.
+fn partitions_are_last(columns: &[SheetColumn<'_>], keys: &[String]) -> bool {
+    if keys.len() > columns.len() {
+        return false;
+    }
+    columns
+        .iter()
+        .skip(columns.len() - keys.len())
+        .zip(keys)
+        .all(|(column, key)| glue_state::fold_name(column.name) == *key)
+}
+
+/// The columns of the rows a statement writes, in projection order.
+fn sheet_columns(result: &StoredResultSet) -> Vec<SheetColumn<'_>> {
+    result
+        .column_info
+        .iter()
+        .map(|column| SheetColumn {
+            name: column.name.as_str(),
+            data_type: column.r#type.as_str(),
+        })
+        .collect()
+}
+
+/// The rows a statement writes: one value per projected column, `None` for a NULL.
+fn sheet_values(result: &StoredResultSet) -> Vec<Vec<Option<&str>>> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.data
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|datum| datum.var_char_value.as_deref())
+                .collect()
+        })
+        .collect()
 }
 
 /// The prefix Athena's message for an unresolvable name opens with, which is also the error
@@ -757,6 +1305,7 @@ fn perform<Eng: Send + Sync + 'static>(
         | CatalogStatement::DropTable { target, .. }
         | CatalogStatement::ShowCreateView { target } => (target.catalog.clone(), target.at),
         CatalogStatement::ShowRelations { schema, .. } => (schema.catalog.clone(), schema.at),
+        CatalogStatement::ShowPartitions { target } => (target.catalog.clone(), target.at),
     };
     let catalog_id = catalog_id_of(engine, &catalog, at)?;
     // An external table's LOCATION has to name storage the table can be registered over:
@@ -816,6 +1365,9 @@ fn perform<Eng: Send + Sync + 'static>(
             views_only,
             filter,
         } => ddl::show_relations(&store, &catalog_id, schema, *views_only, filter.as_ref()),
+        CatalogStatement::ShowPartitions { target } => {
+            ddl::show_partitions(&store, &catalog_id, target)
+        }
     }
 }
 
@@ -845,6 +1397,45 @@ fn drops_a_table_of_the_engines_own<Eng: Send + Sync + 'static>(
     };
     let store = state.lock();
     store.database(&catalog_id, &target.database).is_none()
+}
+
+/// Whether `writing` is a `CREATE TABLE … AS <query>` that declares no location in a
+/// database the DATA CATALOG does not hold, and which therefore defines a table of the
+/// ENGINE's own.
+///
+/// The same reading [`drops_a_table_of_the_engines_own`] takes of a drop, for the create it
+/// is the counterpart of: a definition with no location of its own, in a database the catalog
+/// never held, addresses no catalog table at all — there is no catalog database to register
+/// it in and nowhere of its own for its data to go — so it defines its table where a
+/// `CREATE TABLE` with no query defines one, in the engine database the query's context
+/// addresses. A statement that DOES declare where its data lives, and one inside a database
+/// the catalog holds, defines a catalog table; an `UNLOAD` defines nothing, so it is never
+/// one of these.
+fn defines_a_table_of_the_engines_own<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    writing: &WritingStatement,
+) -> bool {
+    let WriteDestination::Table(table) = &writing.destination else {
+        return false;
+    };
+    if table
+        .external_location
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|location| !location.is_empty())
+    {
+        return false;
+    }
+    let Ok(catalog_id) = catalog_id_of(engine, &table.target.catalog, table.target.at) else {
+        return false;
+    };
+    let Some(state) = glue_state::service_state(engine) else {
+        return false;
+    };
+    let store = state.lock();
+    store
+        .database(&catalog_id, &table.target.database)
+        .is_none()
 }
 
 /// Forget the PARTITION INDEX records of the tables a drop removed.
@@ -1110,6 +1701,29 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
     let mut scanned_bytes = 0usize;
     let mut hidden_columns: HashSet<String> = HashSet::new();
     if !resolution.sources.is_empty() {
+        // WHICH PARTITIONS each read scans: the statement's own predicate decides it, so a
+        // read whose predicate fixes a partition key reads the data of the partitions that
+        // carry it and not the data of the whole table.
+        //
+        // Only where the statement reads exactly ONE relation and nothing else: a column a
+        // predicate names is resolved against the relations in scope, which this layer does
+        // not do — it tracks no alias, and a relation a VIEW reads is materialised once for
+        // the view and the statement both — so with more than one relation in play a
+        // constraint cannot be attributed to the source it belongs to, and narrowing by it
+        // could drop rows the statement asked for. Nothing is narrowed then, which costs a
+        // read nothing but the bytes it scans.
+        let constraints = statement::pruning_constraints(&statement);
+        let one_relation = resolution.sources.len() == 1
+            && resolution.views.is_empty()
+            // `objects` holds the catalog's own reporting tables at this point, and
+            // nothing else: a statement that reads one of those reads more than the
+            // one relation below.
+            && objects.is_empty();
+        if !constraints.is_empty() && one_relation {
+            for source in &mut resolution.sources {
+                source.pruned(&constraints);
+            }
+        }
         let Some(state) = s3_state::service_state(engine) else {
             return Err(Failure::emulator(OBJECT_STORE_UNREACHABLE));
         };

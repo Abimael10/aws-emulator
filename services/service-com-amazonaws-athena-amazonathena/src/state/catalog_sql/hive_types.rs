@@ -267,6 +267,65 @@ fn names_sizes(sizes: &str) -> bool {
             .all(|term| !term.is_empty() && term.chars().all(|digit| digit.is_ascii_digit()))
 }
 
+/// The Hive DDL name a catalog column is DECLARED with for a column whose type a query
+/// reports as `reported`.
+///
+/// The inverse of [`reported_type`] over the same pairs: a statement that DEFINES a table
+/// from the rows a query produced knows each column by the name Athena's SQL reports for its
+/// type, and the catalog records a column's type in HIVE's DDL names — so the few names that
+/// differ are mapped back here, and every type whose two names are the same is recorded as
+/// reported. A parameterised type keeps its parameters.
+///
+/// A column the query reports NO type for — a projection of nothing but NULLs, whose type
+/// nothing fixes — is recorded as the unbounded character type, which is the type such a
+/// column is read back as.
+#[must_use]
+pub fn declared_type(reported: &str) -> String {
+    let (named, parameters) = match reported.trim().split_once('(') {
+        Some((named, rest)) => (named.trim(), rest.split_once(')').map(|(sizes, _)| sizes)),
+        None => (reported.trim(), None),
+    };
+    let declared = match parameters {
+        // A PARAMETERISED type is declared under its own name: every name mapped below is
+        // a plain one, and the bounded character type is declared as itself with the
+        // length it carries rather than as the unbounded type's name.
+        Some(_) => named,
+        // A column the query reports no type for AT ALL is recorded as the unbounded
+        // character type, exactly as one it reports the unknown type for is.
+        None if named.is_empty() => UNDECLARED_TYPE,
+        None => DECLARED_NAMES
+            .iter()
+            .find(|(sql, _)| sql.eq_ignore_ascii_case(named))
+            .map_or(named, |(_, hive)| *hive),
+    };
+    match parameters {
+        Some(sizes) => format!("{declared}({sizes})"),
+        None => declared.to_string(),
+    }
+}
+
+/// The type names a query reports that the catalog DECLARES under another name, each with
+/// that name; see [`declared_type`].
+///
+/// Source: the same reference [`PLAIN_TYPES`] is read from, taken the other way round — the
+/// SQL name beside the DDL one. Only the names that DIFFER are listed: a type whose two
+/// names are the same needs no entry, and recording one for it would be a second place the
+/// pair is spelled.
+const DECLARED_NAMES: &[(&str, &str)] = &[
+    ("integer", "int"),
+    ("real", "float"),
+    ("varbinary", "binary"),
+    // The unbounded character type is `string` in DDL; the bounded one keeps its own name
+    // and its length, which the parameters carried beside it supply.
+    ("varchar", "string"),
+    // A column of no type at all is recorded as the unbounded character type.
+    ("unknown", UNDECLARED_TYPE),
+];
+
+/// The Hive type a column whose type a query reports as nothing at all is DECLARED with: the
+/// unbounded character type, which is the type such a column is read back as.
+const UNDECLARED_TYPE: &str = "string";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +444,49 @@ mod tests {
                 actual.as_deref(),
                 *reported,
                 "case {declared:?}: expected the reported type {reported:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the Hive name a column is DECLARED with, for a type a query reports, is that
+    /// type's DDL name — and every declaration this answers names a type, so a table defined
+    /// from the rows a query produced can be read back.
+    ///
+    /// The rows span what the rule generalises over: the names that differ between the two
+    /// spellings, the ones that do not, the parameterised forms (whose name is their own),
+    /// the case the reported name may carry, and a column no type at all is reported for.
+    #[test]
+    fn a_reported_type_is_declared_under_its_own_hive_name() {
+        // (the type a query reports, the Hive name the catalog declares it under)
+        let cases: Vec<(&str, &str)> = vec![
+            ("integer", "int"),
+            ("bigint", "bigint"),
+            ("double", "double"),
+            ("real", "float"),
+            ("boolean", "boolean"),
+            ("varchar", "string"),
+            ("varbinary", "binary"),
+            ("tinyint", "tinyint"),
+            ("date", "date"),
+            ("timestamp", "timestamp"),
+            ("decimal(10,2)", "decimal(10,2)"),
+            ("varchar(20)", "varchar(20)"),
+            ("timestamp(3)", "timestamp(3)"),
+            ("INTEGER", "int"),
+            // A column the query reports no type for at all.
+            ("unknown", "string"),
+            ("", "string"),
+            ("   ", "string"),
+        ];
+        for (reported, expected) in &cases {
+            let actual = declared_type(reported);
+            assert_eq!(
+                actual, *expected,
+                "case {reported:?}: expected the declared type {expected:?}, got {actual:?}"
+            );
+            assert!(
+                names_a_type(&actual),
+                "case {reported:?}: the declared type {actual:?} must name a type"
             );
         }
     }

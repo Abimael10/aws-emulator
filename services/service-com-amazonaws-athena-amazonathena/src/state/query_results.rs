@@ -115,15 +115,28 @@ pub fn result_objects(record: &QueryExecutionRecord) -> Vec<ResultObject> {
     let Some(Outcome::Succeeded { result, .. }) = record.outcome.as_ref() else {
         return Vec::new();
     };
+    // The DATA MANIFEST of a statement that WROTE objects, which goes beside the results
+    // object: it lists exactly the objects that statement wrote, so a client reads back the
+    // data it produced from the manifest the execution names.
+    let manifest = record
+        .data_manifest_uri()
+        .map(|uri| ResultObject {
+            uri,
+            body: data_manifest(record.written_objects()),
+            content_type: MANIFEST_CONTENT_TYPE,
+        })
+        .into_iter();
     let Some(uri) = record.result_object_uri() else {
-        return Vec::new();
+        return manifest.collect();
     };
     if record.writes_text_output() {
-        return vec![ResultObject {
+        return ::std::iter::once(ResultObject {
             uri,
             body: text_output(result),
             content_type: TEXT_CONTENT_TYPE,
-        }];
+        })
+        .chain(manifest)
+        .collect();
     }
     vec![
         ResultObject {
@@ -137,6 +150,25 @@ pub fn result_objects(record: &QueryExecutionRecord) -> Vec<ResultObject> {
             content_type: METADATA_CONTENT_TYPE,
         },
     ]
+    .into_iter()
+    .chain(manifest)
+    .collect()
+}
+
+/// The media type of a data manifest object: the one Athena's own manifest key names
+/// ([`crate::state::DATA_MANIFEST_SUFFIX`]).
+const MANIFEST_CONTENT_TYPE: &str = "text/csv";
+
+/// The data manifest of a statement that wrote objects: the `s3://` URI of each object it
+/// wrote, one per line and in the order they were written, each line terminated — so a
+/// reader of the manifest gets exactly the objects the statement wrote and nothing else.
+fn data_manifest(written: &[String]) -> Vec<u8> {
+    let mut text = String::new();
+    for object in written {
+        text.push_str(object);
+        text.push('\n');
+    }
+    text.into_bytes()
 }
 
 /// The server-side encryption the objects of one query's results are stored under: the
@@ -266,26 +298,7 @@ pub fn write<Eng: Send + Sync + 'static>(
             );
             continue;
         };
-        let written = {
-            let mut store = state.lock();
-            // HOW the object is encrypted at rest: the configuration this execution's
-            // result configuration settled on, and the destination bucket's own default
-            // encryption configuration where it asks for none — the object store's own rule
-            // for every write another service makes into a bucket, so a result object and a
-            // client's own object in that bucket are stored under one record of it.
-            let encryption = match encryption {
-                Some(encryption) => encryption.clone(),
-                None => s3_state::written_object_encryption(&store, &bucket, None),
-            };
-            let mut stored =
-                s3_state::Object::stored(object.body, Some(object.content_type.to_string()));
-            // An object sealed under a key carries an entity tag that is NOT the digest of
-            // its bytes, which is the object store's own rule for the tag a stored object
-            // takes ([`s3_state::stored_object_etag`]).
-            stored.etag = s3_state::stored_object_etag(&stored.etag, &encryption);
-            stored.encryption = encryption;
-            store.put_object(&bucket, &key, stored)
-        };
+        let written = store_object(&state, &bucket, &key, object, encryption);
         match written {
             Some(s3_state::ObjectWrite::Created | s3_state::ObjectWrite::Replaced) => {}
             // The object store holds no such bucket, or refused the write for a condition
@@ -299,6 +312,42 @@ pub fn write<Eng: Send + Sync + 'static>(
             ),
         }
     }
+}
+
+/// Store ONE object of an execution at `key` of `bucket`, and answer what the object store
+/// made of the write.
+///
+/// The one place this service writes an object of a query: the results, the metadata
+/// information and the data manifest beside them, and the DATA a statement that writes its
+/// output stores ([`super::catalog_sql::query_output`]). So every object an execution leaves
+/// in the store is written under one rule — the encryption the execution's resolved result
+/// configuration settled on, the destination bucket's own default encryption where it asks
+/// for none, and the entity tag the object store gives an object stored that way — and the
+/// callers differ only in what they make of a write the store would not take.
+pub(crate) fn store_object(
+    state: &::engine::ServiceState<s3_state::ComAmazonawsS3Amazons3State>,
+    bucket: &str,
+    key: &str,
+    object: ResultObject,
+    encryption: &ResultEncryption,
+) -> Option<s3_state::ObjectWrite> {
+    let mut store = state.lock();
+    // HOW the object is encrypted at rest: the configuration this execution's result
+    // configuration settled on, and the destination bucket's own default encryption
+    // configuration where it asks for none — the object store's own rule for every write
+    // another service makes into a bucket, so an object of a query and a client's own object
+    // in that bucket are stored under one record of it.
+    let encryption = match encryption {
+        Some(encryption) => encryption.clone(),
+        None => s3_state::written_object_encryption(&store, bucket, None),
+    };
+    let mut stored = s3_state::Object::stored(object.body, Some(object.content_type.to_string()));
+    // An object sealed under a key carries an entity tag that is NOT the digest of its
+    // bytes, which is the object store's own rule for the tag a stored object takes
+    // ([`s3_state::stored_object_etag`]).
+    stored.etag = s3_state::stored_object_etag(&stored.etag, &encryption);
+    stored.encryption = encryption;
+    store.put_object(bucket, key, stored)
 }
 
 /// The CSV a statement whose results are ROWS saves them as: the column labels first and
