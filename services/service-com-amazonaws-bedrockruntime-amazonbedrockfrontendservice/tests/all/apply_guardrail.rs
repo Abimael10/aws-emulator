@@ -1195,11 +1195,12 @@ async fn the_usage_and_coverage_report_what_each_policy_read() {
     ok("usage", &call);
     let body = call.json();
     // (the member, the units it must report). A policy the revision configures read
-    // the guarded text; one it does not configure read nothing. The regular
-    // expressions of a sensitive-information policy are charged as the FREE units.
+    // the guarded text; one it does not configure read nothing. The FREE units of a
+    // sensitive-information policy are charged for what its regular expressions
+    // PLACED, and this text carries nothing the configured one matches.
     let rows: [(&str, i64); 6] = [
         ("wordPolicyUnits", 1),
-        ("sensitiveInformationPolicyFreeUnits", 1),
+        ("sensitiveInformationPolicyFreeUnits", 0),
         ("topicPolicyUnits", 0),
         ("contentPolicyUnits", 0),
         ("sensitiveInformationPolicyUnits", 0),
@@ -1425,6 +1426,345 @@ async fn the_same_reference_is_served_once_its_revision_is_published() {
             "case {case:?}: the published revision configures no policy this text \
              places, so it intervenes in nothing, got {action:?} in {}",
             served.json()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the answer REPORTS of the action it took
+// ---------------------------------------------------------------------------
+
+/// The sentence Amazon Bedrock states as the reason for the action it took, one per
+/// action, written out here so the answer is pinned to the WORDING rather than to
+/// whatever the implementation's own constants currently say.
+const REASON_BLOCKED: &str = "Guardrail blocked.";
+const REASON_MASKED: &str = "Guardrail masked.";
+const REASON_NONE: &str = "No action.";
+
+/// A guardrail configuring one regular expression that acts as `configured`.
+fn regex_revision(configured: PolicyAction) -> GuardrailPolicies {
+    GuardrailPolicies {
+        regexes: vec![RegexEntry {
+            name: "order-id".to_string(),
+            pattern: r"ORD-[0-9]{4}".to_string(),
+            sides: Sides::both(configured),
+        }],
+        ..revision()
+    }
+}
+
+/// A guardrail configuring one word that acts as `configured`.
+fn word_revision(configured: PolicyAction) -> GuardrailPolicies {
+    GuardrailPolicies {
+        words: vec![WordEntry {
+            text: "zephyrine".to_string(),
+            sides: Sides::both(configured),
+        }],
+        ..revision()
+    }
+}
+
+/// One row of [`an_apply_states_the_reason_for_its_action_and_the_text_it_answers_with`]:
+/// the revision applied, the submission it is applied to, and what the answer must
+/// report of the action it took.
+struct VerdictRow {
+    case: &'static str,
+    policies: GuardrailPolicies,
+    /// `GuardrailContentSource` — which side the submission is.
+    source: &'static str,
+    text: &'static str,
+    action: &'static str,
+    reason: &'static str,
+    /// The text the guardrail answers with, block by block.
+    answered: &'static [&'static str],
+    /// The blocked messaging the answer reports, where the guardrail blocked.
+    blocked_response: Option<&'static str>,
+}
+
+/// RULE: every apply states the reason for the action it took — the one sentence
+/// naming that action, for content it blocked, content it left masked and content it
+/// acted on not at all — and reports the text it answers with under both names the
+/// wire carries that list under, plus, for content it BLOCKED, the blocked messaging
+/// of the revision it applied.
+///
+/// The rows differ along the verdict, along which policy reached it, and along whether
+/// the guardrail answered any text at all.
+#[tokio::test]
+async fn an_apply_states_the_reason_for_its_action_and_the_text_it_answers_with() {
+    let rows: [VerdictRow; 6] = [
+        VerdictRow {
+            case: "blocked by a configured word",
+            policies: word_revision(PolicyAction::Block),
+            source: "INPUT",
+            text: "describe zephyrine for me",
+            action: "GUARDRAIL_INTERVENED",
+            reason: REASON_BLOCKED,
+            answered: &[BLOCKED_INPUT],
+            blocked_response: Some(BLOCKED_INPUT),
+        },
+        VerdictRow {
+            case: "blocked by a regular expression, on the output side",
+            policies: regex_revision(PolicyAction::Block),
+            source: "OUTPUT",
+            text: "your order is ORD-1234 today",
+            action: "GUARDRAIL_INTERVENED",
+            reason: REASON_BLOCKED,
+            answered: &[BLOCKED_OUTPUT],
+            blocked_response: Some(BLOCKED_OUTPUT),
+        },
+        VerdictRow {
+            case: "masked by a regular expression",
+            policies: regex_revision(PolicyAction::Anonymize),
+            source: "INPUT",
+            text: "your order is ORD-1234 today",
+            action: "GUARDRAIL_INTERVENED",
+            reason: REASON_MASKED,
+            answered: &["your order is {order-id} today"],
+            blocked_response: None,
+        },
+        VerdictRow {
+            case: "masked by an entity type",
+            policies: GuardrailPolicies {
+                pii_entities: vec![PiiEntry {
+                    entity_type: "EMAIL".to_string(),
+                    sides: Sides::both(PolicyAction::Anonymize),
+                }],
+                ..revision()
+            },
+            source: "INPUT",
+            text: "Write to dana.reed@example.com about the order.",
+            action: "GUARDRAIL_INTERVENED",
+            reason: REASON_MASKED,
+            answered: &["Write to {EMAIL} about the order."],
+            blocked_response: None,
+        },
+        VerdictRow {
+            case: "nothing the revision configures is in the text",
+            policies: word_revision(PolicyAction::Block),
+            source: "INPUT",
+            text: "a benign question about tokens",
+            action: "NONE",
+            reason: REASON_NONE,
+            answered: &[],
+            blocked_response: None,
+        },
+        VerdictRow {
+            case: "placed, but by an entry that only reports",
+            policies: word_revision(PolicyAction::Detect),
+            source: "INPUT",
+            text: "describe zephyrine for me",
+            action: "NONE",
+            reason: REASON_NONE,
+            answered: &[],
+            blocked_response: None,
+        },
+    ];
+
+    for VerdictRow {
+        case,
+        policies,
+        source,
+        text,
+        action,
+        reason,
+        answered,
+        blocked_response,
+    } in rows
+    {
+        let (engine, router) = emulator_with_engine();
+        publish(&engine, policies);
+
+        let call = apply(
+            &router,
+            GUARDRAIL_ID,
+            DRAFT_VERSION,
+            &text_body(source, text, None),
+        )
+        .await;
+        ok(case, &call);
+        let body = call.json();
+        let actual = action_of(&call);
+        assert_eq!(
+            actual, action,
+            "case {case:?}: expected action {action}, got {actual:?} in {body}"
+        );
+        assert_eq!(
+            body["actionReason"].as_str(),
+            Some(reason),
+            "case {case:?}: expected the reason {reason:?}, got {:?} in {body}",
+            body["actionReason"]
+        );
+        assert_eq!(
+            outputs_of(&call),
+            answered,
+            "case {case:?}: expected the guardrail to answer {answered:?}, got {body}"
+        );
+        // The second name the wire carries the answered text under: present on every
+        // answer — the empty list where the guardrail answered nothing — and always
+        // the same list.
+        assert_eq!(
+            body["output"], body["outputs"],
+            "case {case:?}: both names must report the same text, got {body}"
+        );
+        assert!(
+            body["output"].is_array(),
+            "case {case:?}: the answered text is reported as a list, got {body}"
+        );
+        assert_eq!(
+            body["blockedResponse"].as_str(),
+            blocked_response,
+            "case {case:?}: expected the blocked messaging {blocked_response:?}, got {body}"
+        );
+    }
+}
+
+/// RULE: the usage an apply reports carries EVERY counter the wire carries — the ones
+/// for work this evaluation did not do reported as the zero they are rather than left
+/// absent — and the FREE units of a sensitive-information policy are charged for what
+/// its regular expressions PLACED, not for the policy being configured. The same usage
+/// is reported at the apply's own `usage` and in the assessment's invocation metrics.
+///
+/// The rows differ along whether the policy is configured at all and whether the
+/// submitted text carries what it matches.
+#[tokio::test]
+async fn the_usage_reports_every_counter_and_charges_the_free_units_it_placed() {
+    // (case, the revision, the text, the free units it must report)
+    let rows: [(&str, GuardrailPolicies, &str, i64); 4] = [
+        (
+            "a regular expression the text carries",
+            regex_revision(PolicyAction::Block),
+            "your order is ORD-1234 today",
+            1,
+        ),
+        (
+            "a regular expression the text carries, masked rather than blocked",
+            regex_revision(PolicyAction::Anonymize),
+            "your order is ORD-1234 today",
+            1,
+        ),
+        (
+            "a regular expression the text carries nothing of",
+            regex_revision(PolicyAction::Block),
+            "a benign question about tokens",
+            0,
+        ),
+        (
+            "no regular expression configured at all",
+            word_revision(PolicyAction::Block),
+            "a benign question about tokens",
+            0,
+        ),
+    ];
+    // The counters of work no evaluation of this emulator does: reported, and zero.
+    // Source: `smithy_query(query="shape",shape="GuardrailUsage")` — the three members
+    // the model types as optional integers.
+    const REPORTED_ZERO: [&str; 3] = [
+        "contentPolicyImageUnits",
+        "automatedReasoningPolicyUnits",
+        "automatedReasoningPolicies",
+    ];
+
+    for (case, policies, text, free_units) in rows {
+        let (engine, router) = emulator_with_engine();
+        publish(&engine, policies);
+
+        let call = apply(
+            &router,
+            GUARDRAIL_ID,
+            DRAFT_VERSION,
+            &text_body("INPUT", text, None),
+        )
+        .await;
+        ok(case, &call);
+        let body = call.json();
+        let metrics_usage = assessment(&call)["invocationMetrics"]["usage"].clone();
+        assert_eq!(
+            metrics_usage, body["usage"],
+            "case {case:?}: the metrics report the units this evaluation read, got {body}"
+        );
+        for usage in [&body["usage"], &metrics_usage] {
+            assert_eq!(
+                usage["sensitiveInformationPolicyFreeUnits"].as_i64(),
+                Some(free_units),
+                "case {case:?}: expected {free_units} free units, got {usage}"
+            );
+            for member in REPORTED_ZERO {
+                assert_eq!(
+                    usage[member].as_i64(),
+                    Some(0),
+                    "case {case:?}: expected {member} reported as 0, got {usage}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: a word-policy assessment reports the managed word lists it PLACED, and
+/// reports that member not at all where no managed list placed a word — while the
+/// custom words it placed are reported whatever the managed lists did.
+///
+/// The rows differ along which of the two lists the submitted text carries something
+/// of.
+#[tokio::test]
+async fn a_word_policy_reports_the_managed_lists_it_placed() {
+    // (case, the text, a custom word placed, a managed word placed). The managed list
+    // AWS publishes is the profanity one (`GuardrailManagedWordsType` -> [PROFANITY]).
+    let rows: [(&str, &str, bool, bool); 3] = [
+        ("a configured word alone", "describe zephyrine for me", true, false),
+        ("a word of the managed list alone", "why the shit does this fail", false, true),
+        ("both", "why the shit does zephyrine fail", true, true),
+    ];
+    for (case, text, custom, managed) in rows {
+        let (engine, router) = emulator_with_engine();
+        publish(
+            &engine,
+            GuardrailPolicies {
+                words: vec![WordEntry {
+                    text: "zephyrine".to_string(),
+                    sides: Sides::both(PolicyAction::Block),
+                }],
+                managed_word_lists: vec![ManagedWordEntry {
+                    kind: MANAGED_WORDS_PROFANITY.to_string(),
+                    sides: Sides::both(PolicyAction::Block),
+                }],
+                ..revision()
+            },
+        );
+
+        let call = apply(
+            &router,
+            GUARDRAIL_ID,
+            DRAFT_VERSION,
+            &text_body("INPUT", text, None),
+        )
+        .await;
+        ok(case, &call);
+        let policy = assessment(&call)["wordPolicy"].clone();
+        assert_eq!(
+            policy["managedWordLists"].is_null(),
+            !managed,
+            "case {case:?}: expected the managed lists reported={managed}, got {policy}"
+        );
+        if managed {
+            assert_eq!(
+                policy["managedWordLists"][0]["type"].as_str(),
+                Some(MANAGED_WORDS_PROFANITY),
+                "case {case:?}: the placement names the list that placed it, got {policy}"
+            );
+        }
+        let placed_words = policy["customWords"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            !placed_words.is_empty(),
+            custom,
+            "case {case:?}: expected a configured word placed={custom}, got {policy}"
+        );
+        assert!(
+            !policy["customWords"].is_null(),
+            "case {case:?}: the custom words are reported whatever the managed lists \
+             placed, got {policy}"
         );
     }
 }

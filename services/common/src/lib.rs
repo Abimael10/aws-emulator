@@ -817,6 +817,10 @@ pub mod spark_runtime;
 /// the COLLECTION a clause about a collection member is about — served as the
 /// per-operation wrapper that is the only layer with the request it has to be read from.
 pub mod submitted_collections;
+/// The ONE rewrite of a rendered SUCCESS body, for every service whose wire carries a
+/// member its checked-in Smithy model does not declare — the success-body sibling of
+/// [`error_detail_member::with_error_body_members`].
+pub mod success_body_members;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.
 pub mod sqlite_confinement;

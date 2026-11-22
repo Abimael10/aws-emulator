@@ -71,8 +71,23 @@
 //! records finds the record of the call a response it holds is of — and under a freshly
 //! minted id on every other response, which is the shared rule unchanged.
 //!
-//! Nothing else about a response changes: the status, the other headers and every byte of
-//! the body stay as the renderer wrote them.
+//! Nothing else about a response changes THERE: that rule writes one header, and the
+//! status, the other headers and every byte of the body stay as the renderer wrote them.
+//!
+//! ## The members an applied guardrail's answer carries that the model does not declare
+//!
+//! One SIXTH seam, beside the five above: the body of a success. The live
+//! `ApplyGuardrail` answer carries two members this checkout's Smithy model declares
+//! nowhere, and reports one member of its word-policy assessment only where that list
+//! placed a word — none of which a generated shape can express, so they are written over
+//! the body the framework's serializer rendered, at the one wrapper this file already
+//! routes that operation through ([`as_this_service_answers_a_guardrail`]). Which members, and
+//! what they hold, is [`apply_guardrail_body`]; every other operation's body, and every
+//! failure, is untouched.
+
+/// The members an applied guardrail's answer carries that this checkout's model does not
+/// declare, written over the body the framework's serializer rendered.
+mod apply_guardrail_body;
 
 use crate::ops::converse_stream::ConverseStream;
 use crate::ops::invoke_model_with_response_stream::InvokeModelWithResponseStream;
@@ -245,7 +260,7 @@ fn resource_reference_refusal(refusal: &Refusal) -> Option<Refused> {
 /// (`Service::override_refusal`) is handed the violations alone: a request whose
 /// guardrail reference the service cannot read is refused on that reference even
 /// where the boundary validator refused it for something else
-/// ([`in_guardrail_reference_words`]).
+/// ([`as_this_service_answers_a_guardrail`]).
 fn apply_guardrail_identifier(path: &str) -> Option<String> {
     let mut segments = path.trim_start_matches('/').split('/');
     let ("guardrail", Some(identifier), Some("version"), Some(_), Some("apply"), None) = (
@@ -261,8 +276,13 @@ fn apply_guardrail_identifier(path: &str) -> Option<String> {
     Some(service_common::percent_decode_path_label(identifier))
 }
 
-/// `resp` with a `ValidationException` of a request whose GUARDRAIL REFERENCE the
-/// service cannot read stated in the service's own words for that reference.
+/// `resp` as this service answers a request that named a GUARDRAIL in its path: the two
+/// halves of that answer only the whole rendered response can state.
+///
+/// A SUCCESS carries the members the live wire renders on an applied guardrail, written
+/// over the body the framework's serializer rendered ([`apply_guardrail_body`]). A
+/// FAILURE of a request whose guardrail REFERENCE the service cannot read is stated in
+/// the service's own words for that reference.
 ///
 /// The guardrail is read BEFORE the version that selects one of its revisions and
 /// before anything else the request says, so a request naming a guardrail this
@@ -276,11 +296,15 @@ fn apply_guardrail_identifier(path: &str) -> Option<String> {
 /// headers, and every other body member — and a response whose body is not a
 /// `ValidationException` carrying a detail member is returned untouched
 /// ([`service_common::error_detail_member`]).
-fn in_guardrail_reference_words(
+fn as_this_service_answers_a_guardrail(
     req: &aws_smithy_runtime_api::http::Request,
     resp: aws_smithy_runtime_api::http::Response,
     _noted: Option<String>,
 ) -> aws_smithy_runtime_api::http::Response {
+    // A SUCCESS first: the evaluation the guardrail reported, with the members the
+    // model does not declare written over the body the framework's serializer wrote. A
+    // failure carries no evaluation and falls through to the refusal wording below.
+    let resp = apply_guardrail_body::with_served_success_body(resp);
     let Some(identifier) = apply_guardrail_identifier(request_path(req.uri())) else {
         return resp;
     };
@@ -322,7 +346,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     request_id: RequestIdReportedOperation,
     /// Serves a request that names a GUARDRAIL in its path, so a reference this
     /// service cannot read is refused on that reference whatever else is wrong with
-    /// the request ([`in_guardrail_reference_words`]). The request id is reported
+    /// the request ([`as_this_service_answers_a_guardrail`]). The request id is reported
     /// around it, so such a response names the request it answers exactly as every
     /// other does.
     apply_guardrail: RequestIdReportingOperation<RestatedRefusalOperation>,
@@ -352,7 +376,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             ),
             request_id: RequestIdReportedOperation::new(report),
             apply_guardrail: RequestIdReportingOperation::reported(
-                RestatedRefusalOperation::new(in_guardrail_reference_words),
+                RestatedRefusalOperation::new(as_this_service_answers_a_guardrail),
                 report,
             ),
         }

@@ -358,12 +358,21 @@ pub fn apply(
         sensitive_information_policy_units: charged(policies.evaluates_pii(input)),
         // Amazon Bedrock charges the regular-expression filters of a
         // sensitive-information policy at no cost ("Guardrails" in Amazon Bedrock
-        // pricing), so the units they read are reported as the FREE ones.
-        sensitive_information_policy_free_units: charged(policies.evaluates_regexes(input)),
+        // pricing), so the units they read are reported as the FREE ones — and they
+        // are charged for what those filters PLACED, not for the policy being
+        // configured: a submission none of them matched read no free unit.
+        sensitive_information_policy_free_units: charged(!regexes.is_empty()),
         contextual_grounding_policy_units: charged(policies.evaluates_grounding()),
-        content_policy_image_units: None,
-        automated_reasoning_policy_units: None,
-        automated_reasoning_policies: None,
+        // The counters of work this evaluation did NOT do report the zero they are
+        // rather than being left absent, so a client that meters on them reads a
+        // number for every call instead of having to read an absent member as zero:
+        // the content policy read no IMAGE unit (no image is guarded here, which is
+        // what the coverage below reports), and no revision this plane holds
+        // configures an automated-reasoning policy ([`GuardrailPolicies`]), so none
+        // was processed and none of their units was read.
+        content_policy_image_units: Some(0),
+        automated_reasoning_policy_units: Some(0),
+        automated_reasoning_policies: Some(0),
     };
     let coverage = GuardrailCoverage {
         text_characters: Some(GuardrailTextCharactersCoverage {
