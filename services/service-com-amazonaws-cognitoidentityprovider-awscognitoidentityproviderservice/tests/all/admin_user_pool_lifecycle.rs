@@ -1260,13 +1260,7 @@ async fn an_unmodelled_or_unimplemented_value_is_answered_by_its_own_refusal() {
 
     // A modelled auth flow this slice does not perform says so with a 501 rather
     // than answering a sign-in nothing performed.
-    for auth_flow in [
-        "USER_SRP_AUTH",
-        "USER_PASSWORD_AUTH",
-        "CUSTOM_AUTH",
-        "REFRESH_TOKEN_AUTH",
-        "USER_AUTH",
-    ] {
+    for auth_flow in ["USER_SRP_AUTH", "USER_PASSWORD_AUTH", "CUSTOM_AUTH", "USER_AUTH"] {
         let (status, payload) = call(
             &router,
             "AdminInitiateAuth",
@@ -1282,6 +1276,41 @@ async fn an_unmodelled_or_unimplemented_value_is_answered_by_its_own_refusal() {
             (status, error_code(&payload)),
             (501, "NotImplemented"),
             "case {auth_flow:?}: an auth flow nobody has written answers 501, got {payload}"
+        );
+    }
+
+    // The refresh-token flow IS performed, so a request for it that carries no
+    // `REFRESH_TOKEN` is answered by that flow's own modelled refusal rather than by a
+    // 501: the alias the enum carries for it is the same flow.
+    for auth_flow in ["REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"] {
+        let (status, payload) = call(
+            &router,
+            "AdminInitiateAuth",
+            &json!({
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "AuthFlow": auth_flow,
+                "AuthParameters": { "USERNAME": "alice" },
+            }),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&payload),
+                payload["message"].as_str().unwrap_or("<no message>")
+            ),
+            (
+                400,
+                "InvalidParameterException",
+                format!(
+                    "Missing required parameter REFRESH_TOKEN in AuthParameters for AuthFlow \
+                     {auth_flow}"
+                )
+                .as_str()
+            ),
+            "case {auth_flow:?}: the refresh flow is served, so its own refusal answers a \
+             request missing the token, got {payload}"
         );
     }
 

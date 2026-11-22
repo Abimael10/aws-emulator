@@ -1154,13 +1154,14 @@ struct IssuedCode {
 /// as the value" (`InitiateAuth.AuthFlow`), whose one required `AuthParameter` is
 /// `REFRESH_TOKEN`.
 ///
-/// "Valid" is read off the token record this emulator wrote when it issued the token:
-/// it must be a refresh token, issued for the app client the request names, not revoked,
-/// and not past its expiry. A token that was issued for this app client and has since
-/// been REVOKED is refused as revoked, while one that resolves to no record of this app
-/// client at all is refused as invalid. `auth_flow` is the member the request actually
-/// named, so a refusal echoes `REFRESH_TOKEN_AUTH` or its `REFRESH_TOKEN` alias as
-/// submitted.
+/// "Valid" is read off the token record this emulator wrote when it issued the token,
+/// by the store's shared reading of a refresh
+/// ([`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::resolve_refresh_token`]):
+/// it must be a refresh token, issued for the app client the request names, whose user
+/// may sign in, not revoked, not past its expiry. Which of those it misses is what the
+/// refusal reports ([`refresh_refused`]), and `auth_flow` is the member the request
+/// actually named, so a refusal of the FLOW echoes `REFRESH_TOKEN_AUTH` or its
+/// `REFRESH_TOKEN` alias as submitted.
 ///
 /// A refresh mints tokens, so it reaches the pre-token-generation stage — "called when a
 /// user tries to refresh the identity and access tokens" is this generation's own
@@ -1216,39 +1217,14 @@ async fn refresh_sign_in(
         }
         let user_pool_id = pool.id.clone();
 
-        // A record this emulator issued for THIS app client of THIS pool is what
-        // the presented value has to resolve to; anything else — a value never
-        // issued, a token of another kind, or one issued elsewhere — resolves to
-        // nothing at all.
-        let presented = state.token(refresh_token).filter(|record| {
-            record.kind == crate::state::TokenKind::Refresh
-                && record.client_id == client_id
-                && record.user_pool_id == user_pool_id
-        });
-        // A resolved record that was REVOKED is refused as revoked, which is a
-        // different answer from the one a token the service cannot resolve gets:
-        // the caller holds a token this service did issue and has since
-        // invalidated, so the refusal reports that rather than denying the token
-        // was ever issued.
-        if presented.is_some_and(|record| record.revoked) {
-            return Err(refresh_token_revoked());
-        }
-        let (username, sub) = presented
-            .filter(|record| record.expires_at > now)
-            .map(|record| (record.username.clone(), record.sub.clone()))
-            .ok_or_else(invalid_refresh_token)?;
-
-        // The record is only a pointer into the pool: the user it names may have been
-        // disabled, reset or deleted since the token was issued — and a user created
-        // later under that name carries a different id, so it is not the user this
-        // token was issued to.
-        let user = state
-            .pool(&user_pool_id)
-            .and_then(|pool| pool.user(&username))
-            .filter(|user| user.sub == sub)
-            .ok_or_else(invalid_refresh_token)?;
-        refuse_unusable_user(user)?;
-        (user_pool_id, user.username.clone())
+        // Whether the presented value authorizes a refresh at all is the store's own
+        // reading ([`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::resolve_refresh_token`]),
+        // shared with the administrative sign-in and the token exchange, so one token
+        // is not told it is unknown here and refused for another reason there.
+        let refreshed = state
+            .resolve_refresh_token(&user_pool_id, client_id, refresh_token, now)
+            .map_err(refresh_refused)?;
+        (refreshed.user_pool_id, refreshed.username)
     };
 
     let overrides = crate::state::lambda_triggers::fire_pre_token_generation(
@@ -1356,23 +1332,19 @@ fn incorrect_credentials() -> InitiateAuthError {
     not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
 }
 
-/// The refusal for a `REFRESH_TOKEN` this emulator cannot resolve to a live refresh
-/// token of the app client the request names.
+/// The refusal a presented `REFRESH_TOKEN` earns, as the store's shared reading of a
+/// refresh decided it ([`crate::state::RefreshTokenRefusal`], which states the order and
+/// the sentence): the modelled error of THIS operation for each, carrying that sentence.
 ///
-/// One fixed sentence, which names neither the value presented nor the app client it was
-/// presented to — and which ends in no period: this is the sentence Amazon Cognito denies
-/// a refresh token with, and a sentence's punctuation is as much its text as its words
-/// are.
-fn invalid_refresh_token() -> InitiateAuthError {
-    not_authorized("Invalid Refresh Token")
-}
-
-/// The refusal for a `REFRESH_TOKEN` this emulator issued for the app client the
-/// request names and has since revoked — a sign-out of its user, or a revocation
-/// of the token itself. Told apart from [`invalid_refresh_token`] because the
-/// token did authorize this app client until it was invalidated.
-fn refresh_token_revoked() -> InitiateAuthError {
-    not_authorized("Refresh Token has been revoked")
+/// A user that may not sign in is refused by the error its own state names — the two this
+/// operation declares for it — exactly as the password flows refuse it; everything else
+/// about a refresh token is `NotAuthorizedException`.
+fn refresh_refused(refusal: crate::state::RefreshTokenRefusal) -> InitiateAuthError {
+    match refusal {
+        crate::state::RefreshTokenRefusal::PasswordResetRequired => password_reset_required(),
+        crate::state::RefreshTokenRefusal::UserNotConfirmed => user_not_confirmed(),
+        other => not_authorized(other.message()),
+    }
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.

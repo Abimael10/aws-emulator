@@ -55,6 +55,9 @@ mod saml_signing_certificate;
 /// The form a refresh token travels in: the JWE compact serialization it is vended as,
 /// and the key this service seals one under.
 mod refresh_token_jwe;
+/// Whether a presented refresh token signs its user in again, and why it does not: the
+/// refusal order and the sentences every refresh surface of this service shares.
+mod refresh_token_auth;
 /// What a pool publishes about itself under its token issuer: its OpenID Connect
 /// discovery document and the paths it publishes its documents at.
 mod openid_discovery;
@@ -96,6 +99,7 @@ pub use openid_discovery::*;
 pub use pool_preconditions::*;
 pub use pool_resources::*;
 pub use refresh_token_jwe::*;
+pub use refresh_token_auth::*;
 pub use saml_signing_certificate::*;
 pub use scope_order::*;
 pub use sessions::*;

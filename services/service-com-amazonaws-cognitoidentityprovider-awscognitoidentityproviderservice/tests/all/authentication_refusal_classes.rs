@@ -924,10 +924,11 @@ async fn the_refresh_exchange_tells_another_clients_token_apart() {
     );
 }
 
-/// RULE: the refresh-token SIGN-IN denies a value it cannot resolve to a live refresh
-/// token of the app client named with the same sentence the refresh exchange denies one
-/// with — the fixed text, no trailing period — whatever makes the value unresolvable, and
-/// tells a token it DID issue and has since revoked apart from it.
+/// RULE: the refresh-token SIGN-IN words every refusal of a presented refresh token as the
+/// refresh exchange words it — the fixed text, no trailing period for a value neither can
+/// resolve — and tells the three cases apart: a value that resolves to no refresh token at
+/// all, a refresh token this service issued for ANOTHER app client, and one it issued for
+/// this app client and has since revoked.
 #[tokio::test]
 async fn the_refresh_token_sign_in_denies_an_unresolvable_token_in_the_exchanges_words() {
     let router = router();
@@ -973,7 +974,9 @@ async fn the_refresh_token_sign_in_denies_an_unresolvable_token_in_the_exchanges
     // The rows differ along WHY the presented value is not a live refresh token of this
     // app client: nothing issued it, it is a token of another kind of the caller's own
     // sign-in, it is a refresh token of another app client of the pool or of an app
-    // client of another pool, or it was revoked.
+    // client of another pool — which is its OWN sentence, because such a token IS one
+    // this service issued and what it does not authorize is this app client — or it was
+    // revoked.
     let rows: [(&str, &str, &str); 7] = [
         (
             "a value nothing issued",
@@ -998,12 +1001,12 @@ async fn the_refresh_token_sign_in_denies_an_unresolvable_token_in_the_exchanges
         (
             "a refresh token of another app client of the pool",
             siblings.refresh.as_str(),
-            INVALID_REFRESH_TOKEN,
+            REFRESH_TOKEN_DIFFERENT_CLIENT,
         ),
         (
             "a refresh token of an app client of another pool",
             abroads.refresh.as_str(),
-            INVALID_REFRESH_TOKEN,
+            REFRESH_TOKEN_DIFFERENT_CLIENT,
         ),
         (
             "a refresh token a global sign-out revoked",

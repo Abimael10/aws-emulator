@@ -23,6 +23,10 @@
 //! what revoked the session (the refresh token's revocation, a self-service
 //! sign-out, an administrative sign-out, and deactivating the user). Each assertion
 //! names its case and the value it got.
+//!
+//! A refresh presented after the user itself was DEACTIVATED is refused for that state
+//! rather than for the token's: the user's own state is what a caller has to act on, and
+//! re-authenticating is refused while it holds.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -56,6 +60,10 @@ const ACCESS_TOKEN_REVOKED: &str = "Access Token has been revoked";
 /// The fixed sentence a revoked refresh token is refused with, on both operations a
 /// refresh token authorizes.
 const REFRESH_TOKEN_REVOKED: &str = "Refresh Token has been revoked";
+
+/// The fixed sentence a refresh of a DEACTIVATED user is refused with: the user's own
+/// state is reported before the state of any token of it.
+const USER_DISABLED: &str = "User is disabled.";
 
 /// The sentence a value that resolves to no access token of this emulator gets, which
 /// the revoked case must not be collapsed into.
@@ -576,11 +584,19 @@ struct RevokerRow {
     /// Whether the lineage is refreshed first, so the token presented afterwards is the
     /// one a refresh minted rather than the one the sign-in did.
     refresh_first: bool,
+    /// The sentence the REFRESH token of the same lineage is refused with afterwards: the
+    /// revoked one for a row that invalidated the token, and the user's own state for the
+    /// row that deactivated the user — a refresh reports the state of the user it was
+    /// issued to before the state of the token, because that is the state a caller has to
+    /// act on (re-authenticating is refused while the user is deactivated).
+    refresh_refusal: &'static str,
 }
 
-/// RULE, over what revoked the session: the sentence is the same fixed text whatever
-/// invalidated the token — a revocation of its refresh token, either sign-out, or
-/// deactivating its user — and whichever token of the lineage is presented.
+/// RULE, over what revoked the session: the sentence an ACCESS token of the revoked
+/// session is refused with is the same fixed text whatever invalidated it — a revocation
+/// of its refresh token, either sign-out, or deactivating its user — and whichever token
+/// of the lineage is presented; the refresh token of the lineage carries its own fixed
+/// sentence for why a refresh is refused.
 #[tokio::test]
 async fn the_revoked_sentence_is_the_same_whatever_revoked_the_session() {
     let rows = [
@@ -588,31 +604,37 @@ async fn the_revoked_sentence_is_the_same_whatever_revoked_the_session() {
             case: "the refresh token's revocation, the sign-in's own access token",
             revoker: Revoker::RevokeToken,
             refresh_first: false,
+            refresh_refusal: REFRESH_TOKEN_REVOKED,
         },
         RevokerRow {
             case: "the refresh token's revocation, the access token a refresh minted",
             revoker: Revoker::RevokeToken,
             refresh_first: true,
+            refresh_refusal: REFRESH_TOKEN_REVOKED,
         },
         RevokerRow {
             case: "the self-service sign-out",
             revoker: Revoker::GlobalSignOut,
             refresh_first: false,
+            refresh_refusal: REFRESH_TOKEN_REVOKED,
         },
         RevokerRow {
             case: "the self-service sign-out, the access token a refresh minted",
             revoker: Revoker::GlobalSignOut,
             refresh_first: true,
+            refresh_refusal: REFRESH_TOKEN_REVOKED,
         },
         RevokerRow {
             case: "the administrative sign-out",
             revoker: Revoker::AdminUserGlobalSignOut,
             refresh_first: false,
+            refresh_refusal: REFRESH_TOKEN_REVOKED,
         },
         RevokerRow {
             case: "deactivating the user",
             revoker: Revoker::AdminDisableUser,
             refresh_first: false,
+            refresh_refusal: USER_DISABLED,
         },
     ];
 
@@ -704,14 +726,14 @@ async fn the_revoked_sentence_is_the_same_whatever_revoked_the_session() {
             asked.len()
         );
 
-        // The refresh token of the same lineage is refused as revoked too, with its
-        // own fixed sentence.
+        // The refresh token of the same lineage is refused too, with the fixed sentence
+        // for what the row made true of it.
         refused_with(
             &router,
             case,
             "GetTokensFromRefreshToken",
             &json!({ "ClientId": fixture.client_id, "RefreshToken": refresh_token }),
-            REFRESH_TOKEN_REVOKED,
+            row.refresh_refusal,
             &named,
         )
         .await;

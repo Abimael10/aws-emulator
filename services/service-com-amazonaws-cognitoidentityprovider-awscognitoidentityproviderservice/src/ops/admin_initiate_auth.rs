@@ -5,7 +5,9 @@
 //! the legacy `ADMIN_NO_SRP_AUTH`) verifies the password stored by
 //! `AdminSetUserPassword` / `AdminCreateUser` and issues the token triple;
 //! a user that still has to change its password gets the
-//! `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`. Every other
+//! `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`.
+//! `AuthFlow=REFRESH_TOKEN_AUTH` (and its `REFRESH_TOKEN` alias) exchanges a refresh
+//! token this pool issued for a fresh id and access token. Every other
 //! `AuthFlow` answers 501 until it is implemented.
 //!
 //! On a user pool that carries a `DeviceConfiguration`, a completed sign-in also
@@ -438,9 +440,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
         };
 
         // `AuthFlow` is an enumerated member, so the boundary validator has
-        // already refused any value outside `AuthFlowType`. Only the admin
-        // username-password flow is implemented so far; the rest say so rather
-        // than answering a sign-in nothing performed.
+        // already refused any value outside `AuthFlowType`.
+        //
+        // The refresh-token flow is served here as well as on the client-side
+        // sign-in: "REFRESH_TOKEN_AUTH and REFRESH_TOKEN — Receive new ID and
+        // access tokens when you pass a `REFRESH_TOKEN` parameter with a valid
+        // refresh token as the value" is one of the flows THIS operation's own
+        // `AuthFlow` documents (`AdminInitiateAuth.AuthFlow` in this service's
+        // model), and it checks no password, so it is decided before the
+        // password flows below.
+        if matches!(
+            input.auth_flow.as_str(),
+            REFRESH_TOKEN_AUTH | REFRESH_TOKEN
+        ) {
+            return refresh_sign_in(&state, ctx, &input).await;
+        }
+
+        // Only the admin username-password flows are implemented besides it; the
+        // rest say so rather than answering a sign-in nothing performed.
         if !matches!(
             input.auth_flow.as_str(),
             "ADMIN_USER_PASSWORD_AUTH" | "ADMIN_NO_SRP_AUTH"
@@ -813,6 +830,140 @@ enum Decided {
     /// decides whether this username names a user at all.
     MigrateUser,
 }
+
+/// `AuthFlow=REFRESH_TOKEN_AUTH` and its `REFRESH_TOKEN` alias on the ADMINISTRATIVE
+/// sign-in: "Receive new ID and access tokens when you pass a `REFRESH_TOKEN` parameter
+/// with a valid refresh token as the value" (`AdminInitiateAuth.AuthFlow` in this
+/// service's model), whose one required `AuthParameter` is `REFRESH_TOKEN`.
+///
+/// The same exchange the client-side sign-in serves, over the same store reading of what
+/// a refresh token authorizes
+/// ([`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::resolve_refresh_token`]),
+/// so one token is not refreshed on one surface and refused on the other — and, where it
+/// is refused, is refused with the same sentence. What this operation adds is its own
+/// `UserPoolId`: the app client the request names has to be an app client OF that pool,
+/// which is how every other administrative call resolves one.
+///
+/// A refresh mints tokens, so it reaches the pre-token-generation stage — "called when a
+/// user tries to refresh the identity and access tokens" is that generation's own
+/// documented trigger source — and the trigger there gates the tokens, with the state
+/// lock released for the invocation. A refresh is not a sign-in event, so no
+/// pre-authentication trigger fires for it.
+async fn refresh_sign_in(
+    store: &::engine::ServiceState<
+        crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    >,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    input: &AdminInitiateAuthInput,
+) -> Result<AdminInitiateAuthOutput, AdminInitiateAuthError> {
+    let now = ::std::time::SystemTime::now();
+    let auth_parameters = input.auth_parameters.clone().unwrap_or_default();
+    let refresh_token = auth_parameters
+        .get(REFRESH_TOKEN)
+        .ok_or_else(|| missing_auth_parameter(REFRESH_TOKEN, &input.auth_flow))?
+        .clone();
+    // An `Admin*` operation is authorized by IAM credentials rather than by an app
+    // client, so the event a trigger receives names no caller client id.
+    let caller = crate::state::lambda_triggers::Caller::of(ctx.parts(), None);
+    let client_metadata = input.client_metadata.as_ref();
+
+    // The stored state decides the refresh under ONE lock, which this block RELEASES
+    // before the pool's own Lambda trigger is invoked.
+    let username = {
+        let guard = &*store.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let client = pool.clients.get(&input.client_id).ok_or_else(|| {
+            client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            ))
+        })?;
+        // An app client that ROTATES its refresh tokens renews a session through
+        // `GetTokensFromRefreshToken`, the operation that rotates one, while this flow
+        // leaves the submitted refresh token in force — which is not what a rotating
+        // client does with one. So the flow itself is withdrawn from such a client,
+        // however its `ExplicitAuthFlows` are configured, exactly as on the client-side
+        // sign-in.
+        if client.rotates_refresh_tokens() {
+            return Err(unsupported_operation(
+                crate::state::ROTATION_UNSUPPORTED_BY_FLOW_MESSAGE,
+            ));
+        }
+        if !client.allows_refresh_token_auth() {
+            return Err(invalid_parameter(
+                crate::state::auth_flow_not_enabled_message(&input.auth_flow),
+            ));
+        }
+        guard
+            .resolve_refresh_token(&input.user_pool_id, &input.client_id, &refresh_token, now)
+            .map_err(refresh_refused)?
+            .username
+    };
+
+    let overrides = crate::state::lambda_triggers::fire_pre_token_generation(
+        ctx,
+        store,
+        &input.user_pool_id,
+        &username,
+        crate::state::lambda_triggers::TokenGeneration::RefreshTokens,
+        caller,
+        client_metadata,
+    )
+    .await
+    .map_err(trigger_failed)?;
+
+    let authentication_result = store
+        .lock()
+        .refresh_tokens(
+            &input.user_pool_id,
+            &input.client_id,
+            &username,
+            now,
+            &refresh_token,
+            &overrides,
+        )
+        .ok_or_else(internal_error)?;
+    Ok(AdminInitiateAuthOutput {
+        challenge_name: None,
+        session: None,
+        // No challenge is outstanding, so the map is present and empty rather than
+        // absent.
+        challenge_parameters: Some(crate::state::completed_challenge_parameters()),
+        authentication_result: Some(authentication_result),
+        available_challenges: None,
+    })
+}
+
+/// The refusal a presented `REFRESH_TOKEN` earns, as the store's shared reading of a
+/// refresh decided it ([`crate::state::RefreshTokenRefusal`], which states the order and
+/// the sentence): the modelled error of THIS operation for each, carrying that sentence.
+///
+/// A user that may not sign in is refused by the error its own state names — the two this
+/// operation declares for it, the same two the password flows raise — and everything else
+/// about a refresh token is `NotAuthorizedException`.
+fn refresh_refused(refusal: crate::state::RefreshTokenRefusal) -> AdminInitiateAuthError {
+    match refusal {
+        crate::state::RefreshTokenRefusal::PasswordResetRequired => password_reset_required(),
+        crate::state::RefreshTokenRefusal::UserNotConfirmed => user_not_confirmed(),
+        other => not_authorized(other.message()),
+    }
+}
+
+/// This operation's `UnsupportedOperationException`, carrying `message`: the refusal for
+/// a flow the app client the request names is not configured to serve at all.
+fn unsupported_operation(message: &str) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// `AuthFlowType`'s refresh-token flow, and the alias the same enum carries for it.
+const REFRESH_TOKEN_AUTH: &str = "REFRESH_TOKEN_AUTH";
+const REFRESH_TOKEN: &str = "REFRESH_TOKEN";
 
 /// The challenge a user that must change its password is answered with
 /// (`ChallengeNameType` in this service's model).

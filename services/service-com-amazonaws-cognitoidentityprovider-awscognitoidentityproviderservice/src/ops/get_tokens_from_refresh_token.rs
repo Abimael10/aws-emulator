@@ -13,9 +13,10 @@
 //! invalidated is answered with `RefreshTokenReuseException`.
 //!
 //! On a user pool that remembers devices the request has to present the key of a device
-//! `ConfirmDevice` has confirmed for the token's user. A refresh token this emulator
-//! issued and has since revoked is refused AS revoked, which is a different sentence
-//! from the one a value it cannot resolve at all gets.
+//! `ConfirmDevice` has confirmed for the token's user. Why a presented token does not
+//! authorize the refresh at all — and therefore which sentence the refusal carries — is the
+//! store's shared reading of a refresh ([`crate::state::RefreshTokenRefusal`]), the one
+//! every surface that takes a refresh token answers from.
 //!
 //! The exchange this call terminates — the fresh tokens it answers with, or the refusal
 //! that ends it — is also an OBSERVATION of the app client it ran against, published into
@@ -417,62 +418,20 @@ fn resolve(
     // what authorizes this request.
     //
     // "A valid refresh token that can authorize the request for new tokens"
-    // (`RefreshToken`): valid is read off the record this emulator wrote when it issued
-    // the token — a refresh token, not past its expiry — and the app client it was
-    // issued FOR is what the request has to name. A record issued for another app
-    // client is told apart from a value this service cannot resolve to a refresh token
-    // at all: the caller holds a token this service did issue, so the refusal reports
-    // that it belongs to a different app client rather than denying it was ever issued.
-    let record = state
-        .token(&input.refresh_token)
-        .filter(|record| record.kind == crate::state::TokenKind::Refresh)
-        .ok_or_else(invalid_refresh_token)?;
-    if record.client_id != input.client_id || record.user_pool_id != user_pool_id {
-        return Err(refresh_token_different_client());
-    }
-    // A record this emulator issued for this app client and has since REVOKED — a
-    // sign-out of its user, or a revocation of the token itself — is refused as
-    // revoked, which is a different answer from the one a value this service cannot
-    // resolve gets: the caller holds a token this service did issue and has since
-    // invalidated, so the refusal reports that rather than denying the token was ever
-    // issued.
-    if record.revoked {
-        return Err(refresh_token_revoked());
-    }
-    if record.expires_at <= now {
-        return Err(unauthorized_refresh_token());
-    }
-    // A token an earlier rotation replaced is answered as the reuse it is, for as long
-    // as the record of it lives: `RefreshTokenReuseException` is "throw when your
-    // application requests token refresh with a refresh token that has been invalidated
-    // by refresh-token rotation" (this service's model).
-    if record.rotated_out_by(now) {
-        return Err(refresh_token_reuse());
-    }
-
-    // The record is only a pointer into the pool: the user it names may have been
-    // disabled, reset or deleted since the token was issued — and a user created later
-    // under that name carries a different id, so it is not the user this token was
-    // issued to.
+    // (`RefreshToken`) is the store's own shared reading of a refresh
+    // ([`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::resolve_refresh_token`],
+    // which states the order and the sentence of every refusal), the one this
+    // operation shares with the client-side and administrative sign-ins: a token this
+    // service never issued, one issued for another app client, one whose user may not
+    // sign in, one revoked, one expired and one a rotation has replaced are told apart
+    // there rather than here.
+    let refreshed = state
+        .resolve_refresh_token(&user_pool_id, &input.client_id, &input.refresh_token, now)
+        .map_err(refresh_refused)?;
     let user = state
         .pool(&user_pool_id)
-        .and_then(|pool| pool.user(&record.username))
-        .filter(|user| user.sub == record.sub)
+        .and_then(|pool| pool.user(&refreshed.username))
         .ok_or_else(unauthorized_refresh_token)?;
-    if !user.enabled {
-        return Err(not_authorized("User is disabled."));
-    }
-    match user.status {
-        crate::state::UserStatus::ResetRequired => {
-            return Err(not_authorized(
-                crate::state::PASSWORD_RESET_REQUIRED_MESSAGE,
-            ));
-        }
-        crate::state::UserStatus::Unconfirmed => {
-            return Err(not_authorized("User is not confirmed."));
-        }
-        _ => {}
-    }
 
     // "You must provide the confirmed device key in this request if device remembering
     // is enabled in your user pool" (`DeviceKey`), so on such a pool the request is
@@ -491,9 +450,24 @@ fn resolve(
 
     Ok(Refresh {
         user_pool_id,
-        username: user.username.clone(),
+        username: refreshed.username,
         rotation_grace: client.refresh_token_rotation_grace(),
     })
+}
+
+/// The refusal a presented `RefreshToken` earns, as the store's shared reading of a
+/// refresh decided it ([`crate::state::RefreshTokenRefusal`]): the modelled error of THIS
+/// operation for each, carrying that reading's own sentence.
+fn refresh_refused(
+    refusal: crate::state::RefreshTokenRefusal,
+) -> GetTokensFromRefreshTokenError {
+    match refusal {
+        // "Throw[n] when your application requests token refresh with a refresh token
+        // that has been invalidated by refresh-token rotation" (this service's model),
+        // which is its own modelled error rather than an authorization failure.
+        crate::state::RefreshTokenRefusal::ReuseDetected => refresh_token_reuse(),
+        other => not_authorized(other.message()),
+    }
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
@@ -504,49 +478,14 @@ fn client_not_found(client_id: &str) -> GetTokensFromRefreshTokenError {
     .into()
 }
 
-/// The message a value this emulator cannot resolve to a refresh token at all is refused
-/// with: one it never issued, or a token of another kind presented as one. Told apart from
-/// [`UNAUTHORIZED_REFRESH_TOKEN`] — which the two differ from each other ONLY in
-/// punctuation, so neither may be edited into the other — and from the refusal of a token
-/// issued for another app client.
-const INVALID_REFRESH_TOKEN: &str = "Invalid Refresh Token";
-
-/// The message a refresh token this emulator DID issue for the app client the request
-/// names, and that still does not authorize this request, is refused with. Its own
-/// sentence, distinct from [`INVALID_REFRESH_TOKEN`], which denies the token was ever
-/// issued.
-const UNAUTHORIZED_REFRESH_TOKEN: &str = "Invalid Refresh Token.";
-
-/// The refusal for a value this emulator cannot resolve to a refresh token at all: one it
-/// never issued, or a token of another kind presented as one. One fixed sentence, which
-/// names neither the value presented nor the app client it was presented to.
-fn invalid_refresh_token() -> GetTokensFromRefreshTokenError {
-    not_authorized(INVALID_REFRESH_TOKEN)
-}
-
 /// The refusal for a refresh token this emulator DID issue for the app client the request
 /// names and that still does not authorize this request: one past its expiry, one naming a
 /// user that is gone, and one presented without the confirmed device key a pool that
-/// remembers devices requires. Worded as its own sentence, which names nothing of the
-/// request either.
+/// remembers devices requires. Worded as its own sentence
+/// ([`crate::state::UNAUTHORIZED_REFRESH_TOKEN`], which names nothing of the request
+/// either).
 fn unauthorized_refresh_token() -> GetTokensFromRefreshTokenError {
-    not_authorized(UNAUTHORIZED_REFRESH_TOKEN)
-}
-
-/// The refusal for a `RefreshToken` this emulator issued for ANOTHER app client than the
-/// `ClientId` the request names. Told apart from [`invalid_refresh_token`] because the
-/// token is one this service issued: what it does not authorize is this app client. The
-/// sentence names neither app client.
-fn refresh_token_different_client() -> GetTokensFromRefreshTokenError {
-    not_authorized("Refresh Token has different Client")
-}
-
-/// The refusal for a `RefreshToken` this emulator issued for the app client the request
-/// names and has since revoked — a sign-out of its user, or a revocation of the token
-/// itself. Told apart from [`invalid_refresh_token`] because the token did authorize
-/// this app client until it was invalidated.
-fn refresh_token_revoked() -> GetTokensFromRefreshTokenError {
-    not_authorized("Refresh Token has been revoked")
+    not_authorized(crate::state::UNAUTHORIZED_REFRESH_TOKEN)
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.
@@ -557,16 +496,12 @@ fn not_authorized(message: &str) -> GetTokensFromRefreshTokenError {
     .into()
 }
 
-/// The message a refresh token refresh-token rotation has already invalidated is
-/// refused with: the fixed sentence Amazon Cognito answers, which names neither
-/// the token presented nor the app client it was presented to.
-const REFRESH_TOKEN_REUSE_MESSAGE: &str = "Refresh token reuse detected";
-
 /// This operation's `RefreshTokenReuseException` for a refresh token an earlier rotation
-/// already invalidated.
+/// already invalidated, carrying the shared sentence for it
+/// ([`crate::state::REFRESH_TOKEN_REUSE`]).
 fn refresh_token_reuse() -> GetTokensFromRefreshTokenError {
     GetTokensFromRefreshTokenErrorModeled::RefreshTokenReuseException(RefreshTokenReuseException {
-        message: Some(REFRESH_TOKEN_REUSE_MESSAGE.to_string()),
+        message: Some(crate::state::REFRESH_TOKEN_REUSE.to_string()),
     })
     .into()
 }

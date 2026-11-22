@@ -46,6 +46,12 @@ const REVOKED_REFRESH_TOKEN: &str = "Refresh Token has been revoked";
 /// not.
 const INVALID_REFRESH_TOKEN: &str = "Invalid Refresh Token";
 
+/// The sentence a refresh-token sign-in is refused with when the token it
+/// presents is a refresh token this service issued for ANOTHER app client than
+/// the one the request names: the token is one this service did issue, so the
+/// refusal says whose it is rather than denying it was ever issued.
+const REFRESH_TOKEN_DIFFERENT_CLIENT: &str = "Refresh Token has different Client";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -509,7 +515,8 @@ async fn a_revoked_refresh_token_is_told_apart_from_an_unresolvable_one() {
 
     // The rows differ along WHY the presented value is or is not a live refresh
     // token of this app client: revoked by the sign-out, never issued, issued as
-    // a token of another kind, issued for another app client, or live.
+    // a token of another kind, issued for another app client — which is its own
+    // sentence, because the token IS one this service issued — or live.
     for (case, token, expected) in [
         (
             "a refresh token the sign-out revoked",
@@ -534,7 +541,7 @@ async fn a_revoked_refresh_token_is_told_apart_from_an_unresolvable_one() {
         (
             "a live refresh token of another app client",
             other_clients_token.refresh.as_str(),
-            Some(INVALID_REFRESH_TOKEN),
+            Some(REFRESH_TOKEN_DIFFERENT_CLIENT),
         ),
         (
             "a live refresh token of this app client",
