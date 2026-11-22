@@ -1,33 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! FULFILMENT of a capacity movement: when the service that owns the scaled resource has
-//! made the capacity this service set take effect.
+//! APPLIED the capacity this service set on it.
 //!
 //! A capacity movement is two things, not one. This service DECIDES a capacity and sets it
 //! on the resource, which is what the movement's activity records the instant it happens
-//! ("Setting desired count to 3."); the owning service then has to make that capacity real,
+//! ("Setting desired count to 3."); the owning service then has to take that capacity on,
 //! which is what the same activity reports it is still waiting for ("Successfully set
-//! desired count to 3. Waiting for change to be fulfilled by ecs.") until it has happened
-//! ("Change successfully fulfilled by ecs."). So the activity's terminal status is NOT owed
-//! by this service's own clock: a movement reaches `Successful` only once the owning service
-//! reports the capacity as IN EFFECT, and for as long as that service has not made it so the
-//! movement stays `InProgress` — however long that is, and for ever where the resource's own
-//! estate can never satisfy it.
+//! desired count to 3. Waiting for change to be fulfilled by ecs.") until it has
+//! ("Change successfully fulfilled by ecs."). So a movement is non-terminal for the span this
+//! service gives it ([`super::ACTIVITY_FULFILMENT`]) and reaches `Successful` once the capacity
+//! it set is the capacity the owning service holds for the scaled property.
 //!
-//! Which is a fact only the owning service holds, so it is READ there, once per pass
-//! ([`settle_activity_fulfilments`]), for the movements whose own span has already elapsed —
-//! never before, because the capacity is written into the owning service's store after the
-//! activity is recorded ([`super::policy_execution::settle_policy_executions`]), so a
-//! reading taken at the recording instant would be of the capacity the resource held BEFORE.
+//! What it does NOT wait for is the owning service finishing the work that capacity gives it:
+//! the scaled property is the capacity the resource is DRIVEN to — `ecs:service:DesiredCount`
+//! is "the task count of an ECS service", and `Service$desiredCount` is "the desired number of
+//! instantiations of the task definition to keep running on the service" — so the change this
+//! service made is applied the moment that count is the one it asked for, whatever the owning
+//! service's own scheduler then manages to do with it. An estate with nowhere to run the tasks
+//! is reported by the owning service, on the resource's own status and event stream, and not
+//! by this service's scaling history.
 //!
-//! One arm per namespace whose owning service reports an in-effect capacity of its own, APART
-//! from the capacity it was asked for: Amazon ECS does — `Service$desiredCount` is "the
-//! desired number of instantiations of the task definition to keep running on the service"
-//! and `Service$runningCount` "the number of tasks in the cluster that are in the RUNNING
-//! state", so a desired count the cluster has nowhere to place is set and never fulfilled.
-//! For a namespace whose owning service reports no such second value, there is nothing to
-//! observe and the movement is fulfilled by the span this service gives it
-//! ([`super::ACTIVITY_FULFILMENT`]), exactly as before.
+//! Which capacity the owning service holds is a fact only that service has, so it is READ
+//! there, once per pass ([`settle_activity_fulfilments`]), for the movements whose own span has
+//! already elapsed — never before, because the capacity is written into the owning service's
+//! store after the activity is recorded
+//! ([`super::policy_execution::settle_policy_executions`]), so a reading taken at the recording
+//! instant would be of the capacity the resource held BEFORE.
+//!
+//! One arm per namespace whose owning service holds the scaled capacity in a store this
+//! emulator can read: Amazon ECS does. For a namespace whose capacity cannot be read back that
+//! way there is nothing to observe, and the movement is fulfilled by the span alone.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -36,17 +39,17 @@ use super::{
     service_state, ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState, TargetKey,
 };
 
-/// The `ecs` namespace, whose owning service reports the capacity it was asked for
-/// (`desiredCount`) apart from the capacity in effect (`runningCount`).
+/// The `ecs` namespace, whose owning service holds the capacity `ecs:service:DesiredCount`
+/// scales as `Service$desiredCount`.
 const ECS_NAMESPACE: &str = "ecs";
 
 /// Whether a movement of a target in this namespace has its fulfilment CONFIRMED in the
-/// owning service rather than by this service's own span.
+/// owning service rather than by this service's own span alone.
 ///
 /// Namespace by namespace, because it is a property of the owning service and not of any one
-/// request: a service that reports an in-effect capacity of its own is one whose confirmation
-/// can be read, and the next such namespace is a new arm of [`owner_has_fulfilled`] plus a row
-/// here.
+/// request: a service whose stored capacity this emulator can read back is one whose
+/// confirmation can be taken, and the next such namespace is a new arm of
+/// [`owner_has_fulfilled`] plus a row here.
 pub fn owner_confirms_fulfilment(service_namespace: &str) -> bool {
     service_namespace == ECS_NAMESPACE
 }
@@ -65,19 +68,19 @@ struct Awaiting {
     /// The activity, by the id it is reported under.
     activity_id: String,
     target: TargetKey,
-    /// The capacity the movement set, which is the capacity that has to be in effect.
+    /// The capacity the movement set, which is the capacity the owning service has to hold.
     capacity: i32,
 }
 
 /// Confirm, for every capacity movement of `region` still waiting on the service that owns
-/// the scaled resource, whether that service has made the capacity take effect — and end the
-/// activity at the instant it has.
+/// the scaled resource, whether that service has taken the capacity on — and end the activity
+/// at the instant it has.
 ///
 /// Call it with NO store lock held: the activities are collected under this service's lock,
 /// the owning service's store is read with it released, and the confirmations are written
 /// under it again.
 ///
-/// This is work the CLOCK owes and not any request's: the capacity took effect in the owning
+/// This is work the CLOCK owes and not any request's: the capacity was applied in the owning
 /// service at an instant of its own, whether or not anybody called this service afterwards,
 /// so a reporting operation may materialise it.
 pub fn settle_activity_fulfilments<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) {
@@ -121,8 +124,9 @@ fn awaiting_confirmation(
         .collect()
 }
 
-/// End each confirmed movement at `at`: the capacity it set is in effect, so the activity
-/// reaches the terminal status it was recorded with and its `EndTime` is that instant.
+/// End each confirmed movement at `at`: the capacity it set is the one the owning service
+/// holds, so the activity reaches the terminal status it was recorded with and its `EndTime`
+/// is that instant.
 fn confirm_fulfilled(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     confirmed: &BTreeSet<String>,
@@ -140,11 +144,11 @@ fn confirm_fulfilled(
     }
 }
 
-/// Whether the service that OWNS the scaled resource has made `capacity` take effect on it —
-/// or reports nothing this movement waits on, which is as far as the waiting can go.
+/// Whether the service that OWNS the scaled resource has applied `capacity` to it — or holds
+/// nothing this movement can wait on, which is as far as the waiting can go.
 ///
-/// One arm per namespace whose owning service distinguishes the capacity it was asked for
-/// from the capacity it has reached; see the module docs.
+/// One arm per namespace whose owning service holds the scaled capacity in a store this
+/// emulator can read; see the module docs.
 fn owner_has_fulfilled<Eng: Send + Sync + 'static>(
     engine: &Eng,
     target: &TargetKey,
@@ -156,24 +160,22 @@ fn owner_has_fulfilled<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Whether the ECS service an `ecs` `ResourceId` names is RUNNING the task count a movement
-/// set on it: "the number of tasks in the cluster that are in the RUNNING state"
-/// (`Service$runningCount`) against the count the service was asked to keep running
-/// (`Service$desiredCount`), which is what `ecs:service:DesiredCount` scales.
+/// Whether the ECS service an `ecs` `ResourceId` names holds the task count a movement set on
+/// it: `Service$desiredCount`, "the desired number of instantiations of the task definition to
+/// keep running on the service", which is what `ecs:service:DesiredCount` scales.
 ///
-/// There is nothing to wait on — so the movement is as fulfilled as it will get — in the cases
-/// where that count says nothing about this movement: a resource id that names no ECS service,
-/// an engine that holds no ECS store, a service that is no longer active, one whose tasks
-/// Amazon ECS does not place at all (an external deployment controller runs them, so no count
-/// of the scheduler's own ever catches up), and one whose desired count is no longer the
-/// capacity this movement set, which something else has moved on from.
+/// A count that is NOT the one this movement set is a change that has not been applied: the
+/// movement is queued for the owning service and delivered with this service's lock released
+/// (`super::policy_execution::deliver_pending_capacity`), so the first passes after the
+/// activity was recorded can read the count the service held before — and a delivery that
+/// never lands is a movement whose capacity the resource never took, which is not a fulfilled
+/// one. A LATER movement of the same target, which leaves the service holding ITS capacity
+/// instead, resolves this activity as overridden rather than fulfilled
+/// (`super::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::override_unfulfilled_activities`).
 ///
-/// The owning service's clock is advanced first, through the pass that service exposes for
-/// it: the tasks its scheduler placed start at an instant of their own, which arrives whether
-/// or not anybody calls that service, and that pass materialises exactly what the clock has
-/// already made due — including the launch steps a task's start waits on, which is why it is
-/// made with no guard of that store held and through the owner's own entry point rather than
-/// by calling its clock pass directly.
+/// There is nothing to wait on — so the movement is as fulfilled as it will get — where that
+/// count says nothing about this movement at all: a resource id that names no ECS service, an
+/// engine that holds no ECS store, and a service that is no longer active.
 fn ecs_has_fulfilled<Eng: Send + Sync + 'static>(
     engine: &Eng,
     resource_id: &str,
@@ -184,23 +186,17 @@ fn ecs_has_fulfilled<Eng: Send + Sync + 'static>(
     let Some((cluster, service_name)) = super::split_ecs_resource_id(resource_id) else {
         return true;
     };
-    ecs::state::advance_task_clock(engine, SystemTime::now());
     let Some(store) = ecs::state::service_state(engine) else {
         return true;
     };
     let store = store.lock();
-    let Some((places_tasks, desired_count)) = store
+    let Some(desired_count) = store
         .services
         .get(&(cluster.to_string(), service_name.to_string()))
         .filter(|service| service.is_active())
-        .map(|service| (service.places_tasks(), service.desired_count))
+        .map(|service| service.desired_count)
     else {
         return true;
     };
-    if !places_tasks || desired_count != capacity {
-        return true;
-    }
-    // Counted in the same lock the desired count was read under, so the two cannot disagree
-    // about the task set they describe.
-    store.service_tally(cluster, service_name).running == capacity
+    desired_count == capacity
 }

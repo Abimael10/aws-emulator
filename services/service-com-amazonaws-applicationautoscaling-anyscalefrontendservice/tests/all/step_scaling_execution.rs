@@ -28,13 +28,17 @@
 //! * `RegisterScalableTarget$ScalableDimension`: "ecs:service:DesiredCount - The task count of
 //!   an ECS service", which is the capacity an `ecs` target moves.
 //!
-//! And a breach does not stop at one execution. An alarm that STAYS in `ALARM` keeps invoking
-//! the actions it names, at the cadence it is evaluated at ("Valid values are 10, 20, 30, and
-//! any multiple of 60", `PutMetricAlarmInput$Period`), so a step scaling policy is re-invoked
-//! for as long as the breach lasts: the invocations that fall inside its `Cooldown` add
-//! nothing, the first one after that wait has elapsed applies the next step adjustment, and the
-//! capacity goes on advancing one step per wait until the registered window is what stops it
-//! ([`a_continuing_breach_applies_the_next_step_after_every_cooldown`]).
+//! And a breach does not stop at one execution — but what raises the next one is the ALARM
+//! MOVING, not the state it holds. "The actions to execute when this alarm transitions to the
+//! ALARM state from any other state" (`PutMetricAlarmInput$AlarmActions`) is the whole of the
+//! wiring, so a metric that goes on breaching while the alarm stays in `ALARM` executes the
+//! policy once: the capacity moves by one step adjustment and then HOLDS, however many further
+//! evaluations grade the same state. The next step comes when the alarm leaves `ALARM` and
+//! returns to it, and then only outside the policy's `Cooldown` — the wait a transition inside
+//! is netted against ([`a_breach_that_does_not_let_up_moves_the_target_once_per_transition`]).
+//! And the movement that one transition performed settles where a movement settles: terminal
+//! at `Successful` once the owning service reports the capacity in effect, with no later
+//! movement to override it ([`a_sustained_breach_settles_one_successful_activity`]).
 //!
 //! Every case goes through the same front door a client uses — the policy, the alarm, the
 //! breach and the read-back of the ECS service are all requests — so nothing reaches into a
@@ -709,14 +713,15 @@ async fn an_alarm_wired_to_another_policy_executes_nothing() {
 /// The `Period` the alarm of a CONTINUING breach is evaluated on, in seconds.
 ///
 /// The shortest cadence CloudWatch evaluates an alarm at — "Valid values are 10, 20, 30, and
-/// any multiple of 60" (`PutMetricAlarmInput$Period`) — so the invocations an alarm that stays
-/// in `ALARM` makes are this far apart, and a row can watch several of them.
+/// any multiple of 60" (`PutMetricAlarmInput$Period`) — so a row that watches an alarm which
+/// stays in `ALARM` watches over many evaluations of it, and a row that lets the breach up and
+/// drives it back gets its next transition inside a few of them.
 const CONTINUING_PERIOD_SECS: i32 = 10;
 
 /// How long a row that keeps a breach alive waits for the capacity it expects.
 ///
-/// Generous: many invocation cadences, so a row fails on a capacity that never moves again
-/// rather than on a host that was busy for one of them. Nothing in the emulator sleeps for a
+/// Generous: many evaluation cadences, so a row fails on a capacity that never moves rather
+/// than on a host that was busy for one of them. Nothing in the emulator sleeps for a
 /// movement, so a row that is owed one gets it as soon as the clock takes its next pass.
 const CONTINUING_WAIT: Duration = Duration::from_secs(120);
 
@@ -724,13 +729,14 @@ const CONTINUING_WAIT: Duration = Duration::from_secs(120);
 /// keeps the alarm breaching.
 const CONTINUING_POLL: Duration = Duration::from_millis(500);
 
-/// How long a row that expects NO further movement keeps watching: several invocation
-/// cadences, which is more than a row whose wait has elapsed takes two of its steps in.
+/// How long a row that expects NO further movement keeps watching: several evaluation cadences
+/// of the still-breaching alarm, which is far more than one pass of the scaling clock takes to
+/// move a capacity it is owed.
 const QUIET_WATCH: Duration = Duration::from_secs(25);
 
 /// One continuing breach to pin: the window the target is registered with, the capacity the
-/// ECS service starts at, the policy the still-breaching alarm keeps invoking, and the
-/// capacities those invocations have to drive it through.
+/// ECS service starts at, the policy the breaching alarm executes, and the capacities the
+/// successive TRANSITIONS of that alarm have to drive it through.
 struct ContinuingRow {
     case: &'static str,
     /// The `desiredCount` the ECS service is created with.
@@ -739,30 +745,30 @@ struct ContinuingRow {
     max: i64,
     adjustment_type: &'static str,
     steps: &'static [Step],
-    /// The policy's `Cooldown`, in seconds: the wait every invocation after a movement is held
-    /// for.
+    /// The policy's `Cooldown`, in seconds: the wait a transition that arrives inside it is
+    /// netted against, which for a repeat of the same step leaves nothing to apply.
     cooldown: i64,
     /// The alarm's `ComparisonOperator`, which names the side of the threshold it breaches on.
     comparison_operator: &'static str,
     /// How far past the threshold each published datapoint is, signed in the direction of the
     /// breach.
     breach: f64,
-    /// The `NotScaledReason$Code` the invocation after the climb is withheld with: the bound
+    /// The `NotScaledReason$Code` the transition after the climb is withheld with: the bound
     /// of the registered window the capacity has reached.
     reason_code: &'static str,
-    /// The capacity each successive execution lands the target on, in order: the first step,
-    /// and then the step every invocation after the cooldown adds — the last of them being the
-    /// bound the registered window stops the policy at.
+    /// The capacity each successive execution lands the target on, in order: the step the first
+    /// transition applies, and then the step the next transition into `ALARM` adds — the last of
+    /// them being the bound the registered window stops the policy at.
     capacities: &'static [i64],
 }
 
-/// The rows differ in how the adjustment is interpreted, in its magnitude and direction, in
-/// the wait between two invocations that move capacity, and in which bound of the registered
-/// window ends the climb.
+/// The rows differ in how the adjustment is interpreted, in its magnitude and direction, in the
+/// wait a transition is netted against, and in which bound of the registered window ends the
+/// climb.
 const CONTINUING_CATALOG: &[ContinuingRow] = &[
-    // One task per invocation, with no wait at all between them, to the ceiling.
+    // One task per transition, with no wait at all between them, to the ceiling.
     ContinuingRow {
-        case: "one task per invocation to the ceiling",
+        case: "one task per transition to the ceiling",
         starting: 1,
         min: 1,
         max: 3,
@@ -774,10 +780,10 @@ const CONTINUING_CATALOG: &[ContinuingRow] = &[
         reason_code: "AlreadyAtMaxCapacity",
         capacities: &[2, 3],
     },
-    // Two tasks per invocation, with a wait LONGER than the cadence the alarm invokes at: the
-    // invocations inside it add nothing, and the first one after it applies the next step.
+    // Two tasks per transition, with a wait the repeated step is netted against: a transition
+    // inside it adds nothing, and the first one after it applies the next step.
     ContinuingRow {
-        case: "two tasks per invocation, one wait apart",
+        case: "two tasks per transition, one wait apart",
         starting: 1,
         min: 1,
         max: 5,
@@ -789,10 +795,10 @@ const CONTINUING_CATALOG: &[ContinuingRow] = &[
         reason_code: "AlreadyAtMaxCapacity",
         capacities: &[3, 5],
     },
-    // The mirror of the first row: a breach BELOW the threshold keeps removing tasks, down to
-    // the floor.
+    // The mirror of the first row: a breach BELOW the threshold removes tasks, down to the
+    // floor.
     ContinuingRow {
-        case: "three tasks per invocation down to the floor",
+        case: "three tasks per transition down to the floor",
         starting: 8,
         min: 2,
         max: 20,
@@ -804,10 +810,10 @@ const CONTINUING_CATALOG: &[ContinuingRow] = &[
         reason_code: "AlreadyAtMinCapacity",
         capacities: &[5, 2],
     },
-    // A percentage is a percentage of the capacity each invocation FINDS, so the steps grow:
-    // 50% of 4 is 2, and 50% of the 6 the next invocation finds is 3.
+    // A percentage is a percentage of the capacity the execution FINDS, so the steps grow:
+    // 50% of 4 is 2, and 50% of the 6 the next transition finds is 3.
     ContinuingRow {
-        case: "a percentage of the capacity each invocation finds",
+        case: "a percentage of the capacity each execution finds",
         starting: 4,
         min: 1,
         max: 9,
@@ -823,8 +829,8 @@ const CONTINUING_CATALOG: &[ContinuingRow] = &[
 
 /// Create an alarm that drives a continuing breach of `metric_name`: the same wiring a step
 /// scaling policy is attached by — the policy's ARN is the action the alarm executes —
-/// evaluated on [`CONTINUING_PERIOD_SECS`], so the invocations it makes while it stays in
-/// `ALARM` are that far apart.
+/// evaluated on [`CONTINUING_PERIOD_SECS`], so a datapoint published for it is graded that
+/// often.
 async fn given_breaching_alarm_on(
     emulator: &Emulator,
     alarm_name: &str,
@@ -915,7 +921,7 @@ async fn publish_breach(emulator: &Emulator, offset: f64, case: &str) {
 ///
 /// The poll is the TEST waiting for the clock that executes a breach — nothing in the emulator
 /// sleeps for one — and every look publishes the datapoint that keeps the alarm breaching, so
-/// what the row waits on is the policy being invoked again rather than the alarm moving.
+/// what the row waits on is the execution the alarm's own transition raised.
 async fn await_while_breaching(
     emulator: &Emulator,
     cluster: &str,
@@ -936,7 +942,106 @@ async fn await_while_breaching(
     }
 }
 
-/// Keep the breach alive and wait for the log to report a decision WITHHELD with `code`,
+/// Keep the breach alive for the whole of `watch` and answer the `desiredCount` the ECS service
+/// last reported — returning as soon as it LEAVES `held`, which is the movement a row that
+/// expects none fails on.
+async fn watch_while_breaching(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    breach: f64,
+    held: i64,
+    watch: Duration,
+    case: &str,
+) -> i64 {
+    let deadline = std::time::Instant::now() + watch;
+    loop {
+        publish_breach(emulator, breach, case).await;
+        let last = emulator.ecs_desired_count(cluster, service).await;
+        if last != held || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// The state one alarm reports now.
+async fn alarm_state(emulator: &Emulator, alarm_name: &str, case: &str) -> String {
+    let (status, body) = emulator
+        .call_cloudwatch("DescribeAlarms", json!({"AlarmNames": [alarm_name]}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeAlarms to answer 200, got {status} {body:?}"
+    );
+    body["MetricAlarms"][0]["StateValue"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Let the breach UP and drive it back, so the alarm transitions into `ALARM` afresh — the state
+/// change that executes the actions it names again.
+///
+/// The letting up is `SetAlarmState`, the way a client moves an alarm without waiting for a
+/// series to age out of its evaluation range; the return is the alarm's OWN evaluation of the
+/// still-breaching datapoints, so what comes back is a transition CloudWatch decided and the
+/// breach it carries is the measurement that decided it.
+async fn given_fresh_transition(emulator: &Emulator, alarm_name: &str, breach: f64, case: &str) {
+    emulator.set_alarm_state(alarm_name, "OK").await;
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach(emulator, breach, case).await;
+        if alarm_state(emulator, alarm_name, case).await == "ALARM" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the still-breaching datapoints to put {alarm_name:?} back \
+             in ALARM"
+        );
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// How long one fresh transition is watched before a row raises another.
+///
+/// A transition raised inside the policy's `Cooldown` is netted against the movement in flight
+/// and adds nothing, so a row whose wait has not elapsed yet gets its next step from a LATER
+/// transition; this is how long each of them is given, inside the row's own generous deadline.
+const TRANSITION_SETTLE: Duration = Duration::from_secs(5);
+
+/// Raise fresh transitions of the alarm until the ECS service's `desiredCount` reaches
+/// `expected`, answering what it last read.
+async fn await_through_fresh_transitions(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    alarm_name: &str,
+    breach: f64,
+    expected: i64,
+    case: &str,
+) -> i64 {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        given_fresh_transition(emulator, alarm_name, breach, case).await;
+        let last = await_while_breaching(
+            emulator,
+            cluster,
+            service,
+            breach,
+            expected,
+            TRANSITION_SETTLE,
+            case,
+        )
+        .await;
+        if last == expected || std::time::Instant::now() >= deadline {
+            return last;
+        }
+    }
+}
+
+/// Raise fresh transitions of the alarm until the log reports a decision WITHHELD with `code`,
 /// answering the reason that decision carries.
 ///
 /// A decision that moved no capacity is reported only in the view that asks for it
@@ -946,24 +1051,31 @@ async fn await_while_breaching(
 async fn await_withheld_reason(
     emulator: &Emulator,
     resource_id: &str,
+    alarm_name: &str,
     breach: f64,
     code: &str,
     case: &str,
 ) -> Value {
     let deadline = std::time::Instant::now() + CONTINUING_WAIT;
     loop {
-        publish_breach(emulator, breach, case).await;
-        let found = not_scaled_reasons(emulator, resource_id, case)
-            .await
-            .into_iter()
-            .find(|reason| reason["Code"] == json!(code));
-        if let Some(found) = found {
-            return found;
+        given_fresh_transition(emulator, alarm_name, breach, case).await;
+        let settle = std::time::Instant::now() + TRANSITION_SETTLE;
+        loop {
+            let found = not_scaled_reasons(emulator, resource_id, case)
+                .await
+                .into_iter()
+                .find(|reason| reason["Code"] == json!(code));
+            if let Some(found) = found {
+                return found;
+            }
+            if std::time::Instant::now() >= settle {
+                break;
+            }
+            tokio::time::sleep(CONTINUING_POLL).await;
         }
         if std::time::Instant::now() >= deadline {
             return Value::Null;
         }
-        tokio::time::sleep(CONTINUING_POLL).await;
     }
 }
 
@@ -990,7 +1102,7 @@ async fn not_scaled_reasons(emulator: &Emulator, resource_id: &str, case: &str) 
 ///
 /// A decision that moved no capacity reports the reason it was withheld
 /// (`ScalingActivity$NotScaledReasons`), so the movements are the activities that carry none:
-/// this is the log of what the successive invocations really did to the resource.
+/// this is the log of what the successive executions really did to the resource.
 async fn movement_descriptions(emulator: &Emulator, resource_id: &str, case: &str) -> Vec<String> {
     let mut listed = activities(emulator, resource_id, case).await;
     listed.reverse();
@@ -1007,7 +1119,7 @@ async fn movement_descriptions(emulator: &Emulator, resource_id: &str, case: &st
 }
 
 #[tokio::test]
-async fn a_continuing_breach_applies_the_next_step_after_every_cooldown() {
+async fn a_breach_that_does_not_let_up_moves_the_target_once_per_transition() {
     for row in CONTINUING_CATALOG {
         let case = row.case;
         let emulator = Emulator::empty();
@@ -1039,37 +1151,89 @@ async fn a_continuing_breach_applies_the_next_step_after_every_cooldown() {
         )
         .await;
 
-        // The alarm goes on reporting the same breach, so the policy is invoked again and
-        // again: each capacity the row names is reached in turn, however many invocations the
-        // wait between two of them suppresses.
-        for expected in row.capacities {
-            let reached = await_while_breaching(
+        // The alarm's transition into `ALARM` executes the policy, so the capacity moves by the
+        // step whose interval the breach falls in.
+        let first = *row.capacities.first().expect("a row names a capacity");
+        let reached = await_while_breaching(
+            &emulator,
+            cluster,
+            service,
+            row.breach,
+            first,
+            CONTINUING_WAIT,
+            case,
+        )
+        .await;
+        assert_eq!(
+            reached, first,
+            "case {case:?}: expected the alarm's transition into ALARM to drive the ECS \
+             desiredCount to {first}, got {reached:?}"
+        );
+
+        // And then it HOLDS. The metric goes on breaching and the alarm goes on being graded,
+        // but it does not change state again, so there is no further action to execute: one
+        // transition is one step adjustment, not one per evaluation.
+        let held = watch_while_breaching(
+            &emulator,
+            cluster,
+            service,
+            row.breach,
+            first,
+            QUIET_WATCH,
+            case,
+        )
+        .await;
+        assert_eq!(
+            held, first,
+            "case {case:?}: expected the capacity to hold at {first} while the alarm merely \
+             stays in ALARM, got {held:?}"
+        );
+        let state = alarm_state(&emulator, alarm_name, case).await;
+        assert_eq!(
+            state, "ALARM",
+            "case {case:?}: expected the alarm to have been breaching throughout the watch, \
+             got {state:?}"
+        );
+
+        // The next step comes from the next TRANSITION: the breach lets up, the alarm leaves
+        // `ALARM`, and the still-breaching series puts it back there. A transition that lands
+        // inside the policy's wait is netted against the movement in flight and adds nothing,
+        // so it is the first one after that wait which applies the step.
+        for expected in row.capacities.iter().skip(1) {
+            let moved = await_through_fresh_transitions(
                 &emulator,
                 cluster,
                 service,
+                alarm_name,
                 row.breach,
                 *expected,
-                CONTINUING_WAIT,
                 case,
             )
             .await;
             assert_eq!(
-                reached, *expected,
-                "case {case:?}: expected the still-breaching alarm to drive the ECS \
-                 desiredCount to {expected}, got {reached:?}"
+                moved, *expected,
+                "case {case:?}: expected a fresh transition into ALARM to drive the ECS \
+                 desiredCount to {expected}, got {moved:?}"
             );
         }
 
-        // The last capacity is the bound the registered window stops the policy at, and the
-        // invocations keep coming: the next one is DECIDED and withheld, which is what the
-        // reason the model names says about it — "Application Auto Scaling will not scale
-        // capacity to values that are outside of the minimum and maximum range".
-        let withheld =
-            await_withheld_reason(&emulator, &resource_id, row.breach, row.reason_code, case).await;
+        // The last capacity is the bound the registered window stops the policy at, so a
+        // transition after it is DECIDED and withheld, which is what the reason the model names
+        // says about it — "Application Auto Scaling will not scale capacity to values that are
+        // outside of the minimum and maximum range".
+        let withheld = await_withheld_reason(
+            &emulator,
+            &resource_id,
+            alarm_name,
+            row.breach,
+            row.reason_code,
+            case,
+        )
+        .await;
         assert_eq!(
             withheld["Code"].as_str().unwrap_or_default(),
             row.reason_code,
-            "case {case:?}: expected a later invocation to be withheld as {}, got {withheld:?}",
+            "case {case:?}: expected a later transition to be withheld as {}, got {withheld:?}",
             row.reason_code
         );
         let last = *row.capacities.last().expect("a row names a capacity");
@@ -1086,7 +1250,9 @@ async fn a_continuing_breach_applies_the_next_step_after_every_cooldown() {
              got {settled:?}"
         );
 
-        // And each of those executions is one movement of the log, in the order they happened.
+        // And each of those executions is one movement of the log, in the order they happened:
+        // one per transition the policy was executed for, and none for the evaluations in
+        // between.
         let expected: Vec<String> = row
             .capacities
             .iter()
@@ -1095,17 +1261,18 @@ async fn a_continuing_breach_applies_the_next_step_after_every_cooldown() {
         let moved = movement_descriptions(&emulator, &resource_id, case).await;
         assert_eq!(
             moved, expected,
-            "case {case:?}: expected one scaling activity per step, got {moved:?}"
+            "case {case:?}: expected one scaling activity per transition, got {moved:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn invocations_inside_the_cooldown_add_nothing() {
+async fn transitions_inside_the_cooldown_add_nothing() {
     // The same continuing breach with a wait far longer than the window this row watches: the
-    // invocations that keep arriving inside it are suppressed, so the capacity the first step
-    // set is the one the target holds for the whole of it.
-    let case = "a continuing breach inside the cooldown";
+    // alarm lets up and comes back inside that wait, so each of those transitions is netted
+    // against the movement still in flight — a repeat of the same step leaves nothing to apply —
+    // and the capacity the first step set is the one the target holds for the whole of it.
+    let case = "a breach that comes back inside the cooldown";
     let emulator = Emulator::empty();
     let cluster = "cooling";
     let service = "web";
@@ -1137,14 +1304,19 @@ async fn invocations_inside_the_cooldown_add_nothing() {
         .await;
     assert_eq!(
         first, 2,
-        "case {case:?}: expected the first invocation to add one task, got {first:?}"
+        "case {case:?}: expected the alarm's transition into ALARM to add one task, got {first:?}"
     );
 
+    // Three further transitions, every one of them inside the 600-second wait the policy asked
+    // for.
+    for _ in 0..3 {
+        given_fresh_transition(&emulator, alarm_name, 25.0, case).await;
+    }
     let settled =
-        await_while_breaching(&emulator, cluster, service, 25.0, 3, QUIET_WATCH, case).await;
+        watch_while_breaching(&emulator, cluster, service, 25.0, 2, QUIET_WATCH, case).await;
     assert_eq!(
         settled, 2,
-        "case {case:?}: expected every invocation inside the wait to add nothing, got {settled:?}"
+        "case {case:?}: expected every transition inside the wait to add nothing, got {settled:?}"
     );
     let moved = movement_descriptions(&emulator, &resource_id, case).await;
     assert_eq!(
@@ -1461,18 +1633,7 @@ async fn await_second_alarm_breaching(
     let deadline = std::time::Instant::now() + CONTINUING_WAIT;
     loop {
         publish_breach_on(emulator, SECOND_METRIC_NAME, row.second_breach, row.case).await;
-        let (status, body) = emulator
-            .call_cloudwatch("DescribeAlarms", json!({"AlarmNames": [alarm_name]}))
-            .await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected DescribeAlarms to answer 200, got {status} {body:?}",
-            row.case
-        );
-        let state = body["MetricAlarms"][0]["StateValue"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let state = alarm_state(emulator, alarm_name, row.case).await;
         if state == "ALARM" || std::time::Instant::now() >= deadline {
             return state;
         }
@@ -1605,7 +1766,7 @@ async fn an_action_inside_the_wait_the_movement_in_flight_covers_moves_no_capaci
         );
 
         // And the capacity stays where the first movement left it for the whole watch, which
-        // is several of the invocation cadences that alarm goes on invoking the policy at.
+        // is several of the evaluation cadences of the alarm that raised it.
         let held = await_action_inside_the_wait(
             &emulator,
             cluster,
@@ -1627,6 +1788,289 @@ async fn an_action_inside_the_wait_the_movement_in_flight_covers_moves_no_capaci
             vec![format!("Setting desired count to {}.", row.first_capacity)],
             "case {case:?}: expected the one movement the wait has not elapsed since, \
              got {moved:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The movement a sustained breach performed settles at Successful
+// ---------------------------------------------------------------------------
+//
+// A movement reaches its terminal status once the service that OWNS the scaled resource has
+// made the capacity it set take effect — `Service$runningCount`, "the number of tasks in the
+// cluster that are in the RUNNING state", reaching the `desiredCount` the movement asked for —
+// and `ScalingActivity$StatusCode` is where the log says so: "Indicates the status of the
+// scaling activity", one of `ScalingActivityStatusCode` (`Pending`, `InProgress`, `Successful`,
+// `Overridden`, `Unfulfilled`, `Failed`).
+//
+// Which is only reachable because the breach's own alarm raises ONE action: a movement that a
+// later movement of the same target displaces ends `Overridden` rather than `Successful` —
+// the model keeps that value beside it for exactly that outcome — so a breach re-executed on
+// every evaluation would leave a log in which no activity is ever successful, however long a
+// client polls and however plainly the owning service reports the new count.
+
+/// The status a movement the owning service has fulfilled reaches.
+const SUCCESSFUL: &str = "Successful";
+
+/// One sustained breach whose single movement has to settle: the window the target is
+/// registered with, the capacity the ECS service starts at, the step adjustment the breach
+/// fires, and the capacity the one movement lands on.
+struct SettledRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with.
+    starting: i64,
+    min: i64,
+    max: i64,
+    adjustment_type: &'static str,
+    steps: &'static [Step],
+    /// The alarm's `ComparisonOperator`, which names the side of the threshold it breaches on.
+    comparison_operator: &'static str,
+    /// How far past the threshold each published datapoint is, signed in the direction of the
+    /// breach.
+    breach: f64,
+    /// The capacity the movement sets, which is the count ECS then has to be running.
+    capacity: i64,
+}
+
+/// The rows differ in the DIRECTION the one movement is in, in how its adjustment is
+/// interpreted (the three `AdjustmentType` values the model declares), and in whether the
+/// registered window is what decides the capacity it lands on.
+const SETTLED_CATALOG: &[SettledRow] = &[
+    // A scale out by a task count: two more tasks for the cluster to place and run.
+    SettledRow {
+        case: "a scale out by a task count",
+        starting: 2,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+        comparison_operator: "GreaterThanThreshold",
+        breach: 25.0,
+        capacity: 4,
+    },
+    // "For exact capacity, you must specify a non-negative value": the step names the count
+    // itself.
+    SettledRow {
+        case: "a scale out to an exact capacity",
+        starting: 2,
+        min: 1,
+        max: 20,
+        adjustment_type: "ExactCapacity",
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 5 }],
+        comparison_operator: "GreaterThanThreshold",
+        breach: 25.0,
+        capacity: 5,
+    },
+    // A percentage of the capacity the execution finds: 100% of 2 is 2 more.
+    SettledRow {
+        case: "a scale out by a percentage",
+        starting: 2,
+        min: 1,
+        max: 20,
+        adjustment_type: "PercentChangeInCapacity",
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 100 }],
+        comparison_operator: "GreaterThanThreshold",
+        breach: 25.0,
+        capacity: 4,
+    },
+    // The other direction: a scale in, whose capacity the cluster reaches by STOPPING tasks.
+    SettledRow {
+        case: "a scale in by a task count",
+        starting: 6,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[Step { lower: None, upper: Some(0.0), adjustment: -2 }],
+        comparison_operator: "LessThanThreshold",
+        breach: -25.0,
+        capacity: 4,
+    },
+    // An adjustment that overshoots the registered ceiling is performed AT the ceiling, and
+    // that capacity settles like any other.
+    SettledRow {
+        case: "a scale out clamped at the registered ceiling",
+        starting: 2,
+        min: 1,
+        max: 5,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 9 }],
+        comparison_operator: "GreaterThanThreshold",
+        breach: 25.0,
+        capacity: 5,
+    },
+];
+
+/// Keep the breach alive and wait for ECS to report `expected` tasks RUNNING for the service,
+/// answering what it last read.
+async fn await_while_breaching_running(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    breach: f64,
+    expected: i64,
+    case: &str,
+) -> i64 {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach(emulator, breach, case).await;
+        let last = emulator.ecs_running_count(cluster, service).await;
+        if last == expected || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Keep the breach alive and wait for the newest activity of the target to report
+/// `StatusCode` `Successful`, answering the activity it last read.
+async fn await_successful_activity(
+    emulator: &Emulator,
+    resource_id: &str,
+    breach: f64,
+    case: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach(emulator, breach, case).await;
+        let newest = activities(emulator, resource_id, case)
+            .await
+            .first()
+            .cloned()
+            .unwrap_or(Value::Null);
+        if newest["StatusCode"] == json!(SUCCESSFUL) || std::time::Instant::now() >= deadline {
+            return newest;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_sustained_breach_settles_one_successful_activity() {
+    for row in SETTLED_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let cluster = "settling";
+        let service = "web";
+        let resource_id = emulator
+            .given_ecs_service(cluster, service, row.starting)
+            .await;
+        register(&emulator, &resource_id, row.min, row.max, case).await;
+        let policy_arn = put_step_policy(
+            &emulator,
+            &resource_id,
+            "step-policy",
+            json!({
+                "AdjustmentType": row.adjustment_type,
+                "StepAdjustments": step_adjustments(row.steps),
+                // No wait at all, so nothing but the one-action-per-transition rule can be what
+                // keeps the breach from being applied again.
+                "Cooldown": 0,
+            }),
+            case,
+        )
+        .await;
+        let alarm_name = "settling-alarm";
+        given_continuing_alarm(
+            &emulator,
+            alarm_name,
+            &policy_arn,
+            row.comparison_operator,
+            case,
+        )
+        .await;
+
+        // The breach moves the ECS service's desired count once, and the cluster then has to
+        // make that count real.
+        let desired = await_while_breaching(
+            &emulator,
+            cluster,
+            service,
+            row.breach,
+            row.capacity,
+            CONTINUING_WAIT,
+            case,
+        )
+        .await;
+        assert_eq!(
+            desired, row.capacity,
+            "case {case:?}: expected the breach to move the ECS desiredCount to {}, \
+             got {desired:?}",
+            row.capacity
+        );
+        let running = await_while_breaching_running(
+            &emulator,
+            cluster,
+            service,
+            row.breach,
+            row.capacity,
+            case,
+        )
+        .await;
+        assert_eq!(
+            running, row.capacity,
+            "case {case:?}: expected ECS to report {} tasks running, got {running:?}",
+            row.capacity
+        );
+
+        // So the movement that set that count settles terminal: `Successful`, with the
+        // `EndTime` of the instant it was fulfilled at and the `Description` of the change it
+        // made.
+        let settled = await_successful_activity(&emulator, &resource_id, row.breach, case).await;
+        assert_eq!(
+            settled["StatusCode"],
+            json!(SUCCESSFUL),
+            "case {case:?}: expected the fulfilled movement to report {SUCCESSFUL}, \
+             got {settled:?}"
+        );
+        assert_eq!(
+            settled["Description"],
+            json!(format!("Setting desired count to {}.", row.capacity)),
+            "case {case:?}: expected the movement's own Description, got {settled:?}"
+        );
+        let start = settled["StartTime"].as_f64().unwrap_or_default();
+        let end = settled["EndTime"].as_f64().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a fulfilled movement to carry an EndTime, got {settled:?}"
+            )
+        });
+        assert!(
+            end >= start,
+            "case {case:?}: expected EndTime {end} at or after StartTime {start}, got {settled:?}"
+        );
+
+        // And it STAYS successful while the metric goes on breaching: the alarm does not
+        // transition again, so no later movement displaces this one and the log a client polls
+        // really does hold a successful activity for the capacity that moved.
+        let held = watch_while_breaching(
+            &emulator,
+            cluster,
+            service,
+            row.breach,
+            row.capacity,
+            QUIET_WATCH,
+            case,
+        )
+        .await;
+        assert_eq!(
+            held, row.capacity,
+            "case {case:?}: expected the capacity to hold at {} while the alarm stays in ALARM, \
+             got {held:?}",
+            row.capacity
+        );
+        let listed = activities(&emulator, &resource_id, case).await;
+        let successful: Vec<&Value> = listed
+            .iter()
+            .filter(|activity| activity["StatusCode"] == json!(SUCCESSFUL))
+            .collect();
+        assert_eq!(
+            successful.len(),
+            1,
+            "case {case:?}: expected exactly one successful activity, got {listed:?}"
+        );
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: expected the breach to record one activity in all, got {listed:?}"
         );
     }
 }

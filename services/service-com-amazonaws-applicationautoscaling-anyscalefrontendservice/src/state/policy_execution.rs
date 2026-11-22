@@ -53,26 +53,31 @@
 //! has made due ([`super::apply_due_scheduled_actions`]) and delivers the capacity they moved,
 //! and the same task keeps watching while the store holds one.
 //!
-//! One INVOCATION fires one execution: the instant of the invocation a breach belongs to is
-//! recorded on the policy, so no later pass performs the same invocation twice. An alarm does
-//! not invoke its actions once and fall silent — it goes on invoking them for as long as it
-//! STAYS in `ALARM`, at the cadence it is evaluated at ([`invocation_interval_secs`]), so a
-//! breach that persists is executed again and again ([`invocation_secs`]). That is what a
-//! cooldown is a wait against: for the span the policy asks to "wait for a previous scaling
-//! activity to take effect" (`StepScalingPolicyConfiguration$Cooldown`) the movement that
-//! started it is still in flight ([`super::InFlightMovement`]), so an invocation that arrives
-//! inside that span is NOT discarded — it is decided against that movement rather than against
-//! the capacity the movement left behind. Its adjustment is computed from the capacity the
-//! in-flight movement started at, which NETS OUT the capacity that movement has already
-//! delivered: an invocation that asks for no more than it delivered adds nothing, and one that
-//! asks for more — a breach that has grown into a larger step adjustment, or a metric that has
-//! moved further from a tracked value — moves the capacity straight away, by the remainder
-//! alone. A scale in inside the wait is held back until it has elapsed, and the first
-//! invocation after it applies the next adjustment in full — so a target under a breach that
-//! does not let up keeps being moved, one adjustment per wait and sooner where the breach
-//! worsens, until the registered window is what stops it. Each invocation is decided as of ITS
-//! OWN instant rather than the instant a pass reads it, so a pass that comes late performs what
-//! the invocation it reads was owed.
+//! One TRANSITION fires one execution. What wires an alarm to a policy is the alarm's own
+//! action list — "The actions to execute when this alarm transitions to the ALARM state from
+//! any other state" (`PutMetricAlarmInput$AlarmActions`) — so what raises an action is the
+//! alarm CHANGING state and not the state it then holds: an alarm that stays in `ALARM` while
+//! its metric goes on breaching has already executed the actions that breach raised, however
+//! many further evaluations grade the same state, and the next action comes when the alarm
+//! leaves `ALARM` and returns to it. The instant of the transition a breach belongs to is
+//! recorded on the policy ([`remember_invocation`]), so no later pass performs the same
+//! transition twice and a breach that does not let up moves a target once rather than once per
+//! evaluation of its alarm.
+//!
+//! That is what a cooldown is a wait against: for the span the policy asks to "wait for a
+//! previous scaling activity to take effect" (`StepScalingPolicyConfiguration$Cooldown`) the
+//! movement that started it is still in flight ([`super::InFlightMovement`]), so an action
+//! raised inside that span — by another alarm of the same policy, or by the same alarm leaving
+//! `ALARM` and breaching again — is NOT discarded: it is decided against that movement rather
+//! than against the capacity the movement left behind. Its adjustment is computed from the
+//! capacity the in-flight movement started at, which NETS OUT the capacity that movement has
+//! already delivered: an action that asks for no more than it delivered adds nothing, and one
+//! that asks for more — a breach that has grown into a larger step adjustment, or a metric that
+//! has moved further from a tracked value — moves the capacity straight away, by the remainder
+//! alone. A scale in inside the wait is held back until it has elapsed, and the first action
+//! after it applies the next adjustment in full. Each action is decided as of the instant its
+//! alarm transitioned rather than the instant a pass reads it, so a pass that comes late
+//! performs exactly what the transition it reads was owed.
 //!
 //! A breach a WITHHELD STATE of the target rather than a wait keeps from being performed is
 //! left unconsumed — the alarm is still breaching, so the first pass that may perform it does:
@@ -137,23 +142,13 @@ pub const DEFAULT_COOLDOWN_SECS: i64 = 300;
 /// newer than what the policy remembers, so the next pass performs them.
 const MAX_EXECUTIONS_PER_PASS: usize = 32;
 
-/// How many alarms ONE policy remembers an invocation instant for.
+/// How many alarms ONE policy remembers a transition instant for.
 ///
 /// A policy is the action of as many alarms as a client wires it to, and an alarm that is
 /// deleted leaves its entry behind, so the memory is bounded: past this many the OLDEST
-/// invocation is forgotten, which at worst performs one extra execution for an alarm nothing
+/// transition is forgotten, which at worst performs one extra execution for an alarm nothing
 /// has fired in that long.
 const MAX_REMEMBERED_ALARMS_PER_POLICY: usize = 32;
-
-/// How often an alarm that stays in `ALARM` invokes the actions it names again: once a minute.
-///
-/// An alarm that is in `ALARM` keeps the policies its action list names executing for as long
-/// as the breach lasts, at the cadence a static-threshold alarm is evaluated at — one minute,
-/// which is also the shortest `Period` an alarm over a standard-resolution metric carries:
-/// "Valid values are 10, 20, 30, and any multiple of 60" (`MetricAlarm$Period`). An alarm
-/// evaluated more finely than that invokes its actions at its own period instead, and never
-/// less often than this, whatever period it carries ([`invocation_interval_secs`]).
-const ALARM_INVOCATION_INTERVAL_SECS: f64 = 60.0;
 
 /// How long the breaches of one scalable target are collected over before the policies they
 /// trigger are arbitrated against each other ([`arbitration_windows`]).
@@ -190,20 +185,19 @@ const SCALING_CLOCK_WAIT: Duration = Duration::from_millis(250);
 const MAX_SCALING_CLOCK_WAKE_UPS: usize = 2_400;
 
 /// One alarm breach that has not been executed yet: which alarm, when it moved into `ALARM`,
-/// which of its invocations this is, and how far past its threshold the metric was.
+/// and how far past its threshold the metric that moved it there was.
 #[derive(Debug, Clone)]
 struct Breach {
-    /// The alarm whose invocation fires the policy, as its `AlarmName`.
+    /// The alarm whose transition into `ALARM` fires the policy, as its `AlarmName`.
     alarm_name: String,
-    /// The instant it moved into `ALARM`, in epoch seconds, which is the instant the alarms of
-    /// one scalable target are read as having been triggered TOGETHER at
-    /// ([`arbitration_windows`]).
+    /// The instant it moved into `ALARM`, in epoch seconds.
+    ///
+    /// Two things at once: the instant the alarms of one scalable target are read as having
+    /// been triggered TOGETHER at ([`arbitration_windows`]), and the IDENTITY of the action
+    /// this breach raised — a transition is what executes an alarm's actions, so the same
+    /// transition is executed once ([`remember_invocation`]) however many evaluations grade
+    /// the state it left the alarm in.
     transitioned_secs: f64,
-    /// The instant, in epoch seconds, of the invocation this breach belongs to — the identity
-    /// of the invocation, so the same one is executed once ([`invocation_secs`]). The
-    /// transition itself, and then one invocation per cadence the alarm is evaluated at for as
-    /// long as it stays in `ALARM`.
-    invoked_secs: f64,
     /// The alarm's own `Threshold`, which the difference below is measured from.
     threshold: f64,
     /// The difference between the metric and the alarm's `Threshold`, which is what a step
@@ -257,7 +251,7 @@ struct FiringPolicy {
     key: PolicyKey,
     policy_arn: String,
     config: FiringConfig,
-    /// The invocation of each alarm this policy has already been executed for, by alarm name.
+    /// The transition of each alarm this policy has already been executed for, by alarm name.
     executed: BTreeMap<String, f64>,
 }
 
@@ -778,61 +772,6 @@ fn epoch_secs(at: SystemTime) -> f64 {
         .map_or(0.0, |since_epoch| since_epoch.as_secs_f64())
 }
 
-/// The instant of the invocation an alarm that is in `ALARM` is making NOW: the transition
-/// itself, and then one invocation every `interval_secs` for as long as the alarm stays there.
-///
-/// The invocations of one state are a cadence of that state's own instant rather than of the
-/// instant a pass happens to read at, so the identity a pass computes for the invocation in
-/// force does not depend on when it looked: two passes inside one interval read the SAME
-/// invocation, which is what keeps one invocation one execution.
-///
-/// An interval that is not a positive number, and a clock that reads before the transition,
-/// name the transition itself — a cadence cannot be counted from either.
-fn invocation_secs(transitioned_secs: f64, interval_secs: f64, now_secs: f64) -> f64 {
-    if !transitioned_secs.is_finite() || !interval_secs.is_finite() || interval_secs <= 0.0 {
-        return transitioned_secs;
-    }
-    let elapsed = now_secs - transitioned_secs;
-    if !elapsed.is_finite() || elapsed < interval_secs {
-        return transitioned_secs;
-    }
-    transitioned_secs + (elapsed / interval_secs).floor() * interval_secs
-}
-
-/// How often `alarm` invokes the actions it names again while it stays in `ALARM`: once a
-/// minute ([`ALARM_INVOCATION_INTERVAL_SECS`]), or its own evaluation cadence where that is
-/// finer — a high-resolution `Period`, under a minute, is graded that often and so invokes
-/// that often.
-///
-/// An alarm evaluated over a `Metrics` query array carries no period of its own — "you specify
-/// the period for each metric within the objects in the `Metrics` array"
-/// (`PutMetricAlarmInput$Period`) — so the cadence it is read at is the SHORTEST period any of
-/// those queries is taken at: the expression is graded whenever a query of it is.
-fn invocation_interval_secs(
-    alarm: &::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::ops::types::MetricAlarm,
-) -> f64 {
-    let queried = alarm
-        .metrics
-        .iter()
-        .flatten()
-        .filter_map(|query| {
-            query
-                .metric_stat
-                .as_ref()
-                .map(|stat| stat.period)
-                .or(query.period)
-        })
-        .filter(|period| *period >= 1)
-        .min();
-    alarm
-        .period
-        .filter(|period| *period >= 1)
-        .or(queried)
-        .map_or(ALARM_INVOCATION_INTERVAL_SECS, |period| {
-            f64::from(period).min(ALARM_INVOCATION_INTERVAL_SECS)
-        })
-}
-
 /// Whether an alarm breach executes a policy of this type at all.
 fn is_alarm_driven(policy_type: &str) -> bool {
     matches!(
@@ -886,10 +825,12 @@ fn firing_candidates(
 /// the difference between the metric and the alarm's `Threshold`, and a composite alarm has
 /// neither.
 ///
-/// A breach is one INVOCATION of that alarm rather than its transition: an alarm that is in
-/// `ALARM` keeps invoking its actions at its own evaluation cadence for as long as it stays
-/// there ([`invocation_secs`]), so the breach a pass reads is the invocation in force now and a
-/// policy owes it exactly when it has not been executed for that invocation yet.
+/// A breach is one TRANSITION of that alarm into `ALARM` and not a state it merely holds: an
+/// alarm executes the actions it names when it CHANGES state, so the breach a pass reads is the
+/// transition the alarm is standing in and a policy owes it exactly when it has not been
+/// executed for that transition yet. A pass that reads the same alarm again inside the same
+/// state reads the same breach, which is what keeps one transition one execution; the next one
+/// comes when the alarm leaves `ALARM` and returns to it.
 fn unexecuted_breaches<Eng: Send + Sync + 'static>(
     engine: &Eng,
     candidates: &[FiringPolicy],
@@ -899,7 +840,6 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
     let Some(store) = cloudwatch::state::service_state(engine) else {
         return Vec::new();
     };
-    let now_secs = epoch_secs(SystemTime::now());
     let wired: BTreeMap<&str, &FiringPolicy> = candidates
         .iter()
         .map(|policy| (policy.policy_arn.as_str(), policy))
@@ -917,18 +857,15 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
         let Some(alarm_name) = alarm.alarm_name.clone() else {
             continue;
         };
+        // The instant the alarm last CHANGED state, which for an alarm standing in `ALARM` is
+        // the transition that executed its actions. An evaluation that grades the same state
+        // again moves the alarm nowhere and so leaves this instant alone, which is what makes
+        // it the identity of the one action this breach raised.
         let transitioned_secs = alarm
             .state_transitioned_timestamp
             .as_ref()
             .or(alarm.state_updated_timestamp.as_ref())
             .map_or(0.0, ::aws_smithy_types::DateTime::as_secs_f64);
-        // The invocation this alarm is making now: the transition, and then one per period of
-        // the breach it goes on reporting.
-        let invoked_secs = invocation_secs(
-            transitioned_secs,
-            invocation_interval_secs(alarm),
-            now_secs,
-        );
         let Some(graded) = breach_of(alarm) else {
             continue;
         };
@@ -938,12 +875,12 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
             let Some(policy) = wired.get(super::policy_arn_in_action(action)) else {
                 continue;
             };
-            // The invocation this policy was last executed for; a newer one is a breach it
+            // The transition this policy was last executed for; a newer one is a breach it
             // owes, and the same one is a breach it has already performed.
             if policy
                 .executed
                 .get(&alarm_name)
-                .is_some_and(|executed| *executed >= invoked_secs)
+                .is_some_and(|executed| *executed >= transitioned_secs)
             {
                 continue;
             }
@@ -952,7 +889,6 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
                 Breach {
                     alarm_name: alarm_name.clone(),
                     transitioned_secs,
-                    invoked_secs,
                     threshold: graded.threshold,
                     difference: graded.difference,
                     above: graded.above,
@@ -1101,17 +1037,17 @@ fn apply_breaches(
     for (index, ((policy, breach), planned_here)) in fired.iter().zip(&planned).enumerate() {
         // Only a breach that ASKED for a movement can lose the arbitration. One that is being
         // withheld — by a suspended direction, by a window that is still open — has asked for
-        // nothing yet, so it keeps its invocation and the first pass that may perform it
+        // nothing yet, so it keeps its transition and the first pass that may perform it
         // still does.
         let suppressed = matches!(planned_here, Disposition::Move(_))
             && winners
                 .get(&policy.key.target)
                 .is_some_and(|winner| *winner != index);
         if suppressed {
-            // Suppressed by the policy that provides the larger capacity: the invocation is
+            // Suppressed by the policy that provides the larger capacity: the transition is
             // consumed, so no later pass performs it, and the breach reaches neither the
             // resource nor the activity log.
-            remember_invocation(store, &policy.key, &breach.alarm_name, breach.invoked_secs);
+            remember_invocation(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
             continue;
         }
         // Decided again under this lock, against what the movements already performed in this
@@ -1121,7 +1057,12 @@ fn apply_breaches(
             // perform this breach does.
             Disposition::Hold => {}
             Disposition::Consume => {
-                remember_invocation(store, &policy.key, &breach.alarm_name, breach.invoked_secs);
+                remember_invocation(
+                    store,
+                    &policy.key,
+                    &breach.alarm_name,
+                    breach.transitioned_secs,
+                );
             }
             Disposition::NotScaled { reason, consume } => {
                 record_not_scaled(store, policy, breach, reason, now);
@@ -1130,7 +1071,7 @@ fn apply_breaches(
                         store,
                         &policy.key,
                         &breach.alarm_name,
-                        breach.invoked_secs,
+                        breach.transitioned_secs,
                     );
                 }
             }
@@ -1148,7 +1089,7 @@ enum Disposition {
     /// for its target's arbitration window to close, or for the policy or target that went
     /// missing under it.
     Hold,
-    /// Evaluated and done with: there is no capacity movement in it, so the invocation is
+    /// Evaluated and done with: there is no capacity movement in it, so the transition is
     /// remembered and no later pass looks at it again.
     Consume,
     /// Evaluated, and WITHHELD with a reason: there is no capacity movement in it, and the
@@ -1240,12 +1181,12 @@ fn plan_breach(
         return Disposition::Hold;
     };
     // What this policy has been executed for is read AGAIN under this lock: a pass that
-    // overlapped this one may have performed the same invocation between the snapshot and
-    // here, and one invocation is ONE execution.
+    // overlapped this one may have performed the same transition between the snapshot and
+    // here, and one transition is ONE execution.
     if record
         .executed_transitions
         .get(&breach.alarm_name)
-        .is_some_and(|executed| *executed >= breach.invoked_secs)
+        .is_some_and(|executed| *executed >= breach.transitioned_secs)
     {
         return Disposition::Hold;
     }
@@ -1274,17 +1215,17 @@ fn plan_breach(
     }
     // "The amount of time, in seconds, to wait for a previous scaling activity to take
     // effect": the movement this policy made last is still in flight for that span, so an
-    // invocation that ARRIVES inside it is decided against that movement rather than against
-    // the capacity it left behind. Decided as of the instant the alarm invoked the policy and
-    // not as of the instant a pass reads it, so a pass that comes late performs exactly what
-    // the invocation it is reading was owed.
+    // action RAISED inside it is decided against that movement rather than against the
+    // capacity it left behind. Decided as of the instant the alarm transitioned and not as of
+    // the instant a pass reads it, so a pass that comes late performs exactly what the
+    // transition it is reading was owed.
     let waiting = record
         .last_executed
         .map(|last| epoch_secs(last) + cooldown_of(record, tracked_kind).as_secs_f64())
-        .is_some_and(|due| breach.invoked_secs < due);
+        .is_some_and(|due| breach.transitioned_secs < due);
     // What that in-flight movement did, while the wait for it is still running. A wait this
-    // policy has no movement recorded for has nothing to net an invocation against, so it
-    // suppresses the invocation outright.
+    // policy has no movement recorded for has nothing to net an action against, so it
+    // suppresses the action outright.
     let in_flight = match (waiting, record.last_movement) {
         (false, _) => None,
         (true, Some(movement)) => Some(movement),
@@ -1407,7 +1348,7 @@ fn plan_breach(
     })
 }
 
-/// Perform one movement: consume the invocation, set the capacity, record the activity — which
+/// Perform one movement: consume the transition, set the capacity, record the activity — which
 /// is what queues the capacity the resource is owed — record the scaling decision it settles for
 /// the target's policies, and start this policy's cooldown.
 fn perform_movement(
@@ -1422,8 +1363,8 @@ fn perform_movement(
         base,
         settled_for,
     } = movement;
-    // This invocation has now been performed, so no later pass performs it again.
-    remember_invocation(store, &policy.key, &breach.alarm_name, breach.invoked_secs);
+    // This transition has now been performed, so no later pass performs it again.
+    remember_invocation(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
     let cause = breach_cause(policy, breach);
     // The instant THIS movement is made at, which is not the instant the pass started:
     // the pass performs the breaches it found one after another, and two movements that
@@ -1450,7 +1391,7 @@ fn perform_movement(
     }
     if let Some(record) = store.policies.get_mut(&policy.key) {
         record.last_executed = Some(moved_at);
-        // What this movement did, which is what an invocation that arrives while the wait for
+        // What this movement did, which is what an action raised while the wait for
         // it is still running is netted against: the capacity it was computed from and the
         // capacity it moved the target to.
         record.last_movement = Some(super::InFlightMovement {
@@ -1658,20 +1599,20 @@ fn cooldown_of(
     )
 }
 
-/// Record on a policy that it has been executed for the invocation of `alarm_name` at
-/// `invoked_secs`, forgetting the oldest invocation it remembers once the memory is full.
+/// Record on a policy that it has been executed for the transition of `alarm_name` at
+/// `transitioned_secs`, forgetting the oldest transition it remembers once the memory is full.
 fn remember_invocation(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     key: &PolicyKey,
     alarm_name: &str,
-    invoked_secs: f64,
+    transitioned_secs: f64,
 ) {
     let Some(record) = store.policies.get_mut(key) else {
         return;
     };
     record
         .executed_transitions
-        .insert(alarm_name.to_string(), invoked_secs);
+        .insert(alarm_name.to_string(), transitioned_secs);
     while record.executed_transitions.len() > MAX_REMEMBERED_ALARMS_PER_POLICY {
         let Some(oldest) = record
             .executed_transitions

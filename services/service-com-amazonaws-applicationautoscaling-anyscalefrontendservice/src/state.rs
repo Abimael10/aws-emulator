@@ -218,14 +218,15 @@ pub struct ScalingPolicyRecord {
     pub predictive_config: Option<PredictiveScalingPolicyConfiguration>,
     pub alarms: Vec<Alarm>,
     pub creation_time: SystemTime,
-    /// The alarm invocations this policy has already been EXECUTED for: the instant, in epoch
-    /// seconds, of the last invocation of each alarm this service performed an execution for,
+    /// The alarm transitions this policy has already been EXECUTED for: the instant, in epoch
+    /// seconds, of the last transition of each alarm this service performed an execution for,
     /// by alarm name.
     ///
-    /// One invocation fires one execution, so this is what makes a breach idempotent: a later
-    /// pass performs an alarm's invocation only when it is newer than the one recorded here.
-    /// An alarm that STAYS in `ALARM` keeps invoking its actions at its own evaluation cadence,
-    /// so a breach that does not let up is executed again and again (see [`policy_execution`]).
+    /// One transition fires one execution, so this is what makes a breach idempotent: a later
+    /// pass performs an alarm's transition only when it is newer than the one recorded here.
+    /// An alarm that STAYS in `ALARM` has already executed the actions its transition raised,
+    /// so a breach that does not let up moves the target once and not once per evaluation (see
+    /// [`policy_execution`]).
     pub executed_transitions: BTreeMap<String, f64>,
     /// When this policy last moved the capacity of the resource it scales, which is the
     /// instant its `Cooldown` is measured from.
@@ -294,16 +295,16 @@ pub struct ScalingActivityRecord {
     /// reads it for: an activity that moved no capacity has none a later movement could
     /// displace, so it keeps the status it was recorded with.
     pub movement: bool,
-    /// Whether the service that OWNS the scaled resource has still to report the capacity
-    /// this movement set as IN EFFECT before the activity may reach its terminal status.
+    /// Whether the service that OWNS the scaled resource has still to take on the capacity
+    /// this movement set before the activity may reach its terminal status.
     ///
-    /// Setting a capacity and that capacity taking effect are two things: this service does
+    /// Setting a capacity and that capacity being applied are two things: this service does
     /// the first and the owning service the second, which is what the activity's own message
     /// says it is waiting for ([`awaiting_fulfilment_status_message`]). So while this is set
     /// the activity is non-terminal however far past [`ACTIVITY_FULFILMENT`] the clock is,
     /// and the pass that reads the owning service clears it
     /// ([`capacity_fulfilment::settle_activity_fulfilments`]). It is set only for a namespace
-    /// whose owning service reports an in-effect capacity at all
+    /// whose owning service holds the scaled capacity where this emulator can read it
     /// ([`capacity_fulfilment::owner_confirms_fulfilment`]); for every other namespace the
     /// span is the whole of the wait.
     pub awaiting_owner: bool,
@@ -457,11 +458,12 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// `target`, and answer its `ActivityId`.
     ///
     /// The activity is non-terminal for at least [`ACTIVITY_FULFILMENT`], and reaches
-    /// `Successful` once the capacity it set has taken effect: for a namespace whose owning
-    /// service reports that, when that service reports it
-    /// ([`capacity_fulfilment::settle_activity_fulfilments`]), and otherwise as soon as the
-    /// span has elapsed. Unless a LATER movement of the same scalable target takes its
-    /// capacity over first, which is what [`Self::override_unfulfilled_activities`] resolves.
+    /// `Successful` once the capacity it set has been applied by the service that owns the
+    /// scaled resource: for a namespace whose stored capacity this emulator can read back,
+    /// when that service holds it ([`capacity_fulfilment::settle_activity_fulfilments`]), and
+    /// otherwise as soon as the span has elapsed. Unless a LATER movement of the same scalable
+    /// target takes its capacity over first, which is what
+    /// [`Self::override_unfulfilled_activities`] resolves.
     pub fn record_capacity_change(
         &mut self,
         target: &TargetKey,
@@ -757,10 +759,10 @@ pub const ACTIVITY_RETENTION: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 6
 /// that status between two reads rather than only ever seeing the terminal one.
 ///
 /// It is the whole of the wait only for a movement nothing else can be read about. Where the
-/// service that owns the scaled resource reports whether the capacity has taken effect, the
-/// span is the floor and that report is what ends the activity
-/// ([`capacity_fulfilment::settle_activity_fulfilments`]), so a capacity the owning service
-/// never reaches is one its movement never reports as fulfilled.
+/// capacity the scaled resource is driven to can be read back in the service that OWNS it, the
+/// span is the floor and that reading is what ends the activity
+/// ([`capacity_fulfilment::settle_activity_fulfilments`]), so a capacity that service never
+/// takes on is one its movement never reports as fulfilled.
 pub const ACTIVITY_FULFILMENT: Duration = Duration::from_secs(3);
 
 /// How long a capacity movement keeps being OFFERED to a resource that has not taken it.
