@@ -48,7 +48,11 @@ pub(crate) enum Resp {
 
 impl Resp {
     /// The error code a refusal carries (its first word), or `None` for a success.
-    fn error_code(&self) -> Option<&str> {
+    ///
+    /// `pub(crate)` for the reason the type itself is: a second suite that reads a RESP
+    /// refusal branches on the same first word, and a second copy of this match would be a
+    /// second thing to keep correct.
+    pub(crate) fn error_code(&self) -> Option<&str> {
         match self {
             Self::Error(message) => message.split_whitespace().next(),
             _ => None,
