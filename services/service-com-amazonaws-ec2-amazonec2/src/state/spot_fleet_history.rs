@@ -12,7 +12,9 @@
 //! fleet's history a moment apart carry the same records.
 //!
 //! The history of one fleet is bounded by the fleet itself: one event for each `BatchState` it
-//! enters (at most [`crate::ops::types::BATCH_STATE_VALUES`] of them) and at most two — a
+//! ENTERS (at most [`crate::ops::types::BATCH_STATE_VALUES`] of them — a call that asks a fleet
+//! for the state it is already in changes nothing and so records nothing, which is what keeps
+//! this a bound on the fleet rather than on how often a caller calls) and at most two — a
 //! launch and a termination — for each Spot Instance request it placed, which
 //! [`MAX_SPOT_FLEET_SPOT_INSTANCES`] bounds. It holds no caller-chosen text at all: every
 //! word is a `&'static str` of a modelled catalog and every instance id was minted by this

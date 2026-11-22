@@ -2457,8 +2457,49 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
     /// with [`transit_gateway_limit_exceeded`] when it answers `false`.
+    ///
+    /// Only the gateways the account HOLDS are counted: a `deleted` one is a record of a
+    /// resource that is gone ([`Self::finish_transit_gateway_deletion`]), so it takes none of
+    /// the account's quota, and the room it occupies in this store is given back by
+    /// [`Self::release_a_deleted_transit_gateway`] when a create needs it. A teardown followed
+    /// by a create therefore succeeds however often it is repeated, while the store itself
+    /// still holds at most [`MAX_TRANSIT_GATEWAYS`] records.
     pub fn has_transit_gateway_capacity(&self) -> bool {
-        self.transit_gateways.len() < MAX_TRANSIT_GATEWAYS
+        self.transit_gateways
+            .values()
+            .filter(|transit_gateway| {
+                transit_gateway.state.as_deref() != Some(TRANSIT_GATEWAY_STATE_DELETED)
+            })
+            .count()
+            < MAX_TRANSIT_GATEWAYS
+    }
+
+    /// Give back the room the OLDEST `deleted` transit gateway occupies, and answer whether one
+    /// was given back.
+    ///
+    /// A terminal record is kept so a read and a repeat delete can still answer with it, not
+    /// for ever: this store holds at most [`MAX_TRANSIT_GATEWAYS`] gateways in all, so the
+    /// records of gateways that are gone are what a create takes its room from — oldest first,
+    /// the ids this store mints being in minting order. The bytes the record held go back to
+    /// the store's budget on exactly the terms the create charged them
+    /// ([`transit_gateway_payload_bytes`]).
+    pub fn release_a_deleted_transit_gateway(&mut self) -> bool {
+        let oldest = self
+            .transit_gateways
+            .iter()
+            .find(|(_, transit_gateway)| {
+                transit_gateway.state.as_deref() == Some(TRANSIT_GATEWAY_STATE_DELETED)
+            })
+            .map(|(transit_gateway_id, _)| transit_gateway_id.clone());
+        let Some(transit_gateway_id) = oldest else {
+            return false;
+        };
+        if let Some(transit_gateway) = self.transit_gateways.remove(&transit_gateway_id) {
+            self.release_stored_bytes(transit_gateway_payload_bytes(&transit_gateway));
+        }
+        self.transit_gateway_default_route_table
+            .remove(&transit_gateway_id);
+        true
     }
 
     /// Insert a transit gateway in `pending`, with the default route table a create owes
@@ -2485,6 +2526,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// the store's byte budget here, so a writer cannot store them uncharged, and the
     /// clock-owed `available` move is recorded rather than slept for.
     pub fn insert_transit_gateway(&mut self, spec: TransitGatewaySpec) -> String {
+        // The room this record needs comes from the records of gateways that are GONE while
+        // there is one to take it from, so the store's own ceiling bounds what it holds without
+        // a terminal record ever standing in the way of a create.
+        while self.transit_gateways.len() >= MAX_TRANSIT_GATEWAYS
+            && self.release_a_deleted_transit_gateway()
+        {}
         let transit_gateway_id = self.next_id("tgw");
         let creation_time = system_time_to_date_time(spec.created_at);
         let mut options = spec.options;
@@ -2718,13 +2765,17 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// "Deletes the specified transit gateway" is work AWS reports as under way: the
     /// `TransitGatewayState` catalog carries `deleting` and `deleted`, so the gateway is left
-    /// in the TRANSIENT state with the clock owing it the REMOVAL one [`TRANSITION_DELAY`]
+    /// in the TRANSIENT state with the clock owing it the TERMINAL one [`TRANSITION_DELAY`]
     /// later ([`Self::transit_gateway_delete_at`], applied by
     /// [`Self::materialize_due_transitions`]) — the same arrangement, on the same clock, as the
     /// `pending` a create left it in, and the one
     /// [`Self::begin_ipam_deletion`] gives a deleted IPAM. So a caller that reads straight back
-    /// still sees the delete under way and a later one finds the gateway gone, which is what
-    /// `DescribeTransitGateways` no longer carrying it means.
+    /// still sees the delete under way and a later one finds the gateway `deleted`.
+    ///
+    /// A delete the account has ALREADY asked for is answered with the gateway as it stands and
+    /// changes nothing: that work is under way or done, so a repeat delete — a retry, a cleanup
+    /// that runs twice — is accepted and reports the state the resource is in rather than
+    /// starting the move again ([`Self::transit_gateway_deletion_was_recorded`]).
     ///
     /// Any move the clock still owed the gateway is superseded: one on its way out is not going
     /// to land in the state a create or a modification was moving it to.
@@ -2732,6 +2783,9 @@ impl ComAmazonawsEc2Amazonec2State {
         &mut self,
         transit_gateway_id: &str,
     ) -> Option<TransitGateway> {
+        if self.transit_gateway_deletion_was_recorded(transit_gateway_id) {
+            return self.transit_gateways.get(transit_gateway_id).cloned();
+        }
         let transit_gateway = self.transit_gateways.get_mut(transit_gateway_id)?;
         transit_gateway.state = Some(TRANSIT_GATEWAY_STATE_DELETING.to_string());
         let view = transit_gateway.clone();
@@ -2743,11 +2797,52 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(view)
     }
 
-    /// Apply the removal the clock owes a deleted transit gateway, as of `now`.
+    /// Whether the delete of `transit_gateway_id` has already been recorded: the gateway is
+    /// `deleting`, with the clock owing it the terminal state, or already `deleted`.
     ///
-    /// A gateway a `DeleteTransitGateway` left `deleting` was GONE at the instant that call
+    /// The ONE reading of that question, so the writer above and the handler that serves a
+    /// repeat delete cannot disagree about which gateways a further delete has nothing left to
+    /// ask for.
+    pub fn transit_gateway_deletion_was_recorded(&self, transit_gateway_id: &str) -> bool {
+        self.transit_gateways
+            .get(transit_gateway_id)
+            .is_some_and(|transit_gateway| {
+                matches!(
+                    transit_gateway.state.as_deref(),
+                    Some(TRANSIT_GATEWAY_STATE_DELETING | TRANSIT_GATEWAY_STATE_DELETED)
+                )
+            })
+    }
+
+    /// The transit gateway `transit_gateway_id` names that the account still HOLDS, or `None`
+    /// for an id it holds no gateway for and for one the delete has finished with.
+    ///
+    /// A `deleted` gateway is still stored and still reported
+    /// ([`TRANSIT_GATEWAY_STATE_DELETED`]) — that is what a terminal state of a REPORTED
+    /// resource means — but it attaches nothing and takes no further work, so every operation
+    /// that resolves a gateway in order to ACT on it reads it through here and tells such an id
+    /// apart from one the account holds a gateway for. A read that only reports a member of a
+    /// gateway reads the store directly, because a gateway's ARN and owner are facts of it
+    /// whatever state it ended in.
+    pub fn transit_gateway_in_service(&self, transit_gateway_id: &str) -> Option<&TransitGateway> {
+        self.transit_gateways
+            .get(transit_gateway_id)
+            .filter(|transit_gateway| {
+                transit_gateway.state.as_deref() != Some(TRANSIT_GATEWAY_STATE_DELETED)
+            })
+    }
+
+    /// Whether the account holds a transit gateway `transit_gateway_id` names that is still in
+    /// service ([`Self::transit_gateway_in_service`]).
+    pub fn holds_transit_gateway_in_service(&self, transit_gateway_id: &str) -> bool {
+        self.transit_gateway_in_service(transit_gateway_id).is_some()
+    }
+
+    /// Apply the deletion the clock owes a deleted transit gateway, as of `now`.
+    ///
+    /// A gateway a `DeleteTransitGateway` left `deleting` was deleted at the instant that call
     /// recorded for it, with the route tables that came up with it, whether or not anybody
-    /// called again — so the removal is applied from [`Self::materialize_due_transitions`], its
+    /// called again — so the move is applied from [`Self::materialize_due_transitions`], its
     /// one caller, before anything reads the store.
     pub(super) fn materialize_due_transit_gateway_deletions(&mut self, now: Instant) {
         let due: Vec<String> = self
@@ -2758,28 +2853,41 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect();
         for transit_gateway_id in due {
             self.transit_gateway_delete_at.remove(&transit_gateway_id);
-            self.remove_transit_gateway(&transit_gateway_id);
+            self.finish_transit_gateway_deletion(&transit_gateway_id);
         }
     }
 
-    /// Remove the transit gateway `transit_gateway_id` names with the route tables that came
-    /// up with it, and answer it as the store held it — `None` when the account holds no such
-    /// gateway.
+    /// Finish the deletion of the transit gateway `transit_gateway_id` names: the gateway
+    /// enters the terminal [`TRANSIT_GATEWAY_STATE_DELETED`] and the route tables that came up
+    /// with it go. Answers the gateway as the store now holds it — `None` when the account
+    /// holds no such gateway.
+    ///
+    /// The gateway record itself is NOT dropped: `deleted` is a state the `TransitGatewayState`
+    /// catalog publishes for a gateway to be REPORTED in, so the record stays readable —
+    /// `DescribeTransitGateways` answers with it, and a repeat `DeleteTransitGateway` is
+    /// accepted and reports it — where an id the account never held stays a not-found. Its
+    /// caller-chosen bytes stay charged against the store's budget for exactly as long as the
+    /// record is held.
     ///
     /// "When you delete a transit gateway, we delete its default route table": a route table
     /// of the gateway cannot outlive it, so it goes here rather than being left reporting a
-    /// `TransitGatewayId` nothing resolves — and with each table go the associations and
-    /// propagations that named it. The caller-chosen bytes every removed record held go back
-    /// to the store's budget on exactly the terms the create charged them
-    /// ([`transit_gateway_payload_bytes`], [`transit_gateway_route_table_payload_bytes`]), and
-    /// so does the `available` move the clock still owed either.
-    pub fn remove_transit_gateway(&mut self, transit_gateway_id: &str) -> Option<TransitGateway> {
-        let transit_gateway = self.transit_gateways.remove(transit_gateway_id)?;
-        self.release_stored_bytes(transit_gateway_payload_bytes(&transit_gateway));
+    /// `TransitGatewayId` whose gateway takes no further work — and with each table go the
+    /// associations and propagations that named it. The caller-chosen bytes every removed
+    /// record held go back to the store's budget on exactly the terms the create charged them
+    /// ([`transit_gateway_route_table_payload_bytes`]), and so does the `available` move the
+    /// clock still owed either.
+    pub fn finish_transit_gateway_deletion(
+        &mut self,
+        transit_gateway_id: &str,
+    ) -> Option<TransitGateway> {
+        let transit_gateway = self.transit_gateways.get_mut(transit_gateway_id)?;
+        transit_gateway.state = Some(TRANSIT_GATEWAY_STATE_DELETED.to_string());
+        let view = transit_gateway.clone();
         self.transit_gateway_available_at.remove(transit_gateway_id);
         self.transit_gateway_delete_at.remove(transit_gateway_id);
-        // Which table was this gateway's default one is a fact about a gateway that is gone,
-        // so the entry goes with it rather than outliving every gateway the store ever held.
+        // Which table was this gateway's default one is a fact about a gateway that takes no
+        // further work, so the entry goes with the tables rather than outliving every gateway
+        // the store ever held.
         self.transit_gateway_default_route_table
             .remove(transit_gateway_id);
         let route_table_ids: Vec<String> = self
@@ -2806,7 +2914,7 @@ impl ComAmazonawsEc2Amazonec2State {
             self.transit_gateway_prefix_list_references
                 .retain(|(held, _), _| *held != route_table_id);
         }
-        Some(transit_gateway)
+        Some(view)
     }
 
     /// The attachments of `transit_gateway_id` whose KIND has to be deleted before the

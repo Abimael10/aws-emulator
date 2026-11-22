@@ -164,10 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
-        use crate::state::{
-            self, InstanceStateName, MAX_PLACEMENT_GROUP_PARTITION_COUNT,
-            MIN_PLACEMENT_GROUP_PARTITION_COUNT, PLACEMENT_STRATEGY_PARTITION, TENANCY_HOST,
-        };
+        use crate::state::{self, InstanceStateName, TENANCY_HOST};
 
         // Where an instance is placed is a fact of the instance and of the resources the
         // request names by id: nothing here depends on the request's headers or URI.
@@ -304,32 +301,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => held_group_name.clone(),
         };
         // "The number of the partition in which to place the instance. Valid only if the
-        // placement group strategy is set to partition" (`$PartitionNumber`), and a group has
-        // exactly as many partitions as it was created with, so a number outside them names a
-        // partition the group does not have.
+        // placement group strategy is set to partition" (`$PartitionNumber`), read against the
+        // group the instance ends up in through the ONE reading of that rule, which the launch
+        // that places an instance in a partition shares.
         if let Some(partition_number) = input.partition_number {
-            let group = resulting_group_name
-                .as_deref()
-                .and_then(|group_name| store.placement_group_id_for_name(group_name))
-                .and_then(|group_id| store.placement_groups.get(&group_id));
-            let partitions = group
-                .filter(|group| group.strategy.as_deref() == Some(PLACEMENT_STRATEGY_PARTITION))
-                .and_then(|group| group.partition_count)
-                .ok_or_else(|| {
-                    Scaffolded::invalid_parameter_value(format!(
-                        "partitionNumber is valid only for an instance in a placement group \
-                         whose strategy is '{PLACEMENT_STRATEGY_PARTITION}'"
-                    ))
-                })?;
-            // The ceiling the resource itself publishes, applied to the group's own count so
-            // the admitted range can never be wider than any partition group could have.
-            let partitions = partitions.min(MAX_PLACEMENT_GROUP_PARTITION_COUNT);
-            if !(MIN_PLACEMENT_GROUP_PARTITION_COUNT..=partitions).contains(&partition_number) {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Value ({partition_number}) for parameter partitionNumber is invalid. \
-                     Expecting {MIN_PLACEMENT_GROUP_PARTITION_COUNT}-{partitions}."
-                )));
-            }
+            state::require_partition_of_group(
+                &store,
+                resulting_group_name.as_deref(),
+                partition_number,
+            )?;
         }
 
         // "The ID of the Dedicated Host with which to associate the instance" (`$HostId`),

@@ -271,10 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the transit gateway" (`TransitGatewayId`) the VPC is attached to: an
         // attachment is a resource OF a transit gateway, so an id this account holds no
-        // gateway for has nothing to attach the VPC to. Resolved against the store alone — the
-        // one refusal `DescribeTransitGateways` answers for a `TransitGatewayId` it cannot
-        // resolve, so one resource family reads one way.
-        let Some(transit_gateway) = store.transit_gateways.get(&input.transit_gateway_id) else {
+        // gateway for — one it never held, and one whose own delete has finished — has nothing
+        // to attach the VPC to.
+        let Some(transit_gateway) = store.transit_gateway_in_service(&input.transit_gateway_id)
+        else {
             return Err(state::invalid_transit_gateway_id_not_found(
                 &input.transit_gateway_id,
             ));

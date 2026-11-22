@@ -206,10 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the transit gateway for which to create the metering policy"
         // (`TransitGatewayId`): a metering policy is a resource OF a transit gateway, so an id
-        // this account holds no gateway for has nothing to meter. The id is resolved against
-        // the store alone — the one refusal `DescribeTransitGateways` answers for a
-        // `TransitGatewayId` it cannot resolve, so one resource family reads one way.
-        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+        // this account holds no gateway for — one it never held, and one whose own delete has
+        // finished — has nothing to meter.
+        if !store.holds_transit_gateway_in_service(&input.transit_gateway_id) {
             return Err(state::invalid_transit_gateway_id_not_found(
                 &input.transit_gateway_id,
             ));

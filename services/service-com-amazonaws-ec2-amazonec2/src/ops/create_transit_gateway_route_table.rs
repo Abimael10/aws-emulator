@@ -171,10 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the transit gateway" (`TransitGatewayId`) the table is created for: a
         // route table is a resource OF a transit gateway, so an id this account holds no
-        // gateway for has nothing to add a route table to. The id is resolved against the
-        // store alone — the one refusal `DescribeTransitGateways` answers for a
-        // `TransitGatewayId` it cannot resolve, so one resource family reads one way.
-        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+        // gateway for — one it never held, and one whose own delete has finished — has nothing
+        // to add a route table to.
+        if !store.holds_transit_gateway_in_service(&input.transit_gateway_id) {
             return Err(state::invalid_transit_gateway_id_not_found(
                 &input.transit_gateway_id,
             ));

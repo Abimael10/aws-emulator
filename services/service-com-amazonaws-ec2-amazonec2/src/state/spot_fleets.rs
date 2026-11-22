@@ -41,13 +41,26 @@ pub const SPOT_FLEET_STATE_CANCELLED_TERMINATING: &str = "cancelled_terminating"
 pub const SPOT_FLEET_STATE_CANCELLED: &str = "cancelled";
 
 /// The `BatchState` members a Spot Fleet request can be CANCELLED from: one that is holding
-/// capacity, one that has just been accepted and one whose capacity is being changed. Every
-/// other member is a fleet whose cancellation has already been asked for or that failed, so
-/// there is nothing left to cancel.
+/// capacity, one that has just been accepted, one whose capacity is being changed — and one
+/// whose cancellation LEFT ITS INSTANCES RUNNING.
+///
+/// A cancellation is admissible exactly while something is left to cancel. The first three
+/// states are a fleet that is still placing or holding capacity. The fourth is the second step
+/// of the cancellation AWS documents: "otherwise, the Spot Fleet request enters the
+/// `cancelled_running` state and the instances continue to run until they are interrupted or
+/// you terminate them manually" (`CancelSpotFleetRequests`) — the instances are still there, so
+/// a further cancel with `TerminateInstances` set is what takes them down and moves the fleet
+/// on, and refusing it would leave that documented two-step cancel unusable.
+///
+/// Every other member is a fleet whose cancellation has been carried out
+/// ([`SPOT_FLEET_STATE_CANCELLED_TERMINATING`], [`SPOT_FLEET_STATE_CANCELLED`]) or that failed,
+/// so there is nothing left to ask for and
+/// [`CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE`] is reserved for those.
 pub const SPOT_FLEET_CANCELLABLE_STATES: &[&str] = &[
     SPOT_FLEET_STATE_SUBMITTED,
     SPOT_FLEET_STATE_ACTIVE,
     SPOT_FLEET_STATE_MODIFYING,
+    SPOT_FLEET_STATE_CANCELLED_RUNNING,
 ];
 
 /// The most Spot Fleet requests ONE `CancelSpotFleetRequests` call may name: "you can delete
@@ -171,15 +184,15 @@ pub fn spot_fleet_request_id_malformed_message(request_id: &str) -> String {
     invalid_id_message(request_id)
 }
 
-/// The message the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST`] carries: one
-/// fleet of a batch answer, named on its own.
+/// The message the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST`] carries: AWS's
+/// own sentence for a cancellation that could not find the fleet it was asked to cancel.
 ///
-/// A REQUEST-level refusal words the same fact differently, because it names every id the
-/// request could not resolve at once — see
-/// [`spot_fleet_request_ids_not_found_message`].
-pub fn spot_fleet_request_not_found_message(request_id: &str) -> String {
-    format!("The spot fleet request ID '{request_id}' does not exist")
-}
+/// FIXED text, with no variable part: which fleet the entry is about is carried by the entry's
+/// own `SpotFleetRequestId` member, so the sentence does not name it. A REQUEST-level refusal
+/// words the same fact differently, because it names every id the request could not resolve at
+/// once — see [`spot_fleet_request_ids_not_found_message`].
+pub const SPOT_FLEET_REQUEST_CANCELLATION_NOT_FOUND_MESSAGE: &str =
+    "Spot Fleet Request cancellation failed. Spot Fleet Request not found.";
 
 /// The message EC2 refuses a REQUEST that named Spot Fleet request ids this account holds no
 /// fleet for with: one sentence naming every unresolved id, in the order the request gave
@@ -925,7 +938,15 @@ impl ComAmazonawsEc2Amazonec2State {
     ///   the state the fleet enters and whether the instances it launched are terminated;
     /// * a cancelled fleet reaches `cancelled` once it has no running Spot Instance left,
     ///   which is owed to the clock and to those instances
-    ///   ([`SpotFleetRequestRecord::apply_due_move`]).
+    ///   ([`SpotFleetRequestRecord::apply_due_move`]);
+    /// * a cancellation that asks for nothing the fleet has not already done CHANGES NOTHING,
+    ///   and so records nothing: a fleet already in `cancelled_running` has already stopped
+    ///   placing capacity and already left its instances running, so there is no "change in the
+    ///   status or configuration of the Spot Fleet request" to make an event of
+    ///   ([`crate::state::EVENT_TYPE_FLEET_REQUEST_CHANGE`]). The call is still accepted — it
+    ///   asked for a state the fleet is in — and it reports that state as both the previous and
+    ///   the current one. That is what keeps one fleet's history bounded by the states it
+    ///   ENTERS however often a caller repeats the call.
     pub fn cancel_spot_fleet_request(
         &mut self,
         fleet_id: &str,
@@ -935,6 +956,12 @@ impl ComAmazonawsEc2Amazonec2State {
         let previous_state = record.state().to_string();
         if !spot_fleet_request_state_is_cancellable(&previous_state) {
             return None;
+        }
+        // The repeat that moves nothing: the fleet is in the very state this call would put it
+        // in, so nothing is written — no event, no move the clock owes, and no second
+        // cancellation of the Spot Instance requests it placed.
+        if previous_state == SPOT_FLEET_STATE_CANCELLED_RUNNING && !terminate_instances {
+            return Some((previous_state.clone(), previous_state));
         }
         let placements = record.placements.clone();
 

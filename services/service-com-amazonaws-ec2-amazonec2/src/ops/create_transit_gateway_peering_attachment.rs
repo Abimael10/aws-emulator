@@ -238,8 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`$RequesterTgwInfo` below), so it is resolved in this Region: a gateway the store
         // holds for another Region is not one this endpoint can request a peering from.
         if !store
-            .transit_gateways
-            .get(&input.transit_gateway_id)
+            .transit_gateway_in_service(&input.transit_gateway_id)
             .is_some_and(|requester| state::transit_gateway_region(requester) == region)
         {
             return Err(state::invalid_parameter_value(format!(
@@ -261,8 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service can peer with is the transit gateway's own `NotFound` refusal, with
         // nothing stored.
         let peer_resolves = store
-            .transit_gateways
-            .get(&input.peer_transit_gateway_id)
+            .transit_gateway_in_service(&input.peer_transit_gateway_id)
             .is_some_and(|peer| {
                 peer.owner_id.as_deref() == Some(input.peer_account_id.as_str())
                     && state::transit_gateway_region(peer) == input.peer_region

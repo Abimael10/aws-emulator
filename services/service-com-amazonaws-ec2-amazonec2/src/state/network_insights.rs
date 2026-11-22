@@ -984,7 +984,7 @@ pub fn require_network_insights_endpoint<E>(
         {
             Err(invalid_vpc_peering_connection_id_not_found(value))
         }
-        RESOURCE_TYPE_TRANSIT_GATEWAY if !store.transit_gateways.contains_key(value) => {
+        RESOURCE_TYPE_TRANSIT_GATEWAY if !store.holds_transit_gateway_in_service(value) => {
             Err(invalid_transit_gateway_id_not_found(value))
         }
         RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT
@@ -2011,6 +2011,46 @@ pub fn placement_strategy(requested: &str) -> Option<&'static str> {
         .find(|strategy| *strategy == requested)
 }
 
+/// Refuse a `PartitionNumber` that names no partition of the group the instance is in.
+///
+/// "The number of the partition that the instance is in. Valid only if the placement group
+/// strategy is set to `partition`" (`Placement$PartitionNumber`), and a partition group has
+/// exactly as many partitions as it was created with
+/// ([`ComAmazonawsEc2Amazonec2State::placement_group_partition_count`]) — so a number outside
+/// them, and any number at all for an instance that is in no partition group, names a
+/// partition that does not exist and is refused with the wording EC2's parameter layer gives
+/// an invalid value, before anything is written.
+///
+/// `group_name` is the group the instance is in ONCE THE CALL IS SERVED — the one a launch
+/// places it in, or the one a modification moves it into (or leaves it in) — so the partition
+/// is read against the group it is a partition of. The ONE reading of that rule, shared by the
+/// launch that places an instance in a partition and the modification that moves one, so the
+/// two cannot admit different numbers for the same group.
+pub fn require_partition_of_group<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    group_name: Option<&str>,
+    partition_number: i32,
+) -> Result<(), Scaffolded<E>> {
+    let partitions = group_name
+        .and_then(|group_name| store.placement_group_partition_count(group_name))
+        .ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "partitionNumber is valid only for an instance in a placement group \
+                 whose strategy is '{PLACEMENT_STRATEGY_PARTITION}'"
+            ))
+        })?;
+    // The ceiling the resource itself publishes, applied to the group's own count so the
+    // admitted range can never be wider than any partition group could have.
+    let partitions = partitions.min(MAX_PLACEMENT_GROUP_PARTITION_COUNT);
+    if !(MIN_PLACEMENT_GROUP_PARTITION_COUNT..=partitions).contains(&partition_number) {
+        return Err(invalid_parameter_value(format!(
+            "Value ({partition_number}) for parameter partitionNumber is invalid. \
+             Expecting {MIN_PLACEMENT_GROUP_PARTITION_COUNT}-{partitions}."
+        )));
+    }
+    Ok(())
+}
+
 /// The modelled `SpreadLevel` member `requested` names, or `None` when it names none.
 ///
 /// The catalog is the generated [`crate::ops::types::SPREAD_LEVEL_VALUES`], for the reason
@@ -2045,6 +2085,21 @@ impl ComAmazonawsEc2Amazonec2State {
             .iter()
             .find(|(_, group)| group.group_name.as_deref() == Some(group_name))
             .map(|(group_id, _)| group_id.clone())
+    }
+
+    /// The number of partitions the placement group named `group_name` has, or `None` when the
+    /// account holds no such group or that group is not a partition group.
+    ///
+    /// "Valid only if the placement group strategy is set to `partition`"
+    /// (`Placement$PartitionNumber`), and a group has exactly as many partitions as it was
+    /// created with ([`DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT`] when the create named none),
+    /// so this is what a requested partition number has to be one of.
+    pub fn placement_group_partition_count(&self, group_name: &str) -> Option<i32> {
+        let group_id = self.placement_group_id_for_name(group_name)?;
+        self.placement_groups
+            .get(&group_id)
+            .filter(|group| group.strategy.as_deref() == Some(PLACEMENT_STRATEGY_PARTITION))
+            .and_then(|group| group.partition_count)
     }
 
     /// Store a placement group and answer it as it was stored — or `None` when the store is

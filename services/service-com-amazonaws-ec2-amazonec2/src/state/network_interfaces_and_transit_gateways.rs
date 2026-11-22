@@ -1420,8 +1420,22 @@ pub const TRANSIT_GATEWAY_STATE_MODIFYING: &str = "modifying";
 /// A transit gateway whose deletion has been asked for: the `TransitGatewayState` enum's
 /// `deleting` member (`smithy_query(query="shape",shape="TransitGatewayState")`), which is what
 /// `DeleteTransitGateway` answers with until the clock's own
-/// [`ComAmazonawsEc2Amazonec2State::transit_gateway_delete_at`] instant removes the gateway.
+/// [`ComAmazonawsEc2Amazonec2State::transit_gateway_delete_at`] instant carries the deletion
+/// out ([`TRANSIT_GATEWAY_STATE_DELETED`]).
 pub const TRANSIT_GATEWAY_STATE_DELETING: &str = "deleting";
+
+/// A transit gateway the delete has FINISHED with: the `TransitGatewayState` enum's `deleted`
+/// member, the TERMINAL state of the resource.
+///
+/// A gateway in it is still stored and still reported, which is the whole of what the member
+/// means: a state a resource is reported in is a state a read can report, so the record stays
+/// readable instead of being dropped — and that is what makes a repeat delete of a gateway the
+/// account has already deleted answer the resource in its terminal state rather than reporting
+/// an id the account never held
+/// ([`ComAmazonawsEc2Amazonec2State::finish_transit_gateway_deletion`]). It attaches nothing
+/// and carries no further work, so the account no longer HOLDS it
+/// ([`ComAmazonawsEc2Amazonec2State::transit_gateway_in_service`]).
+pub const TRANSIT_GATEWAY_STATE_DELETED: &str = "deleted";
 
 /// VPC Encryption Control being turned ON for a transit gateway: the
 /// `EncryptionStateValue` enum's `enabling` member, the transient state a modification that

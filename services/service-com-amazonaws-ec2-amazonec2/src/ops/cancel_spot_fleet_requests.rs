@@ -154,9 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST, CANCEL_BATCH_FLEET_REQUEST_ID_MALFORMED,
             CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE, CANCEL_BATCH_UNEXPECTED_ERROR,
-            MAX_SPOT_FLEET_REQUESTS_PER_CANCEL, deduplicate_ids, require_service_state,
-            spot_fleet_request_id_is_well_formed, spot_fleet_request_id_malformed_message,
-            spot_fleet_request_not_cancellable_message, spot_fleet_request_not_found_message,
+            MAX_SPOT_FLEET_REQUESTS_PER_CANCEL, SPOT_FLEET_REQUEST_CANCELLATION_NOT_FOUND_MESSAGE,
+            deduplicate_ids, require_service_state, spot_fleet_request_id_is_well_formed,
+            spot_fleet_request_id_malformed_message, spot_fleet_request_not_cancellable_message,
             spot_fleet_request_state_is_cancellable, spot_fleet_request_unexpected_error_message,
         };
 
@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 unsuccessful.push(cancellation_error(
                     &fleet_id,
                     CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST,
-                    spot_fleet_request_not_found_message(&fleet_id),
+                    SPOT_FLEET_REQUEST_CANCELLATION_NOT_FOUND_MESSAGE.to_string(),
                 ));
                 continue;
             };

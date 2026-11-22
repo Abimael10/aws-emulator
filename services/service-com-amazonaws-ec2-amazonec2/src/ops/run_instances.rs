@@ -395,7 +395,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
             PendingTransition, ReservationRecord,
             DEFAULT_INSTANCE_TYPE,
-            DEFAULT_SOURCE_DEST_CHECK, MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS,
+            DEFAULT_SOURCE_DEST_CHECK, MAX_BLOCK_DEVICE_MAPPINGS,
+            MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS,
             MAX_INSTANCES_PER_RUN,
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_NETWORK_INTERFACES, MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
@@ -643,6 +644,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "An instance may be launched with at most \
                  {MAX_SECURITY_GROUPS_PER_INSTANCE} security groups, not {named_groups}"
+            )));
+        }
+        // `BlockDeviceMappings` carries no modelled `@length` either, and every entry of it is
+        // walked below — the `KmsKeyId`/`Encrypted` pairing, the root device overlay, and the
+        // keys this launch asks the service that owns them about — so the list needs a ceiling
+        // of its own beside the count one, and it has to dominate all three: without it one
+        // request could name a list as long as its body has room for and turn it into that much
+        // work before any other bound is reached.
+        let named_mappings = input.block_device_mappings.as_ref().map_or(0, Vec::len);
+        if named_mappings > MAX_BLOCK_DEVICE_MAPPINGS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "An instance may be launched with at most {MAX_BLOCK_DEVICE_MAPPINGS} block \
+                 device mappings, not {named_mappings}"
             )));
         }
         // "If KmsKeyId is specified, the encrypted state must be true" — the rule the same
@@ -1058,6 +1072,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+        // "The number of the partition that the instance is in. Valid only if the placement
+        // group strategy is set to `partition`" (`Placement$PartitionNumber`): a launch that
+        // names one places every instance it mints in THAT partition, so the number is read
+        // against the partition count of the group resolved above — through the ONE reading of
+        // that rule, which `ModifyInstancePlacement` shares — and a number naming no partition
+        // of that group refuses the launch rather than being accepted and dropped, which would
+        // leave the instance reporting no partition at all.
+        let placement_partition_number = input
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.partition_number);
+        if let Some(partition_number) = placement_partition_number {
+            crate::state::require_partition_of_group(
+                &store,
+                placement_group_name.as_deref(),
+                partition_number,
+            )?;
+        }
         // "The ID of the Dedicated Host on which the instance resides"
         // (`Placement$HostId`): a launch that names one puts every instance it mints ON that
         // host, so the id is resolved against the Dedicated Host store here — a host the
@@ -1138,6 +1170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|placement| placement.tenancy.as_deref()),
             placement_group_name: placement_group_name.as_deref(),
+            partition_number: placement_partition_number,
             host_id: placement_host_id.as_deref(),
             account_metadata_defaults: store.instance_metadata_defaults(),
             image_imds_support: image_imds_support.as_deref(),

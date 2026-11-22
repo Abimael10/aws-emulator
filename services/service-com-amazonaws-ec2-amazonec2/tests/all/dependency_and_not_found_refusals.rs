@@ -12,7 +12,9 @@
 //!    for that class, with nothing written;
 //! 2. once a delete has taken effect the resource stops being readable: a describe BY ID
 //!    answers that resource's own `.NotFound`, and an unfiltered describe no longer carries
-//!    it.
+//!    it — EXCEPT where the resource's own model publishes a state for a deleted one (a
+//!    transit gateway's `deleted`, a NAT gateway's), which the resource is then reported in
+//!    instead, only an id the account never held one for answering `.NotFound`.
 //!
 //! The rows of each table differ along what the rule generalises over: which Region a locale
 //! names, which family and how many CIDRs a pool holds, which KIND of resource occupies the
@@ -978,12 +980,12 @@ async fn a_deleted_vpc_endpoint_stops_resolving() {
     }
 }
 
-/// `DeleteTransitGateway` is refused while an attachment still holds the gateway, and a
-/// gateway that is deleted stops resolving: the filtered and the unfiltered
-/// `DescribeTransitGateways` both stop carrying it, and a describe by id answers
-/// `InvalidTransitGatewayID.NotFound`.
+/// `DeleteTransitGateway` is refused while an attachment still holds the gateway, and a gateway
+/// that is deleted ends up in the TERMINAL state the `TransitGatewayState` catalog publishes for
+/// one — still readable there, by id and in the unfiltered report, while only an id the account
+/// has never held a gateway for answers `InvalidTransitGatewayID.NotFound`.
 #[tokio::test]
-async fn a_deleted_transit_gateway_stops_resolving() {
+async fn a_deleted_transit_gateway_settles_in_its_terminal_state() {
     let (router, _engine) = emulator();
     let vpc_id = {
         let body = ok(
@@ -1056,7 +1058,7 @@ async fn a_deleted_transit_gateway_stops_resolving() {
         "a refused delete must leave the gateway readable, got {still_there}"
     );
 
-    // A gateway nothing holds is deletable, and then stops resolving.
+    // A gateway nothing holds is deletable, and then settles in its terminal state.
     let gateway_id = {
         let body = ok("a gateway nothing holds", &router, "CreateTransitGateway", &[]).await;
         member("a gateway nothing holds", &body, "transitGatewayId")
@@ -1087,23 +1089,46 @@ async fn a_deleted_transit_gateway_stops_resolving() {
         Some("deleting"),
         "a caller acting straight after the delete still sees it under way, got {during}"
     );
-    // And once it is due, the gateway resolves to nothing.
-    past_the_transition().await;
-    refused(
-        "a deleted gateway",
-        &router,
-        "DescribeTransitGateways",
-        &[param("TransitGatewayIds.1", &gateway_id)],
-        INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
-        &format!("Transit Gateway {gateway_id} was deleted or does not exist."),
-    )
-    .await;
-    // The unfiltered report carries the gateway the refusal above left alone, and nothing of
-    // the deleted one.
+    // And once the clock has finished the move the gateway is `deleted` — the terminal state
+    // the catalog publishes for one, which it is still REPORTED in: that is what a state a
+    // resource is reported in means. Polled for, so nothing here depends on how fast the host
+    // applies a move the clock owes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let body = ok(
+            "a deleted gateway",
+            &router,
+            "DescribeTransitGateways",
+            &[param("TransitGatewayIds.1", &gateway_id)],
+        )
+        .await;
+        if element(&body, "state").as_deref() == Some("deleted") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a deleted gateway must settle in its terminal state, got {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The unfiltered report carries both: the gateway the refusal above left alone and the
+    // deleted one in its terminal state.
     let all = ok("a deleted gateway", &router, "DescribeTransitGateways", &[]).await;
     let reported = elements(&all, "transitGatewayId");
     assert!(
-        reported.contains(&attached) && !reported.contains(&gateway_id),
-        "the deleted gateway must be gone and the attached one left, got {all}"
+        reported.contains(&attached) && reported.contains(&gateway_id),
+        "both the attached gateway and the deleted one must be reported, got {all}"
     );
+    // Only an id the account has NEVER held a gateway for resolves to nothing: the mint counts
+    // from one, so a high identifier names nothing it ever held.
+    let never_minted = "tgw-0fedcba9876543210";
+    refused(
+        "an id no create ever minted",
+        &router,
+        "DescribeTransitGateways",
+        &[param("TransitGatewayIds.1", never_minted)],
+        INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
+        &format!("Transit Gateway {never_minted} was deleted or does not exist."),
+    )
+    .await;
 }

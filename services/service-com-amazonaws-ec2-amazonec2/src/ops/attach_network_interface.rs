@@ -25,7 +25,9 @@
 //! the store says about the resources it names:
 //!
 //! * `InvalidNetworkInterfaceId.Malformed` / `InvalidInstanceID.Malformed` (400) — a value
-//!   that is not an id of that kind at all, so there is nothing to look up.
+//!   that is not an id of that kind at all, so there is nothing to look up; and, for the
+//!   instance, a LONG-FORM id this service never issued, which it cannot decode back to any
+//!   instance ([`crate::state::require_decoded_instance_record`]).
 //! * `InvalidParameterValue` (400) — a negative `DeviceIndex` or `NetworkCardIndex`: a
 //!   position cannot be below zero, and neither needs the store to be read.
 //! * `InvalidNetworkInterfaceID.NotFound` / `InvalidInstanceID.NotFound` (400) — a well-formed
@@ -232,8 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let interface_zone = interface.availability_zone.clone().unwrap_or_default();
-        // The instance, resolved through the ONE reading of that refusal pair.
-        let instance = state::require_instance_record(&store, instance_id)?;
+        // The instance, resolved through the ONE reading of that refusal pair that DECODES a
+        // long-form id before any lookup: an instance id is an obfuscated identifier, so a
+        // long-form value this service never issued names no instance it could ever have held
+        // and is refused `InvalidInstanceID.Malformed` rather than reported absent, where a
+        // short-form id (which carries no identifier to decode) and one the mint did hand out
+        // are looked up and reported absent.
+        let instance = state::require_decoded_instance_record(&store, instance_id)?;
         let instance_zone = instance.placement_az.clone();
         let instance_type = instance.instance_type.clone();
         let instance_state = instance.state;

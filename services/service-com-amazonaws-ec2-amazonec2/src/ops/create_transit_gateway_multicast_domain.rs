@@ -197,12 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // A multicast domain is a resource OF a transit gateway, so an id this account holds
-        // no gateway for has nothing to create a domain on. Resolved against the store
-        // alone — the one refusal `DescribeTransitGateways` answers for a `TransitGatewayId`
-        // it cannot resolve, so one resource family reads one way.
+        // no gateway for — one it never held, and one whose own delete has finished — has
+        // nothing to create a domain on.
         let Some(transit_gateway_state) = store
-            .transit_gateways
-            .get(&input.transit_gateway_id)
+            .transit_gateway_in_service(&input.transit_gateway_id)
             .map(|gateway| gateway.state.clone().unwrap_or_default())
         else {
             return Err(state::invalid_transit_gateway_id_not_found(

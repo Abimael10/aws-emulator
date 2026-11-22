@@ -11,9 +11,16 @@
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_attachments_of`]), so a
 //! gateway that still holds one is refused for the state those attachments leave it in and
 //! nothing is removed. The gateway's own route tables are NOT a dependency: they came up with
-//! it, so [`crate::state::ComAmazonawsEc2Amazonec2State::remove_transit_gateway`] takes them
-//! with it when the removal the delete recorded falls due
-//! ([`crate::state::ComAmazonawsEc2Amazonec2State::begin_transit_gateway_deletion`]).
+//! it, so [`crate::state::ComAmazonawsEc2Amazonec2State::finish_transit_gateway_deletion`]
+//! takes them with it when the deletion the delete recorded falls due
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::begin_transit_gateway_deletion`]), leaving
+//! the gateway itself in the terminal `deleted` state the `TransitGatewayState` catalog
+//! publishes for a gateway to be REPORTED in.
+//!
+//! So a delete the account has ALREADY asked for is ACCEPTED and answers the gateway in the
+//! state it is in — `deleting` while the clock still owes the move, `deleted` once it has been
+//! made: the record is still there to be reported and the request asks for work that is under
+//! way or done, so only an id the account has never held a gateway for is a not-found.
 //!
 //! `DryRun` is answered BEFORE either question: the flag asks what the CALLER may do, so the
 //! permission answer precedes the existence and dependency ones, and a dry run naming a
@@ -153,8 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "Deletes the specified transit gateway": an id this account holds no gateway for is a
-        // refusal, not a no-op — a caller that deletes twice has to be able to tell the
-        // deletion it performed from one it did not.
+        // refusal, not a no-op — nothing of the account's was ever deleted under it.
         // The FORM question first: a value that is no transit gateway id at all names no
         // gateway in any account, so it is refused before anything is looked up, where an id
         // of the right form that names nothing is reported absent.
@@ -167,6 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::invalid_transit_gateway_id_not_found(
                 transit_gateway_id,
             ));
+        }
+
+        // A gateway this account has already asked to delete: the work is under way or done, so
+        // there is nothing left to ask for and nothing to refuse the request for — it is
+        // answered with the resource in the state it is in, which is what makes a retried or
+        // repeated teardown succeed rather than fail. Asked BEFORE the dependency question
+        // below, because an attachment such a gateway still carries is one the lifecycle has
+        // itself finished with.
+        if store.transit_gateway_deletion_was_recorded(transit_gateway_id) {
+            return Ok(DeleteTransitGatewayOutput {
+                transit_gateway: store.transit_gateways.get(transit_gateway_id).cloned(),
+            });
         }
 
         // An attachment is a resource the CALLER takes away first — "you must first delete all
@@ -196,8 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "Information about the deleted transit gateway" (`$TransitGateway`) as the STORE now
         // holds it: `deleting`, the state the `TransitGatewayState` catalog gives a gateway a
-        // delete has been asked for, with the clock owing it the removal — so the state this
-        // answer carries is one a read straight after this call corroborates.
+        // delete has been asked for, with the clock owing it the terminal `deleted` — so the
+        // state this answer carries is one a read straight after this call corroborates.
         Ok(DeleteTransitGatewayOutput {
             transit_gateway: Some(deleted),
         })

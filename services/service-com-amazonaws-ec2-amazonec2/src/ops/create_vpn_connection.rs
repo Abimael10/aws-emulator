@@ -287,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(transit_gateway_id) = input.transit_gateway_id.as_deref() {
-            if !store.transit_gateways.contains_key(transit_gateway_id) {
+            if !store.holds_transit_gateway_in_service(transit_gateway_id) {
                 return Err(state::invalid_transit_gateway_id_not_found(
                     transit_gateway_id,
                 ));

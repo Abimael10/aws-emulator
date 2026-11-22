@@ -1058,11 +1058,23 @@ async fn attach_refuses_what_it_cannot_attach_and_writes_nothing() {
             "InvalidNetworkInterfaceID.NotFound",
         ),
         AttachRefusal::new(
+            // The retired SHORT form carries no identifier to decode, so a short-form id the
+            // account holds no instance for is looked up and reported absent.
             "an instance id the account holds nothing for",
+            &free,
+            "i-1a2b3c4d",
+            1,
+            "InvalidInstanceID.NotFound",
+        ),
+        AttachRefusal::new(
+            // A LONG-form id is an obfuscated identifier: one this service never issued names
+            // no instance it could ever have held, so it is refused as unreadable rather than
+            // reported absent.
+            "a long-form instance id this service never issued",
             &free,
             "i-0ffffffffffffffff",
             1,
-            "InvalidInstanceID.NotFound",
+            "InvalidInstanceID.Malformed",
         ),
         AttachRefusal::new(
             "an interface an attachment already holds",

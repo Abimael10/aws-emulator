@@ -452,11 +452,16 @@ impl InstanceDetail {
             .unwrap_or(BANDWIDTH_WEIGHTING_DEFAULT),
             tenancy: requested_word("Tenancy", spec.tenancy, TENANCY_VALUES)?
                 .unwrap_or(TENANCY_DEFAULT),
-            // Neither an affinity, a partition nor a host resource group is something a
-            // launch carries: each is a setting `ModifyInstancePlacement` writes, so a fresh
-            // instance holds none of them.
+            // Neither an affinity nor a host resource group is something a launch carries:
+            // each is a setting `ModifyInstancePlacement` writes, so a fresh instance holds
+            // neither.
             affinity: None,
-            partition_number: None,
+            // "The number of the partition that the instance is in"
+            // (`Placement$PartitionNumber`) IS something a launch names, already read against
+            // the partition count of the group the launch places the instance in by the handler
+            // that serves it ([`super::require_partition_of_group`]) — so the instance reports
+            // the partition its launch asked for, and `None` for a launch that named none.
+            partition_number: spec.partition_number,
             host_resource_group_arn: None,
             placement_group_name: spec.placement_group_name.map(str::to_string),
             host_id: spec.host_id.map(str::to_string),
@@ -752,6 +757,11 @@ pub struct InstanceDetailSpec<'request> {
     /// `Placement$GroupName` — the placement group the launch named, already resolved
     /// against the placement group store by the handler that serves the launch.
     pub placement_group_name: Option<&'request str>,
+    /// `Placement$PartitionNumber` — the partition of that group the launch places the
+    /// instance in, already read against the group's own partition count by the handler that
+    /// serves the launch ([`super::require_partition_of_group`]), so the instance never reports
+    /// a partition its group does not have.
+    pub partition_number: Option<i32>,
     /// `Placement$HostId` — the Dedicated Host the launch named, already resolved against the
     /// Dedicated Host store by the handler that serves the launch.
     pub host_id: Option<&'request str>,
@@ -1000,6 +1010,23 @@ impl ComAmazonawsEc2Amazonec2State {
                 .as_ref()
                 .and_then(|placement| placement.tenancy.as_deref()),
             placement_group_name,
+            // "The number of the partition that the instance is in" the version names, read
+            // against that group's own partition count through the ONE reading of that rule —
+            // and LENIENTLY, for the reason the placement group above is: a number that names
+            // no partition of the group is not carried, the instance would otherwise report a
+            // partition the group does not have.
+            partition_number: data
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.partition_number)
+                .filter(|partition_number| {
+                    crate::state::require_partition_of_group::<()>(
+                        self,
+                        placement_group_name,
+                        *partition_number,
+                    )
+                    .is_ok()
+                }),
             host_id,
             account_metadata_defaults: self.instance_metadata_defaults(),
             image_imds_support: image_imds_support.as_deref(),

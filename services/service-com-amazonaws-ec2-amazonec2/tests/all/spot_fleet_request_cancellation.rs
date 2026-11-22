@@ -32,7 +32,8 @@ use ec2::state::{
     CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE, ComAmazonawsEc2Amazonec2State as Ec2State,
     MAX_SPOT_FLEET_REQUESTS_PER_CANCEL, SPOT_FLEET_ACTIVITY_FULFILLED,
     SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT, SPOT_FLEET_ACTIVITY_PENDING_TERMINATION,
-    SPOT_FLEET_STATE_ACTIVE, SPOT_FLEET_STATE_CANCELLED, SPOT_FLEET_STATE_CANCELLED_RUNNING,
+    SPOT_FLEET_REQUEST_CANCELLATION_NOT_FOUND_MESSAGE, SPOT_FLEET_STATE_ACTIVE,
+    SPOT_FLEET_STATE_CANCELLED, SPOT_FLEET_STATE_CANCELLED_RUNNING,
     SPOT_FLEET_STATE_CANCELLED_TERMINATING, SPOT_FLEET_STATE_SUBMITTED,
     SPOT_REQUEST_STATE_CANCELLED, SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT,
     SPOT_STATUS_INSTANCE_TERMINATED_BY_USER, SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
@@ -547,8 +548,9 @@ async fn a_cancelled_fleet_reaches_cancelled_when_its_instances_are_gone() {
 /// of each message is EC2's; the id and the state in it come from the request and the store.
 struct UnservableCase {
     case: &'static str,
-    /// Whether the fleet the row names has to be cancelled before the call under test, which
-    /// is what leaves it in a state it cannot be cancelled from.
+    /// Whether the fleet the row names has to be cancelled WITH ITS INSTANCES before the call
+    /// under test, which is what leaves it in a state its cancellation has been carried out
+    /// from and so cannot be asked for again.
     cancel_first: bool,
     /// The id to name, or `None` to name the fleet this row cancelled first.
     id: Option<&'static str>,
@@ -571,17 +573,18 @@ fn unservable_cases() -> Vec<UnservableCase> {
             cancel_first: false,
             id: Some(UNKNOWN_FLEET_ID),
             expected_code: CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST,
-            expected_message: |id| format!("The spot fleet request ID '{id}' does not exist"),
+            // Fixed text: which fleet the entry is about is its own `SpotFleetRequestId`.
+            expected_message: |_id| SPOT_FLEET_REQUEST_CANCELLATION_NOT_FOUND_MESSAGE.to_string(),
         },
         UnservableCase {
-            case: "a fleet that has already been cancelled",
+            case: "a fleet whose cancellation has already been carried out",
             cancel_first: true,
             id: None,
             expected_code: CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE,
             expected_message: |id| {
                 format!(
                     "The spot fleet request '{id}' is in the state \
-                     '{SPOT_FLEET_STATE_CANCELLED_RUNNING}' and cannot be canceled"
+                     '{SPOT_FLEET_STATE_CANCELLED_TERMINATING}' and cannot be canceled"
                 )
             },
         },
@@ -598,7 +601,10 @@ async fn an_id_that_names_no_cancellable_fleet_is_reported_per_fleet() {
         let healthy = requested_fleet(case, &router, 1, &["t3.micro"]).await;
         let other = requested_fleet(case, &router, 1, &["t3.small"]).await;
         if row.cancel_first {
-            let (status, body) = cancel(&router, &cancel_params(&[other.as_str()], false)).await;
+            // Cancelled WITH its instances: the cancellation has then been carried out, which
+            // is the state no further cancel can be asked from — where one that left its
+            // instances running still has them to take down.
+            let (status, body) = cancel(&router, &cancel_params(&[other.as_str()], true)).await;
             assert_eq!(
                 status, 200,
                 "case {case:?}: the first cancellation must succeed, got {status}: {body}"

@@ -12,7 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use service_com_amazonaws_ec2_amazonec2::state::{MAX_INSTANCES_PER_RUN, TRANSITION_DELAY};
+use service_com_amazonaws_ec2_amazonec2::state::{
+    MAX_BLOCK_DEVICE_MAPPINGS, MAX_INSTANCES_PER_RUN, TRANSITION_DELAY,
+};
 
 use super::ec2_query;
 // The entries of an ec2Query set, from the one shared definition.
@@ -1737,6 +1739,25 @@ async fn run_instances_refuses_an_unservable_request() {
             ],
             status: 400,
             code: "InstanceLimitExceeded",
+        },
+        Case {
+            label: "more block device mappings than one launch may name",
+            params: {
+                let mut params = vec![p("ImageId", AMI), p("MinCount", "1"), p("MaxCount", "1")];
+                for index in 1..=(MAX_BLOCK_DEVICE_MAPPINGS + 1) {
+                    params.push(p(
+                        &format!("BlockDeviceMapping.{index}.DeviceName"),
+                        format!("/dev/sd{index}"),
+                    ));
+                    params.push(p(
+                        &format!("BlockDeviceMapping.{index}.Ebs.VolumeSize"),
+                        "8",
+                    ));
+                }
+                params
+            },
+            status: 400,
+            code: "InvalidParameterValue",
         },
         Case {
             label: "user data above the documented 16 KiB",

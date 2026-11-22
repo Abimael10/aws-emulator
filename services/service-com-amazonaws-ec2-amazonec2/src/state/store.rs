@@ -81,6 +81,18 @@ pub const MAX_RESOURCE_IDS: usize = 1000;
 /// `@range`, so without this a request could ask for `i32::MAX` records.
 pub const MAX_INSTANCES_PER_RUN: i32 = 64;
 
+/// The most block device mappings one `RunInstances` call may name.
+///
+/// CHOSEN, for the reason [`MAX_INSTANCES_PER_RUN`] is: `BlockDeviceMappings` carries no
+/// modelled `@length`, and every entry of it is walked by the launch — for the
+/// `KmsKeyId`/`Encrypted` pairing, for the root device overlay and for the keys the launch
+/// resolves against the service that owns them — so without a ceiling one request could turn a
+/// list as long as its body has room for into that much work before any other bound is reached.
+/// It sits far above the Amazon EBS volumes an instance can hold at all (the EC2 User Guide's
+/// instance volume limits put those in the tens), so no launch an instance type could serve
+/// reaches it.
+pub const MAX_BLOCK_DEVICE_MAPPINGS: usize = 64;
+
 /// The most instances this emulator holds at once.
 ///
 /// Also CHOSEN. Terminated instances are kept (the real service reports them for a

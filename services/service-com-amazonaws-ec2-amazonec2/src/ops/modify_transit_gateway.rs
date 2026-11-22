@@ -232,8 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let Some(current) = store
-            .transit_gateways
-            .get(&modification.transit_gateway_id)
+            .transit_gateway_in_service(&modification.transit_gateway_id)
             .cloned()
         else {
             return Err(state::invalid_transit_gateway_id_not_found(

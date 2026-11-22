@@ -197,9 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // The gateway has to be one this account holds: a concentrator cannot aggregate
-        // connections onto a transit gateway that does not exist, which is the refusal
-        // `DescribeTransitGateways` answers for an id it cannot resolve.
-        if !store.transit_gateways.contains_key(transit_gateway_id) {
+        // connections onto a transit gateway that does not exist — one this account never
+        // held, and one whose own delete has finished.
+        if !store.holds_transit_gateway_in_service(transit_gateway_id) {
             return Err(state::invalid_transit_gateway_id_not_found(
                 transit_gateway_id,
             ));

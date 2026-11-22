@@ -4775,7 +4775,7 @@ impl ComAmazonawsEc2Amazonec2State {
             "VPC" => self.vpcs.contains_key(resource_id),
             "Subnet" => self.subnets.contains_key(resource_id),
             "NetworkInterface" => self.network_interfaces.contains_key(resource_id),
-            "TransitGateway" => self.transit_gateways.contains_key(resource_id),
+            "TransitGateway" => self.holds_transit_gateway_in_service(resource_id),
             "TransitGatewayAttachment" => {
                 self.transit_gateway_attachments.contains_key(resource_id)
             }
