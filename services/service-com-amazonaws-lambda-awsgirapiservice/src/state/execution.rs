@@ -269,8 +269,9 @@ mod host_posix;
 /// — the check every invocation of such a function begins with.
 pub mod environment_key;
 pub use environment_key::{
-    absent_environment_key_refusal, durable_data_key_fault, environment_key_fault,
-    report_environment_key_fault, EnvironmentKeyFault,
+    absent_environment_key_refusal, absent_source_key_refusal, durable_data_key_fault,
+    environment_key_fault, report_environment_key_fault, unencryptable_environment_refusal,
+    EnvironmentKeyFault,
 };
 
 /// The X-Ray trace context one invocation runs with, which the execution environment

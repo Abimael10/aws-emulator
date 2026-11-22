@@ -32,6 +32,15 @@
 //! Either way the refusal RELAYS the key service's own answer: the exception class it
 //! states the refusal under and the sentence it states about the key, inside Lambda's own
 //! sentence for the decrypt it could not perform.
+//!
+//! The ENCRYPT those variables are stored under is the same question asked of the request
+//! that CONFIGURES the key, so it is asked over the same hop and refused before anything is
+//! written: a key the key service holds no record of
+//! ([`absent_environment_key_refusal`]), and a key it HOLDS that cannot perform that
+//! encryption at all ([`unencryptable_environment_refusal`]). The OTHER key a function's
+//! configuration names — the one its deployment package is encrypted with,
+//! `Code$SourceKMSKeyArn` — is resolved over the same hop too
+//! ([`absent_source_key_refusal`]).
 
 use std::collections::BTreeMap;
 
@@ -115,6 +124,12 @@ const KMS_INVALID_STATE_CODE: &str = "KMSInvalidStateException";
 /// shape carries it.
 const KMS_RELAY_SERVICE: &str = "Kms";
 const KMS_RELAY_STATUS: u16 = 400;
+
+/// The name the OTHER rendering of a relayed answer reports the key service by — the simple
+/// name of the client class that caught the exception, rather than the sdkId casing
+/// [`KMS_RELAY_SERVICE`] carries. Which rendering a message carries is the answering
+/// service's own (`service_common::relayed_refusal`), not something this service chooses.
+const KMS_CAUGHT_SERVICE: &str = "AWSKMS";
 
 /// Which of the four KMS failures a relayed answer is.
 #[derive(Debug, Clone, Copy)]
@@ -391,6 +406,140 @@ pub async fn absent_environment_key_refusal(
         return None;
     }
     Some(report_message(ENCRYPT_NOT_FOUND_MESSAGE, &answer))
+}
+
+/// The encryption algorithm Lambda's own encryption of a function's environment variables
+/// is performed under: the DEFAULT one, which is the only algorithm a request that names
+/// none encrypts with ("This parameter is required only for asymmetric KMS keys. The default
+/// value, SYMMETRIC_DEFAULT, is the algorithm used for symmetric encryption KMS keys",
+/// `smithy_query(query="doc",shape="EncryptRequest",member="EncryptionAlgorithm")` of the key
+/// service's model).
+const ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT: &str = "SYMMETRIC_DEFAULT";
+
+/// The sentence a request configuring a key that cannot encrypt the function's environment
+/// variables is refused with.
+///
+/// Fixed text with NO variable part: the encryption is Lambda's own, so what failed is
+/// Lambda's and the caller is told only that it failed and may try again — which is why the
+/// refusal is the modelled server error rather than one about a parameter's value.
+const ENVIRONMENT_ENCRYPTION_FAILED_MESSAGE: &str =
+    "Lambda was unable to encrypt your environment variables. Please try again.";
+
+/// The refusal a request that stores environment variables under `kms_key_arn` gets when the
+/// key service HOLDS that key and it cannot perform the encryption, or `None` when nothing
+/// says it cannot.
+///
+/// Storing the variables under a customer managed key ENCRYPTS them, and that encryption is
+/// performed under the default symmetric algorithm
+/// ([`ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT`]), so the key has to be one the key service
+/// reports as supporting it: "The encryption algorithms that the KMS key supports. You cannot
+/// use the KMS key with other encryption algorithms within KMS"
+/// (`smithy_query(query="doc",shape="KeyMetadata",member="EncryptionAlgorithms")`), a list
+/// that "appears only when the KeyUsage of the KMS key is ENCRYPT_DECRYPT". A key whose own
+/// list does not name that algorithm — a key for signing, for message authentication or for
+/// key agreement, and an asymmetric encryption key, whose algorithms are its spec's and not
+/// the symmetric default — is a key the variables could never be sealed under, so the request
+/// is refused with nothing written and the function left exactly as it was.
+///
+/// `variables` is the environment the request asks the function to hold: one with no
+/// variables has nothing to encrypt, so there is nothing to ask about — the same reading
+/// [`environment_key_fault`] makes of the decrypt. The key's STATE is no part of this either
+/// (see [`absent_environment_key_refusal`]): what is asked here is what the key CAN do, which
+/// no state of it changes. An answer that establishes nothing — the key service is not mounted
+/// beside this one, it holds no record of the key (which is the other refusal), it refused the
+/// question, or it reported no metadata — refuses nothing.
+pub async fn unencryptable_environment_refusal(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    kms_key_arn: Option<&str>,
+    variables: &BTreeMap<String, String>,
+) -> Option<&'static str> {
+    // `KMSKeyArn`'s own pattern admits the empty string, which names no key and asks for
+    // none ([`named_key`]).
+    let key_arn = named_key(kms_key_arn)?;
+    if variables.is_empty() {
+        return None;
+    }
+    // Boxed for the reason [`environment_key_fault`] states.
+    let described = Box::pin(
+        kms_client(callback, region)
+            .describe_key()
+            .key_id(key_arn)
+            .send(),
+    )
+    .await
+    .ok()?;
+    let metadata = described.key_metadata()?;
+    let encrypts = metadata
+        .encryption_algorithms()
+        .iter()
+        .any(|algorithm| algorithm.as_str() == ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT);
+    (!encrypts).then_some(ENVIRONMENT_ENCRYPTION_FAILED_MESSAGE)
+}
+
+/// Lambda's own sentence for a key it could not find at all, which is how it words the
+/// failure to resolve the key its DEPLOYMENT PACKAGE is encrypted with
+/// (`Code$SourceKMSKeyArn`): the package is decrypted with that key when the function is
+/// deployed, so a key the key service holds no record of is a package Lambda could never
+/// unpack.
+const SOURCE_KEY_NOT_FOUND_SENTENCE: &str =
+    "Lambda can't find the KMS key. Check your KMS key settings.";
+
+/// Why a request naming `source_kms_key_arn` as the key its deployment package is encrypted
+/// with cannot be applied, or `None` when nothing says it cannot.
+///
+/// The same reading of the key service's answer every other key a function's configuration
+/// names gets ([`relayed_key_answer`]), and the same ONE class that refuses a configure:
+/// a key the key service holds NO RECORD of — an ARN it answers `NotFoundException` for, and
+/// one it rejects as no key ARN at all — is a key nothing could have been encrypted under, so
+/// the request is refused before anything is written. The key's state, a denial of the
+/// question, and an answer that establishes nothing are no part of it.
+pub async fn absent_source_key_refusal(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    source_kms_key_arn: Option<&str>,
+) -> Option<String> {
+    // `KMSKeyArn`'s own pattern admits the empty string, which names no key and asks for
+    // none ([`named_key`]).
+    let key_arn = named_key(source_kms_key_arn)?;
+    // Boxed for the reason [`environment_key_fault`] states.
+    let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
+    if !matches!(answer.class, FaultClass::NotFound) {
+        return None;
+    }
+    Some(caught_answer_message(SOURCE_KEY_NOT_FOUND_SENTENCE, &answer))
+}
+
+/// A relayed answer as the rendering that names the CAUGHT exception states it: Lambda's own
+/// sentence, then the key service's answer — the exception class it stated the refusal under
+/// and the sentence it stated about the key — then the clause naming the call it came from.
+///
+/// Lambda words the whole sentence before that clause itself, labels included, so the
+/// opening and the exception class the shared renderer would state for an SDK that caught the
+/// exception are left to it; what is reused is the ONE rendering of the clause
+/// (`service_common::relayed_refusal::caught_exception_message`), so a client parses the
+/// service, the status, the code and the request id back out of one form whichever emulated
+/// service relayed the call. The id belongs to the relayed CALL, so one is minted per call
+/// exactly as [`relayed_call_message`]'s envelope mints one.
+fn caught_answer_message(sentence: &str, answer: &RelayedKeyAnswer) -> String {
+    let stated = match &answer.reason {
+        Some(reason) => format!(
+            "{sentence} KMS exception: {code} KMS message: {reason}",
+            code = answer.code
+        ),
+        None => format!("{sentence} KMS exception: {code}", code = answer.code),
+    };
+    ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        &stated,
+        ::service_common::relayed_refusal::CaughtCall {
+            service: KMS_CAUGHT_SERVICE,
+            status: KMS_RELAY_STATUS,
+            code: &answer.code,
+            request_id: &::service_common::query_error_envelope::new_request_id(),
+        },
+    )
 }
 
 /// The sentence a configuration READ states on `EnvironmentError$Message`, for each class of
@@ -712,6 +861,67 @@ mod tests {
             assert_eq!(
                 named, *expected,
                 "case {case:?}: expected {expected:?} to be asked about, got {named:?}"
+            );
+        }
+    }
+
+    /// The refusal of a key the key service holds no record of states Lambda's own sentence,
+    /// then that service's answer under the labels this rendering gives them, then the clause
+    /// naming the call — and an answer that stated no sentence contributes none. One row per
+    /// form the answer takes; every word is written out here rather than read from the
+    /// implementation, so a wrong constant there cannot make this pass.
+    #[test]
+    fn a_caught_answer_states_the_class_the_sentence_and_the_call() {
+        let key_arn = "arn:aws:kms:us-east-1:000000000000:key/a-key";
+        // (case, what the key service said about the key, the text the message must carry
+        //  before the clause)
+        let rows: &[(&str, Option<String>, String)] = &[
+            (
+                "a key the key service holds no record of",
+                Some(format!("Key '{key_arn}' does not exist")),
+                format!(
+                    "Lambda can't find the KMS key. Check your KMS key settings. KMS \
+                     exception: NotFoundException KMS message: Key '{key_arn}' does not exist"
+                ),
+            ),
+            (
+                "an identifier it rejected as no key ARN",
+                Some(format!("Invalid arn {key_arn}")),
+                format!(
+                    "Lambda can't find the KMS key. Check your KMS key settings. KMS \
+                     exception: NotFoundException KMS message: Invalid arn {key_arn}"
+                ),
+            ),
+            (
+                "an answer that stated no sentence",
+                None,
+                "Lambda can't find the KMS key. Check your KMS key settings. KMS exception: \
+                 NotFoundException"
+                    .to_string(),
+            ),
+        ];
+        for (case, reason, stated) in rows {
+            let answered = RelayedKeyAnswer {
+                class: FaultClass::NotFound,
+                code: "NotFoundException".to_string(),
+                reason: reason.clone(),
+            };
+            let message = caught_answer_message(SOURCE_KEY_NOT_FOUND_SENTENCE, &answered);
+            let head = format!(
+                "{stated} (Service: AWSKMS; Status Code: 400; Error Code: NotFoundException; \
+                 Request ID: "
+            );
+            assert!(
+                message.starts_with(&head) && message.ends_with("; Proxy: null)"),
+                "case {case:?}: expected {head:?} and the proxy clause, got {message:?}"
+            );
+            let request_id = message
+                .strip_prefix(&head)
+                .and_then(|rest| rest.strip_suffix("; Proxy: null)"))
+                .unwrap_or_default();
+            assert!(
+                ::service_common::query_error_envelope::is_request_id(request_id),
+                "case {case:?}: expected the relayed call's own request id, got {request_id:?}"
             );
         }
     }

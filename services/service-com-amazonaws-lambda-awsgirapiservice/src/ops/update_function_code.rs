@@ -405,6 +405,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => None,
         };
 
+        // A new package's own encryption key is resolved in the key service before the store
+        // is reached, for the reason the Amazon S3 read above is: it is a call out of this
+        // handler and no store guard may be held across one. The reference comes from the
+        // request, so nothing of the record is needed to resolve it; whether it refuses this
+        // update is decided where the package is resolved below, so the order a client sees
+        // this operation's refusals in is unchanged (see
+        // [`crate::state::absent_source_key_refusal`], including the answers that establish
+        // nothing about the key and refuse nothing). A request bringing a CONTAINER IMAGE
+        // carries no .zip package for such a key to encrypt, so there is nothing to ask about
+        // for one.
+        let source_key_refusal = if input.image_uri.is_some() {
+            None
+        } else {
+            crate::state::absent_source_key_refusal(
+                ctx.callback(),
+                &region,
+                input.source_kms_key_arn.as_deref(),
+            )
+            .await
+        };
+
         // A new CONTAINER IMAGE is FOLLOWED into the registry before the store is reached,
         // for the same reason the Amazon S3 read above is: it is a call back into the engine,
         // and no store guard may be held across one — a guard held across a call that
@@ -506,6 +527,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(invalid_parameter)?;
+
+        // The key the new .zip package is encrypted with, as the key service answered for it
+        // above: a key it holds no record of is a package Lambda could never unpack, so the
+        // update is refused with nothing changed. Decided HERE, after the package resolution
+        // above has already refused a request whose members the function's package type does
+        // not admit — so what reaches this line named a key, brought no image, and carries it
+        // on the .zip package this update stores.
+        if let Some(message) = source_key_refusal {
+            return Err(invalid_parameter(message));
+        }
 
         // The object the Amazon S3 location named, as this handler already read it: a
         // refusal Amazon S3 answered about a bucket it holds refuses this update with

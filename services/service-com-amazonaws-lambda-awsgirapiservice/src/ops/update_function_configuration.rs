@@ -484,13 +484,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its configuration to be updated at all, so that is settled first, under a guard
         // scoped to the read so none is held across the in-process hop to the key service.
         if let Some(kms_key_arn) = input.kms_key_arn.as_deref() {
-            let held = {
+            let stored = {
                 let store = state.lock();
-                store.functions.contains_key(&reference.name)
+                store
+                    .functions
+                    .get(&reference.name)
+                    .map(|record| record.config.environment.clone())
             };
-            if !held {
+            let Some(stored_variables) = stored else {
                 return Err(not_found(&region, &reference.name));
-            }
+            };
             if let Some(message) = crate::state::absent_environment_key_refusal(
                 ctx.callback(),
                 &region,
@@ -499,6 +502,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .await
             {
                 return Err(invalid_parameter(message));
+            }
+            // The key this update puts on the function has to be able to PERFORM that
+            // encryption, not merely exist: applying it re-encrypts the variables the function
+            // will hold — the ones this request states, or the ones already stored when it
+            // states none — so a key the key service holds that cannot encrypt under the
+            // default symmetric algorithm is an encryption that fails and an update that is
+            // not applied (see [`crate::state::unencryptable_environment_refusal`]). A set of
+            // variables the environment rule itself refuses is left to the refusal it already
+            // gets below.
+            let variables = match input.environment.as_ref() {
+                Some(environment) => {
+                    crate::state::environment_variables(Some(environment)).ok()
+                }
+                None => Some(stored_variables),
+            };
+            if let Some(variables) = variables {
+                if let Some(message) = crate::state::unencryptable_environment_refusal(
+                    ctx.callback(),
+                    &region,
+                    Some(kms_key_arn),
+                    &variables,
+                )
+                .await
+                {
+                    return Err(
+                        UpdateFunctionConfigurationErrorModeled::ServiceException(
+                            ServiceException {
+                                r#type: None,
+                                message: Some(message.to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
             }
         }
 

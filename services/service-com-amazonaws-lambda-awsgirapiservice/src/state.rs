@@ -422,11 +422,13 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    absent_environment_key_refusal, durable_data_key_fault, engine_for, environment_key_fault,
+    absent_environment_key_refusal, absent_source_key_refusal, durable_data_key_fault, engine_for,
+    environment_key_fault,
     function_sdk_access, function_sdk_access_in_vpc,
     invocation_trace_context, layer_archives, log_target, mint_request_id,
     report_environment_key_fault, run_invocation, runs_handler, supplied_event_source_links,
-    supplied_trace_header, AwsAccess, Engine, EnvironmentKeyFault, EventSourceTraceLinks,
+    supplied_trace_header, unencryptable_environment_refusal, AwsAccess, Engine,
+    EnvironmentKeyFault, EventSourceTraceLinks,
     Invocation, Invoked, LogTarget, Unrunnable, FUNCTION_ERROR_UNHANDLED,
 };
 

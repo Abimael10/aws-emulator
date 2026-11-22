@@ -583,6 +583,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The ARN of the Key Management Service (KMS) customer managed key that's used to
+        // encrypt your function's .zip deployment package" (`Code$SourceKMSKeyArn`): Lambda
+        // DECRYPTS that package under the key when it deploys the function, so the key has to
+        // be one the key service resolves at this moment. A key it holds no record of is
+        // refused here, before anything is stored, and the refusal relays the key service's
+        // own answer — the exception class it stated and the sentence it stated about the key —
+        // inside Lambda's own sentence for the key it could not find (see
+        // [`crate::state::absent_source_key_refusal`], including the answers that establish
+        // nothing about the key and refuse nothing). Asked over the emulator's own in-process
+        // seam with no store guard held, exactly as the role below is.
+        if let Some(message) = crate::state::absent_source_key_refusal(
+            ctx.callback(),
+            &region,
+            code.source_kms_key_arn.as_deref(),
+        )
+        .await
+        {
+            return Err(invalid_parameter(message));
+        }
+
         // "To create a function, you need a deployment package and an execution role."
         // The function RUNS AS the role the request names, so that role is resolved
         // before anything is written: a role this emulator's own IAM HOLDS whose trust
@@ -624,6 +644,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             return Err(invalid_parameter(message));
+        }
+
+        // "Environment variables that are accessible from function code during execution",
+        // under the same quota every operation that accepts a set of them applies. Read ONCE
+        // here, so the encryption below and the record built further down hold the same set;
+        // the refusal a set that rule rejects gets is still answered where it was, with every
+        // other refusal, so the order a client sees is unchanged.
+        let requested_environment = crate::state::environment_variables(input.environment.as_ref());
+
+        // The key the variables are stored under has to be able to PERFORM that encryption,
+        // not merely exist: Lambda encrypts them as the function is created, so a key the key
+        // service holds that cannot encrypt under the default symmetric algorithm is an
+        // encryption that fails and a function that is never created (see
+        // [`crate::state::unencryptable_environment_refusal`]). A set the environment rule
+        // itself rejects has no encryption to perform here: it is left to the refusal it
+        // already gets below.
+        if let Ok(variables) = &requested_environment {
+            if let Some(message) = crate::state::unencryptable_environment_refusal(
+                ctx.callback(),
+                &region,
+                input.kms_key_arn.as_deref(),
+                variables,
+            )
+            .await
+            {
+                return Err(CreateFunctionErrorModeled::ServiceException(ServiceException {
+                    r#type: None,
+                    message: Some(message.to_string()),
+                })
+                .into());
+            }
         }
 
         // "To connect a function to a VPC, Lambda creates an elastic network interface for
@@ -785,11 +836,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // "Environment variables that are accessible from function code during execution",
-        // under the same quota every operation that accepts a set of them applies. Resolved
-        // HERE, with every other refusal, so that nothing below it can turn the request away.
-        let environment = crate::state::environment_variables(input.environment.as_ref())
-            .map_err(invalid_parameter)?;
+        // The environment variables read above, answered HERE with every other refusal, so
+        // that nothing below it can turn the request away.
+        let environment = requested_environment.map_err(invalid_parameter)?;
 
         // "To connect a function to a VPC, Lambda creates an elastic network interface for
         // each subnet in your function's VPC configuration": the attachment IS those
