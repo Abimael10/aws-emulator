@@ -533,11 +533,11 @@ async fn a_reboot_is_refused_unless_the_cluster_is_an_active_provisioned_one() {
         not_an_arn.body
     );
 
-    // Values that ARE ARNs and name no MSK cluster: nothing can hold a permission
-    // scoped to a cluster they do not name, so authorization refuses them before
-    // anything resolves or parses the target. The rows differ along which field of
-    // the ARN form makes it name no cluster.
-    let naming_no_cluster: &[(&str, String)] = &[
+    // Values naming a resource of another KIND — another vendor's, or another of
+    // this service's — are no cluster reference at all, so no permission scoped to a
+    // cluster is matched against them and this surface answers them as the parameter
+    // they are.
+    let another_kind: &[(&str, String)] = &[
         (
             "another service's ARN",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster/orders/{GHOST_ID}"),
@@ -546,21 +546,30 @@ async fn a_reboot_is_refused_unless_the_cluster_is_an_active_provisioned_one() {
             "another resource type of this service",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/orders/{GHOST_ID}"),
         ),
-        (
-            "a cluster ARN with no id segment",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/orders"),
-        ),
     ];
-    for (case, value) in naming_no_cluster {
+    for (case, value) in another_kind {
         let reply = reboot(&emulator, value, &["1"]).await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case {case:?}: expected the authorization refusal, got {} {}",
+            (400, "BadRequestException"),
+            "case {case:?}: expected this surface's parameter refusal, got {} {}",
             reply.status,
             reply.body
         );
     }
+
+    // A cluster REFERENCE that identifies no cluster resolves to no resource a
+    // permission could be scoped to, so authorization refuses it before anything
+    // resolves or parses the target.
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/orders");
+    let denied = reboot(&emulator, &nameless, &["1"]).await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"a cluster ARN with no id segment\": expected the authorization refusal, got {} {}",
+        denied.status,
+        denied.body
+    );
 }
 
 /// The session ARN `sts:AssumeRole` reports for the session the rows below sign

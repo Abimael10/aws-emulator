@@ -562,11 +562,19 @@ async fn an_unresolvable_cluster_or_topic_is_refused() {
     // other topic reader resolves it.
     let unresolvable: Vec<(&str, String, u16, &str)> = vec![
         (
-            // An ARN this account holds no cluster resource under: the
-            // authorization gate refuses it ahead of any lookup, because no
-            // resource-scoped permission can be matched against it.
+            // An ARN naming a resource of another kind is no cluster reference at
+            // all, so this reader answers it as the parameter it cannot read.
             "an ARN of another service",
             format!("arn:aws:sqs:{REGION}:{ACCOUNT}:queue-not-a-cluster"),
+            400,
+            "BadRequestException",
+        ),
+        (
+            // A cluster REFERENCE that identifies no cluster: the authorization
+            // gate refuses it ahead of any lookup, because it resolves to no
+            // resource a permission could be scoped to.
+            "a cluster reference identifying no cluster",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name"),
             403,
             "AccessDeniedException",
         ),

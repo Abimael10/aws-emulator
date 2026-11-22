@@ -691,8 +691,10 @@ async fn update_monitoring_refuses_what_it_cannot_apply() {
 
     // Rows: every way the request can fail, as `(case, ARN, signing region,
     // body, status, error code)`. The ARN rows walk the grammar the service
-    // parses — not an ARN, the wrong service, the wrong resource type, an extra
-    // segment, an empty region — then a well-formed ARN no cluster holds, and
+    // parses — not an ARN, the wrong service and the wrong resource type (none of
+    // them a cluster reference, so each is the parameter refusal), an extra segment
+    // and an empty region (cluster references identifying no cluster, which
+    // authorization refuses) — then a well-formed ARN no cluster holds, and
     // this cluster's own ARN seen from another region's endpoint.
     let rows: Vec<(&str, String, &str, Value, u16, &str)> = vec![
         (
@@ -708,16 +710,16 @@ async fn update_monitoring_refuses_what_it_cannot_apply() {
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/refusals/abc-1"),
             REGION,
             json!({ "currentVersion": version, "enhancedMonitoring": monitoring }),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "wrong-resource-type",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/refusals/abc"),
             REGION,
             json!({ "currentVersion": version, "enhancedMonitoring": monitoring }),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "extra-segment",

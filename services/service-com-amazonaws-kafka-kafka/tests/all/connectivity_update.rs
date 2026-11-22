@@ -567,10 +567,12 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
 
     // Rows: every way the request can fail, as `(case, ARN, signing region,
     // body, status, error code)`. A value that is no ARN at all is the parameter
-    // refusal; the wrong service, the wrong resource type, an extra segment and an
-    // empty region each name no cluster, which authorization refuses before
-    // anything resolves; then a well-formed ARN no cluster holds, and this
-    // cluster's own ARN seen from another region's endpoint.
+    // refusal; the wrong service and the wrong resource type are no cluster
+    // reference either, so they keep that same refusal; an extra segment and an
+    // empty region are cluster references identifying no cluster, which
+    // authorization refuses before anything resolves; then a well-formed ARN no
+    // cluster holds, and this cluster's own ARN seen from another region's
+    // endpoint.
     let rows: Vec<(&str, String, &str, Value, u16, &str)> = vec![
         (
             "not-an-arn",
@@ -585,16 +587,16 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/refusals/abc-1"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "wrong-resource-type",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/refusals/abc"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "extra-segment",

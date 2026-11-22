@@ -499,13 +499,19 @@ async fn the_cluster_is_resolved_before_the_body() {
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
     );
     let not_found: Vec<String> = vec![absent, elsewhere];
-    let bad_request: Vec<String> = vec!["not-an-arn".to_string(), String::new()];
-    // Values that ARE ARNs and name no cluster: nothing can hold a permission
-    // scoped to a cluster they do not name, so authorization refuses them before
-    // the cluster is resolved and before the body is read at all.
-    let unauthorized: Vec<String> = vec![
+    // A value that is no ARN at all, and one naming a resource of another KIND, are
+    // no cluster reference: this surface answers each as the parameter it cannot
+    // read.
+    let bad_request: Vec<String> = vec![
+        "not-an-arn".to_string(),
+        String::new(),
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc-1"),
+    ];
+    // Cluster REFERENCES that identify no cluster: each resolves to no resource a
+    // permission could be scoped to, so authorization refuses them before the
+    // cluster is resolved and before the body is read at all.
+    let unauthorized: Vec<String> = vec![
         format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc-1/extra"),
     ];

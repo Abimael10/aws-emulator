@@ -365,40 +365,51 @@ async fn describes_the_operation_each_update_files() {
     }
 }
 
-/// A value that is no ARN at all is refused as a bad request; a value that IS an
-/// ARN and names no cluster operation is refused by authorization before anything
-/// resolves it, since nothing can hold a permission scoped to a resource it does
-/// not name; and a well-formed cluster-operation ARN this region holds no
-/// operation for is a resource that does not exist. The rows differ along how the
-/// value fails: the wrong resource type, a truncated resource path, a foreign
-/// service, and something that is no ARN at all.
+/// A value that is no ARN at all, and one naming a resource of another KIND, are
+/// refused as a bad request: neither is a cluster-operation reference, so no
+/// permission scoped to one is matched against them. A REFERENCE of that kind which
+/// identifies no cluster operation is refused by authorization before anything
+/// resolves it, since it resolves to no resource a permission could be scoped to;
+/// and a well-formed cluster-operation ARN this region holds no operation for is a
+/// resource that does not exist. The rows differ along how the value fails: the
+/// wrong resource type, a truncated resource path, a foreign service, and something
+/// that is no ARN at all.
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_value_that_names_no_operation() {
     let emulator = Emulator::new();
-    let naming_no_operation = [
+    let another_kind = [
         (
             "cluster-arn",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/11111111-2222-3333-4444-555555555555-1"),
-        ),
-        (
-            "missing-operation-id",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/11111111-2222-3333-4444-555555555555-1"),
         ),
         (
             "other-service",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/cluster-id/operation-id"),
         ),
     ];
-    for (case, value) in naming_no_operation {
+    for (case, value) in another_kind {
         let reply = describe_v2(&emulator, &value).await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case {case}: expected the authorization refusal for {value:?}, got {} {}",
+            (400, "BadRequestException"),
+            "case {case}: expected this reader's own refusal for {value:?}, got {} {}",
             reply.status,
             reply.body
         );
     }
+    let truncated = format!(
+        "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/\
+         11111111-2222-3333-4444-555555555555-1"
+    );
+    let denied = describe_v2(&emulator, &truncated).await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case missing-operation-id: expected the authorization refusal for {truncated:?}, got \
+         {} {}",
+        denied.status,
+        denied.body
+    );
     let reply = describe_v2(&emulator, "a-cluster-operation").await;
     assert_eq!(
         reply.status, 400,

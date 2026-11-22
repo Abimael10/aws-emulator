@@ -6,21 +6,23 @@
 //!
 //! RULE under test: a topic call is authorized on the `ClusterArn` it names before
 //! any resource is resolved, and a permission for it is scoped to a CLUSTER
-//! resource — so a value that IS an ARN but names no MSK cluster of this account
+//! resource — so a cluster REFERENCE that identifies no MSK cluster of this account
 //! matches no permission, reaches no grant, and is refused HTTP 403
 //! `AccessDeniedException` naming the principal, the action and the resource the
-//! decision was taken over; a well-formed cluster ARN passes that gate and is
-//! answered by the resolution behind it (`NotFoundException` where this endpoint
-//! holds no such cluster). A value that is not an ARN at all names no resource for
-//! a policy to be matched against and keeps the service's parameter refusal, HTTP
-//! 400 `BadRequestException`.
+//! decision was taken over, which is the WILDCARD: the reference resolved to no
+//! resource, so there was none to decide over, and the sentence ends there. A
+//! well-formed cluster ARN passes that gate and is answered by the resolution behind
+//! it (`NotFoundException` where this endpoint holds no such cluster). A value that
+//! names a resource of another KIND is no cluster reference at all, and one that is
+//! not an ARN names no resource for a policy to be matched against; both keep the
+//! service's parameter refusal, HTTP 400 `BadRequestException`.
 //!
-//! The rows differ along what the rule generalises over: what makes the value name
-//! no cluster (another vendor's namespace, another resource kind of this service, a
-//! cluster resource field missing its id or carrying an extra segment, an empty
-//! account or region segment), what makes it no ARN at all (free text, a truncated
-//! ARN, a non-ASCII value), and which of the six topic operations answers — the
-//! gate is the surface's, not one handler's.
+//! The rows differ along what the rule generalises over: what makes a cluster
+//! reference identify no cluster (a resource field missing its id, one carrying an
+//! extra segment, an empty account or region segment), which values are no cluster
+//! reference at all (another vendor's namespace, another resource kind of this
+//! service, free text, a truncated ARN, a non-ASCII value), and which of the six
+//! topic operations answers — the gate is the surface's, not one handler's.
 
 use serde_json::{json, Value};
 
@@ -47,14 +49,17 @@ fn caller() -> String {
 
 /// The sentence a request that reaches no grant is refused with: fixed connectives
 /// around the principal, the action and the resource the decision was taken over,
-/// closed by IAM's default-deny clause naming the action nothing allowed.
+/// and nothing after that resource — no document was reached to be named.
 fn not_authorized(resource: &str) -> String {
     format!(
-        "User: {} is not authorized to perform: {CLUSTER_CONNECT_ACTION} on resource: {resource} \
-         because no identity-based policy allows the {CLUSTER_CONNECT_ACTION} action",
+        "User: {} is not authorized to perform: {CLUSTER_CONNECT_ACTION} on resource: {resource}",
         caller()
     )
 }
+
+/// The resource an authorization decision is taken over when the value referenced
+/// none: IAM's wildcard.
+const ANY_RESOURCE: &str = "*";
 
 /// One topic operation, as a request this suite can make for any `ClusterArn`.
 struct TopicCall {
@@ -119,19 +124,12 @@ async fn make(emulator: &Emulator, call: &TopicCall, cluster_arn: &str) -> Reply
         .await
 }
 
-/// Values that ARE ARNs and name no MSK cluster of this account: nothing can hold
-/// a permission scoped to them, so the authorization gate refuses every topic call
-/// carrying one — naming the value as the resource the decision was taken over.
-fn arns_naming_no_cluster() -> Vec<(&'static str, String)> {
+/// Values that ARE cluster REFERENCES of this service and identify no cluster:
+/// nothing resolves them to a cluster a permission could be scoped to, so the
+/// authorization gate refuses every topic call carrying one — naming the wildcard as
+/// the resource the decision was taken over, there having been none.
+fn references_naming_no_cluster() -> Vec<(&'static str, String)> {
     vec![
-        (
-            "another vendor's namespace",
-            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
-        ),
-        (
-            "another resource kind of this service",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/{GHOST_ID}"),
-        ),
         (
             "a cluster resource field missing its id",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name"),
@@ -151,10 +149,20 @@ fn arns_naming_no_cluster() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Values that are no ARN at all, which name no resource for a policy to be
-/// matched against and are answered as the parameter they are.
-fn values_that_are_no_arn() -> Vec<(&'static str, String)> {
+/// Values that are no cluster reference at all — an ARN of another vendor or of
+/// another resource kind of this service, and values that are no ARN — which name no
+/// resource for a policy to be matched against and are answered as the parameter
+/// they are.
+fn values_that_are_no_cluster_reference() -> Vec<(&'static str, String)> {
     vec![
+        (
+            "another vendor's namespace",
+            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
+        ),
+        (
+            "another resource kind of this service",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/{GHOST_ID}"),
+        ),
         ("free text", "not-a-cluster-arn".to_string()),
         ("free text with spaces", "not an arn at all".to_string()),
         ("a truncated ARN", "arn:aws:kafka".to_string()),
@@ -166,14 +174,15 @@ fn values_that_are_no_arn() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// RULE: every topic call carrying an ARN that names no cluster of this account is
-/// refused by authorization, with the one sentence and the one code — whichever
-/// operation answers and whatever makes the value name no cluster.
+/// RULE: every topic call carrying a cluster reference that identifies no cluster of
+/// this account is refused by authorization, with the one sentence — over the
+/// wildcard — and the one code, whichever operation answers and whatever makes the
+/// reference identify none.
 #[tokio::test]
 async fn an_arn_that_names_no_cluster_is_refused_by_authorization_on_every_topic_call() {
     let emulator = Emulator::new();
 
-    for (case, value) in arns_naming_no_cluster() {
+    for (case, value) in references_naming_no_cluster() {
         for call in topic_calls() {
             let reply = make(&emulator, &call, &value).await;
             assert_eq!(
@@ -181,25 +190,33 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_on_every_topic
                 (
                     ACCESS_DENIED_STATUS,
                     ACCESS_DENIED_CODE,
-                    not_authorized(&value).as_str()
+                    not_authorized(ANY_RESOURCE).as_str()
                 ),
                 "case {case:?}/{}: expected the authorization refusal, got {} {}",
                 call.name,
                 reply.status,
                 reply.body
             );
+            assert!(
+                !reply.error_message().contains(value.as_str()),
+                "case {case:?}/{}: the decision was taken over no resource, so the refusal must \
+                 not echo the submitted value, got {:?}",
+                call.name,
+                reply.error_message()
+            );
         }
     }
 }
 
-/// RULE: a value that is no ARN at all names no resource to decide over, so it
-/// keeps the service's parameter refusal — the gate does not swallow a mistyped
-/// path segment.
+/// RULE: a value that is no cluster reference at all — an ARN of another kind of
+/// resource, or text that is no ARN — names no cluster for a policy to be matched
+/// against, so it keeps the service's parameter refusal: the gate swallows neither a
+/// mistyped path segment nor a reference to another resource.
 #[tokio::test]
 async fn a_value_that_is_no_arn_at_all_stays_a_parameter_refusal() {
     let emulator = Emulator::new();
 
-    for (case, value) in values_that_are_no_arn() {
+    for (case, value) in values_that_are_no_cluster_reference() {
         for call in topic_calls() {
             let reply = make(&emulator, &call, &value).await;
             assert_eq!(

@@ -498,39 +498,65 @@ async fn reject_refuses_a_reference_it_cannot_act_on() {
         }
     }
 
-    // A `ClusterArn` that IS an ARN and names no cluster of this service — here a
-    // VPC-connection ARN of this very service — matches no resource-scoped
-    // permission anything can hold, so the reject reaches no grant before it reads
-    // the connection reference, and it moves nothing either. The sentence is the
-    // one the service answers a value that names a resource no statement of the
-    // caller's covers.
+    // A `ClusterArn` that names a resource of ANOTHER KIND — here a VPC-connection
+    // ARN of this very service — is no cluster reference at all, so no permission
+    // scoped to a cluster is matched against it: the reject answers it as the
+    // parameter it is, before it reads the connection reference, and it moves
+    // nothing either.
     let no_cluster = connection.clone();
-    let denied = emulator
+    let refused = emulator
         .reject_client_vpc_connection(&no_cluster, &connection)
         .await;
-    assert_eq!(
-        (denied.status, denied.error_code()),
-        (403, "AccessDeniedException"),
-        "case a-cluster-arn-of-another-resource-kind: expected the authorization refusal, got {} {}",
-        denied.status,
-        denied.body
-    );
-    assert_eq!(
-        denied.error_message(),
-        format!(
-            "User: {} is not authorized to perform: kafka:RejectClientVpcConnection on resource: \
-             {no_cluster} because no identity-based policy allows the \
-             kafka:RejectClientVpcConnection action",
-            caller_principal()
-        ),
-        "case a-cluster-arn-of-another-resource-kind: expected the default-deny sentence, got {:?}",
-        denied.error_message()
+    assert_bad_parameter(
+        &refused,
+        "a-cluster-arn-of-another-resource-kind",
+        CLUSTER_ARN_MEMBER,
+        CLUSTER_ARN_NOT_VALID_MESSAGE,
     );
     for (owner, arn) in [(&cluster, &connection), (&other_cluster, &other_connection)] {
         assert_every_reader_reports(
             &emulator,
             REGION,
             "a-cluster-arn-of-another-resource-kind",
+            owner,
+            arn,
+            AVAILABLE,
+        )
+        .await;
+    }
+
+    // A `ClusterArn` that IS a cluster reference and identifies no cluster resolves
+    // to no resource a permission could be scoped to, so the reject reaches no
+    // grant before it reads the connection reference. The decision was taken over
+    // no resource, so that is what the sentence names.
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name");
+    let denied = emulator
+        .reject_client_vpc_connection(&nameless, &connection)
+        .await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case a-cluster-reference-identifying-no-cluster: expected the authorization refusal, \
+         got {} {}",
+        denied.status,
+        denied.body
+    );
+    assert_eq!(
+        denied.error_message(),
+        format!(
+            "User: {} is not authorized to perform: kafka:RejectClientVpcConnection on \
+             resource: *",
+            caller_principal()
+        ),
+        "case a-cluster-reference-identifying-no-cluster: expected the refusal over the \
+         wildcard, got {:?}",
+        denied.error_message()
+    );
+    for (owner, arn) in [(&cluster, &connection), (&other_cluster, &other_connection)] {
+        assert_every_reader_reports(
+            &emulator,
+            REGION,
+            "a-cluster-reference-identifying-no-cluster",
             owner,
             arn,
             AVAILABLE,

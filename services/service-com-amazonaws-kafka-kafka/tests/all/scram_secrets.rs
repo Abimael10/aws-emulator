@@ -700,8 +700,9 @@ async fn a_cluster_that_does_not_authenticate_sasl_scram_holds_no_secrets() {
     }
 }
 
-/// RULE: a `ClusterArn` that is no ARN at all is a bad request; a value that IS
-/// an ARN and names no MSK cluster is refused by authorization before anything
+/// RULE: a `ClusterArn` that is no ARN at all, and one naming a resource of another
+/// KIND, are a bad request — neither is a cluster reference; a REFERENCE of that
+/// kind which identifies no MSK cluster is refused by authorization before anything
 /// resolves it; and a well-formed cluster ARN this endpoint's region holds no
 /// cluster for is a not-found — on all three operations, so the writers and the
 /// reader draw the same lines.
@@ -710,24 +711,29 @@ async fn a_cluster_arn_this_endpoint_cannot_resolve_is_refused() {
     let emulator = Emulator::new();
     let secrets = vec![secret_arn("AmazonMSK_unresolved-4v5w6x")];
 
-    // A value that is not an ARN at all names no resource for a policy to be
-    // matched against, so it stays this surface's parameter refusal.
-    for value in ["not-an-arn", "not an arn at all"] {
+    // A value that is not an ARN at all, and one naming a resource of another kind
+    // — another service's namespace, another MSK resource type — name no cluster for
+    // a policy to be matched against, so each stays this surface's parameter
+    // refusal.
+    for value in [
+        "not-an-arn",
+        "not an arn at all",
+        "arn:aws:secretsmanager:us-west-2:000000000000:secret:AmazonMSK_not-a-cluster",
+        &format!(
+            "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/cfg/\
+             00000000-0000-0000-0000-000000000000-1"
+        ),
+    ] {
         let case = format!("cluster-arn={value:?}");
         assert_bad_request(&associate(&emulator, value, &secrets).await, &case);
         assert_bad_request(&disassociate(&emulator, value, &secrets).await, &case);
         assert_bad_request(&list(&emulator, value, "").await, &case);
     }
 
-    // Values that ARE ARNs and name no MSK cluster: another service's namespace,
-    // another MSK resource type, a cluster ARN missing its id segment. Nothing can
-    // hold a permission scoped to a cluster they do not name, so the authorization
-    // gate answers them — before anything reads what this registry holds.
-    for value in [
-        "arn:aws:secretsmanager:us-west-2:000000000000:secret:AmazonMSK_not-a-cluster",
-        &format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/cfg/00000000-0000-0000-0000-000000000000-1"),
-        &format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/no-id-segment"),
-    ] {
+    // A cluster REFERENCE that identifies no cluster — here one missing its id
+    // segment — resolves to no resource a permission could be scoped to, so the
+    // authorization gate answers it before anything reads what this registry holds.
+    for value in [&format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/no-id-segment")] {
         let case = format!("cluster-arn={value:?}");
         for reply in [
             associate(&emulator, value, &secrets).await,

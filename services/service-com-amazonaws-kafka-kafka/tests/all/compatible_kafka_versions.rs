@@ -428,9 +428,11 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
         .to_string();
 
     // Rows: every way the ARN can fail — absent and another region's (the miss),
-    // not an ARN at all (the parameter refusal), and then another service, another
-    // resource type, an empty region and a trailing segment: each an ARN that names
-    // no cluster, which authorization refuses before anything is resolved.
+    // not an ARN at all and ARNs naming a resource of another KIND (another service,
+    // another resource type), none of them a cluster reference, so each keeps the
+    // parameter refusal — and then an empty region and a trailing segment: cluster
+    // REFERENCES that identify no cluster, which authorization refuses before
+    // anything is resolved.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"),
@@ -441,13 +443,13 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
         ("not-an-arn".to_string(), 400, "BadRequestException"),
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),

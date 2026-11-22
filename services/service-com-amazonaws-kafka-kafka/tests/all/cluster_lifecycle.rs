@@ -1088,10 +1088,10 @@ async fn a_cluster_is_only_visible_in_its_own_region() {
 }
 
 /// RULE: a reader that models both errors separates a well-formed `ClusterArn` no
-/// live cluster holds (`NotFoundException`, 404) from one that names no cluster at
-/// all, which is refused earlier still, by authorization
-/// (`AccessDeniedException`, 403), since nothing can hold a permission scoped to a
-/// cluster it does not name. `GetBootstrapBrokers`, which models no
+/// live cluster holds (`NotFoundException`, 404) from a cluster REFERENCE that
+/// identifies no cluster, which is refused earlier still, by authorization
+/// (`AccessDeniedException`, 403), since it resolves to no resource a permission
+/// could be scoped to. `GetBootstrapBrokers`, which models no
 /// `NotFoundException`, answers the same code and status as the readers for the
 /// same reference; the DELETE, whose action no cluster policy governs, keeps the
 /// parameter refusal for a value that is no ARN at all.
@@ -1101,11 +1101,13 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
     emulator.create_ok(&ClusterRequest::named("present")).await;
 
     // `(arn, expected status, expected error code)` for DescribeCluster and
-    // DeleteCluster. Rows: well-formed but absent (two regions), then one row per
-    // way an ARN can name no cluster — wrong service, wrong resource type, an
-    // extra resource segment, and an empty region. A value that is not an ARN at
-    // all is answered differently by the two operations and is asserted after the
-    // table.
+    // DeleteCluster. Rows: well-formed but absent (two regions), then an ARN naming
+    // a resource of another KIND — wrong service, wrong resource type — which is no
+    // cluster reference at all and so keeps each operation's own parameter refusal,
+    // and two cluster REFERENCES that identify no cluster — an extra resource
+    // segment, and an empty region — which authorization refuses. A value that is
+    // not an ARN at all is answered differently by the two operations and is
+    // asserted after the table.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"),
@@ -1119,13 +1121,13 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
         ),
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),

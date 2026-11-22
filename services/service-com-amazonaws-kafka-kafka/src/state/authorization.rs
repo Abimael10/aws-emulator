@@ -28,22 +28,33 @@
 //! carries no account to decide against, so the account test passes it; whether it
 //! is then refused depends on what could have granted the action.
 //!
-//! A value that READS as an ARN and names no cluster is the first case: the action
-//! a cluster-scoped call asks for applies to a CLUSTER, and a permission for it is
-//! scoped to the cluster resource it is granted on, so such a value leaves nothing
-//! for a statement to be matched against, reaches no grant, and is refused by
-//! [`no_grant_for_cluster`] before anything the request names is resolved or any
-//! member of the body is read. A value that is no ARN AT ALL names no resource for
-//! a statement to be matched against either, so for those actions it is left to the
-//! operation's own parameter refusal, which is what the service answers for a
-//! mistyped path segment.
+//! A value that REFERENCES a cluster and identifies none is the first case: the
+//! action a cluster-scoped call asks for applies to a CLUSTER, and a permission for
+//! it is scoped to the cluster resource it is granted on, so a cluster reference
+//! that identifies no cluster — a `cluster` resource field of the wrong arity, one
+//! carrying no id — resolves to no resource for a statement to be matched against,
+//! reaches no grant, and is refused by [`no_grant_for_cluster`] before anything the
+//! request names is resolved or any member of the body is read. The decision was
+//! taken over no resource, so that is what it names ([`ANY_RESOURCE`]).
+//!
+//! A value naming a resource of ANOTHER KIND — another vendor's, or another of this
+//! service's — is no cluster reference at all, so no permission scoped to a cluster
+//! is ever matched against it and this gate decides nothing about it: it is left to
+//! the operation, which answers the reference it cannot use, the same way the
+//! configuration family reads a value naming no configuration
+//! ([`crate::state::configuration_arn`]). A value that is no ARN AT ALL names no
+//! resource for a statement to be matched against either, so for those actions it is
+//! left to the operation's own parameter refusal, which is what the service answers
+//! for a mistyped path segment.
 //!
 //! For the four actions a cluster's own resource-based policy GOVERNS
 //! ([`CLUSTER_POLICY_ACTIONS`]) there is nothing else a grant can rest on: that
-//! document lives ON the cluster, so a request that names no cluster can reach no
-//! grant whatever the value's shape, and the authorization refusal is the answer
-//! for a value that is no ARN too — which is why `CreateVpcConnection`'s target
-//! has always been decided that way ([`authorize_target_cluster`]).
+//! document lives ON the cluster, so a value that stands for no resource this
+//! endpoint could hold a document on can reach no grant, and the authorization
+//! refusal is the answer for a value that is no ARN too — taken over the value as
+//! submitted, there being nothing else it stands for, which is why
+//! `CreateVpcConnection`'s target has always been decided that way
+//! ([`authorize_target_cluster`]).
 //!
 //! That is one decision for every call whose target is a cluster, whichever plane
 //! it acts on: the control-plane gate ([`authorize_caller_operation`], taken by
@@ -134,16 +145,16 @@ pub const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
 /// Kafka plane asks for [`CLUSTER_CONNECT_ACTION`] on it — which is the action
 /// this gate takes the decision for, since connecting to the cluster is what every
 /// topic call needs whatever it then does to a topic. A permission for it is
-/// scoped to the CLUSTER resource it is granted on, so the decision needs an ARN
-/// that names one: a value that IS an ARN but names no MSK cluster — another
-/// vendor's resource, another kind of this service's, or a `cluster/<name>/<id>`
-/// resource field it does not have — matches no resource-scoped permission, so
-/// nothing grants the call and it is refused with the authorization refusal rather
-/// than with a description of what the value looks like: the decision comes first,
-/// and a caller it refuses learns nothing about what this registry holds. A value
-/// that is not an ARN at all carries no resource for a policy to be matched
-/// against either way, and is left to the operation's own parameter refusal, which
-/// is what the service answers for a mistyped path segment.
+/// scoped to the CLUSTER resource it is granted on, so the decision needs a value
+/// that identifies one: a cluster REFERENCE that identifies no cluster — a
+/// `cluster` resource field of the wrong arity — matches no resource-scoped
+/// permission, so nothing grants the call and it is refused with the authorization
+/// refusal rather than with a description of what the value looks like: the decision
+/// comes first, and a caller it refuses learns nothing about what this registry
+/// holds. A value naming a resource of another kind is no cluster reference at all,
+/// and a value that is not an ARN carries no resource for a policy to be matched
+/// against either way; both are left to the operation's own refusal, which is what
+/// the service answers for a mistyped path segment.
 ///
 /// `operation` is the caller's own `Operation::NAME`, so nothing about the
 /// decision depends on which topic call took it beyond the cluster it named.
@@ -161,13 +172,15 @@ pub fn authorize_cluster_connect<Eng: Send + Sync + 'static, E>(
 ///
 /// `kafka:<ApiName>` applies to a CLUSTER resource, and a permission for it is
 /// scoped to the cluster it is granted on — so the decision needs a value that
-/// names one. A value that IS an ARN and names no MSK cluster (another vendor's
-/// resource, another kind of this service's, or a `cluster/<name>/<id>` resource
-/// field it does not have) matches no resource-scoped permission of the caller's,
-/// reaches no grant, and is refused with the authorization refusal rather than with
-/// a description of what the value looks like: authorization is evaluated ahead of
-/// the service, so the request never reaches the parameter check that would describe
-/// the target, and the caller learns nothing about what this registry holds.
+/// identifies one. A cluster REFERENCE that identifies no MSK cluster (a
+/// `cluster/<name>/<id>` resource field it does not have) matches no
+/// resource-scoped permission of the caller's, reaches no grant, and is refused
+/// with the authorization refusal rather than with a description of what the value
+/// looks like: authorization is evaluated ahead of the service, so the request
+/// never reaches the parameter check that would describe the target, and the caller
+/// learns nothing about what this registry holds. A value naming another kind of
+/// resource is no cluster reference, so this gate decides nothing about it and the
+/// operation answers it.
 ///
 /// `operation` is the caller's own `Operation::NAME`, so the action can never drift
 /// from the operation taking the decision.
@@ -184,10 +197,11 @@ pub fn authorize_caller_operation<Eng: Send + Sync + 'static, E>(
 /// named by `ClusterOperationArn`.
 ///
 /// Same rule, same reason: `kafka:<ApiName>` applies to the resource the request
-/// names, a permission for it is scoped to that resource, and a value that IS an
-/// ARN and names no cluster operation of this service matches none — so the
+/// names, a permission for it is scoped to that resource, and a reference of THAT
+/// kind identifying no cluster operation of this service matches none — so the
 /// decision is the authorization refusal rather than a description of the value's
-/// shape, taken before the operation is resolved.
+/// shape, taken before the operation is resolved. A value naming another kind of
+/// resource is left to the operation, as [`authorize_named_resource`] says.
 pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -199,6 +213,7 @@ pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
         ctx,
         &control_plane_action(operation),
         operation_arn,
+        crate::state::CLUSTER_OPERATION_RESOURCE_TYPE,
         crate::state::is_cluster_operation_arn(operation_arn),
         grantable_by_cluster_policy(&control_plane_action(operation)),
     )
@@ -224,47 +239,90 @@ fn authorize_cluster_action<Eng: Send + Sync + 'static, E>(
         ctx,
         action,
         cluster_arn,
+        crate::state::CLUSTER_RESOURCE_TYPE,
         crate::state::is_cluster_arn(cluster_arn),
         grantable_by_cluster_policy(action),
     )
 }
 
 /// The decision for `action` on the resource `value` is meant to name, where
-/// `names_the_resource` says whether it names one of the kind the action applies
-/// to and `only_a_resource_policy_can_grant` whether the only document that can
-/// grant the action is the RESOURCE's own.
+/// `resource_type` is the ARN resource type of the kind the action applies to,
+/// `names_the_resource` says whether `value` names one of that kind and
+/// `only_a_resource_policy_can_grant` whether the only document that can grant the
+/// action is the RESOURCE's own.
 ///
 /// The ONE place the order lives, for every target this service decides over: the
 /// caller's own policies and the ARN's account first
 /// ([`authorize_caller_action`]), then whether there is a resource for a grant to
 /// rest on at all.
 ///
-/// Where an identity-based document can grant the action, the decision is taken
-/// over the RESOURCE the value names: a value that IS an ARN and names no resource
-/// of the right kind matches no resource-scoped permission and reaches no grant,
-/// while a value that is no ARN at all names no resource for a statement to be
-/// matched against either way, so it is left to the operation's own parameter
-/// refusal — which is what this service answers for a mistyped path segment.
+/// The decision is taken over the resource of `resource_type` the value REFERENCES,
+/// so it is taken only where the value is a reference to one. A value naming a
+/// resource of ANOTHER kind — another vendor's, or another of this service's — is no
+/// reference to that kind at all, so no permission scoped to the action's own
+/// resource is ever matched against it and the gate takes no decision: it is left
+/// to the operation, which answers the reference it cannot use (the same reading
+/// [`crate::state::configuration_arn`] makes for the configuration family). A value
+/// that reads as a reference of the right kind and identifies no resource of it
+/// reaches no grant, and is refused by [`no_grant_for_cluster`].
 ///
-/// Where only the resource's OWN policy can grant it ([`CLUSTER_POLICY_ACTIONS`]),
-/// there is nothing else to fall back on: that document lives ON the cluster, so a
-/// value naming no cluster reaches no grant whatever its shape, and the
-/// authorization refusal is the answer for a value that is no ARN too.
+/// A value that is no ARN at all names no resource for a statement to be matched
+/// against either, so where an identity-based document can grant the action it too
+/// is left to the operation's own parameter refusal — which is what this service
+/// answers for a mistyped path segment. Where only the resource's OWN policy can
+/// grant the action ([`CLUSTER_POLICY_ACTIONS`]) there is nothing else to fall back
+/// on: that document lives ON the cluster, so such a value reaches no grant and the
+/// authorization refusal is the answer for it too.
 fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     value: &str,
+    resource_type: &str,
     names_the_resource: bool,
     only_a_resource_policy_can_grant: bool,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     authorize_caller_action(engine, ctx, action, value)?;
-    let reads_as_a_resource =
-        only_a_resource_policy_can_grant || ::service_common::arn::parse(value).is_some();
-    if names_the_resource || !reads_as_a_resource {
+    if names_the_resource {
         return Ok(());
     }
-    Err(no_grant_for_cluster(engine, ctx, action, value))
+    match ungranted_resource(value, resource_type, only_a_resource_policy_can_grant) {
+        None => Ok(()),
+        Some(resource) => Err(no_grant_for_cluster(engine, ctx, action, resource)),
+    }
+}
+
+/// The resource an authorization decision over `value` is taken against when
+/// `value` identifies no resource of `resource_type` — and `None` where the gate
+/// takes no decision over it at all, leaving the value to the operation.
+///
+/// Three readings of one value, which is what makes the refusal's resource token
+/// the one AWS names:
+///
+/// * a reference of the action's own kind that identifies no resource of it (a
+///   resource field of the wrong arity, a field carrying no id) resolves to NO
+///   resource in the decision's context, so the decision is taken over
+///   [`ANY_RESOURCE`];
+/// * an ARN naming a resource of another kind is no reference of this kind, so
+///   there is nothing for the decision to be taken over and the operation answers;
+/// * a value that is no ARN resolves to nothing either, so the decision — where one
+///   is taken at all, which is where only the resource's own policy could have
+///   granted the action — is taken over the VALUE as submitted, there being nothing
+///   else it stands for.
+fn ungranted_resource<'value>(
+    value: &'value str,
+    resource_type: &str,
+    only_a_resource_policy_can_grant: bool,
+) -> Option<&'value str> {
+    // An ARN's resource type is read through the tree's one caller-supplied-ARN
+    // parse, under this service's own namespace — which is the namespace its
+    // actions are published under, so one constant says both.
+    match ::service_common::arn::parse_of(value, CONTROL_PLANE_ACTION_NAMESPACE) {
+        Some(parsed) if parsed.resource_type() == resource_type => Some(ANY_RESOURCE),
+        Some(_) => None,
+        None if ::service_common::arn::parse(value).is_some() => None,
+        None => only_a_resource_policy_can_grant.then_some(value),
+    }
 }
 
 /// The wire error code an authorization refusal carries.
@@ -401,17 +459,16 @@ pub fn authorize_target_cluster<Eng: Send + Sync + 'static, E>(
     authorize_caller_operation(engine, ctx, operation, target_arn)
 }
 
-/// The refusal for a request whose target value names no cluster of this service:
-/// there is no cluster resource for a permission to be scoped to, so nothing
-/// grants the action on it.
+/// The refusal for a request whose target value identifies no cluster of this
+/// service: there is no cluster resource for a permission to be scoped to, so
+/// nothing grants the action on it.
 ///
-/// Worded as the decision IAM actually reached, which depends on whether the value
-/// reads as a resource at all. A value that DOES read as an ARN is the resource the
-/// decision was taken over, and no statement of the caller's covers it — IAM's
-/// default deny, whose sentence closes by naming the action nothing allowed
-/// ([`::service_common::iam_authorization::no_identity_policy_allows`]). A value
-/// that reads as no resource leaves nothing to take a decision over: it is taken
-/// over [`ANY_RESOURCE`] and no document is named, because none was reached.
+/// ONE sentence, naming the principal that signed, the action asked for and
+/// `resource` — the resource the decision was actually taken over, which
+/// [`ungranted_resource`] reads off the submitted value. It closes THERE: no clause
+/// names a document, because no document was reached to withhold the grant
+/// ([`::service_common::iam_authorization::not_authorized_to_perform`], the form
+/// this service's own recorded refusals carry).
 ///
 /// The principal is the one the REQUEST's credential speaks for
 /// ([`crate::state::identity_authorization::calling_principal`]), so a refusal
@@ -421,24 +478,12 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
-    value: &str,
+    resource: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
     let principal = crate::state::identity_authorization::calling_principal(engine, ctx);
-    if ::service_common::arn::parse(value).is_some() {
-        return access_denied(
-            ::service_common::iam_authorization::not_authorized_by_identity_policy(
-                &principal,
-                action,
-                value,
-                &::service_common::iam_authorization::no_identity_policy_allows(action),
-            ),
-        );
-    }
     access_denied(
         ::service_common::iam_authorization::not_authorized_to_perform(
-            &principal,
-            action,
-            ANY_RESOURCE,
+            &principal, action, resource,
         ),
     )
 }
@@ -718,5 +763,63 @@ mod tests {
             "case \"the data-plane action\": a cluster policy does not govern \
              {CLUSTER_CONNECT_ACTION}"
         );
+    }
+
+    /// RULE: the resource a pre-resolution decision is taken over follows what the
+    /// submitted value REFERENCES — the wildcard for a reference of the action's own
+    /// kind that identifies no resource of it, the value itself for a value nothing
+    /// resolves (where only the resource's own policy could have granted the
+    /// action), and no decision at all for an ARN naming a resource of another kind.
+    #[test]
+    fn the_resource_decided_over_follows_what_the_value_references() {
+        let account = ::engine::emulator_account_id();
+        let cluster = crate::state::CLUSTER_RESOURCE_TYPE;
+        // `(case, value, only a resource policy can grant, the resource decided over)`.
+        let rows: Vec<(&str, String, bool, Option<&str>)> = vec![
+            (
+                "a cluster reference without its id",
+                format!("arn:aws:kafka:us-west-2:{account}:cluster/only-a-name"),
+                false,
+                Some(ANY_RESOURCE),
+            ),
+            (
+                "a cluster reference with an extra segment",
+                format!("arn:aws:kafka:us-west-2:{account}:cluster/a/b/c"),
+                true,
+                Some(ANY_RESOURCE),
+            ),
+            (
+                "another kind of this service's resources",
+                format!("arn:aws:kafka:us-west-2:{account}:configuration/a/b"),
+                true,
+                None,
+            ),
+            (
+                "another vendor's resource",
+                format!("arn:aws:ec2:us-west-2:{account}:instance/i-0a1b2c3d"),
+                false,
+                None,
+            ),
+            (
+                "no ARN at all, where only a resource policy could grant",
+                "not-an-arn".to_string(),
+                true,
+                Some("not-an-arn"),
+            ),
+            (
+                "no ARN at all, where an identity policy could grant",
+                "not-an-arn".to_string(),
+                false,
+                None,
+            ),
+        ];
+        for (case, value, only_a_resource_policy_can_grant, expected) in rows {
+            let decided = ungranted_resource(&value, cluster, only_a_resource_policy_can_grant);
+            assert_eq!(
+                decided, expected,
+                "case {case:?}: expected the decision to be taken over {expected:?}, got \
+                 {decided:?}"
+            );
+        }
     }
 }

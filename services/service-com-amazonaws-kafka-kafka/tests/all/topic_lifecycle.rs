@@ -420,24 +420,26 @@ async fn delete_rejects_an_unknown_cluster_or_topic() {
 
     // `(cluster ARN, topic name, expected status, expected error code)`. Rows: a
     // value that is not an ARN at all (the mistyped path segment, a parameter
-    // problem), then the ARN-shaped values that name no cluster of this account —
-    // which no resource-scoped permission can be matched against, so the
-    // data-plane authorization gate refuses them before any lookup — then a
-    // well-formed ARN no cluster answers for (absent, and belonging to another
-    // region), then the cluster that does exist with a topic it does not hold.
+    // problem) and ones naming a resource of another KIND, which are no cluster
+    // reference either and so keep that same parameter refusal, then the cluster
+    // REFERENCES that identify no cluster — which resolve to no resource a
+    // permission could be scoped to, so the data-plane authorization gate refuses
+    // them before any lookup — then a well-formed ARN no cluster answers for
+    // (absent, and belonging to another region), then the cluster that does exist
+    // with a topic it does not hold.
     let rows: Vec<(String, &str, u16, &str)> = vec![
         ("not-an-arn".to_string(), "kept", 400, "BadRequestException"),
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
             "kept",
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
             "kept",
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
@@ -858,10 +860,11 @@ async fn every_topic_operation_resolves_the_cluster_first() {
     // Rows: well-formed cluster ARNs no live cluster answers for (absent name,
     // another region, another partition), the one whose account makes it a cluster
     // the caller may not reach at all, the value that is not an ARN at all (the
-    // mistyped path segment, a parameter problem), then the ARN-shaped values that
-    // name no cluster of this account, which no resource-scoped permission can be
-    // matched against and which the data-plane authorization gate therefore
-    // refuses before any lookup.
+    // mistyped path segment, a parameter problem) and the ones naming a resource of
+    // another KIND, which are no cluster reference either and keep that same
+    // refusal, then the cluster REFERENCES that identify no cluster, which resolve
+    // to no resource a permission could be scoped to and which the data-plane
+    // authorization gate therefore refuses before any lookup.
     let rows: Vec<(&str, String, u16, &str)> = vec![
         (
             "absent cluster",
@@ -903,14 +906,14 @@ async fn every_topic_operation_resolves_the_cluster_first() {
         (
             "wrong service",
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/c/abc-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "wrong resource type",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/c/abc-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             "resource without an id",

@@ -516,14 +516,16 @@ async fn serves_a_cluster_with_no_broker_nodes() {
 /// A `ClusterArn` that names no cluster of this endpoint, and a `NextToken`
 /// this listing did not mint for the cluster being listed, are refused rather
 /// than answered with a page. The rows differ along how the value fails: a value
-/// that is no ARN at all keeps the parameter refusal, while an ARN that names no
-/// cluster — the wrong resource type, a truncated resource path, a foreign
-/// service — is refused by authorization; a cluster this region does not hold, and
-/// a real cluster read through another region's endpoint, are the miss.
+/// that is no ARN at all, and one naming a resource of another KIND — the wrong
+/// resource type, a foreign service — are no cluster reference and keep the
+/// parameter refusal, while a cluster REFERENCE that identifies no cluster (a
+/// truncated resource path) is refused by authorization; a cluster this region does
+/// not hold, and a real cluster read through another region's endpoint, are the
+/// miss.
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_cluster_arn_that_names_no_cluster() {
     let emulator = Emulator::new();
-    let naming_no_cluster = [
+    let another_kind = [
         (
             "operation-arn",
             format!(
@@ -532,24 +534,29 @@ async fn refuses_a_cluster_arn_that_names_no_cluster() {
             ),
         ),
         (
-            "missing-cluster-id",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster"),
-        ),
-        (
             "other-service",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster/a-cluster/cluster-id"),
         ),
     ];
-    for (case, value) in naming_no_cluster {
+    for (case, value) in another_kind {
         let reply = list_v2(&emulator, &value, "").await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case {case}: expected the authorization refusal for {value:?}, got {} {}",
+            (400, "BadRequestException"),
+            "case {case}: expected this listing's own refusal for {value:?}, got {} {}",
             reply.status,
             reply.body
         );
     }
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster");
+    let reply = list_v2(&emulator, &nameless, "").await;
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (403, "AccessDeniedException"),
+        "case missing-cluster-id: expected the authorization refusal for {nameless:?}, got {} {}",
+        reply.status,
+        reply.body
+    );
     let reply = list_v2(&emulator, "a-cluster", "").await;
     assert_eq!(
         reply.status, 400,

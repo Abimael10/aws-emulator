@@ -571,13 +571,31 @@ async fn an_unknown_cluster_is_not_found_whatever_the_body_asks_for() {
         reply.body
     );
 
-    // Rows: one per way an ARN can name no cluster — another vendor's namespace,
-    // another resource kind of this service, an extra resource segment, an empty
-    // region. Nothing can hold a permission scoped to a cluster they do not name,
-    // so authorization refuses each before the update resolves anything.
-    let naming_no_cluster = vec![
+    // Rows: one per way a value can be no cluster reference — another vendor's
+    // namespace, another resource kind of this service — which this surface answers
+    // as the parameter it cannot read, and one per way a cluster REFERENCE can
+    // identify no cluster — an extra resource segment, an empty region — which
+    // authorization refuses before the update resolves anything.
+    let another_kind = vec![
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
+    ];
+    for arn in &another_kind {
+        let reply = update_storage(
+            &emulator,
+            arn,
+            json!({ "currentVersion": version, "volumeSizeGB": 1000 }),
+        )
+        .await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (400, "BadRequestException"),
+            "case arn={arn:?}: expected this surface's parameter refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+    let naming_no_cluster = vec![
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
         format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
     ];
@@ -833,7 +851,9 @@ async fn each_update_records_its_own_operation() {
     }
 
     // Rows: a well-formed operation ARN nothing holds, a value that is no ARN at
-    // all, and values that ARE ARNs and name no cluster operation.
+    // all, values naming a resource of another KIND (neither a cluster-operation
+    // reference, so each is this reader's own refusal), and a REFERENCE of that kind
+    // that identifies no cluster operation (the authorization refusal).
     let unknown = format!(
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/history/11111111-2222-4333-8444-555555555555-1/99999999-8888-4777-8666-555555555555"
     );
@@ -845,28 +865,29 @@ async fn each_update_records_its_own_operation() {
         reply.status,
         reply.body
     );
-    let reply = describe_operation(&emulator, "not-an-arn").await;
-    assert_eq!(
-        (reply.status, reply.error_code()),
-        (400, "BadRequestException"),
-        "case arn=\"not-an-arn\": expected 400 BadRequestException, got {} {}",
-        reply.status,
-        reply.body
-    );
-    for naming_no_operation in [
+    for value in [
+        "not-an-arn".to_string(),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/history/abc-1"),
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster-operation/history/abc-1/def"),
-        format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/history/abc-1"),
     ] {
-        let reply = describe_operation(&emulator, &naming_no_operation).await;
+        let reply = describe_operation(&emulator, &value).await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case arn={naming_no_operation:?}: expected the authorization refusal, got {} {}",
+            (400, "BadRequestException"),
+            "case arn={value:?}: expected 400 BadRequestException, got {} {}",
             reply.status,
             reply.body
         );
     }
+    let truncated = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/history/abc-1");
+    let reply = describe_operation(&emulator, &truncated).await;
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (403, "AccessDeniedException"),
+        "case arn={truncated:?}: expected the authorization refusal, got {} {}",
+        reply.status,
+        reply.body
+    );
 
     // An operation belongs to its cluster, so deleting the cluster takes its
     // history with it.

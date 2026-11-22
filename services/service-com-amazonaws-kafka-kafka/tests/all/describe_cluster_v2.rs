@@ -301,11 +301,12 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
     sleep_past_activation();
 
     // Rows: (ClusterArn, expected status, expected error code). This reader's
-    // action is one only a cluster's OWN resource-based policy can grant, so a
-    // request that names no cluster reaches no grant whatever the value's shape:
-    // the wrong service, the wrong resource type, a missing segment, an extra one
-    // and a value that is no ARN at all are each the authorization refusal, taken
-    // before anything resolves.
+    // action is one only a cluster's OWN resource-based policy can grant, so a value
+    // that stands for no resource this endpoint could hold such a document on
+    // reaches no grant — a cluster reference with a missing or extra segment, and a
+    // value that is no ARN at all, are each the authorization refusal, taken before
+    // anything resolves. An ARN naming a resource of another KIND is no cluster
+    // reference at all, so this reader answers it itself.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/00000000-0000-4000-8000-000000000000-1"),
@@ -321,13 +322,13 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
         ),
         (
             format!("arn:aws:kinesis:{REGION}:{ACCOUNT}:cluster/wrong-service/00000000-0000-4000-8000-000000000000-1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/not-a-cluster/1"),
-            403,
-            "AccessDeniedException",
+            400,
+            "BadRequestException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/missing-id"),

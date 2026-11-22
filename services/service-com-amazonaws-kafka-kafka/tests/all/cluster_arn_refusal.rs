@@ -11,11 +11,14 @@
 //! RULE 1 (the gate that answers first, for every operation whose target is a
 //! resource this service names by ARN): the action such a call asks for applies to
 //! that resource, and a permission for it is scoped to the resource it is granted
-//! on — so a value that IS an ARN and names no resource of that kind matches no
-//! resource-scoped permission, reaches no grant, and is refused HTTP 403
+//! on — so a REFERENCE of that very kind which identifies no resource of it matches
+//! no resource-scoped permission, reaches no grant, and is refused HTTP 403
 //! `AccessDeniedException` naming the calling principal, the operation's IAM action
-//! and the resource the decision was taken over, before anything parses the value
-//! or resolves what it names.
+//! and the resource the decision was taken over, which is the WILDCARD: the
+//! reference resolved to no resource, so there was none to decide over. The sentence
+//! ends at that resource token. A value naming a resource of ANOTHER kind is no
+//! reference of this one, so no permission scoped to this kind is matched against it
+//! and the gate decides nothing about it: the operation answers it.
 //!
 //! RULE 2: a value that is no ARN AT ALL names no resource for a policy to be
 //! matched against, so it keeps the service's parameter refusal: HTTP 400
@@ -31,19 +34,21 @@
 //! Rule 2 does NOT hold for the four actions an MSK cluster POLICY governs
 //! (`CreateVpcConnection`, `GetBootstrapBrokers`, `DescribeCluster`,
 //! `DescribeClusterV2`): the only document that can grant one of them is the one
-//! attached to the cluster, so a request naming no cluster reaches no grant
-//! whatever the value's shape and Rule 1 answers it even for a value that is no
-//! ARN — which is the third suite below.
+//! attached to the cluster, so a value that stands for no resource this endpoint
+//! could hold such a document on reaches no grant and Rule 1 answers it even for a
+//! value that is no ARN — over the value AS SUBMITTED, there being nothing else it
+//! stands for — which is the third suite below.
 //!
 //! The rows span both dimensions the rules generalise over: which operation
 //! answers (every cluster-scoped reader, update, delete and policy call, the two
 //! cluster-operation readers, plus `GetCompatibleKafkaVersions`, which carries the
 //! ARN in a query parameter rather than in the URI path) and what makes the
 //! value unusable (not an ARN at all, a truncated ARN, a very long opaque string
-//! and a non-ASCII one for Rule 2; another service's namespace, another resource
-//! kind of this service, a cluster ARN missing or carrying an extra segment and one
-//! with an empty region for Rule 1 — none of which is a cluster ARN, and none a
-//! cluster-OPERATION ARN either, so one table serves both members).
+//! and a non-ASCII one for Rule 2; a reference of the operation's OWN resource kind
+//! missing a segment, carrying an extra one, and one with an empty region for Rule
+//! 1; another service's namespace, another resource kind of this service and the
+//! other kind this suite's two members carry for the half of Rule 1 the gate leaves
+//! to the operation).
 //!
 //! `CreateVpcConnection` is outside both rules: it names its target in the BODY, so
 //! authorization refuses a value that is no ARN at all there too
@@ -422,13 +427,59 @@ fn values_that_are_no_arn() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every way a value can BE an ARN and still name no resource either kind of
-/// member carries: none of these rows is an MSK cluster ARN, and none is an MSK
-/// cluster-OPERATION ARN either, so one table serves both members. The account
-/// segment of each row is the emulator's own, so no row is refused on the account
-/// it names: what refuses them is that nothing can hold a permission scoped to a
-/// resource they do not name.
-fn arns_naming_no_cluster() -> Vec<(&'static str, String)> {
+/// Every way a value can be a REFERENCE of the resource kind `member` carries and
+/// still identify no resource of it: the resource field of that kind with a segment
+/// missing, with one too many, and one whose Region segment is empty. The account
+/// segment of each row is the emulator's own, so no row is refused on the account it
+/// names: what refuses them is that they resolve to no resource for a permission to
+/// be scoped to.
+fn references_naming_no_resource(member: &str) -> Vec<(&'static str, String)> {
+    // The resource-type segment of the ARN kind each member carries, and the id
+    // path a well-formed one of that kind takes.
+    let (kind, id_path) = if member == CLUSTER_OPERATION_ARN_MEMBER {
+        (
+            "cluster-operation",
+            "a-cluster/11111111-2222-4333-8444-555555555555-1/\
+             99999999-8888-4777-8666-555555555555",
+        )
+    } else {
+        (
+            "cluster",
+            "a-cluster/11111111-2222-4333-8444-555555555555-1",
+        )
+    };
+    vec![
+        (
+            "a-resource-field-of-the-right-kind-missing-a-segment",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:{kind}/only-a-name"),
+        ),
+        (
+            "a-resource-field-of-the-right-kind-with-an-extra-segment",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:{kind}/{id_path}/extra"),
+        ),
+        (
+            "a-reference-of-the-right-kind-without-a-region",
+            format!("arn:aws:kafka::{ACCOUNT}:{kind}/{id_path}"),
+        ),
+    ]
+}
+
+/// Every way a value can be a well-formed ARN naming a resource of ANOTHER kind
+/// than `member` carries: another vendor's resource, another kind of this service's,
+/// and the OTHER kind this suite's two members carry. None of them is a reference of
+/// the operation's own kind, so the authorization gate decides nothing about them.
+fn arns_of_another_kind(member: &str) -> Vec<(&'static str, String)> {
+    let other_kind = if member == CLUSTER_OPERATION_ARN_MEMBER {
+        format!(
+            "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/\
+             11111111-2222-4333-8444-555555555555-1"
+        )
+    } else {
+        format!(
+            "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/\
+             11111111-2222-4333-8444-555555555555-1/99999999-8888-4777-8666-555555555555"
+        )
+    };
     vec![
         (
             "another-service-namespace",
@@ -441,37 +492,24 @@ fn arns_naming_no_cluster() -> Vec<(&'static str, String)> {
                  11111111-2222-4333-8444-555555555555-1"
             ),
         ),
-        (
-            "cluster-arn-missing-its-id-segment",
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name"),
-        ),
-        (
-            "cluster-arn-with-an-extra-segment",
-            format!(
-                "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/\
-                 11111111-2222-4333-8444-555555555555-1/extra"
-            ),
-        ),
-        (
-            "cluster-arn-without-a-region",
-            format!(
-                "arn:aws:kafka::{ACCOUNT}:cluster/a-cluster/\
-                 11111111-2222-4333-8444-555555555555-1"
-            ),
-        ),
+        ("the-other-kind-this-suite-drives", other_kind),
     ]
 }
 
 /// The sentence a request that reaches no grant is refused with: fixed connectives
 /// around the calling principal, the IAM action and the resource the decision was
-/// taken over, closed by IAM's default-deny clause naming the action nothing
-/// allowed.
+/// taken over, and nothing after that resource — no document was reached to be
+/// named.
 fn not_authorized(action: &str, resource: &str) -> String {
     format!(
         "User: arn:aws:iam::{ACCOUNT}:user/emulator is not authorized to perform: {action} on \
-         resource: {resource} because no identity-based policy allows the {action} action"
+         resource: {resource}"
     )
 }
+
+/// The resource an authorization decision is taken over when the value referenced
+/// none: IAM's wildcard.
+const ANY_RESOURCE: &str = "*";
 
 /// Assert `reply` is the refusal the service answers a value it cannot parse as
 /// the ARN kind `member` names: HTTP 400 `BadRequestException`, that surface's
@@ -608,13 +646,13 @@ async fn each_surface_answers_one_byte_identical_message() {
     );
 }
 
-/// RULE 1: every operation whose target is a resource named by ARN is authorized
-/// on that value as submitted, before anything parses it — so a value that reads as
-/// an ARN and names no resource of that kind matches no resource-scoped permission,
-/// reaches no grant, and is refused HTTP 403 `AccessDeniedException` naming the
-/// calling principal, that operation's IAM action and the resource the decision was
-/// taken over; whichever operation answers, and whatever makes the value name no
-/// resource.
+/// RULE 1: every operation whose target is a resource named by ARN is authorized on
+/// that value as submitted, before anything parses it — so a REFERENCE of its own
+/// resource kind that identifies no resource of that kind matches no resource-scoped
+/// permission, reaches no grant, and is refused HTTP 403 `AccessDeniedException`
+/// naming the calling principal, that operation's IAM action and the WILDCARD, the
+/// decision having been taken over no resource at all; whichever operation answers,
+/// and whatever makes the reference identify none.
 #[tokio::test]
 async fn an_arn_that_names_no_cluster_is_refused_by_authorization_not_as_a_parameter() {
     let emulator = Emulator::new();
@@ -627,7 +665,7 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_not_as_a_param
     sleep_past_activation();
 
     for operation in operations() {
-        for (case, value) in arns_naming_no_cluster() {
+        for (case, value) in references_naming_no_resource(operation.member) {
             let reply = emulator
                 .call(operation.method, &operation.uri(&value), operation.body())
                 .await;
@@ -641,8 +679,14 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_not_as_a_param
             );
             assert_eq!(
                 reply.error_message(),
-                not_authorized(&operation.action(), &value),
-                "case {case}: expected the default-deny sentence, got {:?}",
+                not_authorized(&operation.action(), ANY_RESOURCE),
+                "case {case}: expected the refusal over the wildcard, got {:?}",
+                reply.error_message()
+            );
+            assert!(
+                !reply.error_message().contains(value.as_str()),
+                "case {case}: the decision was taken over no resource, so the refusal must not \
+                 echo the submitted value, got {:?}",
                 reply.error_message()
             );
             assert!(
@@ -665,6 +709,55 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_not_as_a_param
         "case control: the held cluster must still be served, got {} {}",
         described.status,
         described.body
+    );
+}
+
+/// RULE 1 (the half the gate does NOT take): a value naming a resource of another
+/// KIND than the operation's target is no reference of that kind at all, so no
+/// permission scoped to it is ever matched against the value and the gate decides
+/// nothing — the operation answers the reference it cannot use, never with the
+/// authorization refusal. Driven over every operation this suite carries, crossed
+/// with every kind of ARN that is not its own.
+#[tokio::test]
+async fn an_arn_of_another_resource_kind_is_left_to_the_operation() {
+    let emulator = Emulator::new();
+
+    let held = emulator
+        .create_ok(&ClusterRequest::named("other-kind-control"))
+        .await;
+    sleep_past_activation();
+
+    for operation in operations() {
+        for (case, value) in arns_of_another_kind(operation.member) {
+            let reply = emulator
+                .call(operation.method, &operation.uri(&value), operation.body())
+                .await;
+            let case = format!("{case}/{}", operation.name);
+            // The operation's own refusal for a reference it cannot read — the same
+            // one Rule 2 gives a value that is no ARN, since neither names a
+            // resource of the kind the member carries.
+            assert_unparsable_arn(
+                &reply,
+                &case,
+                operation.member,
+                operation.message,
+                &value,
+            );
+            assert!(
+                !reply.error_message().contains("is not authorized to perform"),
+                "case {case}: the operation's own refusal carries no authorization sentence, got \
+                 {:?}",
+                reply.error_message()
+            );
+        }
+    }
+
+    // The control: the cluster this endpoint holds is still served.
+    let described = emulator.describe(&held).await;
+    assert_eq!(
+        described.status, 200,
+        "case control: the held cluster must still be served, got {} {}",
+        described.status, described.body
     );
 }
 
@@ -747,10 +840,11 @@ async fn the_gates_are_ordered_and_each_answers_its_own_values() {
 
 /// RULE 1 (its other half): for the four actions an MSK cluster POLICY governs,
 /// the only document that can grant the call is the one attached to the cluster —
-/// so a request that names no cluster reaches no grant whatever the value's shape,
-/// and even a value that is no ARN at all is the authorization refusal rather than
-/// the parameter one. The rows are every such operation this suite drives, crossed
-/// with every value that is no ARN.
+/// so a value that stands for no resource this endpoint could hold such a document
+/// on reaches no grant, and even a value that is no ARN at all is the authorization
+/// refusal rather than the parameter one, taken over the value AS SUBMITTED, there
+/// being nothing else it stands for. The rows are every such operation this suite
+/// drives, crossed with every value that is no ARN.
 #[tokio::test]
 async fn an_action_only_a_cluster_policy_can_grant_is_refused_for_any_unmatchable_value() {
     let emulator = Emulator::new();
@@ -773,11 +867,12 @@ async fn an_action_only_a_cluster_policy_can_grant_is_refused_for_any_unmatchabl
                 reply.status,
                 reply.body
             );
-            // The decision was taken over no resource at all, so the refusal names
-            // IAM's wildcard rather than echoing what the request sent.
-            assert!(
-                !reply.error_message().contains(value.as_str()),
-                "case {case}: the refusal must not echo the submitted value, got {:?}",
+            // Nothing resolves such a value, so the decision was taken over the
+            // value itself and the refusal names it.
+            assert_eq!(
+                reply.error_message(),
+                not_authorized(&operation.action(), &value),
+                "case {case}: expected the refusal over the submitted value, got {:?}",
                 reply.error_message()
             );
         }

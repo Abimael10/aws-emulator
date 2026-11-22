@@ -129,10 +129,13 @@ fn unreadable_references() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every way a submitted reference can BE an ARN and still name neither an MSK
-/// cluster nor an MSK replicator. The account segment of each row is the
+/// Every way a submitted reference can BE a well-formed ARN naming a resource of
+/// ANOTHER KIND than the delete's target — another vendor's, and another of this
+/// service's. Neither delete can read one as its own target, and neither decides an
+/// authorization question over it: no permission scoped to the target's kind is ever
+/// matched against a resource of another. The account segment of each row is the
 /// emulator's own, so no row is refused on the account it names.
-fn arns_naming_no_resource() -> Vec<(&'static str, String)> {
+fn arns_of_another_kind() -> Vec<(&'static str, String)> {
     vec![
         (
             "another-service-namespace",
@@ -142,6 +145,13 @@ fn arns_naming_no_resource() -> Vec<(&'static str, String)> {
             "another-resource-kind-of-this-service",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/{GHOST_ID}"),
         ),
+    ]
+}
+
+/// Every way a submitted reference can BE a CLUSTER reference and still identify no
+/// cluster: the resource field with a segment missing, and with one too many.
+fn cluster_references_naming_no_cluster() -> Vec<(&'static str, String)> {
+    vec![
         (
             "cluster-arn-missing-its-id-segment",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name"),
@@ -223,7 +233,13 @@ async fn an_unreadable_reference_is_blamed_on_the_input_its_surface_names() {
     let emulator = Emulator::new();
 
     for delete in deletes() {
-        for (form, reference) in unreadable_references() {
+        // A value that is no ARN at all, and one naming a resource of another KIND:
+        // neither is a reference to the delete's own target, so each surface blames
+        // the input it names, with its own fixed sentence.
+        for (form, reference) in unreadable_references()
+            .into_iter()
+            .chain(arns_of_another_kind())
+        {
             for probe in version_probes() {
                 let case = format!("{}/{form}/currentVersion={probe:?}", delete.name);
                 let reply = emulator
@@ -241,12 +257,13 @@ async fn an_unreadable_reference_is_blamed_on_the_input_its_surface_names() {
             }
         }
 
-        // A value that IS an ARN and names no resource: on the CLUSTER delete the
-        // action asks for a cluster nothing can hold a permission over, so
-        // authorization answers before the reference is read and the attribution
-        // never arises; the replicator delete, whose target is a replicator,
-        // blames its own ARN member as before.
-        for (form, reference) in arns_naming_no_resource() {
+        // A CLUSTER reference that identifies no cluster: on the CLUSTER delete the
+        // action asks for a cluster that resolves to no resource a permission could
+        // be scoped to, so authorization answers before the reference is read and
+        // the attribution never arises; the replicator delete, whose target is a
+        // replicator, reads it as no reference of its own kind and blames its own
+        // ARN member as before.
+        for (form, reference) in cluster_references_naming_no_cluster() {
             for probe in version_probes() {
                 let case = format!("{}/{form}/currentVersion={probe:?}", delete.name);
                 let reply = emulator

@@ -471,17 +471,19 @@ async fn an_update_outside_the_rule_is_refused_and_changes_nothing() {
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
     );
     let wrong_resource_type = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/refusals/abc");
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name");
     let another_region = format!(
         "arn:aws:kafka:us-east-1:{ACCOUNT}:cluster/refusals/11111111-2222-4333-8444-555555555555-1"
     );
 
     // `(case, cluster arn, currentVersion, targetBrokerEBSVolumeInfo, status, code)`.
-    // Rows: each way the ARN can fail — a value that is no ARN at all is the
-    // parameter refusal, one that IS an ARN and names no cluster is refused by
-    // authorization before anything resolves, and a well-formed cluster ARN this
-    // endpoint holds no cluster for is the miss — then each way the target list can
-    // fail (count, broker id, nothing to set), each bound of
-    // `EBSStorageInfo$VolumeSize` passed by one, a shrink, and a stale version.
+    // Rows: each way the ARN can fail — a value that is no ARN at all and one naming
+    // a resource of another KIND are both this surface's parameter refusal, a
+    // cluster reference that identifies no cluster is refused by authorization
+    // before anything resolves, and a well-formed cluster ARN this endpoint holds no
+    // cluster for is the miss — then each way the target list can fail (count,
+    // broker id, nothing to set), each bound of `EBSStorageInfo$VolumeSize` passed by
+    // one, a shrink, and a stale version.
     let rows: Vec<(&str, &str, &str, Value, u16, &str)> = vec![
         (
             "malformed-arn",
@@ -494,6 +496,14 @@ async fn an_update_outside_the_rule_is_refused_and_changes_nothing() {
         (
             "wrong-resource-type",
             wrong_resource_type.as_str(),
+            version.as_str(),
+            json!([target("ALL", Some(200), None)]),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "a-cluster-reference-identifying-no-cluster",
+            nameless.as_str(),
             version.as_str(),
             json!([target("ALL", Some(200), None)]),
             403,

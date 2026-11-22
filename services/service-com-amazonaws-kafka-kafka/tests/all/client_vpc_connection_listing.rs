@@ -561,11 +561,12 @@ async fn a_deleted_connection_leaves_the_listing() {
     }
 }
 
-/// RULE: a value that is no ARN at all, and a well-formed cluster ARN this Region
-/// holds no cluster for, are refused as a bad request naming the cluster-ARN member
-/// — this operation models no not-found error — and so is a `NextToken` it did not
-/// mint for this cluster. A value that IS an ARN and names no cluster is refused
-/// earlier still, by authorization.
+/// RULE: a value that is no ARN at all, an ARN naming a resource of another KIND,
+/// and a well-formed cluster ARN this Region holds no cluster for are refused as a
+/// bad request naming the cluster-ARN member — this operation models no not-found
+/// error — and so is a `NextToken` it did not mint for this cluster. A value that
+/// IS a cluster reference and identifies no cluster is refused earlier still, by
+/// authorization.
 #[tokio::test]
 async fn an_unresolvable_request_is_refused() {
     let emulator = Emulator::new();
@@ -646,11 +647,10 @@ async fn an_unresolvable_request_is_refused() {
         );
     }
 
-    // The values that ARE ARNs and name no cluster: nothing can hold a permission
-    // scoped to a cluster they do not name, so authorization answers them before
-    // this listing resolves anything. The rows differ along what makes the value
-    // name no cluster: another vendor's resource, and another kind of this
-    // service's.
+    // An ARN naming a resource of another KIND is no cluster reference at all, so
+    // no permission scoped to a cluster is matched against it and this listing
+    // answers it as the parameter it is. The rows differ along what kind of
+    // resource it names: another vendor's, and another of this service's.
     for (case, value) in [
         (
             "an ARN of another service",
@@ -667,10 +667,30 @@ async fn an_unresolvable_request_is_refused() {
         let reply = emulator.list_client_vpc_connections(&value, "").await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case {case}: expected the authorization refusal, got {} {}",
+            (400, "BadRequestException"),
+            "case {case}: expected this listing's own refusal, got {} {}",
             reply.status,
             reply.body
         );
+        assert_eq!(
+            reply.at("/invalidParameter").as_str(),
+            Some(CLUSTER_ARN_MEMBER),
+            "case {case}: expected the refusal to name {CLUSTER_ARN_MEMBER}, got {}",
+            reply.body
+        );
     }
+
+    // A cluster REFERENCE that identifies no cluster resolves to no resource a
+    // permission could be scoped to, so authorization answers it before this
+    // listing resolves anything.
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name");
+    let denied = emulator.list_client_vpc_connections(&nameless, "").await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case a cluster reference identifying no cluster: expected the authorization refusal, \
+         got {} {}",
+        denied.status,
+        denied.body
+    );
 }

@@ -780,8 +780,11 @@ async fn an_explicit_deny_in_the_cluster_policy_refuses_the_readers_it_governs()
 /// the request NAMES, before that target is resolved or parsed, so a
 /// `TargetClusterArn` the caller holds no grant over is refused HTTP 403
 /// `AccessDeniedException` naming the principal, the IAM action and the resource
-/// the decision was taken over — the wildcard when the value names no resource at
-/// all — and never a parameter complaint about the value's shape.
+/// the decision was taken over — the value as submitted where nothing resolves it,
+/// the wildcard where it is a cluster reference identifying no cluster — and never
+/// a parameter complaint about the value's shape. A value naming a resource of
+/// another KIND is no cluster reference at all, so that gate decides nothing about
+/// it and the operation answers.
 #[tokio::test]
 async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refusal() {
     let emulator = Emulator::new();
@@ -789,51 +792,42 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
 
     // The rows differ along every way a value can fail to name a cluster of this
     // account: not an ARN at all (free text, empty, a truncated ARN, a very long
-    // opaque value, a non-ASCII one), an ARN of another vendor, an ARN of another
-    // resource kind of this service, and a cluster ARN missing its id segment.
-    // The resource the refusal names is the value where the value is an ARN —
-    // which IAM matched against the caller's statements and none covered — and the
-    // wildcard where it is not, where there was nothing to match at all.
+    // opaque value, a non-ASCII one) and a cluster reference missing its id
+    // segment. The resource the refusal names is the value where nothing resolves
+    // it — the decision was taken over the value itself, there being nothing else
+    // it stands for — and the wildcard where it IS a cluster reference and
+    // identifies no cluster, the decision then having been taken over no resource.
     let wildcard = "*";
     let long = format!("not-a-cluster-arn-{}", "x".repeat(200));
-    let configuration = format!(
-        "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/{GHOST_ID}"
-    );
-    let instance = format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d");
+    let non_ascii = "ニセのクラスター-arn".to_string();
     let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name");
     let rows: Vec<(&str, String, &str)> = vec![
-        ("not-an-arn-at-all", "not-a-cluster-arn".to_string(), wildcard),
-        ("free-text-with-spaces", "not an arn at all".to_string(), wildcard),
-        ("empty", String::new(), wildcard),
-        ("truncated-arn", "arn:aws:kafka".to_string(), wildcard),
-        ("a-long-opaque-value", long.clone(), wildcard),
-        ("a-non-ascii-value", "ニセのクラスター-arn".to_string(), wildcard),
-        ("another-vendor", instance.clone(), instance.as_str()),
         (
-            "another-resource-kind-of-this-service",
-            configuration.clone(),
-            configuration.as_str(),
+            "not-an-arn-at-all",
+            "not-a-cluster-arn".to_string(),
+            "not-a-cluster-arn",
         ),
         (
-            "a-cluster-arn-without-its-id-segment",
+            "free-text-with-spaces",
+            "not an arn at all".to_string(),
+            "not an arn at all",
+        ),
+        ("empty", String::new(), ""),
+        ("truncated-arn", "arn:aws:kafka".to_string(), "arn:aws:kafka"),
+        ("a-long-opaque-value", long.clone(), long.as_str()),
+        ("a-non-ascii-value", non_ascii.clone(), non_ascii.as_str()),
+        (
+            "a-cluster-reference-without-its-id-segment",
             nameless.clone(),
-            nameless.as_str(),
+            wildcard,
         ),
     ];
 
     for (case, value, resource) in &rows {
-        // A value that READS as an ARN is a resource the decision was taken over
-        // and nothing granted, which IAM's default-deny clause says; one that
-        // reads as no resource was decided over the wildcard, where no document
-        // was reached to be named.
-        let expected = if *resource == wildcard {
-            not_authorized(action, resource)
-        } else {
-            format!(
-                "{} because no identity-based policy allows the {action} action",
-                not_authorized(action, resource)
-            )
-        };
+        // One sentence for both: the principal, the action and the resource the
+        // decision was taken over, ending there — no document was reached to be
+        // named in a clause.
+        let expected = not_authorized(action, resource);
         let request = ConnectionRequest {
             target_cluster_arn: value.clone(),
             ..ConnectionRequest::to("")
@@ -853,6 +847,38 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
         };
         let reply = emulator.create_vpc_connection(&unusable).await;
         assert_access_denied(&reply, &format!("{case} with an unusable body"), &expected);
+    }
+
+    // An ARN naming a resource of ANOTHER kind is no cluster reference, so no
+    // permission scoped to a cluster is ever matched against it: the gate decides
+    // nothing and the operation answers the target it cannot use.
+    let configuration = format!(
+        "arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/a-configuration/{GHOST_ID}"
+    );
+    let instance = format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d");
+    for (case, value) in [
+        ("another-vendor", &instance),
+        ("another-resource-kind-of-this-service", &configuration),
+    ] {
+        let reply = emulator
+            .create_vpc_connection(&ConnectionRequest {
+                target_cluster_arn: value.clone(),
+                ..ConnectionRequest::to("")
+            })
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (400, "BadRequestException"),
+            "case {case}: expected the operation's own refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
+        assert!(
+            !reply.error_message().contains("is not authorized to perform"),
+            "case {case}: an ARN of another resource kind is no reference the gate decides over, \
+             got {:?}",
+            reply.error_message()
+        );
     }
 
     // A cluster ARN of ANOTHER account does name a resource, and the account that

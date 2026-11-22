@@ -577,10 +577,10 @@ async fn the_node_listing_refuses_an_unresolvable_request() {
         }
     }
 
-    // A `ClusterArn` that IS an ARN and names no MSK cluster matches no
-    // resource-scoped permission, so the listing is refused by authorization
-    // before it resolves anything. The rows differ along what makes the value name
-    // no cluster: another vendor's resource, and another kind of this service's.
+    // A `ClusterArn` naming a resource of another KIND is no cluster reference, so
+    // no permission scoped to a cluster is matched against it and the listing
+    // answers it as the parameter it cannot read. The rows differ along what kind of
+    // resource it names: another vendor's, and another of this service's.
     for (case, value) in [
         (
             "an ARN of another service",
@@ -597,12 +597,26 @@ async fn the_node_listing_refuses_an_unresolvable_request() {
         let reply = list_nodes(&emulator, &value, "").await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (403, "AccessDeniedException"),
-            "case {case}: expected the authorization refusal, got {} {}",
+            (400, "BadRequestException"),
+            "case {case}: expected this listing's own refusal, got {} {}",
             reply.status,
             reply.body
         );
     }
+
+    // A cluster REFERENCE that identifies no cluster resolves to no resource a
+    // permission could be scoped to, so the listing is refused by authorization
+    // before it resolves anything.
+    let nameless = format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/only-a-name");
+    let denied = list_nodes(&emulator, &nameless, "").await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case a cluster reference identifying no cluster: expected the authorization refusal, \
+         got {} {}",
+        denied.status,
+        denied.body
+    );
 
     // A cluster lives in one region, so another region's endpoint holds none for
     // its ARN — the same answer an absent cluster gets.

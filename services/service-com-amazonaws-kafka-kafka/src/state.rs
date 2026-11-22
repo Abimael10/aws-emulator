@@ -3171,6 +3171,12 @@ pub const CLUSTER_RESOURCE_TYPE: &str = "cluster";
 /// The resource-type segment of an MSK channel ARN.
 pub const CHANNEL_RESOURCE_TYPE: &str = "channel";
 
+/// The resource-type segment of an MSK cluster-OPERATION ARN, which is what
+/// [`is_cluster_operation_arn`] reads and what the gate deciding over such a
+/// target ([`authorization::authorize_cluster_operation_target`]) names as the
+/// kind its action applies to.
+pub const CLUSTER_OPERATION_RESOURCE_TYPE: &str = "cluster-operation";
+
 /// The resource-type segment of an MSK replicator ARN.
 pub const REPLICATOR_RESOURCE_TYPE: &str = "replicator";
 
@@ -4666,7 +4672,7 @@ pub fn is_cluster_operation_arn(value: &str) -> bool {
             segments.next()
         ),
         (
-            Some("cluster-operation"),
+            Some(CLUSTER_OPERATION_RESOURCE_TYPE),
             Some(name),
             Some(cluster_id),
             Some(operation_id),
