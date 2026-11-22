@@ -29,11 +29,19 @@
 //! the listed template through the identity the summary alone reported — the
 //! `id` and the `arn` — so a summary that reported an identity nothing resolves
 //! would fail here.
+//!
+//! The last table crosses the projection with the PAGE the summary arrived on:
+//! a page boundary cuts a listing, so every page size the model admits — not
+//! only the one-entry page the tables above read — has to report each element in
+//! full.
+
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
     TAG_PROPAGATION_RESOURCE_TYPE_VALUES, TEMPLATE_STATUS_VALUES,
 };
+use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 
 use crate::harness::{domain, is_minted_id, string_at, Emulator};
 
@@ -697,5 +705,179 @@ async fn a_summary_carries_every_member_whatever_shape_the_listing_request_takes
             seen > 0,
             "case {shape:?}: the listing must report at least one template to project, got none"
         );
+    }
+}
+
+/// Every summary of one listing, gathered page by page with the listing cut at
+/// `max_results` (`None` for a request that names no page size).
+///
+/// A page may hold no more entries than the cut admits, and following the tokens
+/// has to terminate: a listing that kept handing one out fails here rather than
+/// running on. `at_most` is how many entries the listing can report at all,
+/// which bounds the number of pages.
+async fn summaries_page_by_page(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    max_results: Option<i32>,
+    at_most: usize,
+) -> Vec<Value> {
+    let limit = max_results.unwrap_or(MAX_PAGE_SIZE) as usize;
+    let mut gathered: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= at_most + 1,
+            "case {case:?}: following nextToken must terminate, but page {pages} still carried \
+             one after {} summary(s)",
+            gathered.len()
+        );
+        let query = match (max_results, &token) {
+            (Some(size), Some(value)) => format!("?maxResults={size}&nextToken={value}"),
+            (Some(size), None) => format!("?maxResults={size}"),
+            (None, Some(value)) => format!("?nextToken={value}"),
+            (None, None) => String::new(),
+        };
+        let answer = list(emulator, case, domain_id, &query).await;
+        let page = answer
+            .get("templates")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a listing must carry templates, got {answer:?}")
+            })
+            .clone();
+        assert!(
+            page.len() <= limit,
+            "case {case:?}: page {pages} may hold at most {limit} summary(s), got {}",
+            page.len()
+        );
+        gathered.extend(page);
+        token = answer
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            return gathered;
+        }
+    }
+}
+
+/// The summary of `template_id` among the ones a traversal gathered.
+fn summary_among(case: &str, summaries: &[Value], template_id: &str) -> Value {
+    summaries
+        .iter()
+        .find(|summary| summary.get("templateId").and_then(Value::as_str) == Some(template_id))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the pages must report template {template_id}: {summaries:?}")
+        })
+        .clone()
+}
+
+/// A page boundary CUTS a listing; it does not change what an element of it
+/// reports. Whatever page size the request names, every summary on every page is
+/// the full projection of its stored template — identity under both names it is
+/// reported by, name, status and the tag-propagation list, empty rather than
+/// absent — each stored template is reported exactly once across the pages, and
+/// a traversal reports the same elements as the one before it, because listing
+/// changes nothing.
+///
+/// The rows span the page sizes the request can name: both bounds of the model's
+/// `MaxResults` range for this operation (`MAX_PAGE_SIZE` is this service's
+/// reading of the `@range(1..100)` it shares with the `@length(max: 100)` of the
+/// list a page carries), sizes inside the range that do and do not divide the
+/// listing, a size that holds the whole listing, and no page size at all. The
+/// templates themselves are the table at the top of this suite, so each page
+/// carries elements of differing tag-propagation shape and status.
+#[tokio::test]
+async fn every_page_of_a_cut_listing_carries_the_full_projection() {
+    // The region the caller signs for, which is the one the ARN each summary
+    // reports is scoped to: named once, so the emulator and the expected ARNs
+    // below cannot drift apart.
+    const REGION: &str = "us-east-1";
+
+    let emulator = Emulator::in_region(REGION);
+    let domain_id = domain(&emulator, "paged-summary-domain").await;
+
+    let rows = rows();
+    let mut created: Vec<(String, String, String)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("paged-template-{index:03}");
+        let case = format!("create {name}");
+        let (template_id, _) = create(&emulator, &case, &domain_id, &name, row).await;
+        created.push((
+            template_id,
+            name,
+            row.status.unwrap_or("Active").to_string(),
+        ));
+    }
+
+    let entries = rows.len() as i32;
+    let cuts: Vec<Option<i32>> = vec![
+        None,
+        Some(1),
+        Some(2),
+        Some(entries - 1),
+        Some(entries),
+        Some(MAX_PAGE_SIZE),
+    ];
+
+    let mut first_traversal: Option<(String, Vec<Value>)> = None;
+    for cut in cuts {
+        let case = match cut {
+            Some(size) => format!("maxResults={size}"),
+            None => "no maxResults".to_string(),
+        };
+        let gathered =
+            summaries_page_by_page(&emulator, &case, &domain_id, cut, rows.len()).await;
+        assert_eq!(
+            gathered.len(),
+            created.len(),
+            "case {case:?}: following the pages to exhaustion must report every template, got \
+             {gathered:?}"
+        );
+
+        // Every element in full, whichever page it arrived on.
+        for (row, (template_id, name, status)) in rows.iter().zip(created.iter()) {
+            let element = format!("{case}, {}", row.case);
+            let summary = summary_among(&element, &gathered, template_id);
+            assert_summary(
+                &element,
+                &summary,
+                &Stored {
+                    region: REGION,
+                    domain_id: &domain_id,
+                    template_id,
+                    name,
+                    status,
+                    tag_propagation_configurations: &row.tag_propagation_configurations,
+                },
+            );
+        }
+
+        // Exactly once each: a template reported on two pages would be counted
+        // twice by a client that pages through the listing.
+        let identities: Vec<String> = gathered
+            .iter()
+            .map(|summary| string_at(summary, "id", &case))
+            .collect();
+        let distinct: BTreeSet<&String> = identities.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            identities.len(),
+            "case {case:?}: no template may be reported on two pages, got {identities:?}"
+        );
+
+        // And the same elements, in the same order, as the traversal before it.
+        match &first_traversal {
+            None => first_traversal = Some((case, gathered)),
+            Some((first_case, first)) => assert_eq!(
+                &gathered, first,
+                "case {case:?}: a page size cuts the listing, it does not reorder it or change \
+                 what an element reports: expected what {first_case:?} reported ({first:?}), got \
+                 {gathered:?}"
+            ),
+        }
     }
 }
