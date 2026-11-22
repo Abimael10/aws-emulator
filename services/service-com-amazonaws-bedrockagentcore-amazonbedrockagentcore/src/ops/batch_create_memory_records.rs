@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with its own sentence, the one its readers refuse with, so the container level
         // of this plane reads the same whichever record operation reports it. The
         // inventory is read and released before this service's own store is taken.
-        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+        crate::state::memory_item_container_resolved(&*self.engine, &input.memory_id).map_err(
             |missing| match missing {
                 Some(message) => {
                     BatchCreateMemoryRecordsErrorModeled::ResourceNotFoundException(

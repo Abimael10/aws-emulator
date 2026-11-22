@@ -333,7 +333,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     ///
     /// A container this plane holds no record for reports none, which is not a statement
     /// about whether the CONTAINER exists — that is resolved against the component that
-    /// owns it ([`super::memory_record_container_resolved`]) before this is read. The
+    /// owns it ([`super::memory_item_container_resolved`]) before this is read. The
     /// records are borrowed rather than cloned, so only the page a response carries is
     /// ever materialised.
     #[must_use]

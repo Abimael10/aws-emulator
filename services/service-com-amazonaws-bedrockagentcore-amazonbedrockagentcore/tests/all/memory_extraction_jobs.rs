@@ -13,6 +13,11 @@
 //! is bounded by `maxResults` with a `nextToken` resuming after it, and the listing
 //! reports nothing about an extraction attempt (no `status`, no `failureReason`).
 //!
+//! A listing addressing a container the account does not hold is refused at that CONTAINER
+//! level, worded the way the surfaces that address a container's stored memory ITEMS word
+//! an absent container — after the memory-item store, with no part of the request in the
+//! sentence — which is not how the same container's EVENTS word that same level.
+//!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so the wire shape (routes, status codes, `restJson1` bodies, modelled error
 //! codes) is exercised, not just the handler functions.
@@ -21,7 +26,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-use super::harness::{create_memory, label};
+use super::harness::{create_memory, delete_memory, label};
 
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
@@ -29,15 +34,26 @@ const MEMORY: &str = "extraction-memory-0123456789";
 /// The same memory addressed by its ARN spelling, which that same pattern admits.
 const MEMORY_ARN: &str =
     "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/extraction-memory-0123456789";
-/// A memory id the CONTROL plane never created, so nothing addresses a container.
+/// A memory id the CONTROL plane never created, so nothing addresses a container, and the
+/// ARN spelling of that same absent id.
 const ABSENT_MEMORY: &str = "absent-memory-0123456789";
+const ABSENT_MEMORY_ARN: &str =
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/absent-memory-0123456789";
 
-/// The emulator, with request authentication off so a test signs nothing.
+/// A container the CONTROL plane created, which took an event, and which the CONTROL plane
+/// then deleted: this plane still has that session's unit of extraction work indexed under
+/// the id, and the ARN spelling of it.
+const DELETED_MEMORY: &str = "gone-memory-9876543210";
+const DELETED_MEMORY_ARN: &str =
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/gone-memory-9876543210";
+
+/// The emulator and the shared engine beside it, with request authentication off so a test
+/// signs nothing.
 ///
 /// The memory container this suite reads is created first, through the shared inventory
 /// the CONTROL plane's `CreateMemory` writes: a call addressing a container that was
 /// never created is refused.
-fn emulator() -> MultiServiceRouter {
+fn emulator_with_engine() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     create_memory(&engine, MEMORY);
     let mut router = MultiServiceRouter::new();
@@ -47,7 +63,12 @@ fn emulator() -> MultiServiceRouter {
             Arc::clone(&engine),
         ),
     );
-    router
+    (engine, router)
+}
+
+/// The emulator alone, for a case that needs no further control-plane change.
+fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().1
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` for an
@@ -761,23 +782,229 @@ async fn pages_are_bounded_and_resume() {
     }
 }
 
-/// A container the CONTROL plane never created is refused with the resource it addressed,
-/// and one it created but nothing has been written into holds no job.
-#[tokio::test]
-async fn container_is_resolved_before_the_listing() {
-    let router = emulator();
+/// The whole sentence a call on a container's stored memory ITEMS is refused with when the
+/// `memoryId` it addresses names no container the account holds. Fixed text: no part of it
+/// comes from the request or from the store.
+const CONTAINER_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
 
-    let (status, answer) = list_extraction_jobs(&router, ABSENT_MEMORY, json!({})).await;
+/// The whole sentence a call on the same container's EVENTS is refused with at that same
+/// level: the container's own label, `": "`, then the identifier the request spelled.
+fn event_surface_message(memory_id: &str) -> String {
+    format!("Memory not found: {memory_id}")
+}
+
+/// Every string a request spelled for itself: the `memoryId` on its path and every string
+/// its body carries, none of which a refusal with no variable part may name.
+fn spelled_values(memory_id: &str, body: &Value) -> Vec<String> {
+    let mut spelled = vec![memory_id.to_string()];
+    collect_strings(body, &mut spelled);
+    spelled
+}
+
+fn collect_strings(value: &Value, into: &mut Vec<String>) {
+    match value {
+        Value::String(spelled) => into.push(spelled.clone()),
+        Value::Array(items) => items.iter().for_each(|item| collect_strings(item, into)),
+        Value::Object(members) => members
+            .values()
+            .for_each(|member| collect_strings(member, into)),
+        _ => {}
+    }
+}
+
+/// Every listing whose `memoryId` names no container the account holds is refused 404
+/// `ResourceNotFoundException` with the memory-item sentence — however the container came
+/// not to be held, in whichever form the memory id arrived, and whatever page or filter the
+/// request asked for.
+#[tokio::test]
+async fn an_absent_container_is_refused_with_the_memory_item_sentence() {
+    let (engine, router) = emulator_with_engine();
+
+    // A container the control plane created, which took one event, and then deleted: this
+    // plane still holds that session's unit of work, and existence is still the owning
+    // component's answer.
+    create_memory(&engine, DELETED_MEMORY);
+    let (status, created) = create_event(
+        &router,
+        DELETED_MEMORY,
+        json!({
+            "actorId": "actor-orphan",
+            "sessionId": "session-orphan",
+            "eventTimestamp": 1_762_000_000,
+            "payload": [conversational("USER", "remember this")],
+        }),
+    )
+    .await;
     assert_eq!(
-        (status, error_code(&answer)),
-        (404, "ResourceNotFoundException"),
-        "case absent: a container that was never created must be refused, got {status} {answer}"
+        status, 201,
+        "the fixture event of the container to be deleted must be created, got {status} \
+         {created}"
     );
+    delete_memory(&engine, DELETED_MEMORY);
+
+    // A `nextToken` this very operation issued, so a row can resume a page against a
+    // container that does not exist: two sessions make the live container's listing
+    // offer one at `maxResults` 1.
+    for session in ["session-page-one", "session-page-two"] {
+        event_id(
+            &router,
+            "actor-page",
+            session,
+            vec![conversational("USER", "hello")],
+            None,
+        )
+        .await;
+    }
+    let (_, page) = list_extraction_jobs(&router, MEMORY, json!({"maxResults": 1})).await;
+    let resumable = text(&page, "nextToken");
+    assert!(
+        !resumable.is_empty(),
+        "the live listing must offer a nextToken to resume with, got {page}"
+    );
+
+    // Rows: why the container is not held × the form the memory id arrived in × what the
+    // request asked for (the whole filter, each published `maxResults` bound — the member
+    // is `@range(1..50)`, source: smithy_query query="operation"
+    // operation="ListMemoryExtractionJobs" — and a page resumed with a token this
+    // operation issued).
+    let cases: Vec<(&str, &str, Value)> = vec![
+        ("never-created", ABSENT_MEMORY, json!({})),
+        ("never-created-by-arn", ABSENT_MEMORY_ARN, json!({})),
+        (
+            "never-created-with-every-filter-member",
+            ABSENT_MEMORY,
+            json!({"filter": {
+                "actorId": "actor-absent",
+                "sessionId": "session-absent",
+                "strategyId": "strategy-absent",
+                "status": "FAILED",
+            }}),
+        ),
+        (
+            "never-created-at-the-smallest-page",
+            ABSENT_MEMORY,
+            json!({"maxResults": 1}),
+        ),
+        (
+            "never-created-at-the-largest-page",
+            ABSENT_MEMORY,
+            json!({"maxResults": 50}),
+        ),
+        (
+            "never-created-resuming-a-page-this-operation-issued",
+            ABSENT_MEMORY,
+            json!({"nextToken": resumable}),
+        ),
+        ("created-then-deleted", DELETED_MEMORY, json!({})),
+        (
+            "created-then-deleted-by-arn",
+            DELETED_MEMORY_ARN,
+            json!({}),
+        ),
+    ];
+
+    for (case, memory, body) in cases {
+        let (status, answer) = list_extraction_jobs(&router, memory, body.clone()).await;
+        assert_eq!(
+            (status, error_code(&answer)),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected 404 ResourceNotFoundException, got {status} {answer}"
+        );
+        let reported = text(&answer, "message");
+        assert_eq!(
+            reported, CONTAINER_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected message {CONTAINER_NOT_FOUND_MESSAGE:?}, got {reported:?}"
+        );
+        // The sentence has no variable part, so nothing the request spelled is in it.
+        for named in spelled_values(memory, &body) {
+            assert!(
+                !reported.contains(&named),
+                "case {case:?}: the message must not name {named:?}, got {reported:?}"
+            );
+        }
+    }
+
+    // None of those refusals touched the live container: it still lists its own jobs.
+    let (status, answer) = list_extraction_jobs(&router, MEMORY, json!({})).await;
     assert_eq!(
-        text(&answer, "message"),
-        format!("Memory not found: {ABSENT_MEMORY}"),
-        "case absent: the refusal must name the container the request addressed, got {answer}"
+        (status, sessions_of(&answer).len()),
+        (200, 2),
+        "case \"the live container still lists\": expected its two jobs, got {status} {answer}"
     );
+}
+
+/// The two surfaces of one container stay distinguishable by the sentence alone: its stored
+/// memory ITEMS — the extraction jobs and the memory records — word an absent container
+/// after the memory-item store with no variable part, while its EVENTS word the same level
+/// after the container itself and echo the `memoryId` the request spelled.
+#[tokio::test]
+async fn the_memory_item_and_event_surfaces_word_an_absent_container_differently() {
+    let router = emulator();
+    let actor = "actor-contrast";
+    let session = "session-contrast";
+
+    for memory in [ABSENT_MEMORY, ABSENT_MEMORY_ARN] {
+        for (case, path) in [
+            (
+                "extraction-jobs",
+                format!("/memories/{}/extractionJobs", label(memory)),
+            ),
+            (
+                "memory-records",
+                format!("/memories/{}/memoryRecords", label(memory)),
+            ),
+        ] {
+            let (status, answer) = send(&router, "POST", &path, Some(json!({}))).await;
+            assert_eq!(
+                (status, error_code(&answer)),
+                (404, "ResourceNotFoundException"),
+                "case {case:?} on {memory:?}: expected 404 ResourceNotFoundException, got \
+                 {status} {answer}"
+            );
+            let reported = text(&answer, "message");
+            assert_eq!(
+                reported, CONTAINER_NOT_FOUND_MESSAGE,
+                "case {case:?} on {memory:?}: expected message \
+                 {CONTAINER_NOT_FOUND_MESSAGE:?}, got {reported:?}"
+            );
+        }
+
+        let (status, answer) = send(
+            &router,
+            "POST",
+            &format!(
+                "/memories/{}/actor/{}/sessions/{}",
+                label(memory),
+                label(actor),
+                label(session)
+            ),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&answer)),
+            (404, "ResourceNotFoundException"),
+            "case \"events\" on {memory:?}: expected 404 ResourceNotFoundException, got \
+             {status} {answer}"
+        );
+        let expected = event_surface_message(memory);
+        let reported = text(&answer, "message");
+        assert_eq!(
+            reported, expected,
+            "case \"events\" on {memory:?}: expected message {expected:?}, got {reported:?}"
+        );
+        assert_ne!(
+            reported, CONTAINER_NOT_FOUND_MESSAGE,
+            "case \"events\" on {memory:?}: the two surfaces must not share one sentence, or \
+             nothing on the wire tells them apart"
+        );
+    }
+}
+
+/// A container the CONTROL plane created but nothing has been written into holds no job.
+#[tokio::test]
+async fn an_empty_container_holds_no_job() {
+    let router = emulator();
 
     let (status, answer) = list_extraction_jobs(&router, MEMORY, json!({})).await;
     assert_eq!(

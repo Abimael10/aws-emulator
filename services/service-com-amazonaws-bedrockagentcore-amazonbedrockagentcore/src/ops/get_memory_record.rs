@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reached only for a record a live container does not hold. The inventory is read
         // and released before this service's own store is taken, which is the lock order
         // every reader of it keeps.
-        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+        crate::state::memory_item_container_resolved(&*self.engine, &input.memory_id).map_err(
             |missing| match missing {
                 Some(message) => GetMemoryRecordErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

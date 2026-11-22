@@ -154,7 +154,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     ///
     /// A container this plane has nothing stored for holds no unit — which is not a
     /// statement about whether the CONTAINER exists, resolved by
-    /// [`super::memory_container_resolved`] before this is read.
+    /// [`super::memory_item_container_resolved`] before this is read.
     #[must_use]
     pub fn extraction_job_units(&self, memory_id: &str) -> Vec<ExtractionJobUnit> {
         let Some(memory) = self.memories.get(&normalize_memory_id(memory_id)) else {

@@ -200,8 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same pre-condition every call addressing something inside a container
         // keeps: a Memory container is created through the CONTROL plane, so the one
         // addressed resource on this path is resolved against the component that owns it,
-        // before this service's own store is taken.
-        crate::state::memory_container_resolved(&*self.engine, &input.memory_id).map_err(
+        // before this service's own store is taken. The extraction jobs are composed over
+        // the container's stored memory ITEMS, so this refusal is worded the way those
+        // surfaces word an absent container — after the memory-item store and with no part
+        // of the request in it — and not after the container as the event surfaces word it.
+        crate::state::memory_item_container_resolved(&*self.engine, &input.memory_id).map_err(
             |missing| match missing {
                 Some(message) => ListMemoryExtractionJobsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

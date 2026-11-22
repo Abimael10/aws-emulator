@@ -388,17 +388,20 @@ pub const MEMORY_RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// id nor the namespace the request spelled appears in it.
 pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "The memory record was not found";
 
-/// The message a memory-record read or delete is refused with when its `memoryId` names no
-/// memory container at all — the OTHER not-found precondition of the same request, one
-/// level further out than [`MEMORY_RECORD_NOT_FOUND_MESSAGE`].
+/// The message a call on a container's stored memory ITEMS is refused with when its
+/// `memoryId` names no memory container at all — the OTHER not-found precondition of such a
+/// request, one level further out than [`MEMORY_RECORD_NOT_FOUND_MESSAGE`].
 ///
-/// The memory-records API words this refusal after the item store the container is held in
-/// rather than after the identifier the request spelled, so the sentence carries no
-/// variable part either: the memory id, the record id and the namespace appear in neither
-/// level's sentence. Status (404) and error class are the same for both, so the sentence is
-/// all a client has to tell "re-create the container" from "re-ingest the record" by, and
-/// the two constants are what keeps them apart service-wide.
-pub const MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
+/// These surfaces — the memory RECORDS a container holds and the extraction jobs composed
+/// over them — word the container level after the memory-item store the container is held
+/// in rather than after the identifier the request spelled, so the sentence carries no
+/// variable part at all: the memory id, the record id, the namespace and the job id appear
+/// in none of it. The surfaces that address a container's EVENTS or submit content to it
+/// word that level after the container itself ([`NotFoundResource::Memory`]) instead, and
+/// status (404) and error class are the same everywhere, so the sentence is all a client
+/// has to tell one level — and one surface — from another, and these constants are what
+/// keeps them apart service-wide.
+pub const MEMORY_ITEM_CONTAINER_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
 
 /// The branch an event created without a `branch` belongs to.
 ///
@@ -2184,7 +2187,10 @@ fn accounted_file_bytes(key: &str, size: usize) -> usize {
 /// a sentence of its own ([`Self::message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotFoundResource {
-    /// An AgentCore Memory container, addressed by `memoryId`.
+    /// An AgentCore Memory container, addressed by `memoryId`, as a call on its EVENTS or
+    /// one submitting content to it reports it missing; a call on its stored memory ITEMS
+    /// words that same level after the memory-item store instead
+    /// ([`MEMORY_ITEM_CONTAINER_NOT_FOUND_MESSAGE`]).
     Memory,
     /// A code interpreter sandbox, addressed by `codeInterpreterIdentifier`.
     CodeInterpreter,
@@ -2545,16 +2551,18 @@ pub fn holds_memory<Eng: Send + Sync + 'static>(engine: &Eng, memory_id: &str) -
     Some(held)
 }
 
-/// The pre-condition every call ADDRESSING something inside a memory container keeps,
-/// whether it writes or only reports: a container is created through the CONTROL plane, so
-/// its existence is resolved against the component that OWNS it ([`holds_memory`]) and
-/// never against this plane's own index of what has been written into it — a container
-/// nothing has been written into yet exists and holds nothing.
+/// The pre-condition every call on a container's EVENTS keeps, and every call submitting
+/// content to it, whether it writes or only reports: a container is created through the
+/// CONTROL plane, so its existence is resolved against the component that OWNS it
+/// ([`holds_memory`]) and never against this plane's own index of what has been written into
+/// it — a container nothing has been written into yet exists and holds nothing.
 ///
 /// `Ok(())` when the account holds it. `Err(Some(message))` is the
 /// `ResourceNotFoundException` message naming the container, with the identifier exactly as
 /// the request spelled it; `Err(None)` says the shared engine does not carry the inventory
-/// at all, which a handler answers with a modelled server error.
+/// at all, which a handler answers with a modelled server error. A call on the container's
+/// stored memory ITEMS keeps the same pre-condition worded its own way
+/// ([`memory_item_container_resolved`]).
 pub fn memory_container_resolved<Eng: Send + Sync + 'static>(
     engine: &Eng,
     memory_id: &str,
@@ -2569,11 +2577,11 @@ pub fn memory_container_resolved<Eng: Send + Sync + 'static>(
     }
 }
 
-/// The container pre-condition every memory-RECORD call keeps: the same read as
+/// The container pre-condition every call on a container's stored memory ITEMS keeps — its
+/// memory records and the extraction jobs composed over them: the same read as
 /// [`memory_container_resolved`] — against the component that OWNS the container, never
-/// against this plane's index of what has been written into it — worded as the
-/// memory-records API words its container level
-/// ([`MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE`]).
+/// against this plane's index of what has been written into it — worded as those surfaces
+/// word their container level ([`MEMORY_ITEM_CONTAINER_NOT_FOUND_MESSAGE`]).
 ///
 /// A record lookup keeps it BEFORE it addresses a record, so a request naming no container
 /// is refused at the container level and the record sentence is reached only once the
@@ -2582,13 +2590,13 @@ pub fn memory_container_resolved<Eng: Send + Sync + 'static>(
 /// `Err(Some(message))` is the `ResourceNotFoundException` message; `Err(None)` says the
 /// shared engine does not carry the inventory at all, which a handler answers with a
 /// modelled server error.
-pub fn memory_record_container_resolved<Eng: Send + Sync + 'static>(
+pub fn memory_item_container_resolved<Eng: Send + Sync + 'static>(
     engine: &Eng,
     memory_id: &str,
 ) -> Result<(), Option<String>> {
     match holds_memory(engine, memory_id) {
         None => Err(None),
-        Some(false) => Err(Some(MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE.to_string())),
+        Some(false) => Err(Some(MEMORY_ITEM_CONTAINER_NOT_FOUND_MESSAGE.to_string())),
         Some(true) => Ok(()),
     }
 }
