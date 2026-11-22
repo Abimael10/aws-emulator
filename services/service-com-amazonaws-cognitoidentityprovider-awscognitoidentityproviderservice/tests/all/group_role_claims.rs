@@ -113,7 +113,10 @@ fn decode_base64url(segment: &str) -> Vec<u8> {
 }
 
 /// The claim set of a compact-serialized JWS.
-fn claims_of(token: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite reading the same claims drives this one rather than a
+/// second copy of the decoding.
+pub(crate) fn claims_of(token: &str) -> Value {
     let segments: Vec<&str> = token.split('.').collect();
     assert_eq!(
         segments.len(),

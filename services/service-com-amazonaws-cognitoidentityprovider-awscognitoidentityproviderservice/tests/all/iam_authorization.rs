@@ -27,6 +27,10 @@
 //! `Allow`, an `Allow` for another action, an `Allow` on another pool, an explicit `Deny`
 //! beside a wildcard `Allow`, a boundary that withholds the grant) and where those policies
 //! LIVE (inline on the user, in an attached managed policy, in a permissions boundary).
+//!
+//! The harness below (the emulator, the principals it makes and the pieces of an answer this
+//! rule is read from) is `pub(crate)` so a sibling suite asserting the SAME rule over another
+//! operation of this surface drives it through this one, rather than through a second copy.
 
 use std::sync::Arc;
 
@@ -43,15 +47,15 @@ const REGION: &str = "us-west-2";
 /// The access-key id standing for the account's own published credential: IAM holds no
 /// record of it, so it resolves to the account's own identity, which carries no IAM policies
 /// and is allowed — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// The wire shape of an authorization refusal: the status this endpoint answers every
 /// refusal of the caller under, and the AWS-common error code a client branches on.
-const ACCESS_DENIED: (u16, &str) = (400, "AccessDeniedException");
+pub(crate) const ACCESS_DENIED: (u16, &str) = (400, "AccessDeniedException");
 
 /// One emulator: a single shared engine carrying this service beside the IAM service the
 /// principals and their policies are made with.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The ONE shared engine both services are mounted on — also the engine carrying the
     /// account's session directory, which is where the service that MINTS a temporary
@@ -61,7 +65,7 @@ struct Emulator {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -77,7 +81,12 @@ impl Emulator {
     }
 
     /// One call to this service, with `access_key_id` in the SigV4 credential scope.
-    async fn call(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(
+        &self,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -140,7 +149,7 @@ impl Emulator {
 
     /// Create a user pool with the account's own credential and answer its id and the ARN
     /// this service reports for it — the ARN a policy statement about that pool names.
-    async fn pool(&self, name: &str) -> (String, String) {
+    pub(crate) async fn pool(&self, name: &str) -> (String, String) {
         let (status, created) = self
             .call(ACCOUNT_KEY, "CreateUserPool", &json!({ "PoolName": name }))
             .await;
@@ -163,7 +172,7 @@ impl Emulator {
 
     /// Create an IAM user carrying `policy` as its inline policy (when one is given), mint a
     /// long-term access key for it, and answer that key id with the user's own ARN.
-    async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
+    pub(crate) async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
         let created = self
             .iam("CreateUser", &[("UserName", user_name.to_string())])
             .await;
@@ -336,9 +345,9 @@ impl Emulator {
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
@@ -367,7 +376,7 @@ pub(crate) fn xml_element(body: &str, name: &str) -> Option<String> {
 
 /// The IAM action `operation` is performed under: this service's ARN namespace and the
 /// operation's own shape name.
-fn action_of(operation: &str) -> String {
+pub(crate) fn action_of(operation: &str) -> String {
     format!("{}:{operation}", cognito_idp::state::SIGNING_NAME)
 }
 
@@ -382,7 +391,7 @@ fn any_pool_arn() -> String {
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -401,12 +410,12 @@ fn allow_all_but(denied: &str) -> String {
 
 /// The error code a response carries (`__type` in an awsJson envelope), and the empty string
 /// for a response that is no error at all.
-fn code_of(body: &Value) -> String {
+pub(crate) fn code_of(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
 /// The message an error response carries.
-fn message_of(body: &Value) -> String {
+pub(crate) fn message_of(body: &Value) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
 
