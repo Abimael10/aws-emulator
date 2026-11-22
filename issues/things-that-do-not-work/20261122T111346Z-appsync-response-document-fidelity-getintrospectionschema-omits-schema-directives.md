@@ -1,0 +1,54 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: appsync-eval-schema-creation-introspection
+Issue-Step: task#7
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: appsync-eval-schema-creation-introspection appsync-unit-resolver-code-evaluation
+Issue-Shape-Id: com.amazonaws.appsync#AWSDeepdishControlPlaneService
+Issue-Key: appsync|GetIntrospectionSchema|2xx->2xx|$.data.__schema.directives
+Issue-Key: appsync|EvaluateCode|2xx->2xx|$.error.codeErrors[*].value
+Issue-Related: 20261111T092526Z-appsync-evaluatecode-diverges-across-the-board-context-not.md
+Issue-Commit: 70d0fc11ecb60d04215bdc79411a2d078de215b2
+
+# AppSync response-document fidelity: GetIntrospectionSchema omits __schema.directives and EvaluateCode parse diagnostics are mis-worded (2 causes)
+
+> _Note: this issue was identified against the code base at commit `70d0fc11ecb60d04215bdc79411a2d078de215b2`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetIntrospectionSchema
+
+## Description
+Two net-new appsync wire divergences in which the emulator returns the right status and most of the right document, but the document itself is incomplete or carries emulator-authored text where AWS carries service text. Both are response-projection faults on the GraphQL-tooling surface (schema introspection and APPSYNC_JS code evaluation). This issue bundles 2 causes; both must be closed.
+
+=== Cause 1 of 2: GetIntrospectionSchema drops __schema.directives from the introspection document (fixture appsync-eval-schema-creation-introspection, step task#7) ===
+AWS: Smithy: GetIntrospectionSchema, GET /v1/apis/{apiId}/schema, http code 200; input apiId (@httpLabel, required), format (OutputType enum, @httpQuery "format", required), includeDirectives (BooleanValue, @httpQuery "includeDirectives", documented as "A flag that specifies whether the schema introspection should contain directives"); output schema (Blob, @httpPayload); modeled errors GraphQLSchemaException(400), NotFoundException(404), UnauthorizedException(401), InternalFailureException(500). The JSON-format payload is a standard GraphQL introspection document, and when includeDirectives is true the document's $.data.__schema.directives member is PRESENT and lists one entry per directive the API supports, each with name, description, locations, args (each arg with name/description/type/defaultValue) and the legacy onOperation/onFragment/onField flags. The directive names, their descriptions, their locations and their arg names are fixed service text (the recording shows the GraphQL spec directives include/skip/deprecated alongside AppSync's own defer, aws_cognito_user_pools, aws_api_key and the rest of the AppSync directive set); nothing in the list is derived from the request beyond the API whose schema is being introspected.
+Emulator: HTTP 200 with an introspection document whose $.data.__schema.directives member is absent entirely — the whole directives array is missing, not merely short or differently ordered. Every other asserted part of the document matches.
+Why: a client that introspects an AppSync API with includeDirectives=true — exactly what codegen tools, schema linters and GraphQL IDEs do — gets a schema in which no directive exists. Generated clients silently omit @aws_cognito_user_pools / @aws_api_key auth annotations and @deprecated handling, and code that iterates __schema.directives raises on a missing/None member rather than reading an empty-or-populated list.
+Fix: the GetIntrospectionSchema handler's introspection-document builder/serializer — it must emit __schema.directives (populated from the service's directive set, honoring the includeDirectives query flag) as part of the JSON-format payload.
+Traces: appsync-eval-schema-creation-introspection#task#7.
+
+=== Cause 2 of 2: EvaluateCode's parse-error envelope carries a generic message and emulator-authored diagnostic text instead of AWS's TS-compiler diagnostic, and still emits logs: [] (fixture appsync-unit-resolver-code-evaluation, step task#4) ===
+AWS: Smithy: EvaluateCode, POST /v1/dataplane-evaluatecode, http code 200; output EvaluateCodeResponse{evaluationResult, error: EvaluateCodeErrorDetail{message, codeErrors: list<CodeError{errorType, value, location: CodeErrorLocation{line, column, span}}>}, logs, stash, outErrors}; CodeError$errorType is documented with the examples LINT_ERROR and PARSER_ERROR and CodeError$value is documented as "A user presentable error" (documented example "Parsing error: Unterminated string literal"). Recorded behavior: code that fails to compile is answered with HTTP 200 and error populated, where CodeError$value is the compiler diagnostic in the form "code.js(<line>,<column>): error TS<code>: <compiler text>\n" and EvaluateCodeErrorDetail$message is "Error: <that same value> [code: PARSE_ERROR] [start: line: <line>, col: <column>] [end: line: <line>, col: <column>]". The fixed parts are the "code.js(" prefix, the "): error TS" / "<code>: " diagnostic form, and the " [code: <errorType>] [start: line: <l>, col: <c>] [end: line: <l>, col: <c>]" suffix; the variable parts — line, column, span, the TypeScript error number and its compiler text — are derived from the `code` submitted in the request. In the same response AWS omits `logs` entirely when the submitted code logged nothing.
+Emulator: HTTP 200 (the status is now right), but error.message is the generic fixed string "The code contains one or more errors." — which is AWS's wording for the CreateFunction/CreateResolver BadRequestException refusal, not for EvaluateCode's 200 diagnostic envelope — and error.codeErrors[0].value is emulator-authored text of the form "code.js(<line>,<column>): error: <emulator phrase>\n" (recorded here as "error: invalid property name"), carrying no TS<code> and not the compiler's wording. `logs` is also present as [] where AWS omits it.
+Why: EvaluateCode is the documented pre-flight lint/compile for APPSYNC_JS resolver code. A client that surfaces error.codeErrors[*].value to a developer, or that classifies the failure by matching the diagnostic form, gets a message no AWS region produces and cannot tell which syntactic construct failed; error.message no longer identifies the error class or its start/end position at all. A client reading response['logs'] as "present means something was logged" also sees a spurious empty list.
+Fix: the EvaluateCode handler's APPSYNC_JS compile stage and its diagnostic serializer — CodeError$value must carry the compiler diagnostic form and EvaluateCodeErrorDetail$message must be the per-error concatenation with the [code:]/[start:]/[end:] suffixes; plus the response projection must omit `logs` when nothing was logged.
+Traces: appsync-unit-resolver-code-evaluation#task#4.
+
+Related open issues (neither owns these clusters; the replay reported both with an empty owned_by): 20261111T092526Z-appsync-evaluatecode-diverges-across-the-board-context-not.md describes the broader EvaluateCode family, and its Cause 9 covered the SAME fixture step as Cause 2 above when the emulator answered HTTP 400 — the emulator now answers 200, so what remains there is the message/diagnostic wording filed here, on different response keys. 20261112T064707Z-appsync-appsync-js-code-diagnostics-and-cachingkeys-validation.md covers the equivalent diagnostics on CreateFunction/CreateResolver, not on EvaluateCode. 20261117T060152Z-appsync-the-graphql-data-plane-never-answers-an.md covers introspection over the GraphQL DATA plane, not the control-plane GetIntrospectionSchema document in Cause 1.
+
+## Evidence
+Both are mismatch clusters from trace set simparity-wire-aws-v1 (service appsync), with empty stub_path and empty owned_by.
+
+Cause 1 — appsync-eval-schema-creation-introspection#task#7, operation GetIntrospectionSchema, expected 200 / got 200, affected_count 1: "$.data.__schema.directives: missing (expected [{'name': 'include', 'description': 'Directs the executor to include this field or fragment only when the `if` argument is true', 'locations': ['FIELD', 'FRAGMENT_SPREAD', 'INLINE_FRAGMENT'], 'args': [{'name': 'if', ... 'type': {'kind': 'NON_NULL', 'name': None, 'ofType': {'kind': 'SCALAR', 'name': 'Boolean', 'ofType': None}}, 'defaultValue': None}], 'onOperation': False, 'onFragment': True, 'onField': True}, {'name': 'skip', ...}, {'name': 'defer', ...}, {'name': 'aws_cognito_user_pools', ...}, {'name': 'aws_api_key', ...}, {'name': 'deprecated', 'locations': ['FIELD_DEFINITION', 'ENUM_VALUE'], 'args': [{'name': 'reason', ...}]}, ...], got None)". Divergence key: service=appsync|GetIntrospectionSchema|status=200->200|keys=$.data.__schema.directives.
+
+Cause 2 — appsync-unit-resolver-code-evaluation#task#4, operation EvaluateCode, expected 200 / got 200, affected_count 1: "$.error.message: value_mismatch (expected \"Error: code.js(3,1): error TS1005: '}' expected.\\n [code: PARSE_ERROR] [start: line: 3, col: 1] [end: line: 3, col: 1]\", got 'The code contains one or more errors.')"; "$.error.codeErrors[0].value: value_mismatch (expected \"code.js(3,1): error TS1005: '}' expected.\\n\", got 'code.js(3,1): error: invalid property name\\n')"; "$.logs: type_mismatch (expected None, got [])". Divergence key: service=appsync|EvaluateCode|status=200->200|keys=$.error.codeErrors[0].value,$.error.message,$.logs.
+
+(The recorded line/column/span and the TS error number above are that recording's values filling the diagnostic template; the requirement is the template, not those numbers.)
+
+## Steps to Reproduce
+Boot the emulator from this checkout and replay the wire corpus (trace set simparity-wire-aws-v1). Each cause is one recorded step.
+
+Cause 1: replay appsync-eval-schema-creation-introspection step task#7 — create a GraphqlApi, StartSchemaCreation with the fixture's SDL, then appsync.get_introspection_schema(apiId=<that api>, format='JSON', includeDirectives=True) and parse the returned blob as JSON. Expect data.__schema.directives to be a populated list (include/skip/deprecated plus the AppSync directives); observe the member absent.
+
+Cause 2: replay appsync-unit-resolver-code-evaluation step task#4 — appsync.evaluate_code(runtime={'name':'APPSYNC_JS','runtimeVersion':'1.0.0'}, code=<APPSYNC_JS source with an unbalanced brace / malformed property so it does not compile>, context=<the fixture's context JSON>, function='request'). Expect HTTP 200 with error.codeErrors[0].value in the "code.js(<line>,<col>): error TS<n>: <compiler text>\n" form and error.message that value wrapped as "Error: <value> [code: PARSE_ERROR] [start: line: <l>, col: <c>] [end: line: <l>, col: <c>]", and NO logs member; observe error.message 'The code contains one or more errors.', an emulator-authored codeErrors[0].value, and logs == [].
