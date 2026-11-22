@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportVerifiedAccessInstanceClientConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportVerifiedAccessInstanceClientConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportVerifiedAccessInstanceClientConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure READ of one Verified Access instance: the configuration it answers is DERIVED from
+//! what this store holds for that instance at the instant of the call — the trust providers
+//! attached to it (their kinds, and the user provider's own OIDC configuration), the network
+//! CIDR endpoints that belong to it, and the Region the request was signed for — so two
+//! exports of one unchanged instance hand back the same configuration and nothing a later
+//! caller sees is changed by this one.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +139,265 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportVerifiedAccessInstanceClientConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportVerifiedAccessInstanceClientConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportVerifiedAccessInstanceClientConfiguration"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            invalid_verified_access_instance_id_not_found, missing_required_parameter,
+            request_region, require_service_state, TRUST_PROVIDER_TYPE_USER,
+        };
+
+        // "The ID of the Verified Access instance"
+        // (`ExportVerifiedAccessInstanceClientConfigurationRequest$VerifiedAccessInstanceId`)
+        // is modelled `@required` AND `@clientOptional`, so a request that leaves it out
+        // reaches this handler rather than being refused at the boundary: an absent parameter
+        // is reported as the parameter it left out, in the one sentence this crate answers for
+        // an absent required member.
+        let instance_id = input.verified_access_instance_id.as_str();
+        if instance_id.is_empty() {
+            return Err(missing_required_parameter("VerifiedAccessInstanceId"));
+        }
+
+        // "The Region" (`ExportVerifiedAccessInstanceClientConfigurationResult$Region`): the
+        // Region the client reaches this instance in. EC2 is a regional service reached
+        // through a regional endpoint, and the credential scope is the only thing a request
+        // says about the Region it is asking in.
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A reporting operation materialises what the CLOCK already owes before it reads, so
+        // the endpoints this configuration routes a client to are exactly the ones a describe
+        // would report at this instant — an endpoint whose deletion has fallen due is gone
+        // from both. Nothing else here writes.
+        store.materialize_due_transitions();
+
+        // "Exports the client configuration for a Verified Access instance": an id that names
+        // no instance of the account has no configuration to export and is refused.
+        let Some(instance) = store.verified_access_instances.get(instance_id) else {
+            return Err(invalid_verified_access_instance_id_not_found(instance_id));
+        };
+
+        // DryRun sits AFTER every parameter has been validated and the named instance
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The trust providers the INSTANCE names as attached
+        // (`VerifiedAccessInstance$VerifiedAccessTrustProviders`), which is this crate's one
+        // reading of an attachment, in the order they were attached in.
+        let attached: Vec<&VerifiedAccessTrustProviderCondensed> = instance
+            .verified_access_trust_providers
+            .iter()
+            .flatten()
+            .collect();
+
+        // "The device trust providers" (`…Result$DeviceTrustProviders`) is a list of
+        // `DeviceTrustProviderType`, so what it reports is the KINDS of device trust provider
+        // a client must satisfy — not the providers themselves. A kind is named once however
+        // many attached providers are of it, in the order the first of them was attached.
+        let mut device_trust_providers: Vec<String> = Vec::new();
+        for kind in attached
+            .iter()
+            .filter_map(|entry| entry.device_trust_provider_type.as_deref())
+        {
+            if !device_trust_providers
+                .iter()
+                .any(|named| named.as_str() == kind)
+            {
+                device_trust_providers.push(kind.to_string());
+            }
+        }
+
+        // "The user identity trust provider" (`…Result$UserTrustProvider`), singular: a
+        // Verified Access instance authenticates users against ONE user trust provider, so the
+        // first user provider the instance has attached is the one a client authenticates
+        // against. Its configuration is read off the STORED trust provider, so what this
+        // exports and what `DescribeVerifiedAccessTrustProviders` reports for the same
+        // provider cannot disagree.
+        let user_trust_provider = attached
+            .iter()
+            .filter(|entry| entry.trust_provider_type.as_deref() == Some(TRUST_PROVIDER_TYPE_USER))
+            .filter_map(|entry| entry.verified_access_trust_provider_id.as_deref())
+            .filter_map(|trust_provider_id| {
+                store.verified_access_trust_providers.get(trust_provider_id)
+            })
+            .map(user_trust_provider_client_configuration)
+            .next();
+
+        Ok(ExportVerifiedAccessInstanceClientConfigurationOutput {
+            version: Some(CLIENT_CONFIGURATION_VERSION.to_string()),
+            // Read off the STORED instance rather than echoed from the request, so the id
+            // reported is the one the account holds.
+            verified_access_instance_id: instance.verified_access_instance_id.clone(),
+            region: Some(region),
+            device_trust_providers: Some(device_trust_providers),
+            user_trust_provider,
+            open_vpn_configurations: Some(open_vpn_client_configurations(&store, instance_id)),
+        })
     }
+}
+
+/// "The version" (`ExportVerifiedAccessInstanceClientConfigurationResult$Version`): the
+/// version of the exported configuration document, which is what tells a client which members
+/// to expect in it.
+///
+/// CHOSEN, because the model says only "The version" and the document's members are the ones
+/// `ExportVerifiedAccessInstanceClientConfigurationResult` declares: this is the first version
+/// of that document, so it moves only if the members this handler fills change meaning. It is
+/// a property of the FORMAT, so it does not vary per instance or per call.
+const CLIENT_CONFIGURATION_VERSION: &str = "1";
+
+/// The OpenVPN `dev` a Verified Access network CIDR endpoint's client configuration names: a
+/// routed `tun` device, the one the configuration file this crate's other OpenVPN export
+/// writes carries too (`ExportClientVpnClientConfiguration`).
+const OPENVPN_DEVICE: &str = "tun";
+
+/// The transport the tunnel runs over: a Verified Access endpoint is a TLS endpoint — it
+/// presents the certificate `VerifiedAccessEndpoint$DomainCertificateArn` names at the DNS
+/// name `VerifiedAccessEndpoint$EndpointDomain` gives — so a client dials it over TCP.
+const OPENVPN_PROTOCOL: &str = "tcp";
+
+/// The port that TLS endpoint is dialled on: HTTPS's, which is the port a Verified Access
+/// endpoint's domain serves.
+const OPENVPN_PORT: u16 = 443;
+
+/// The logging verbosity the configuration names, as the file this crate's other OpenVPN
+/// export writes carries it.
+const OPENVPN_VERBOSITY: u8 = 3;
+
+/// `provider` as a client is configured to authenticate its users against it:
+/// "Describes the trust provider"
+/// (`smithy_query(query="shape",shape="VerifiedAccessInstanceUserTrustProviderClientConfiguration")`).
+///
+/// Every member is read off the STORED trust provider: the kind it is
+/// (`VerifiedAccessTrustProvider$UserTrustProviderType`) and the OIDC configuration it was
+/// created or modified with. The endpoints a client talks to come from `OidcOptions`, and the
+/// two members only the native-application options carry — the public signing key endpoint —
+/// from `NativeApplicationOidcOptions`; a provider configured with only the native application
+/// options is read from those throughout, so a client gets the endpoints the account really
+/// configured whichever block carries them. A trust provider that is not OIDC at all
+/// (`iam-identity-center`) carries no options, so it reports its kind and nothing else: there
+/// is no endpoint for a client to talk to.
+fn user_trust_provider_client_configuration(
+    provider: &VerifiedAccessTrustProvider,
+) -> VerifiedAccessInstanceUserTrustProviderClientConfiguration {
+    let oidc = provider.oidc_options.as_ref();
+    let native = provider.native_application_oidc_options.as_ref();
+    VerifiedAccessInstanceUserTrustProviderClientConfiguration {
+        r#type: provider.user_trust_provider_type.clone(),
+        // "The set of user claims to be requested from the IdP" (`$Scopes`) is the OIDC scope
+        // the provider was configured with (`OidcOptions$Scope`).
+        scopes: oidc
+            .and_then(|options| options.scope.clone())
+            .or_else(|| native.and_then(|options| options.scope.clone())),
+        issuer: oidc
+            .and_then(|options| options.issuer.clone())
+            .or_else(|| native.and_then(|options| options.issuer.clone())),
+        authorization_endpoint: oidc
+            .and_then(|options| options.authorization_endpoint.clone())
+            .or_else(|| native.and_then(|options| options.authorization_endpoint.clone())),
+        // The only block that carries a public signing key endpoint
+        // (`smithy_query(query="shape",shape="OidcOptions")` declares none), so a provider
+        // configured without native application options reports none.
+        public_signing_key_endpoint: native
+            .and_then(|options| options.public_signing_key_endpoint.clone()),
+        token_endpoint: oidc
+            .and_then(|options| options.token_endpoint.clone())
+            .or_else(|| native.and_then(|options| options.token_endpoint.clone())),
+        user_info_endpoint: oidc
+            .and_then(|options| options.user_info_endpoint.clone())
+            .or_else(|| native.and_then(|options| options.user_info_endpoint.clone())),
+        client_id: oidc
+            .and_then(|options| options.client_id.clone())
+            .or_else(|| native.and_then(|options| options.client_id.clone())),
+        // The client secret a trust provider was configured with is WRITE-ONLY in this
+        // emulator: the create and the modify store the mask the service answers in its place
+        // (`crate::state::REDACTED_CLIENT_SECRET`) and the value itself is kept nowhere, so
+        // what this reports is the stored member — a provider configured with a secret reports
+        // that it has one, and a provider configured without one reports none at all.
+        client_secret: oidc.and_then(|options| options.client_secret.clone()),
+        // "Indicates whether Proof of Key Code Exchange (PKCE) is enabled" (`$PkceEnabled`):
+        // no member of any stored trust provider configures it
+        // (`smithy_query(query="shape",shape="OidcOptions")` and
+        // `shape="NativeApplicationOidcOptions"` declare none), so nothing in this store
+        // decides the answer and none is reported rather than one being invented.
+        pkce_enabled: None,
+    }
+}
+
+/// The OpenVPN client configurations the instance `instance_id` is reached through: one per
+/// network CIDR endpoint of that instance the store holds, in endpoint-id order.
+///
+/// "Describes a set of routes"
+/// (`smithy_query(query="shape",shape="VerifiedAccessInstanceOpenVpnClientConfiguration")`) —
+/// a network CIDR endpoint is the kind of Verified Access endpoint a client reaches by
+/// tunnelling to it, so each configuration carries the routes that tunnel carries (the
+/// endpoint's own `VerifiedAccessEndpointCidrOptions$Cidr`) beside the OpenVPN directives that
+/// dial the endpoint. An instance with no network CIDR endpoint has nothing to tunnel to, so
+/// it reports the EMPTY set, and the other kinds of endpoint — the ones reached over HTTPS by
+/// their application domain — contribute none.
+fn open_vpn_client_configurations(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Vec<VerifiedAccessInstanceOpenVpnClientConfiguration> {
+    store
+        .verified_access_endpoints
+        .values()
+        .filter(|record| {
+            record.view.verified_access_instance_id.as_deref() == Some(instance_id)
+                && record.view.endpoint_type.as_deref()
+                    == Some(crate::state::VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR)
+        })
+        .map(|record| {
+            let endpoint_domain = record.view.endpoint_domain.as_deref().unwrap_or_default();
+            VerifiedAccessInstanceOpenVpnClientConfiguration {
+                config: Some(open_vpn_configuration(endpoint_domain)),
+                // "The routes" (`$Routes`): the CIDR this endpoint gives access to, as the
+                // endpoint's own options name it. An endpoint whose options name none routes
+                // nothing, so it carries no route rather than an empty one.
+                routes: Some(
+                    record
+                        .view
+                        .cidr_options
+                        .as_ref()
+                        .and_then(|options| options.cidr.clone())
+                        .map(|cidr| VerifiedAccessInstanceOpenVpnClientConfigurationRoute {
+                            cidr: Some(cidr),
+                        })
+                        .into_iter()
+                        .collect(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// "The base64-encoded Open VPN client configuration"
+/// (`VerifiedAccessInstanceOpenVpnClientConfiguration$Config`) for the endpoint reached at
+/// `endpoint_domain`.
+///
+/// The directives are the ones a client needs to establish the tunnel to THIS endpoint, and
+/// the one that names a value is read off the stored endpoint: the DNS name generated for it
+/// (`VerifiedAccessEndpoint$EndpointDomain`). The routes the tunnel carries are reported by
+/// `VerifiedAccessInstanceOpenVpnClientConfiguration$Routes` rather than written into the
+/// file, so this document describes the connection alone.
+fn open_vpn_configuration(endpoint_domain: &str) -> String {
+    use ::base64::Engine as _;
+
+    let mut configuration = [
+        "client".to_string(),
+        format!("dev {OPENVPN_DEVICE}"),
+        format!("proto {OPENVPN_PROTOCOL}"),
+        format!("remote {endpoint_domain} {OPENVPN_PORT}"),
+        "resolv-retry infinite".to_string(),
+        "nobind".to_string(),
+        "remote-cert-tls server".to_string(),
+        format!("verb {OPENVPN_VERBOSITY}"),
+    ]
+    .join("\n");
+    // A configuration FILE: every directive is one line, and the last one ends.
+    configuration.push('\n');
+    ::base64::engine::general_purpose::STANDARD.encode(configuration)
 }
