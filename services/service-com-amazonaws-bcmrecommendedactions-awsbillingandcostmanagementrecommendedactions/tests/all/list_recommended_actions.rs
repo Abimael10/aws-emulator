@@ -2593,3 +2593,662 @@ async fn the_reason_states_whether_the_refused_value_could_be_read() {
         );
     }
 }
+
+/// WHO may read the inventory, over the same awsJson1_0 wire path the cases above
+/// drive — so what is asserted is what a client holding those credentials sees.
+///
+/// THE RULE UNDER TEST: the request is authorized against the IAM policies in force
+/// on the principal its credentials name, against
+/// `bcm-recommended-actions:ListRecommendedActions`, BEFORE the store is read. This
+/// service's operation addresses no resource of its own, so a grant covers it only
+/// through the all-resources element; an explicit `Deny` covering the action wins
+/// over any `Allow`, a request no readable `Allow` covers falls to IAM's default
+/// deny, and a session policy the credential was minted with caps what the
+/// principal's own documents grant. Either way the answer is HTTP 403
+/// `AccessDeniedException` naming the principal, the action and which of IAM's rules
+/// refused it, carrying nothing of the inventory; a request a matching `Allow`
+/// covers reaches the operation's own answer.
+///
+/// The user, the role, their policies and the sessions live in the IAM and STS
+/// stores of the SAME shared engine — the stores those services' own handlers write
+/// — so the documents under test are the ones `iam:PutRolePolicy` stores and the
+/// principal a refusal blames is the one `sts:GetCallerIdentity` answers for the key
+/// the request signed with.
+///
+/// The tables span what the rule generalises over: the principal (an IAM user's
+/// long-term access key, an assumed-role session, a session scoped by a session
+/// policy, and the account's own published credential), the document in force (none
+/// at all, another billing service's actions, this operation's name under another
+/// namespace, a grant scoped to an ARN, an explicit deny beside an allow, an allow of
+/// exactly the action, of the action spelled in lower case, of the whole service and
+/// of everything), and the lifecycle of a carve-out (granted, denied, granted again).
+mod identity_authorization {
+    use super::*;
+
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+    use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
+
+    /// This service's IAM action namespace: its `arnNamespace`, which is also its
+    /// `sigv4Name` (`smithy_query(query="service_info")`).
+    const ACTION_PREFIX: &str = "bcm-recommended-actions";
+
+    /// The error shape an authorization refusal carries, and the status the model
+    /// declares for it (`smithy_query(query="shape", shape="AccessDeniedException")`:
+    /// `httpError` 403).
+    const ACCESS_DENIED: &str = "AccessDeniedException";
+    const ACCESS_DENIED_STATUS: u16 = 403;
+
+    /// The IAM user the policy rows sign with, and the access key id it owns.
+    const USER_NAME: &str = "billing-reader";
+    const USER_KEY_ID: &str = "AKIAEXAMPLEBCMUSER001";
+
+    /// The role an assumed-role session is of, the session's name, and the access key
+    /// ids of the unscoped session and of the one a session policy scoped.
+    const ROLE: &str = "billing-recommendations";
+    const SESSION: &str = "recommendations-session";
+    const SESSION_KEY_ID: &str = "ASIAEXAMPLEBCMSESS001";
+    const SCOPED_SESSION_KEY_ID: &str = "ASIAEXAMPLEBCMSESS002";
+
+    /// The name of the inline policy the user and the role carry.
+    const POLICY_NAME: &str = "inline";
+
+    /// An AWS-managed policy: it belongs to AWS, so this emulator holds no document
+    /// for it and a principal carrying it holds a grant the emulator cannot read.
+    const AWS_MANAGED_POLICY: &str = "arn:aws:iam::aws:policy/ReadOnlyAccess";
+
+    /// How long a seeded session lasts: an hour, STS's own default for `AssumeRole`.
+    const SESSION_SECONDS: i32 = 3_600;
+
+    /// This service beside the IAM and STS services over ONE shared engine, so the
+    /// policies and sessions a case seeds are the ones those services hold.
+    struct Signed {
+        engine: Arc<engine::InMemoryEngine>,
+        router: MultiServiceRouter,
+    }
+
+    impl Signed {
+        fn new() -> Self {
+            let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+            let mut router = MultiServiceRouter::new();
+            router.set_request_authentication(false);
+            router.register_service(bcm::EmulatedService::new(Arc::clone(&engine)));
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+            router.register_service(
+                service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+            Self { engine, router }
+        }
+
+        /// `ListRecommendedActions` signed with `access_key_id` — the value that names
+        /// the principal the request speaks for — reporting the status and payload.
+        async fn list_as(&self, access_key_id: &str, body: &Value) -> (u16, Value) {
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("host", "bcm-recommended-actions.us-east-1.amazonaws.com")
+                .header("content-type", "application/x-amz-json-1.0")
+                .header("x-amz-target", TARGET)
+                .header(
+                    "authorization",
+                    format!(
+                        "AWS4-HMAC-SHA256 \
+                         Credential={access_key_id}/20261029/us-east-1/{ACTION_PREFIX}/aws4_request, \
+                         SignedHeaders=host;x-amz-target, Signature=0000"
+                    ),
+                )
+                .body(bytes::Bytes::from(
+                    serde_json::to_vec(body).expect("serialize the request body"),
+                ))
+                .expect("build the request");
+            let response = self.router.dispatch(request).await;
+            let status = response.status().as_u16();
+            let payload = if response.body().is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+            };
+            (status, payload)
+        }
+
+        /// The IAM store of the shared engine, as that service's own handlers write it.
+        fn iam(&self) -> ::engine::ServiceState<iam::ComAmazonawsIamAwsidentitymanagementv20100508State>
+        {
+            iam::service_state(&*self.engine).expect("the IAM store")
+        }
+
+        /// Record the IAM user [`USER_KEY_ID`] belongs to, as `iam:CreateUser` and
+        /// `iam:CreateAccessKey` record one. NO policy is attached.
+        fn given_user_key(&self) {
+            let store = self.iam();
+            let mut store = store.lock();
+            store.users.insert(
+                iam::name_key(USER_NAME),
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User {
+                    path: "/".to_string(),
+                    user_name: USER_NAME.to_string(),
+                    user_id: "AIDAEXAMPLEBCMUSER".to_string(),
+                    arn: user_arn(),
+                    create_date: ::aws_smithy_types::DateTime::from_secs(0),
+                    password_last_used: None,
+                    permissions_boundary: None,
+                    tags: None,
+                },
+            );
+            store.access_keys.insert(
+                USER_KEY_ID.to_string(),
+                iam::AccessKeyRecord {
+                    user_key: iam::name_key(USER_NAME),
+                    status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+                    create_date: ::aws_smithy_types::DateTime::from_secs(0),
+                },
+            );
+        }
+
+        /// Record the role, as `iam:CreateRole` does.
+        fn given_role(&self) {
+            self.iam().lock().roles.insert(
+                iam::name_key(ROLE),
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role {
+                    path: "/".to_string(),
+                    role_name: ROLE.to_string(),
+                    role_id: "AROAEXAMPLEBCMROLE".to_string(),
+                    arn: role_arn(),
+                    create_date: ::aws_smithy_types::DateTime::from_secs(0),
+                    assume_role_policy_document: None,
+                    description: None,
+                    max_session_duration: None,
+                    permissions_boundary: None,
+                    tags: None,
+                    role_last_used: None,
+                    source_role_template: None,
+                },
+            );
+        }
+
+        /// Record the assumed-role session `access_key_id` speaks for, scoped by
+        /// `policies` — what `sts:AssumeRole` records for the credential it vends.
+        fn given_session(&self, access_key_id: &str, policies: sts::SessionPolicies) {
+            let vend = sts::NewSession {
+                role_arn: Some(role_arn()),
+                policies,
+                ..sts::NewSession::new(
+                    sts::Identity {
+                        user_id: sts::role_id(&role_arn()),
+                        account: ::engine::emulator_account_id().to_string(),
+                        arn: session_arn(),
+                    },
+                    sts::SessionKind::AssumedRole,
+                    SESSION_SECONDS,
+                )
+            };
+            sts::service_state(&*self.engine)
+                .expect("the STS store")
+                .lock()
+                .insert(vend.into_session(access_key_id, SystemTime::now()))
+                .expect("the session is recorded");
+        }
+
+        /// Put `document` in force on the IAM user, replacing whatever it carried;
+        /// `None` takes every policy off it, as `iam:DeleteUserPolicy` does.
+        fn given_user_policy(&self, document: Option<&Value>) {
+            let store = self.iam();
+            let mut store = store.lock();
+            store.user_inline_policies.remove(&iam::name_key(USER_NAME));
+            if let Some(document) = document {
+                store
+                    .user_inline_policies
+                    .insert(iam::name_key(USER_NAME), inline(document));
+            }
+        }
+
+        /// The same for the role, as `iam:PutRolePolicy` and `iam:DeleteRolePolicy` do.
+        fn given_role_policy(&self, document: Option<&Value>) {
+            let store = self.iam();
+            let mut store = store.lock();
+            store.role_inline_policies.remove(&iam::name_key(ROLE));
+            if let Some(document) = document {
+                store
+                    .role_inline_policies
+                    .insert(iam::name_key(ROLE), inline(document));
+            }
+        }
+
+        /// Attach the managed policy `policy_arn` to the role, as
+        /// `iam:AttachRolePolicy` does.
+        fn given_role_attachment(&self, policy_arn: &str) {
+            self.iam()
+                .lock()
+                .role_attached_policies
+                .insert(
+                    iam::name_key(ROLE),
+                    BTreeSet::from([policy_arn.to_string()]),
+                );
+        }
+    }
+
+    /// The IAM user's ARN, as IAM holds it and a refusal of its requests names it.
+    fn user_arn() -> String {
+        format!(
+            "arn:aws:iam::{}:user/{USER_NAME}",
+            ::engine::emulator_account_id()
+        )
+    }
+
+    /// The ARN the account holds the role under — the identity whose documents an
+    /// assumed-role session's request is judged on.
+    fn role_arn() -> String {
+        format!(
+            "arn:aws:iam::{}:role/{ROLE}",
+            ::engine::emulator_account_id()
+        )
+    }
+
+    /// The principal the seeded session speaks for, as `sts:GetCallerIdentity`
+    /// reports it — what a refusal of its requests names.
+    fn session_arn() -> String {
+        format!(
+            "arn:aws:sts::{}:assumed-role/{ROLE}/{SESSION}",
+            ::engine::emulator_account_id()
+        )
+    }
+
+    /// One inline policy holding `document`, as `iam:PutRolePolicy` stores one.
+    fn inline(document: &Value) -> BTreeMap<String, iam::InlinePolicy> {
+        BTreeMap::from([(
+            iam::name_key(POLICY_NAME),
+            iam::InlinePolicy {
+                policy_name: POLICY_NAME.to_string(),
+                policy_document: document.to_string(),
+            },
+        )])
+    }
+
+    /// The IAM action this operation is performed under.
+    fn action() -> String {
+        format!("{ACTION_PREFIX}:{TARGET_OPERATION}")
+    }
+
+    /// This operation's own name, the suffix of the awsJson target this service
+    /// answers.
+    const TARGET_OPERATION: &str = "ListRecommendedActions";
+
+    /// A policy allowing `actions` on every resource — the element an action that
+    /// names no resource type is granted through.
+    fn allow(actions: Value) -> Value {
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": "*" }],
+        })
+    }
+
+    /// Which of IAM's refusals a row expects.
+    #[derive(Debug, Clone, Copy)]
+    enum Refusal {
+        /// The default deny of a request no readable statement allows.
+        DefaultDeny,
+        /// The explicit deny of a request a `Deny` statement covers.
+        ExplicitDeny,
+        /// The cap of a session policy that does not allow the action.
+        SessionPolicyWithholds,
+        /// The explicit deny of a request a `Deny` in a SESSION policy covers.
+        SessionPolicyExplicitDeny,
+    }
+
+    impl Refusal {
+        /// The clause IAM closes the refusal with.
+        fn reason(self, action: &str) -> String {
+            match self {
+                Self::DefaultDeny => {
+                    format!("because no identity-based policy allows the {action} action")
+                }
+                Self::ExplicitDeny => {
+                    "with an explicit deny in an identity-based policy".to_string()
+                }
+                Self::SessionPolicyWithholds => {
+                    format!("because no session policy allows the {action} action")
+                }
+                Self::SessionPolicyExplicitDeny => {
+                    "with an explicit deny in a session policy".to_string()
+                }
+            }
+        }
+    }
+
+    /// Assert that `answer` is the authorization refusal `refused` naming `principal`,
+    /// and that it carries nothing of the inventory.
+    fn assert_refused(
+        case: &str,
+        principal: &str,
+        refused: Refusal,
+        (status, body): (u16, Value),
+    ) {
+        let action = action();
+        assert_eq!(
+            status, ACCESS_DENIED_STATUS,
+            "case {case:?}: expected HTTP {ACCESS_DENIED_STATUS}, got {status} with {body}"
+        );
+        assert_eq!(
+            body.get("__type").and_then(Value::as_str),
+            Some(ACCESS_DENIED),
+            "case {case:?}: expected an {ACCESS_DENIED}, got {body}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(
+                format!(
+                    "User: {principal} is not authorized to perform: {action} {}",
+                    refused.reason(&action)
+                )
+                .as_str()
+            ),
+            "case {case:?}: expected IAM's wording, got {body}"
+        );
+        assert!(
+            body.get("recommendedActions").is_none() && body.get("nextToken").is_none(),
+            "case {case:?}: a refused request reports nothing of the inventory, got {body}"
+        );
+    }
+
+    /// The ids a served listing reported, so an allowed call can be shown to reach the
+    /// operation's own answer over the store's records.
+    fn reported_ids(case: &str, (status, body): (u16, Value)) -> Vec<String> {
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an allowed request reaches the operation's answer, got {status} with \
+             {body}"
+        );
+        body.get("recommendedActions")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a recommendedActions array, got {body}"))
+            .iter()
+            .filter_map(|record| record.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The documents a row puts in force on the principal, and which refusal the
+    /// request then meets — `None` for a request a matching `Allow` permits.
+    fn documents_in_force() -> Vec<(&'static str, Option<Value>, Option<Refusal>)> {
+        let action = action();
+        vec![
+            ("no policy at all", None, Some(Refusal::DefaultDeny)),
+            (
+                "an allow of every action of another billing service",
+                Some(allow(json!("bcm-data-exports:*"))),
+                Some(Refusal::DefaultDeny),
+            ),
+            (
+                "an allow of this operation's name under another namespace",
+                Some(allow(json!(format!("ce:{TARGET_OPERATION}")))),
+                Some(Refusal::DefaultDeny),
+            ),
+            (
+                // This action names no resource type, so a statement scoped to an ARN
+                // covers no request to this service.
+                "an allow of this action scoped to an ARN",
+                Some(json!({
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": action,
+                        "Resource": format!(
+                            "arn:aws:bcm-recommended-actions:us-east-1:{}:recommended-action/*",
+                            ::engine::emulator_account_id()
+                        ),
+                    }],
+                })),
+                Some(Refusal::DefaultDeny),
+            ),
+            (
+                "an explicit deny of exactly this action beside an allow of it",
+                Some(json!({
+                    "Statement": [
+                        { "Effect": "Allow", "Action": action, "Resource": "*" },
+                        { "Effect": "Deny", "Action": action, "Resource": "*" },
+                    ],
+                })),
+                Some(Refusal::ExplicitDeny),
+            ),
+            (
+                "an explicit deny of this whole service beside an allow of everything",
+                Some(json!({
+                    "Statement": [
+                        { "Effect": "Allow", "Action": "*", "Resource": "*" },
+                        {
+                            "Effect": "Deny",
+                            "Action": format!("{ACTION_PREFIX}:*"),
+                            "Resource": "*",
+                        },
+                    ],
+                })),
+                Some(Refusal::ExplicitDeny),
+            ),
+            (
+                "an allow of exactly this action",
+                Some(allow(json!(action))),
+                None,
+            ),
+            (
+                // IAM compares action names case-insensitively, so the spelling of the
+                // allow is not what decides the request.
+                "an allow of this action spelled in lower case",
+                Some(allow(json!(action.to_lowercase()))),
+                None,
+            ),
+            (
+                "an allow listing this action beside another service's",
+                Some(allow(json!(["ce:GetCostAndUsage", action]))),
+                None,
+            ),
+            (
+                "an allow of every action of this service",
+                Some(allow(json!(format!("{ACTION_PREFIX}:*")))),
+                None,
+            ),
+            ("an allow of every action", Some(allow(json!("*"))), None),
+        ]
+    }
+
+    /// THE RULE: the request is judged on the identity-based documents in force on the
+    /// principal its credentials name — the IAM user's own for a long-term key, the
+    /// ROLE's for an assumed-role session, which a refusal nonetheless blames under the
+    /// SESSION's ARN — and a refused request reports nothing of the inventory while an
+    /// allowed one reaches the operation's own answer.
+    #[tokio::test]
+    async fn the_documents_in_force_on_the_principal_decide_the_request() {
+        // (the principal, the access key id it signs with, how a row puts a document in
+        // force on it)
+        type PutPolicy = fn(&Signed, Option<&Value>);
+        let principals: Vec<(&str, String, &str, PutPolicy)> = vec![
+            (
+                "an IAM user's long-term access key",
+                user_arn(),
+                USER_KEY_ID,
+                Signed::given_user_policy,
+            ),
+            (
+                "an assumed-role session",
+                session_arn(),
+                SESSION_KEY_ID,
+                Signed::given_role_policy,
+            ),
+        ];
+
+        for (principal_case, principal, access_key_id, put_policy) in principals {
+            for (row, document, refused) in documents_in_force() {
+                let case = format!("{principal_case} with {row}");
+                // A fresh store per row: no row can pass on another's write.
+                let emulator = Signed::new();
+                emulator.given_user_key();
+                emulator.given_role();
+                emulator.given_session(SESSION_KEY_ID, sts::SessionPolicies::default());
+                put_policy(&emulator, document.as_ref());
+
+                let answer = emulator.list_as(access_key_id, &json!({})).await;
+                match refused {
+                    Some(refusal) => assert_refused(&case, &principal, refusal, answer),
+                    None => assert!(
+                        !reported_ids(&case, answer).is_empty(),
+                        "case {case:?}: an allowed read reports the inventory the store holds"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// THE RULE, as an operator relies on it: an explicit `Deny` carves one action out
+    /// of a broad grant, and lifting the `Deny` restores the very call it refused —
+    /// while the grant the principal cannot read (an AWS-managed attachment) neither
+    /// denies the call nor survives the carve-out.
+    #[tokio::test]
+    async fn an_explicit_deny_carves_the_action_out_of_a_broad_grant() {
+        let emulator = Signed::new();
+        emulator.given_role();
+        emulator.given_session(SESSION_KEY_ID, sts::SessionPolicies::default());
+        // The shape an operator attaches: a managed policy whose document this emulator
+        // does not hold, beside an inline allow of this whole service.
+        emulator.given_role_attachment(AWS_MANAGED_POLICY);
+        let broad = allow(json!(format!("{ACTION_PREFIX}:*")));
+        emulator.given_role_policy(Some(&broad));
+
+        let before = reported_ids(
+            "before the deny",
+            emulator.list_as(SESSION_KEY_ID, &json!({})).await,
+        );
+        assert!(
+            !before.is_empty(),
+            "case \"before the deny\": the broad grant must serve the inventory"
+        );
+
+        // The carve-out: the same broad allow, plus an explicit deny of this one action.
+        let carved = json!({
+            "Statement": [
+                { "Effect": "Allow", "Action": format!("{ACTION_PREFIX}:*"), "Resource": "*" },
+                { "Effect": "Deny", "Action": action(), "Resource": "*" },
+            ],
+        });
+        emulator.given_role_policy(Some(&carved));
+        assert_refused(
+            "the carve-out in force",
+            &session_arn(),
+            Refusal::ExplicitDeny,
+            emulator.list_as(SESSION_KEY_ID, &json!({})).await,
+        );
+        // Still refused on a second attempt: the decision is about the documents, not
+        // about how often the credential has called.
+        assert_refused(
+            "the carve-out in force, polled again",
+            &session_arn(),
+            Refusal::ExplicitDeny,
+            emulator.list_as(SESSION_KEY_ID, &json!({})).await,
+        );
+
+        // Lifting the deny restores the identical call, and the refusals changed
+        // nothing of what the store reports.
+        emulator.given_role_policy(Some(&broad));
+        let after = reported_ids(
+            "the deny lifted",
+            emulator.list_as(SESSION_KEY_ID, &json!({})).await,
+        );
+        assert_eq!(
+            after, before,
+            "case \"the deny lifted\": the refusals must have changed nothing the store reports"
+        );
+    }
+
+    /// THE RULE: a session policy the credential was minted with CAPS what the role's
+    /// own documents grant — "the resulting session's permissions are the intersection
+    /// of the role's identity-based policy and the session policies" — so a scope that
+    /// states nothing about this action withholds it, and one that allows it keeps the
+    /// role's grant.
+    #[tokio::test]
+    async fn a_session_policy_caps_what_the_roles_documents_grant() {
+        // (case, the inline session policy the mint passed, which refusal it meets)
+        let rows: Vec<(&str, Value, Option<Refusal>)> = vec![
+            (
+                "a scope naming another service's actions",
+                allow(json!("ce:GetCostAndUsage")),
+                Some(Refusal::SessionPolicyWithholds),
+            ),
+            (
+                "a scope denying this action",
+                json!({
+                    "Statement": [
+                        { "Effect": "Allow", "Action": "*", "Resource": "*" },
+                        { "Effect": "Deny", "Action": action(), "Resource": "*" },
+                    ],
+                }),
+                // An explicit deny in the scope is still an explicit deny, and IAM
+                // names the document that carried it rather than the role's own.
+                Some(Refusal::SessionPolicyExplicitDeny),
+            ),
+            (
+                "a scope allowing exactly this action",
+                allow(json!(action())),
+                None,
+            ),
+            (
+                "a scope allowing every action of this service",
+                allow(json!(format!("{ACTION_PREFIX}:*"))),
+                None,
+            ),
+        ];
+
+        for (case, scope, withheld) in rows {
+            let emulator = Signed::new();
+            emulator.given_role();
+            // The ROLE allows the action outright, so only the scope can withhold it.
+            emulator.given_role_policy(Some(&allow(json!(format!("{ACTION_PREFIX}:*")))));
+            emulator.given_session(
+                SCOPED_SESSION_KEY_ID,
+                sts::SessionPolicies {
+                    inline: Some(scope.to_string()),
+                    ..sts::SessionPolicies::default()
+                },
+            );
+
+            let answer = emulator.list_as(SCOPED_SESSION_KEY_ID, &json!({})).await;
+            match withheld {
+                Some(refusal) => assert_refused(case, &session_arn(), refusal, answer),
+                None => assert!(
+                    !reported_ids(case, answer).is_empty(),
+                    "case {case:?}: a scope that allows the action keeps the role's grant"
+                ),
+            }
+        }
+    }
+
+    /// THE RULE's one unbounded caller: the account's own published credential — a key
+    /// neither STS nor IAM holds a record for — is not a principal the IAM store holds
+    /// policies for, so it is served while a principal-less key of the same account is
+    /// refused.
+    #[tokio::test]
+    async fn the_accounts_own_published_credential_is_served() {
+        let emulator = Signed::new();
+        emulator.given_user_key();
+        emulator.given_user_policy(None);
+
+        assert_refused(
+            "an IAM user carrying no policy",
+            &user_arn(),
+            Refusal::DefaultDeny,
+            emulator.list_as(USER_KEY_ID, &json!({})).await,
+        );
+        assert!(
+            !reported_ids(
+                "the account's own published credential",
+                emulator.list_as("AKIDEXAMPLE", &json!({})).await,
+            )
+            .is_empty(),
+            "case \"the account's own published credential\": it must be served the inventory"
+        );
+    }
+}

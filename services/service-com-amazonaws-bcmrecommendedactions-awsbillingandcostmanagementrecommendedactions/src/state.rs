@@ -20,6 +20,13 @@
 //! Records are held in INSERTION ORDER: `ListRecommendedActions` is `@paginated`,
 //! and a stable order is what makes its `nextToken` resume exactly where the
 //! previous page stopped without duplicating or skipping a record.
+//!
+//! WHO may read those records is a different question from what they are, and it is
+//! decided before the store is reached: see [`authorization`].
+
+/// Whether IAM lets the calling principal perform the action a request asks for —
+/// the decision taken in front of the store.
+pub mod authorization;
 
 use std::collections::BTreeMap;
 

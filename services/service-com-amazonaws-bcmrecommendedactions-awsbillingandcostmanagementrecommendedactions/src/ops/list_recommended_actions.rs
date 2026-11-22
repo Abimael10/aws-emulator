@@ -26,11 +26,15 @@
 //!   would hide every member-account record the shape exists to carry. This emulator
 //!   presents one account id ([`engine::emulator_account_id`]), so a record is
 //!   normally seeded with that id.
-//! * **Authorization is deliberately unmodelled.** The emulator verifies every
-//!   request signature at its boundary and holds no per-principal policy, so this
-//!   handler never evaluates permissions and the modelled `AccessDeniedException`
-//!   (403) stays constructible but unreached; read the silence as "not modelled",
-//!   not as an enforced allow.
+//! * **Authorization comes first.** `AccessDeniedException` (403) is a
+//!   service-common error of this model, and IAM decides a signed call ahead of the
+//!   service, so this handler asks [`crate::state::authorization::authorize`] — the
+//!   shared evaluation of the calling principal's identity-based policy documents
+//!   against `bcm-recommended-actions:ListRecommendedActions` — BEFORE it reads the
+//!   store, and a caller no readable statement allows, or that an explicit `Deny`
+//!   covers, is answered that refusal and nothing of the inventory. Only the
+//!   DECISION is taken here; who the caller is, which documents are in force and how
+//!   a denial is worded all live in that module.
 //! * **Filtering.** `filter.actions` is a list of `ActionFilter`s, each naming a
 //!   record field (`FEATURE` / `SEVERITY` / `TYPE`), a `matchOption` (`EQUALS`
 //!   keeps the records whose field is one of `values`, `NOT_EQUALS` excludes them)
@@ -873,7 +877,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides a signed call ahead of the service, so the caller's permissions
+        // are evaluated before anything else happens: a request no readable statement
+        // allows — or one an explicit `Deny` covers — is answered the modelled
+        // `AccessDeniedException` (403) and reports nothing of the inventory, and
+        // nothing of the store is read on the way to that answer. The decision, the
+        // documents it reads and its wording live in [`crate::state::authorization`].
+        crate::state::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(ListRecommendedActionsErrorModeled::AccessDeniedException)?;
 
         // Refuse a bad filter BEFORE touching the store, so a rejected request is
         // refused on its own terms whatever the store holds.

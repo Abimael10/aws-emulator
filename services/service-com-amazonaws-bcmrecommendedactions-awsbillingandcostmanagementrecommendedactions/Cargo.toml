@@ -33,7 +33,18 @@ base64 = "0.22"
 # The shared service layer. Carries the requirement sentence a constraint
 # violation states (`validation_message::requirement`), so the words this
 # service's refusals use are the framework's and are not re-derived per crate.
+# `iam_authorization` is the shared evaluation of a principal's policy documents
+# against an action — and the clauses a denial is worded with — and `iam_role`
+# reads which IAM entity a principal ARN names, so this service's authorization
+# step decides and words a denial as every other one does.
 service-common = { path = "../common" }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with, plus
+# the session policies that credential's mint scoped it with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that
+# principal and the permissions boundary that caps them.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
