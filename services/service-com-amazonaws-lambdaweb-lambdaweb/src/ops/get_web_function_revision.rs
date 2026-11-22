@@ -198,9 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(revision) = function.revisions.get(&input.revision_id) else {
             return Err(GetWebFunctionRevisionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "The revision {} of web function {} doesn't exist.",
-                        input.revision_id, input.function_name
+                    message: crate::state::revision_not_found_message(
+                        &input.revision_id,
+                        &input.function_name,
                     ),
                     resource_id: None,
                     resource_type: None,

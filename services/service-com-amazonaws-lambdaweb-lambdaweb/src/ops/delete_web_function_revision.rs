@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWebFunctionRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWebFunctionRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWebFunctionRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one revision of a web function from the revision slice of this service's
+//! state ([`crate::state::revisions`]) — the same record the two create paths write and
+//! `GetWebFunctionRevision` and `ListWebFunctionRevisions` read, so a revision this
+//! delete removed is gone for every reader of this service, and the function's "newest
+//! revision" becomes the newest one the store still holds.
+//!
+//! A revision "that is currently serving traffic on an endpoint" cannot be deleted: that
+//! is the modelled `ConflictException` (HTTP 409). The operation is `@idempotent` and
+//! states an END STATE — the named revision is not to exist — so a revision the function
+//! does not carry already satisfies it and settles as the modelled success, while a
+//! request addressed at a FUNCTION this store does not hold reports that function absent,
+//! the way every operation on a function's sub-resources does.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +150,37 @@ impl From<DeleteWebFunctionRevisionErrorModeled> for DeleteWebFunctionRevisionEr
     }
 }
 
+/// The modelled 404 for a resource this store does not hold, carrying `message`.
+fn not_found(message: String) -> DeleteWebFunctionRevisionError {
+    DeleteWebFunctionRevisionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: None,
+        resource_type: None,
+    })
+    .into()
+}
+
+/// The modelled 409 for a delete that conflicts with the current state of the resource,
+/// carrying `message`.
+fn conflict(message: String) -> DeleteWebFunctionRevisionError {
+    DeleteWebFunctionRevisionErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id: None,
+        resource_type: None,
+    })
+    .into()
+}
+
+/// The modelled 500 for a store this handler cannot reach, or whose record moved out from
+/// under the guard that found it — never a success reported for a delete nothing was
+/// written for.
+fn unavailable() -> DeleteWebFunctionRevisionError {
+    DeleteWebFunctionRevisionErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the web function store is unavailable".to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteWebFunctionRevision` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,18 +217,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWebFunctionRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWebFunctionRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWebFunctionRevision"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // ONE guard decides and writes, so no endpoint can start serving the revision
+        // between the refusal below and the removal it clears.
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // Either resource may be named by name or by ARN; both resolve to the one stored
+        // record.
+        let function_name = crate::state::resolve_function_name(&input.function_name).to_string();
+        let revision_id = crate::state::resolve_revision_id(&input.revision_id).to_string();
+
+        {
+            let function = state.functions.get(&function_name).ok_or_else(|| {
+                not_found(crate::state::function_not_found_message(
+                    &input.function_name,
+                ))
+            })?;
+
+            if !function.revisions.contains_key(&revision_id) {
+                // The end state this call asks for already holds, so it settles as the
+                // modelled success: no record is touched, and no error shape is reported
+                // for work there was none of — which is what makes the modelled
+                // `@idempotent` trait safe to retry on.
+                //
+                // The audit record for a destructive call that removed nothing: who,
+                // what, outcome. No secret and no credential material — the access key
+                // id identifies the caller the way the real service's trail does. The
+                // revision is quoted and escaped, not interpolated raw: the value came
+                // straight from the request's URI label.
+                ::tracing::info!(
+                    operation = "DeleteWebFunctionRevision",
+                    akid = %akid,
+                    function_name = %function.function_name,
+                    revision_id = ?input.revision_id,
+                    outcome = "already_absent",
+                    "a web function revision delete named no stored revision"
+                );
+                return Ok(DeleteWebFunctionRevisionOutput);
+            }
+
+            // "You cannot delete a revision that is currently serving traffic on an
+            // endpoint."
+            if let Some(endpoint_name) =
+                crate::state::endpoint_serving_revision(function, &revision_id)
+            {
+                let message =
+                    crate::state::revision_serving_traffic_message(&revision_id, endpoint_name);
+                return Err(conflict(message));
+            }
+        }
+
+        let removed = state
+            .remove_revision(&function_name, &revision_id, now)
+            .ok_or_else(unavailable)?;
+
+        // The audit record for the state change.
+        ::tracing::info!(
+            operation = "DeleteWebFunctionRevision",
+            akid = %akid,
+            function_name = %function_name,
+            revision_arn = %removed.revision_arn,
+            outcome = "deleted",
+            "web function revision deleted"
+        );
+
+        Ok(DeleteWebFunctionRevisionOutput)
     }
 }

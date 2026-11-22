@@ -366,9 +366,9 @@ impl RevisionWeightProblem {
     /// reports it identically.
     pub fn message(&self, function_name: &str) -> String {
         match self {
-            Self::UnknownRevision { revision_id } => format!(
-                "The revision {revision_id} of web function {function_name} doesn't exist."
-            ),
+            Self::UnknownRevision { revision_id } => {
+                super::revision_not_found_message(revision_id, function_name)
+            }
             Self::RepeatedRevision { revision_id } => format!(
                 "The revisionWeights parameter names revision {revision_id} more than once: each \
                  entry must name a different revision."
@@ -420,21 +420,21 @@ pub fn revision_weight_problem(
 /// ONTO, so there is no conflict to report: the endpoint keeps serving the revisions its
 /// `@required` `revisionWeights` already name.
 ///
-/// The refusal reports the resource the request conflicts with and the state it is in,
-/// and closes with the sentence the model's own `ConflictException` documentation states
-/// for this class — "Resolve the conflict and try again." — with the revision, the
-/// function and the state taken from the store.
+/// The refusal names the LATEST revision and the state it is in, states that it cannot
+/// be deployed, states the rule that only `Active` revisions can be deployed, and tells
+/// the caller what to do about it — create a new revision. The revision id and the state
+/// word are the store's own; no other resource is named, and the model's general
+/// `ConflictException` sentence is not what this class is worded with.
 pub fn latest_revision_switch_conflict(function: &WebFunction) -> Option<String> {
     let newest = function.latest_revision()?;
     if newest.state == RevisionState::Active {
         return None;
     }
+    let revision_id = &newest.revision_id;
+    let state = newest.state.wire();
     Some(format!(
-        "The revision {} of web function {} is in the {} state. Resolve the conflict and try \
-         again.",
-        newest.revision_id,
-        function.function_name,
-        newest.state.wire()
+        "The latest revision {revision_id} is in {state} state and cannot be deployed. Only \
+         revisions in Active state can be deployed. Create a new revision."
     ))
 }
 

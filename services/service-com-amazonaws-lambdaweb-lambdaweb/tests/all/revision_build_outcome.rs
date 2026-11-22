@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdaweb_lambdaweb::state::code_package::NOT_A_ZIP_ARCHIVE_REASON;
 use service_com_amazonaws_lambdaweb_lambdaweb::state::PROVISIONING_DELAY;
 
-use super::web_function_lifecycle::{build_config, role_arn, Emulator, Reply};
+use super::web_function_lifecycle::{build_config, percent_encoded, role_arn, Emulator, Reply};
 
 /// The region every request here signs with.
 const REGION: &str = "us-east-1";
@@ -838,4 +838,574 @@ async fn a_switch_onto_a_revision_still_building_waits_for_the_build() {
         }
         other => panic!("expected 202 or 409 from the switch, got {other} with {:?}", switched.body),
     }
+}
+
+/// The sentence this service words the refusal to auto-deploy a revision that is not
+/// `Active` with: its fixed text, with the two variable parts taken from the store — the
+/// latest revision's id and the state word that revision is in.
+///
+/// The model fixes no message text for `ConflictException` (`smithy_query(query="operation",
+/// operation="UpdateWebFunctionEndpoint")` — httpError 409, documented for the class only),
+/// so the wording is the service's recorded behaviour and belongs here in full.
+fn latest_revision_not_deployable(revision_id: &str, state: &str) -> String {
+    format!(
+        "The latest revision {revision_id} is in {state} state and cannot be deployed. Only \
+         revisions in Active state can be deployed. Create a new revision."
+    )
+}
+
+/// The `message` member of an error body.
+fn message_of(reply: &Reply) -> String {
+    text(&reply.body, "message")
+}
+
+/// RULE: the `409 ConflictException` that refuses switching an endpoint into the
+/// auto-deployment mode while the function's newest revision is not `Active` states which
+/// revision cannot be deployed and the state it is in, the rule that only `Active`
+/// revisions can be deployed, and the remedy (create a new revision) — the revision id and
+/// the state word come from the store, and the refusal names no other resource.
+///
+/// The rows span what the rule generalises over: WHICH non-`Active` state the newest
+/// revision is in (`Failed`, `Pending` — the only non-`Active` members of `RevisionState`),
+/// how the build got there, and whether an older revision is serving behind it.
+#[tokio::test]
+async fn the_latest_revision_switch_conflict_words_the_refusal_as_the_service_does() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "message-good.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'good';")]),
+    )
+    .await;
+    stage_object(&emulator, "message-broken.zip", b"not a zip archive".to_vec()).await;
+    stage_object(
+        &emulator,
+        "message-truncated.zip",
+        {
+            let mut built = archive(&[("index.mjs", b"export const handler = () => 1;")]);
+            built.truncate(built.len() / 2);
+            built
+        },
+    )
+    .await;
+    // Staged NOWHERE: "message-absent.zip" is the key the bucket holds nothing under, so a
+    // revision built from it fails for a different reason and still refuses the same way.
+
+    // (case, the key the initial revision builds from, the key of a revision created after
+    // it)
+    let rows: [(&str, &str, Option<&str>); 4] = [
+        (
+            // The recorded case: the newest revision's build failed while an older
+            // revision serves traffic.
+            "the newest revision's build failed, an older one serves",
+            "message-good.zip",
+            Some("message-broken.zip"),
+        ),
+        (
+            "the only revision's build failed",
+            "message-broken.zip",
+            None,
+        ),
+        (
+            "the newest revision's build failed on a truncated archive",
+            "message-good.zip",
+            Some("message-truncated.zip"),
+        ),
+        (
+            "the newest revision's build failed on an object the store does not hold",
+            "message-good.zip",
+            Some("message-absent.zip"),
+        ),
+    ];
+
+    for (index, (case, initial_key, later_key)) in rows.into_iter().enumerate() {
+        let name = format!("conflict-message-{index}");
+        let created = create_function_with_endpoint(&emulator, &name, initial_key, "Disabled").await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunction expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        let initial_revision = text(
+            created.field("revision").unwrap_or(&Value::Null),
+            "revisionId",
+        );
+        let newest_revision = match later_key {
+            Some(key) => {
+                let later = create_revision(&emulator, &name, key).await;
+                assert_eq!(
+                    later.status, 202,
+                    "case {case:?}: CreateWebFunctionRevision expected 202, got {} with {:?}",
+                    later.status, later.body
+                );
+                text(&later.body, "revisionId")
+            }
+            None => initial_revision.clone(),
+        };
+        let settled_state = poll_until_settled(&emulator, &name, &newest_revision).await;
+        assert_eq!(
+            settled_state, "Failed",
+            "case {case:?}: expected the newest revision's build to fail, got {settled_state}"
+        );
+
+        let switched = update_endpoint(&emulator, &name, switch_to_latest_revision()).await;
+        assert_eq!(
+            switched.status, 409,
+            "case {case:?}: expected 409, got {} with {:?}",
+            switched.status, switched.body
+        );
+        assert_eq!(
+            switched.error(),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {:?}",
+            switched.body
+        );
+        let expected = latest_revision_not_deployable(&newest_revision, "Failed");
+        let actual = message_of(&switched);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the message {expected:?}, got {actual:?}"
+        );
+        assert!(
+            !actual.contains(&name),
+            "case {case:?}: the refusal names no resource but the revision, got {actual:?}"
+        );
+    }
+}
+
+/// RULE, for the other non-`Active` state a revision can be in: a newest revision that is
+/// still `Pending` refuses the same switch with the same sentence, carrying `Pending` as
+/// the state it reports that revision in.
+#[tokio::test]
+async fn the_latest_revision_switch_conflict_reports_a_revision_that_is_still_building() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "pending-first.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'first';")]),
+    )
+    .await;
+    stage_object(
+        &emulator,
+        "pending-newer.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'newer';")]),
+    )
+    .await;
+
+    let name = "conflict-message-pending";
+    let created =
+        create_function_with_endpoint(&emulator, name, "pending-first.zip", "Disabled").await;
+    assert_eq!(
+        created.status, 202,
+        "CreateWebFunction expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    let first_revision = text(
+        created.field("revision").unwrap_or(&Value::Null),
+        "revisionId",
+    );
+    assert_eq!(
+        poll_until_settled(&emulator, name, &first_revision).await,
+        "Active",
+        "the first revision's build must succeed"
+    );
+
+    // The switch is attempted with no wait after the create, and the newest revision's
+    // state is read on both sides of it. A revision's build state only ever moves AWAY from
+    // `Pending`, so reading `Pending` on both sides means the refusal was decided while it
+    // was `Pending`; a build that settled first is reported as that settled state instead.
+    let later = create_revision(&emulator, name, "pending-newer.zip").await;
+    let newer_revision = text(&later.body, "revisionId");
+    let before = text(&get_revision(&emulator, name, &newer_revision).await, "state");
+    let switched = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+    let after = text(&get_revision(&emulator, name, &newer_revision).await, "state");
+
+    if before == "Pending" && after == "Pending" {
+        assert_eq!(
+            switched.status, 409,
+            "a switch onto a revision that is still building is refused, got {} with {:?}",
+            switched.status, switched.body
+        );
+        assert_eq!(
+            switched.error(),
+            "ConflictException",
+            "the refusal is the modelled conflict, got {:?}",
+            switched.body
+        );
+        let expected = latest_revision_not_deployable(&newer_revision, "Pending");
+        let actual = message_of(&switched);
+        assert_eq!(
+            actual, expected,
+            "a still-building newest revision: expected the message {expected:?}, got {actual:?}"
+        );
+    } else {
+        // The build settled before the switch was decided: either it was accepted onto an
+        // `Active` revision, or refused naming the state it settled in.
+        assert!(
+            switched.status == 202 || switched.status == 409,
+            "expected 202 or 409 from the switch, got {} with {:?}",
+            switched.status, switched.body
+        );
+        if switched.status == 409 {
+            let expected = latest_revision_not_deployable(&newer_revision, &after);
+            let actual = message_of(&switched);
+            assert_eq!(
+                actual, expected,
+                "a newest revision in {after}: expected the message {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    // Once the build has settled `Active`, the same switch is accepted: the refusal is the
+    // revision's state, not the endpoint.
+    assert_eq!(
+        poll_until_settled(&emulator, name, &newer_revision).await,
+        "Active",
+        "the newest revision's build must succeed"
+    );
+    let again = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+    assert_eq!(
+        again.status, 202,
+        "the switch must be accepted once the revision is Active, got {} with {:?}",
+        again.status, again.body
+    );
+    assert_eq!(
+        text(&again.body, "autoDeploymentMode"),
+        "LatestRevision",
+        "the accepted switch stores the mode, got {:?}",
+        again.body
+    );
+}
+
+/// `DELETE /web-functions/{name}/revisions/{revisionId}` — `DeleteWebFunctionRevision`
+/// (model: `smithy_query(query="operation", operation="DeleteWebFunctionRevision")`),
+/// addressing the revision by `identifier` in either form the member documents,
+/// percent-encoded as one URI segment.
+async fn delete_revision(emulator: &Emulator, function: &str, identifier: &str) -> Reply {
+    emulator
+        .send(
+            "DELETE",
+            &format!(
+                "/web-functions/{}/revisions/{}",
+                percent_encoded(function),
+                percent_encoded(identifier)
+            ),
+            REGION,
+            None,
+        )
+        .await
+}
+
+/// `GET /web-functions/{name}/revisions/{revisionId}` as the wire answered it, whatever
+/// the status — the read-back a delete is proved by.
+async fn read_revision(emulator: &Emulator, function: &str, identifier: &str) -> Reply {
+    emulator
+        .send(
+            "GET",
+            &format!(
+                "/web-functions/{}/revisions/{}",
+                percent_encoded(function),
+                percent_encoded(identifier)
+            ),
+            REGION,
+            None,
+        )
+        .await
+}
+
+/// RULE: `DeleteWebFunctionRevision` removes the named revision of the named function —
+/// so a reader of this service no longer holds it — and is refused `409
+/// ConflictException` while an endpoint of that function is serving it ("You cannot
+/// delete a revision that is currently serving traffic on an endpoint"). It is
+/// `@idempotent` and states an END STATE, so a revision the function does not carry
+/// settles as the modelled `204`, while a request addressed at a function this store does
+/// not hold reports that FUNCTION absent with `404 ResourceNotFoundException`.
+#[tokio::test]
+async fn deleting_a_revision_removes_it_unless_an_endpoint_is_serving_it() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "delete-good.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'good';")]),
+    )
+    .await;
+    stage_object(&emulator, "delete-broken.zip", b"not a zip archive".to_vec()).await;
+
+    // Each row drives one function: an endpoint serving the INITIAL revision, and a
+    // second revision created behind it. The rows span what the rule generalises over:
+    // which revision is named, which FORM names it (the id or the revision ARN), whether
+    // an endpoint serves it, and whether it is stored at all.
+    // (case, which revision the delete names, whether it is named by its ARN, the status
+    // expected)
+    let rows: [(&str, Target, bool, u16); 6] = [
+        ("the newest revision, by its id", Target::Newest, false, 204),
+        ("the newest revision, by its ARN", Target::Newest, true, 204),
+        (
+            "the newest revision, deleted twice",
+            Target::NewestTwice,
+            false,
+            204,
+        ),
+        (
+            "the revision the endpoint serves",
+            Target::Served,
+            false,
+            409,
+        ),
+        (
+            "a revision id nothing is stored under",
+            Target::Absent,
+            false,
+            204,
+        ),
+        (
+            "a revision of a function nothing is stored under",
+            Target::AbsentFunction,
+            false,
+            404,
+        ),
+    ];
+
+    for (index, (case, target, by_arn, expected_status)) in rows.into_iter().enumerate() {
+        let name = format!("delete-revision-{index}");
+        let created =
+            create_function_with_endpoint(&emulator, &name, "delete-good.zip", "Disabled").await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunction expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        let served_revision = text(
+            created.field("revision").unwrap_or(&Value::Null),
+            "revisionId",
+        );
+        let later = create_revision(&emulator, &name, "delete-broken.zip").await;
+        assert_eq!(
+            later.status, 202,
+            "case {case:?}: CreateWebFunctionRevision expected 202, got {} with {:?}",
+            later.status, later.body
+        );
+        let newest_revision = text(&later.body, "revisionId");
+        let newest_arn = text(&later.body, "revisionArn");
+
+        let (function_named, identifier) = match target {
+            Target::Newest | Target::NewestTwice => (
+                name.clone(),
+                if by_arn {
+                    newest_arn.clone()
+                } else {
+                    newest_revision.clone()
+                },
+            ),
+            Target::Served => (name.clone(), served_revision.clone()),
+            Target::Absent => (
+                name.clone(),
+                "00000000-0000-0000-0000-00000000dead".to_string(),
+            ),
+            Target::AbsentFunction => (format!("{name}-absent"), newest_revision.clone()),
+        };
+
+        if matches!(target, Target::NewestTwice) {
+            let first = delete_revision(&emulator, &function_named, &identifier).await;
+            assert_eq!(
+                first.status, 204,
+                "case {case:?}: the first delete expected 204, got {} with {:?}",
+                first.status, first.body
+            );
+        }
+
+        let deleted = delete_revision(&emulator, &function_named, &identifier).await;
+        assert_eq!(
+            deleted.status, expected_status,
+            "case {case:?}: expected {expected_status}, got {} with {:?}",
+            deleted.status, deleted.body
+        );
+
+        match target {
+            Target::Newest | Target::NewestTwice => {
+                // The revision the delete named is gone, and the one the endpoint serves
+                // is untouched: the store, not the answer, is what the delete is proved
+                // by.
+                let gone = read_revision(&emulator, &name, &newest_revision).await;
+                assert_eq!(
+                    gone.status, 404,
+                    "case {case:?}: a deleted revision is no longer readable, got {} with {:?}",
+                    gone.status, gone.body
+                );
+                assert_eq!(
+                    gone.error(),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException, got {:?}",
+                    gone.body
+                );
+                let expected_message =
+                    format!("The revision {newest_revision} of web function {name} doesn't exist.");
+                let actual = text(&gone.body, "message");
+                assert_eq!(
+                    actual, expected_message,
+                    "case {case:?}: expected the message {expected_message:?}, got {actual:?}"
+                );
+                let kept = read_revision(&emulator, &name, &served_revision).await;
+                assert_eq!(
+                    kept.status, 200,
+                    "case {case:?}: the other revisions are untouched, got {} with {:?}",
+                    kept.status, kept.body
+                );
+            }
+            Target::Absent => {
+                // The end state already held, so the success removed nothing: both
+                // stored revisions are still readable.
+                for still_there in [&served_revision, &newest_revision] {
+                    let kept = read_revision(&emulator, &name, still_there).await;
+                    assert_eq!(
+                        kept.status, 200,
+                        "case {case:?}: the delete of an absent revision removes nothing, {} \
+                         answered {} with {:?}",
+                        still_there, kept.status, kept.body
+                    );
+                }
+            }
+            Target::Served => {
+                assert_eq!(
+                    deleted.error(),
+                    "ConflictException",
+                    "case {case:?}: expected ConflictException, got {:?}",
+                    deleted.body
+                );
+                let expected_message = format!(
+                    "The revision {served_revision} is serving traffic on endpoint \
+                     {ENDPOINT_NAME} and cannot be deleted. Shift the endpoint's traffic to \
+                     another revision and try again."
+                );
+                let actual = text(&deleted.body, "message");
+                assert_eq!(
+                    actual, expected_message,
+                    "case {case:?}: expected the message {expected_message:?}, got {actual:?}"
+                );
+                let kept = read_revision(&emulator, &name, &served_revision).await;
+                assert_eq!(
+                    kept.status, 200,
+                    "case {case:?}: a refused delete removes nothing, got {} with {:?}",
+                    kept.status, kept.body
+                );
+            }
+            Target::AbsentFunction => {
+                assert_eq!(
+                    deleted.error(),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException, got {:?}",
+                    deleted.body
+                );
+                let expected_message = format!("The function {function_named} does not exist.");
+                let actual = text(&deleted.body, "message");
+                assert_eq!(
+                    actual, expected_message,
+                    "case {case:?}: expected the message {expected_message:?}, got {actual:?}"
+                );
+                let kept = read_revision(&emulator, &name, &newest_revision).await;
+                assert_eq!(
+                    kept.status, 200,
+                    "case {case:?}: a delete of another function's revision removes nothing, got \
+                     {} with {:?}",
+                    kept.status, kept.body
+                );
+            }
+        }
+    }
+}
+
+/// Which revision one row of the delete table names.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// The function's newest revision, which no endpoint serves.
+    Newest,
+    /// The newest revision, deleted once already.
+    NewestTwice,
+    /// The revision the function's endpoint serves.
+    Served,
+    /// A revision id the function carries nothing under.
+    Absent,
+    /// A revision of a function this store holds nothing under.
+    AbsentFunction,
+}
+
+/// RULE: a function's NEWEST revision is the newest one the store still holds, so
+/// deleting the newest revision moves "the newest revision" back onto the one created
+/// before it — which is what the auto-deployment switch then acts on: refused while the
+/// newest revision is not `Active`, accepted once the newest revision the store holds is.
+#[tokio::test]
+async fn deleting_the_newest_revision_moves_the_latest_revision_back() {
+    let emulator = Emulator::with_object_store();
+    create_bucket(&emulator).await;
+    stage_object(
+        &emulator,
+        "latest-good.zip",
+        archive(&[("index.mjs", b"export const handler = () => 'good';")]),
+    )
+    .await;
+    stage_object(&emulator, "latest-broken.zip", b"not a zip archive".to_vec()).await;
+
+    let name = "delete-revision-latest";
+    let created =
+        create_function_with_endpoint(&emulator, name, "latest-good.zip", "Disabled").await;
+    assert_eq!(
+        created.status, 202,
+        "CreateWebFunction expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    let first_revision = text(
+        created.field("revision").unwrap_or(&Value::Null),
+        "revisionId",
+    );
+    assert_eq!(
+        poll_until_settled(&emulator, name, &first_revision).await,
+        "Active",
+        "the first revision's build must succeed"
+    );
+
+    // A newer revision whose build fails: while it is the newest, the switch into the
+    // auto-deployment mode is refused.
+    let later = create_revision(&emulator, name, "latest-broken.zip").await;
+    let failed_revision = text(&later.body, "revisionId");
+    assert_eq!(
+        poll_until_settled(&emulator, name, &failed_revision).await,
+        "Failed",
+        "the newer revision's build must fail"
+    );
+    let refused = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+    assert_eq!(
+        refused.status, 409,
+        "the switch onto a revision that did not build is refused, got {} with {:?}",
+        refused.status, refused.body
+    );
+
+    // Deleting it moves the function's newest revision back onto the one that BUILT, so
+    // the same switch is now a change the service can make.
+    let deleted = delete_revision(&emulator, name, &failed_revision).await;
+    assert_eq!(
+        deleted.status, 204,
+        "deleting a revision no endpoint serves expected 204, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    let accepted = update_endpoint(&emulator, name, switch_to_latest_revision()).await;
+    assert_eq!(
+        accepted.status, 202,
+        "the switch must be accepted once the newest revision is Active, got {} with {:?}",
+        accepted.status, accepted.body
+    );
+    assert_eq!(
+        text(&accepted.body, "autoDeploymentMode"),
+        "LatestRevision",
+        "the accepted switch stores the mode, got {:?}",
+        accepted.body
+    );
+    assert_eq!(
+        served_revisions(&accepted.body),
+        vec![first_revision.clone()],
+        "the endpoint serves the newest revision the store holds, got {:?}",
+        accepted.body
+    );
 }

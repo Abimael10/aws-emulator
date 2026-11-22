@@ -61,6 +61,11 @@ pub use resource_policies::*;
 /// asks KMS about it, and the sentence a create is refused with when it cannot be used.
 pub mod revision_key;
 
+/// The revision slice: how a request names a revision, the sentence an absent one is
+/// reported with, and the rule a revision's delete follows.
+mod revisions;
+pub use revisions::*;
+
 /// The tag slice: the tags a web function carries, and the rules the tag
 /// operations hold a key set to.
 mod tags;
