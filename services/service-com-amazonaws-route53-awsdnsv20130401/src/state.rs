@@ -73,6 +73,12 @@ pub mod managed_zone;
 /// and the CloudWatch Logs log group it publishes them to.
 pub mod query_logging;
 
+/// Which hosted zone an `AliasTarget` names, and the problem a target that does
+/// not lie within that zone is refused with.
+pub mod alias_target_zones;
+
+pub use alias_target_zones::alias_target_zone_problem;
+
 use crate::ops::types::change_cidr_collection_types::CidrCollectionVersionMismatchException;
 use crate::ops::types::create_cidr_collection_types::CidrCollection;
 use crate::ops::types::list_cidr_blocks_types::CidrBlockSummary;
@@ -3140,62 +3146,6 @@ pub fn name_is_in_zone(name: &str, zone_name: &str) -> bool {
         return false;
     };
     name_labels[offset..] == zone_labels[..]
-}
-
-/// The hosted zones AWS publishes ONE FIXED id for, each with the domain the
-/// names of its resources' endpoints lie in.
-///
-/// `AliasTarget$HostedZoneId` fixes the id of exactly these two target zones —
-/// "CloudFront distribution: Specify `Z2FDTNDATAQYW2`" and "Global Accelerator
-/// accelerator: Specify `Z2BJ6XQ5FK7U4H`" — while every other target zone it
-/// describes is read off the resource itself (a load balancer's
-/// `CanonicalHostedZoneId`, an API's `regionalHostedZoneId`, the hosted zone id
-/// of a region's Amazon S3 website endpoints) or is a zone of the account's own,
-/// so an id this list does not name fixes no domain to check a target against.
-/// The domain beside each id is the one `AliasTarget$DNSName` names for that
-/// resource: "the name of the associated CloudFront distribution, such as
-/// `da1b2c3d4e5.cloudfront.net`", and an accelerator's own DNS name, which is a
-/// label under `awsglobalaccelerator.com`.
-///
-/// Read from `smithy_query(query="doc",shape="AliasTarget",member="HostedZoneId")`
-/// and the same query for `DNSName`.
-pub const FIXED_TARGET_ZONE_DOMAINS: &[(&str, &str)] = &[
-    ("Z2FDTNDATAQYW2", "cloudfront.net"),
-    ("Z2BJ6XQ5FK7U4H", "awsglobalaccelerator.com"),
-];
-
-/// Why the alias target `(target, zone_id)` does not lie within the hosted zone
-/// it names, or `None` when it does — and `None` as well for a target zone
-/// whose domain is not fixed with its id ([`FIXED_TARGET_ZONE_DOMAINS`]), which
-/// there is nothing to check a target against.
-///
-/// An alias "[routes] traffic to the resource" its target names, and the target
-/// names that resource by the zone it lives in and its name INSIDE that zone, so
-/// a name outside the zone names no resource there and the alias routes nowhere.
-/// For the zones whose id is fixed by the service that owns them, the domain
-/// their names lie in is fixed with it, which is what makes the target checkable
-/// from the request alone.
-///
-/// A resource's endpoint in THIS emulator is published as the address a client
-/// dials rather than as a name in the owning service's zone (the `host:port` the
-/// service that opened the data plane reported), so a target that names an
-/// address ([`dns_name_address`]) names an endpoint of that zone and lies within
-/// it.
-///
-/// REQUEST-DERIVED: the sentence names the target, the record type and the zone
-/// the change asked for, and nothing else.
-pub fn alias_target_zone_problem(target: &str, rr_type: &str, zone_id: &str) -> Option<String> {
-    let zone_id = normalize_zone_id(zone_id);
-    let (_, domain) = FIXED_TARGET_ZONE_DOMAINS
-        .iter()
-        .find(|(id, _)| id.eq_ignore_ascii_case(zone_id))?;
-    if dns_name_address(target).is_some() || name_is_in_zone(target, domain) {
-        return None;
-    }
-    Some(format!(
-        "Tried to create an alias that targets {target}, type {rr_type} in zone {zone_id}, but \
-         the alias target name does not lie within the target zone"
-    ))
 }
 
 /// A resource's tag set as the wire carries it, in tag-key order.

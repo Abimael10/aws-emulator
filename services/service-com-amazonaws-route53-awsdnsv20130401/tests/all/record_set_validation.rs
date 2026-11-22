@@ -28,12 +28,20 @@
 //!    within the hosted zone it names — checkable for the target zones whose id
 //!    the owning service fixes, and refused (`InvalidChangeBatch`) when it does
 //!    not.
+//! 7. That same rule over every zone whose contents are decidable here: the
+//!    target zones AWS publishes ONE ID PER REGION for (the Amazon S3 website
+//!    endpoints), read from both sides of the pair, and a hosted zone of the
+//!    account's own.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness `hosted_zone_records` uses, so what is asserted is the HTTP/restXml
 //! behaviour a Route 53 client sees.
 
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_route53_awsdnsv20130401::state::alias_target_zones::{
+    s3_website_domains, S3_WEBSITE_TARGET_ZONE_REGIONS,
+};
 
 use crate::hosted_zone_records::{
     call, change_batch_body, create_zone_ok, escape_xml, router, Reply,
@@ -1271,6 +1279,310 @@ async fn an_alias_target_must_lie_within_the_hosted_zone_it_names() {
              {CLOUDFRONT_ZONE}, but the alias target name does not lie within the target zone]"
         ),
         &upserted.canonical(),
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// 7. The same rule over the target zones AWS publishes ONE ID PER REGION for
+// ---------------------------------------------------------------------------
+
+/// The problem a refused alias is reported with, for a target already in the
+/// form the service reports it (lower-cased and fully qualified).
+fn out_of_zone_problem(reported_target: &str, rr_type: &str, zone_id: &str) -> String {
+    format!(
+        "[Tried to create an alias that targets {reported_target}, type {rr_type} in zone \
+         {zone_id}, but the alias target name does not lie within the target zone]"
+    )
+}
+
+#[tokio::test]
+async fn an_alias_target_must_lie_within_the_region_zone_of_the_id_it_names() {
+    // The rule: an alias target lies within the hosted zone its `HostedZoneId`
+    // names, and for the target zones AWS publishes the id of, the domain that
+    // zone holds names in is published with the id — one id for every CloudFront
+    // distribution and every accelerator, and ONE PER REGION for the Amazon S3
+    // website endpoints ("Specify the hosted zone ID for the region that you
+    // created the bucket in"). So a Region's endpoint host under another
+    // Region's published id names a zone it does not lie within, and the batch
+    // is refused `InvalidChangeBatch`.
+    //
+    // Asserted over the WHOLE published catalog
+    // (`service_com_amazonaws_route53_awsdnsv20130401::state::alias_target_zones`,
+    // read from the *Amazon S3 Website Endpoints* table
+    // `smithy_query(query="doc",shape="AliasTarget",member="HostedZoneId")`
+    // links), not over one Region: every entry's own id accepts the endpoint
+    // domain in both spellings Amazon S3 publishes and a bucket host under it,
+    // and the NEXT entry's id refuses the same name.
+    let router = router();
+    let zone_id = create_zone_ok(&router, ZONE, "s3-website-alias-zone").await;
+    let catalog = S3_WEBSITE_TARGET_ZONE_REGIONS;
+    assert!(
+        catalog.len() > 1,
+        "the published catalog must hold more than one Region, got {catalog:?}"
+    );
+
+    for (index, (id, region)) in catalog.iter().enumerate() {
+        let [hyphenated, dotted] = s3_website_domains(region);
+        // The endpoint domain itself, which is what `AliasTarget$DNSName`
+        // documents for a bucket website ("the domain name of the Amazon S3
+        // website endpoint that you created the bucket in"), in both spellings
+        // Amazon S3 publishes, and a bucket's own host under it.
+        let targets = [
+            dotted.clone(),
+            hyphenated.clone(),
+            format!("{ZONE}.{hyphenated}"),
+        ];
+        for (spelling, target) in targets.iter().enumerate() {
+            let case = format!("{region}: {target:?} under its own published zone {id}");
+            let record = Rrset::new(&format!("s3-{index}-{spelling}.{ZONE}"), "A").alias(id, target);
+            let reply = submit_one(&router, &zone_id, "CREATE", &record).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected the alias to be accepted, got {} with body {}",
+                reply.status, reply.body
+            );
+            let listed = list(&router, &zone_id).await;
+            let reported = format!("{target}.");
+            let targets_listed = listed.all("AliasTarget/DNSName");
+            assert!(
+                targets_listed.contains(&reported.as_str()),
+                "case {case:?}: expected the alias target {reported:?} in the listing, got \
+                 {targets_listed:?}"
+            );
+        }
+
+        // The same endpoint host under the NEXT Region's published id: one
+        // Region's endpoints do not lie within another Region's zone.
+        let (other_id, other_region) = catalog[(index + 1) % catalog.len()];
+        let case = format!("{region} endpoint {dotted:?} under {other_region}'s zone {other_id}");
+        let record =
+            Rrset::new(&format!("s3-mismatch-{index}.{ZONE}"), "A").alias(other_id, &dotted);
+        let reply = submit_one(&router, &zone_id, "CREATE", &record).await;
+        assert_refused(
+            &router,
+            &zone_id,
+            &case,
+            &reply,
+            "InvalidChangeBatch",
+            &out_of_zone_problem(&format!("{dotted}."), "A", other_id),
+            &record.canonical(),
+        )
+        .await;
+    }
+}
+
+/// One alias target submitted under one published hosted zone id, and whether
+/// the batch must be refused.
+struct PublishedZoneCase {
+    label: &'static str,
+    /// The `AliasTarget.HostedZoneId` the change names.
+    zone: &'static str,
+    /// The `AliasTarget.DNSName` the change names.
+    target: &'static str,
+    /// Whether the batch must be refused.
+    refused: bool,
+}
+
+#[tokio::test]
+async fn an_s3_website_alias_target_is_judged_by_the_endpoint_domain_of_its_own_region() {
+    // The same rule, over what the published per-Region zones DO and do not
+    // hold: a Region's website zone holds the names under that Region's
+    // endpoint domain and nothing else, so a name that merely carries the
+    // endpoint label, one under another Region's domain, and one under the
+    // wrong DNS suffix all lie outside it.
+    //
+    // The ids and Regions below are entries of the published catalog
+    // (`state::alias_target_zones::S3_WEBSITE_TARGET_ZONE_REGIONS`, read from
+    // the *Amazon S3 Website Endpoints* table
+    // `smithy_query(query="doc",shape="AliasTarget",member="HostedZoneId")`
+    // links); the China Region is there because its endpoints are published
+    // under their own DNS suffix.
+    let router = router();
+    let zone_id = create_zone_ok(&router, ZONE, "s3-website-domain-zone").await;
+
+    /// The published zone id of the Amazon S3 website endpoints of `eu-west-1`.
+    const EU_WEST_1: &str = "Z1BKCTXD74EZPE";
+    /// The published zone id of the Amazon S3 website endpoints of `cn-north-1`.
+    const CN_NORTH_1: &str = "Z5CN8UMXT92WN";
+
+    let rows: &[PublishedZoneCase] = &[
+        PublishedZoneCase {
+            label: "the Region's own endpoint domain",
+            zone: EU_WEST_1,
+            target: "s3-website.eu-west-1.amazonaws.com",
+            refused: false,
+        },
+        PublishedZoneCase {
+            label: "a bucket host under the Region's own endpoint domain",
+            zone: EU_WEST_1,
+            target: "reports.s3-website-eu-west-1.amazonaws.com",
+            refused: false,
+        },
+        PublishedZoneCase {
+            label: "a bucket host under ANOTHER Region's endpoint domain",
+            zone: EU_WEST_1,
+            target: "reports.s3-website-us-east-2.amazonaws.com",
+            refused: true,
+        },
+        PublishedZoneCase {
+            label: "a name that only carries the endpoint label",
+            zone: EU_WEST_1,
+            target: "s3-website.example.net",
+            refused: true,
+        },
+        PublishedZoneCase {
+            label: "a name that carries the endpoint domain in a longer suffix",
+            zone: EU_WEST_1,
+            target: "site.s3-website-eu-west-1.amazonaws.com.example.net",
+            refused: true,
+        },
+        PublishedZoneCase {
+            label: "a China Region's endpoint domain, under its own DNS suffix",
+            zone: CN_NORTH_1,
+            target: "s3-website.cn-north-1.amazonaws.com.cn",
+            refused: false,
+        },
+        PublishedZoneCase {
+            label: "the same Region's endpoint under the wrong DNS suffix",
+            zone: CN_NORTH_1,
+            target: "s3-website.cn-north-1.amazonaws.com",
+            refused: true,
+        },
+        PublishedZoneCase {
+            // An endpoint this emulator serves is published as the address a
+            // client dials rather than as a name in the owning service's zone,
+            // so a target that names one names an endpoint of that zone.
+            label: "the address an endpoint of this emulator is published at",
+            zone: EU_WEST_1,
+            target: "127.0.0.1:41000",
+            refused: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let record = Rrset::new(&format!("held{index}.{ZONE}"), "A").alias(row.zone, row.target);
+        let reply = submit_one(&router, &zone_id, "CREATE", &record).await;
+        if row.refused {
+            assert_refused(
+                &router,
+                &zone_id,
+                row.label,
+                &reply,
+                "InvalidChangeBatch",
+                &out_of_zone_problem(&format!("{}.", row.target), "A", row.zone),
+                &record.canonical(),
+            )
+            .await;
+            continue;
+        }
+        assert_eq!(
+            reply.status, 200,
+            "case {:?}: expected the alias to be accepted, got {} with body {}",
+            row.label, reply.status, reply.body
+        );
+    }
+}
+
+/// One alias whose `HostedZoneId` names a hosted zone of the account's own, and
+/// whether the target it names lies within that zone.
+struct OwnZoneCase {
+    label: &'static str,
+    /// The `AliasTarget.DNSName` the change names.
+    target: &'static str,
+    /// Whether the batch must be refused.
+    refused: bool,
+}
+
+#[tokio::test]
+async fn an_alias_target_must_lie_within_the_callers_own_hosted_zone() {
+    // The rule, for the other kind of zone whose contents are known here: a
+    // hosted zone of the account's own holds exactly the names inside it —
+    // "Another Route 53 resource record set in your hosted zone: Specify the
+    // hosted zone ID of your hosted zone. (An alias resource record set can't
+    // reference a resource record set in a different hosted zone.)", whose
+    // `DNSName` is "the value of the `Name` element for a resource record set
+    // in the current hosted zone" — so a target outside that zone's own name is
+    // refused.
+    //
+    // The rows span a name inside the zone, the zone apex itself, a subdomain
+    // of a subdomain, a name whose last labels only LOOK like the zone's, a
+    // name in another zone THIS ACCOUNT holds, and a name of a published
+    // endpoint zone.
+    let router = router();
+    let zone_id = create_zone_ok(&router, ZONE, "own-zone-alias").await;
+    let other_zone_id = create_zone_ok(&router, "example.net", "own-zone-alias-other").await;
+
+    let rows: &[OwnZoneCase] = &[
+        OwnZoneCase {
+            label: "a name inside the zone",
+            target: "www.example.com",
+            refused: false,
+        },
+        OwnZoneCase {
+            label: "the zone apex itself",
+            target: APEX,
+            refused: false,
+        },
+        OwnZoneCase {
+            label: "a name several labels inside the zone",
+            target: "blue.www.example.com",
+            refused: false,
+        },
+        OwnZoneCase {
+            label: "a name whose last labels only look like the zone's",
+            target: "notexample.com",
+            refused: true,
+        },
+        OwnZoneCase {
+            label: "a name in another zone the account holds",
+            target: "www.example.net",
+            refused: true,
+        },
+        OwnZoneCase {
+            label: "a published endpoint zone's own name",
+            target: "d111111abcdef8.cloudfront.net",
+            refused: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let record = Rrset::new(&format!("own{index}.{ZONE}"), "A").alias(&zone_id, row.target);
+        let reply = submit_one(&router, &zone_id, "CREATE", &record).await;
+        let reported = format!("{}.", row.target.trim_end_matches('.'));
+        if row.refused {
+            assert_refused(
+                &router,
+                &zone_id,
+                row.label,
+                &reply,
+                "InvalidChangeBatch",
+                &out_of_zone_problem(&reported, "A", &zone_id),
+                &record.canonical(),
+            )
+            .await;
+            continue;
+        }
+        assert_eq!(
+            reply.status, 200,
+            "case {:?}: expected the alias to be accepted, got {} with body {}",
+            row.label, reply.status, reply.body
+        );
+    }
+
+    // The zone the batch is submitted to is not what decides this: an alias in
+    // the OTHER zone naming the first zone's id is held against the first
+    // zone's names just the same.
+    let crossed = Rrset::new("cross.example.net", "A").alias(&zone_id, "www.example.net");
+    let reply = submit_one(&router, &other_zone_id, "CREATE", &crossed).await;
+    assert_refused(
+        &router,
+        &other_zone_id,
+        "a target in the submitting zone, under another zone's id",
+        &reply,
+        "InvalidChangeBatch",
+        &out_of_zone_problem("www.example.net.", "A", &zone_id),
+        &crossed.canonical(),
     )
     .await;
 }

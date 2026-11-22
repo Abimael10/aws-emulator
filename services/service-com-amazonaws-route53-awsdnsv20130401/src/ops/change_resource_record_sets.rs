@@ -785,6 +785,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut problems = Problems::default();
         let mut record_count = zone.records.len();
 
+        // The NAMES of the hosted zones THIS ACCOUNT holds that the batch's
+        // alias targets name, so an alias naming one of them is held against
+        // the names that zone actually holds ("An alias resource record set
+        // can't reference a resource record set in a different hosted zone").
+        // Resolved once, before the batch is walked, and sized by the (bounded)
+        // batch rather than by the store.
+        let aliased_zone_names: BTreeMap<String, String> = input
+            .change_batch
+            .changes
+            .iter()
+            .filter_map(|change| change.resource_record_set.alias_target.as_ref())
+            .filter_map(|alias| {
+                let id = normalize_zone_id(&alias.hosted_zone_id).to_string();
+                let name = store.zones.get(&id)?.name.clone();
+                Some((id, name))
+            })
+            .collect();
+
         for change in &input.change_batch.changes {
             let mut record = change.resource_record_set.clone();
             // A record set is stored, keyed and reported under the ONE canonical
@@ -816,7 +834,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .filter(|_| action != CHANGE_ACTION_DELETE);
             if let Some(problem) = written_alias.and_then(|alias| {
-                alias_target_zone_problem(&alias.dns_name, &record.r#type, &alias.hosted_zone_id)
+                alias_target_zone_problem(
+                    &alias.dns_name,
+                    &record.r#type,
+                    &alias.hosted_zone_id,
+                    aliased_zone_names
+                        .get(normalize_zone_id(&alias.hosted_zone_id))
+                        .map(String::as_str),
+                )
             }) {
                 problems.push(problem);
                 continue;
