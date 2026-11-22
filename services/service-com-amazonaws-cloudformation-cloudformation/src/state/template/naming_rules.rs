@@ -369,6 +369,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         crate::state::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
+        // Amazon Redshift `CreateEventSubscription.SubscriptionName`: "Cannot be null, empty, or
+        // blank", "Must contain from 1 to 255 alphanumeric characters or hyphens", "First
+        // character must be a letter", "Cannot end with a hyphen or contain two consecutive
+        // hyphens" (that member's own doc) — Redshift's model carries no `@length` for it. That
+        // member states no case folding, so a generated name is held as generated and only the
+        // LENGTH is a bound one could break, for the reason the grant's entry above records.
+        crate::state::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION => {
+            rules(255, Characters::AsGenerated)
+        }
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
         EC2_SECURITY_GROUP => rules(255, Characters::AsGenerated),
@@ -986,6 +995,13 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // so neither `ClusterParameterGroupName` nor `Name` finds it.
         crate::state::provisioner::redshift_parameter_groups::REDSHIFT_CLUSTER_PARAMETER_GROUP => {
             Some("ParameterGroupName")
+        }
+        // The same service's `CreateEventSubscription` takes a `SubscriptionName` — "the name of
+        // the event subscription to be created" — and the type publishes it, so the name the
+        // template states is the subscription's. The type's last segment is `EventSubscription`,
+        // so neither `EventSubscriptionName` nor `Name` finds it.
+        crate::state::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION => {
+            Some("SubscriptionName")
         }
         // Amazon ElastiCache's `CreateCacheCluster` takes a `CacheClusterId`, and the type
         // publishes it as `ClusterName` — "Ref returns the name of the cache cluster" — so

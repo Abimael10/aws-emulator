@@ -81,6 +81,7 @@
 use super::provisioner::client_vpn::{
     EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
 };
+use super::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION;
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
 use super::provisioner::redshift_serverless::{
     REDSHIFT_SERVERLESS_NAMESPACE, REDSHIFT_SERVERLESS_SNAPSHOT, REDSHIFT_SERVERLESS_WORKGROUP,
@@ -887,12 +888,14 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Recycle Bin. The retention rule is created in the owning service
     // (`super::provisioner`), through that service's own `CreateRule`.
     RBIN_RULE,
-    // Amazon Redshift. The snapshot copy grant is created in the owning service
-    // (`super::provisioner`), through that service's own `CreateSnapshotCopyGrant`.
+    // Amazon Redshift. The snapshot copy grant and the event notification subscription are
+    // created in the owning service (`super::provisioner`), through that service's own
+    // `CreateSnapshotCopyGrant` and `CreateEventSubscription`.
     "AWS::Redshift::Cluster",
     "AWS::Redshift::ClusterParameterGroup",
     "AWS::Redshift::ClusterSecurityGroup",
     "AWS::Redshift::ClusterSubnetGroup",
+    REDSHIFT_EVENT_SUBSCRIPTION,
     REDSHIFT_SNAPSHOT_COPY_GRANT,
     // Amazon Redshift Serverless — a different service from Amazon Redshift above, reached by
     // the `redshift-serverless` signing name. All three types are created in the owning

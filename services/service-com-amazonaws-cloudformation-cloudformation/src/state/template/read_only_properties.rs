@@ -94,6 +94,23 @@ pub const READ_ONLY_PROPERTIES: &[ReadOnlyProperties] = &[
         resource_type: "AWS::SecretsManager::RotationSchedule",
         read_only: &[SECRETSMANAGER_ID],
     },
+    // `AWS::Redshift::EventSubscription`: the six values Amazon Redshift ANSWERS for a
+    // subscription and no member of `CreateEventSubscription` or `ModifyEventSubscription`
+    // accepts — the account it belongs to, the name that service holds it under, its status,
+    // the instant it was created, and the source and category lists as that service RESOLVED
+    // them (the declaration states its own under `SourceIds` and `EventCategories`).
+    ReadOnlyProperties {
+        resource_type:
+            crate::state::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION,
+        read_only: &[
+            "CustSubscriptionId",
+            "CustomerAwsId",
+            "EventCategoriesList",
+            "SourceIdsList",
+            "Status",
+            "SubscriptionCreationTime",
+        ],
+    },
 ];
 
 /// The one read-only property the `AWS::SecretsManager::*` types above publish.

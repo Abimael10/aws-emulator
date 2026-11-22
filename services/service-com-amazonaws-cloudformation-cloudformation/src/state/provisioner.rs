@@ -1033,6 +1033,16 @@ pub(super) enum Provisioner {
     /// Key Management Service before it holds one, so a declaration naming a key that service
     /// cannot read is that service's own refusal on this resource.
     RedshiftSnapshotCopyGrant,
+    /// `AWS::Redshift::EventSubscription`: the event notification subscription that publishes
+    /// that service's events to an Amazon SNS topic, which `CreateEventSubscription` creates
+    /// under the name the declaration states — the name this type's `Ref` returns —
+    /// `DescribeEventSubscriptions` reports, `ModifyEventSubscription` changes and
+    /// `DeleteEventSubscription` removes ([`redshift_event_subscriptions`]).
+    ///
+    /// The topic the subscription publishes to is resolved by Amazon Redshift against Amazon
+    /// SNS before it holds one, so a declaration naming an ARN that service holds no topic
+    /// under is that service's own refusal on this resource.
+    RedshiftEventSubscription,
     EventsRule,
     /// `AWS::Pipes::Pipe`: a pipe of Amazon EventBridge Pipes, which `CreatePipe` creates
     /// under the name the template states, `UpdatePipe` changes and `DeletePipe` deletes.
@@ -1702,6 +1712,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         REDSHIFT_CLUSTER_SUBNET_GROUP => Some(Provisioner::RedshiftClusterSubnetGroup),
         REDSHIFT_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RedshiftClusterParameterGroup),
         REDSHIFT_SNAPSHOT_COPY_GRANT => Some(Provisioner::RedshiftSnapshotCopyGrant),
+        redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION => {
+            Some(Provisioner::RedshiftEventSubscription)
+        }
         EVENTS_RULE => Some(Provisioner::EventsRule),
         EVENTS_EVENT_BUS => Some(Provisioner::EventsEventBus),
         EVENTS_EVENT_BUS_POLICY => Some(Provisioner::EventsEventBusPolicy),
@@ -2266,6 +2279,12 @@ impl Provisioner {
             // carries the tags CloudFormation gives it beside the declared ones.
             Self::RedshiftSnapshotCopyGrant => {
                 Box::pin(create_snapshot_copy_grant(ctx, region, resource, propagated)).await
+            }
+            // `AWS::Redshift::EventSubscription` publishes `Tags` as the `{Key, Value}` list
+            // `CreateEventSubscription`'s own `Tags` member takes, so a subscription a stack
+            // creates carries the tags CloudFormation gives it beside the declared ones.
+            Self::RedshiftEventSubscription => {
+                Box::pin(create_event_subscription(ctx, region, resource, propagated)).await
             }
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
@@ -3080,6 +3099,9 @@ impl Provisioner {
                 // the one check its own crate's tag validation makes — so a grant carries the
                 // stack's own tags without the three.
                 | Self::RedshiftSnapshotCopyGrant
+                // The same check guards `CreateEventSubscription`'s own `Tags` member, so an
+                // event subscription carries the stack's own tags without the three.
+                | Self::RedshiftEventSubscription
                 // Amazon MemoryDB refuses a tag key in the reserved namespace on every call
                 // that takes tags — the `Tags` member of each group create and `TagResource`
                 // alike, in the one check its own crate's tag validation makes — so a
@@ -3581,6 +3603,9 @@ impl Provisioner {
             }
             Self::RedshiftSnapshotCopyGrant => {
                 delete_snapshot_copy_grant(ctx, region, physical_resource_id).await
+            }
+            Self::RedshiftEventSubscription => {
+                delete_event_subscription(ctx, region, physical_resource_id).await
             }
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
@@ -4404,6 +4429,13 @@ pub(super) mod redshift_parameter_groups;
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a
 /// client's own read of that service resolves the name the stack publishes.
 pub(super) mod redshift_snapshot_copy_grants;
+/// The Amazon Redshift EVENT SUBSCRIPTION arm: the subscription an
+/// `AWS::Redshift::EventSubscription` declares, created in the service that owns it so a
+/// client's own `DescribeEventSubscriptions` resolves the name the stack publishes. Visible to
+/// the rest of this service's state because the type's own NAME lives here, beside the arms
+/// that provision it, and the catalogue of declarable types and the naming rules key their
+/// entries for it by that name.
+pub(in crate::state) mod redshift_event_subscriptions;
 /// The Amazon MemoryDB group arms: the parameter group and the subnet group a cluster's
 /// configuration is declared with, created in the service that owns them so a client's own
 /// read of that service resolves the names and ARNs the stack publishes.
@@ -4451,6 +4483,7 @@ use elasticache_caches::*;
 use rds_db_clusters::*;
 use redshift_parameter_groups::*;
 use redshift_snapshot_copy_grants::*;
+use redshift_event_subscriptions::*;
 use ssm_associations::*;
 use ssm_maintenance_windows::*;
 use ssm_documents::*;

@@ -691,6 +691,11 @@ impl Provisioner {
             Self::RedshiftSnapshotCopyGrant => {
                 describe_snapshot_copy_grant(ctx, region, physical_resource_id).await
             }
+            // Amazon Redshift's own read of the event subscription the stack created, by the
+            // name it was created under.
+            Self::RedshiftEventSubscription => {
+                describe_event_subscription(ctx, region, physical_resource_id).await
+            }
             // The AgentCore control plane's own read of the identity, by the name it was
             // created under.
             Self::BedrockAgentCoreWorkloadIdentity => {

@@ -202,6 +202,13 @@ impl Provisioner {
             // service publishes no modify for one — so the arm decides whether the change is
             // one the grant the stack has can take at all.
             Self::RedshiftSnapshotCopyGrant => update_snapshot_copy_grant(resource, declared),
+            // Everything an event subscription carries beside its name and its tags is a
+            // member of `ModifyEventSubscription`, so a changed declaration is applied to the
+            // subscription the stack created rather than replacing it
+            // ([`update_event_subscription`]).
+            Self::RedshiftEventSubscription => {
+                Box::pin(update_event_subscription(ctx, region, resource, declared)).await
+            }
             // Every member of a health check's configuration that can change on a live one
             // is a member of `UpdateHealthCheck`, so a changed declaration is applied to the
             // health check the stack created — under the id its `Ref` resolves to — rather
