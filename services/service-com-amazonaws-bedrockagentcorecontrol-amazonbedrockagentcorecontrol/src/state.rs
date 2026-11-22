@@ -85,7 +85,12 @@
 //!   [`OnlineEvaluationConfigRecord`] per `onlineEvaluationConfigId`, holding
 //!   the whole configuration `CreateOnlineEvaluationConfig` persisted, whether
 //!   its evaluation is running and the status the clock owes it, so
-//!   `GetOnlineEvaluationConfig` reports exactly that.
+//!   `GetOnlineEvaluationConfig` reports exactly that;
+//! * the evaluator (`/evaluators/`): one [`EvaluatorRecord`] per `evaluatorId`,
+//!   holding the configuration `CreateEvaluator` persisted, the statuses the
+//!   clock owes it and the removal an accepted deletion owes it, so
+//!   `GetEvaluator`, `UpdateEvaluator` and `DeleteEvaluator` answer from one
+//!   store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -1722,6 +1727,12 @@ pub mod consent_portals;
 /// handler names `crate::state::…` for it exactly as it does for the resources
 /// beside it.
 pub mod online_evaluation_configs;
+/// The custom evaluator this account holds: the record `CreateEvaluator` persists,
+/// the ARN it is reported by, the type its configuration makes it, the statuses the
+/// clock owes it and whether an online evaluation configuration has it locked for
+/// modification. Re-exported, so a handler names `crate::state::…` for it exactly
+/// as it does for the resources beside it.
+pub mod evaluators;
 /// The endpoint every agent runtime is created WITH: the service-managed one, how it
 /// tracks the runtime's newest published version, and why it does not block the
 /// runtime's own delete. Re-exported, so a handler names `crate::state::…` for it
@@ -1784,6 +1795,7 @@ pub use gateway_target_tool_discovery::*;
 pub use listings::*;
 pub use oauth2_credential_providers::*;
 pub use online_evaluation_configs::*;
+pub use evaluators::*;
 pub use memory_strategies::*;
 pub use payment_connectors::*;
 pub use payment_credential_providers::*;
@@ -3167,6 +3179,7 @@ impl ConfigurationBundleRecord {
 /// index),
 /// [`MAX_ONLINE_EVALUATION_CONFIGS`] the online evaluation configurations (and
 /// with them their 1:1 name index),
+/// [`MAX_EVALUATORS`] the evaluators (and with them their 1:1 name index),
 /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
 /// the rate limits one gateway holds,
 /// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
@@ -3533,6 +3546,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::online_evaluation_config_idempotency`] in the order they
     /// were first recorded, so the oldest record is the one evicted at the ceiling.
     online_evaluation_config_idempotency_order: VecDeque<String>,
+    /// Every evaluator this account created, keyed by the `evaluatorId` the create
+    /// minted — the identifier every evaluator route addresses it by. The key order
+    /// is the deterministic list order an evaluator listing pages over.
+    pub evaluators: BTreeMap<String, EvaluatorRecord>,
+    /// `evaluatorName` -> `evaluatorId`, so a duplicate name at create time is a
+    /// `ConflictException` ("Must be unique within your account"). One entry per
+    /// stored evaluator.
+    pub evaluator_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the evaluator that token first produced, so a
+    /// replayed `CreateEvaluator` answers with its first result instead of minting a
+    /// second evaluator. Separate from the maps above because the record is validated
+    /// against a different store; the key carries the operation for the same reason as
+    /// there.
+    evaluator_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::evaluator_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    evaluator_idempotency_order: VecDeque<String>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,

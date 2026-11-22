@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEvaluator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEvaluator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEvaluator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +177,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEvaluator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEvaluatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEvaluator"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEvaluatorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the evaluator store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An evaluator whose deletion the clock has already made due is gone before this
+        // call looks at the account's names, so the name it held is free for this create.
+        store.expire_deleted_evaluators(now);
+
+        // A replayed request carrying the same `clientToken` answers with the evaluator that
+        // token first produced, rather than minting a second one: "If this token matches a
+        // previous request, the service ignores the request, but doesn't return an error."
+        if let Some(evaluator_id) =
+            store.replayed_evaluator_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_evaluator_result` answers only for an evaluator the store still
+            // holds, so this lookup cannot miss.
+            if let Some(record) = store.evaluators.get(&evaluator_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // The name "Must be unique within your account", so a name this account already
+        // holds is a conflict and not a second evaluator a caller reading by name could not
+        // tell apart.
+        if store.evaluator_names.contains_key(&input.evaluator_name) {
+            return Err(CreateEvaluatorErrorModeled::ConflictException(
+                crate::state::evaluator_name_conflict(&input.evaluator_name),
+            )
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on create meets
+        // the modelled quota instead of this process's memory limit.
+        if store.evaluators.len() >= crate::state::MAX_EVALUATORS {
+            return Err(CreateEvaluatorErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} evaluators",
+                        crate::state::MAX_EVALUATORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let evaluator_id = store.mint_evaluator_id(&input.evaluator_name, now);
+        let name = input.evaluator_name.clone();
+        let client_token = input.client_token.clone();
+        // A new evaluator is creating, not active: the transition to `ACTIVE` is owed by the
+        // clock rather than by this call, which is why the create is accepted with 202.
+        let record =
+            crate::state::EvaluatorRecord::created(&region, evaluator_id.clone(), input, now);
+        let output = record.create_output(now);
+
+        store.remember_evaluator_client_token(Self::NAME, client_token, &evaluator_id);
+        store.evaluator_names.insert(name, evaluator_id.clone());
+        store.evaluators.insert(evaluator_id, record);
+
+        Ok(output)
     }
 }

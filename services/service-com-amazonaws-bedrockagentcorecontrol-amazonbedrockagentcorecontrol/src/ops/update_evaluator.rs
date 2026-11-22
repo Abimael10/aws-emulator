@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEvaluator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEvaluator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEvaluator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -183,20 +174,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEvaluator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEvaluatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEvaluator"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEvaluatorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the evaluator store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An evaluator whose deletion the clock has already made due is gone before this call
+        // looks for it, so a change asked of it past that span is the modelled 404.
+        store.expire_deleted_evaluators(now);
+
+        // A replayed request carrying the same `clientToken` reports the evaluator that token
+        // first changed rather than applying the change a second time: "If this token matches
+        // a previous request, the service ignores the request, but doesn't return an error."
+        if let Some(evaluator_id) =
+            store.replayed_evaluator_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_evaluator_result` answers only for an evaluator the store still
+            // holds, so this lookup cannot miss.
+            if let Some(record) = store.evaluators.get(&evaluator_id) {
+                return Ok(record.update_output(now));
+            }
+        }
+
+        // An evaluator an online evaluation configuration is evaluating with is locked for
+        // modification, so the change is refused the modelled 409 rather than taken under the
+        // evaluation already using it.
+        let locked = store.evaluator_locked_for_modification(&input.evaluator_id);
+        // The store is keyed by the `evaluatorId` the create minted; one naming no stored
+        // evaluator is the modelled 404.
+        let record = store.evaluators.get_mut(&input.evaluator_id).ok_or_else(|| {
+            UpdateEvaluatorErrorModeled::ResourceNotFoundException(
+                crate::state::evaluator_not_found(),
+            )
+        })?;
+
+        // An evaluator whose deletion has been accepted is going away, so a change asked of it
+        // collides with that removal and is refused the modelled 409 until the removal the
+        // clock owes turns every call that names it into the modelled 404. An evaluator whose
+        // own create or update is still settling takes the change: the request replaces what
+        // that work was going to leave.
+        if record.is_deleting() {
+            let status = record.status_at(now).to_string();
+            return Err(UpdateEvaluatorErrorModeled::ConflictException(
+                crate::state::evaluator_status_conflict(&input.evaluator_id, &status),
+            )
+            .into());
+        }
+        if locked {
+            return Err(UpdateEvaluatorErrorModeled::ConflictException(
+                crate::state::evaluator_locked_conflict(&input.evaluator_id),
+            )
+            .into());
+        }
+
+        // Accepted: each member the request carries replaces the stored one and each member it
+        // leaves out leaves the stored one alone, and the evaluator reports `UPDATING` until
+        // the clock owes it `ACTIVE` — which is why the change is accepted with 202 rather
+        // than reported complete.
+        let client_token = input.client_token.clone();
+        let evaluator_id = input.evaluator_id.clone();
+        record.accept_update(input, now);
+        let output = record.update_output(now);
+        store.remember_evaluator_client_token(Self::NAME, client_token, &evaluator_id);
+
+        Ok(output)
     }
 }
