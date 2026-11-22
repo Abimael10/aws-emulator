@@ -789,9 +789,10 @@ async fn a_range_given_to_a_pool_within_another_is_an_allocation_of_it() {
 // An allocation keeps its pool from being deleted
 // ---------------------------------------------------------------------------
 
-/// "You cannot delete an IPAM pool if there are allocations in it": a pool holding one is
-/// refused — ahead of the CIDR the allocation came out of, which is the order a caller empties
-/// the pool in — and `Cascade` is the one way to delete it along with them.
+/// "You cannot delete an IPAM pool if there are allocations in it or CIDRs provisioned to it":
+/// a pool holding one is refused, and the refusal names the dependency a caller clears — the
+/// provisioned range the allocation was carved out of, ahead of the allocation itself — while
+/// `Cascade` is the one way to delete the pool along with both.
 #[tokio::test]
 async fn an_allocation_blocks_the_delete_of_its_pool() {
     let case = "a pool holding one allocation";
@@ -813,7 +814,7 @@ async fn an_allocation_blocks_the_delete_of_its_pool() {
         DEPENDENCY_VIOLATION,
         &format!(
             "The specified action is not valid for {pool_id}. There are one or more \
-             allocations in the pool."
+             pool cidrs provisioned in the pool."
         ),
     )
     .await;

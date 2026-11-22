@@ -157,11 +157,20 @@ pub fn vpc_tags(case: &str, body: &str) -> Vec<(String, String)> {
 /// lowercase hex digits, the form every EC2 resource id has taken since the long-id
 /// change.
 pub fn is_long_id(prefix: &str, value: &str) -> bool {
+    is_hex_id(prefix, value, 17)
+}
+
+/// Whether `value` is `prefix`, a hyphen and exactly `digits` lowercase hexadecimal digits.
+///
+/// The form [`is_long_id`] asks about, with the digit count a parameter: an id AWS mints
+/// WIDER than an EC2 resource id (an IPAM pool CIDR's own id, say) is asserted by the same
+/// reading, so no suite spells a hex-id check out for itself.
+pub fn is_hex_id(prefix: &str, value: &str, digits: usize) -> bool {
     value
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('-'))
         .is_some_and(|suffix| {
-            suffix.len() == 17
+            suffix.len() == digits
                 && suffix
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))

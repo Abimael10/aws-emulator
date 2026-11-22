@@ -150,29 +150,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine held on `self`.
         let _ = ctx;
 
-        // The request's own FORM first, before anything is resolved and before the DryRun arm
-        // below: "not an IPAM pool id at all" is a malformed request rather than a pool that
-        // does not exist, which is the order every resource of this crate asks the two
-        // questions in.
-        let pool_id = input.ipam_pool_id.as_str();
-        state::require_well_formed_id(
-            state::IPAM_POOL_ID_PREFIX,
-            pool_id,
-            state::INVALID_IPAM_POOL_ID_MALFORMED,
-        )?;
-
         // "Either 'NetmaskLength' or 'Cidr' is required" (`$Cidr` / `$NetmaskLength`): a
         // request that names neither asks for no range at all, and one that names both says
         // two different things about the size of the range it wants. Either way what is wrong
         // is the COMBINATION of members the request carries, which is the class EC2 answers
         // for both halves of this rule, in the sentence it words it with.
+        //
+        // Asked BEFORE the form of the pool id below: a combination of members the request may
+        // not carry is a fact about the REQUEST, which EC2 settles before it reads any id the
+        // request names — so a call that both names something that is no pool id and asks for
+        // no range is told what it has to carry, not what the id looks like.
         let requested_cidr = input.cidr.as_deref().filter(|cidr| !cidr.is_empty());
         match (requested_cidr, input.netmask_length) {
             (None, None) => {
-                return Err(state::invalid_parameter_combination(
-                    "The request cannot contain empty CIDR and Netmask Length. Exactly one \
-                     of them should be provided.",
-                ));
+                return Err(state::invalid_parameter_combination(MISSING_CIDR_AND_NETMASK));
             }
             (Some(_), Some(_)) => {
                 return Err(state::invalid_parameter_combination(
@@ -182,6 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => {}
         }
+
+        // The form of the id the request names, before anything is resolved and before the
+        // DryRun arm below: "not an IPAM pool id at all" is a malformed request rather than a
+        // pool that does not exist, which is the order every resource of this crate asks the
+        // two questions in.
+        let pool_id = input.ipam_pool_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_POOL_ID_PREFIX,
+            pool_id,
+            state::INVALID_IPAM_POOL_ID_MALFORMED,
+        )?;
 
         // "A unique, case-sensitive identifier that you provide to ensure the idempotency of
         // the request" (`$ClientToken`): bounded the way every other caller-chosen token of
@@ -384,10 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (None, None) => {
                 // Refused above, where the request's own form is read.
-                return Err(state::invalid_parameter_combination(
-                    "The request cannot contain empty CIDR and Netmask Length. Exactly one \
-                     of them should be provided.",
-                ));
+                return Err(state::invalid_parameter_combination(MISSING_CIDR_AND_NETMASK));
             }
         };
         let requested_cidr = requested_cidr.as_str();
@@ -475,6 +474,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
     }
 }
+
+/// What EC2 answers a request that names NEITHER of two mutually required members with: the
+/// members it had to carry one of, in the sentence EC2 states that requirement in.
+///
+/// Fixed text with no variable part at all — nothing of the request is echoed into it, because
+/// what is wrong is that the request carried neither member, not the value of either.
+const MISSING_CIDR_AND_NETMASK: &str = "The request must contain either a CIDR or Netmask Length.";
 
 /// The prefix length of an Amazon-provided IPv6 CIDR block: "an Amazon-provided IPv6 CIDR block
 /// with a /56 prefix length" (`CreateVpcRequest$AmazonProvidedIpv6CidrBlock`), which is the

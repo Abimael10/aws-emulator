@@ -454,9 +454,9 @@ async fn a_deleted_ipam_stops_resolving() {
         &[param("IpamId", &held.id)],
         DEPENDENCY_VIOLATION,
         &format!(
-            "The specified action is not valid for {ipam}. There are one or more pools in the \
-             ipam.",
-            ipam = held.id,
+            "The specified action is not valid for {scope}. The scope is either default scope \
+             or there are one or more pools attached to the scope.",
+            scope = held.private_scope,
         ),
     )
     .await;

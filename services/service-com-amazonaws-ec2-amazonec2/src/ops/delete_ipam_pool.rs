@@ -239,19 +239,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deprovision pool CIDRs, see DeprovisionIpamPoolCidr" (`DeleteIpamPool`), and a
             // pool within this one is a resource within it that `Cascade` is the one way to
             // delete along with it. EC2 words every one of those refusals the same way: the
-            // action, the resource it is not valid for, and what is still in it — and they are
-            // asked in the order a caller empties the pool, allocations first, because a range
-            // is allocated OUT OF space provisioned to the pool, so the space cannot go while
-            // an allocation of it is still there.
+            // action, the resource it is not valid for, and what is still in it.
             //
-            // The allocations are read through the one reader of which space of a pool is
-            // assigned ([`state::ComAmazonawsEc2Amazonec2State::ipam_pool_allocated_cidrs`]),
-            // so a range a caller allocated out of the pool blocks a delete exactly as a range
-            // given to a pool within it does.
-            if !store.ipam_pool_allocated_cidrs(pool_id).is_empty() {
+            // Each one names the dependency that actually BLOCKS the delete, which is what
+            // decides the order they are asked in — a caller branches on the sentence to pick
+            // the call that clears the blocker, so reporting a dependency it cannot clear
+            // first sends it after the wrong record:
+            //
+            // * a pool that another pool DRAWS ON is reported as that before anything else:
+            //   the space such a pool was given is held by it, and shows up here as an
+            //   allocation of this pool, which the caller does not own — what it has to take
+            //   away is the pool that uses this one as its source;
+            // * then the CIDRs provisioned to the pool, over the allocations carved OUT of
+            //   them: the space is the pool's own, and an allocation of it goes with the range
+            //   it came out of, so the provisioned range is the blocker a caller clears;
+            // * the allocations last, which is what is left when the pool holds space it was
+            //   never provisioned (a range allocated out of a BYOIP range it manages).
+            //
+            // Each reading goes through the ONE reader of its question
+            // ([`state::ComAmazonawsEc2Amazonec2State::ipam_pool_provisioned_cidrs`] /
+            // [`state::ComAmazonawsEc2Amazonec2State::ipam_pool_allocated_cidrs`]), so a pool
+            // cannot be judged empty by one path and occupied by another.
+            if !within.is_empty() {
                 return Err(state::dependency_violation(format!(
                     "The specified action is not valid for {pool_id}. There are one or more \
-                     allocations in the pool."
+                     pools that use the pool as a source."
                 )));
             }
             if !store.ipam_pool_provisioned_cidrs(pool_id).is_empty() {
@@ -260,10 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      pool cidrs provisioned in the pool."
                 )));
             }
-            if !within.is_empty() {
+            if !store.ipam_pool_allocated_cidrs(pool_id).is_empty() {
                 return Err(state::dependency_violation(format!(
                     "The specified action is not valid for {pool_id}. There are one or more \
-                     pools in the pool."
+                     allocations in the pool."
                 )));
             }
         }

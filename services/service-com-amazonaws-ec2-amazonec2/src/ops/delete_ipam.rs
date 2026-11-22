@@ -216,15 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.deprovision_ipam_pool_cidrs(pool_id);
                 store.begin_ipam_pool_deletion(pool_id);
             }
-        } else if !public_pools.is_empty() || !private_pools.is_empty() {
+        } else if let Some(scope_id) = store.ipam_scope_holding_pools(ipam_id) {
             // A pool is a resource within the IPAM, and the scopes it lives in exist for as
             // long as the IPAM does, so an IPAM that still holds one cannot be deleted —
-            // `Cascade` is the one way to delete them along with it. EC2's own code for a
-            // delete the resource's dependencies forbid, worded the way the IPAM family words
-            // that refusal: the action, the resource it is not valid for, and why.
+            // `Cascade` is the one way to delete them along with it. What BLOCKS the delete is
+            // the scope those pools are attached to, which is the resource EC2 names in this
+            // refusal and the one a caller has to empty, so the sentence carries the scope's
+            // id rather than the IPAM's: the pools cannot be found through the IPAM id at all.
             return Err(state::dependency_violation(format!(
-                "The specified action is not valid for {ipam_id}. There are one or more pools \
-                 in the ipam."
+                "The specified action is not valid for {scope_id}. The scope is either default \
+                 scope or there are one or more pools attached to the scope."
             )));
         }
 

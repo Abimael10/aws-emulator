@@ -50,6 +50,11 @@ const REFUSAL_STATUS: u16 = 400;
 /// The provision this suite drives.
 const PROVISION: &str = "ProvisionIpamPoolCidr";
 
+/// How many hexadecimal digits an `IpamPoolCidr$IpamPoolCidrId` carries after its prefix:
+/// written out here rather than read off the service's own constant, so a change to the width
+/// the service mints fails this suite instead of being re-asserted by it.
+const POOL_CIDR_ID_DIGITS: usize = 32;
+
 /// The read every provision of this suite is proved through.
 const GET_CIDRS: &str = "GetIpamPoolCidrs";
 
@@ -449,8 +454,9 @@ async fn a_provisioned_range_is_stored_and_read_back_as_the_pool_holds_it() {
              itself, got {answered:?}"
         );
         assert!(
-            super::wire::is_long_id(IPAM_POOL_CIDR_ID_PREFIX, &answered.id),
-            "case {case:?}: expected a minted {IPAM_POOL_CIDR_ID_PREFIX} id, got {:?}",
+            super::wire::is_hex_id(IPAM_POOL_CIDR_ID_PREFIX, &answered.id, POOL_CIDR_ID_DIGITS),
+            "case {case:?}: expected a minted {IPAM_POOL_CIDR_ID_PREFIX} id of \
+             {POOL_CIDR_ID_DIGITS} hexadecimal digits, got {:?}",
             answered.id
         );
 
@@ -775,9 +781,7 @@ async fn a_range_the_pool_cannot_hand_out_is_refused_and_stored_nowhere() {
             &[],
             INVALID_PARAMETER_COMBINATION,
             |_| {
-                "The request cannot contain empty CIDR and Netmask Length. Exactly one of \
-                 them should be provided."
-                    .to_string()
+                "The request must contain either a CIDR or Netmask Length.".to_string()
             },
         ),
         (

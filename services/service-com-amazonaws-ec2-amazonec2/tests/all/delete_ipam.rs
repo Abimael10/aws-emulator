@@ -696,48 +696,62 @@ enum Scope {
 /// option if there is a pool in your public scope" (`DeleteIpamRequest$Cascade`) — and a refused
 /// delete writes nothing: the IPAM and its pools stay exactly as they were.
 ///
+/// What a refusal NAMES is the resource that blocks the delete: without `Cascade` that is the
+/// SCOPE the pools are attached to, which is the container a caller has to empty, so the
+/// sentence carries the scope's id; the `Cascade` arm is refused for the IPAM itself, whose
+/// option it is.
+///
 /// The rows differ along which scope holds the pool and whether the request carries `Cascade`,
 /// which is what the dependency generalises over.
 #[tokio::test]
 async fn an_ipam_that_still_holds_a_pool_cannot_be_deleted() {
-    // (case, the scopes the pools are created in, whether the request carries Cascade, the
-    //  sentence the refusal carries after the action and the IPAM it is not valid for)
-    let rows: [(&str, &[Scope], bool, &str); 4] = [
+    // (case, the scopes the pools are created in, whether the request carries Cascade, whether
+    //  the refusal names the blocking SCOPE rather than the IPAM, the sentence the refusal
+    //  carries after the resource it is not valid for)
+    let rows: [(&str, &[Scope], bool, bool, &str); 4] = [
         (
             "a private-scope pool, no cascade",
             &[Scope::Private],
             false,
-            "There are one or more pools in the ipam.",
+            true,
+            "The scope is either default scope or there are one or more pools attached to the \
+             scope.",
         ),
         (
             "a public-scope pool, no cascade",
             &[Scope::Public],
             false,
-            "There are one or more pools in the ipam.",
+            true,
+            "The scope is either default scope or there are one or more pools attached to the \
+             scope.",
         ),
         (
             "a public-scope pool, with Cascade",
             &[Scope::Public],
             true,
+            false,
             "There are one or more pools in the public scope of the IPAM.",
         ),
         (
             "a pool in each scope, with Cascade",
             &[Scope::Private, Scope::Public],
             true,
+            false,
             "There are one or more pools in the public scope of the IPAM.",
         ),
     ];
 
-    for (case, scopes, cascade, sentence) in rows {
+    for (case, scopes, cascade, names_scope, sentence) in rows {
         let router = emulator();
         let fixture = create_ipam(case, &router).await;
         let mut pools: Vec<String> = Vec::new();
+        let mut scope_ids: Vec<String> = Vec::new();
         for scope in scopes {
             let scope_id = match scope {
                 Scope::Private => &fixture.private_scope,
                 Scope::Public => &fixture.public_scope,
             };
+            scope_ids.push(scope_id.clone());
             pools.push(create_pool(case, &router, scope_id, &[]).await);
         }
 
@@ -745,6 +759,15 @@ async fn an_ipam_that_still_holds_a_pool_cannot_be_deleted() {
         if cascade {
             params.push(param("Cascade", "true"));
         }
+        // The blocking scope is the one this row put a pool in; the rows that name the IPAM
+        // instead are the `Cascade` ones, refused for the option rather than for a container.
+        let mut blocking = scope_ids.clone();
+        blocking.sort();
+        let named = if names_scope {
+            blocking.first().cloned().unwrap_or_default()
+        } else {
+            fixture.id.clone()
+        };
         refused(
             case,
             &router,
@@ -752,10 +775,7 @@ async fn an_ipam_that_still_holds_a_pool_cannot_be_deleted() {
             &params,
             REFUSAL_STATUS,
             DEPENDENCY_VIOLATION,
-            &format!(
-                "The specified action is not valid for {ipam}. {sentence}",
-                ipam = fixture.id
-            ),
+            &format!("The specified action is not valid for {named}. {sentence}"),
         )
         .await;
 

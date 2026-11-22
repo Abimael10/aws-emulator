@@ -92,6 +92,27 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect()
     }
 
+    /// The `IpamScopeId`s of the scopes of the IPAM `ipam_id` names that still STAND, in
+    /// scope-id order: the ones no delete has been asked for.
+    ///
+    /// A scope on its way out takes the pools created in it with it, so no reader counts it
+    /// among what its IPAM still holds ([`ipam_scope_is_deleting`]) — which is why this, and
+    /// not [`Self::ipam_scope_ids_of_ipam`], is what the two readings below walk: a delete and
+    /// its `Cascade` arm cannot disagree about which scopes an IPAM still has.
+    fn standing_ipam_scope_ids(&self, ipam_id: &str) -> Vec<String> {
+        let mut scope_ids: Vec<String> = self
+            .ipam_scope_ids_of_ipam(ipam_id)
+            .into_iter()
+            .filter(|scope_id| {
+                self.ipam_scopes
+                    .get(scope_id)
+                    .is_some_and(|scope| !ipam_scope_is_deleting(scope))
+            })
+            .collect();
+        scope_ids.sort();
+        scope_ids
+    }
+
     /// The `IpamPoolId`s of the pools of the IPAM `ipam_id` names that are in a scope of
     /// `scope_type`, through the two readings above — the pools a `DeleteIpam` has to decide
     /// about: "you cannot delete the IPAM with this option if there is a pool in your public
@@ -99,7 +120,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// are what the cascade deletes.
     pub fn ipam_pool_ids_in_ipam_scopes(&self, ipam_id: &str, scope_type: &str) -> Vec<String> {
         let mut pools: Vec<String> = Vec::new();
-        for scope_id in self.ipam_scope_ids_of_ipam(ipam_id) {
+        for scope_id in self.standing_ipam_scope_ids(ipam_id) {
             if self
                 .ipam_scopes
                 .get(&scope_id)
@@ -112,6 +133,26 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         pools.sort();
         pools
+    }
+
+    /// The `IpamScopeId` of a scope of the IPAM `ipam_id` names that still HOLDS a pool, if
+    /// one does — the scope that blocks a delete of the IPAM.
+    ///
+    /// A pool lives in a scope and a scope lives for as long as its IPAM, so what stands in
+    /// the way of deleting an IPAM is a SCOPE that cannot go: "the scope is either default
+    /// scope or there are one or more pools attached to the scope" is what EC2 reports of it,
+    /// so the refusal names the scope rather than the IPAM — a caller that has to empty
+    /// something can only find the pools through the scope they are attached to.
+    ///
+    /// Answered through the one reader of which scopes an IPAM still has
+    /// ([`Self::standing_ipam_scope_ids`]) and the one reader of which pools a scope holds
+    /// ([`Self::ipam_pool_ids_in_scope`]), so neither a scope nor a pool whose own delete has
+    /// already been asked for blocks anything here, and in scope-id order, so one of several
+    /// blocking scopes is named the same way however the store holds its rows.
+    pub fn ipam_scope_holding_pools(&self, ipam_id: &str) -> Option<String> {
+        self.standing_ipam_scope_ids(ipam_id)
+            .into_iter()
+            .find(|scope_id| !self.ipam_pool_ids_in_scope(scope_id).is_empty())
     }
 
     /// Start deleting the IPAM `ipam_id` names, and answer it as the store then holds it —

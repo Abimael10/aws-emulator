@@ -163,26 +163,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the engine held on `self`.
         let _ = ctx;
 
-        // The request's own FORM first, before anything is resolved and before the DryRun arm
-        // below: "not an IPAM pool id at all" is a malformed request rather than a pool that
-        // does not exist, which is the order every resource of this crate asks the two
-        // questions in.
-        let pool_id = input.ipam_pool_id.as_str();
-        state::require_well_formed_id(
-            state::IPAM_POOL_ID_PREFIX,
-            pool_id,
-            state::INVALID_IPAM_POOL_ID_MALFORMED,
-        )?;
-
         // "If the DefaultNetmaskLength allocation rule is set on the pool, you can specify
         // EITHER the NetmaskLength OR the CIDR" (`$Cidr`): a request naming both says two
         // different things about the range it wants.
+        //
+        // Asked BEFORE the form of the pool id below, the way
+        // [`crate::ops::provision_ipam_pool_cidr`] asks the same question of the same pair: a
+        // combination of members the request may not carry is a fact about the REQUEST, which
+        // EC2 settles before it reads any id the request names.
         let requested_cidr = input.cidr.as_deref().filter(|cidr| !cidr.is_empty());
         if requested_cidr.is_some() && input.netmask_length.is_some() {
             return Err(state::invalid_parameter_combination(
                 "Only one of 'cidr' or 'netmaskLength' may be provided",
             ));
         }
+
+        // The form of the id the request names, before anything is resolved and before the
+        // DryRun arm below: "not an IPAM pool id at all" is a malformed request rather than a
+        // pool that does not exist, which is the order every resource of this crate asks the
+        // two questions in.
+        let pool_id = input.ipam_pool_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_POOL_ID_PREFIX,
+            pool_id,
+            state::INVALID_IPAM_POOL_ID_MALFORMED,
+        )?;
 
         // "Allowed CIDRs are only allowed if using netmask length for allocation"
         // (`$AllowedCidrs`), and the same of `$DisallowedCidrs`: both lists steer the CHOICE
