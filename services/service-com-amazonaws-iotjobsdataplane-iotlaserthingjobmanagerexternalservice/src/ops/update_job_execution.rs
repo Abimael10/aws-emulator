@@ -9,6 +9,13 @@
 //! that would carry the execution BACKWARD through its lifecycle with 409
 //! `InvalidStateTransitionException`.
 //!
+//! A device reporting `SUCCEEDED` also makes the job's PACKAGE VERSION REPORTING due:
+//! the job named "the package version ARNs that are installed on the device when the job
+//! successfully completes", so with the account's reporting turned on the service records
+//! them in the thing's reserved `$package` named shadow (the IoT data plane's
+//! `state::package_version_reporting`, which owns that shadow store) once the terminal
+//! status is recorded.
+//!
 //! The stored status the two refusals are decided from is read at the CURRENT
 //! instant: the `TIMED_OUT` transition the clock has already made due is materialised
 //! first
@@ -118,7 +125,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::STATUS_IN_PROGRESS;
+use crate::state::{STATUS_IN_PROGRESS, STATUS_SUCCEEDED};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -395,22 +402,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // device" — `JobExecution$versionNumber`.
         record.version_number += 1;
 
-        Ok(ResponseDocument::new(
-            UpdateJobExecutionOutput {
-                // Both members are opt-in: "The default is false" for each. A member
-                // the request did not ask for is reported as JSON `null`, not left
-                // out of the document.
-                execution_state: input
-                    .include_job_execution_state
-                    .unwrap_or(false)
-                    .then(|| crate::state::to_execution_state(record)),
-                job_document: input
-                    .include_job_document
-                    .unwrap_or(false)
-                    .then(|| record.job_document.clone())
-                    .flatten(),
-            },
-            Self::OUTPUT_SCHEMA,
-        ))
+        let output = UpdateJobExecutionOutput {
+            // Both members are opt-in: "The default is false" for each. A member
+            // the request did not ask for is reported as JSON `null`, not left
+            // out of the document.
+            execution_state: input
+                .include_job_execution_state
+                .unwrap_or(false)
+                .then(|| crate::state::to_execution_state(record)),
+            job_document: input
+                .include_job_document
+                .unwrap_or(false)
+                .then(|| record.job_document.clone())
+                .flatten(),
+        };
+
+        // A device reporting SUCCEEDED is the instant a job's PACKAGE VERSION REPORTING
+        // falls due: the job named "the package version ARNs that are installed on the
+        // device when the job successfully completes", and with the account's reporting
+        // turned on the SERVICE — not the device — records them in the thing's reserved
+        // `$package` named shadow. That shadow lives in the IoT data plane's store, so
+        // the write is that service's own
+        // (`package_version_reporting::report_job_package_versions`) and is performed
+        // with THIS store released: the execution is already recorded, and no store is
+        // held while another is taken.
+        let reached_success = record.status == STATUS_SUCCEEDED;
+        let thing_name = record.thing_name.clone();
+        let job_id = record.job_id.clone();
+        drop(state);
+        if reached_success {
+            ::service_com_amazonaws_iotdataplane_iotmoonrakerservice::state::
+                package_version_reporting::report_job_package_versions(
+                    &*self.engine,
+                    &thing_name,
+                    &job_id,
+                );
+        }
+
+        Ok(ResponseDocument::new(output, Self::OUTPUT_SCHEMA))
     }
 }

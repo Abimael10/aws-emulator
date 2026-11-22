@@ -158,6 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes nothing. The modelled constraints on `roleArn` are refused before this
         // handler runs, and the operation is `@idempotent`, so the same request applied
         // twice leaves the same record.
+        //
+        // What the record then DOES is report a job's package versions: "If configured,
+        // Jobs updates the thing's reserved named shadow with the package version
+        // information up on successful job completion"
+        // (`smithy_query(query="shape",shape="VersionUpdateByJobsConfig")`). That write
+        // is performed where the shadow lives, when a targeted thing's job execution
+        // reaches `SUCCEEDED` — see the IoT data plane's
+        // `state::package_version_reporting` — so this call arranges an effect rather
+        // than only storing a flag.
         if let Some(requested) = input.version_update_by_jobs_config.as_ref() {
             state.lock().package_configuration.apply(requested);
         }

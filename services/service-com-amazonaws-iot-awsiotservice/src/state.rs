@@ -188,7 +188,9 @@ pub use ::service_common::iot_jobs;
 /// One job in the jobs plane, as the services that mint one persist it. The record is
 /// shared (see [`iot_jobs`]); this crate names it `RegisteredJob` beside its other
 /// `Registered*` records.
-pub use ::service_common::iot_jobs::{IotJob as RegisteredJob, MAX_JOBS};
+pub use ::service_common::iot_jobs::{
+    IotJob as RegisteredJob, MAX_DESTINATION_PACKAGE_VERSIONS, MAX_JOBS,
+};
 
 /// The configuration of a thing: the members of a `CreateThing` request that
 /// describe the thing rather than name it.

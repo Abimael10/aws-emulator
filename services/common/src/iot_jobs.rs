@@ -65,6 +65,34 @@ pub const TARGET_SELECTION_CONTINUOUS: &str = "CONTINUOUS";
 /// reports as its own modelled error — rather than growing without bound.
 pub const MAX_JOBS: usize = 10_000;
 
+/// How many package version ARNs ONE job may name.
+///
+/// Published on `CreateJobRequest$destinationPackageVersions` itself — "The following
+/// Length Constraints relates to a single ARN. Up to 25 package version ARNs are
+/// allowed" — so it is the service's own limit and not an emulator-chosen one, and it
+/// is what keeps a job's package association bounded however many ARNs a create names.
+pub const MAX_DESTINATION_PACKAGE_VERSIONS: usize = 25;
+
+/// The `package/<packageName>/version/<versionName>` resource segment every
+/// package-version ARN carries, split into the two names it holds — or `None` for an
+/// ARN that is not one.
+///
+/// A package version's ARN is
+/// `arn:<partition>:iot:<region>:<account>:package/<packageName>/version/<versionName>`,
+/// the form `CreatePackageVersion$packageVersionArn` reports, so the package and the
+/// version a job's `destinationPackageVersions` entry names are read out of the ARN
+/// rather than carried beside it. Only the resource part is read: the partition, the
+/// region and the account of the ARN do not change which package it names.
+#[must_use]
+pub fn package_version_from_arn(arn: &str) -> Option<(&str, &str)> {
+    let resource = arn.split(":package/").nth(1)?;
+    let (package_name, version_name) = resource.split_once("/version/")?;
+    if package_name.is_empty() || version_name.is_empty() || version_name.contains('/') {
+        return None;
+    }
+    Some((package_name, version_name))
+}
+
 /// One IoT job, as the services that mint and report one persist it.
 ///
 /// It holds what a job NEEDS to be reconstructed by a reader and to create its
@@ -125,6 +153,20 @@ pub struct IotJob {
     /// optional comment string describing why the job was canceled" — or `None` when it
     /// named none.
     pub comment: Option<String>,
+    /// "The package version Amazon Resource Names (ARNs) that are installed on the
+    /// device when the job successfully completes"
+    /// (`CreateJobRequest$destinationPackageVersions`), verbatim and in the order the
+    /// create named them.
+    ///
+    /// They are the job's PACKAGE ASSOCIATION, which is what the version reporting a
+    /// job performs is computed from: when the account has package-version reporting
+    /// by jobs turned on, each of these ARNs names the package and version a device
+    /// that finishes this job now runs, so the association has to outlive the create —
+    /// a reader reports it, and the plane that finishes an execution reads it.
+    ///
+    /// Empty for a job that names none, which is what makes a reader report no list
+    /// rather than an empty one.
+    pub destination_package_versions: Vec<String>,
 }
 
 impl IotJob {
@@ -150,6 +192,7 @@ impl IotJob {
             force_canceled: None,
             reason_code: None,
             comment: None,
+            destination_package_versions: Vec::new(),
         }
     }
 

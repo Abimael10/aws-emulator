@@ -165,10 +165,13 @@ pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobP
 /// none ([`reported_configuration`]). `abortConfig` and `jobExecutionsRetryConfig` are
 /// the two whose own `criteriaList` the model makes `@required`, so there is no empty
 /// form of either and they are reported only from a record that holds criteria — which
-/// none here does. `jobTemplateArn`, `namespaceId` and `destinationPackageVersions` are
+/// none here does. `jobTemplateArn` and `namespaceId` are
 /// single values no creator persists, and `scheduledJobRollouts` is "the next seven
 /// maintenance window occurrences" of a schedule no record carries, so those are left
-/// out rather than reported empty.
+/// out rather than reported empty. `destinationPackageVersions` IS persisted by the
+/// create that named it, so it is reported from the record — and only from a record that
+/// holds one: a job that names no package version reports no list rather than an empty
+/// one.
 ///
 /// `forceCanceled` is "true if the job was canceled with the optional force parameter
 /// set to true", and `reasonCode` / `comment` are what the call that moved the job's own
@@ -215,6 +218,7 @@ pub fn to_job(job: &RegisteredJob, executions: &JobExecutionStore) -> Job {
         is_concurrent: Some(progress.is_concurrent),
         scheduling_config: reported_configuration(None),
         scheduled_job_rollouts: None,
-        destination_package_versions: None,
+        destination_package_versions: (!job.destination_package_versions.is_empty())
+            .then(|| job.destination_package_versions.clone()),
     }
 }

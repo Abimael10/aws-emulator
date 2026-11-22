@@ -48,6 +48,12 @@ pub const STATUS_REJECTED: &str = "REJECTED";
 /// terminal `JobExecutionStatus` value of both IoT models, so a cancelled execution is
 /// no longer pending and its device is handed no further work for that job.
 pub const STATUS_CANCELED: &str = "CANCELED";
+/// The status a device reports when it COMPLETED the work it was handed. It is a
+/// terminal `JobExecutionStatus` value of both IoT models, and the one status that makes
+/// a job's package version reporting due: a job's `destinationPackageVersions` are "the
+/// package version ARNs that are installed on the device when the job successfully
+/// completes", so only this status says the device now runs them.
+pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// The two statuses an execution is PENDING in — the ones
 /// `GetPendingJobExecutions` documents as "not in a terminal status" and

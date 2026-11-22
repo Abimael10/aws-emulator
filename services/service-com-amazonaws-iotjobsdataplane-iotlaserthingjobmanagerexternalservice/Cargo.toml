@@ -30,6 +30,12 @@ service-common = { path = "../common" }
 sha2 = { workspace = true }
 # Renders those digests as the hex an executionId's pattern allows.
 hex = { workspace = true }
+# The IoT DATA plane, in the SAME shared engine: an execution a device reports
+# `SUCCEEDED` is what makes a job's package version reporting due, and the reserved
+# `$package` named shadow that reporting writes lives in that service's shadow store —
+# written through its own
+# `state::package_version_reporting` rather than through a second copy of the store here.
+service-com-amazonaws-iotdataplane-iotmoonrakerservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

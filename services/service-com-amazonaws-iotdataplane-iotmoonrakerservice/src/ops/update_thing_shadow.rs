@@ -305,65 +305,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Both halves of the key come from the request, so a caller must not be able
-        // to name a new shadow per call forever. An update of a shadow name that
-        // already has a slot never trips this. The cap is this emulator's, not a quota
-        // the service publishes, so its message says so.
-        if !guard.shadows.contains_key(&key) && guard.shadows.len() >= crate::state::MAX_SHADOWS {
-            return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
-                InvalidRequestException::new(format!(
-                    "this emulator tracks at most {} shadow names; a shadow name's version \
-                     counter outlives its document, so deleting a shadow does not free one",
-                    crate::state::MAX_SHADOWS
-                )),
-            )
-            .into());
-        }
-
-        // The merge is applied to a COPY first: the state-document quota bounds the
-        // ACCUMULATED document, not one request, so an update whose result would
-        // exceed it has to be refused without having changed what is stored.
+        // The merge, the two ceilings a stored shadow is held to and the version the
+        // shadow name consumes are the ONE accepted write every writer of a shadow goes
+        // through (`crate::state::shadow_writes`), so the service's own write — a job's
+        // package version reporting — cannot come to enforce different ceilings than
+        // this one. Each refusal it answers is worded here, in this operation's terms.
         let timestamp_secs = crate::state::now_secs();
-        let previous = guard
-            .stored_shadow(&key)
-            .map(|(document, _version)| document.clone());
-        let mut merged = previous.clone().unwrap_or_default();
-        merged.apply(desired, reported, timestamp_secs);
-        merged.timestamp_secs = timestamp_secs;
-        let version = stored_version + 1;
-        let stored_document = merged.document(version);
-        // The same measure again, on the state the merge would leave STORED: the
-        // quota bounds the accumulated state, not one request's document.
-        let state_bytes = merged.state_bytes();
-        if state_bytes > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
-            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException::new(crate::state::json_document_too_large(
-                    state_bytes,
-                    crate::state::MAX_SHADOW_DOCUMENT_BYTES,
-                )),
-            )
-            .into());
-        }
-        let stored =
-            ::serde_json::to_vec(&stored_document).expect("a shadow document serializes to JSON");
-        if stored.len() > crate::state::MAX_STORED_SHADOW_BYTES {
-            // Another cap of this emulator's own, on the whole stored record rather
-            // than the state the quota bounds, so it names itself as the emulator's.
-            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
-                    "stores a shadow document",
-                    stored.len(),
-                    crate::state::MAX_STORED_SHADOW_BYTES,
-                )),
-            )
-            .into());
-        }
-        let slot = guard.shadows.entry(key).or_default();
-        // The slot's counter was read under this same guard, so the version it consumes
-        // here is exactly the `version` the reply reports.
-        slot.consume_version();
-        let current = merged.clone();
-        slot.document = Some(merged);
+        let written = crate::state::shadow_writes::apply_shadow_write(
+            &mut guard,
+            &key,
+            desired,
+            reported,
+            timestamp_secs,
+        )
+        .map_err(|refusal| -> UpdateThingShadowError {
+            match refusal {
+                crate::state::shadow_writes::ShadowWriteRefusal::TooManyShadows => {
+                    // The cap is this emulator's, not a quota the service publishes, so
+                    // its message says so.
+                    UpdateThingShadowErrorModeled::InvalidRequestException(
+                        InvalidRequestException::new(format!(
+                            "this emulator tracks at most {} shadow names; a shadow name's \
+                             version counter outlives its document, so deleting a shadow \
+                             does not free one",
+                            crate::state::MAX_SHADOWS
+                        )),
+                    )
+                    .into()
+                }
+                // The published quota, measured on the state the merge would leave
+                // STORED: it bounds the accumulated state, not one request's document.
+                crate::state::shadow_writes::ShadowWriteRefusal::StateTooLarge(bytes) => {
+                    UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                        RequestEntityTooLargeException::new(crate::state::json_document_too_large(
+                            bytes,
+                            crate::state::MAX_SHADOW_DOCUMENT_BYTES,
+                        )),
+                    )
+                    .into()
+                }
+                // Another cap of this emulator's own, on the whole stored record rather
+                // than the state the quota bounds, so it names itself as the emulator's.
+                crate::state::shadow_writes::ShadowWriteRefusal::RecordTooLarge(bytes) => {
+                    UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                        RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
+                            "stores a shadow document",
+                            bytes,
+                            crate::state::MAX_STORED_SHADOW_BYTES,
+                        )),
+                    )
+                    .into()
+                }
+            }
+        })?;
+        let stored_document = written.stored_document;
+        let version = written.version;
+        let previous = written.previous;
+        let current = written.current;
         // This service's store is released before the broker's is taken: the announcements
         // below are a publication, and no store is held across the fan-out.
         drop(guard);
@@ -387,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::shadow_topics::AcceptedUpdate {
                 accepted: &accepted,
                 previous: previous.as_ref(),
-                previous_version: stored_version,
+                previous_version: written.previous_version,
                 current: &current,
                 version,
                 timestamp_secs,

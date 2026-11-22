@@ -310,6 +310,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut targeted_things = fanout.things;
         let targeted_groups = fanout.groups;
 
+        // "The package version Amazon Resource Names (ARNs) that are installed on the
+        // device when the job successfully completes": the association is what the
+        // version reporting a finished job performs is computed from, so it is persisted
+        // with the job rather than read and dropped. The member's own documentation
+        // publishes how many a job may name — "Up to 25 package version ARNs are
+        // allowed" — so a create past that is refused with the modelled limit error
+        // before anything is written, which also bounds what one job's reporting walks.
+        let destination_package_versions =
+            input.destination_package_versions.clone().unwrap_or_default();
+        if destination_package_versions.len() > crate::state::MAX_DESTINATION_PACKAGE_VERSIONS {
+            return Err(over_limit(format!(
+                "a job may name at most {} package version ARNs, got {}",
+                crate::state::MAX_DESTINATION_PACKAGE_VERSIONS,
+                destination_package_versions.len()
+            )));
+        }
+
         // `documentParameters` are the values the document's substitution parameters
         // resolve to, so they are persisted with the job: a reader reports the document
         // as written OR with every parameter resolved, and a device is handed the
@@ -368,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|config| config.in_progress_timeout_in_minutes),
             document_parameters,
+            destination_package_versions,
             ..crate::state::RegisteredJob::in_progress(
                 input.job_id.clone(),
                 crate::state::job_arn(&region, &input.job_id),

@@ -15636,6 +15636,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-iotdataplane-iotmoonrakerservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",

@@ -39,6 +39,18 @@ use sha2::{Digest, Sha256};
 
 pub mod shadow_topics;
 
+// The ONE accepted shadow write — the merge, the version a shadow name consumes and the
+// two ceilings a stored shadow is held to — lives in `state/shadow_writes.rs`, so the
+// client's `UpdateThingShadow` and the write the service performs for a job's package
+// version reporting go through one sequence rather than a copy each.
+pub mod shadow_writes;
+
+// The write the SERVICE performs into a thing's reserved `$package` named shadow once a
+// job that names package versions finishes on it — the package version reporting the IoT
+// control plane's package configuration turns on — lives in
+// `state/package_version_reporting.rs`, beside the shadow store it writes.
+pub mod package_version_reporting;
+
 /// How many `traceId`s this process has minted. Part of what makes the next one
 /// unique: two calls in the same clock tick still differ.
 static TRACE_IDS_MINTED: AtomicU64 = AtomicU64::new(0);
