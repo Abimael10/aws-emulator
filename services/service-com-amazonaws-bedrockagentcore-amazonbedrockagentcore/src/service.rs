@@ -44,6 +44,7 @@ use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 use crate::ops::invoke_code_interpreter::InvokeCodeInterpreter;
+use crate::ops::invoke_harness::InvokeHarness;
 use service_common::event_stream::EventStreamRoute;
 
 /// The WORDS this service states a boundary refusal with — its own concern, kept out of
@@ -77,22 +78,30 @@ const TOOLS_SEGMENT: &str = "tools";
 /// See [`CODE_INTERPRETERS_SEGMENT`].
 const INVOKE_SEGMENT: &str = "invoke";
 
+/// The segments of `InvokeHarness`'s modelled URI, `/harnesses/invoke` (source:
+/// `smithy_query(query="operation", operation="InvokeHarness")`) — a URI with no label at
+/// all, so the routing seam below matches both its segments literally. The harness the
+/// invocation addresses travels as the `harnessArn` query parameter, which the input
+/// deserializer reads.
+const HARNESSES_SEGMENT: &str = "harnesses";
+
 /// The `com-amazonaws-bedrockagentcore-amazonbedrockagentcore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 ///
-/// Besides the generated entry it holds this service's one event-stream operation,
-/// `InvokeCodeInterpreter`. It is NOT in the entry's routing table in a servable form:
-/// the generated `ErasedOperation` shim of an operation whose output is a `@streaming`
-/// union declines the request (it cannot drive `serialize_as_event_stream<P>` through
-/// an object-safe `run`), so it is held here behind an [`EventStreamRoute`] and routed
-/// by [`EmulatedService::override_operation`] — which the router consults FIRST, before
-/// the generated table.
+/// Besides the generated entry it holds this service's two event-stream operations,
+/// `InvokeCodeInterpreter` and `InvokeHarness`. Neither is in the entry's routing table in
+/// a servable form: the generated `ErasedOperation` shim of an operation whose output is a
+/// `@streaming` union declines the request (it cannot drive
+/// `serialize_as_event_stream<P>` through an object-safe `run`), so each is held here
+/// behind an [`EventStreamRoute`] and routed by [`EmulatedService::override_operation`] —
+/// which the router consults FIRST, before the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     invoke_code_interpreter: EventStreamRoute<InvokeCodeInterpreter<Eng>>,
+    invoke_harness: EventStreamRoute<InvokeHarness<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -102,7 +111,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            invoke_code_interpreter: EventStreamRoute(InvokeCodeInterpreter::new(engine)),
+            invoke_code_interpreter: EventStreamRoute(InvokeCodeInterpreter::new(Arc::clone(
+                &engine,
+            ))),
+            invoke_harness: EventStreamRoute(InvokeHarness::new(engine)),
         }
     }
 }
@@ -149,27 +161,35 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // The one event-stream operation the generated routing table cannot serve: its
-        // output member targets a `@streaming` union, so the generated shim declines
-        // the request and this seam \u2014 which the router consults FIRST \u2014 hands it to the
+        // The two event-stream operations the generated routing table cannot serve: each
+        // output member targets a `@streaming` union, so the generated shim declines the
+        // request and this seam \u2014 which the router consults FIRST \u2014 hands it to the
         // hand-authored operation instead.
         //
-        // Routed by the method and the URI the model binds it to, `POST
-        // /code-interpreters/{codeInterpreterIdentifier}/tools/invoke`: the identifier
-        // is a label, so the match is on the method and on the two segments after it.
-        // Every other request, including this service's other `@streaming` operations,
-        // still resolves through the generated table and keeps answering the
-        // framework's "modeled but not served" response rather than being half-served
-        // here.
+        // Each is routed by the method and the URI the model binds it to: `POST
+        // /code-interpreters/{codeInterpreterIdentifier}/tools/invoke`, whose identifier is
+        // a label so the match is on the method and on the two segments after it, and `POST
+        // /harnesses/invoke`, which carries no label at all. Every other request, including
+        // this service's other `@streaming` operations, still resolves through the
+        // generated table and keeps answering the framework's "modeled but not served"
+        // response rather than being half-served here.
         if req.method() != http::Method::POST.as_str() {
             return None;
         }
         let path = service_common::request_path(req.uri());
-        let addressed = service_common::nth_path_segment(path, 0) == Some(CODE_INTERPRETERS_SEGMENT)
+        let addresses_tool_invocation = service_common::nth_path_segment(path, 0)
+            == Some(CODE_INTERPRETERS_SEGMENT)
             && service_common::nth_path_segment(path, 2) == Some(TOOLS_SEGMENT)
             && service_common::nth_path_segment(path, 3) == Some(INVOKE_SEGMENT)
             && service_common::nth_path_segment(path, 4).is_none();
-        addressed.then_some(&self.invoke_code_interpreter as &dyn ErasedOperation)
+        if addresses_tool_invocation {
+            return Some(&self.invoke_code_interpreter as &dyn ErasedOperation);
+        }
+        let addresses_harness_invocation = service_common::nth_path_segment(path, 0)
+            == Some(HARNESSES_SEGMENT)
+            && service_common::nth_path_segment(path, 1) == Some(INVOKE_SEGMENT)
+            && service_common::nth_path_segment(path, 2).is_none();
+        addresses_harness_invocation.then_some(&self.invoke_harness as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

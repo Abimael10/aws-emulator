@@ -273,10 +273,14 @@ const CASES: &[Case] = &[
         claimed: false,
     },
     Case {
-        // `InvokeHarness` is the only operation this model binds under `/harnesses`, and
-        // it is one of the streaming operations this emulator registers no handler for,
-        // so no route accepts the path and neither service claims it.
-        name: "a modelled path no registered operation serves",
+        // `InvokeHarness` is the only operation this model binds under `/harnesses`. It IS
+        // served (`src/ops/invoke_harness.rs`, routed through
+        // `Service::override_operation`), but its route binds a `@required` query parameter
+        // (`harnessArn`) and a `@required` header (`runtimeSessionId`), and the framework's
+        // route lookup rejects a candidate route whose required bindings the request does
+        // not carry — so this bare path selects no route and is not claimed. The test below
+        // shows the other half of that rule on `StopRuntimeSession`.
+        name: "a modelled path whose route the request carries no required binding for",
         method: "POST",
         path_and_query: "/harnesses/invoke",
         signing_name: Some("bedrock-agentcore"),

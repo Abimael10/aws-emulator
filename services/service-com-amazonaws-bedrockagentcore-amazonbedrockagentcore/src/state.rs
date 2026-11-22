@@ -159,6 +159,17 @@ pub use resource_token_auth_sessions::*;
 mod batch_evaluations;
 pub use batch_evaluations::*;
 
+/// The agent-runtime plane: [`resolve_runtime_endpoint`], which says which endpoint of
+/// which runtime a data-plane call addresses, and [`RuntimeSessionRecord`], the sessions
+/// running in one.
+mod agent_runtimes;
+pub use agent_runtimes::*;
+
+/// The harness plane: [`resolve_harness`], which says which harness an invocation reached,
+/// and [`harness_turn`], the turn its stream carries.
+mod harness_invocation;
+pub use harness_invocation::*;
+
 /// The browser tools plane: [`BrowserStore`] and [`BrowserSessionRecord`], plus the
 /// lookups and the write path the browser session operations go through.
 mod browser;
@@ -511,6 +522,10 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// created through the CONTROL plane, a different service. Bounded by
     /// [`MAX_BROWSERS`].
     pub browsers: HashMap<String, BrowserStore>,
+    /// Every session running in an agent runtime, keyed by the runtime it runs in and the
+    /// `runtimeSessionId` the invocation that established it was made under. Bounded by
+    /// [`MAX_RUNTIME_SESSIONS`]; see [`agent_runtimes`].
+    pub runtime_sessions: RuntimeSessions,
     /// Every workload access token this service issued and has not pruned.
     pub workload_access_tokens: IssuedWorkloadAccessTokens,
     /// Every user authorization session of the OAuth2 resource-token flow this plane handed
@@ -2439,6 +2454,23 @@ pub fn workload_identity_arn(region: &str, workload_name: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("workload-identity-directory/default/workload-identity/{workload_name}"),
+    )
+}
+
+/// The AgentCore Memory container a `memoryId` addresses, in the ARN spelling the CONTROL
+/// plane mints for a container of that id — what an IAM statement scoped to one memory
+/// container names, and therefore what a request to a memory-record operation is judged
+/// against.
+///
+/// Either spelling `MemoryId` admits addresses one container
+/// ([`normalize_memory_id`]), so an ARN-spelled request and a bare-id request are judged
+/// against the SAME resource; the ARN itself is the control plane's own
+/// ([`::service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::state::memory_arn`]),
+/// so the two planes cannot spell one container's ARN differently.
+pub fn memory_arn(region: &str, memory_id: &str) -> String {
+    ::service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::state::memory_arn(
+        region,
+        &normalize_memory_id(memory_id),
     )
 }
 

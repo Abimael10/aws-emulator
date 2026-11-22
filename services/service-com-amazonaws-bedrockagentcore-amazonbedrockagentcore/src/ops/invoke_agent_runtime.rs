@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeAgentRuntime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeAgentRuntime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: the INVOCATION itself — handing a payload to the agent the
+//! runtime runs and answering with what it produced — is not written yet, so a request that
+//! gets as far as it is answered HTTP 501 `NotImplemented`. That work has its own gap issue;
+//! this file is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeAgentRuntime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What IS decided here is everything AWS decides AHEAD of the invocation, because those
+//! answers are not the invocation's to withhold:
+//!
+//! * IAM — the identity-based policies in force on the calling principal decide whether it
+//!   may invoke the agent the request addresses ([`crate::state::authorize`]), before this
+//!   service resolves anything the request named, so an unauthorized caller is refused
+//!   `AccessDeniedException` (403) and learns nothing about what exists;
+//! * the ENDPOINT — an agent runtime and its endpoints are created through the CONTROL
+//!   plane, so the agent and the alias the `qualifier` names are resolved against the
+//!   component that owns them ([`crate::state::resolve_runtime_endpoint`]), and a request
+//!   naming neither is answered with the modelled `ResourceNotFoundException` (404) that
+//!   names the qualifier and the agent it asked for.
+//!
+//! A 501 past those two means "nobody has written the invocation yet", never "the emulator
+//! is broken". Replace it with real behaviour and delete the SCAFFOLDED marker line above;
+//! that line is the machine-readable record of which operations are still stubs
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`), so leaving it on an
+//! implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -234,18 +248,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeAgentRuntime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeAgentRuntimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // IAM decides FIRST, before anything the request named is resolved: the resource
+        // this call addresses is the agent its ARN names, taken from the request alone.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.agent_runtime_arn)
+            .map_err(InvokeAgentRuntimeErrorModeled::AccessDeniedException)?;
+
+        // The endpoint this invocation is addressed to, read off the component that owns
+        // agent runtimes: a payload cannot be handed to an agent that does not exist, and
+        // an alias naming no endpoint on one addresses nothing either.
+        crate::state::resolve_runtime_endpoint(
+            &*self.engine,
+            &input.agent_runtime_arn,
+            input.qualifier.as_deref(),
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|unavailable| match unavailable {
+            crate::state::RuntimeEndpointUnavailable::NotFound(message) => {
+                InvokeAgentRuntimeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::RuntimeEndpointUnavailable::StoreUnavailable(message) => {
+                InvokeAgentRuntimeErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        // Everything past here is the invocation itself: the agent the runtime runs is the
+        // caller's own program, and running it is the work the SCAFFOLDED marker at the top
+        // of this file still records as unwritten.
         Err(crate::scaffolded::Scaffolded::not_implemented("InvokeAgentRuntime"))
     }
 }

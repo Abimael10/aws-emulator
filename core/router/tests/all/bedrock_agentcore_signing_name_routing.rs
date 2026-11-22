@@ -34,6 +34,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::{MultiServiceRouter, Service};
 
+// Percent-encodes one `@httpLabel` value the way an AWS SDK does, so an ARN's `:` and `/`
+// reach the server as part of the label rather than as URI syntax. Shared with the sibling
+// AgentCore suites of this crate rather than written again here.
+use crate::bedrock_agentcore_data_plane_parent_resources::label;
+
 /// A SigV4 `Authorization` header whose credential scope names the signing name both
 /// services share. The signature is never checked: the routers here run with request
 /// authentication off.
@@ -325,7 +330,15 @@ fn exactly_one_service_sharing_the_agentcore_signing_name_claims_each_request() 
             OWNER_DATA,
         ),
         (
-            "data InvokeHarness, modelled but unwired",
+            // The harness invocation is HAND-AUTHORED since it was implemented, for the
+            // same reason `InvokeCodeInterpreter` above is — but its route binds a
+            // `@required` query parameter (`harnessArn`) and a `@required` header
+            // (`runtimeSessionId`), and the framework's REST route lookup rejects a
+            // candidate route whose required bindings the request does not carry. So this
+            // bare probe addresses no route of either model and belongs to neither; the
+            // test below this one claims a well-formed harness invocation and shows the
+            // data plane taking it.
+            "data InvokeHarness without the query and header its route binds",
             "POST",
             "localhost:9297",
             "/harnesses/invoke",
@@ -374,6 +387,45 @@ fn exactly_one_service_sharing_the_agentcore_signing_name_claims_each_request() 
     }
 }
 
+/// A WELL-FORMED harness invocation — one carrying the `@required` query parameter and the
+/// `@required` session header its route binds — is claimed by the DATA plane, the service
+/// whose model binds `POST /harnesses/invoke`, and by it alone.
+///
+/// Its own row in the table above carries neither binding, which is why that probe belongs
+/// to neither service: the framework's route lookup rejects a candidate route whose required
+/// bindings are absent, so the two halves together are what says the data plane claims this
+/// route exactly when a request addresses it.
+#[tokio::test]
+async fn a_well_formed_harness_invocation_is_claimed_by_the_data_plane() {
+    let (control, data) = both_services();
+    let harness_arn =
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/probe_harness-0123456789";
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/harnesses/invoke?harnessArn={}",
+            label(harness_arn)
+        ))
+        .header("host", "localhost:9297")
+        .header("content-type", "application/json")
+        .header("authorization", AUTHORIZATION)
+        // `SessionId`'s own length floor is 33 characters.
+        .header(
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id",
+            "probe-harness-session-0123456789abc",
+        )
+        .body(Bytes::new())
+        .expect("the test request is well formed");
+    let parts = request.into_parts().0;
+
+    let actual = claimant(&control, &data, &parts);
+    assert_eq!(
+        actual, OWNER_DATA,
+        "case \"a well-formed InvokeHarness\": expected it to be claimed by {OWNER_DATA}, got \
+         {actual}"
+    );
+}
+
 #[tokio::test]
 async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambiguous() {
     let router = router_with_both_services();
@@ -400,14 +452,45 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         .unwrap_or_else(|| panic!("CreateMemory reported no memory id: {memory:?}"))
         .to_string();
 
+    // An agent runtime of the control plane, so the data-plane invocation rows below
+    // address an agent that EXISTS: an invocation resolves the agent and its endpoint
+    // against the plane that owns them before it reaches the invocation itself, so the
+    // scaffold's own answer is only observable for a runtime that resolves.
+    let (status, code, runtime) = call(
+        &router,
+        "PUT",
+        "/runtimes/",
+        json!({
+            "agentRuntimeName": "shared_signing_name_invoked",
+            "agentRuntimeArtifact": {
+                "containerConfiguration": {
+                    "containerUri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:3"
+                }
+            },
+            "networkConfiguration": {"networkMode": "PUBLIC"},
+            "roleArn": "arn:aws:iam::123456789012:role/AgentRuntimeRole"
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (202, ""),
+        "the fixture agent runtime must be created, got HTTP {status} {code:?} with {runtime:?}"
+    );
+    let runtime_arn = runtime["agentRuntimeArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateAgentRuntime reported no ARN: {runtime:?}"))
+        .to_string();
+
     // (case, method, uri, body, expected status, expected error code)
     //
     // Each row names the answer of the ONE service that owns the route, which is what
     // excludes both routing failures: `AmbiguousService` (500, two claimants) and
     // `UnknownService` (404, none). An operation that is still scaffolded answers the
-    // scaffold's `501 NotImplemented` — also an answer from the service that owns the
+    // scaffold's `501 NotImplemented`, and one whose own resource lookup misses answers its
+    // modelled `404 ResourceNotFoundException` — both answers from the service that owns the
     // route, where the router's refusals are not.
-    let rows: [(&str, &str, String, Value, u16, &str); 8] = [
+    let rows: [(&str, &str, String, Value, u16, &str); 9] = [
         (
             "CreateGateway, the operation this issue was filed on",
             "POST",
@@ -484,12 +567,20 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
             "",
         ),
         (
-            "InvokeAgentRuntime on the data plane, still scaffolded",
+            "InvokeAgentRuntime on the data plane, its invocation still scaffolded",
             "POST",
-            "/runtimes/probe-0123456789/invocations".to_string(),
+            format!("/runtimes/{}/invocations", label(&runtime_arn)),
             json!({}),
             501,
             "NotImplemented",
+        ),
+        (
+            "InvokeAgentRuntime on an agent nothing created",
+            "POST",
+            "/runtimes/probe-0123456789/invocations".to_string(),
+            json!({}),
+            404,
+            "ResourceNotFoundException",
         ),
     ];
 

@@ -96,6 +96,13 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # samples are appended there rather than kept in a copy of this plane's own
 # (src/state/session_metrics.rs). Only its `state` accessor is used.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# Amazon Bedrock Runtime, which is where this emulator's INFERENCE lives: `InvokeHarness`
+# serves one turn of a managed agent loop, and no language model runs in this emulator, so
+# the text, the token counts and the stop reason of that turn come from that plane's own
+# generation stage (`emulated_completion`) and tokenizer rather than from a second copy of
+# either here (src/state/harness_invocation.rs). The sibling Bedrock Agent Runtime
+# emulator's `InvokeAgent` reaches it the same way. Only its `state` accessors are used.
+service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

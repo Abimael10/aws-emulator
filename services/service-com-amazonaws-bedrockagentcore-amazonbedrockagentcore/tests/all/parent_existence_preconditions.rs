@@ -23,6 +23,12 @@
 //! * whether the parent EXISTS when the call arrives: never created, created, or created
 //!   and then deleted.
 //!
+//! The RUNTIME half of the plane — `InvokeAgentRuntime`, `StopRuntimeSession` and
+//! `InvokeHarness`, each addressed at an agent the control plane owns — keeps the same rule
+//! with its own sentence: the alias the request asked for and the agent it asked for it on,
+//! which is the one sentence that half words an unresolved endpoint with. Its rows are the
+//! last test of this file.
+//!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so the routes, status codes and `restJson1` error bodies are exercised and not
 //! just the handler functions.
@@ -588,6 +594,156 @@ async fn a_write_on_a_deleted_code_interpreter_is_refused_again() {
             "case {}-after-the-delete: expected message {expected:?}, got {:?}",
             write.operation(),
             message(&body)
+        );
+    }
+}
+
+/// The emulator with BOTH AgentCore planes on one shared engine, which is how the router
+/// mounts them: the runtime-plane rows below resolve an agent against the control plane's
+/// own store rather than against a registry mirror, so that plane has to be there.
+fn both_planes() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(agentcore::EmulatedService::new(engine));
+    router
+}
+
+/// One row of the runtime-plane table below: the call it makes and what the refusal has to
+/// name. A struct rather than a tuple so each field is read by name at the assertion.
+struct Invocation {
+    case: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    /// The agent the refusal names, as the request addressed it.
+    agent: &'static str,
+    /// The alias the refusal names: the `qualifier` the request carried, else the default.
+    qualifier: &'static str,
+}
+
+/// The RUNTIME half of the same pre-condition: an invocation of an agent runtime, a stop of
+/// one of its sessions and an invocation of a harness each resolve the agent they address
+/// against the CONTROL plane that owns it, and refuse an ARN that plane holds nothing for
+/// with 404 `ResourceNotFoundException` — worded, for this half of the plane, by the alias
+/// the request asked for and the agent it asked for it on.
+///
+/// The rows span what that rule generalises over: which OPERATION invokes (an agent runtime
+/// invocation, a runtime-session stop, a harness invocation), which RESOURCE the request
+/// names (a runtime, a harness), whether it named a `qualifier` or fell back to the default
+/// alias, and whether the value it carried is an ARN at all.
+#[tokio::test]
+async fn an_invocation_naming_an_agent_nothing_created_is_refused_with_404() {
+    let router = both_planes();
+    let ghost_runtime =
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/ghost_runtime-9z8y7x6w5v";
+    let ghost_harness =
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/ghost_harness-9z8y7x6w5v";
+    // The session header both runtime-plane operations bind (source: smithy_query
+    // query="operation" operation="StopRuntimeSession"), long enough for its 33-character
+    // floor.
+    let session = "probe-runtime-session-0123456789abcd";
+
+    // (case, method, the URI the request addresses, the body it carries, the agent and the
+    //  qualifier the refusal must name)
+    let rows = [
+        Invocation {
+            case: "InvokeAgentRuntime on a runtime never created",
+            method: "POST",
+            uri: format!("/runtimes/{}/invocations", label(ghost_runtime)),
+            body: Some(json!({"prompt": "hello"})),
+            agent: ghost_runtime,
+            qualifier: "DEFAULT",
+        },
+        Invocation {
+            case: "InvokeAgentRuntime on a value that is no ARN at all",
+            method: "POST",
+            uri: format!("/runtimes/{}/invocations", label("not-an-arn")),
+            body: Some(json!({"prompt": "hello"})),
+            agent: "not-an-arn",
+            qualifier: "DEFAULT",
+        },
+        Invocation {
+            case: "StopRuntimeSession on a runtime never created",
+            method: "POST",
+            uri: format!("/runtimes/{}/stopruntimesession", label(ghost_runtime)),
+            body: None,
+            agent: ghost_runtime,
+            qualifier: "DEFAULT",
+        },
+        Invocation {
+            case: "StopRuntimeSession naming an alias of a runtime never created",
+            method: "POST",
+            uri: format!(
+                "/runtimes/{}/stopruntimesession?qualifier=prod",
+                label(ghost_runtime)
+            ),
+            body: None,
+            agent: ghost_runtime,
+            qualifier: "prod",
+        },
+        Invocation {
+            case: "InvokeHarness on a harness never created",
+            method: "POST",
+            uri: format!("/harnesses/invoke?harnessArn={}", label(ghost_harness)),
+            body: Some(json!({
+                "messages": [{"role": "user", "content": [{"text": "plan the trip"}]}],
+                "model": {"bedrockModelConfig": {"modelId": "amazon.titan-text-express-v1"}},
+            })),
+            agent: ghost_harness,
+            qualifier: "DEFAULT",
+        },
+    ];
+    for Invocation {
+        case,
+        method,
+        uri,
+        body,
+        agent,
+        qualifier,
+    } in rows
+    {
+        let payload = body.map_or_else(bytes::Bytes::new, |value| {
+            bytes::Bytes::from(value.to_string())
+        });
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!(
+                "https://bedrock-agentcore.us-east-1.amazonaws.com{uri}"
+            ))
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/bedrock-agentcore/\
+                 aws4_request, SignedHeaders=host, Signature=0",
+            )
+            .header("content-type", "application/json")
+            .header("X-Amzn-Bedrock-AgentCore-Runtime-Session-Id", session)
+            .body(payload)
+            .expect("build the request");
+        let response = router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let refused: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} with {refused:?}"
+        );
+        assert!(
+            error_code(&refused).ends_with(RESOURCE_NOT_FOUND),
+            "case {case:?}: expected {RESOURCE_NOT_FOUND}, got {refused:?}"
+        );
+        let expected =
+            format!("No endpoint or agent found with qualifier '{qualifier}' for agent '{agent}'");
+        assert_eq!(
+            message(&refused),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            message(&refused)
         );
     }
 }

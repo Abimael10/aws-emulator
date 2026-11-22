@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopRuntimeSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopRuntimeSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops one session running in an agent runtime, addressed by the runtime's ARN, the
+//! endpoint alias the `qualifier` names and the `runtimeSessionId` the session runs under.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopRuntimeSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three decisions, in the order AWS takes them:
+//!
+//! 1. IAM — the identity-based policies in force on the calling principal decide whether
+//!    it may stop a session of the agent the request addresses
+//!    ([`crate::state::authorize`]), ahead of this service resolving anything the request
+//!    named, so a refusal discloses nothing about what exists;
+//! 2. the ENDPOINT — an agent runtime and its endpoints are created through the CONTROL
+//!    plane, so the agent and the alias are resolved against the component that owns them
+//!    ([`crate::state::resolve_runtime_endpoint`]), and a request naming neither is
+//!    answered with the modelled 404 that names the qualifier and the agent it asked for;
+//! 3. the SESSION — a session exists only because an invocation of that runtime
+//!    established it ([`crate::state::RuntimeSessionRecord`]), so an id addressing no
+//!    running session is the modelled 404 too, and the stop of one that IS running writes
+//!    the instant it ended and answers with the session's own id.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +195,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopRuntimeSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopRuntimeSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopRuntimeSession"))
+        // IAM decides FIRST, before anything the request named is resolved or written: the
+        // resource this call addresses is the agent its ARN names, taken from the request
+        // alone.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.agent_runtime_arn)
+            .map_err(StopRuntimeSessionErrorModeled::AccessDeniedException)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopRuntimeSessionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        // The endpoint this stop is addressed to, read off the component that owns agent
+        // runtimes. Resolved and released before this service's own store is taken, which
+        // is the lock order every reader of the owner's store keeps.
+        let endpoint = crate::state::resolve_runtime_endpoint(
+            &*self.engine,
+            &input.agent_runtime_arn,
+            input.qualifier.as_deref(),
+            now,
+        )
+        .map_err(|unavailable| match unavailable {
+            crate::state::RuntimeEndpointUnavailable::NotFound(message) => {
+                StopRuntimeSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::RuntimeEndpointUnavailable::StoreUnavailable(message) => {
+                StopRuntimeSessionErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        let mut store = state.lock();
+        let session = store
+            .runtime_session_mut(&endpoint.agent_runtime_id, &input.runtime_session_id)
+            .filter(|session| session.is_running())
+            .ok_or_else(|| {
+                StopRuntimeSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::runtime_session_not_found(
+                            &input.runtime_session_id,
+                            &input.agent_runtime_arn,
+                        )),
+                    },
+                )
+            })?;
+        // Stopping the session is what this operation DOES, so the end of it is written:
+        // the session runs nothing more, and a second stop of it finds nothing to stop.
+        session.stopped_at = Some(now);
+        session.written_at = now;
+        let runtime_session_id = session.runtime_session_id.clone();
+
+        Ok(StopRuntimeSessionOutput {
+            runtime_session_id: Some(runtime_session_id),
+            // "The status code of the request to stop the session": the stop was carried
+            // out by this call, so it is the success status the operation's own `@http`
+            // trait gives it.
+            status_code: Some(i32::from(Self::SUCCESS_STATUS)),
+        })
     }
 }

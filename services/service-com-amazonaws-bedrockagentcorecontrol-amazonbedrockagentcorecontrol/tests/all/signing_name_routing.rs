@@ -143,10 +143,11 @@ fn this_service_claims_the_routes_its_own_model_binds_and_no_more() {
             false,
         ),
         (
-            // Modelled by the sibling but UNWIRED there (a `@streaming` event-stream
-            // output the scaffold generator declines), so it is in no route table at all
-            // — which is still not a claim by THIS service.
-            "sibling: InvokeHarness, modelled but unwired",
+            // Bound by the SIBLING data plane, which serves it; this bare path carries
+            // neither the `@required` query parameter nor the `@required` header that
+            // route binds, so it selects no route there either — and in neither case is it
+            // a claim by THIS service.
+            "sibling: InvokeHarness",
             "POST",
             "/harnesses/invoke",
             false,

@@ -161,9 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not read by this operation: every member it needs is
-        // bound into `input` by the centralized request walk.
-        let _ = ctx;
+        // IAM decides FIRST, ahead of the service resolving anything the request named:
+        // the resource this call addresses is the memory container the `memoryId` names,
+        // built from the request alone, so a caller no identity-based policy allows to
+        // delete this container's records is refused without being told whether it exists.
+        crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::memory_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.memory_id,
+            ),
+        )
+        .map_err(DeleteMemoryRecordErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMemoryRecordErrorModeled::ServiceException(ServiceException {
                 message: "the shared engine does not carry this service's state".to_string(),
