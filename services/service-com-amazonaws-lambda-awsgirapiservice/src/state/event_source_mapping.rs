@@ -264,6 +264,27 @@ pub fn mint_event_source_mapping_uuid() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
+/// The instant an event source mapping's `LastModified` reports for `at`.
+///
+/// `LastModified` is "The date that the event source mapping was last updated or that its
+/// state changed", and the model puts no `@timestampFormat` on
+/// `com.amazonaws.lambda#Date` (`smithy_query(query="shape",shape="Date")` reports a bare
+/// `timestamp`), so this member travels in the form this `restJson1` service's protocol
+/// gives a timestamp: the epoch-seconds NUMBER. What this adds is the RESOLUTION the
+/// service reports that date at — WHOLE seconds, which is what the recorded answers for a
+/// mapping carry — so the member is the date of the change and not a reading of the
+/// emulator's clock taken to the microsecond, which is a value no answer of the service
+/// has the precision to carry.
+///
+/// Truncating towards the epoch keeps the ORDER of two instants, so a client that compares
+/// the member across two reads, or across two mappings, still never sees it go backwards;
+/// two changes inside one second report the same date, exactly as the service's own
+/// resolution makes them.
+#[must_use]
+pub fn reported_date(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs(::aws_smithy_types::DateTime::from(at).secs())
+}
+
 /// The service an `EventSourceArn` names, which is what the per-source defaults and
 /// requirements documented for `BatchSize`, `MaximumBatchingWindowInSeconds` and
 /// `StartingPosition` are keyed on.
@@ -696,9 +717,10 @@ pub struct EventSourceMappingRecord {
     pub shard_cursors: BTreeMap<String, ShardCursor>,
     /// `LastProcessingResult`: "The result of the event source mapping's last processing
     /// attempt" — `None` for a mapping whose poller has not had a batch to attempt yet,
-    /// which is every mapping at the instant it is created. Written only by the poller that
-    /// made the attempt; see [`crate::state::sqs_poller::poll_due`] and
-    /// [`crate::state::event_source_poller`].
+    /// which is every mapping at the instant it is created, and for one whose polling is
+    /// PAUSED, which has no poller making attempts at all ([`Self::begin_update`]).
+    /// Written only by the poller that made the attempt; see
+    /// [`crate::state::sqs_poller::poll_due`] and [`crate::state::event_source_poller`].
     pub last_processing_result: Option<String>,
 }
 
@@ -781,6 +803,15 @@ impl EventSourceMappingRecord {
     /// reports [`EVENT_SOURCE_MAPPING_STATE_UPDATING`]. So a client that paused a consumer
     /// and is waiting for the pause to take hold reads the pause's own window rather than a
     /// state that names an unrelated change.
+    ///
+    /// An update that leaves the mapping with polling PAUSED also leaves it with no
+    /// processing attempt to report: `LastProcessingResult` is "the result of the event
+    /// source mapping's last processing attempt", a reading of the poller that is making
+    /// those attempts, and "when false, Lambda pauses polling and invocation" — so the
+    /// attempt the stopped poller last made is no longer what the mapping reports, and the
+    /// member is absent until a resumed poller attempts a batch of its own. That is what
+    /// keeps a mapping nothing is polling from reporting the health of a poll it is no
+    /// longer making ([`Self::last_processing_result`]).
     pub fn begin_update(&mut self, now: SystemTime, polled_before: bool) {
         self.state = if self.enabled == polled_before {
             EVENT_SOURCE_MAPPING_STATE_UPDATING
@@ -790,6 +821,9 @@ impl EventSourceMappingRecord {
             EVENT_SOURCE_MAPPING_STATE_DISABLING
         }
         .to_string();
+        if !self.enabled {
+            self.last_processing_result = None;
+        }
         self.state_transition_reason = self.caller_transition_reason().to_string();
         // "The date that the event source mapping was last updated or that its state
         // changed": both happened now.
@@ -903,7 +937,7 @@ impl EventSourceMappingRecord {
             metrics_config: self.metrics_config.clone(),
             logging_config: self.logging_config.clone(),
             scaling_config: self.scaling_config.clone(),
-            last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
+            last_modified: Some(reported_date(self.last_modified)),
             // "The result of the event source mapping's last processing attempt": what
             // the mapping's poller recorded — and, until it has attempted a batch, that no
             // record has been processed, which is what the shard pollers report for a

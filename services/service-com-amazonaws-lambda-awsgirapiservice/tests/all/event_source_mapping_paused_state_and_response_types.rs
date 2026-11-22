@@ -28,14 +28,13 @@
 //! value the enum has).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY;
 
 use crate::event_source_mappings::{
-    create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    DYNAMODB_SOURCE, KINESIS_SOURCE, MSK_SOURCE, QUEUE_SOURCE, STATE_CREATING, STATE_DISABLED,
+    await_mapping_state, create_function, create_mapping, create_request, get_mapping,
+    list_mappings, router_on, DYNAMODB_SOURCE, KINESIS_SOURCE, MSK_SOURCE, QUEUE_SOURCE,
+    STATE_CREATING, STATE_DISABLED,
 };
 
 /// The terminal state a mapping asked to be active reaches, from
@@ -47,11 +46,6 @@ const STATE_ENABLED: &str = "Enabled";
 /// `smithy_query(query="shape", shape="FunctionResponseType")` — a list of at most one of
 /// them (`FunctionResponseTypeList` is `@length(min: 0, max: 1)`).
 const REPORT_BATCH_ITEM_FAILURES: &str = "ReportBatchItemFailures";
-
-/// How long past a due instant this suite waits before calling. The transition is owed by
-/// the CLOCK, so nothing here sleeps on the emulator's behalf: it waits past the instant
-/// the create made due.
-const SLACK: Duration = Duration::from_millis(100);
 
 /// One row: the mapping to create, and what its configuration must report.
 struct Row {
@@ -260,14 +254,15 @@ async fn a_paused_mapping_is_created_disabled_and_every_mapping_reports_its_resp
         created_rows.push((row, uuid, created_at));
     }
 
-    // Past the instant the creates made their transitions due: a mapping that was created
-    // paused was already in its terminal state, so it reports the same one and the instant
-    // it was last modified has not moved; a mapping asked to be active has reached
-    // `Enabled` by now.
-    tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
-
+    // Each mapping is read once the transition its create owed is IN FORCE: the transition
+    // is the CLOCK's, so this waits for the state it brings — looking again until it holds
+    // or the crate's own budget for clock-owed work passes ([`await_mapping_state`]) —
+    // rather than for a span of wall clock. A mapping created paused was already in its
+    // terminal state, so that wait has nothing to wait for and the instant it was last
+    // modified has not moved.
     for (row, uuid, created_at) in created_rows {
         let label = row.name;
+        await_mapping_state(&router, label, &uuid, row.settles_into).await;
         let settled = get_mapping(&router, &uuid).await;
         assert_eq!(
             (settled.status, settled.string("State")),
@@ -287,10 +282,16 @@ async fn a_paused_mapping_is_created_disabled_and_every_mapping_reports_its_resp
                 row.settles_into
             );
         } else {
+            // The transition moves the date to the instant the clock owed it at, which is a
+            // FRACTION of a second after the create (the state-settle span this crate
+            // chooses), while the member is reported at whole-second resolution (see
+            // `crate::event_source_mapping_instant_and_attempt`): so the date the transition
+            // stamps is the creation's own second or the one after it, and never any other.
             assert!(
-                settled_at.is_some_and(|modified| modified > created_at),
-                "case {label:?}: LastModified must move with the transition from \
-                 {created_at}, got {settled_at:?}"
+                settled_at
+                    .is_some_and(|modified| modified == created_at || modified == created_at + 1.0),
+                "case {label:?}: LastModified must move with the transition to the second the \
+                 clock owed it in, {created_at} or the next, got {settled_at:?}"
             );
         }
         assert_eq!(

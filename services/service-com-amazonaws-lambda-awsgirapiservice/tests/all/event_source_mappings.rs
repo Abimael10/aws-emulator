@@ -1671,12 +1671,12 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
         ));
     }
 
-    // The transition is owed by the clock, not by anybody calling: nothing here sleeps on
-    // the emulator's behalf, it just waits past the instant the create made due.
-    let delay = service_com_amazonaws_lambda_awsgirapiservice::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY;
-    tokio::time::sleep(delay + std::time::Duration::from_millis(100)).await;
-
+    // The transition is owed by the CLOCK, not by anybody calling: nothing here sleeps on
+    // the emulator's behalf, it waits for the STATE the transition brings — looking again
+    // until it holds or this crate's own budget for clock-owed work passes
+    // ([`await_mapping_state`]).
     for (label, uuid, expected, created_state, created_at) in uuids {
+        await_mapping_state(&router, label, &uuid, expected).await;
         let mut settled_at = None;
         for read in 1..=2 {
             let fetched = get_mapping(&router, &uuid).await;
@@ -1702,10 +1702,19 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
                      transition, so LastModified stays at {created_at}, got {reported:?}"
                 );
             } else {
+                // The transition IS a state change, so the date moves to the instant the
+                // clock owed it at — which is a FRACTION of a second after the create
+                // (`EVENT_SOURCE_MAPPING_SETTLE_DELAY`), while the member is reported at
+                // whole-second resolution (see
+                // `crate::event_source_mapping_instant_and_attempt`). So the date the
+                // transition stamps is the creation's own second or the one after it, and
+                // never any other.
                 assert!(
-                    reported.is_some_and(|modified| modified > created_at),
+                    reported.is_some_and(|modified| modified == created_at
+                        || modified == created_at + 1.0),
                     "case {label:?} read {read}: LastModified must move with the state change \
-                     from {created_at}, got {reported:?}"
+                     to the second the clock owed it in, {created_at} or the next, got \
+                     {reported:?}"
                 );
             }
             if let Some(before) = settled_at {
