@@ -19,6 +19,10 @@
 //! with a CHALLENGE, which the caller answers next — contributes nothing yet: the call that
 //! finishes it publishes its outcome ([`Attempt`]).
 //!
+//! The counters are bare numbers of attempts: a user pool declares no unit for the series it
+//! publishes about its own traffic, so every datapoint here is stored with none and read back
+//! under [`UNIT_NONE`] — which is also the only unit a read may select them by.
+//!
 //! Which series a call contributes to follows what it attempted, not which operation
 //! served it ([`Counter`]): a sign-in lands in [`SIGN_IN_SUCCESSES`], a refresh-token
 //! exchange in [`TOKEN_REFRESH_SUCCESSES`] and a self-service registration in
@@ -87,8 +91,12 @@ pub const SIGN_IN_OPERATION: &str = "SignIn";
 /// The [`OPERATION_DIMENSION`] value a registration evaluation carries.
 pub const SIGN_UP_OPERATION: &str = "SignUp";
 
-/// The `StandardUnit` these observations carry: each is a number of attempts.
-pub const COUNT_UNIT: &str = "Count";
+/// The `StandardUnit` these observations are read under: a user pool declares no unit for the
+/// series it publishes about its own traffic, so each datapoint is stored with none and the
+/// metric store reports it under the value the enumerated type declares for a measurement that
+/// HAS no unit (`smithy_query(query="shape",shape="StandardUnit")`). A read naming that value
+/// therefore selects these datapoints, and a read naming any other unit selects none of them.
+pub const UNIT_NONE: &str = cloudwatch::UNIT_NONE;
 
 /// The resolution these series are stored at, in seconds — the regular resolution a metric
 /// has unless its publisher asks for the high-resolution one ("This field is optional, if
@@ -305,7 +313,9 @@ fn append<Eng: Send + Sync + 'static>(
             sum: *value,
             minimum: *value,
             maximum: *value,
-            unit: Some(COUNT_UNIT.to_string()),
+            // No unit of its own: these series are bare numbers of attempts, which the store
+            // reports under [`UNIT_NONE`].
+            unit: None,
             storage_resolution: STORAGE_RESOLUTION_SECS,
         };
         let watched = key.clone();
@@ -321,7 +331,7 @@ fn append<Eng: Send + Sync + 'static>(
         }
         written.push(cloudwatch::WrittenSeries {
             key: watched,
-            units: vec![COUNT_UNIT.to_string()],
+            units: vec![UNIT_NONE.to_string()],
         });
     }
     store.make_alarms_due(&written, timestamp_secs);
