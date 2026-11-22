@@ -161,6 +161,12 @@ impl TransactionControl {
     pub fn opens(self) -> bool {
         self == Self::Begin
     }
+
+    /// Whether this control COMMITS the transaction it closes, as opposed to
+    /// rolling it back.
+    pub fn commits(self) -> bool {
+        self == Self::Commit
+    }
 }
 
 /// Read `sql` as Redshift SQL and report what the engine has to do for it.

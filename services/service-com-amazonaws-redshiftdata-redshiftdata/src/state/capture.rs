@@ -411,13 +411,38 @@ fn copy_database(
     destination: &mut Database,
     deadline: Instant,
 ) -> Result<i64, WarehouseUnavailable> {
+    let pages = copy_connection(
+        &source.connection,
+        &mut destination.connection,
+        deadline,
+        COPY_TIMEOUT,
+    )?;
+    // The schemas the source holds are the source's catalogue, and the copy is
+    // the same database: a captured warehouse restores the schemas its tables
+    // are held under, not only the tables.
+    destination.schemas = source.schemas.clone();
+    Ok(pages)
+}
+
+/// The copy itself, between two open connections: everything [`copy_database`]
+/// does to the ENGINE, with no catalogue of its own.
+///
+/// `pub(super)` so the transaction beside this module
+/// ([`super::transactions`]) copies a database the same way a snapshot does: it
+/// hands a transaction a copy of the committed database to run on, and copies
+/// that database back when the transaction commits.
+pub(super) fn copy_connection(
+    source: &rusqlite::Connection,
+    destination: &mut rusqlite::Connection,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<i64, WarehouseUnavailable> {
     let engine_error =
         |error: rusqlite::Error| WarehouseUnavailable::Engine(scrub_paths(&error.to_string()));
-    let backup = rusqlite::backup::Backup::new(&source.connection, &mut destination.connection)
-        .map_err(engine_error)?;
+    let backup = rusqlite::backup::Backup::new(source, destination).map_err(engine_error)?;
     loop {
         if Instant::now() >= deadline {
-            return Err(WarehouseUnavailable::TimedOut(COPY_TIMEOUT));
+            return Err(WarehouseUnavailable::TimedOut(budget));
         }
         match backup.step(COPY_PAGES_PER_STEP).map_err(engine_error)? {
             rusqlite::backup::StepResult::Done => break,
@@ -432,9 +457,5 @@ fn copy_database(
             }
         }
     }
-    // The schemas the source holds are the source's catalogue, and the copy is
-    // the same database: a captured warehouse restores the schemas its tables
-    // are held under, not only the tables.
-    destination.schemas = source.schemas.clone();
     Ok(i64::from(backup.progress().pagecount.max(0)))
 }

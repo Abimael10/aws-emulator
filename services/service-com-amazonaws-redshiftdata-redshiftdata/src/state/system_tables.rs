@@ -36,6 +36,7 @@ pub const SYSTEM_TABLES: &[&str] = &[
     "stv_wlm_service_class_config",
     "stv_recents",
     "stl_load_errors",
+    "stv_blocklist",
     "svv_table_info",
 ];
 
@@ -250,6 +251,7 @@ pub fn materialise(
             "stv_wlm_service_class_config" => materialise_service_classes(connection, queues)?,
             "stv_recents" => materialise_recents(connection, log)?,
             "stl_load_errors" => materialise_load_errors(connection, log)?,
+            "stv_blocklist" => materialise_blocklist(connection, log)?,
             "svv_table_info" => materialise_table_info(connection, log, database)?,
             _ => {}
         }
@@ -596,6 +598,109 @@ fn materialise_load_errors(
 /// How long a `querytxt` is: `STL_QUERY` declares `char(4000)`, and a longer
 /// statement is truncated to it there.
 const QUERY_TEXT_LENGTH: usize = 4_000;
+
+/// `STV_BLOCKLIST`: "the number of 1 MB disk blocks used by each slice, table,
+/// or column in a database".
+///
+/// One row per block of one column of one table, as the table's grain is
+/// (`slice`, `tbl`, `col`, `blocknum`). What this engine really holds is what is
+/// reported: the tables its catalog holds, the columns each of them declares and
+/// the values each column holds (`num_values`), on the single slice this engine
+/// runs ([`SINGLE_SLICE`]). A table holding no row occupies no block, so it has
+/// no row here.
+///
+/// The columns that describe how a CLUSTER lays a block out on disk — where its
+/// super block sits, which disk it prefers, whether it is pinned, on disk,
+/// modified, unsorted or new, and the range of values it holds — are facts of
+/// that storage, which an in-process engine does not model: each one is left at
+/// the value the reference publishes as its default rather than given an
+/// invented one.
+fn materialise_blocklist(
+    connection: &rusqlite::Connection,
+    log: &mut SystemLog,
+) -> rusqlite::Result<()> {
+    create(
+        connection,
+        "stv_blocklist",
+        "slice INTEGER, col INTEGER, tbl INTEGER, blocknum INTEGER, num_values INTEGER, \
+         extended_limits INTEGER, minvalue BIGINT, maxvalue BIGINT, sb_pos INTEGER, \
+         pinned INTEGER, on_disk INTEGER, modified INTEGER, hdr_modified INTEGER, \
+         unsorted INTEGER, tombstone INTEGER, preferred_diskno INTEGER, temporary INTEGER, \
+         newblock INTEGER",
+    )?;
+    // The engine's own catalog: the tables this database holds, which is the
+    // same list its catalog operations read. A view stores no block of its own,
+    // so only tables are listed.
+    let mut listing = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name",
+    )?;
+    let held: Vec<String> = listing
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    drop(listing);
+    let mut blocks: Vec<(i64, usize, i64)> = Vec::new();
+    for name in held {
+        let quoted = name.replace('"', "\"\"");
+        // The columns the table declares, read the way every other reader of a
+        // relation's columns here reads them: off the query that returns them.
+        let columns = match connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0")) {
+            Ok(probe) => probe.column_count(),
+            // A relation the engine cannot prepare a read of holds no block
+            // this reader can report.
+            Err(_unreadable) => continue,
+        };
+        let rows: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM \"{quoted}\""), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_default();
+        if rows == 0 {
+            continue;
+        }
+        blocks.push((log.table_id(&name), columns, rows));
+    }
+    let mut insert = connection.prepare(
+        "INSERT INTO temp.stv_blocklist (slice, col, tbl, blocknum, num_values, \
+         extended_limits, minvalue, maxvalue, sb_pos, pinned, on_disk, modified, hdr_modified, \
+         unsorted, tombstone, preferred_diskno, temporary, newblock) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+         ?18)",
+    )?;
+    for (table_id, columns, rows) in blocks {
+        for column in 0..columns {
+            insert.execute(rusqlite::params![
+                SINGLE_SLICE,
+                // "col: zero-based index for the column".
+                i64::try_from(column).unwrap_or(0),
+                table_id,
+                // The one block this engine holds a column's values in: it
+                // stores a table in one place rather than in 1 MB blocks
+                // across slices.
+                FIRST_BLOCK,
+                rows,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// The `blocknum` of a column's first block, which is the only one this engine
+/// reports: the reference numbers a block from zero.
+const FIRST_BLOCK: i64 = 0;
 
 /// Create one system table EMPTY on the connection's temporary schema,
 /// replacing the one a previous statement left there.

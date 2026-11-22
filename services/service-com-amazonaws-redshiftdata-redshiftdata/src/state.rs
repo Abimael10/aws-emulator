@@ -127,6 +127,10 @@ pub use table_restore::*;
 /// The CONNECTION a submission's statements run on: the temporary relations
 /// that belong to it alone, and the locks it holds against the others.
 mod connections;
+/// The TRANSACTION one connection has open: the connection of its own that its
+/// uncommitted work lives on, and what the other connections read while it is
+/// open.
+mod transactions;
 /// The `ColumnMetadata` a result set's and a table's columns are reported as.
 mod column_metadata;
 /// Where a statement's result columns come from, read from its own text and
@@ -141,6 +145,7 @@ pub use column_metadata::*;
 pub use connections::*;
 pub use result_size::*;
 pub use schema_catalogue::*;
+pub use transactions::*;
 
 /// Page size `ListStatements` uses when the request leaves `MaxResults` at its
 /// modelled default of 0 — the modelled maximum, so an unparameterised call
@@ -1349,6 +1354,18 @@ impl Interrupt {
 #[derive(Debug)]
 pub struct Database {
     connection: rusqlite::Connection,
+    /// The transactions the connections of this database have OPEN, by the
+    /// connection's key: each one runs on a connection of its own, over a copy
+    /// of this database taken when it opened, so its uncommitted work is
+    /// invisible to every other connection until it commits (see
+    /// [`transactions`]). Bounded by [`MAX_OPEN_TRANSACTIONS`].
+    transactions: HashMap<String, transactions::OpenTransaction>,
+    /// How much has been COMMITTED to this database: one per submission that
+    /// changed it outside a transaction, and one per transaction that landed.
+    /// A transaction commits by copying the database it holds back over this
+    /// one, so a transaction that opened before any of this was committed
+    /// cannot land — this counter is what says so.
+    committed_writes: u64,
     /// The schemas this database holds — its own catalogue, which the engine has
     /// no notion of. `CREATE SCHEMA` adds one and `DROP SCHEMA` removes one, and
     /// a table of a schema is held under its qualified name (see
@@ -1448,6 +1465,8 @@ impl Database {
 
         Ok(Self {
             connection,
+            transactions: HashMap::new(),
+            committed_writes: 0,
             // "PUBLIC schema … Every database created in Amazon Redshift has a
             // schema named PUBLIC": a database holds it from the moment it
             // exists, and a table nothing qualifies is a table of it.
@@ -1579,6 +1598,13 @@ struct ConnectionOutcome {
     temp_created: Vec<String>,
     /// The locks it took and released, in the order it asked for them.
     locks: Vec<LockEffect>,
+    /// What it did to the transaction the connection has open, when it opened
+    /// or ended one.
+    transaction: Option<transactions::TransactionEffect>,
+    /// Whether it CHANGED the database it ran on, rather than only reading it:
+    /// what a transaction that opened before this statement cannot land over
+    /// once this statement has committed it (see [`note_committed_work`]).
+    changed: bool,
 }
 
 /// What one statement does to the WAREHOUSE's catalogue of databases.
@@ -1810,6 +1836,11 @@ pub fn run_on(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop_retired_relations(&database, scope);
+    transactions::retire_closed(&mut database, scope);
+    // A connection with a transaction open runs on that transaction's own
+    // connection, so what it has not committed stays out of the database every
+    // other connection reads.
+    transactions::activate(&mut database, scope);
     let mut budget = Retention::new();
     let mut held = scope.temp_names();
     let mut run = RunContext {
@@ -1821,8 +1852,31 @@ pub fn run_on(
         plane,
     };
     let mut execution = run_sql(&mut database, sql, parameters, Binding::Every, &mut run);
-    close_connection(&mut database, scope, std::slice::from_mut(&mut execution));
+    transactions::deactivate(&mut database, scope);
+    let rolled_back = close_connection(&mut database, scope, std::slice::from_mut(&mut execution));
+    if !rolled_back {
+        note_committed_work(&mut database, scope, std::slice::from_ref(&execution));
+    }
     execution
+}
+
+/// Count what this submission COMMITTED to the database, which is what a
+/// transaction that opened earlier cannot land over.
+///
+/// Only work committed to the database itself counts: a submission running
+/// inside its own transaction has committed nothing until that transaction does,
+/// a submission whose connection closed with its transaction still open
+/// committed nothing either, and a submission that only read changed nothing.
+fn note_committed_work(database: &mut Database, scope: &ConnectionScope, executions: &[Execution]) {
+    if transactions::holds_open_transaction(database, scope) {
+        return;
+    }
+    if executions
+        .iter()
+        .any(|execution| execution.connection.changed)
+    {
+        database.committed_writes = database.committed_writes.saturating_add(1);
+    }
 }
 
 /// Run `sqls` serially, in submission order, on the engine `handle` guards, and/// report one [`Execution`] per submitted statement in that same order.
@@ -1857,6 +1911,10 @@ pub fn run_batch_on(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop_retired_relations(&database, scope);
+    transactions::retire_closed(&mut database, scope);
+    // As for a single statement: a connection with a transaction open runs on
+    // that transaction's own connection.
+    transactions::activate(&mut database, scope);
     let deadline = Instant::now() + timeout;
     let transactional = mode == ExecutionMode::Transaction;
 
@@ -1864,14 +1922,22 @@ pub fn run_batch_on(
     // authorizer every submitted statement runs under. If it cannot be opened,
     // no statement of the batch ran, and each one reports the engine's own
     // message for why.
+    let mut opened_here = false;
     if transactional {
         if let Err(error) = database.connection.execute_batch("BEGIN") {
             let message = scrub_paths(&error.to_string());
-            return sqls
+            let mut executions: Vec<Execution> = sqls
                 .iter()
                 .map(|_| Execution::failed(message.clone()))
                 .collect();
+            // Every path out puts the committed connection back: the
+            // transaction's own connection is this submission's only while its
+            // statements run.
+            transactions::deactivate(&mut database, scope);
+            close_connection(&mut database, scope, &mut executions);
+            return executions;
         }
+        opened_here = true;
     }
 
     let mut executions: Vec<Execution> = Vec::with_capacity(sqls.len());
@@ -1924,9 +1990,9 @@ pub fn run_batch_on(
             }
         }
         // A transaction left open would leak into the next statement submitted
-        // against this database, so it is closed even when the close above
-        // reported an error.
-        if !database.connection.is_autocommit() {
+        // against this database, so the one this batch opened is closed even
+        // when the close above reported an error.
+        if opened_here && !database.connection.is_autocommit() {
             let _ = database.connection.execute_batch("ROLLBACK");
         }
     }
@@ -1936,7 +2002,11 @@ pub fn run_batch_on(
     while executions.len() < sqls.len() {
         executions.push(Execution::never_ran());
     }
-    close_connection(&mut database, scope, &mut executions);
+    transactions::deactivate(&mut database, scope);
+    let rolled_back = close_connection(&mut database, scope, &mut executions);
+    if !rolled_back {
+        note_committed_work(&mut database, scope, &executions);
+    }
     executions
 }
 
@@ -2260,6 +2330,38 @@ fn carry_out(
     query: i64,
 ) -> Result<Produced, ExecutionFailure> {
     let translated = redshift_sql::translate(sql, &database.schemas, &effects.temp());
+    // Which statements CHANGE the database they run on: everything but a lock
+    // and a transaction control, each of which acts on the connection rather
+    // than on the data. A statement the engine answers with a result set read
+    // and changed nothing, so what is left — a statement that reports affected
+    // rows — is what committed work to this database.
+    let changes_data = !matches!(
+        translated,
+        redshift_sql::Translated::Lock { .. } | redshift_sql::Translated::Transaction(_)
+    );
+    let produced = carry_out_translated(
+        database, sql, parameters, binding, budget, plane, effects, query, translated,
+    );
+    if changes_data && matches!(produced, Ok(Produced::Affected(_))) {
+        effects.connection.changed = true;
+    }
+    produced
+}
+
+/// Do what the statement `translated` reads as asks for. The one caller is
+/// [`carry_out`], which decides from the same value what the statement changes.
+#[allow(clippy::too_many_arguments)]
+fn carry_out_translated(
+    database: &mut Database,
+    sql: &str,
+    parameters: &[SqlParameter],
+    binding: Binding,
+    budget: &mut Retention,
+    plane: &data_plane::DataPlane,
+    effects: &mut RunEffects<'_>,
+    query: i64,
+    translated: redshift_sql::Translated,
+) -> Result<Produced, ExecutionFailure> {
     match translated {
         redshift_sql::Translated::Run(text) => {
             prepare_references(database, plane, sql)?;
@@ -2327,11 +2429,18 @@ fn carry_out(
             if control.opens() == in_transaction {
                 return Ok(Produced::Affected(0));
             }
-            database.connection.execute_batch(control.as_sql())?;
-            // The transaction is over, and the locks it held are the
-            // transaction's: "the locks are held until the transaction ends".
-            if !control.opens() {
+            if control.opens() {
+                // A session's transaction is given a connection of its own, so
+                // what it writes is not in the database the other connections
+                // read until it commits.
+                transactions::open(database, effects.scope)?;
+                effects.connection.transaction = Some(transactions::TransactionEffect::Opened);
+            } else {
+                transactions::close(database, effects.scope, control.commits())?;
+                // The transaction is over, and the locks it held are the
+                // transaction's: "the locks are held until the transaction ends".
                 effects.connection.locks.push(LockEffect::ReleaseAll);
+                effects.connection.transaction = Some(transactions::TransactionEffect::Closed);
             }
             Ok(Produced::Affected(0))
         }
@@ -2580,20 +2689,27 @@ fn drop_retired_relations(database: &Database, scope: &ConnectionScope) {
 }
 
 /// Close the connection a submission ran on, when that connection does not
-/// outlive the submission.
+/// outlive the submission, and report whether a transaction it had left open
+/// was rolled back with it.
 ///
 /// A statement submitted without a `SessionId` runs on a connection opened for
 /// it, so what that connection held goes away with it: the temporary relations
-/// it created are dropped, and the locks it took are released with the
-/// connection rather than recorded against it.
+/// it created are dropped, the locks it took are released with the connection
+/// rather than recorded against it, and a transaction it never ended is rolled
+/// back.
 fn close_connection(
     database: &mut Database,
     scope: &ConnectionScope,
     executions: &mut [Execution],
-) {
+) -> bool {
     if scope.is_session() {
-        return;
+        return false;
     }
+    // A connection that closes with a transaction still open rolls it back, so
+    // nothing it did is committed and the next statement on this database finds
+    // the connection in autocommit. Only a connection of this kind runs a
+    // transaction on the committed connection at all (see [`transactions`]).
+    let rolled_back = transactions::close_submission(database);
     // A connection that is gone holds no session parameters either: the next
     // statement on a connection of its own reads their defaults.
     database.settings.remove(scope.key());
@@ -2603,6 +2719,7 @@ fn close_connection(
         }
         execution.connection.locks.clear();
     }
+    rolled_back
 }
 
 /// Drop one temporary relation by its ENGINE name, whichever kind of relation it
@@ -4239,12 +4356,19 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         // statement as FINISHED before what it built is reachable.
         let mut created: Vec<String> = Vec::new();
         let mut locks: Vec<LockEffect> = Vec::new();
+        let mut transaction: Option<transactions::TransactionEffect> = None;
         for execution in &executions {
             created.extend(execution.connection.temp_created.iter().cloned());
             locks.extend(execution.connection.locks.iter().cloned());
+            // The LAST thing the submission's statements did to the connection's
+            // transaction is the state it left it in.
+            if let Some(effect) = execution.connection.transaction {
+                transaction = Some(effect);
+            }
         }
         self.hold_temp_relations(id, &created);
         self.apply_lock_effects(id, &locks);
+        self.apply_transaction_effect(id, transaction);
         let Some(statement) = self.statements.get_mut(id) else {
             return;
         };

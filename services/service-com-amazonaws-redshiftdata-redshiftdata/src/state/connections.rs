@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::{
     service_state, ComAmazonawsRedshiftdataRedshiftdataState, ExecutionBound, QueueSlot,
-    MAX_RETAINED_SESSIONS,
+    TransactionEffect, MAX_RETAINED_SESSIONS,
 };
 
 /// The prefix the temporary relations of ONE connection are held under in the
@@ -131,6 +131,11 @@ pub struct ConnectionScope {
     /// The ENGINE names of the temporary relations of connections this service
     /// no longer holds, for this execution to drop.
     retired: Vec<String>,
+    /// The connections this service no longer holds that have a TRANSACTION
+    /// open on this database, for this execution to roll back: a closed
+    /// connection's transaction was never committed, and a closed connection
+    /// holds nothing.
+    retired_transactions: Vec<String>,
     /// How many locks this connection already holds, so a `LOCK` that would
     /// take it past [`MAX_LOCKS_PER_CONNECTION`] is refused while it runs
     /// rather than reported as taken and then dropped by the registry.
@@ -152,8 +157,21 @@ impl ConnectionScope {
             session,
             temp,
             retired,
+            retired_transactions: Vec::new(),
             locks_held,
         }
+    }
+
+    /// The same connection, told which closed connections' transactions the
+    /// execution it is handed to has to roll back.
+    pub(crate) fn retiring_transactions(mut self, retired: Vec<String>) -> Self {
+        self.retired_transactions = retired;
+        self
+    }
+
+    /// Those connections.
+    pub fn retired_transactions(&self) -> &[String] {
+        &self.retired_transactions
     }
 
     /// A connection of its own, holding nothing: what work that is not a
@@ -330,6 +348,13 @@ pub(crate) struct Connections {
     temp: HashMap<String, SessionTemp>,
     /// The locks the live sessions hold, bounded by [`MAX_HELD_LOCKS`].
     locks: Vec<HeldLock>,
+    /// Which connections have a TRANSACTION open, by the database they have it
+    /// open on ([`ConnectionTarget::database_key`]) — the state store's view of
+    /// what the engine holds (see [`super::transactions`]), so that the
+    /// transaction of a session this service has let go of is rolled back by
+    /// the next statement that runs on that database. Bounded by the sessions
+    /// this service holds.
+    transactions: HashMap<String, BTreeSet<String>>,
 }
 
 impl ComAmazonawsRedshiftdataRedshiftdataState {
@@ -354,6 +379,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             .map(|held| held.relations.clone())
             .unwrap_or_default();
         let retired = self.retire_closed_connections(&database_key);
+        let retired_transactions = self.retire_closed_transactions(&database_key);
         let locks_held = self
             .connections
             .locks
@@ -361,6 +387,75 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             .filter(|held| held.owner == key)
             .count();
         ConnectionScope::new(key, session.is_some(), temp, retired, locks_held)
+            .retiring_transactions(retired_transactions)
+    }
+
+    /// The connections this service no longer holds that have a transaction
+    /// open on `database_key`, dropped from this view here and rolled back on
+    /// the engine by the execution that is given them.
+    fn retire_closed_transactions(&mut self, database_key: &str) -> Vec<String> {
+        if !self.connections.transactions.contains_key(database_key) {
+            return Vec::new();
+        }
+        let live = self.live_sessions();
+        let Some(open) = self.connections.transactions.get_mut(database_key) else {
+            return Vec::new();
+        };
+        let retired: Vec<String> = open
+            .iter()
+            .filter(|owner| !live.contains(*owner))
+            .cloned()
+            .collect();
+        for owner in &retired {
+            open.remove(owner);
+        }
+        if open.is_empty() {
+            self.connections.transactions.remove(database_key);
+        }
+        retired
+    }
+
+    /// Record what the statements of the submission recorded under `id` did to
+    /// the transaction their connection has open.
+    ///
+    /// Only a SESSION's connection outlives its submission, so only its
+    /// transactions are recorded: a statement submitted without a session runs
+    /// on a connection that closes when it ends, and a transaction it left open
+    /// is rolled back with that connection.
+    pub(crate) fn apply_transaction_effect(
+        &mut self,
+        id: &str,
+        effect: Option<TransactionEffect>,
+    ) {
+        let Some(effect) = effect else {
+            return;
+        };
+        let Some(statement) = self.statements.get(id) else {
+            return;
+        };
+        let Some(owner) = statement.session_id.clone() else {
+            return;
+        };
+        let database_key = statement
+            .target
+            .database_key(statement.database.as_deref().unwrap_or_default());
+        match effect {
+            TransactionEffect::Opened => {
+                self.connections
+                    .transactions
+                    .entry(database_key)
+                    .or_default()
+                    .insert(owner);
+            }
+            TransactionEffect::Closed => {
+                if let Some(open) = self.connections.transactions.get_mut(&database_key) {
+                    open.remove(&owner);
+                    if open.is_empty() {
+                        self.connections.transactions.remove(&database_key);
+                    }
+                }
+            }
+        }
     }
 
     /// The ENGINE names of the temporary relations held in `database_key` by
