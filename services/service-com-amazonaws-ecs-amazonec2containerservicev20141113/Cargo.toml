@@ -121,10 +121,11 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # `ListMetrics` and `GetMetricStatistics`. They cannot travel over `PutMetricData`, which is
 # for a client's own namespaces. No cycle: that crate does not depend on this one.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
-# The CloudWatch Logs service, which SERVES the stream creation the `awslogs` log driver of a
+# The CloudWatch Logs service, which SERVES the creations the `awslogs` log driver of a
 # launched task's container needs: whether the task's execution role may create that stream,
-# and whether this account holds the log group the configuration names, which decides whether
-# the task's containers can be launched at all (`crate::state::log_driver_init` ->
+# whether this account holds the log group the configuration names, and whether that role may
+# create the group itself where the driver was asked to, which decides whether the task's
+# containers can be launched at all (`crate::state::log_driver_init` ->
 # `…cloudwatchlogs…::state::log_stream_creation::serve_log_stream_creation`). The log group
 # and the policies on the role are that service's and IAM's own records, held in their own
 # stores in the shared engine, so the creation is answered by the service that owns them

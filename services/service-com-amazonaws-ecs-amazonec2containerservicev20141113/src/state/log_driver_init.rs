@@ -14,12 +14,12 @@
 //! `TaskDefinition$executionRoleArn`).
 //!
 //! So a launch whose logger cannot be initialised launches nothing: no container starts,
-//! nothing is delivered to the group the configuration names, and the task is stopped at the
-//! instant it would otherwise have started, with the stop code of a task that never ran
-//! ([`STOP_CODE_TASK_FAILED_TO_START`]) and the `stoppedReason` the agent words for a logger
-//! it could not validate ([`unable_to_initialise_logger_message`]). A launch whose logger
-//! can be initialised runs, and each container's output is delivered to its own stream
-//! ([`super::container_logs`]).
+//! nothing is delivered to the group the configuration names, that group is not created, and
+//! the task is stopped at the instant it would otherwise have started, with the stop code of
+//! a task that never ran ([`STOP_CODE_TASK_FAILED_TO_START`]) and the `stoppedReason` the
+//! agent words for a logger it could not validate
+//! ([`unable_to_initialise_logger_message`]). A launch whose logger can be initialised runs,
+//! and each container's output is delivered to its own stream ([`super::container_logs`]).
 //!
 //! Every half asks the service that OWNS the log group: whether the execution role may
 //! create the stream, whether there is a group to create it in, and whether that role may

@@ -7,9 +7,9 @@
 //! A compute service that delivers a workload's output to this service does not sign a
 //! request of its own: its agent creates the stream the output goes to AS a role of the
 //! caller's account — an Amazon ECS task execution role, say — before the workload exists.
-//! That creation is still this service's to answer, because the two questions it turns on
-//! are facts about this service's own resources, and they are the very two
-//! `CreateLogStream` itself answers:
+//! That creation is still this service's to answer, because the questions it turns on are
+//! facts about this service's own resources, and they are the very ones `CreateLogStream`
+//! itself answers:
 //!
 //! 1. **may this principal create it** — `logs:CreateLogStream` ("Creates a log stream for
 //!    the specified log group", `CreateLogStream`) on the stream the driver names, decided
@@ -124,6 +124,8 @@ pub fn serve_log_stream_creation<Eng: Send + Sync + 'static>(
     log_stream: &str,
     principal: Option<DeliveryPrincipal<'_>>,
 ) -> Result<(), StreamCreationRefusal> {
+    // The RESOURCE the creation addresses: the stream itself, which is what a grant written
+    // for a log driver names (the group's ARN with the trailing wildcard covers it).
     let resource = super::log_stream_arn(region, log_group, log_stream);
     if let Some(message) = withheld_creation(
         engine,

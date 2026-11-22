@@ -608,6 +608,20 @@ const STANDALONE_ROWS: &[StandaloneRow] = &[
         ends: Ends::EssentialExit(0),
     },
     StandaloneRow {
+        // The shape a run-to-completion task takes: the program writes a line, WAITS past
+        // the span a standalone task's work is reported running for, and then ends of its
+        // own accord. The status the container reports is the one its own program produced,
+        // never the one a container ended from OUTSIDE the task would carry.
+        case: "a program that writes a line, waits and then ends on its own",
+        containers: &[StandaloneContainer {
+            name: "app",
+            command: Some(&["/bin/sh", "-c", "echo ready; sleep 4"]),
+            essential: true,
+            exit_code: Some(0),
+        }],
+        ends: Ends::EssentialExit(0),
+    },
+    StandaloneRow {
         case: "a program that ends with a status of its own",
         containers: &[StandaloneContainer {
             name: "app",

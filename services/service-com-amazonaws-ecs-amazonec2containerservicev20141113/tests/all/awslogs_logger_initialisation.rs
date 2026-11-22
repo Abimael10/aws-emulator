@@ -20,9 +20,9 @@
 //! The rows span what the rule generalises over: WHY the stream creation is refused (the
 //! group is not there; no policy in force on the execution role grants the action; a policy
 //! explicitly denies it), and the configurations the rule does NOT decide against (a group
-//! that is there with the grant in place, a driver asked to create the group itself, and a
-//! revision naming no execution role at all, which states no principal for a policy to be
-//! read against).
+//! that is there with the grant in place, a driver asked to create the group itself under a
+//! role that may create it, and a revision naming no execution role at all, which states no
+//! principal for a policy to be read against).
 //!
 //! Every fact is created through the owning service's own API — the log group through
 //! CloudWatch Logs' `CreateLogGroup`, the execution role and its policies through IAM's
@@ -36,6 +36,11 @@
 //! group). Its rows assert the WHOLE `stoppedReason`, whose variable parts — the session the
 //! execution role was assumed in, the action the driver performs and the stream ARN it
 //! addressed — come from the request and from the emulator's IAM and Logs state.
+//!
+//! A third table spans the GROUP the driver creates where it was asked to
+//! (`awslogs-create-group`): that creation is a call of the driver's too, made as the same
+//! role, so a launch whose execution role may not make it is refused and the group is never
+//! created — while one whose role may runs and the group appears.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -169,7 +174,7 @@ const ROWS: &[Row] = &[
     Row {
         // "awslogs-create-group": the driver creates the group as well as the stream, under a
         // role that may create it, so a group that is not there yet is not a logger that
-        // cannot be initialised.
+        // cannot be initialised. The role that may NOT is the third table below.
         case: "the driver is asked to create the group it delivers to",
         group: UNHELD_GROUP,
         create_group: true,
@@ -1064,4 +1069,367 @@ async fn started_task_arn(
         .first()
         .unwrap_or_else(|| panic!("case {case:?}: expected a task back, got {body}"));
     string(task, "taskArn", case)
+}
+
+// ---------------------------------------------------------------------------------------
+// The GROUP the driver creates where it was asked to (`awslogs-create-group`)
+// ---------------------------------------------------------------------------------------
+
+/// The cluster the third table's tasks run in: its own, so its launches compete with no
+/// other row's for capacity.
+const CREATE_GROUP_CLUSTER: &str = "loggercreategroup";
+
+/// The fixed OPENING of the agent's account of a logger it could not validate, up to the
+/// THING the driver could not create — the attempts it reports are the stream creation's,
+/// which is the call the driver retries. Spelled out here rather than imported, so a wrong
+/// constant in the implementation cannot make this pass.
+const LOGGER_FAILURE_OPENING: &str =
+    "ResourceInitializationError: failed to validate logger args: create stream has been \
+     retried 1 times: failed to create Cloudwatch log ";
+
+/// What the third table's execution role is allowed, as one identity-based document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateGrant {
+    /// The two actions the driver performs on the STREAM and nothing about creating a group
+    /// — which is exactly what AWS's own managed policy for a task execution role grants
+    /// (`AmazonECSTaskExecutionRolePolicy`: `logs:CreateLogStream`, `logs:PutLogEvents`).
+    DeliveryOnly,
+    /// Those actions AND the creation of the group.
+    DeliveryAndGroup,
+    /// The creation of the group alone, so the STREAM the driver creates first is outside
+    /// what the role may do.
+    GroupOnly,
+    /// Those actions with the group's creation explicitly DENIED.
+    GroupDenied,
+}
+
+/// Which of IAM's rules withheld the grant, as the clause a refusal names it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    /// IAM's default deny: nothing readable allowed the action.
+    NoPolicyAllows,
+    /// An explicit `Deny` in one of the principal's own documents.
+    ExplicitDeny,
+}
+
+/// What a third-table row's launch produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Initialised {
+    /// The logger was initialised, so the task RUNS — and the group the driver was asked to
+    /// create is there with this container's stream in it when `creates_group` is set.
+    Runs { creates_group: bool },
+    /// The GROUP creation is refused: `logs:CreateLogGroup` on the group's own ARN.
+    GroupRefused(Clause),
+    /// The STREAM creation is refused: `logs:CreateLogStream` on the stream's ARN.
+    StreamRefused(Clause),
+    /// There is no group to deliver into and the driver was not asked to create one, so what
+    /// CloudWatch Logs answers is its own sentence for a group this account does not hold.
+    NoGroup,
+}
+
+/// One row: whether the driver is asked to create the group it delivers to, whether that
+/// group is there already, what the execution role may do, and the launch that produces.
+struct CreateGroupRow {
+    case: &'static str,
+    /// `awslogs-create-group`.
+    create_group: bool,
+    /// Whether the suite creates the group through CloudWatch Logs' own API first.
+    held: bool,
+    grant: CreateGrant,
+    outcome: Initialised,
+}
+
+/// The rows differ along what the rule generalises over: whether the driver was asked to
+/// create its group, whether there is one already, and which of the driver's two creations
+/// the execution role may make.
+const CREATE_GROUP_ROWS: &[CreateGroupRow] = &[
+    CreateGroupRow {
+        case: "the driver must create the group and nothing allows the role to",
+        create_group: true,
+        held: false,
+        grant: CreateGrant::DeliveryOnly,
+        outcome: Initialised::GroupRefused(Clause::NoPolicyAllows),
+    },
+    CreateGroupRow {
+        case: "the driver must create the group and a policy denies that creation",
+        create_group: true,
+        held: false,
+        grant: CreateGrant::GroupDenied,
+        outcome: Initialised::GroupRefused(Clause::ExplicitDeny),
+    },
+    CreateGroupRow {
+        case: "the driver must create the group and the role may",
+        create_group: true,
+        held: false,
+        grant: CreateGrant::DeliveryAndGroup,
+        outcome: Initialised::Runs {
+            creates_group: true,
+        },
+    },
+    CreateGroupRow {
+        // Nothing is created where the group is already there, so a role that may not create
+        // one launches all the same.
+        case: "the group is there already and the role may not create one",
+        create_group: true,
+        held: true,
+        grant: CreateGrant::DeliveryOnly,
+        outcome: Initialised::Runs {
+            creates_group: false,
+        },
+    },
+    CreateGroupRow {
+        // A driver that was NOT asked to create its group never makes that call, so the
+        // grant for it decides nothing: what such a launch meets is the missing group.
+        case: "the driver is not asked to create the group, and there is none",
+        create_group: false,
+        held: false,
+        grant: CreateGrant::DeliveryAndGroup,
+        outcome: Initialised::NoGroup,
+    },
+    CreateGroupRow {
+        // The STREAM is the creation the driver makes first, and the group is created only
+        // because that one found no group to land in: a role allowed the group alone is
+        // refused the stream.
+        case: "the role may create the group but not the stream",
+        create_group: true,
+        held: false,
+        grant: CreateGrant::GroupOnly,
+        outcome: Initialised::StreamRefused(Clause::NoPolicyAllows),
+    },
+];
+
+/// The identity-based document one third-table row's execution role carries.
+fn create_group_policy(grant: CreateGrant) -> String {
+    let delivery = [CREATE_LOG_STREAM, PUT_LOG_EVENTS];
+    match grant {
+        CreateGrant::DeliveryOnly => policy("Allow", &delivery),
+        CreateGrant::DeliveryAndGroup => policy(
+            "Allow",
+            &[CREATE_LOG_GROUP, CREATE_LOG_STREAM, PUT_LOG_EVENTS],
+        ),
+        CreateGrant::GroupOnly => policy("Allow", &[CREATE_LOG_GROUP]),
+        CreateGrant::GroupDenied => json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [CREATE_LOG_GROUP, CREATE_LOG_STREAM, PUT_LOG_EVENTS],
+                    "Resource": "*",
+                },
+                { "Effect": "Deny", "Action": [CREATE_LOG_GROUP], "Resource": "*" },
+            ],
+        })
+        .to_string(),
+    }
+}
+
+/// The ARN of the log GROUP itself — the resource a `logs:CreateLogGroup` grant names, which
+/// carries no stream and no trailing wildcard, since that call names a group and no stream.
+fn group_arn(group: &str) -> String {
+    format!("arn:aws:logs:{SIGNED_REGION}:{ACCOUNT}:log-group:{group}")
+}
+
+/// The authorization refusal CloudWatch Logs answers one of the driver's creations with:
+/// the session the execution role was assumed in, the action the driver performs, the
+/// resource it addressed and the clause naming which of IAM's rules withheld the grant.
+fn not_authorized(clause: Clause, action: &str, session: &str, resource: &str) -> String {
+    let reason = match clause {
+        Clause::NoPolicyAllows => {
+            format!("because no identity-based policy allows the {action} action")
+        }
+        Clause::ExplicitDeny => "with an explicit deny in an identity-based policy".to_string(),
+    };
+    format!(
+        "{ACCESS_DENIED}User: {session} is not authorized to perform: {action} on resource: \
+         {resource} {reason}"
+    )
+}
+
+/// The WHOLE `stoppedReason` a refused third-table row's task must carry: the fixed opening,
+/// WHICH of the driver's creations failed, the answer CloudWatch Logs gave and the agent's
+/// account of how often it tried.
+fn created_group_reason(
+    outcome: Initialised,
+    role_arn: &str,
+    group: &str,
+    task_id: &str,
+    case: &str,
+) -> String {
+    let session = session_arn(role_arn, task_id);
+    let (created, failure) = match outcome {
+        Initialised::GroupRefused(clause) => (
+            "group",
+            not_authorized(clause, CREATE_LOG_GROUP, &session, &group_arn(group)),
+        ),
+        Initialised::StreamRefused(clause) => (
+            "stream",
+            not_authorized(
+                clause,
+                CREATE_LOG_STREAM,
+                &session,
+                &stream_arn(group, task_id),
+            ),
+        ),
+        Initialised::NoGroup => ("stream", RESOURCE_NOT_FOUND.to_string()),
+        Initialised::Runs { .. } => {
+            panic!("case {case:?}: this row's logger is initialised, so it carries no reason")
+        }
+    };
+    format!("{LOGGER_FAILURE_OPENING}{created}: {failure}: exceeded maximum number of attempts, 1")
+}
+
+/// The names of every log group whose name begins with `prefix`, through CloudWatch Logs'
+/// own `DescribeLogGroups` — empty when this account holds none.
+async fn group_names(router: &MultiServiceRouter, prefix: &str) -> Vec<String> {
+    let (status, body) = logs(
+        router,
+        "DescribeLogGroups",
+        json!({ "logGroupNamePrefix": prefix }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeLogGroups must answer the groups of this account, got {status} with {body}"
+    );
+    body["logGroups"]
+        .as_array()
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| group["logGroupName"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read a group's name again until this account holds it, and panic naming what it held
+/// instead when it never does.
+async fn group_created(router: &MultiServiceRouter, group: &str, case: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let held = group_names(router, group).await;
+        if held.iter().any(|name| name == group) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the driver to create the group {group}, got {held:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: the GROUP a driver configured to create the one it delivers to has to create is a
+/// call of that driver's, made as the task's execution role — so a launch whose role may not
+/// make it is never started, the group it named is never created, and the stop says which of
+/// the driver's creations failed; a launch whose role may runs, and the group appears.
+#[tokio::test]
+async fn a_driver_asked_to_create_its_log_group_launches_only_where_the_role_may_create_it() {
+    let router = emulator();
+    cluster_with_capacity(&router, CREATE_GROUP_CLUSTER, "created group").await;
+
+    // Every row is started FIRST and read back afterwards: the launches are decided in the
+    // one emulator, so the suite waits for the longest of them rather than for their sum.
+    let mut launched: Vec<(&CreateGroupRow, String, String, String)> = Vec::new();
+    for (index, row) in CREATE_GROUP_ROWS.iter().enumerate() {
+        let case = row.case;
+        // One group name per row, so a group a row creates is not a group another row finds.
+        let group = format!("/emulator/ecs/created-group-{index}");
+        if row.held {
+            let (status, created) = logs(
+                &router,
+                "CreateLogGroup",
+                json!({ "logGroupName": group.clone() }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the group this row delivers into must be created, got {status} \
+                 with {created}"
+            );
+        }
+        let role_arn = create_role(
+            &router,
+            &format!("createGroupRole{index}"),
+            Some(create_group_policy(row.grant)),
+            case,
+        )
+        .await;
+        let definition = register_logging_revision(
+            &router,
+            &format!("creategroup{index}"),
+            &group,
+            row.create_group,
+            Some(&role_arn),
+            STAYS_UP_PROGRAM,
+            case,
+        )
+        .await;
+        let task_arn = started_task_arn(
+            &router,
+            "RunTask",
+            json!({ "cluster": CREATE_GROUP_CLUSTER, "taskDefinition": definition }),
+            case,
+        )
+        .await;
+        launched.push((row, group, role_arn, task_arn));
+    }
+
+    for (row, group, role_arn, arn) in &launched {
+        let case = row.case;
+        let refused = !matches!(row.outcome, Initialised::Runs { .. });
+        let refusal = refused.then_some(Refusal::NotAuthorized);
+        let task = settled_task(&router, CREATE_GROUP_CLUSTER, arn, refusal, case).await;
+        let task_id = task_id(arn);
+        let stream = format!("{STREAM_PREFIX}/{CONTAINER}/{task_id}");
+        if let Initialised::Runs { creates_group } = row.outcome {
+            assert_eq!(
+                last_status(&task),
+                RUNNING,
+                "case {case:?}: a task whose logger can be initialised runs, got {task}"
+            );
+            assert!(
+                stop_code(&task).is_empty() && stopped_reason(&task).is_empty(),
+                "case {case:?}: a running task carries no stop, got {task}"
+            );
+            if creates_group {
+                group_created(&router, group, case).await;
+            }
+            group_holding_stream(&router, group, &stream, case).await;
+            continue;
+        }
+        assert_eq!(
+            stop_code(&task),
+            TASK_FAILED_TO_START,
+            "case {case:?}: a task whose logger could not be initialised never ran, got {task}"
+        );
+        assert_eq!(
+            stopped_reason(&task),
+            created_group_reason(row.outcome, role_arn, group, &task_id, case),
+            "case {case:?}: expected the agent's whole account of the logger it could not \
+             validate, got {task}"
+        );
+        // Nothing ran, and nothing was created: a task Amazon ECS never started carries no
+        // `startedAt`, no container of it claims an exit code, and the group the driver would
+        // have created is not there.
+        assert!(
+            task["startedAt"].is_null(),
+            "case {case:?}: a task whose logger could not be initialised was never started, \
+             so it reports no startedAt, got {task}"
+        );
+        for container in list(&task, "containers", case) {
+            assert_eq!(
+                present_count(&container, "exitCode", case),
+                None,
+                "case {case:?}: a container that never started reports no exit code, got \
+                 {container}"
+            );
+        }
+        let held = group_names(&router, group).await;
+        assert!(
+            held.is_empty(),
+            "case {case:?}: the log group of a logger that could not be initialised is never \
+             created, got {held:?}"
+        );
+    }
 }
