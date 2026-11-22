@@ -2875,6 +2875,156 @@ async fn message_metadata_is_reported_for_the_items_a_receipt_can_name() {
     );
 }
 
+/// What an authentication refusal may depend on: nothing.
+///
+/// Every `SessionId` the model permits that names no session the caller may act on — asked
+/// for by a chat the flow block initiated NOTHING for and by a chat holding a current
+/// session of its own — is refused with one and the same answer: the same status, the same
+/// code and the same sentence, carrying neither what the request named nor what this store
+/// holds. So the refusal is no oracle for whether a session exists, or for whom.
+#[tokio::test]
+async fn an_authentication_refusal_reveals_neither_the_request_nor_the_store() {
+    let harness = router();
+    let bare_token = "participant-token-refusal-bare";
+    let stocked_token = "participant-token-refusal-stocked";
+    let bare = connect(&harness, bare_token).await;
+    let stocked = connect(&harness, stocked_token).await;
+    let stocked_contact = harness.start_chat(stocked_token);
+
+    // The ONE session this store holds: the stocked chat's own, current and reachable by it.
+    let initiated = "90000000-aaaa-4aaa-8aaa-00000000000a";
+    initiate_authentication(
+        &harness,
+        initiated,
+        authentication_session(
+            &stocked_contact,
+            "https://pool-r.auth.us-east-1.amazoncognito.com/oauth2/authorize",
+            "client-refusal",
+            &["openid", "profile"],
+            0,
+            false,
+        ),
+    );
+
+    // The rows differ in the FORM of the 36-character `SessionId` (modelled `@length` min 36
+    // / max 36, so every row is a value the model itself permits) and in the `RedirectUri`
+    // the request asks for (`RedirectURI` len 1..1024, so the rows span that bound too).
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a dashed uuid no session was initiated for",
+            "00000000-0000-4000-8000-00000000000b".to_string(),
+            "https://example.com/cb".to_string(),
+        ),
+        (
+            "one character repeated to the modelled length",
+            "z".repeat(36),
+            "https://example.com/callback?next=%2Fhome".to_string(),
+        ),
+        (
+            "thirty-six digits",
+            "0123456789".chars().cycle().take(36).collect(),
+            "/".to_string(),
+        ),
+        (
+            "mixed case and punctuation",
+            "A_b-c.d~e+f=g!h?i&j:k;l,m@n#o$p%qRsTuV"
+                .chars()
+                .take(36)
+                .collect(),
+            format!("https://example.com/{}", "a".repeat(1004)),
+        ),
+    ];
+
+    // Every row is asked by BOTH callers, so the two stores one refusal is produced over
+    // differ: one chat has no authentication session at all, the other has a live one. The
+    // last request adds the id of the session that DOES exist, asked by the chat it does not
+    // belong to — the one reason a state-revealing sentence would word differently.
+    let mut requests: Vec<(String, &str, String, String)> = Vec::new();
+    for (label, session_id, redirect_uri) in &rows {
+        for (caller, token) in [
+            ("a chat with no session of its own", bare.as_str()),
+            ("a chat holding its own current session", stocked.as_str()),
+        ] {
+            requests.push((
+                format!("{label}, asked by {caller}"),
+                token,
+                session_id.clone(),
+                redirect_uri.clone(),
+            ));
+        }
+    }
+    requests.push((
+        "the only session this store holds, asked by the chat it does not belong to"
+            .to_string(),
+        bare.as_str(),
+        initiated.to_string(),
+        "https://example.com/other".to_string(),
+    ));
+
+    let mut answers: Vec<(String, u16, String, String)> = Vec::new();
+    for (label, token, session_id, redirect_uri) in &requests {
+        assert_eq!(
+            session_id.chars().count(),
+            36,
+            "case {label:?}: a SessionId is 36 characters, got {}",
+            session_id.chars().count()
+        );
+        assert!(
+            (1..=1024).contains(&redirect_uri.chars().count()),
+            "case {label:?}: a RedirectUri is 1..1024 characters, got {}",
+            redirect_uri.chars().count()
+        );
+        for (operation, (status, body)) in [
+            (
+                "GetAuthenticationUrl",
+                get_authentication_url(&harness, token, session_id, redirect_uri).await,
+            ),
+            (
+                "CancelParticipantAuthentication",
+                cancel_participant_authentication(&harness, token, session_id).await,
+            ),
+        ] {
+            let case = format!("{operation} with {label}");
+            assert_invalid_parameters(
+                &case,
+                status,
+                &body,
+                &[session_id.as_str(), redirect_uri.as_str()],
+            );
+            answers.push((case, status, error_type(&body), error_message(&body)));
+        }
+    }
+
+    // One answer for all of them: whichever request was submitted, and whatever the store
+    // held for its chat, the status, the code and the sentence are the same.
+    let (first_case, first_status, first_type, first_message) =
+        answers.first().expect("at least one refusal").clone();
+    for (case, status, code, message) in &answers {
+        assert_eq!(
+            (*status, code.as_str(), message.as_str()),
+            (first_status, first_type.as_str(), first_message.as_str()),
+            "case {case:?}: expected the answer {first_case:?} got \
+             ({first_status}, {first_type:?}, {first_message:?}), \
+             got ({status}, {code:?}, {message:?})"
+        );
+    }
+
+    // The refusals took nothing away: the session this store holds still reports its URL to
+    // the chat it belongs to, and is still open.
+    let (status, body) =
+        get_authentication_url(&harness, &stocked, initiated, "https://example.com/cb").await;
+    assert_eq!(status, 200, "case the session's own chat: got {body:?}");
+    assert!(
+        harness
+            .store()
+            .lock()
+            .authentication_sessions
+            .get(initiated)
+            .is_some_and(|session| !session.cancelled),
+        "case the session's own chat: the refusals must leave the stored session open"
+    );
+}
+
 /// Append an item of `item_type` to the transcript of the chat `participant_token` names,
 /// through the state calls the service's own appenders use, and answer its `Id`.
 fn append_stored_item(harness: &Harness, participant_token: &str, item_type: &str) -> String {
