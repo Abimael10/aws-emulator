@@ -27,10 +27,12 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_NOT_FOUND, PACKAGE_STATUS_COPYING,
+    PACKAGE_NOT_FOUND, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
 };
 
-use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    create_baseline, error_code, poll_until, Answer, Emulator, PREFIX,
+};
 use super::package_associations::{
     create_package, PACKAGE_CONTENT, PACKAGE_TYPES, SERVICE_PACKAGE_ID, UNKNOWN_PACKAGE_ID,
 };
@@ -228,12 +230,40 @@ async fn stored_ids(emulator: &Emulator, case: &str) -> Vec<String> {
         .collect()
 }
 
-/// A live AVAILABLE package and a second one created, deleted and waited out — so the
-/// id of the deleted one resolves to nothing while the account still holds a package.
+/// Whether every id named reports its content as IN PLACE, read through the listing a
+/// client reads: the condition the copy a create or an update started owes, which a
+/// case looks for again rather than waiting a stretch of time out.
+async fn all_available(emulator: &Emulator, ids: &[&str]) -> bool {
+    let answer = emulator
+        .call(
+            "POST",
+            &format!("{PREFIX}/packages/describe"),
+            Some(json!({ "MaxResults": 100 })),
+        )
+        .await;
+    let listed = answer.body["PackageDetailsList"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    ids.iter().all(|id| {
+        listed.iter().any(|details| {
+            details["PackageID"].as_str() == Some(id)
+                && details["PackageStatus"].as_str() == Some(PACKAGE_STATUS_AVAILABLE)
+        })
+    })
+}
+
+/// A live AVAILABLE package and a second one created, deleted and gone — so the id of
+/// the deleted one resolves to nothing while the account still holds a package.
 async fn with_a_live_and_a_deleted_package(emulator: &Emulator) -> (String, String) {
     let live = create_package(emulator, "unresolvable-live", PACKAGE_TYPES[0]).await;
     let gone = create_package(emulator, "unresolvable-gone", PACKAGE_TYPES[1]).await;
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The delete below removes a package whose content is in place, so the helper waits
+    // for the copies the creates started to have landed.
+    poll_until("the creates' copies landing", || async {
+        all_available(emulator, &[live.as_str(), gone.as_str()]).await
+    })
+    .await;
 
     let deleted = emulator
         .call("DELETE", &format!("{PREFIX}/packages/{gone}"), None)
@@ -243,7 +273,12 @@ async fn with_a_live_and_a_deleted_package(emulator: &Emulator) -> (String, Stri
         "case the delete that makes an id stop resolving: expected 200, got {} with {:?}",
         deleted.status, deleted.body
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The record's removal is owed by the clock: the helper waits for the account to
+    // hold only the live package.
+    poll_until("the delete's removal landing", || async {
+        stored_ids(emulator, "while the delete lands").await == vec![live.clone()]
+    })
+    .await;
 
     let stored = stored_ids(emulator, "after the delete").await;
     assert_eq!(
@@ -394,7 +429,12 @@ async fn a_package_the_account_holds_is_served_by_the_same_operations() {
         "case UpdatePackage(the live package): the new content is being copied, got {:?}",
         updated.body
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The copy the update started is owed its landing by the clock: the case waits for
+    // THAT condition, not for a stretch of time.
+    poll_until("the update's copy landing", || async {
+        all_available(&emulator, &[live.as_str()]).await
+    })
+    .await;
     let history = emulator
         .call("GET", &format!("{PREFIX}/packages/{live}/history"), None)
         .await;
@@ -411,7 +451,7 @@ async fn a_package_the_account_holds_is_served_by_the_same_operations() {
         .collect();
     assert_eq!(
         versions,
-        vec!["2".to_string(), "1".to_string()],
+        vec!["v2".to_string(), "v1".to_string()],
         "case GetPackageVersionHistory(after the update): expected the update to have recorded a \
          version, got {versions:?}"
     );

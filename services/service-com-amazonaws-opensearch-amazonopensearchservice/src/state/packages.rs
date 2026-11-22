@@ -38,6 +38,21 @@ pub const PACKAGE_TYPE_ZIP_PLUGIN: &str = "ZIP-PLUGIN";
 /// content adds the next number.
 pub const FIRST_PACKAGE_VERSION: u32 = 1;
 
+/// How a numbered version of a package's content is NAMED on the wire: the letter
+/// `v` before the number ([`FIRST_PACKAGE_VERSION`] onwards).
+///
+/// `PackageVersion` is an unconstrained string in the model, so the form belongs to
+/// the service: it labels each numbered version of a package's content `v1`, `v2`
+/// and so on — the same form the 2015-01-01 surface of this service renders through
+/// its own `package_version_label`, because the two surfaces describe one package
+/// plane. ONE function writes it, so `PackageDetails$AvailablePackageVersion`, a
+/// `PackageVersionHistory$PackageVersion` and a `DomainPackageDetails$PackageVersion`
+/// cannot name one version three different ways, and the only place a version is
+/// matched by name ([`Package::content_at`]) reads the same form.
+pub fn package_version_label(version: u32) -> String {
+    format!("v{version}")
+}
+
 /// How many packages this account holds before `CreatePackage` refuses with the
 /// modelled `LimitExceededException`.
 ///
@@ -120,7 +135,7 @@ impl PackageVersionRecord {
     /// package version reports it through the one projection.
     pub fn to_history(&self) -> PackageVersionHistory {
         PackageVersionHistory {
-            package_version: Some(self.version.to_string()),
+            package_version: Some(package_version_label(self.version)),
             commit_message: self.commit_message.clone(),
             created_at: Some(datetime(self.created_at)),
             // The plugin's name, class and uncompressed size are the ones recorded for
@@ -294,7 +309,7 @@ impl Package {
     pub fn content_at(&self, package_version: &str) -> Option<&str> {
         self.versions
             .iter()
-            .find(|version| version.version.to_string() == package_version)?
+            .find(|version| package_version_label(version.version) == package_version)?
             .content
             .as_deref()
     }
@@ -314,7 +329,7 @@ impl Package {
             // "The package version", meaning the version a domain association would
             // get: there is one only once the content is in place.
             available_package_version: (self.status == PACKAGE_STATUS_AVAILABLE)
-                .then(|| self.version.to_string()),
+                .then(|| package_version_label(self.version)),
             // "Additional information if the package is in an error state" — this
             // package is not, so there is nothing to report.
             error_details: None,

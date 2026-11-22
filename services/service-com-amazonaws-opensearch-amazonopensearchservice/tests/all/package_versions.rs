@@ -23,6 +23,9 @@
 //!   changes nothing, and a version already recorded is never rewritten;
 //! * the version the copy puts in place becomes the version the package reports as
 //!   available, once the copy span has passed and without any call asking for it;
+//! * every member that NAMES a version of a package's content names it the way the
+//!   service does — `v` before the number of that version — over the versions an
+//!   account's own package goes through and the ones the published catalog carries;
 //! * a package whose copy is still in flight takes no second update, so concurrent
 //!   updates of one package are serialised: exactly one of them records a version;
 //! * an id that names no package of the account is refused on both paths, over the
@@ -37,11 +40,13 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_NOT_FOUND, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
+    published_packages, PACKAGE_NOT_FOUND, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
     PACKAGE_TYPE_TXT_DICTIONARY, PACKAGE_VERSION_QUOTA,
 };
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    create_baseline, error_code, poll_until, Answer, Emulator, PREFIX, SETTLE_WAIT,
+};
 use super::package_associations::PACKAGE_CONTENT;
 
 /// The object every create and update of this suite IMPORTS is put at the Amazon S3
@@ -369,9 +374,9 @@ async fn an_update_records_the_next_version_and_the_history_reports_it() {
         );
 
         // The copy the update started is owed its outcome by the clock: no call asks
-        // for the move, and once the span has passed the version it copied is the one
-        // the package reports as available.
-        tokio::time::sleep(SETTLE_WAIT).await;
+        // for the move, and once it has fallen due the version it copied is the one
+        // the package reports as available. The case waits for that CONDITION.
+        available(&emulator, &package_id, &case).await;
         let settled = describe_one(&emulator, &package_id, &case).await;
         assert_eq!(
             settled["PackageStatus"].as_str(),
@@ -380,7 +385,7 @@ async fn an_update_records_the_next_version_and_the_history_reports_it() {
         );
         assert_eq!(
             settled["AvailablePackageVersion"].as_str(),
-            Some(version.to_string().as_str()),
+            Some(format!("v{version}").as_str()),
             "case {case}: the copy put version {version} in place, got {settled:?}"
         );
 
@@ -392,9 +397,10 @@ async fn an_update_records_the_next_version_and_the_history_reports_it() {
             "case {case}: the history holds every version recorded so far, got {reported:?}"
         );
 
-        // Newest version first, and every version numbered one past the one before it.
+        // Newest version first, every version numbered one past the one before it, and
+        // each named the way the service names a package version: `v` before the number.
         let expected_versions: Vec<String> =
-            (1..=version).rev().map(|number| number.to_string()).collect();
+            (1..=version).rev().map(|number| format!("v{number}")).collect();
         assert_eq!(
             reported_versions(&read, &case),
             expected_versions,
@@ -492,14 +498,15 @@ async fn a_copy_in_flight_serialises_updates_of_one_package() {
     );
     assert_eq!(
         reported_versions(&history(&emulator, &package_id, &[]).await, case),
-        vec!["2".to_string(), "1".to_string()],
+        vec!["v2".to_string(), "v1".to_string()],
         "case {case}: the refused update recorded no version"
     );
 
     // Once the copy has landed the package takes another update, so the refusal above
-    // is about the status and not about the package.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // is about the status and not about the package. The case waits for the copy's
+    // landing, which is the condition the clock owes.
     let case = "UpdatePackage(after the copy landed)";
+    available(&emulator, &package_id, case).await;
     details(
         &update(
             &emulator,
@@ -508,7 +515,7 @@ async fn a_copy_in_flight_serialises_updates_of_one_package() {
         .await,
         case,
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    available(&emulator, &package_id, case).await;
 
     // Four updates of one package made at once: whichever of them is served first
     // takes the next version number, and the rest find the copy it started in flight.
@@ -553,10 +560,10 @@ async fn a_copy_in_flight_serialises_updates_of_one_package() {
     assert_eq!(
         reported_versions(&history(&emulator, &package_id, &[]).await, case),
         vec![
-            "4".to_string(),
-            "3".to_string(),
-            "2".to_string(),
-            "1".to_string()
+            "v4".to_string(),
+            "v3".to_string(),
+            "v2".to_string(),
+            "v1".to_string()
         ],
         "case {case}: exactly one version was added by the four concurrent updates"
     );
@@ -630,7 +637,7 @@ async fn an_unknown_package_id_is_not_found_on_every_path_that_resolves_one() {
             &history(&emulator, &held, &[]).await,
             "GetPackageVersionHistory(held)"
         ),
-        vec!["1".to_string()],
+        vec!["v1".to_string()],
         "case GetPackageVersionHistory(held): the stored package's history stands"
     );
 }
@@ -643,7 +650,8 @@ async fn the_history_pages_the_whole_log_once() {
     let emulator = Emulator::new();
     let package_id = available_package(&emulator, "pkg-versions-paged").await;
 
-    // Three updates, each waited out, so the log holds four versions.
+    // Three updates, each waited out — for the CONDITION the copy owes, not for a
+    // stretch of time — so the log holds four versions.
     for version in 2..=4 {
         let case = format!("UpdatePackage(v{version})");
         details(
@@ -658,14 +666,14 @@ async fn the_history_pages_the_whole_log_once() {
             .await,
             &case,
         );
-        tokio::time::sleep(SETTLE_WAIT).await;
+        available(&emulator, &package_id, &case).await;
     }
 
     let whole_log: Vec<String> = vec![
-        "4".to_string(),
-        "3".to_string(),
-        "2".to_string(),
-        "1".to_string(),
+        "v4".to_string(),
+        "v3".to_string(),
+        "v2".to_string(),
+        "v1".to_string(),
     ];
 
     // Every page size from one result to past the whole log, plus the largest page
@@ -722,8 +730,9 @@ async fn the_history_pages_the_whole_log_once() {
     }
 
     // A token names the version the next page starts at: one that names no version of
-    // this package names no place in its history.
-    for token in ["5", "0", "not-a-version"] {
+    // this package names no place in its history, whether it is written in the label
+    // form the history reports or in no version form at all.
+    for token in ["v5", "v0", "5", "0", "not-a-version"] {
         let case = format!("GetPackageVersionHistory(nextToken={token})");
         let refused = history(&emulator, &package_id, &[("nextToken", token.to_string())]).await;
         assert_eq!(
@@ -802,5 +811,140 @@ async fn a_packages_version_history_is_bounded() {
         reported_history(&history(&emulator, &package_id, &[]).await, case).len(),
         PACKAGE_VERSION_QUOTA,
         "case {case}: the refused update left the log at the quota"
+    );
+}
+
+/// Look again until the package reports the content as in place, so a case waits for
+/// the CONDITION the copy span owes rather than for a stretch of time.
+async fn available(emulator: &Emulator, package_id: &str, case: &str) {
+    poll_until(case, || async {
+        describe_one(emulator, package_id, case).await["PackageStatus"].as_str()
+            == Some(PACKAGE_STATUS_AVAILABLE)
+    })
+    .await;
+}
+
+/// Every member that NAMES a version of a package's content names it the way the
+/// service does: the letter `v` before the number of that version.
+///
+/// The rows span the class the rule covers rather than one call: a package the account
+/// created, at the version its create imported and at every version an update adds;
+/// every member that reports a version — the listing's `AvailablePackageVersion`, each
+/// `PackageVersionHistory$PackageVersion`, the token that resumes a history and an
+/// association's `DomainPackageDetails$PackageVersion`; and the packages the SERVICE
+/// publishes, whose histories the catalog states, including ones with more than one
+/// version.
+#[tokio::test]
+async fn every_member_that_names_a_package_version_names_it_v_before_its_number() {
+    let emulator = Emulator::new();
+    let created = details(
+        &create(&emulator, create_body("pkg-version-labels")).await,
+        "CreatePackage(pkg-version-labels)",
+    );
+    let package_id = created["PackageID"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case CreatePackage: expected a PackageID, got {created:?}"))
+        .to_string();
+
+    // One row per number of versions the package has had: the create's own, then one
+    // more per update. Each row states the WHOLE history as it is reported, newest
+    // version first, so the label of every version is asserted on every row.
+    let rows: [(&str, &[&str]); 3] = [
+        ("the version the create imported", &["v1"]),
+        ("the version one update added", &["v2", "v1"]),
+        ("the version a second update added", &["v3", "v2", "v1"]),
+    ];
+    for (index, (case, labels)) in rows.iter().enumerate() {
+        if index > 0 {
+            let body = source_only_update(
+                &package_id,
+                "package-bucket",
+                &format!("labels/content-{index}.txt"),
+            );
+            details(&update(&emulator, body).await, case);
+        }
+        available(&emulator, &package_id, case).await;
+
+        let listed = describe_one(&emulator, &package_id, case).await;
+        assert_eq!(
+            listed["AvailablePackageVersion"].as_str(),
+            Some(labels[0]),
+            "case {case}: expected the available version named {:?}, got {listed:?}",
+            labels[0]
+        );
+        let read = history(&emulator, &package_id, &[]).await;
+        assert_eq!(
+            reported_versions(&read, case),
+            labels.to_vec(),
+            "case {case}: expected the history named {labels:?}, got {:?}",
+            read.body
+        );
+    }
+
+    // The token that resumes a history names the version the next page starts at, in
+    // the same form: the page after the newest of three versions starts at the second.
+    let case = "the token of a one-result page";
+    let paged = history(&emulator, &package_id, &[("maxResults", "1".to_string())]).await;
+    assert_eq!(
+        paged.body["NextToken"].as_str(),
+        Some("v2"),
+        "case {case}: expected the token to name the next version, got {:?}",
+        paged.body
+    );
+
+    // An association carries the version it put on the domain, named the same way.
+    let case = "the version an association put on the domain";
+    let domain = "pkg-version-labels";
+    create_baseline(&emulator, domain).await;
+    let associated = emulator
+        .call(
+            "POST",
+            &format!("{PREFIX}/packages/associate/{package_id}/{domain}"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        associated.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        associated.status, associated.body
+    );
+    assert_eq!(
+        associated.body["DomainPackageDetails"]["PackageVersion"].as_str(),
+        Some("v3"),
+        "case {case}: expected the version the package has available, got {:?}",
+        associated.body
+    );
+
+    // The packages the SERVICE publishes are named the same way, whatever number of
+    // versions the catalog carries for one: every entry of every published history,
+    // read by the id the catalog publishes it under.
+    let mut longest = 0;
+    for published in published_packages() {
+        let case = format!("the published package {}", published.package_id);
+        let expected: Vec<String> = (1..=published.versions.len())
+            .rev()
+            .map(|number| format!("v{number}"))
+            .collect();
+        longest = longest.max(published.versions.len());
+        let read = history(&emulator, &published.package_id, &[]).await;
+        assert_eq!(
+            reported_versions(&read, &case),
+            expected,
+            "case {case}: expected the published history named {expected:?}, got {:?}",
+            read.body
+        );
+        let listed = describe_one(&emulator, &published.package_id, &case).await;
+        assert_eq!(
+            listed["AvailablePackageVersion"].as_str(),
+            expected.first().map(String::as_str),
+            "case {case}: expected the available version of the published package named {:?}, \
+             got {listed:?}",
+            expected.first()
+        );
+    }
+    assert!(
+        longest > 1,
+        "case the published catalog: expected it to publish a package with more than one \
+         version, got a longest history of {longest}"
     );
 }

@@ -41,7 +41,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     DOMAIN_PACKAGE_STATUS_ACTIVE, DOMAIN_PACKAGE_STATUS_ASSOCIATING, PACKAGE_TYPE_TXT_DICTIONARY,
 };
 
-use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    create_baseline, error_code, poll_until, Answer, Emulator, PREFIX, SETTLE_WAIT,
+};
 use super::package_associations::{
     available_packages, create_package, member, stored_status, KEY_ACCESS_ROLE_ARN, PACKAGE_TYPES,
     UNKNOWN_PACKAGE_ID,
@@ -223,10 +225,11 @@ async fn the_named_package_is_associated_and_reported_from_the_stored_record() {
             "case {case}: a new association is being put in place, got {reported:?}"
         );
         // The packages were created once and never updated, so the version available
-        // to associate is the first one.
+        // to associate is the first one, under the label the service names a package's
+        // versions with.
         assert_eq!(
             member(&reported, "PackageVersion", case),
-            "1",
+            "v1",
             "case {case}: the association carries the package's available version, \
              got {reported:?}"
         );
@@ -515,7 +518,7 @@ async fn a_change_in_flight_on_the_domain_is_not_overtaken_and_a_settled_one_tak
     let reported = details(&first, "AssociatePackage(first)");
     assert_eq!(
         member(&reported, "PackageVersion", "AssociatePackage(first)"),
-        "1",
+        "v1",
         "case AssociatePackage(first): the first association takes version one, got {reported:?}"
     );
 
@@ -546,7 +549,12 @@ async fn a_change_in_flight_on_the_domain_is_not_overtaken_and_a_settled_one_tak
         );
     }
 
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The association is owed its landing by the clock: the case waits for THAT, not
+    // for a stretch of time.
+    poll_until("AssociatePackage(settled)", || async {
+        stored_status(&emulator, domain, &ids[0]).as_deref() == Some(DOMAIN_PACKAGE_STATUS_ACTIVE)
+    })
+    .await;
     assert_eq!(
         stored_status(&emulator, domain, &ids[0]).as_deref(),
         Some(DOMAIN_PACKAGE_STATUS_ACTIVE),
@@ -572,7 +580,7 @@ async fn a_change_in_flight_on_the_domain_is_not_overtaken_and_a_settled_one_tak
     let reported = details(&again, "AssociatePackage(again)");
     assert_eq!(
         member(&reported, "PackageVersion", "AssociatePackage(again)"),
-        "2",
+        "v2",
         "case AssociatePackage(again): a re-association takes the version available now, \
          got {reported:?}"
     );

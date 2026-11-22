@@ -352,7 +352,7 @@ async fn every_named_package_is_taken_off_the_domain_and_reported_from_the_store
             // it is removing rather than inventing one.
             assert_eq!(
                 member(details, "PackageVersion", &case),
-                "1",
+                "v1",
                 "case {case}: the record carries the version the association had, got {details:?}"
             );
             assert!(

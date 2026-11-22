@@ -1194,7 +1194,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             // The version this association puts on the domain is the one the package
             // has available now, so a package whose content was updated reaches the
             // domain through THIS call rather than on its own.
-            package_version: package.version.to_string(),
+            package_version: package_version_label(package.version),
             // The call's own list, which REPLACES whatever an earlier association of
             // the same package recorded: the prerequisites belong to the association
             // this call makes.

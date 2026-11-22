@@ -15,6 +15,9 @@
 //!   the commit message, creation instant and configuration stored WITH that version
 //!   and no plugin properties, over a table of creates spanning package types, the
 //!   configuration container present and absent, and both engine lines;
+//! * every version is NAMED the way the service names a package version — the letter
+//!   `v` before its number — in the history, in the token that resumes it and in the
+//!   version the package reports as available;
 //! * the history is a SEQUENCE: it is reported MOST RECENT VERSION FIRST and paged
 //!   through without repeating or skipping a version, whatever page size is asked for,
 //!   over a table crossing the page size with a history longer than it;
@@ -32,10 +35,11 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
     PackageConfiguration, PACKAGE_TYPE_VALUES, REQUIREMENT_LEVEL_VALUES,
 };
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PackageVersionRecord, FIRST_PACKAGE_VERSION, PACKAGE_NOT_FOUND, PACKAGE_TYPE_ZIP_PLUGIN,
+    PackageVersionRecord, FIRST_PACKAGE_VERSION, PACKAGE_NOT_FOUND, PACKAGE_STATUS_AVAILABLE,
+    PACKAGE_TYPE_ZIP_PLUGIN,
 };
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{error_code, poll_until, Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::package_associations::{PACKAGE_CONTENT, SERVICE_PACKAGE_ID, UNKNOWN_PACKAGE_ID};
 
 /// The largest page size `GetPackageVersionHistory` publishes: `MaxResults` is
@@ -140,6 +144,15 @@ fn reported_versions(answer: &Answer, case: &str) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// How the service NAMES the `number`-th version of a package's content on the wire:
+/// the letter `v` before the number, which is the form every `PackageVersion` member
+/// is reported in (`AvailablePackageVersion` 'v2' and a two-entry history 'v2', 'v1'
+/// in the recorded answers of this surface). Written out here, so the expected form is
+/// this suite's own statement rather than a value read back out of the crate.
+fn version_label(number: u32) -> String {
+    format!("v{number}")
 }
 
 /// One create to make, and the `PackageConfiguration` it carries.
@@ -375,7 +388,7 @@ async fn the_history_reports_the_version_of_the_content_the_create_imported() {
         let entry = &reported[0];
         assert_eq!(
             entry["PackageVersion"].as_str(),
-            Some(FIRST_PACKAGE_VERSION.to_string().as_str()),
+            Some(version_label(FIRST_PACKAGE_VERSION).as_str()),
             "case {case}: the first version of a package's content is numbered one, got {entry:?}"
         );
         assert!(
@@ -429,15 +442,26 @@ async fn the_history_a_package_carries_does_not_change_when_its_copy_lands() {
     let before = history(&emulator, &id, "").await;
     assert_eq!(
         reported_versions(&before, "the read before the copy landed"),
-        vec![FIRST_PACKAGE_VERSION.to_string()],
+        vec![version_label(FIRST_PACKAGE_VERSION)],
         "case the read before the copy landed: expected the version the create imported, got {:?}",
         before.body
     );
 
-    // Past the span the clock owes the copy: the package becomes available, which
-    // changes which version is available for an association and not which versions of
-    // the content it has had.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The copy is owed its landing by the clock, so the case waits for THAT condition
+    // rather than for a stretch of time: the package becomes available, which changes
+    // which version is available for an association and not which versions of the
+    // content it has had.
+    let case = "the copy landing";
+    poll_until(case, || async {
+        let listed = describe(
+            &emulator,
+            json!({ "Filters": [{ "Name": "PackageID", "Value": [id.clone()] }] }),
+        )
+        .await;
+        listed.body["PackageDetailsList"][0]["PackageStatus"].as_str()
+            == Some(PACKAGE_STATUS_AVAILABLE)
+    })
+    .await;
     let after = history(&emulator, &id, "").await;
     assert_eq!(
         after.body, before.body,
@@ -471,7 +495,7 @@ async fn the_history_reports_every_stored_version_newest_first() {
         let case = format!("{case} (version {number})");
         assert_eq!(
             entry["PackageVersion"].as_str(),
-            Some(number.to_string().as_str()),
+            Some(version_label(number).as_str()),
             "case {case}: expected the history most recent version first, got {reported:?}"
         );
         let Some(seeded) = versions.get((number as usize).wrapping_sub(2)) else {
@@ -510,7 +534,9 @@ async fn paging_the_history_reports_every_version_exactly_once() {
     // recent first.
     let whole: Vec<String> = (0..=versions.len())
         .rev()
-        .map(|index| (FIRST_PACKAGE_VERSION as usize + index).to_string())
+        .map(|index| {
+            version_label(FIRST_PACKAGE_VERSION + u32::try_from(index).unwrap_or_default())
+        })
         .collect();
 
     // One row per page size: no page size at all, the smallest, sizes that divide the
@@ -644,8 +670,10 @@ async fn a_request_that_cannot_be_served_reports_no_history() {
 
     // A token is only ever a value this operation handed out, so one that names no
     // version of this package is a malformed request rather than an empty page: a
-    // version past the newest, one below the first, and values of no version form.
-    for token in ["2", "0", "-1", "99", "not-a-version", "pkg-1"] {
+    // version past the newest and one below the first, in the label form the history
+    // reports, the bare numbers that are no version label at all, and values of no
+    // version form.
+    for token in ["v2", "v0", "2", "0", "-1", "99", "not-a-version", "pkg-1"] {
         let case = format!("GetPackageVersionHistory(nextToken={token:?})");
         let answer = history(&emulator, &id, &format!("nextToken={token}")).await;
         assert_eq!(
@@ -668,7 +696,7 @@ async fn a_request_that_cannot_be_served_reports_no_history() {
         let answer = history(&emulator, &id, &format!("maxResults={value}")).await;
         assert_eq!(
             reported_versions(&answer, &case),
-            vec![FIRST_PACKAGE_VERSION.to_string()],
+            vec![version_label(FIRST_PACKAGE_VERSION)],
             "case {case}: the published bound is accepted and reports the history, got {:?}",
             answer.body
         );

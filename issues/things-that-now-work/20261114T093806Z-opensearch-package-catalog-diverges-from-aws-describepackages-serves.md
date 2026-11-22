@@ -55,3 +55,38 @@ Related but NOT covering these: the open issue 20261029T190009Z-es-package-vpc-e
 2. Replay fixture opensearch-catalog-get-package-version-history, step task#1: GET /2021-01-01/packages/{PackageID}/history for a PackageID listed by the AWS package catalog. Emulator answers 400 with no body members; AWS answers 200 with PackageID and PackageVersionHistoryList.
 3. Replay fixture opensearch-catalog-describe-packages, step task#1: POST /2021-01-01/packages/describe with no filters. Compare PackageDetailsList against the recording — the emulator returns ~92 legacy Elasticsearch analysis plugins instead of the AWS-managed catalog, and omits PackageOwner / AvailablePackageConfiguration / ErrorDetails.
 4. Both steps are reported by replay_wire_corpus as mismatches with stub_path="" and owned_by=[].
+
+## Resolution
+
+Fixed: the FORM every member that names a version of a package's content is reported in.
+The package plane rendered a version as a bare ordinal ("1", "2"); the service names the
+n-th version of a package's content `v` before its number, which is the form this
+report's own evidence carries (`AvailablePackageVersion 'v2'`, a history of 'v2' then
+'v1') and the form the 2015-01-01 surface of this service already renders.
+`state::package_version_label` is now the one writer of it, read by
+`PackageDetails$AvailablePackageVersion`, `PackageVersionHistory$PackageVersion`,
+`DomainPackageDetails$PackageVersion`, the token that resumes a history and the lookup
+that resolves a version's content. Held by
+`tests/all/package_versions.rs::every_member_that_names_a_package_version_names_it_v_before_its_number`.
+
+Already correct, so unchanged: `DescribePackages` answers from the catalog state through
+one `PackageDetails` projection that emits `PackageOwner`,
+`AvailablePackageConfiguration`, `AvailablePluginProperties`, `EngineVersion`,
+`CreatedAt`, `LastUpdatedAt` and `ErrorDetails` (null for a package that is not in an
+error state, as the model documents), and `GetPackageVersionHistory` answers 200 with the
+id echoed and the whole newest-first history for every package visible to the account —
+the ones it created and every one the catalog publishes
+(`tests/all/published_package_catalog.rs`).
+
+Divergent by design, and not a defect of the emulator: WHICH packages the published
+catalog holds. The ids AWS mints for its own catalog packages are server-generated
+values; this emulator's are its own, conforming to `PackageID`'s pattern, unique and
+stable across reads, Regions and processes because they are derived from what the package
+is (`state::published_package_id`). So the recorded step's `pkg-<hex>` id names no
+package here and is refused, and the recorded 93-row listing is not reproduced: serving
+either would mean writing one recording's id and rows into the catalog rather than
+implementing a rule. The refusal of an unresolvable `PackageID` stays on the 400 channel,
+which is where this corpus records AWS refusing one
+(opensearch-associate-packages-missing-package-error#task#2 diverges in its message
+alone); that message's wording is owned by
+20261029T190009Z-es-package-vpc-endpoint-tagging-and-reserved-instance.md.

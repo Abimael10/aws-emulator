@@ -89,7 +89,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_next_token, max_results_out_of_range, package_not_found};
+use crate::state::{
+    invalid_next_token, max_results_out_of_range, package_not_found, package_version_label,
+};
 
 /// The largest page size this operation publishes, as the modelled member's own type:
 /// `MaxResults` is `@range(max: 100)`, so 100 results is the most any request can ask
@@ -239,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             None => 0,
             Some(token) => history()
-                .position(|version| version.version.to_string() == token)
+                .position(|version| package_version_label(version.version) == token)
                 .ok_or_else(|| {
                     GetPackageVersionHistoryErrorModeled::ValidationException(invalid_next_token())
                 })?,
@@ -272,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ended it.
             next_token: history()
                 .nth(start.saturating_add(page_size))
-                .map(|version| version.version.to_string()),
+                .map(|version| package_version_label(version.version)),
         })
     }
 }

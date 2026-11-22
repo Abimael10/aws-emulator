@@ -701,7 +701,11 @@ async fn a_published_package_can_be_put_on_a_domain_and_read_back() {
     );
     assert_eq!(
         on_domain[0]["PackageVersion"].as_str(),
-        package.versions.last().map(|latest| latest.version.to_string()).as_deref(),
+        package
+            .versions
+            .last()
+            .map(|latest| format!("v{}", latest.version))
+            .as_deref(),
         "case ListPackagesForDomain({case}): expected the version the package has available, got \
          {:?}",
         on_domain[0]

@@ -499,7 +499,7 @@ async fn a_package_becomes_available_once_the_copy_span_has_passed() {
         );
         assert_eq!(
             package["AvailablePackageVersion"].as_str(),
-            Some("1"),
+            Some("v1"),
             "case {case}: an available package carries its first version, got {package:?}"
         );
         let created = created_at
