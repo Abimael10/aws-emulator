@@ -199,6 +199,12 @@ rcgen = "0.13"
 # single non-greedy `{apiId}` path segment the way an AWS SDK does, rather than escaping it
 # by hand.
 percent-encoding = "2.3"
+# The service that OWNS the table an `AMAZON_DYNAMODB` data source resolves against, mounted
+# beside this one in the real-time suite that drives the whole recorded topology — a signed
+# subscriber, a mutation that WRITES through such a resolver, and the query that reads it back
+# — so what a field reports is what that service holds. (The IAM service the data source's
+# service role is created with is already this crate's own dependency.)
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # The owners of what an `AMAZON_EVENTBRIDGE` data source publishes onto, mounted beside this
 # service in the EventBridge data-source suite: EventBridge holds the bus and the rules that
 # route each event, and Amazon SQS the queue a rule targets — which is where a case reads a

@@ -304,21 +304,16 @@ fn is_preflight(method: &::http::Method, headers: &::http::HeaderMap) -> bool {
     method == ::http::Method::OPTIONS && headers.contains_key(REQUEST_METHOD_FIELD)
 }
 
-/// Whether `origin` is a page served from THIS MACHINE: an origin whose host is a loopback
-/// one, by the core's own reading of that question (`emulator_server::is_loopback_host`, which
-/// is also what the `Host` allowlist is decided by).
+/// Whether `origin` is a page served from THIS MACHINE: the plane's ONE reading of that
+/// question ([`event_api::served_from_this_machine`]), so this endpoint and the real-time
+/// one cannot differ about which origin names another site.
 ///
 /// Such a page is the browser-based client of the emulator — a development server on a
 /// loopback port, the console opened against it — and is who this endpoint's CORS answer is
 /// for. A page of any OTHER site is not, and is refused before anything of the API is reached
 /// ([`refused_before_dispatch`]).
 fn served_from_this_machine(origin: &str) -> bool {
-    let authority = origin
-        .split_once("://")
-        .map_or(origin, |(_scheme, authority)| authority);
-    ::emulator_server::is_loopback_host(
-        ::service_common::data_plane_addressing::host_only(authority),
-    )
+    event_api::served_from_this_machine(origin)
 }
 
 /// Answer one request to the GraphQL endpoint.

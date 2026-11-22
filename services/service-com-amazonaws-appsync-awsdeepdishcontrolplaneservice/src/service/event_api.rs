@@ -351,14 +351,23 @@ pub fn host_allowed(host: &str) -> bool {
 /// Why a request a BROWSER made from ANOTHER SITE is refused, or `None` for every other
 /// client.
 ///
-/// The browser-set fields are read by the CORE'S OWN reading of them
+/// An `Origin` naming an address of THIS MACHINE ([`served_from_this_machine`]) names no
+/// other site: these sockets are bound on this machine, so that origin is the one the
+/// endpoint itself is addressed by, and both the client that states it about the address it
+/// dialled and the page served from this machine are served — which is what an AppSync API's
+/// data plane exists to be called from, and what its HTTPS endpoint already serves
+/// (`super::graphql_api::query`'s reading of the same question).
+///
+/// Every other origin is read by the CORE'S OWN reading of the browser-set fields
 /// (`emulator_server::classify_browser_request`, which the core applies to every request on
 /// one of its HTTP listeners) rather than by a second rule written here: a request carrying
 /// no `Origin` and no `Sec-Fetch-Site` is not a browser's and is served, a same-origin one
-/// is served, and a cross-site one is refused. The policy is the default one — same-origin
-/// only, and no remote origin reaches a data plane — because nothing here is an operator
-/// knob.
+/// is served, and a cross-site one is refused. The policy is the default one — no origin of
+/// another site reaches a data plane — because nothing here is an operator knob.
 pub fn cross_site_browser(origin: Option<&str>, sec_fetch_site: Option<&str>) -> Option<String> {
+    if origin.is_some_and(served_from_this_machine) {
+        return None;
+    }
     match ::emulator_server::classify_browser_request(
         origin,
         sec_fetch_site,
@@ -368,6 +377,24 @@ pub fn cross_site_browser(origin: Option<&str>, sec_fetch_site: Option<&str>) ->
         ::emulator_server::BrowserVerdict::Allow => None,
         ::emulator_server::BrowserVerdict::Forbid(reason) => Some(reason.to_string()),
     }
+}
+
+/// Whether `origin` names an address of THIS MACHINE: an origin whose host is a loopback
+/// one, by the core's own reading of that question (`emulator_server::is_loopback_host`,
+/// which is also what the `Host` allowlist is decided by ([`host_allowed`])).
+///
+/// It is the origin an endpoint of this plane is ADDRESSED by — every such socket is bound
+/// on this machine — so it is what a client states about the very address it dialled, and
+/// what a browser sets for a page served from this machine: the development server on a
+/// loopback port, the console opened against it. An origin of any OTHER site is not, and is
+/// refused before anything of the API is reached ([`cross_site_browser`]).
+pub fn served_from_this_machine(origin: &str) -> bool {
+    let authority = origin
+        .split_once("://")
+        .map_or(origin, |(_scheme, authority)| authority);
+    ::emulator_server::is_loopback_host(::service_common::data_plane_addressing::host_only(
+        authority,
+    ))
 }
 
 /// Whether the material presented authorizes `call` on `api_id`, by the ONE rule this plane
