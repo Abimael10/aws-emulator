@@ -13,12 +13,12 @@
 //! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries is the recorded
 //! contract of the ROUTE that looked it up:
 //!
-//! * a call ADDRESSED by a CONFIGURATION resource's own ARN to READ it — either configuration
-//!   family's read, and the infrastructure configuration's delete — reports the ARN the
-//!   request carried, quoted: "The resource ARN '<arn>' was not found.", which names no kind.
+//! * a call ADDRESSED by the INFRASTRUCTURE configuration's own ARN — its read and its delete
+//!   — reports the ARN the request carried, quoted: "The resource ARN '<arn>' was not found.",
+//!   which names no kind.
 //! * everywhere else — the components, recipes, pipelines, images, workflows, and a
-//!   distribution configuration a delete, an update, a policy write, a tagging write or a
-//!   reference names — the required resource it is: "The following required resource
+//!   distribution configuration a read, a delete, an update, a policy write, a tagging write
+//!   or a reference names — the required resource it is: "The following required resource
 //!   '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN identifies.
 //!
 //! The TAG LISTING is the one lookup answered by another layer and so by another class: it
@@ -168,8 +168,8 @@ fn assert_reported_missing(
 }
 
 /// Assert `status` and the answer are the not-found report the rule requires for a call
-/// ADDRESSED by a CONFIGURATION resource's own ARN: HTTP 404, the same modelled error type,
-/// and the message that quotes `arn` and names no kind.
+/// ADDRESSED by the INFRASTRUCTURE configuration's own ARN: HTTP 404, the same modelled error
+/// type, and the message that quotes `arn` and names no kind.
 fn assert_arn_not_found(case: &str, status: u16, body: &Value, arn: &str) {
     assert_not_found_shape(case, status, body);
     let expected = format!("The resource ARN '{arn}' was not found.");
@@ -360,9 +360,9 @@ fn distribution_arn(region: &str, normalized: &str) -> String {
 /// Which not-found class a lookup's answer carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MissingReport {
-    /// This service's own modelled not-found error for a call ADDRESSED by a configuration
-    /// resource's own ARN — either family's read, and the infrastructure configuration's
-    /// delete — quoting the ARN the request carried and naming no kind.
+    /// This service's own modelled not-found error for a call ADDRESSED by the INFRASTRUCTURE
+    /// configuration's own ARN — its read and its delete — quoting the ARN the request carried
+    /// and naming no kind.
     ConfigurationArn,
     /// This service's own modelled not-found error everywhere else, naming the kind and the
     /// ARN.
@@ -504,15 +504,15 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             );
         }
         "DistributionConfiguration" => {
-            // A READ addressed by this configuration's own ARN quotes that ARN and names no
-            // kind, as the sibling configuration family's read does; the delete and the update
-            // name the kind its ARN identifies.
+            // Every lookup of this family names the kind its ARN identifies — the read as much
+            // as the delete and the update — where the sibling configuration family's read
+            // quotes its ARN alone.
             push(
                 "GetDistributionConfiguration",
                 "GET",
                 format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
                 None,
-                MissingReport::ConfigurationArn,
+                MissingReport::RequiredResource,
             );
             push(
                 "DeleteDistributionConfiguration",

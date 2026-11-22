@@ -108,10 +108,9 @@ const INVALID_HOST_ID_MALFORMED_IN_PREVIEW: &str = "InvalidHostId.Malformed";
 /// printed form that this account was never handed are both request defects, and that is all
 /// this refusal says.
 ///
-/// The preview prices a reservation for the whole `HostIdSet`, so the sentence names that SET,
-/// through the crate's one sentence for a set of ids it could not resolve
-/// ([`unresolvable_host_ids_message`]) — which `crate::ops::purchase_host_reservation` answers
-/// for the same member.
+/// The sentence names that SET, through the crate's one sentence for a set of ids it could not
+/// resolve ([`unresolvable_host_ids_message`]) — which
+/// `crate::ops::purchase_host_reservation` answers for the same member.
 fn host_ids_malformed(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
     Scaffolded::service_error(
         INVALID_HOST_ID_MALFORMED_IN_PREVIEW,

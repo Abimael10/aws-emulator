@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH CHECK refused a Dedicated Host id, over the two operations that price a reservation
-//! for a `HostIdSet` — `GetHostReservationPurchasePreview` and `PurchaseHostReservation`.
+//! How the two operations that price a reservation for a `HostIdSet` refuse a Dedicated Host
+//! id they cannot resolve — `GetHostReservationPurchasePreview` and `PurchaseHostReservation`.
 //!
 //! The rule under test, for the PREVIEW: a host id this account was never issued — a value
 //! outside the id form EC2 publishes, and a value in that form the account was never handed —
@@ -12,8 +12,9 @@
 //! account was EVER ISSUED the id and never by the request's spelling alone.
 //!
 //! The purchase beside it is recorded splitting the same two classes at a different place and
-//! spelling both codes differently, so every expectation here is per operation
-//! ([`expected_code`]) and neither operation is the specification for the other.
+//! spelling both codes differently — its validation refuses only a value outside the PRINTED
+//! id form, and every value inside that form reaches its lookup — so every expectation here is
+//! per operation ([`expected_code`]) and neither operation is the specification for the other.
 //!
 //! Driven over the wire the service speaks (`ec2Query`, through the crate's shared
 //! [`super::ec2_query`] harness), so what is asserted is what a client reads.
@@ -21,8 +22,8 @@
 //! The rows span what the rule generalises over — the id's LENGTH (both published digit
 //! counts, one digit short of each, one digit long), its alphabet (uppercase hex, non-hex),
 //! its prefix (another resource's, none at all), the all-zero placeholder no host can hold,
-//! how many ids the set carries, and, for the ids EC2 could have issued, HOW the host came to
-//! be absent (never allocated, or allocated by this run and released) — so no row is the
+//! how many ids the set carries, and, for the ids in a published form, HOW the host came to be
+//! absent (never issued, or allocated by this run and released) — so no row is the
 //! specification.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -47,10 +48,13 @@ const ONE_YEAR_SECONDS: i32 = 365 * 24 * 60 * 60;
 /// How an id the request named fails to name a live Dedicated Host of this account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Unresolvable {
-    /// Outside the id form EC2 issues: no account could ever have been handed it.
+    /// Outside the PRINTED id form: `h-` and either published digit count in lowercase
+    /// hexadecimal is what a Dedicated Host id reads as, and no account could ever have been
+    /// handed anything else.
     OutsideForm,
     /// In one of the printed id forms, but a value this account was NEVER ISSUED — no host of
-    /// it has ever carried the id.
+    /// it has ever carried the id. The all-zero placeholder belongs here: the mint counting
+    /// from one can never produce it, and it is still in the printed form.
     NeverIssued,
     /// An id this account really held and has given back, so the host it names is gone.
     Released,
@@ -62,8 +66,8 @@ pub(super) enum Unresolvable {
 /// The preview answers its own `InvalidHostId.Malformed` for every id the account was never
 /// issued, whatever its spelling, and the code EC2 publishes for an absent host
 /// ([`ec2::state::INVALID_HOST_ID_NOT_FOUND`]) for a host the account released; the purchase is
-/// recorded answering `InvalidHostID.Malformed` for a value outside the id form and
-/// `InvalidHostId.NotFound` for an id EC2 could have issued.
+/// recorded answering `InvalidHostID.Malformed` for a value outside the printed id form and
+/// `InvalidHostId.NotFound` for every value inside it.
 fn expected_code(action: &str, kind: Unresolvable) -> &'static str {
     const PREVIEW: &str = "GetHostReservationPurchasePreview";
     match (action, kind) {
@@ -177,6 +181,19 @@ fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>
             vec![held, "h-0fedcba987654321f"],
             Unresolvable::NeverIssued,
         ),
+        // The all-zero placeholder: the mint counting from one can never produce it, so this
+        // account was never issued it — and it is in the printed form, which is what decides
+        // the purchase's half.
+        (
+            "the all-zero placeholder",
+            vec!["h-00000000000000000"],
+            Unresolvable::NeverIssued,
+        ),
+        (
+            "the all-zero placeholder, short form",
+            vec!["h-00000000"],
+            Unresolvable::NeverIssued,
+        ),
         // Ids this account really held and gave back: the host is gone rather than the id
         // being one of someone else's.
         (
@@ -189,9 +206,9 @@ fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>
             vec![held, released],
             Unresolvable::Released,
         ),
-        // Outside the form: no digit count EC2 publishes, an alphabet it does not issue, no
-        // host prefix at all, or the all-zero placeholder the mint counting from one can never
-        // produce — none of these could name a host in any account.
+        // Outside the printed form: no digit count EC2 publishes, an alphabet it does not
+        // issue, another resource's prefix, or no host prefix at all — none of these could
+        // name a host in any account.
         (
             "a digit short of the short form",
             vec!["h-1234567"],
@@ -230,16 +247,6 @@ fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>
         (
             "no prefix at all",
             vec!["0123456789abcdef0"],
-            Unresolvable::OutsideForm,
-        ),
-        (
-            "the all-zero placeholder",
-            vec!["h-00000000000000000"],
-            Unresolvable::OutsideForm,
-        ),
-        (
-            "the all-zero placeholder, short form",
-            vec!["h-00000000"],
             Unresolvable::OutsideForm,
         ),
         (
@@ -313,6 +320,45 @@ async fn the_preview_names_the_requested_host_id_set() {
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
         let expected = not_valid_sentence(&host_ids);
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?} in {body}",
+            error_message(&body)
+        );
+    }
+}
+
+/// The purchase's refusal names the id its VALIDATION could not accept, and the whole SET once
+/// the lookup is what refused it — the two sentences its recorded refusals carry.
+#[tokio::test]
+async fn the_purchase_names_the_id_or_the_set_its_refusal_is_about() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let held = allocate(&router, 1).await.remove(0);
+    let released = allocate(&router, 1).await.remove(0);
+    release(&router, &released).await;
+    let offering_id = published_offering(&router).await;
+
+    for (case, host_ids, kind) in rows(&held, &released) {
+        let (status, body) =
+            priced(&router, "PurchaseHostReservation", &host_ids, &offering_id).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let expected = match kind {
+            Unresolvable::OutsideForm => {
+                // The id the purchase's validation refuses is the first one outside the
+                // PRINTED form, by the crate's own reading of that form.
+                let refused = host_ids
+                    .iter()
+                    .find(|host_id| !ec2::state::prefixed_id_is_well_formed("h", host_id))
+                    .copied()
+                    .unwrap_or_else(|| panic!("case {case:?}: a row outside the form names one"));
+                format!("The dedicated-host ID '{refused}' is malformed")
+            }
+            _ => not_valid_sentence(&host_ids),
+        };
         assert_eq!(
             error_message(&body),
             expected,

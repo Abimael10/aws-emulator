@@ -1119,11 +1119,9 @@ pub fn federation_source_not_registered(source: &str) -> String {
 /// `CreateCatalog` for a `Name` the account already holds a catalog under.
 ///
 /// RECORDED constant, and the whole message: the sentence is fixed text that names the
-/// resource kind and withholds the requested name, and it carries NO trailing full stop —
-/// unlike the database duplicate ([`DATABASE_ALREADY_EXISTS`]), whose own recorded wording
-/// ends in one. One character of fixed text is still fixed text, so the two are two
-/// strings rather than one.
-pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+/// resource kind, withholds the requested name, and ends in a full stop like the database
+/// duplicate's own wording ([`DATABASE_ALREADY_EXISTS`]).
+pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// `CreateCatalog` whose `Name` is the account's own id. Stated by the model: the
 /// catalog's name "Cannot be the same as the account ID" (`Catalog$Name`), because

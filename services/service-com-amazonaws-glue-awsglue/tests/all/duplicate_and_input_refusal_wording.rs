@@ -36,12 +36,12 @@ const ALREADY_EXISTS: &str = "AlreadyExistsException";
 const INVALID_INPUT: &str = "InvalidInputException";
 
 // ---------------------------------------------------------------------------
-// CreateCatalog: one fixed sentence, with NO trailing full stop
+// CreateCatalog: one fixed sentence
 // ---------------------------------------------------------------------------
 
 /// The whole `Message` a second `CreateCatalog` for a name the account already holds is
 /// refused with.
-const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// A `CreateCatalog` body for `name`, naming a source outside the Glue Data Catalog —
 /// the only catalog this operation registers — and carrying `description` so one create's
@@ -76,10 +76,9 @@ fn catalog_names() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A repeat `CreateCatalog` is refused with ONE fixed sentence — no name, and no trailing
-/// full stop — whatever the name is spelled like and whether the second create carries the
-/// first definition or another one, and the catalog already stored is left exactly as the
-/// first create wrote it.
+/// A repeat `CreateCatalog` is refused with ONE fixed sentence — no name in it — whatever the
+/// name is spelled like and whether the second create carries the first definition or another
+/// one, and the catalog already stored is left exactly as the first create wrote it.
 #[tokio::test]
 async fn a_duplicate_catalog_name_answers_one_fixed_sentence() {
     let router = emulator();
@@ -110,10 +109,6 @@ async fn a_duplicate_catalog_name_answers_one_fixed_sentence() {
             .await;
             let message = error_message(&answered);
             assert_withholds(&case, &message, &name);
-            assert!(
-                !message.ends_with('.'),
-                "case {case}: the sentence carries no trailing full stop, got {message:?}"
-            );
         }
 
         // The refused creates left the stored catalog as the first create wrote it.

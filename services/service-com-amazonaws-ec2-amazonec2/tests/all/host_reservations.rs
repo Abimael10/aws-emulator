@@ -794,6 +794,13 @@ async fn a_purchase_that_cannot_be_made_is_refused() {
             "InvalidHostID.Malformed",
         ),
         (
+            "the all-zero placeholder, which is in the printed id form",
+            vec!["h-00000000000000000"],
+            offering_id.as_str(),
+            Vec::new(),
+            "InvalidHostId.NotFound",
+        ),
+        (
             "an offering of another instance family",
             vec![hosts[0].as_str()],
             other_family.as_str(),

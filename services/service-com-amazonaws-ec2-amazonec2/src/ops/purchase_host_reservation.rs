@@ -250,16 +250,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The IDs of the Dedicated Hosts with which the reservation will be associated"
-        // (`HostIdSet`): the reservation covers THOSE hosts, so an id this account holds no
-        // host for has nothing to reserve — refused before the offering is read, because a
-        // purchase for a host that is not there cannot be priced either. A malformed id is
-        // answered as malformed first, the order this service keeps for every id. The refusal
-        // names the whole SET the request asked for, the way this operation's recorded answer
-        // does: the purchase is for the set, so it is the set that is not valid.
+        // (`HostIdSet`): the reservation covers THOSE hosts, so an id this operation cannot
+        // resolve to an active Dedicated Host of the account has nothing to reserve —
+        // refused before the offering is read, because a purchase for a host that is not
+        // there cannot be priced either. WHICH refusal it is is decided by the id's FORM: a
+        // value EC2 could never have issued is answered the malformed code naming that id
+        // ([`host_id_malformed`]), while every id EC2 could have issued — including the
+        // all-zero placeholder, which is in the printed form — reaches the lookup and is
+        // answered the not-found code naming the whole SET ([`host_ids_not_valid`]).
         if let Some(host_id) = input
             .host_id_set
             .iter()
-            .find(|host_id| !state::host_id_is_well_formed(host_id))
+            .find(|host_id| !host_id_is_in_the_printed_form(host_id))
         {
             return Err(host_id_malformed(host_id));
         }
@@ -486,8 +488,21 @@ fn purchased(
     })
 }
 
-/// `InvalidHostID.Malformed` (HTTP 400): the request named something that is not a Dedicated
-/// Host id at all, so there is nothing to look up.
+/// Whether `host_id` is in the PRINTED form of a Dedicated Host id, which is the form check
+/// this operation makes: `h-` and either published digit count in lowercase hexadecimal
+/// ([`crate::state::prefixed_id_is_well_formed`]).
+///
+/// A reading of its own beside [`crate::state::host_id_is_well_formed`], which additionally
+/// refuses the all-zero placeholder no host can hold: this operation's recorded refusals put
+/// the all-zero id on the NOT-FOUND side — a value in the printed form is an id EC2 could have
+/// issued as far as this purchase is concerned, so it is looked up, and it is the LOOKUP that
+/// answers for it. Only a value outside the printed form is refused for its shape.
+fn host_id_is_in_the_printed_form(host_id: &str) -> bool {
+    crate::state::prefixed_id_is_well_formed("h", host_id)
+}
+
+/// `InvalidHostID.Malformed` (HTTP 400): the request named something outside the printed form
+/// of a Dedicated Host id, so there is nothing to look up.
 ///
 /// The sentence names the resource the way EC2's own `ResourceType` member for it spells it
 /// (`dedicated-host`) and the id the REQUEST sent — the wording this operation is recorded
@@ -504,27 +519,30 @@ fn host_id_malformed(host_id: &str) -> PurchaseHostReservationError {
     )
 }
 
-/// `InvalidHostId.NotFound` (HTTP 400): the request named host ids this account holds no
-/// Dedicated Hosts for.
+/// `InvalidHostId.NotFound` (HTTP 400): every id the request named is in the printed form of a
+/// Dedicated Host id, and at least one of them names no active Dedicated Host of this account
+/// — one it never held, or one it has given back, whose id "can no longer be specified in
+/// another request" (`ReleaseHosts`).
 ///
-/// A SECOND spelling of that code beside [`crate::state::invalid_host_id_not_found`]'s
-/// `InvalidHostID.NotFound`, and a named function here rather than a literal at the call
-/// site, because which of the two an operation answers is a fact of that operation: the
-/// Dedicated Host operations themselves answer `InvalidHostID.NotFound` for the ONE host they
-/// act on, while the reservation purchase — which buys a reservation for the whole `HostIdSet`
-/// — is recorded answering this one and naming that SET, as a Python-style list of the ids the
-/// REQUEST carried.
+/// The EXISTENCE half, reached once the form check above has passed. A SECOND spelling of the
+/// code beside [`crate::state::invalid_host_id_not_found`]'s `InvalidHostID.NotFound`, because
+/// which spelling an operation answers is a fact of that operation: the Dedicated Host
+/// operations themselves answer the crate constant for the ONE host they act on, while the
+/// reservation purchase — which buys a reservation for the whole `HostIdSet` — is recorded
+/// answering this one and naming that SET.
+///
+/// The sentence names the ids the REQUEST carried, as a bracketed list, through the crate's
+/// one sentence for a set of Dedicated Host ids it could not resolve
+/// ([`crate::state::unresolvable_host_ids_message`]) — the same one the purchase PREVIEW
+/// answers for the same member.
 fn host_ids_not_valid(host_id_set: &[String]) -> PurchaseHostReservationError {
-    let named: Vec<String> = host_id_set
-        .iter()
-        .map(|host_id| format!("'{host_id}'"))
-        .collect();
     crate::scaffolded::Scaffolded::service_error(
-        "InvalidHostId.NotFound",
+        INVALID_HOST_ID_NOT_FOUND_IN_PURCHASE,
         400,
-        format!(
-            "The specified Dedicated host IDs [{ids}] are not valid.",
-            ids = named.join(", "),
-        ),
+        crate::state::unresolvable_host_ids_message(host_id_set.iter().map(String::as_str)),
     )
 }
+
+/// The code THIS operation is recorded answering a `HostIdSet` it cannot resolve:
+/// `InvalidHostId.NotFound`.
+const INVALID_HOST_ID_NOT_FOUND_IN_PURCHASE: &str = "InvalidHostId.NotFound";

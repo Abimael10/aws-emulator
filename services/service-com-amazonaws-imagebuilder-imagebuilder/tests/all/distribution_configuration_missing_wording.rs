@@ -8,12 +8,12 @@
 //! a signed AWS SDK request observes.
 //!
 //! The rule under test: which not-found sentence a refusal carries is the recorded contract
-//! of the ROUTE that looked the ARN up. A READ addressed by a configuration resource's own
-//! ARN reports that ARN by itself — "The resource ARN '<arn>' was not found." — for the
-//! distribution configuration as for the infrastructure configuration, while a call that has
-//! to RESOLVE a reference to the configuration — a delete, an update, a tagging write —
-//! reports it as the required resource it is, naming the kind its ARN identifies: "The
-//! following required resource 'DistributionConfiguration' cannot be found: '<arn>'."
+//! of the ROUTE that looked the ARN up. EVERY lookup of a DISTRIBUTION configuration — its
+//! read, its delete, its update and a tagging write on it — reports a missing one as the
+//! required resource it is, naming the kind its ARN identifies: "The following required
+//! resource 'DistributionConfiguration' cannot be found: '<arn>'." The ARN-only sentence
+//! — "The resource ARN '<arn>' was not found." — belongs to the INFRASTRUCTURE
+//! configuration's read and delete, which is the boundary the second test pins.
 //!
 //! The rows span what the rule generalises over: which operation performs the lookup, why the
 //! ARN resolves to nothing (never created, deleted after an accepted update, a name that only
@@ -35,14 +35,14 @@ const OTHER_REGION: &str = "eu-west-1";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 const ACCOUNT: &str = "000000000000";
 
-/// The sentence a missing distribution configuration is reported in by the calls that resolve
-/// a reference to it: the kind its ARN identifies, and the ARN the request carried.
+/// The sentence a missing distribution configuration is reported in by every lookup of one:
+/// the kind its ARN identifies, and the ARN the request carried.
 fn kind_sentence(kind: &str, arn: &str) -> String {
     format!("The following required resource '{kind}' cannot be found: '{arn}'.")
 }
 
-/// The sentence a call addressed by a configuration's own ARN to READ it is reported in: the
-/// ARN alone.
+/// The sentence a call addressed by an INFRASTRUCTURE configuration's own ARN is reported in:
+/// the ARN alone.
 fn arn_sentence(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -185,12 +185,11 @@ async fn create_distribution(router: &MultiServiceRouter, region: &str, name: &s
         .to_string()
 }
 
-/// Every lookup of the distribution configuration `arn`, as (operation, method, uri, body,
-/// whether the route reports a missing configuration by quoting the ARN alone).
+/// Every lookup of the distribution configuration `arn`, as (operation, method, uri, body).
 fn distribution_lookups(
     region: &str,
     arn: &str,
-) -> Vec<(String, &'static str, String, Option<Value>, bool)> {
+) -> Vec<(String, &'static str, String, Option<Value>)> {
     let name = arn.rsplit('/').next().unwrap_or(arn);
     vec![
         (
@@ -198,14 +197,12 @@ fn distribution_lookups(
             "GET",
             format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
             None,
-            true,
         ),
         (
             "DeleteDistributionConfiguration".to_string(),
             "DELETE",
             format!("/DeleteDistributionConfiguration?distributionConfigurationArn={arn}"),
             None,
-            false,
         ),
         (
             "UpdateDistributionConfiguration".to_string(),
@@ -216,34 +213,31 @@ fn distribution_lookups(
                 "clientToken": format!("update-{region}-{name}"),
                 "distributions": [entry(region)],
             })),
-            false,
         ),
         (
             "TagResource".to_string(),
             "POST",
             format!("/tags/{}", encode_label(arn)),
             Some(json!({ "tags": { "owner": "platform" } })),
-            false,
         ),
         (
             "UntagResource".to_string(),
             "DELETE",
             format!("/tags/{}?tagKeys=owner", encode_label(arn)),
             None,
-            false,
         ),
     ]
 }
 
 /// Assert `arn` is reported missing by every lookup of a distribution configuration, each in
-/// the sentence its own route carries.
+/// the one sentence this family carries.
 async fn assert_every_lookup_reports_it_missing(
     router: &MultiServiceRouter,
     row: &str,
     region: &'static str,
     arn: &str,
 ) {
-    for (operation, method, uri, body, quotes_the_arn) in distribution_lookups(region, arn) {
+    for (operation, method, uri, body) in distribution_lookups(region, arn) {
         let case = format!("{operation} on {row}");
         let (status, answer) = call_in(router, region, method, &uri, body.as_ref()).await;
         assert_eq!(
@@ -255,11 +249,7 @@ async fn assert_every_lookup_reports_it_missing(
             code, "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {code:?} with {answer}"
         );
-        let expected = if quotes_the_arn {
-            arn_sentence(arn)
-        } else {
-            kind_sentence("DistributionConfiguration", arn)
-        };
+        let expected = kind_sentence("DistributionConfiguration", arn);
         let actual = error_message(&case, &answer);
         assert_eq!(
             actual, expected,
@@ -268,10 +258,9 @@ async fn assert_every_lookup_reports_it_missing(
     }
 }
 
-/// RULE: a distribution configuration the calling Region holds nothing under is reported in
-/// the sentence its own route carries — the ARN alone on its read, the kind it is on the calls
-/// that resolve a reference to it — by every lookup of it and whatever the reason it resolves
-/// to nothing.
+/// RULE: a distribution configuration the calling Region holds nothing under is reported as
+/// the required resource it is — by every lookup of it and whatever the reason it resolves to
+/// nothing.
 #[tokio::test]
 async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing() {
     let router = emulator();
@@ -382,8 +371,8 @@ async fn every_lookup_of_a_missing_distribution_configuration_reports_it_missing
 }
 
 /// RULE's boundary: the INFRASTRUCTURE configuration is reported by its ARN alone for its read
-/// and for its delete alike — the distribution configuration's read words it the same way, and
-/// a tagging write on either names the kind, so the sentence follows the route rather than the
+/// and for its delete — where the distribution configuration's read names the kind — while a
+/// tagging write on either names the kind, so the sentence follows the route rather than the
 /// family.
 #[tokio::test]
 async fn the_infrastructure_configuration_is_still_reported_by_its_arn_alone() {

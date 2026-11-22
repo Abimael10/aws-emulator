@@ -12,14 +12,13 @@
 //! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the one
 //! the ROUTE's own recorded contract gives it:
 //!
-//! * a READ addressed by a CONFIGURATION resource's own ARN — the infrastructure
-//!   configuration's and the distribution configuration's alike — reports the ARN the request
-//!   carried, quoted, naming no kind: "The resource ARN '<arn>' was not found."; the
-//!   infrastructure configuration's DELETE reports it the same way;
+//! * a READ addressed by the INFRASTRUCTURE configuration's own ARN reports the ARN the
+//!   request carried, quoted, naming no kind: "The resource ARN '<arn>' was not found."; that
+//!   family's DELETE reports it the same way;
 //! * every other report names the resource KIND the ARN identifies — "The following required
 //!   resource '<Kind>' cannot be found: '<arn>'." — whether the call reads one of the
-//!   versioned families, deletes a distribution configuration, updates one, tags one or
-//!   resolves a reference to one.
+//!   versioned families, reads a distribution configuration, deletes one, updates one, tags
+//!   one or resolves a reference to one.
 //!
 //! The rows span what the rule generalises over: which configuration family the ARN names,
 //! which operation performs the lookup, the form of the configuration name the ARN carries,
@@ -153,8 +152,8 @@ fn assert_ok(case: &str, status: u16, body: Value) -> Value {
 /// Which of this service's two missing-resource sentences an answer has to carry.
 #[derive(Clone, Copy)]
 enum Sentence {
-    /// The one a call addressed by a configuration's own ARN carries: the ARN the request
-    /// named, quoted.
+    /// The one a call addressed by the infrastructure configuration's own ARN carries: the
+    /// ARN the request named, quoted.
     Arn,
     /// The one every other report carries: the kind the ARN identifies, and the ARN.
     Kind(&'static str),
@@ -311,7 +310,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
-    sentence: Sentence::Arn,
+    sentence: Sentence::Kind("DistributionConfiguration"),
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`, as the modelled
@@ -326,7 +325,7 @@ fn arn_of(family: Family, region: &str, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_read_of_a_configuration_this_region_holds_nothing_under_quotes_the_arn()
+async fn a_read_of_a_configuration_this_region_holds_nothing_under_reports_it_missing()
 {
     for family in [INFRASTRUCTURE, DISTRIBUTION] {
         let router = emulator();

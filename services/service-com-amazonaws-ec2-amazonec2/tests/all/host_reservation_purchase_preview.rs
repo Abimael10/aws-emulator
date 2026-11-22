@@ -337,7 +337,11 @@ async fn a_host_the_account_does_not_hold_is_refused() {
             vec!["i-0123456789abcdef0"],
             "InvalidHostId.Malformed",
         ),
-        ("not an id at all", vec!["not-a-host"], "InvalidHostId.Malformed"),
+        (
+            "not an id at all",
+            vec!["not-a-host"],
+            "InvalidHostId.Malformed",
+        ),
     ];
 
     for (case, host_ids, expected_code) in rows {
