@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallDomains"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFirewallDomainsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `operation` is a plain `String` in the model, so the boundary validator
+        // checks nothing about it and this handler owns the membership: the
+        // member's own documentation names the values it accepts.
+        let Some(operation) = crate::state::FirewallDomainUpdate::from_wire(&input.operation) else {
+            return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "operation",
+                    format!(
+                        "must be one of {}",
+                        crate::state::FIREWALL_DOMAIN_UPDATE_VALUES.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        };
+
+        // The per-request ceiling the `domains` member documents.
+        if input.domains.len() > crate::state::MAX_DOMAINS_PER_UPDATE {
+            return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "domains",
+                    format!(
+                        "must carry at most {} domains per request, got {}",
+                        crate::state::MAX_DOMAINS_PER_UPDATE,
+                        input.domains.len()
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        let Some(list) = state
+            .firewall_domain_lists
+            .get_mut(&input.firewall_domain_list_id)
+        else {
+            return Err(UpdateFirewallDomainsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::FIREWALL_DOMAIN_LIST_KIND,
+                    &input.firewall_domain_list_id,
+                ),
+            )
+            .into());
+        };
+
+        // The membership this request asks for, computed before anything is
+        // stored, so a request past the ceiling leaves the list as it was.
+        let mut domains = list.domains.clone();
+        match operation {
+            crate::state::FirewallDomainUpdate::Add => {
+                domains.extend(input.domains.iter().cloned());
+            }
+            crate::state::FirewallDomainUpdate::Remove => {
+                for domain in &input.domains {
+                    domains.remove(domain);
+                }
+            }
+            crate::state::FirewallDomainUpdate::Replace => {
+                domains = input.domains.iter().cloned().collect();
+            }
+        }
+        if domains.len() > crate::state::MAX_DOMAINS_PER_FIREWALL_DOMAIN_LIST {
+            return Err(
+                UpdateFirewallDomainsErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::FIREWALL_DOMAIN_RESOURCE,
+                        Some(&input.firewall_domain_list_id),
+                        crate::state::MAX_DOMAINS_PER_FIREWALL_DOMAIN_LIST,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The membership changes now — the next `ListFirewallDomains` reports it —
+        // while the list reports the non-terminal status of a resource being
+        // updated until the clock owes it the terminal one again.
+        list.domains = domains;
+        list.status = crate::state::CrResourceStatus::Updating;
+        list.updated_at = now;
+        list.operational_at = now + crate::state::PROVISIONING_DELAY;
+
+        Ok(UpdateFirewallDomainsOutput {
+            id: list.id.clone(),
+            name: list.name.clone(),
+            status: list.status.as_wire().to_string(),
+        })
     }
 }

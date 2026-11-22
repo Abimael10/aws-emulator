@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallDomains"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFirewallDomainsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `maxResults` is a plain `Integer` with no `@range`, so the page size is
+        // this service's rule to enforce: a page holds at least one item.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(ListFirewallDomainsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "maxResults",
+                        format!("must be at least 1, got {max_results}"),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // The cursor this list issues is one of the domain specifications it
+        // holds, so a token that is not one was never issued by this service and
+        // the page is refused rather than silently served from the start.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_domain_specification(token) {
+                return Err(ListFirewallDomainsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "nextToken",
+                        "is not a token this service issued",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        // A page of domains only exists under a domain list, so an id the store
+        // does not hold is the modelled 404.
+        let Some(list) = state
+            .firewall_domain_lists
+            .get(&input.firewall_domain_list_id)
+        else {
+            return Err(ListFirewallDomainsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::FIREWALL_DOMAIN_LIST_KIND,
+                    &input.firewall_domain_list_id,
+                ),
+            )
+            .into());
+        };
+
+        // The domains are held in one ordered set, so a page is in a stable order
+        // and the token that resumes it is the next domain after the page — the
+        // same cursor rule this service's other paginated lists follow.
+        let (page, next_token) = crate::state::page(
+            list.domains.iter().map(|domain| (domain, domain)),
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListFirewallDomainsOutput {
+            next_token,
+            domains: page.into_iter().cloned().collect(),
+        })
     }
 }

@@ -17,6 +17,14 @@ use serde_json::{json, Value};
 use service_com_amazonaws_route53globalresolver_ec2dnsglobalresolvercustomerapi as resolver_service;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The domain MEMBERSHIP of a list, and the delete of the list itself, as a child
+// module of this suite in `tests/all/state_roundtrip/firewall_domain_lists/`. A
+// child module of an already-declared suite is declared by its parent, here, and
+// reuses this file's emulator. The `#[path]` is relative to this file's own
+// directory.
+#[path = "firewall_domain_lists/domains.rs"]
+mod domains;
+
 /// The Region the request's SigV4 credential scope names. Route 53 Global
 /// Resolver's own docs tell callers to use US East (Ohio).
 const REGION: &str = "us-east-2";

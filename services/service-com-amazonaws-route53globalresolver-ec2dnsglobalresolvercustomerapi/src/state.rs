@@ -140,6 +140,23 @@ pub const MAX_DNS_VIEWS_PER_RESOLVER: usize = 100;
 /// reason and with the same refusal.
 pub const MAX_FIREWALL_DOMAIN_LISTS_PER_RESOLVER: usize = 100;
 
+/// The most domain specifications one firewall domain list holds at once, for the
+/// same reason and with the same refusal (`ServiceQuotaExceededException`, HTTP
+/// 402). This is the emulator's own ceiling, not AWS's published quota, and it is
+/// at least the per-request maximum ([`MAX_DOMAINS_PER_UPDATE`]) so a list that is
+/// empty can take a whole request.
+pub const MAX_DOMAINS_PER_FIREWALL_DOMAIN_LIST: usize = 1000;
+
+/// The most domain specifications ONE `UpdateFirewallDomains` request may carry.
+/// Documented by the member itself (`UpdateFirewallDomainsInput$domains`: "You can
+/// add up to 1000 domains per request"), so a longer list is the modelled 400.
+pub const MAX_DOMAINS_PER_UPDATE: usize = 1000;
+
+/// The token a quota refusal about the domains of a firewall domain list names
+/// them by. The domains of a list are not a resource with an ARN of their own, so
+/// this is a message token only.
+pub const FIREWALL_DOMAIN_RESOURCE: &str = "firewall-domain";
+
 /// The most Regions one `CreateGlobalResolver` request may name, so a single
 /// record cannot be grown without limit either. AWS has well under this many
 /// Regions, and a list past it is refused with the modelled `ValidationException`.
@@ -163,6 +180,9 @@ pub enum CrResourceStatus {
     Creating,
     /// Ready to serve queries.
     Operational,
+    /// Being changed: the status an update of the resource's contents answers
+    /// with, until the clock owes it the terminal one again.
+    Updating,
     /// Being removed: the status a delete answers with.
     Deleting,
 }
@@ -173,6 +193,7 @@ impl CrResourceStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Operational => "OPERATIONAL",
+            Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
         }
     }
@@ -424,17 +445,24 @@ pub struct FirewallDomainList {
     /// When the clock owes this list its terminal status.
     pub operational_at: SystemTime,
     /// The domain specifications this list holds, deduplicated and ordered;
-    /// `domainCount` is their number. A list is created empty — the operations
-    /// that add domains to one are scaffolds still.
+    /// `domainCount` is their number. A list is created empty and
+    /// `UpdateFirewallDomains` is what adds to, removes from or replaces the set.
     pub domains: BTreeSet<String>,
     /// The tags the create request carried.
     pub tags: BTreeMap<String, String>,
 }
 
 impl FirewallDomainList {
-    /// The firewall domain list counterpart of [`GlobalResolver::settle`].
+    /// The firewall domain list counterpart of [`GlobalResolver::settle`]. A list
+    /// whose membership was just changed is settled the same way a freshly minted
+    /// one is: both report a non-terminal status until the instant stored on the
+    /// record falls due.
     fn settle(&mut self, now: SystemTime) {
-        if self.status == CrResourceStatus::Creating && now >= self.operational_at {
+        let pending = matches!(
+            self.status,
+            CrResourceStatus::Creating | CrResourceStatus::Updating
+        );
+        if pending && now >= self.operational_at {
             self.status = CrResourceStatus::Operational;
             self.updated_at = self.operational_at;
         }
@@ -454,6 +482,40 @@ impl FirewallDomainList {
             && self.name == input.name
             && self.description == input.description
             && self.tags == tags_of(input.tags.as_ref())
+    }
+}
+
+/// What an `UpdateFirewallDomains` request asks this service to do with the
+/// domains it carries.
+///
+/// The model types that member as a plain `String`, so the values live in the
+/// member's documentation rather than in an enum shape
+/// (`UpdateFirewallDomainsInput$operation`: "The allowed values are ADD, REMOVE,
+/// and REPLACE").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirewallDomainUpdate {
+    /// Add the request's domains to the ones the list already holds.
+    Add,
+    /// Remove the request's domains from the list, ignoring any it does not hold.
+    Remove,
+    /// Make the request's domains the whole membership of the list.
+    Replace,
+}
+
+/// The values [`FirewallDomainUpdate`] accepts, in the order the member's
+/// documentation lists them — the catalog a refusal of any other value names.
+pub const FIREWALL_DOMAIN_UPDATE_VALUES: &[&str] = &["ADD", "REMOVE", "REPLACE"];
+
+impl FirewallDomainUpdate {
+    /// Parse a wire value, or `None` when it is not one of
+    /// [`FIREWALL_DOMAIN_UPDATE_VALUES`].
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "ADD" => Some(Self::Add),
+            "REMOVE" => Some(Self::Remove),
+            "REPLACE" => Some(Self::Replace),
+            _ => None,
+        }
     }
 }
 
@@ -535,6 +597,22 @@ pub fn dns_view_id(sequence: u64) -> String {
 /// constraint.
 pub fn firewall_domain_list_id(sequence: u64) -> String {
     format!("{FIREWALL_DOMAIN_LIST_ID_PREFIX}{sequence:012x}")
+}
+
+/// Whether `value` is a domain specification of the form the `Domains` member
+/// declares (`@length` 1..256, `@pattern`
+/// `^\*?[a-zA-Z0-9!"#$%&'()*+,./:;<=>?@\[\\\]^_`{|}~-]+$`): an optional leading
+/// wildcard followed by at least one visible ASCII character and no whitespace.
+///
+/// The framework checks that pattern on every entry of a request's `domains`
+/// before a handler runs; this is the same rule applied to the page cursor
+/// `ListFirewallDomains` issues, which is one of the stored specifications, so a
+/// `nextToken` of any other shape was never issued by this service.
+pub fn is_domain_specification(value: &str) -> bool {
+    let body = value.strip_prefix('*').unwrap_or(value);
+    !body.is_empty()
+        && value.len() <= 256
+        && body.chars().all(|c| c.is_ascii_graphic())
 }
 
 /// Whether `token` is a page cursor this service could have issued for ids
