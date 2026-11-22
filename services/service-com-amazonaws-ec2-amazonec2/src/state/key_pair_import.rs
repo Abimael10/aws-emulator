@@ -46,21 +46,23 @@ pub const IMPORTABLE_RSA_KEY_BITS: [usize; 3] = [1024, 2048, 4096];
 pub const MAX_PUBLIC_KEY_MATERIAL_BYTES: usize = 4096;
 
 /// The code EC2 answers for public key material it cannot import: "the format of the public
-/// key you are attempting to upload is not valid" (AWS's `InvalidKeyPair.Format` error-code
-/// entry).
-pub const INVALID_KEY_PAIR_FORMAT: &str = "InvalidKeyPair.Format";
+/// key you are attempting to upload is not valid" — the `InvalidKey.Format` family, which
+/// names the KEY rather than the key pair. Codes are compared exactly, so the
+/// `InvalidKeyPair.*` spelling of the surrounding key-pair codes is a different code to every
+/// client and is not what an import answers for unreadable material.
+pub const INVALID_KEY_FORMAT: &str = "InvalidKey.Format";
 
 /// Refuse an import whose material is not a public key EC2 can take: HTTP 400
-/// [`INVALID_KEY_PAIR_FORMAT`].
+/// [`INVALID_KEY_FORMAT`].
 ///
 /// ONE sentence for every way the material fails [`read_public_key_material`] — not a key at
 /// all, a key of an algorithm an import does not take, an RSA key of a length the
 /// requirements do not list, material longer than any of them — because what EC2 reports is
 /// that the key it was given is not one it can read: the sentence names neither which clause
 /// failed nor the material itself, and carries no variable part.
-pub fn invalid_key_pair_format<E>() -> crate::scaffolded::Scaffolded<E> {
+pub fn invalid_key_format<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
-        INVALID_KEY_PAIR_FORMAT,
+        INVALID_KEY_FORMAT,
         400,
         UNREADABLE_PUBLIC_KEY_MESSAGE,
     )
@@ -94,7 +96,7 @@ pub struct ImportedPublicKey {
 /// ([`IMPORTABLE_RSA_KEY_BITS`]). Anything else — material that is not UTF-8, is longer than
 /// [`MAX_PUBLIC_KEY_MATERIAL_BYTES`], is no key at all, is a key of another algorithm, or is
 /// an RSA key of an unlisted length — is not a key this operation can take, and its caller
-/// answers [`invalid_key_pair_format`].
+/// answers [`invalid_key_format`].
 pub fn read_public_key_material(material: &[u8]) -> Option<ImportedPublicKey> {
     if material.len() > MAX_PUBLIC_KEY_MATERIAL_BYTES {
         return None;

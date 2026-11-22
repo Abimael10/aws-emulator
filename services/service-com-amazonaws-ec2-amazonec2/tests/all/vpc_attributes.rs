@@ -426,7 +426,7 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
             "ModifyVpcAttribute",
             vec![param("VpcId", &vpc_id)],
             400,
-            ec2::state::MISSING_PARAMETER,
+            ec2::state::INVALID_PARAMETER_COMBINATION,
         ),
         (
             "a modification of a VPC that does not exist",

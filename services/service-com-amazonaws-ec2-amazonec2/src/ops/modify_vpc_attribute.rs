@@ -117,6 +117,13 @@ impl From<ModifyVpcAttributeErrorModeled> for ModifyVpcAttributeError {
     }
 }
 
+/// EC2's sentence for a `ModifyVpcAttribute` that names no attribute to change at all.
+///
+/// Fixed text with no variable part: the request states no modification, so there is no value
+/// and no one member to name back. Public so a suite can assert the sentence this refusal
+/// carries without writing it out a second time.
+pub const NO_ATTRIBUTES_SPECIFIED: &str = "No attributes specified.";
+
 /// The `ModifyVpcAttribute` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,13 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::fields_for_multiple_attribute_types(&named));
         }
         if requested.is_empty() {
-            return Err(state::missing_parameter(format!(
-                "The request must name an attribute to modify: {support}, {hostnames} or \
-                 {metrics}",
-                support = state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT,
-                hostnames = state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES,
-                metrics = state::VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS,
-            )));
+            // A request that names the VPC and no attribute at all asks for no modification:
+            // the parameters it carries cannot be acted on together, which EC2 answers with
+            // the combination class rather than with `MissingParameter` — no single parameter
+            // is the one the caller left out, since any ONE of the three would have served.
+            return Err(state::invalid_parameter_combination(
+                NO_ATTRIBUTES_SPECIFIED,
+            ));
         }
 
         let store = state::require_service_state(&*self.engine)?;

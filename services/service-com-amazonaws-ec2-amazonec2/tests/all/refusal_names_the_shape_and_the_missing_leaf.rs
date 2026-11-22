@@ -14,9 +14,11 @@
 //!    outside that form is refused under the shape the member targets (`Ipv4PoolCoipId`),
 //!    `InvalidIpv4PoolCoipId.Malformed`, with the crate's one malformed-id sentence for the
 //!    resource kind. The digit COUNT is not part of the question.
-//! 2. A prefix list id that names no prefix list the caller can see is refused
-//!    `InvalidPrefixListID.NotFound`, and the operations that resolve a list to REPORT ON or
-//!    REMOVE it all answer one sentence — `The prefix list (<id>) does not exist.` — while the
+//! 2. A prefix list id that names no prefix list the caller can see is refused with the
+//!    not-found code that surface answers — `InvalidPrefixListID.NotFound` for the managed
+//!    prefix list surface, `InvalidPrefixListId.NotFound` for the legacy read of a Region's
+//!    AWS service prefix lists — and the operations that resolve a list to REPORT ON or REMOVE
+//!    it all answer one sentence — `The prefix list (<id>) does not exist.` — while the
 //!    revise (`ModifyManagedPrefixList`) answers its own.
 //! 3. A network ACL rule whose protocol needs a port range, or an ICMP type and code, and
 //!    carries none names the LEAF member the caller has to fill in (`portRange.from`) rather
@@ -226,21 +228,47 @@ async fn create_prefix_list(router: &MultiServiceRouter, case: &str, name: &str)
 }
 
 /// The operations that resolve ONE prefix list to report on or remove it, with the field each
-/// names it through: the reads of a list's entries and of what references it, the two
-/// describes that take a prefix-list-id selector, and the delete.
-const PREFIX_LIST_READERS: [(&str, &str); 5] = [
-    ("GetManagedPrefixListEntries", "PrefixListId"),
-    ("GetManagedPrefixListAssociations", "PrefixListId"),
-    ("DescribeManagedPrefixLists", "PrefixListId.1"),
-    ("DescribePrefixLists", "PrefixListId.1"),
-    ("DeleteManagedPrefixList", "PrefixListId"),
+/// names it through and the CODE each answers: the reads of a list's entries and of what
+/// references it, the two describes that take a prefix-list-id selector, and the delete.
+///
+/// EC2 is not uniform about the spelling of this code: the managed-prefix-list surface answers
+/// `InvalidPrefixListID.NotFound` and the legacy read of a Region's AWS service prefix lists
+/// answers `InvalidPrefixListId.NotFound`, so the code is a column of the table rather than one
+/// value for every row.
+const PREFIX_LIST_READERS: [(&str, &str, &str); 5] = [
+    (
+        "GetManagedPrefixListEntries",
+        "PrefixListId",
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
+    ),
+    (
+        "GetManagedPrefixListAssociations",
+        "PrefixListId",
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
+    ),
+    (
+        "DescribeManagedPrefixLists",
+        "PrefixListId.1",
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
+    ),
+    (
+        "DescribePrefixLists",
+        "PrefixListId.1",
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ,
+    ),
+    (
+        "DeleteManagedPrefixList",
+        "PrefixListId",
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
+    ),
 ];
 
 /// Rule 2: an id no prefix list the caller can see carries is refused with ONE sentence from
 /// every operation that resolves a list to report on or remove it, built from the id the
-/// request named. The rows are the operations, over an id in each of EC2's two published id
-/// forms and over the id of a list this store minted and then deleted — so the rule holds for
-/// an id that never existed and for one that stopped existing.
+/// request named, under that surface's own not-found code. The rows are the operations, over an
+/// id in each of EC2's two published id forms and over the id of a list this store minted and
+/// then deleted — so the rule holds for an id that never existed and for one that stopped
+/// existing.
 #[tokio::test]
 async fn a_prefix_list_read_names_the_list_it_could_not_resolve() {
     let never_existed = ["pl-0f1e2d3c", "pl-0123456789abcdef0"];
@@ -290,7 +318,7 @@ async fn a_prefix_list_read_names_the_list_it_could_not_resolve() {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    for (action, member) in PREFIX_LIST_READERS {
+    for (action, member, expected_code) in PREFIX_LIST_READERS {
         for unknown in never_existed
             .iter()
             .map(|id| (*id).to_string())
@@ -304,9 +332,8 @@ async fn a_prefix_list_read_names_the_list_it_could_not_resolve() {
             );
             assert_eq!(
                 error_code(&body),
-                ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
-                "case {action:?} with {unknown:?}: expected the prefix list's not-found code, \
-                 got {body}"
+                expected_code,
+                "case {action:?} with {unknown:?}: expected {expected_code}, got {body}"
             );
             let message = error_message(&body);
             let expected_message = format!("The prefix list ({unknown}) does not exist.");

@@ -17,7 +17,7 @@
 //!    service, so they are STABLE across reads and DISTINCT between the lists of one
 //!    Region.
 //! 2. `PrefixListIds` reports the lists it names; an id that names none of the Region's
-//!    prefix lists is refused with `InvalidPrefixListID.NotFound`.
+//!    prefix lists is refused with `InvalidPrefixListId.NotFound`.
 //! 3. `Filters` (`prefix-list-id`, `prefix-list-name`) are ANDed with one another and
 //!    ORed over each filter's values, with EC2's `*` and `?` wildcards; a filter the
 //!    operation does not document is refused with `InvalidParameterValue`.
@@ -348,7 +348,7 @@ async fn prefix_list_ids_select_the_lists_they_name() {
 }
 
 /// A `PrefixListIds` entry that names none of the Region's prefix lists is refused with
-/// `InvalidPrefixListID.NotFound` naming it — not answered with an empty list.
+/// `InvalidPrefixListId.NotFound` naming it — not answered with an empty list.
 ///
 /// The rows differ in how the id is wrong: a well-formed id nothing has, an id of
 /// another Region's list, something that is not a prefix list id at all, and an unknown
@@ -385,8 +385,8 @@ async fn an_unknown_prefix_list_id_is_refused() {
         );
         assert_eq!(
             element(&body, "Code").as_deref(),
-            Some("InvalidPrefixListID.NotFound"),
-            "case {case:?}: expected InvalidPrefixListID.NotFound, got {body}"
+            Some("InvalidPrefixListId.NotFound"),
+            "case {case:?}: expected InvalidPrefixListId.NotFound, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
         assert!(

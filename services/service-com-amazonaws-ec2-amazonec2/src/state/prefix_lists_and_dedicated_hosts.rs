@@ -92,7 +92,22 @@ pub const PREFIX_LIST_LIMIT_EXCEEDED: &str = "PrefixListLimitExceeded";
 /// EC2's error code for a request that named a prefix list id no prefix list of the account
 /// or of the Region has, spelled the way this service spells its other id-not-found codes
 /// ([`INVALID_VPC_ID_NOT_FOUND`], `InvalidSubnetID.NotFound`).
+///
+/// The legacy `DescribePrefixLists` surface — the read of the AWS SERVICE prefix lists a
+/// Region publishes — spells the id part of this code `Id` instead
+/// ([`INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ`]): EC2 is not uniform here, and each
+/// spelling is the one that surface's recorded refusals carry.
 pub const INVALID_PREFIX_LIST_ID_NOT_FOUND: &str = "InvalidPrefixListID.NotFound";
+
+/// EC2's error code for a prefix list id the legacy read of a Region's AWS SERVICE prefix
+/// lists (`DescribePrefixLists`) cannot resolve.
+///
+/// The SAME refusal class as [`INVALID_PREFIX_LIST_ID_NOT_FOUND`], spelled with the `Id` that
+/// surface's recorded refusals carry rather than the upper-case `ID` the managed-prefix-list
+/// and prefix-list-reference surfaces answer. Codes are compared exactly, so the two
+/// spellings are two different codes to every client and neither surface may answer the
+/// other's.
+pub const INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ: &str = "InvalidPrefixListId.NotFound";
 
 /// Refuse a request that named a prefix list id nothing the caller can see has: HTTP 400
 /// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`].
@@ -103,7 +118,7 @@ pub const INVALID_PREFIX_LIST_ID_NOT_FOUND: &str = "InvalidPrefixListID.NotFound
 pub fn invalid_prefix_list_id_not_found<E>(prefix_list_id: &str) -> Scaffolded<E> {
     id_not_found(
         INVALID_PREFIX_LIST_ID_NOT_FOUND,
-        "prefix list ID",
+        PREFIX_LIST_ID_KIND,
         prefix_list_id,
     )
 }
@@ -113,10 +128,12 @@ pub fn invalid_prefix_list_id_not_found<E>(prefix_list_id: &str) -> Scaffolded<E
 /// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`] with `The prefix list (<id>) does not exist.` — the
 /// id in parentheses, with the terminating full stop.
 ///
-/// The ONE place that sentence lives, for every operation recorded answering it: the delete
-/// of a list, the read of its entries, the describe that reports it, the restore of an earlier
-/// version of its entries, and the transit gateway reference that points at it. The id is the
-/// one the REQUEST named and nothing else is in the text.
+/// The ONE place that sentence lives, for every operation recorded answering it under this
+/// code: the delete of a list, the read of its entries, the describe that reports it, the
+/// restore of an earlier version of its entries, and the transit gateway reference that points
+/// at it. The id is the one the REQUEST named and nothing else is in the text. The legacy read
+/// of a Region's AWS SERVICE prefix lists answers the same sentence under its own code
+/// ([`service_prefix_list_does_not_exist`]).
 ///
 /// EC2 does NOT word this code one way everywhere, so an operation recorded answering another
 /// sentence keeps it rather than being moved here:
@@ -132,10 +149,40 @@ pub fn prefix_list_does_not_exist<E>(prefix_list_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PREFIX_LIST_ID_NOT_FOUND,
         400,
-        format!(
-            "The prefix list ({echoed}) does not exist.",
-            echoed = echoed_resource_id(prefix_list_id),
-        ),
+        prefix_list_does_not_exist_message(prefix_list_id),
+    )
+}
+
+/// Refuse a prefix list id the legacy read of a Region's AWS SERVICE prefix lists
+/// (`DescribePrefixLists`) cannot resolve: HTTP 400
+/// [`INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ`] with the sentence every operation that
+/// resolves a prefix list to REPORT ON it answers ([`prefix_list_does_not_exist_message`]).
+///
+/// Same class and same sentence as [`prefix_list_does_not_exist`], under the CODE this surface
+/// is recorded answering — the `Id` spelling rather than the managed surface's `ID`. The
+/// sentence comes from the one place it lives, so the two cannot word one refusal differently.
+pub fn service_prefix_list_does_not_exist<E>(prefix_list_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ,
+        400,
+        prefix_list_does_not_exist_message(prefix_list_id),
+    )
+}
+
+/// The kind of id a prefix list refusal names: the resource as EC2 names it in the sentence of
+/// the `Invalid<Kind>.NotFound` family, which is the ID rather than the list.
+pub const PREFIX_LIST_ID_KIND: &str = "prefix list ID";
+
+/// EC2's sentence for a prefix list id it cannot resolve for an operation that resolves one to
+/// REPORT ON it: `The prefix list (<id>) does not exist.`
+///
+/// The one place that sentence lives, for both codes it is answered under
+/// ([`prefix_list_does_not_exist`], [`service_prefix_list_does_not_exist`]). Fixed text around
+/// the id the REQUEST named, quoted through [`echoed_resource_id`].
+pub fn prefix_list_does_not_exist_message(prefix_list_id: &str) -> String {
+    format!(
+        "The prefix list ({echoed}) does not exist.",
+        echoed = echoed_resource_id(prefix_list_id),
     )
 }
 
@@ -2142,6 +2189,26 @@ pub const AWS_ENDPOINT_SERVICE_PREFIX: &str = "com.amazonaws.";
 /// "VPC endpoint policy size", which is what bounds the document a create reads and stores.
 pub const MAX_VPC_ENDPOINT_POLICY_CHARS: usize = 20_480;
 
+/// The code EC2 answers for a `PolicyDocument` it will not take as a VPC endpoint policy.
+///
+/// Its own code for the member rather than a generic parameter one, so a client that
+/// re-authors the policy can branch on it.
+pub const INVALID_POLICY_DOCUMENT: &str = "InvalidPolicyDocument";
+
+/// EC2's sentence for a VPC endpoint policy it will not take: fixed text with NO variable
+/// part, naming neither which clause failed nor the quota it is held to.
+pub const INVALID_VPC_ENDPOINT_POLICY_MESSAGE: &str = "Please provide a valid VPC Endpoint policy";
+
+/// Refuse a `PolicyDocument` that is not one EC2 takes as a VPC endpoint policy: HTTP 400
+/// [`INVALID_POLICY_DOCUMENT`] with [`INVALID_VPC_ENDPOINT_POLICY_MESSAGE`].
+pub fn invalid_vpc_endpoint_policy<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_POLICY_DOCUMENT,
+        400,
+        INVALID_VPC_ENDPOINT_POLICY_MESSAGE,
+    )
+}
+
 /// Read the `PolicyDocument` a request attaches to a VPC endpoint, or refuse it.
 ///
 /// "(Interface and gateway endpoints) A policy to attach to the endpoint that controls access
@@ -2153,6 +2220,11 @@ pub const MAX_VPC_ENDPOINT_POLICY_CHARS: usize = 20_480;
 /// the JSON parser this crate already depends on rather than a hand-rolled shape check, so
 /// "valid JSON format" means what JSON means.
 ///
+/// EVERY way the document fails — past the quota, or not JSON at all — is the one refusal EC2
+/// answers for a document it will not take as an endpoint policy
+/// ([`invalid_vpc_endpoint_policy`]): one code and one sentence, which states no clause and so
+/// publishes neither the quota nor which test the document failed.
+///
 /// `None` is a request that named no document. What that means is the CALLER's: the default
 /// full-access policy for a create, and "leave the attached one alone" for a modify.
 pub fn requested_vpc_endpoint_policy<E>(
@@ -2162,16 +2234,10 @@ pub fn requested_vpc_endpoint_policy<E>(
         return Ok(None);
     };
     if document.chars().count() > MAX_VPC_ENDPOINT_POLICY_CHARS {
-        return Err(invalid_parameter_value(format!(
-            "Invalid value for policyDocument: a VPC endpoint policy may carry at most {max} \
-             characters",
-            max = MAX_VPC_ENDPOINT_POLICY_CHARS,
-        )));
+        return Err(invalid_vpc_endpoint_policy());
     }
     if ::serde_json::from_str::<::serde_json::Value>(document).is_err() {
-        return Err(invalid_parameter_value(
-            "Invalid value for policyDocument: the policy must be in valid JSON format",
-        ));
+        return Err(invalid_vpc_endpoint_policy());
     }
     Ok(Some(document.to_string()))
 }

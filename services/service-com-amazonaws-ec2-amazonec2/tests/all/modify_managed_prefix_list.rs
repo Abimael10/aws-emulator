@@ -809,7 +809,7 @@ async fn a_request_the_operation_cannot_serve_is_refused_and_changes_nothing() {
                 param("AddEntry.1.Cidr", "2001:db8::/32"),
             ],
             400,
-            "InvalidParameterValue",
+            "InvalidParameterCombination",
         ),
         (
             "a value that is no CIDR block at all".to_string(),
@@ -1031,20 +1031,25 @@ async fn a_dry_run_changes_nothing_and_the_revision_after_it_does() {
 }
 
 /// Rule 5, the WORDING of one refusal class: an id no prefix list the caller can see carries
-/// is refused HTTP 400 `InvalidPrefixListID.NotFound`, and EC2 does not word that code one
-/// way for every operation — the operations that resolve a list TO REPORT ON it answer `The
+/// is refused HTTP 400 with that surface's not-found code, and EC2 does not word that refusal
+/// one way for every operation — the operations that resolve a list TO REPORT ON it answer `The
 /// prefix list (<id>) does not exist.`, while THIS operation, which revises the list, answers
-/// `Prefix List <id> not found.` Each sentence carries only the id the request named.
+/// `Prefix List <id> not found.` Each sentence carries only the id the request named. The CODE
+/// differs per surface too: the managed prefix list operations answer
+/// `InvalidPrefixListID.NotFound`, the legacy read of a Region's AWS service prefix lists
+/// `InvalidPrefixListId.NotFound`.
 #[tokio::test]
 async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
     let (router, _engine) = super::ec2_query::emulator();
+    let managed = ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND;
+    let service_read = ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND_SERVICE_READ;
 
     // Both id forms EC2 mints for a prefix list — the short one and the long one — neither of
     // which this emulator holds a list under.
     for unknown in ["pl-0a1b2c3d", "pl-00000000000000000"] {
         let revised = format!("Prefix List {unknown} not found.");
         let reported = format!("The prefix list ({unknown}) does not exist.");
-        let calls: Vec<(&str, Vec<Field>, &String)> = vec![
+        let calls: Vec<(&str, Vec<Field>, &String, &str)> = vec![
             (
                 "ModifyManagedPrefixList",
                 vec![
@@ -1052,34 +1057,40 @@ async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
                     param("PrefixListName", "renamed"),
                 ],
                 &revised,
+                managed,
             ),
             (
                 "GetManagedPrefixListEntries",
                 vec![param("PrefixListId", unknown)],
                 &reported,
+                managed,
             ),
             (
                 "GetManagedPrefixListAssociations",
                 vec![param("PrefixListId", unknown)],
                 &reported,
+                managed,
             ),
             (
                 "DescribeManagedPrefixLists",
                 vec![param("PrefixListId.1", unknown)],
                 &reported,
+                managed,
             ),
             (
                 "DescribePrefixLists",
                 vec![param("PrefixListId.1", unknown)],
                 &reported,
+                service_read,
             ),
             (
                 "DeleteManagedPrefixList",
                 vec![param("PrefixListId", unknown)],
                 &reported,
+                managed,
             ),
         ];
-        for (action, params, expected) in &calls {
+        for (action, params, expected, expected_code) in &calls {
             let (status, body) = super::ec2_query::call(&router, REGION, action, params).await;
             assert_eq!(
                 status, 400,
@@ -1088,9 +1099,8 @@ async fn an_unresolvable_prefix_list_id_is_refused_with_one_wording() {
             );
             assert_eq!(
                 error_code(&body),
-                "InvalidPrefixListID.NotFound",
-                "case {action:?} with {unknown:?}: expected InvalidPrefixListID.NotFound, got \
-                 {body}"
+                *expected_code,
+                "case {action:?} with {unknown:?}: expected {expected_code}, got {body}"
             );
             assert_eq!(
                 &error_message(&body),

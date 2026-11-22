@@ -611,7 +611,7 @@ fn create_refusals() -> Vec<RefusalCase> {
                 param("Strategy", "cluster"),
                 param("PartitionCount", "3"),
             ],
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
             400,
         ),
         (
@@ -621,7 +621,7 @@ fn create_refusals() -> Vec<RefusalCase> {
                 param("Strategy", "spread"),
                 param("PartitionCount", "3"),
             ],
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
             400,
         ),
         // `SpreadLevel` is a modelled enum too, so the boundary validator refuses a value
@@ -643,7 +643,7 @@ fn create_refusals() -> Vec<RefusalCase> {
                 param("Strategy", "cluster"),
                 param("SpreadLevel", "rack"),
             ],
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
             400,
         ),
         (
@@ -653,7 +653,7 @@ fn create_refusals() -> Vec<RefusalCase> {
                 param("Strategy", "spread"),
                 param("ParentGroupId", "pg-00000000000000001"),
             ],
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
             400,
         ),
         (

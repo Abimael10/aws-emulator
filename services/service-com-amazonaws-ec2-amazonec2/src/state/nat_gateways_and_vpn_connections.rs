@@ -1603,6 +1603,49 @@ pub fn invalid_capacity_reservation_fleet_id_not_found<E>(fleet_id: &str) -> Sca
     )
 }
 
+/// Is `allowed` the `FleetInstanceMatchCriteria` catalog — the value set the model declares
+/// for the instance matching criteria a Capacity Reservation Fleet accepts
+/// (`crate::ops::types::FLEET_INSTANCE_MATCH_CRITERIA_VALUES`)?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`crate::state::is_modelled_catalog`] records that rule), so every member of this model
+/// that names a Fleet's matching criteria is refused an unpublished one in the same words —
+/// "Currently, Capacity Reservation Fleets support `open` instance matching criteria only"
+/// (`CreateCapacityReservationFleetRequest$InstanceMatchCriteria`), so any other word is a
+/// value this service cannot use for that parameter rather than a shape violation.
+pub fn is_fleet_instance_match_criteria_catalog(allowed: &[String]) -> bool {
+    crate::state::is_modelled_catalog(
+        allowed,
+        crate::ops::types::FLEET_INSTANCE_MATCH_CRITERIA_VALUES,
+    )
+}
+
+/// How EC2 states an `InstanceMatchCriteria` a Capacity Reservation Fleet cannot be created
+/// with: the value the request sent, the member it carried it in and the values that member
+/// takes — `targeted is not a valid value for the 'instanceMatchCriteria' parameter. Valid
+/// values include: open.`
+///
+/// The member's OWN sentence rather than this crate's general catalog clause
+/// ([`crate::state::modelled_catalog_refusal_message`]): EC2 does not word a refused catalog
+/// value one way everywhere, and this is the wording the recorded refusals of this member
+/// carry. Both variable parts come from the request and the model — the value as the caller
+/// sent it and the catalog the GENERATED constant publishes — so nothing of one run is written
+/// into the template. The ONE place it lives, for the handler that resolves the member and for
+/// the boundary that refuses a value before that handler runs.
+pub fn fleet_instance_match_criteria_refusal_message(value: &str) -> String {
+    format!(
+        "{value} is not a valid value for the '{member}' parameter. \
+         Valid values include: {valid}.",
+        member = FLEET_INSTANCE_MATCH_CRITERIA_MEMBER,
+        valid = crate::ops::types::FLEET_INSTANCE_MATCH_CRITERIA_VALUES.join(", "),
+    )
+}
+
+/// The member a Capacity Reservation Fleet's instance matching criteria is named by, as the
+/// ec2Query WIRE spells it — which is also the path the boundary's constraint walk reports a
+/// refused value under, so the refusal and the walk cannot name it differently.
+pub const FLEET_INSTANCE_MATCH_CRITERIA_MEMBER: &str = "instanceMatchCriteria";
+
 /// Refuse a create that would take the store past [`MAX_CAPACITY_RESERVATION_FLEETS`]: HTTP
 /// 400 [`CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED`].
 pub fn capacity_reservation_fleet_limit_exceeded<E>() -> Scaffolded<E> {

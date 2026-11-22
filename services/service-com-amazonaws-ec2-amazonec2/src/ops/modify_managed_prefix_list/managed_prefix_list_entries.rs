@@ -65,8 +65,8 @@ use crate::scaffolded::Scaffolded;
 use crate::state::{
     INVALID_PREFIX_LIST_ID_NOT_FOUND, MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS,
     MAX_STORED_RECORDS_PER_STORE, PREFIX_LIST_ADDRESS_FAMILY_IPV6,
-    PREFIX_LIST_STATE_CREATE_COMPLETE, canonical_cidr_block, invalid_parameter_value,
-    managed_prefix_list_payload_bytes,
+    PREFIX_LIST_STATE_CREATE_COMPLETE, canonical_cidr_block, invalid_parameter_combination,
+    invalid_parameter_value, managed_prefix_list_payload_bytes,
 };
 
 /// Refuse a request that named an id no prefix list the caller can see carries: HTTP 400
@@ -135,15 +135,50 @@ pub const PREFIX_LIST_STATES_ADMITTING_A_REVISION: [&str; 3] = [
 /// The canonical form has the block's host bits clear, the way every other caller-supplied
 /// range of this service is stored ([`canonical_cidr_block`]), so two spellings of one range
 /// name one entry.
+///
+/// The two refusals are two CLASSES, and two sentences, because what the caller has to repair
+/// differs:
+///
+/// * text that is no CIDR block at all is one parameter carrying a value the service cannot
+///   read, which EC2 answers [`invalid_parameter_value`] for, naming the member and the value
+///   ([`unreadable_entry_block_message`]);
+/// * a well-formed block of the OTHER IP version is a conflict BETWEEN two parameters of the
+///   request — the family the list is declared with and the version the block is of, each valid
+///   on its own — which EC2 answers [`invalid_parameter_combination`] for, in the sentence that
+///   states the two that cannot be combined ([`entry_block_family_mismatch_message`]).
 pub fn read_entry_block<E>(cidr: &str, family: &str) -> Result<String, Scaffolded<E>> {
     let wants_ipv6 = family == PREFIX_LIST_ADDRESS_FAMILY_IPV6;
     match canonical_cidr_block(cidr) {
         Some(canonical) if cidr.contains(':') == wants_ipv6 => Ok(canonical),
-        _ => Err(invalid_parameter_value(format!(
-            "Value ({cidr}) for parameter cidr is invalid. \
-             This is not a valid {family} CIDR block.",
+        Some(_) => Err(invalid_parameter_combination(
+            entry_block_family_mismatch_message(cidr, family),
+        )),
+        None => Err(invalid_parameter_value(unreadable_entry_block_message(
+            cidr, family,
         ))),
     }
+}
+
+/// How EC2 states a `Cidr` whose IP version is not the list's declared `AddressFamily`: the
+/// family the list carries and the block the request named, each in parentheses — `An (IPv6)
+/// prefix list cannot contain an (10.50.0.0/24) CIDR.`
+///
+/// Fixed text around the two variable parts, both of which come from the request: the family
+/// the list is declared with and the block as the caller spelled it. It names the two
+/// parameters that cannot be combined and no clause, which is what makes it EC2's sentence for
+/// this class rather than a validation clause.
+pub fn entry_block_family_mismatch_message(cidr: &str, family: &str) -> String {
+    format!("An ({family}) prefix list cannot contain an ({cidr}) CIDR.")
+}
+
+/// How EC2 states a `Cidr` that is no CIDR block of either version: the member, the value the
+/// request sent and the family it was read against, in the clause the PARAMETER layer refuses a
+/// value it could not read with.
+pub fn unreadable_entry_block_message(cidr: &str, family: &str) -> String {
+    format!(
+        "Value ({cidr}) for parameter cidr is invalid. \
+         This is not a valid {family} CIDR block."
+    )
 }
 
 /// The entries a request named as the stored, reported [`PrefixListEntry`] shape, or the

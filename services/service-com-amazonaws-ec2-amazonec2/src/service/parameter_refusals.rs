@@ -177,6 +177,14 @@ fn nonexistent_instance_types(
 /// violation — the member's own `@range` — and only the two words EC2 was recorded varying
 /// per operation come from the input shape being read.
 ///
+/// A value outside the `@range` a member publishes is the last refusal this service states,
+/// and the one that is keyed to the OPERATION rather than to the value: the surfaces recorded
+/// answering EC2's own `InvalidRequest` for it
+/// ([`crate::state::RANGE_REFUSED_AS_INVALID_REQUEST_INPUT_SHAPES`]) answer that code over
+/// AWS's own validation clause for the value, which the framework builds from the violation.
+/// Every other operation keeps the framework's own refusal whole, exactly as the page sizes
+/// keep theirs.
+///
 /// An absent `@required` member is the one refusal here that is about no value at all: EC2
 /// answers its own `MissingParameter` in the sentence the validator of that operation's SURFACE
 /// words ([`crate::state::absent_required_member_message`]) — the core parameter validator's
@@ -411,6 +419,44 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
                     maximum,
                     crate::state::PageSizeBound::Largest,
                 ),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_fleet_instance_match_criteria_catalog(allowed) =>
+        {
+            // "Currently, Capacity Reservation Fleets support `open` instance matching
+            // criteria only" (`CreateCapacityReservationFleetRequest$InstanceMatchCriteria`):
+            // a Fleet asked for any other criteria is a parameter carrying a value the service
+            // cannot use, which EC2 answers its own `InvalidParameterValue` for rather than as
+            // a validation clause, in the sentence it words for THAT member
+            // ([`crate::state::fleet_instance_match_criteria_refusal_message`]) — which is what
+            // the handler that resolves this member answers too, so a caller reads one wording
+            // whichever side of dispatch refused the value. The value it names is already
+            // elided to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot amplify a
+            // request into an arbitrarily long response.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::fleet_instance_match_criteria_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+            if crate::state::range_refused_as_invalid_request(input_being_read().as_deref()) =>
+        {
+            // The surfaces recorded answering EC2's own `InvalidRequest` for a value outside a
+            // member's published `@range`
+            // ([`crate::state::RANGE_REFUSED_AS_INVALID_REQUEST_INPUT_SHAPES`]) answer that
+            // code over AWS's OWN validation clause for the value — the sentence the framework
+            // builds from the violation (`aws_smithy_schema_server::envelope`), which names the
+            // member, the value the request sent and the bound the member's `@range`
+            // publishes. Only the CODE is this service's, so an operation with another bound is
+            // refused with its own and nothing of one run's request is written here. The clause
+            // is built from this violation alone, because EC2 reports one parameter at a time.
+            Some(Refused {
+                code: crate::state::INVALID_REQUEST.to_string(),
+                message: aws_smithy_schema_server::envelope(::std::slice::from_ref(violation))
+                    .unwrap_or_default(),
             })
         }
         _ => None,

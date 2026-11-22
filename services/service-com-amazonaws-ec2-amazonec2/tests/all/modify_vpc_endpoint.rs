@@ -1103,7 +1103,7 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
                 param("PolicyDocument", "not json at all"),
             ],
             400,
-            ec2::state::INVALID_PARAMETER_VALUE,
+            ec2::state::INVALID_POLICY_DOCUMENT,
         ),
         (
             "a policy document past the published quota",
@@ -1112,7 +1112,7 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
                 param("PolicyDocument", oversize_policy.as_str()),
             ],
             400,
-            ec2::state::INVALID_PARAMETER_VALUE,
+            ec2::state::INVALID_POLICY_DOCUMENT,
         ),
         (
             "a reset and a policy document in the same call",

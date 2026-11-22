@@ -224,11 +224,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the modelled `FleetCapacityReservationTenancy` (`$Tenancy`). The catalogs are
         // the GENERATED ones, so this crate holds no second copy of either, and a request
         // that names neither inherits the single value each publishes.
-        let instance_match_criteria = catalog_word(
-            input.instance_match_criteria.as_deref(),
-            FLEET_INSTANCE_MATCH_CRITERIA_VALUES,
-            "instanceMatchCriteria",
-        )?;
+        //
+        // The criteria has a sentence of its OWN for a value the catalog does not hold
+        // (`crate::state::fleet_instance_match_criteria_refusal_message`, which is also what
+        // the boundary answers when it refuses the value before this handler runs), so that
+        // member is resolved against the catalog here rather than through the general clause.
+        let instance_match_criteria = match input.instance_match_criteria.as_deref() {
+            Some(requested) if !FLEET_INSTANCE_MATCH_CRITERIA_VALUES.contains(&requested) => {
+                return Err(Scaffolded::invalid_parameter_value(
+                    crate::state::fleet_instance_match_criteria_refusal_message(requested),
+                ));
+            }
+            requested => catalog_word(
+                requested,
+                FLEET_INSTANCE_MATCH_CRITERIA_VALUES,
+                crate::state::FLEET_INSTANCE_MATCH_CRITERIA_MEMBER,
+            )?,
+        };
         let tenancy = catalog_word(
             input.tenancy.as_deref(),
             FLEET_CAPACITY_RESERVATION_TENANCY_VALUES,

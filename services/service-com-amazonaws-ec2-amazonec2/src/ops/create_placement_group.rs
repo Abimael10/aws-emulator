@@ -201,8 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The number of partitions. Valid only when Strategy is set to partition"
         // (`$PartitionCount`): with any other strategy there are no partitions for the
-        // count to describe, so naming one is a combination that cannot hold rather than a
-        // value to ignore.
+        // count to describe, so naming one is a value this operation cannot use rather than
+        // a value to ignore ([`strategy_scoped_member_refusal`]).
         let partition_count = match (strategy, input.partition_count) {
             (state::PLACEMENT_STRATEGY_PARTITION, Some(count)) => {
                 if !(state::MIN_PLACEMENT_GROUP_PARTITION_COUNT
@@ -224,11 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(state::DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT)
             }
             (_, Some(count)) => {
-                return Err(state::invalid_parameter_combination(format!(
-                    "PartitionCount ({count}) is valid only when Strategy is \
-                     '{partition}', not '{strategy}'",
-                    partition = state::PLACEMENT_STRATEGY_PARTITION,
-                )))
+                return Err(strategy_scoped_member_refusal(
+                    "partitionCount",
+                    &count.to_string(),
+                    state::PLACEMENT_STRATEGY_PARTITION,
+                ))
             }
             (_, None) => None,
         };
@@ -250,11 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (state::PLACEMENT_STRATEGY_SPREAD, None) => Some(state::SPREAD_LEVEL_RACK),
             (_, Some(requested)) => {
-                return Err(state::invalid_parameter_combination(format!(
-                    "SpreadLevel ({requested}) is valid only when Strategy is \
-                     '{spread}', not '{strategy}'",
-                    spread = state::PLACEMENT_STRATEGY_SPREAD,
-                )))
+                return Err(strategy_scoped_member_refusal(
+                    "spreadLevel",
+                    requested,
+                    state::PLACEMENT_STRATEGY_SPREAD,
+                ))
             }
             (_, None) => None,
         };
@@ -308,11 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Some(parent) => {
                 if strategy != state::PLACEMENT_STRATEGY_CLUSTER {
-                    return Err(state::invalid_parameter_combination(format!(
-                        "ParentGroupId ({parent}) is valid only when Strategy is \
-                         '{cluster}', not '{strategy}'",
-                        cluster = state::PLACEMENT_STRATEGY_CLUSTER,
-                    )));
+                    return Err(strategy_scoped_member_refusal(
+                        "parentGroupId",
+                        parent,
+                        state::PLACEMENT_STRATEGY_CLUSTER,
+                    ));
                 }
                 if !store.placement_groups.contains_key(parent) {
                     return Err(state::invalid_placement_group_unknown(parent));
@@ -376,4 +376,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             placement_group: Some(group),
         })
     }
+}
+
+/// Refuse a member the model documents as "valid only when `Strategy` is set to
+/// `<required_strategy>`" that arrived with another strategy: HTTP 400
+/// `InvalidParameterValue`, naming the member, the value it carried and the strategy it holds
+/// for.
+///
+/// Each of this operation's three strategy-scoped members carries that rule —
+/// `PartitionCount` is "valid only when Strategy is set to `partition`", `SpreadLevel`
+/// describes the `spread` strategy, and `ParentGroupId` is "valid only when Strategy is set to
+/// `cluster`" — and all three are refused HERE, so one rule has one implementation and one
+/// wording.
+///
+/// The CLASS is the value's and not the combination's: the strategy the request asked for is
+/// one EC2 serves, so what the caller has to repair is the member that does not belong to it —
+/// a value EC2 cannot use for that parameter. Both variable parts come from the request; the
+/// strategy word comes from this crate's own catalog constants.
+fn strategy_scoped_member_refusal<E>(
+    member: &str,
+    value: &str,
+    required_strategy: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::state::invalid_parameter_value(format!(
+        "Value ({value}) for parameter {member} is invalid. \
+         {declared} is valid only when Strategy is set to {required_strategy}.",
+        declared = crate::state::declared_member_name(member),
+    ))
 }

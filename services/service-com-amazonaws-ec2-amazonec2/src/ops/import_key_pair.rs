@@ -16,7 +16,7 @@
 //! model states for an imported pair, which is not the rule a generated pair's fingerprint
 //! follows. The caller owns only the name, the material and the tags: a name the account
 //! already holds is `InvalidKeyPair.Duplicate`, exactly as it is for a create, and material
-//! that is not an RSA or ED25519 public key EC2 can read is `InvalidKeyPair.Format`.
+//! that is not an RSA or ED25519 public key EC2 can read is `InvalidKey.Format`.
 //!
 //! ## Shape of an operation
 //!
@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // third-party tool", and material that is not such a key is refused rather than
         // stored as a pair whose fingerprint stands for nothing.
         let Some(imported) = state::read_public_key_material(&input.public_key_material) else {
-            return Err(state::invalid_key_pair_format());
+            return Err(state::invalid_key_format());
         };
 
         // "The tags to apply to the imported key pair" (`$TagSpecifications`) — the shared

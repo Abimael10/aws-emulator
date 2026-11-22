@@ -415,6 +415,21 @@ pub const RECORDED_PAGE_SIZE_WORDINGS: &[RecordedPageSizeRefusal] = &[
         above_largest_code: INVALID_MAX_RESULTS,
         wording: PageSizeWording::ComparedWithBound,
     },
+    // `GetManagedPrefixListAssociations` publishes 5..255
+    // (`GetManagedPrefixListAssociationsMaxResults`), and a page size below that floor is
+    // recorded carrying the code EC2 answers for a parameter value it cannot use rather than
+    // its own page-size code: EC2 is not uniform here, so this operation's floor refusal is
+    // keyed to it instead of taking the default. Its sentence is the one every paged operation
+    // whose own wording is not recorded answers ([`DEFAULT_PAGE_SIZE_WORDING`]).
+    RecordedPageSizeRefusal {
+        input_shape: "GetManagedPrefixListAssociationsRequest",
+        below_smallest_code: INVALID_PARAMETER_VALUE,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::ValueForParameter {
+            parameter: DEFAULT_PAGE_SIZE_WORDING.0,
+            clause: DEFAULT_PAGE_SIZE_WORDING.1,
+        },
+    },
 ];
 
 /// The `(minimum, maximum)` page size the Reachability Analyzer describes publish: the
@@ -547,6 +562,29 @@ pub fn page_size_message(
          {clause} {bound}.",
         comparison = outside.comparison(),
     )
+}
+
+/// The input shapes whose operation refuses a value outside a member's published `@range` with
+/// EC2's own [`INVALID_REQUEST`] rather than with the framework's model-constraint code.
+///
+/// EC2 answers no error SHAPES, so the code a refused `@range` carries is a fact of the
+/// operation recorded by its callers, exactly as the page-size codes are
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]): the snapshot-lock surface — whose `LockDuration` and
+/// `CoolOffPeriod` are the periods a lock is asked for — is recorded answering `InvalidRequest`
+/// for a period outside the range the model publishes, under AWS's own validation clause for
+/// the value. Keyed to the INPUT SHAPE, the one key that names the members of ONE operation, so
+/// every ranged member of an operation named here is refused in that operation's own code; an
+/// operation not named here keeps the framework's own refusal whole.
+pub const RANGE_REFUSED_AS_INVALID_REQUEST_INPUT_SHAPES: &[&str] = &["LockSnapshotRequest"];
+
+/// Whether the operation reading `input_shape` refuses a value outside a member's published
+/// `@range` with EC2's own [`INVALID_REQUEST`]
+/// ([`RANGE_REFUSED_AS_INVALID_REQUEST_INPUT_SHAPES`]).
+///
+/// `None` — a refusal given before any input shape was read — is `false`, so such a refusal
+/// keeps the framework's own answer rather than taking another request's.
+pub fn range_refused_as_invalid_request(input_shape: Option<&str>) -> bool {
+    input_shape.is_some_and(|shape| RANGE_REFUSED_AS_INVALID_REQUEST_INPUT_SHAPES.contains(&shape))
 }
 
 /// How EC2 refuses a page size outside the range an operation publishes: the two bounds of

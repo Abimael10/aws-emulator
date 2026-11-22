@@ -851,7 +851,7 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
                 param("PolicyDocument", "allow everything"),
             ],
             400,
-            ec2::state::INVALID_PARAMETER_VALUE,
+            ec2::state::INVALID_POLICY_DOCUMENT,
         ),
         (
             "a policy past the published size quota",
@@ -861,7 +861,7 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
                 param("PolicyDocument", &oversize_policy),
             ],
             400,
-            ec2::state::INVALID_PARAMETER_VALUE,
+            ec2::state::INVALID_POLICY_DOCUMENT,
         ),
         (
             "two configurations for one subnet",

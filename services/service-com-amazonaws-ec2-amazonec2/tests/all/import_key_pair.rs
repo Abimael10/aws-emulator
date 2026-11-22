@@ -572,7 +572,7 @@ fn refusal_table() -> Vec<RefusalCase> {
         (
             "material that is not a key at all",
             import_params("not-a-key", "this is not a public key", &[]),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -585,7 +585,7 @@ fn refusal_table() -> Vec<RefusalCase> {
                 ),
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -597,7 +597,7 @@ fn refusal_table() -> Vec<RefusalCase> {
                     .trim_end_matches("---- END SSH2 PUBLIC KEY ----"),
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -608,7 +608,7 @@ fn refusal_table() -> Vec<RefusalCase> {
                  ---- END SSH2 PUBLIC KEY ----\n",
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -619,13 +619,13 @@ fn refusal_table() -> Vec<RefusalCase> {
                  ---- END SSH2 PUBLIC KEY ----\n",
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
             "an openssh line whose body is truncated",
             import_params("truncated", &readable_key[..readable_key.len() - 20], &[]),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -635,7 +635,7 @@ fn refusal_table() -> Vec<RefusalCase> {
                 &openssh_line("ssh-rsa", &rsa_blob(512, 22), ""),
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -645,7 +645,7 @@ fn refusal_table() -> Vec<RefusalCase> {
                 &openssh_line("ssh-rsa", &rsa_blob(3072, 23), ""),
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
@@ -655,13 +655,13 @@ fn refusal_table() -> Vec<RefusalCase> {
                 &openssh_line("ssh-rsa", &rsa_blob(8192, 24), ""),
                 &[],
             ),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (
             "a readable key of an algorithm an import does not take",
             import_params("ecdsa", &ecdsa, &[]),
-            ec2::state::INVALID_KEY_PAIR_FORMAT,
+            ec2::state::INVALID_KEY_FORMAT,
             400,
         ),
         (

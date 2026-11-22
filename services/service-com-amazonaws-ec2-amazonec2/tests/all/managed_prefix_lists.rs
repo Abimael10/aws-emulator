@@ -563,12 +563,12 @@ async fn a_create_outside_the_documented_constraints_is_refused_and_stores_nothi
         RefusalCase {
             name: "an IPv6 entry on an IPv4 list",
             params: ipv6_entry_on_an_ipv4_list,
-            code: "InvalidParameterValue",
+            code: "InvalidParameterCombination",
         },
         RefusalCase {
             name: "an IPv4 entry on an IPv6 list",
             params: ipv4_entry_on_an_ipv6_list,
-            code: "InvalidParameterValue",
+            code: "InvalidParameterCombination",
         },
         RefusalCase {
             name: "one range given twice",
