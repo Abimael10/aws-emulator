@@ -86,7 +86,10 @@ fn kms_arn() -> String {
 /// `POST /matchingworkflows/{workflowName}/jobs` — `StartMatchingJob`. The operation
 /// models no body members at all (`workflowName` is its only input, an @httpLabel), so
 /// the request carries no payload.
-async fn start_matching_job(emulator: &Emulator, workflow_name: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling `response_messages` suite drives the SAME wire path when
+/// it pins this operation's refusal TEXT, instead of cloning a second caller.
+pub(crate) async fn start_matching_job(emulator: &Emulator, workflow_name: &str) -> Reply {
     emulator
         .call(
             "POST",

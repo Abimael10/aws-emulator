@@ -850,10 +850,12 @@ impl Default for ComAmazonawsEntityresolutionAwsveniceserviceState {
 /// spells it (`SchemaMapping`, `MatchingWorkflow`), with the requested name
 /// substituted only where that operation's own template includes it. None of it is a
 /// sentence composed from the request or from the stored record, and none of it is
-/// shared between operations: a missing workflow reads `MatchingWorkflow Not Found`
-/// from `GetMatchingWorkflow` but `MatchingWorkflow <workflowName> does not exist`
-/// from `DeleteMatchingWorkflow`, so collapsing the two into one string would be
-/// wrong. Each path therefore gets its OWN item below, derived from no other.
+/// shared between operations: one missing workflow reads `MatchingWorkflow Not Found`
+/// from `GetMatchingWorkflow`, `MatchingWorkflow <workflowName> does not exist` from
+/// `DeleteMatchingWorkflow` and `Workflow not found.` from `StartMatchingJob`, so
+/// collapsing any two of them into one string would be wrong. Each path therefore gets
+/// its OWN item below, derived from no other — an operation's text is never justified
+/// by what ANOTHER operation was observed answering, however alike the two lookups are.
 pub mod messages {
     /// `DeleteSchemaMappingOutput$message` — modelled @required, target `String`, doc
     /// "A successful operation message"
@@ -959,10 +961,15 @@ pub mod messages {
     /// `StartMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when no
     /// matching workflow of the requested name exists — the condition this operation's
     /// own doc describes ("The workflow must have previously been created using the
-    /// CreateMatchingWorkflow endpoint"). Not itself recorded; this operation's OWN
-    /// constant, spelled with the resource type the API uses and in the same constant
-    /// form as the recorded [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
-    pub const START_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+    /// CreateMatchingWorkflow endpoint").
+    ///
+    /// The whole string is this operation's own fixed text as the corpus shows AWS
+    /// wording it: a sentence, spelling the resource `Workflow`, with no name of the
+    /// workflow that was asked for composed into it. It is deliberately NOT the
+    /// reader's text — the same missing workflow reads
+    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] from `GetMatchingWorkflow` — so the start
+    /// path's wording is never derived from the read path's.
+    pub const START_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "Workflow not found.";
 
     /// `StartMatchingJob`'s `ConflictException$message` (HTTP 400) when a job of that
     /// workflow is still in progress — the condition `ConflictException`'s own doc
@@ -971,8 +978,9 @@ pub mod messages {
     pub const START_MATCHING_JOB_ALREADY_RUNNING: &str = "MatchingWorkflow is currently running";
 
     /// `GetMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when the
-    /// `workflowName` names no matching workflow. This reader's own constant, in the
-    /// same form as [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    /// `workflowName` names no matching workflow. This reader's own constant: not
+    /// recorded, so it stands on the `<ResourceType> Not Found` form this API's readers
+    /// use rather than on any other operation's observed text.
     pub const GET_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
     /// `GetMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when the
@@ -1094,9 +1102,9 @@ pub mod messages {
     /// no workflow carries the `workflowName` @httpLabel. Not itself recorded; it is
     /// this operation's own constant. `UpdateMatchingWorkflow` addresses the SAME
     /// resource by the SAME key as `GetMatchingWorkflow` ("The workflow must already
-    /// exist for this operation to succeed"), and AWS's text for that lookup names no
-    /// resource name, so this follows the recorded
-    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] form rather than the templated delete one.
+    /// exist for this operation to succeed"), so this names no workflow either and
+    /// follows the `<ResourceType> Not Found` form rather than the templated delete
+    /// one — a choice about FORM only, never a claim that the two share one text.
     pub const UPDATE_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
     /// `UpdateIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404) when no ID
@@ -1179,8 +1187,8 @@ pub mod messages {
     /// `workflowName` @httpLabel names no matching workflow — the precondition its own
     /// doc states ("The rule-based matching workflow must exist and be active before
     /// calling this operation"). Not recorded; this operation's own constant, spelled
-    /// with the resource type the API uses, in the same form as the recorded
-    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    /// with the resource type the API uses, standing on that naming form alone and not
+    /// on another operation's observed text.
     pub const GENERATE_MATCH_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
     /// `GetMatchId`'s `ResourceNotFoundException$message` (HTTP 404) when the
@@ -1190,8 +1198,8 @@ pub mod messages {
 
     /// `BatchDeleteUniqueId`'s `ResourceNotFoundException$message` (HTTP 404) when the
     /// `workflowName` @httpLabel names no matching workflow. This operation's own
-    /// constant, spelled with the resource type the API uses and in the same form as
-    /// the recorded [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    /// constant, spelled with the resource type the API uses; not recorded, and not
+    /// taken from another operation's observed text.
     pub const BATCH_DELETE_UNIQUE_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
     /// `BatchDeleteUniqueId`'s `ValidationException$message` (HTTP 400) when the

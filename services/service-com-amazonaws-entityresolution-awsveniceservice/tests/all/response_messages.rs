@@ -16,8 +16,9 @@
 //! the store for the in-use conflict, which is what tells a caller which workflow blocks
 //! the delete. For a path whose text carries no name it is INVARIANT over the name, the
 //! size and the shape of the resource; and the wording is per-operation, so
-//! `GetMatchingWorkflow`'s not-found text and `DeleteMatchingWorkflow`'s are different
-//! strings, and two `Delete*` success texts need not even share their capitalization.
+//! `GetMatchingWorkflow`'s not-found text, `DeleteMatchingWorkflow`'s and
+//! `StartMatchingJob`'s are three different strings, and two `Delete*` success texts
+//! need not even share their capitalization.
 //!
 //! Each table row differs along what the rule generalises over: the resource name
 //! (every character class the modelled `EntityName` pattern `^[a-zA-Z_0-9-]*$`
@@ -30,6 +31,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use crate::matching_job_lifecycle::start_matching_job;
 use crate::schema_mapping_workflow_lifecycle::{
     assert_error_shape, glue_table_arn, role_arn, string_member, Emulator, Reply,
 };
@@ -50,6 +52,10 @@ const ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
 /// `DeleteIdNamespace`'s success text, as AWS words it — `deleted` lowercase, which is
 /// not the casing of [`SCHEMA_MAPPING_DELETED`].
 const ID_NAMESPACE_DELETED: &str = "IdNamespace deleted.";
+/// `StartMatchingJob`'s not-found text, as AWS words it for the START path: a sentence
+/// spelling the resource `Workflow`, which is NOT the reader's
+/// [`MATCHING_WORKFLOW_NOT_FOUND`] for the very same missing workflow.
+const START_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "Workflow not found.";
 
 /// A DELETE path's text is a template over the request: the `@httpLabel` the caller
 /// asked for is substituted into it.
@@ -327,6 +333,82 @@ async fn a_reader_answers_its_own_constant_not_found_message() {
              asked for, saw {texts:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn start_matching_job_answers_its_own_not_found_text_not_the_readers() {
+    let emulator = Emulator::new();
+    let mut start_texts = BTreeSet::new();
+
+    for case in name_cases() {
+        let label = case.case;
+
+        // A workflow that was never created at all.
+        let never_created = start_matching_job(&emulator, &case.name).await;
+        assert_error(
+            label,
+            &never_created,
+            404,
+            "ResourceNotFoundException",
+            START_MATCHING_JOB_WORKFLOW_NOT_FOUND,
+        );
+        start_texts.insert(string_member(&never_created.body, "message"));
+
+        // And the same name after a workflow under it was created and DELETED: the
+        // store no longer holds it, so the start is refused the same way.
+        let schemas = create_referenced_schemas(&emulator, &case).await;
+        let created = emulator
+            .create_matching_workflow(&workflow_request(&case.name, &schemas))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: expected HTTP 200 from CreateMatchingWorkflow, got {created:?}"
+        );
+        let deleted = emulator.delete_matching_workflow(&case.name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {label:?}: expected HTTP 200 from DeleteMatchingWorkflow, got {deleted:?}"
+        );
+        let after_delete = start_matching_job(&emulator, &case.name).await;
+        assert_error(
+            label,
+            &after_delete,
+            404,
+            "ResourceNotFoundException",
+            START_MATCHING_JOB_WORKFLOW_NOT_FOUND,
+        );
+        let start_message = string_member(&after_delete.body, "message");
+        start_texts.insert(start_message.clone());
+
+        // The text carries nothing of the request, and the READER of the same missing
+        // workflow answers a DIFFERENT string, so no one constant can serve both paths.
+        assert!(
+            !start_message.contains(case.name.as_str()),
+            "case {label:?}: the start path's not-found text must not be composed from the \
+             requested name, got {start_message:?}"
+        );
+        let read = emulator.get_matching_workflow(&case.name).await;
+        assert_error(
+            label,
+            &read,
+            404,
+            "ResourceNotFoundException",
+            MATCHING_WORKFLOW_NOT_FOUND,
+        );
+        assert_ne!(
+            string_member(&read.body, "message"),
+            start_message,
+            "case {label:?}: StartMatchingJob and GetMatchingWorkflow must not answer the \
+             same not-found text"
+        );
+    }
+
+    assert_eq!(
+        start_texts.len(),
+        1,
+        "StartMatchingJob's not-found message must not depend on the workflow it was \
+         asked for, nor on whether that workflow ever existed, saw {start_texts:?}"
+    );
 }
 
 #[tokio::test]
