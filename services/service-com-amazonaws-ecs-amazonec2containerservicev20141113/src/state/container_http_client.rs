@@ -21,6 +21,23 @@
 //! started ([`super::container_servers`]) — and every other address is one this session has no
 //! network to reach, which stays a command it could not run.
 //!
+//! # Where the document GOES
+//!
+//! Each client has its own default and its own way of being told otherwise, and a probe written
+//! as a pipeline depends on which one it asked for:
+//!
+//! * `curl` writes what it fetched to its standard output unless it was given a file to save it
+//!   in ("`-o`, `--output <file>` — write to file instead of stdout");
+//! * `wget` SAVES it, "to a file whose name corresponds to the URL", unless it was given a
+//!   name — and the name `-` is standard output itself: "if `-` is used as file, documents will
+//!   be printed to standard output" (the GNU Wget manual's `-O file` /
+//!   `--output-document=file`), which is what [`STANDARD_OUTPUT_OPERAND`] names.
+//!
+//! So a document asked for on standard output goes through the session's own stream — the pipe
+//! the next command of a pipeline reads, the file a redirection names, or the container's own
+//! output — and nothing is saved for it; one asked for by NAME is saved under that name and goes
+//! nowhere else.
+//!
 //! # No socket, no host
 //!
 //! Nothing here dials anything, resolves a name or reads a host path. The servers are the ones
@@ -126,6 +143,16 @@ struct Request {
     /// The path the document is saved at, and `None` for a request whose document goes to the
     /// client's own output.
     save_to: Option<String>,
+    /// Whether the invocation asked for the document on STANDARD OUTPUT ITSELF, which both
+    /// clients spell with [`STANDARD_OUTPUT_OPERAND`] as the name of the file to write — "if
+    /// `-` is used as file, documents will be printed to standard output" (the GNU Wget
+    /// manual).
+    ///
+    /// It is what tells that request from one naming no file at all: the downloader SAVES what
+    /// it fetched under a name of the URL's own when the invocation names none ([`saved_at`]),
+    /// so the two cannot be folded together without the document a probe pipes into another
+    /// command going to a file instead.
+    to_standard_output: bool,
     /// Whether the client reports an HTTP ERROR RESPONSE as a failure of its own.
     report_error: bool,
     /// Whether the client writes the document at all: the one invocation that asks only whether
@@ -163,7 +190,10 @@ fn read_request(program: &str, arguments: &[String]) -> Option<Request> {
         // That client writes what it fetched to its own output unless it was told to save it.
         save_to: invocation
             .output
-            .filter(|named| named != STANDARD_OUTPUT_OPERAND),
+            .as_deref()
+            .filter(|named| *named != STANDARD_OUTPUT_OPERAND)
+            .map(ToString::to_string),
+        to_standard_output: invocation.output.as_deref() == Some(STANDARD_OUTPUT_OPERAND),
         report_error: invocation.fail,
         wants_document: true,
     })
@@ -268,13 +298,15 @@ fn read_short_options(
 ///
 /// It saves what it fetched rather than writing it ("by default ... the output is written to a
 /// file whose name corresponds to the URL"), so an invocation naming no path still names where
-/// the document goes ([`saved_at`]); and it reports every error response as a failure of its own,
-/// having no option to be asked for one.
+/// the document goes ([`saved_at`]) — while one naming [`STANDARD_OUTPUT_OPERAND`] asked for the
+/// document on standard output itself and saves nothing; and it reports every error response as
+/// a failure of its own, having no option to be asked for one.
 fn read_downloader_request(arguments: &[String]) -> Option<Request> {
     let mut request = Request {
         method: "GET".to_string(),
         url: String::new(),
         save_to: None,
+        to_standard_output: false,
         report_error: true,
         wants_document: true,
     };
@@ -332,6 +364,7 @@ fn read_downloader_request(arguments: &[String]) -> Option<Request> {
     if request.url.is_empty() {
         return None;
     }
+    request.to_standard_output = named_output.as_deref() == Some(STANDARD_OUTPUT_OPERAND);
     request.save_to = named_output.filter(|named| named != STANDARD_OUTPUT_OPERAND);
     Some(request)
 }
@@ -362,6 +395,10 @@ impl ContainerHttpClient {
     /// nothing of: a form that client's reading does not read, a scheme it does not make a
     /// request over, or a host that is not this container's own task, which such a container has
     /// no network to reach.
+    ///
+    /// WHERE the document goes is each client's own (see this module's header): the answer
+    /// carries the path it is SAVED at, and none for the one that is written to the session's
+    /// standard output.
     ///
     /// A READ: asking a server for a document moves nothing of the container, of the task or of
     /// the records the server is published in.
@@ -422,11 +459,15 @@ impl ContainerHttpClient {
             status: 0,
             document,
             // The downloader SAVES what it fetched, so an invocation of it that named no path
-            // still names where the document goes.
-            save_to: match (&request.save_to, downloader && request.wants_document) {
+            // still names where the document goes — while one that named standard output
+            // itself asked for the document on this session's own stream, which is the pipe,
+            // the redirection or the container's output, and saves nothing.
+            save_to: match (&request.save_to, request.wants_document) {
                 (Some(named), _) => Some(named.clone()),
-                (None, true) => Some(saved_at(&path)),
-                (None, false) => None,
+                (None, true) if downloader && !request.to_standard_output => {
+                    Some(saved_at(&path))
+                }
+                (None, _) => None,
             },
         })
     }
@@ -805,6 +846,18 @@ mod tests {
                 HTTP_DOWNLOADER,
                 "-q -O /tmp/held http://localhost/ping",
                 Some("/tmp/held"),
+            ),
+            (
+                "the downloader asked for standard output itself",
+                HTTP_DOWNLOADER,
+                "-q -O - http://localhost/ping",
+                None,
+            ),
+            (
+                "the downloader asked for it with the operand joined to the option",
+                HTTP_DOWNLOADER,
+                "-qO- http://localhost/",
+                None,
             ),
             (
                 "the downloader asked only whether the document is there",
