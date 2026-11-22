@@ -195,13 +195,14 @@ pub fn channel_not_found_message(channel_type: &str, application_id: &str) -> St
 pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application not found";
 
 /// The service's generic text for a resource it does not hold — the
-/// `NotFoundException` message a request for a CHANNEL of an application answers with
-/// when the application that would hold it is not stored.
+/// `NotFoundException` message a request addressed at a resource OF an application
+/// answers with when that resource resolves to nothing: a channel of an application
+/// that is not stored, or an endpoint an application does not hold.
 ///
-/// A channel is reached as a resource of an application, so a request for one of an
-/// application that does not exist resolves no resource at all and is refused as such:
-/// the refusal classifies neither the channel (there is no application to enable it on)
-/// nor the application (the caller addressed a channel), and carries nothing out of the
+/// Such a resource is reached through the application, so a request for one that does
+/// not resolve is refused as a resource rather than as the application: the refusal
+/// classifies neither the channel (there is no application to enable it on) nor the
+/// application (the caller addressed a resource of one), and carries nothing out of the
 /// request.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 

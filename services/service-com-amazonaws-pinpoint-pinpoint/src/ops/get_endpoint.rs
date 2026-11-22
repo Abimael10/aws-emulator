@@ -171,12 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An endpoint is reached as a resource OF an application, so an id the
+        // application does not hold resolves no resource: the refusal is the service's
+        // generic resource text, which classifies neither the application (the caller
+        // addressed an endpoint of one that IS stored) nor anything out of the request
+        // — the identifiers the caller named are not part of the text.
         let Some(endpoint) = app.endpoints.get(&input.endpoint_id) else {
             return Err(GetEndpointErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Endpoint not found: {} in application {}",
-                    input.endpoint_id, input.application_id
-                )),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 request_id: None,
             })
             .into());
