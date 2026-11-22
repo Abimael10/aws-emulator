@@ -147,8 +147,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{self, CAPACITY_RESERVATION_PREFERENCE_ONLY, InstanceStateName};
 
         // Which instance is reconfigured and which reservation it is pointed at are facts of
-        // the ids the request names: nothing here depends on the request's metadata.
-        let _ = ctx;
+        // the ids the request names, and both are resources of the Region it was signed for:
+        // EC2 is reached through a regional endpoint, so an id naming an instance of another
+        // Region names no instance here.
+        let region = state::request_region(ctx.parts());
 
         let specification = &input.capacity_reservation_specification;
         // "Indicates the instance's Capacity Reservation preferences"
@@ -200,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the instance to be modified" (`$InstanceId`), resolved through the one
         // reading of those two refusals this crate has: malformed before not-found.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
         let instance_state = instance.state;
         let instance_id = instance.instance_id.clone();
         let instance_type = instance.instance_type.clone();

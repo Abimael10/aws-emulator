@@ -161,10 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             require_service_state,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — a link is a
-        // fact of the instance and the VPC, not of the Region the request was signed for.
-        // The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: a link is a fact of the instance and the
+        // VPC, and both are resources of THIS Region — EC2 is reached through a regional
+        // endpoint, so an instance of another Region is invisible here and an id naming one
+        // names no instance at all. The store is reached through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The instance IDs" (`InstanceIds`): every entry is resolved against the store
         // below, so the list is capped the way every other EC2 request's id list is, before
@@ -267,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it sits among ids that name no instance.
         require_well_formed_instance_ids(requested_ids)?;
         for instance_id in requested_ids {
-            require_known_instance(&store, instance_id)?;
+            require_known_instance(&store, &region, instance_id)?;
         }
 
         // DryRun sits AFTER every parameter has been validated and every named instance
@@ -298,6 +299,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The id narrowing is read off the key, so a link the request did not name
             // costs no projection and no comparison at all.
             if !wanted.is_empty() && !wanted.contains(instance_id.as_str()) {
+                continue;
+            }
+            // The Region scope, asked before any filter: a link over an instance of another
+            // Region is invisible to this request, so it is not a candidate at all.
+            if crate::state::instance_record_in_region(&store, &region, instance_id).is_none() {
                 continue;
             }
             let Some(view) = store.classic_link_instance_view(instance_id) else {

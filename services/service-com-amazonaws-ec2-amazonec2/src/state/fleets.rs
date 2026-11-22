@@ -1755,6 +1755,7 @@ pub fn require_known_mac_modification_task<E>(
 /// name, and the resolved record is handed back so a handler reads the instance once.
 pub fn require_mac_instance<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, Scaffolded<E>> {
     // The Mac task validators word an instance id they cannot read their own way — "The
@@ -1764,6 +1765,7 @@ pub fn require_mac_instance<'store, E>(
     // id ([`require_instance_record_worded`]).
     let instance = require_instance_record_worded(
         store,
+        region,
         instance_id,
         Scaffolded::instance_id_is_malformed,
     )?;

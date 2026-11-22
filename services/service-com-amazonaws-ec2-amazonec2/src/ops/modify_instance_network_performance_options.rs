@@ -146,8 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{self, InstanceStateName};
 
         // Which instance is reconfigured is a fact of the id the request names, and the
-        // weighting comes off the request: nothing here depends on the request's metadata.
-        let _ = ctx;
+        // weighting comes off the request — but the instance is one of the Region the request
+        // was signed for: EC2 is reached through a regional endpoint, so an id naming an
+        // instance of another Region names no instance here.
+        let region = state::request_region(ctx.parts());
 
         // "Specify the bandwidth weighting option to boost the associated type of baseline
         // bandwidth" (`$BandwidthWeighting`), resolved against the catalog of its own modelled
@@ -176,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the instance to update" (`$InstanceId`), resolved through the one reading
         // of those two refusals this crate has: malformed before not-found.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
         let instance_state = instance.state;
         // The id is read back off the record the lookup resolved, so the answer reports the
         // stored instance rather than the request's text.

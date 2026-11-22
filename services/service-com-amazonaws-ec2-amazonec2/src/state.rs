@@ -3144,6 +3144,10 @@ mod service_link_virtual_interfaces;
 /// primitive of this module.
 mod tag_descriptions;
 mod instance_ids_and_instance_types;
+/// The Region scope of a named instance: the one reading of whether an instance is one of
+/// the Region a request was signed for. Re-exported below, so the resolvers and the handlers
+/// reach it as `crate::state::instance_record_in_region` like any other primitive here.
+mod instance_region_scope;
 /// The display data AWS publishes for a Region — its long name, its geography and its
 /// sub-geography — as the zones of that Region report it. Re-exported below, so a zone's
 /// projection reaches it as `crate::state::region_display` like any other primitive here.
@@ -3188,6 +3192,7 @@ pub use default_subnets::*;
 pub use instances_and_filters::*;
 pub use instance_report_filters::*;
 pub use instance_ids_and_instance_types::*;
+pub use instance_region_scope::*;
 pub use availability_zone_display::*;
 pub use local_gateways_and_filter_patterns::*;
 pub use outpost_lags::*;

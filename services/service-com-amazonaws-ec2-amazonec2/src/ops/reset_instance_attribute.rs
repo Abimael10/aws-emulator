@@ -161,15 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            require_known_instance, require_service_state, unknown_attribute_parameter_value,
-            InstanceStateName, DEFAULT_SOURCE_DEST_CHECK, INSTANCE_ATTRIBUTE_KERNEL,
-            INSTANCE_ATTRIBUTE_RAMDISK, INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK,
-            RESETTABLE_INSTANCE_ATTRIBUTES,
+            instance_record_in_region, request_region, require_known_instance,
+            require_service_state, unknown_attribute_parameter_value, InstanceStateName,
+            DEFAULT_SOURCE_DEST_CHECK, INSTANCE_ATTRIBUTE_KERNEL, INSTANCE_ATTRIBUTE_RAMDISK,
+            INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK, RESETTABLE_INSTANCE_ATTRIBUTES,
         };
+
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so an id naming an instance of another Region names no instance here and
+        // no attribute of it may be reset.
+        let region = request_region(ctx.parts());
 
         // "You can only reset the following attributes: kernel | ramdisk |
         // sourceDestCheck" (`ResetInstanceAttributeRequest$Attribute`). Every other
@@ -194,8 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The one definition of how this service resolves an instance id: malformed before
         // unknown.
-        require_known_instance(&store, &input.instance_id)?;
-        let Some(instance) = store.instances.get(&input.instance_id) else {
+        require_known_instance(&store, &region, &input.instance_id)?;
+        let Some(instance) = instance_record_in_region(&store, &region, &input.instance_id) else {
             return Err(Scaffolded::invalid_instance_id_not_found(&input.instance_id));
         };
 

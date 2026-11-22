@@ -169,11 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
-        use crate::state::{require_instance_record, require_service_state, InstanceStateName};
+        use crate::state::{
+            request_region, require_instance_record, require_service_state, InstanceStateName,
+        };
 
-        // Nothing about this answer depends on the request's Region or headers: which
-        // instance takes the interrupt is a fact of the id the request names.
-        let _ = ctx;
+        // Which instance takes the interrupt is a fact of the id the request names, and that
+        // instance is one of the Region the request was signed for: EC2 is reached through a
+        // regional endpoint, so an id naming an instance of another Region names no instance
+        // here.
+        let region = request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the operation, WITHOUT
         // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation"
@@ -194,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Malformed before unknown, the order this service resolves an instance id in. The
         // id is read back off the record the lookup resolved, so the interrupt is recorded
         // against the stored instance rather than against the request's text.
-        let instance = require_instance_record(&store, &input.instance_id)?;
+        let instance = require_instance_record(&store, &region, &input.instance_id)?;
         // An interrupt "triggers a kernel panic … or a blue screen/stop error", which needs
         // an operating system that is up to crash. An instance in `pending` is one the
         // clock is about to make `running` and nothing else, so this service's own launch

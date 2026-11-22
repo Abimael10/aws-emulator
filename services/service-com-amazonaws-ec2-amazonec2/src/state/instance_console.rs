@@ -41,6 +41,7 @@ use super::InstanceRecord;
 /// looking it up again behind an unreachable branch.
 pub fn require_console_instance<'store, E>(
     store: &'store super::ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     // A value that is not an instance id at all never reaches the store: it is refused by
@@ -50,9 +51,10 @@ pub fn require_console_instance<'store, E>(
             instance_id,
         ));
     }
-    store
-        .instances
-        .get(instance_id)
+    // An instance of ANOTHER Region is as absent as an id the account holds no instance
+    // under, EC2 being reached through a regional endpoint, so it is answered the same
+    // sentence this reading words an absent instance with.
+    super::instance_record_in_region(store, region, instance_id)
         .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
 }
 

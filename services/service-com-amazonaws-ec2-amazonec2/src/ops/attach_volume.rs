@@ -207,9 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volume_already_attached, volume_id_is_well_formed,
         };
 
-        // Both resources carry their own Availability Zone, so nothing here depends on the
-        // Region the request was signed for.
-        let _ = ctx;
+        // Both resources carry their own Availability Zone, and both are resources of the
+        // Region this request was signed for: EC2 is reached through a regional endpoint, so
+        // an id naming an instance of another Region names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         if !volume_id_is_well_formed(&input.volume_id) {
             return Err(invalid_volume_id_malformed(&input.volume_id));
@@ -258,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // looked up twice and no branch is left for an id that resolved and could then not
         // be read. The instance is resolved first, because it is the resource the volume is
         // checked AGAINST — its zone and its state are what admit the attach.
-        let instance = require_instance_record(&store, &input.instance_id)?;
+        let instance = require_instance_record(&store, &region, &input.instance_id)?;
         let instance_zone = instance.placement_az.clone();
         let instance_type = instance.instance_type.clone();
         let instance_state = instance.state;

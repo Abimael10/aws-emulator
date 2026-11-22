@@ -430,35 +430,10 @@ pub fn require_well_formed_instance_ids<E>(
 /// the sentence [`require_instance_record`] beneath it answers.
 pub fn require_known_instance<E>(
     store: &ComAmazonawsEc2Amazonec2State,
-    instance_id: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    require_instance_record(store, instance_id).map(|_| ())
-}
-
-/// [`require_known_instance`] for an operation reached through a REGIONAL endpoint: the same
-/// two refusals, plus `InvalidInstanceID.NotFound` for an instance of another Region.
-///
-/// EC2 is a regional service reached through a regional endpoint, so "the instances" an
-/// operation of it acts on are the ones of the Region the request was signed for: an instance
-/// that runs in another Region is invisible here, and an id naming one names no instance at
-/// all. The Region an instance runs in is read through the crate's one answer to that
-/// ([`instance_region`]), so an operation that ACTS on an instance and one that REPORTS it
-/// cannot disagree about which Region holds it — the same scope `DescribeInstances` applies
-/// to the ids it is given.
-///
-/// The ONE place that scope is applied to a named instance, so no operation re-spells it.
-pub fn require_instance_record_in_region<'store, E>(
-    store: &'store ComAmazonawsEc2Amazonec2State,
     region: &str,
     instance_id: &str,
-) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    let instance = require_instance_record(store, instance_id)?;
-    if instance_region(instance) != region {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_not_found(
-            instance_id,
-        ));
-    }
-    Ok(instance)
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_instance_record(store, region, instance_id).map(|_| ())
 }
 
 /// The stored instance `instance_id` names for an operation that DECODES a long-form id
@@ -495,10 +470,12 @@ pub fn require_instance_record_in_region<'store, E>(
 ///   malformed there would contradict a recording.
 pub fn require_decoded_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     require_decoded_instance_record_worded(
         store,
+        region,
         instance_id,
         crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
     )
@@ -515,11 +492,13 @@ pub fn require_decoded_instance_record<'store, E>(
 /// this service never issued.
 pub fn require_decoded_instance_record_worded<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     require_decoded_instance_record_fully_worded(
         store,
+        region,
         instance_id,
         malformed,
         crate::scaffolded::Scaffolded::invalid_instance_id_not_found,
@@ -538,6 +517,7 @@ pub fn require_decoded_instance_record_worded<'store, E>(
 /// halves follow stays here once, so no operation re-spells it to change a sentence.
 pub fn require_decoded_instance_record_fully_worded<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
     not_found: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
@@ -545,7 +525,7 @@ pub fn require_decoded_instance_record_fully_worded<'store, E>(
     if !instance_id_decodes_as_one(store, instance_id) {
         return Err(malformed(instance_id));
     }
-    require_instance_record_fully_worded(store, instance_id, malformed, not_found)
+    require_instance_record_fully_worded(store, region, instance_id, malformed, not_found)
 }
 
 /// The stored instance `instance_id` names, refusing an id this service cannot resolve
@@ -562,10 +542,12 @@ pub fn require_decoded_instance_record_fully_worded<'store, E>(
 /// template instead ([`require_decoded_instance_record`]), on their own recorded refusals.
 pub fn require_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     require_instance_record_worded(
         store,
+        region,
         instance_id,
         crate::scaffolded::Scaffolded::instance_id_is_malformed,
     )
@@ -583,11 +565,13 @@ pub fn require_instance_record<'store, E>(
 /// no instance is the not-found half.
 pub fn require_instance_record_worded<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     require_instance_record_fully_worded(
         store,
+        region,
         instance_id,
         malformed,
         crate::scaffolded::Scaffolded::invalid_instance_id_not_found,
@@ -602,6 +586,7 @@ pub fn require_instance_record_worded<'store, E>(
 /// half.
 pub fn require_instance_record_fully_worded<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
     not_found: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
@@ -609,7 +594,7 @@ pub fn require_instance_record_fully_worded<'store, E>(
     if !instance_id_is_well_formed(instance_id) {
         return Err(malformed(instance_id));
     }
-    store.instances.get(instance_id).ok_or_else(|| {
+    instance_record_in_region(store, region, instance_id).ok_or_else(|| {
         // The long form is an identifier the service DECODES before it looks anything up, so
         // one it spent on another kind of resource is no instance id and is refused as
         // malformed; one it has issued to nothing, or issued as an instance's own, names an
@@ -639,6 +624,7 @@ pub fn require_instance_record_fully_worded<'store, E>(
 /// once, so no operation re-spells it.
 pub fn require_instance_record_in_form<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
     in_form: impl Fn(&str) -> bool,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
@@ -647,9 +633,7 @@ pub fn require_instance_record_in_form<'store, E>(
             instance_id,
         ));
     }
-    store
-        .instances
-        .get(instance_id)
+    instance_record_in_region(store, region, instance_id)
         .ok_or_else(|| crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id))
 }
 
@@ -667,9 +651,10 @@ pub fn require_instance_record_in_form<'store, E>(
 /// to the other's operations.
 pub fn require_readable_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    require_instance_record_in_form(store, instance_id, instance_id_reads_as_one)
+    require_instance_record_in_form(store, region, instance_id, instance_id_reads_as_one)
 }
 
 /// The stored instance `instance_id` names, for an operation that looks an id up under the
@@ -684,9 +669,10 @@ pub fn require_readable_instance_record<'store, E>(
 /// reported as an instance that does not exist.
 pub fn require_looked_up_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    require_instance_record_in_form(store, instance_id, instance_id_is_well_formed)
+    require_instance_record_in_form(store, region, instance_id, instance_id_is_well_formed)
 }
 
 /// The id prefix of an EC2 instance, as [`instance_id_is_well_formed`] reads one and as a
@@ -717,6 +703,7 @@ pub const INSTANCE_IDS_PARAMETER: &str = "instanceId";
 /// a value inside it is looked up.
 pub fn require_instance_record_by_parameter<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if !instance_id_is_well_formed(instance_id) {
@@ -728,7 +715,7 @@ pub fn require_instance_record_by_parameter<'store, E>(
             INSTANCE_ID_PREFIX,
         ));
     }
-    store.instances.get(instance_id).ok_or_else(|| {
+    instance_record_in_region(store, region, instance_id).ok_or_else(|| {
         crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
     })
 }

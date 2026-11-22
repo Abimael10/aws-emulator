@@ -152,9 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
 
-        // Nothing about this answer depends on the request's Region or headers: what an
-        // instance's console shows is a fact of that instance.
-        let _ = ctx;
+        // What an instance's console shows is a fact of that instance, and the instance a
+        // request can ask about is one of the Region it was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the operation, WITHOUT
         // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation" (`$DryRun`).
@@ -181,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot resolve is answered `InvalidInstanceID.Malformed`, a value that is no
         // instance id at all by the id space's own wording and a well-formed id the account
         // holds no instance under by this validator's.
-        let instance = require_console_instance(&store, &input.instance_id)?;
+        let instance = require_console_instance(&store, &region, &input.instance_id)?;
 
         // "When enabled, retrieves the latest console output for the instance. Default:
         // disabled (false)" (`$Latest`): the console this service holds is derived from the

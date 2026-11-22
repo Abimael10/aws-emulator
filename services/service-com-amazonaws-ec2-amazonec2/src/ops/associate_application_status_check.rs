@@ -164,10 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAX_CLIENT_TOKEN_CHARS, MAX_RESOURCE_IDS, MAX_STORED_BYTES,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — what a check
-        // is associated with is a fact of the check and of the instances, not of the Region
-        // the request was signed for. The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: what a check is associated with is a fact
+        // of the check and of the instances, and the instances it may be associated with are
+        // the ones of THIS Region — EC2 is reached through a regional endpoint. The store is
+        // reached through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The ID of the application status check to associate": a value that is not an id of
         // this kind is refused BEFORE anything else is read, and a well-formed id that names no
@@ -275,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut unsuccessful: Vec<UnsuccessfulAssociationResponseObject> = Vec::new();
         let mut instances_to_associate: Vec<String> = Vec::new();
         for instance_id in &asked_instance_ids {
-            match instance_association_failure_reason(&store, instance_id) {
+            match instance_association_failure_reason(&store, &region, instance_id) {
                 Some(reason) => unsuccessful.push(UnsuccessfulAssociationResponseObject {
                     application_status_check_id: Some(application_status_check_id.clone()),
                     association_type: Some(ASSOCIATION_TYPE_INSTANCE_ID.to_string()),

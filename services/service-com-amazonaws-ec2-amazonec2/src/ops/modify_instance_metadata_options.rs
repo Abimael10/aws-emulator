@@ -189,9 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Which instance's options change is a fact of the id the request names, and the
-        // options themselves come off the request: nothing here depends on the request's
-        // headers or URI.
-        let _ = ctx;
+        // options themselves come off the request — but the instance is one of the Region the
+        // request was signed for: EC2 is reached through a regional endpoint, so an id naming
+        // an instance of another Region names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every option the request asks for, resolved against the catalog of that member's
         // own modelled enum — so what reaches the store is a catalog member, never the
@@ -234,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // Malformed before unknown, the order this service resolves an instance id in.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
         // "Modify the instance metadata parameters on a RUNNING OR STOPPED instance": an
         // instance on its way to `terminated`, or already there, has no metadata service
         // left to configure, while `pending` and `stopping` are transient states on their

@@ -151,9 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about this answer depends on the request's Region or headers: the variable
-        // store an instance holds is a fact of that instance.
-        let _ = ctx;
+        // The variable store an instance holds is a fact of that instance, and the instance
+        // a request can ask about is one of the Region it was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         let state_handle = require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
@@ -168,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved through the crate's reading of a request-named instance an operation LOOKS
         // UP: a value outside the form EC2 issues is `InvalidInstanceID.Malformed`, and every
         // id inside it the account holds no instance under is `InvalidInstanceID.NotFound`.
-        let instance = require_looked_up_instance_record(&store, &input.instance_id)?;
+        let instance = require_looked_up_instance_record(&store, &region, &input.instance_id)?;
 
         // "Checks whether you have the required permissions for the operation, without
         // actually making the request … the error response is DryRunOperation" (`$DryRun`),

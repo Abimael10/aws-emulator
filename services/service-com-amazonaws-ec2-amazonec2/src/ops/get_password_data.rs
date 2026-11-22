@@ -7,8 +7,9 @@
 //! `PasswordData` blob, which is empty for an instance whose password is not
 //! available. An id outside the form EC2 issues is `InvalidInstanceID.Malformed` and an
 //! id inside that form which names no instance of the account is
-//! `InvalidInstanceID.NotFound` (both from [`crate::state::require_known_instance`],
-//! which is where that form is read), answered before `DryRun`, so a dry run reports
+//! `InvalidInstanceID.NotFound` (both from [`crate::state::require_instance_record`],
+//! which is where that form is read, and which resolves the id only among the instances of
+//! the Region the request was signed for), answered before `DryRun`, so a dry run reports
 //! whether the request WOULD have succeeded.
 //!
 //! ## Why the password data is empty
@@ -170,19 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
-        use crate::state::{require_known_instance, require_service_state};
+        use crate::state::{require_instance_record, require_service_state};
 
-        // Nothing about this answer depends on the request's Region or headers: the
-        // password data of an instance is a fact of that instance.
-        let _ = ctx;
+        // The password data of an instance is a fact of that instance, and the instance a
+        // request can ask about is one of the Region it was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = require_service_state(&*self.engine)?;
         // A SHARED read: this operation reports and never writes, so it takes the
         // guard only to read the instance store through it.
         let store = state.lock();
 
-        // A malformed id before an unknown one, the order EC2 answers the two in.
-        require_known_instance(&store, &input.instance_id)?;
+        // A malformed id before an unknown one, the order EC2 answers the two in, resolved
+        // ONCE: the record this report is built from is the record that resolution returned,
+        // so the id is not looked up a second time.
+        let instance = require_instance_record(&store, &region, &input.instance_id)?;
 
         // DryRun sits AFTER the instance has been resolved: the flag asks whether the
         // request WOULD have succeeded, so one naming an instance that does not exist
@@ -190,13 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.dry_run == Some(true) {
             return Err(Scaffolded::dry_run_operation());
         }
-
-        // `require_known_instance` just resolved the id, so the lookup cannot miss;
-        // the `NotFound` keeps that invariant local rather than unwrapping.
-        let instance = store
-            .instances
-            .get(&input.instance_id)
-            .ok_or_else(|| Scaffolded::invalid_instance_id_not_found(&input.instance_id))?;
 
         Ok(GetPasswordDataOutput {
             // The id is read back off the stored record rather than echoed from the

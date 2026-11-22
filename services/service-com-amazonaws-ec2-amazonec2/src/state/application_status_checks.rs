@@ -805,19 +805,22 @@ pub fn initializing_application_status_detail(
 }
 
 /// Why `instance_id` cannot be monitored by an application status check, or `None` when the
-/// account holds that instance.
+/// account holds that instance IN `region`.
 ///
 /// The SENTENCE this service refuses that instance id with
 /// ([`super::require_instance_record`], a malformed id before an unknown one), carried as one
 /// item's `Reason` instead of as a refusal of the whole request: the association operations
 /// report per-item outcomes ("The associations that were successfully created" beside "The
 /// associations that failed to be created"), so one instance the account does not hold fails
-/// on its own row and the rest of the request is still carried out.
+/// on its own row and the rest of the request is still carried out. An instance of another
+/// Region is one of those: EC2 is reached through a regional endpoint, so it is as absent
+/// here as an id nothing was ever launched under.
 pub fn instance_association_failure_reason(
     store: &ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Option<String> {
-    let refusal: Scaffolded<()> = match super::require_instance_record(store, instance_id) {
+    let refusal: Scaffolded<()> = match super::require_instance_record(store, region, instance_id) {
         Ok(_) => return None,
         Err(refusal) => refusal,
     };

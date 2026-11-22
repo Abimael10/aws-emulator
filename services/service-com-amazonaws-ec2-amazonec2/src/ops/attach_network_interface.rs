@@ -178,12 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it — the interface
-        // and the instance are named by id, and each carries its own Availability Zone. The
-        // store is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: the interface and the instance each carry
+        // their own Availability Zone, and both are resources of THIS Region — EC2 being
+        // reached through a regional endpoint, an id naming an instance of another Region
+        // names no instance here. The store is reached through the engine held on `self`.
         use crate::scaffolded::Scaffolded;
         use crate::state;
+
+        let region = state::request_region(ctx.parts());
 
         let network_interface_id = input.network_interface_id.as_str();
         let instance_id = input.instance_id.as_str();
@@ -239,8 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // long-form value this service never issued names no instance it could ever have held
         // and is refused `InvalidInstanceID.Malformed` rather than reported absent, where a
         // short-form id (which carries no identifier to decode) and one the mint did hand out
-        // are looked up and reported absent.
-        let instance = state::require_decoded_instance_record(&store, instance_id)?;
+        // are looked up and reported absent — in the Region this request was signed for, an
+        // instance of another Region being as absent here as an id nothing was launched under.
+        let instance = state::require_decoded_instance_record(&store, &region, instance_id)?;
         let instance_zone = instance.placement_az.clone();
         let instance_type = instance.instance_type.clone();
         let instance_state = instance.state;

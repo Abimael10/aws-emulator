@@ -170,12 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             date_time_key, date_time_to_system_time, deduplicate_ids, instance_id_is_well_formed,
-            instance_status_report_payload_bytes, require_service_state, resource_limit_exceeded,
-            InstanceStateName, InstanceStatusReport, MAX_RESOURCE_IDS, MAX_STORED_BYTES,
-            MAX_STORED_RECORDS_PER_STORE,
+            instance_record_in_region, instance_status_report_payload_bytes, request_region,
+            require_service_state, resource_limit_exceeded, InstanceStateName,
+            InstanceStatusReport, MAX_RESOURCE_IDS, MAX_STORED_BYTES, MAX_STORED_RECORDS_PER_STORE,
         };
 
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instances a report may name are the ones of THIS Region and an id
+        // naming an instance of another Region names no instance at all.
+        let region = request_region(ctx.parts());
 
         // The two LIST members a report is built from. A request that OMITS one of them
         // is already refused by the boundary validator, which reads the model's
@@ -247,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !instance_id_is_well_formed(instance_id) {
                 return Err(Scaffolded::instance_id_is_malformed(instance_id));
             }
-            let Some(instance) = store.instances.get(instance_id) else {
+            let Some(instance) = instance_record_in_region(&store, &region, instance_id) else {
                 return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
             };
             // "The instance must be in the running state" — the second sentence of this

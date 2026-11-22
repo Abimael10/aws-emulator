@@ -213,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it — the
-        // instance is named by id. The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instance an id names is the one of THIS Region. The store is
+        // reached through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "You can specify only one attribute at a time" — `Attribute` is one
         // `InstanceAttributeName`, and the response carries only the member it names. The
@@ -243,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this operation's own recorded answer carries.
         let instance = require_instance_record_worded(
             &store,
+            &region,
             &input.instance_id,
             instance_id_is_not_an_issued_id,
         )?;

@@ -150,9 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             self, invalid_instance_event_id_not_found, scheduled_instance_event,
         };
 
-        // A scheduled event belongs to the instance, reached by the ids the request names:
-        // nothing here depends on the request's headers or URI.
-        let _ = ctx;
+        // A scheduled event belongs to the instance, reached by the ids the request names,
+        // and that instance is one of the Region the request was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = state::request_region(ctx.parts());
 
         let service_state = state::require_service_state(&*self.engine)?;
         let mut store = service_state.lock();
@@ -162,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the instance with the scheduled event" (`$InstanceId`), resolved through
         // the one reading of those two refusals this crate has: malformed before not-found.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
 
         // "The ID of the event whose date and time you are modifying" (`$InstanceEventId`),
         // resolved against the events THAT instance has. An id that names none of them names

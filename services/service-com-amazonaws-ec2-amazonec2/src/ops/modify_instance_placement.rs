@@ -167,8 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{self, InstanceStateName, TENANCY_HOST};
 
         // Where an instance is placed is a fact of the instance and of the resources the
-        // request names by id: nothing here depends on the request's headers or URI.
-        let _ = ctx;
+        // request names by id, and all of them are resources of the Region it was signed for:
+        // EC2 is reached through a regional endpoint, so an id naming an instance of another
+        // Region names no instance here.
+        let region = state::request_region(ctx.parts());
 
         // "At least one attribute for affinity, host ID, tenancy, or placement group name
         // must be specified in the request": a request naming none asks for no change at
@@ -217,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the instance that you are modifying" (`$InstanceId`), resolved through
         // the one reading of those two refusals this crate has: malformed before not-found.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
         let instance_state = instance.state;
         let instance_id = instance.instance_id.clone();
         let held_tenancy = instance.detail.tenancy;

@@ -140,12 +140,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_instance_record_by_parameter, require_service_state,
-            InstanceStateName, MAX_RESOURCE_IDS, MONITORING_STATE_DISABLED,
-            MONITORING_STATE_DISABLING,
+            deduplicate_ids, request_region, require_instance_record_by_parameter,
+            require_service_state, InstanceStateName, MAX_RESOURCE_IDS,
+            MONITORING_STATE_DISABLED, MONITORING_STATE_DISABLING,
         };
 
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instances this call may act on are the ones of THIS Region and an
+        // id naming an instance of another Region names no instance at all.
+        let region = request_region(ctx.parts());
 
         // The empty-list and batch-size answers `MonitorInstances` gives, for the same
         // member of the same shape: an operation that names no instance has none to act on,
@@ -176,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of the same shape: the pair share one `InstanceIds` list and one validator, so
             // a value outside the instance-id form is the one parameter-value refusal for
             // both halves of the monitoring move.
-            let instance = require_instance_record_by_parameter(&store, instance_id)?;
+            let instance = require_instance_record_by_parameter(&store, &region, instance_id)?;
             // "Disables detailed monitoring for a RUNNING instance", read the way
             // `MonitorInstances` reads it: `pending` is on its way to `running`, and every
             // other state has nothing running to stop monitoring.

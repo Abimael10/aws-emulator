@@ -140,15 +140,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, instance_id_is_well_formed, require_service_state,
-            system_time_to_date_time,
+            deduplicate_ids, instance_id_is_well_formed, instance_record_in_region, request_region,
+            require_service_state, system_time_to_date_time,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — a
-        // suppression is a fact of the instance rather than of the Region the request was
-        // signed for, exactly as `DescribeApplicationStatus` reads it. The store is reached
-        // through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: a suppression is a fact of the instance,
+        // and the instances this call may name are the ones of THIS Region — EC2 is reached
+        // through a regional endpoint, exactly as `DescribeApplicationStatus` reads it. The
+        // store is reached through the engine held on `self`.
+        let region = request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the operation, WITHOUT
         // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         for instance_id in &instance_ids {
-            if !store.instances.contains_key(instance_id) {
+            if instance_record_in_region(&store, &region, instance_id).is_none() {
                 return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
             }
         }

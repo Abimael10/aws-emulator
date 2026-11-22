@@ -177,9 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAC_MODIFICATION_TASK_TYPE_SIP_MODIFICATION, MAX_CLIENT_TOKEN_CHARS,
         };
 
-        // `ctx` carries request metadata only, and nothing a Mac modification task holds
-        // names a Region: the modelled `MacModificationTask` carries no ARN and no zone.
-        let _ = ctx;
+        // The modelled `MacModificationTask` carries no ARN and no zone, but the instance a
+        // task may be created for is one of the Region the request was signed for: EC2 is
+        // reached through a regional endpoint, so an id naming an instance of another Region
+        // names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         if input
             .client_token
@@ -221,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The ID of the Amazon EC2 Mac instance" (`InstanceId`), resolved through the one
         // reader both Mac task creates share, so neither accepts an instance the other
         // refuses.
-        require_mac_instance(&store, &input.instance_id)?;
+        require_mac_instance(&store, &region, &input.instance_id)?;
 
         // DryRun sits AFTER every parameter has been validated and the instance resolved,
         // and BEFORE the first write: the flag asks whether the request WOULD have worked,

@@ -174,10 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{require_instance_record, require_service_state};
 
-        // Nothing about this answer depends on the request's Region or headers: a
-        // product code's owner and an instance's codes are facts of the stored
-        // resources.
-        let _ = ctx;
+        // A product code's owner and an instance's codes are facts of the stored resources,
+        // and the instance a request may ask about is one of the Region it was signed for:
+        // EC2 is reached through a regional endpoint, so an id naming an instance of another
+        // Region names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = require_service_state(&*self.engine)?;
         // The guard is taken only to READ: this operation reports and writes nothing
@@ -201,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A malformed id before an unknown one, the order EC2 answers the two in, and
         // the record itself so the id is resolved once.
-        let instance = require_instance_record(&store, &input.instance_id)?;
+        let instance = require_instance_record(&store, &region, &input.instance_id)?;
 
         // DryRun sits AFTER everything that would refuse the request: the flag asks
         // whether the request WOULD have succeeded.

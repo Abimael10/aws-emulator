@@ -153,11 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             require_service_state,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it (an
-        // instance's zone, and so its zone id, is a fact of the instance rather than of
-        // the Region this request was signed for). The store is reached through the engine
-        // held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: an instance's zone is a fact of the
+        // instance, but WHICH instances a request can see is a fact of the Region — EC2 is
+        // reached through a regional endpoint, so the instances reported here are the ones of
+        // this Region and an id naming one of another Region names no instance at all. The
+        // store is reached through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         let requested_ids = input.instance_ids.clone().unwrap_or_default();
         if requested_ids.len() > MAX_RESOURCE_IDS {
@@ -249,13 +250,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "The IDs of the instances for which to describe application status": an id that
-        // names no instance of the account is an error, not an absent row — a malformed
-        // one before an unknown one, and the FORM of every id the request names is read
-        // before any of them is resolved, so a value this service cannot read as an instance
-        // id is refused as malformed wherever it sits among ids that name no instance.
+        // names no instance of the account IN THIS REGION is an error, not an absent row — a
+        // malformed one before an unknown one, and the FORM of every id the request names is
+        // read before any of them is resolved, so a value this service cannot read as an
+        // instance id is refused as malformed wherever it sits among ids that name no
+        // instance.
         require_well_formed_instance_ids(&requested_ids)?;
         for instance_id in &requested_ids {
-            require_known_instance(&store, instance_id)?;
+            require_known_instance(&store, &region, instance_id)?;
         }
 
         // DryRun sits AFTER every parameter has been validated and every named instance
@@ -283,6 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for instance in store.instances.values() {
             if budget.exhausted() {
                 break;
+            }
+            // The Region scope, asked before any filter: an instance of another Region is
+            // invisible to this request, so it is not a candidate at all.
+            if crate::state::instance_region(instance) != region {
+                continue;
             }
             // The id narrowing is read off the stored record, so an instance the request
             // did not name costs no projection and no comparison at all.

@@ -179,10 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ElasticIpAssociationSpec,
         };
 
-        // Nothing here depends on the request's metadata: an Elastic IP address and the
-        // resource it is associated with are both resources of the account, reached by the
-        // ids the request names.
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instance an id names is the one of THIS Region — an id naming an
+        // instance of another Region names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The allocation ID. This is required." (`AssociateAddressRequest$AllocationId`),
         // and `PublicIp` is "Deprecated." — the older way of naming the SAME address. So
@@ -259,6 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // instance as readily as with a running one.
                 let instance = require_instance_record_worded(
                     &store,
+                    &region,
                     instance_id,
                     crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
                 )?;

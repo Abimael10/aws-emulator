@@ -140,10 +140,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; the instance, the environment and the S3
-        // target are each named by the request.
-        let _ = ctx;
         use crate::state;
+
+        // The instance, the environment and the S3 target are each named by the request, and
+        // the instance is one of the Region the request was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names no
+        // instance here.
+        let region = state::request_region(ctx.parts());
 
         // The three `@required` members are modelled `clientOptional`, so a request that
         // left one out reaches this handler as an empty value rather than being refused at
@@ -208,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // id that resolves to nothing: it states that the id provided does not exist and what
         // the caller is to do about it, the only part built from the request being the id
         // echoed back.
-        if !store.instances.contains_key(&input.instance_id) {
+        if state::instance_record_in_region(&store, &region, &input.instance_id).is_none() {
             return Err(invalid_parameter(format!(
                 "The instance ID provided ({instance_id}) does not exist. Please make sure the \
                  ID is correct.",

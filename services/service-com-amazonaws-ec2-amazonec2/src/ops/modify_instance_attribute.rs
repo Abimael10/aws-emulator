@@ -871,9 +871,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it — the
-        // instance is named by id and every value it writes comes from the request.
-        let _ = ctx;
+        // The Region this request was signed for: the instance is named by id and every
+        // value this writes comes from the request, but EC2 is reached through a regional
+        // endpoint, so an id naming an instance of another Region names no instance here and
+        // nothing of it may be modified.
+        let region = state::request_region(ctx.parts());
 
         // "You can specify only one attribute at a time": the attributes the request NAMES
         // are the ones it asks to modify, so a request naming none asks for no modification
@@ -912,7 +914,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the instance" (`InstanceId`), resolved through the one reading of those
         // two refusals this crate has: malformed before not-found.
-        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_instance_record(&store, &region, &input.instance_id)?;
         let instance_state = instance.state;
 
         // "To modify some attributes, the instance must be stopped" — and an instance on its

@@ -280,15 +280,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sits among ids that merely name no instance.
         require_decoded_instance_ids(&store, requested_ids)?;
         for instance_id in requested_ids {
-            let instance = require_decoded_instance_record_fully_worded(
+            require_decoded_instance_record_fully_worded(
                 &store,
+                &region,
                 instance_id,
                 Scaffolded::invalid_instance_id_malformed,
                 Scaffolded::instance_id_does_not_exist,
             )?;
-            if instance_region(instance) != region {
-                return Err(Scaffolded::instance_id_does_not_exist(instance_id));
-            }
         }
 
         // DryRun sits AFTER every parameter has been validated and every named instance

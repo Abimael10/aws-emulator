@@ -621,22 +621,29 @@ pub fn sql_ha_describe_selection<E>(
     })
 }
 
-/// The ids of `instance_ids` that name no registration this store holds, each named ONCE
-/// however many times the request repeated it, in the order the request named them.
+/// The ids of `instance_ids` that name no registration this store holds IN `region`, each
+/// named ONCE however many times the request repeated it, in the order the request named
+/// them.
 ///
 /// The one resolution step the SQL Server High Availability describes share: an id either
 /// surface cannot resolve is an error, not an absent row, and neither distinguishes an id the
 /// account holds no instance for from one whose instance is not enabled for monitoring — so
-/// the caller refuses the whole list through [`sql_ha_instance_ids_not_found`].
+/// the caller refuses the whole list through [`sql_ha_instance_ids_not_found`]. A registration
+/// over an instance of ANOTHER Region is unresolvable here too, EC2 being reached through a
+/// regional endpoint.
 pub fn unresolved_sql_ha_instance_ids<'a>(
     store: &ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_ids: &'a [String],
 ) -> Vec<&'a str> {
     let mut seen = ::std::collections::HashSet::new();
     instance_ids
         .iter()
         .map(String::as_str)
-        .filter(|instance_id| !store.sql_ha_registrations.contains_key(*instance_id))
+        .filter(|instance_id| {
+            !store.sql_ha_registrations.contains_key(*instance_id)
+                || super::instance_record_in_region(store, region, instance_id).is_none()
+        })
         .filter(|instance_id| seen.insert(*instance_id))
         .collect()
 }

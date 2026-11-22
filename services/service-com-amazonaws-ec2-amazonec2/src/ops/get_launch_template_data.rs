@@ -567,9 +567,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{require_instance_record, require_service_state};
 
-        // Nothing about this answer depends on the request's Region or headers: the launch
-        // parameters of an instance are facts of that instance.
-        let _ = ctx;
+        // The launch parameters of an instance are facts of that instance, and the instance
+        // a request can ask about is one of the Region it was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = require_service_state(&*self.engine)?;
         // A SHARED read: this operation reports and never writes, so it takes the guard
@@ -577,7 +579,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // A malformed id before an unknown one, the order EC2 answers the two in.
-        let instance = require_instance_record(&store, &input.instance_id)?;
+        let instance = require_instance_record(&store, &region, &input.instance_id)?;
 
         // DryRun sits AFTER the instance has been resolved: the flag asks whether the
         // request WOULD have succeeded, so one naming an instance that does not exist is

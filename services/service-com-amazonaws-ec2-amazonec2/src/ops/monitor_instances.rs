@@ -147,12 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_instance_record_by_parameter, require_service_state,
-            InstanceStateName, MAX_RESOURCE_IDS, MONITORING_STATE_ENABLED,
+            deduplicate_ids, request_region, require_instance_record_by_parameter,
+            require_service_state, InstanceStateName, MAX_RESOURCE_IDS, MONITORING_STATE_ENABLED,
             MONITORING_STATE_PENDING,
         };
 
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instances this call may monitor are the ones of THIS Region and an
+        // id naming an instance of another Region names no instance at all.
+        let region = request_region(ctx.parts());
 
         // `InstanceIds` is `@required` but `clientOptional`: the boundary validator refuses
         // a request that OMITS the list, and this is this operation's own answer for one
@@ -194,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // naming the parameter and the form expected, not the resource-level
             // `InvalidInstanceID.Malformed` an operation resolving ONE named instance
             // answers.
-            let instance = require_instance_record_by_parameter(&store, instance_id)?;
+            let instance = require_instance_record_by_parameter(&store, &region, instance_id)?;
             // "Enables detailed monitoring for a RUNNING instance": an instance in
             // `pending` is one the clock is about to make `running` and nothing else, so a
             // caller monitoring the instance it has just launched is monitoring a running

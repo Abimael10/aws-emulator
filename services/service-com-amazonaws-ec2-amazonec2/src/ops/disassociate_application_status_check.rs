@@ -169,10 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tag_association_value, validate_tag_size,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — what a check
-        // is associated with is a fact of the check and of the instances, not of the Region
-        // the request was signed for. The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: what a check is associated with is a fact
+        // of the check and of the instances, and the instances it may name are the ones of
+        // THIS Region — EC2 is reached through a regional endpoint. The store is reached
+        // through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The ID of the application status check to disassociate": the SUBJECT of the call is
         // resolved first, through the one reader both halves of that refusal come from — a
@@ -269,14 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut unsuccessful: Vec<UnsuccessfulAssociationResponseObject> = Vec::new();
         let mut instances_to_disassociate: Vec<String> = Vec::new();
         for instance_id in &asked_instance_ids {
-            let reason = instance_association_failure_reason(&store, instance_id).or_else(|| {
-                (!holds_instance_association(
-                    &store,
-                    &application_status_check_id,
-                    instance_id,
-                ))
-                .then(|| NOT_ASSOCIATED_REASON.to_string())
-            });
+            let reason = instance_association_failure_reason(&store, &region, instance_id)
+                .or_else(|| {
+                    (!holds_instance_association(
+                        &store,
+                        &application_status_check_id,
+                        instance_id,
+                    ))
+                    .then(|| NOT_ASSOCIATED_REASON.to_string())
+                });
             match reason {
                 Some(reason) => unsuccessful.push(UnsuccessfulAssociationResponseObject {
                     application_status_check_id: Some(application_status_check_id.clone()),

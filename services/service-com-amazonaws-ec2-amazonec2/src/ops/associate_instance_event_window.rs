@@ -150,11 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TRANSITION_DELAY,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — an event
-        // window carries no ARN and no Availability Zone, so nothing about it is derived
-        // from the Region the call was signed for. The store is reached through the engine
-        // held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: an event window carries no ARN and no
+        // Availability Zone, but the instances it may be associated with are the instances of
+        // THIS Region, EC2 being reached through a regional endpoint. The store is reached
+        // through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         let window_id = input.instance_event_window_id.as_str();
         let requested = &input.association_target;
@@ -223,8 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A target is a REFERENCE to a resource of this account, so one this service cannot
         // resolve is refused rather than stored: a window associated with an instance that
         // was never launched would report a target no scheduled event could ever belong to.
+        // An instance of another Region is no instance of this one, so it is as unresolvable
+        // here as an id nothing was ever launched under.
         for instance_id in instance_ids {
-            require_known_instance(&store, instance_id)?;
+            require_known_instance(&store, &region, instance_id)?;
         }
         for host_id in dedicated_host_ids {
             if !store.dedicated_hosts.contains_key(host_id) {

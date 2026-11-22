@@ -134,11 +134,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only, and nothing an association reports is a fact
-        // of the Region (`IamInstanceProfileAssociation` carries no Region member), so this
-        // operation reads none of it. The store is reached through the engine held on
-        // `self`.
-        let _ = ctx;
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, so the instance the request names is the one of THIS Region. The store is
+        // reached through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The IAM instance profile" (`AssociateIamInstanceProfileRequest$IamInstanceProfile`)
         // is read BEFORE the store is touched, so a request that names no profile this
@@ -159,9 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // id first — EC2's long id form is an obfuscated identifier, so one this service
         // never issued is `InvalidInstanceID.Malformed` in this operation's own wording
         // before any lookup, and a readable id the account holds no instance for is
-        // `InvalidInstanceID.NotFound`.
+        // `InvalidInstanceID.NotFound` — which is also what an instance of ANOTHER Region
+        // names here, EC2 being reached through a regional endpoint.
         crate::state::require_decoded_instance_record_worded(
             &store,
+            &region,
             &input.instance_id,
             crate::scaffolded::Scaffolded::instance_id_is_malformed,
         )?;

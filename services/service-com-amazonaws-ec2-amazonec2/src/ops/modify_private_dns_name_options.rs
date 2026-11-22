@@ -159,9 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Which instance's hostname options change is a fact of the id the request names,
-        // and the options themselves come off the request: nothing here depends on the
-        // request's headers or URI.
-        let _ = ctx;
+        // and the options themselves come off the request — but the instance is one of the
+        // Region the request was signed for: EC2 is reached through a regional endpoint, so
+        // an id naming an instance of another Region names no instance here.
+        let region = state::request_region(ctx.parts());
 
         // "The type of hostname for EC2 instances" (`$PrivateDnsHostnameType`), resolved
         // against the catalog of its own modelled enum — so what reaches the store is a
@@ -193,6 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record the write lands on is resolved ONCE: every refusal below is answered
         // from it, and neither of them reads the store again, so the instance is looked up
         // one time rather than once per step.
+        // An instance of ANOTHER Region is one this request cannot resolve either, EC2 being
+        // reached through a regional endpoint, so it is answered that same code.
+        if state::instance_record_in_region(&store, &region, &input.instance_id).is_none() {
+            return Err(Scaffolded::unknown_resource(&input.instance_id));
+        }
         let Some(instance) = store.instances.get_mut(&input.instance_id) else {
             return Err(Scaffolded::unknown_resource(&input.instance_id));
         };

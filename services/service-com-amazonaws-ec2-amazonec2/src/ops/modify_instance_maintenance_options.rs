@@ -165,9 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Which instance's settings change is a fact of the id the request names, and the
-        // settings themselves come off the request: nothing here depends on the request's
-        // headers or URI.
-        let _ = ctx;
+        // settings themselves come off the request — but the instance is one of the Region
+        // the request was signed for: EC2 is reached through a regional endpoint, so an id
+        // naming an instance of another Region names no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         // Each behaviour the request asks for, resolved against the catalog of that
         // member's own modelled enum — so what reaches the store is a catalog member, never
@@ -195,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the reading of the id form this operation is recorded taking, where a
         // value EC2 can read as an instance id but has issued no instance for names an
         // instance that is not there rather than an id that cannot be read.
-        let instance = state::require_readable_instance_record(&store, &input.instance_id)?;
+        let instance = state::require_readable_instance_record(&store, &region, &input.instance_id)?;
         // An instance on its way to `terminated`, or already there, has no maintenance or
         // recovery behaviour left to configure, while `pending` and `stopping` are transient
         // states on their way to exactly `running` and `stopped`, so this service's own

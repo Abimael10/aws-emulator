@@ -240,10 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags_from_specifications, unresolvable_snapshot_id,
         };
 
-        // `ctx` carries request metadata only, and nothing this record holds names a
-        // Region: the modelled `ReplaceRootVolumeTask` carries no ARN and no zone, and the
-        // zone the volume check compares against is read off the instance.
-        let _ = ctx;
+        // The modelled `ReplaceRootVolumeTask` carries no ARN and no zone, and the zone the
+        // volume check compares against is read off the instance — but the instance a task
+        // may be created for is one of the Region the request was signed for: EC2 is reached
+        // through a regional endpoint, so an id naming an instance of another Region names
+        // no instance here.
+        let region = crate::state::request_region(ctx.parts());
 
         // The four restore forms are mutually exclusive: each of the three members that
         // selects one says the other two must be omitted ("If you want to restore the
@@ -316,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`require_replaceable_instance`] for why an id it cannot resolve is answered
         // malformed rather than not-found. ONE lookup: the validator hands back the record
         // it resolved.
-        let instance = require_replaceable_instance(&store, &input.instance_id)?;
+        let instance = require_replaceable_instance(&store, &region, &input.instance_id)?;
         // "Replaces the EBS-backed root volume for a `running` instance"
         // (`CreateReplaceRootVolumeTask`): the replacement is attached to the instance in
         // place, which is work only a running instance is given — an instance in any other
@@ -507,10 +509,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// looking it up again behind an unreachable branch.
 fn require_replaceable_instance<'a, E>(
     store: &'a crate::state::ComAmazonawsEc2Amazonec2State,
+    region: &str,
     instance_id: &str,
 ) -> Result<&'a crate::state::InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    store
-        .instances
-        .get(instance_id)
+    // An instance of ANOTHER Region is as absent as an id the account holds no instance
+    // under, EC2 being reached through a regional endpoint, so it is answered the same
+    // sentence — through the crate's one reading of which Region holds an instance
+    // ([`crate::state::instance_record_in_region`]).
+    crate::state::instance_record_in_region(store, region, instance_id)
         .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
 }

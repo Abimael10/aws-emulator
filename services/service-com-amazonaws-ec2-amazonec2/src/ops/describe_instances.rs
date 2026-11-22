@@ -301,13 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for instance_id in &requested_ids {
             // A long-form id this service never issued is one it cannot decode, which is
             // the malformed half; a short-form id it holds no instance for is the
-            // not-found half.
-            let instance = require_decoded_instance_record(&store, instance_id)?;
-            // And an instance of ANOTHER Region is not one this request can name: EC2 is
-            // reached through a regional endpoint, so the id names no instance here.
-            if instance_region(instance) != region {
-                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
-            }
+            // not-found half — and so is an instance of ANOTHER Region, which is not one
+            // this request can name at all, EC2 being reached through a regional endpoint.
+            require_decoded_instance_record(&store, &region, instance_id)?;
         }
 
         // DryRun sits AFTER every parameter has been validated and every named

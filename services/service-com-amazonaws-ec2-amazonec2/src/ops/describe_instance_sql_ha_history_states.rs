@@ -161,11 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unresolved_sql_ha_instance_ids,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — a
-        // registration, and the states it has been through, are facts of the instance rather
-        // than of the Region the request was signed for. The store is reached through the
-        // engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: a registration, and the states it has been
+        // through, are facts of the instance, and the instances it can be over are the ones
+        // of THIS Region — EC2 is reached through a regional endpoint. The store is reached
+        // through the engine held on `self`.
+        let region = crate::state::request_region(ctx.parts());
 
         // The request members both SQL Server High Availability describes publish —
         // `InstanceIds`, `MaxResults`, `Filters` and `NextToken` — read and refused through
@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose instance is not enabled for monitoring — both are refused together, in one
         // refusal naming every id it could not resolve
         // (`crate::state::sql_ha_instance_ids_not_found`).
-        let unresolved = unresolved_sql_ha_instance_ids(&store, requested_ids);
+        let unresolved = unresolved_sql_ha_instance_ids(&store, &region, requested_ids);
         if !unresolved.is_empty() {
             return Err(sql_ha_instance_ids_not_found(&unresolved));
         }
@@ -251,6 +251,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The id narrowing is read off the key, so a registration the request did not
             // name costs no projection and no comparison at all.
             if !wanted.is_empty() && !wanted.contains(instance_id.as_str()) {
+                continue;
+            }
+            // The Region scope, asked before any filter: a registration over an instance of
+            // another Region is invisible to this request, so it is not a candidate at all.
+            if crate::state::instance_record_in_region(&store, &region, instance_id).is_none() {
                 continue;
             }
             for (ordinal, held) in store

@@ -150,14 +150,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, dry_run_operation, instance_id_is_well_formed, require_service_state,
+            deduplicate_ids, dry_run_operation, instance_id_is_well_formed,
+            instance_record_in_region, request_region, require_service_state,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — a
-        // registration is a fact of the instance rather than of the Region the request was
-        // signed for, exactly as the enablement and the describes read it. The store is
-        // reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: a registration is a fact of the instance,
+        // and the instances this call may name are the ones of THIS Region — EC2 is reached
+        // through a regional endpoint, exactly as the enablement and the describes read it.
+        // The store is reached through the engine held on `self`.
+        let region = request_region(ctx.parts());
 
         // "The IDs of the instances to disable from SQL Server High Availability standby
         // detection monitoring" (`InstanceIds`). One instance gets one answer however many
@@ -185,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The whole batch is resolved before the first registration is removed, so a request
         // naming one id this account holds no instance for disables nothing at all.
         for instance_id in &instance_ids {
-            if !store.instances.contains_key(instance_id) {
+            if instance_record_in_region(&store, &region, instance_id).is_none() {
                 return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
             }
         }

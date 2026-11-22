@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, request_region, require_instance_record_in_region,
+            deduplicate_ids, request_region, require_instance_record,
             require_service_state, MAX_RESOURCE_IDS,
         };
 
@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for instance_id in &instance_ids {
             // An instance of ANOTHER Region is no instance this request can name: EC2 is
             // reached through a regional endpoint, so the id names nothing here.
-            let instance = require_instance_record_in_region(&store, &region, instance_id)?;
+            let instance = require_instance_record(&store, &region, instance_id)?;
             if instance.disable_api_termination && !instance.state.is_terminating() {
                 // The sentence EC2 answers for a protected instance, ending in the full
                 // stop it ends in: the only interpolated value is the instance the REQUEST

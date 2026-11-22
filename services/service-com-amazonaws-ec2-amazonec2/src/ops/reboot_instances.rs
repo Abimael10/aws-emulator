@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, request_region, require_instance_record_in_region,
+            deduplicate_ids, request_region, require_instance_record,
             require_service_state, InstanceStateName, MAX_RESOURCE_IDS,
         };
 
@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Malformed before unknown, the order this service resolves an instance id in —
             // and an instance of ANOTHER Region is no instance this request can name, EC2
             // being reached through a regional endpoint.
-            let instance = require_instance_record_in_region(&store, &region, instance_id)?;
+            let instance = require_instance_record(&store, &region, instance_id)?;
             // "Requests to reboot terminated instances are ignored" — the one state this
             // operation neither acts on nor refuses.
             if instance.state == InstanceStateName::Terminated {
