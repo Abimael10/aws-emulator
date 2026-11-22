@@ -260,9 +260,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyReplicationGroupShardConfigurationErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(crate::state::replication_group_not_found_message(
-                            &input.replication_group_id,
-                        )),
+                        message: Some(
+                            crate::service::replication_group_not_found::quoted_message(
+                                &input.replication_group_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),

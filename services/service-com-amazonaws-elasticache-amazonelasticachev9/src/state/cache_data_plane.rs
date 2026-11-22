@@ -45,6 +45,7 @@ pub mod commands;
 pub mod keyspace;
 pub mod resp_frame;
 pub mod resp_wire;
+pub mod slot_routing;
 pub mod slow_log;
 
 use std::collections::BTreeMap;
@@ -313,6 +314,17 @@ pub struct CacheFacts {
     pub writable: bool,
     /// Whether the cache is partitioned (cluster mode enabled).
     pub cluster_enabled: bool,
+    /// The whole partition of a cluster mode enabled cache: one entry per shard, with the
+    /// slots it serves and the address of each of its nodes. Empty for a cache whose
+    /// keyspace is not partitioned, which has one keyspace and no map to publish.
+    pub cluster_slots: Vec<slot_routing::ShardRouting>,
+    /// The slots the shard THIS socket's node belongs to serves, which are the keys a
+    /// command on it may name; `None` for a cache whose keyspace is not partitioned, where
+    /// every key belongs to the one node.
+    pub serving_slots: Option<(u16, u16)>,
+    /// The member cluster this socket's node is, for the `CLUSTER` answers that state which
+    /// node the session is on. Empty for a cache that is not a member of a group.
+    pub node_cluster_id: String,
     /// The digests of the auth tokens that authenticate a client of this cache — more
     /// than one while a rotation has two live.
     pub auth_token_digests: Vec<String>,
@@ -364,6 +376,11 @@ pub fn cache_facts(
                 // A standalone cluster is the only node there is, so it is the writer.
                 writable: true,
                 cluster_enabled: false,
+                // A standalone cluster's keyspace is not partitioned: it holds every key
+                // and there is no map of shards to publish.
+                cluster_slots: Vec::new(),
+                serving_slots: None,
+                node_cluster_id: cluster.cache_cluster_id.clone(),
                 auth_token_digests: cluster.auth_token_digests.clone(),
                 user_group_id: None,
                 limits,
@@ -403,6 +420,20 @@ pub fn cache_facts(
                 // the primary role of its shard takes writes.
                 writable: group.is_shard_primary(cache_cluster_id),
                 cluster_enabled: group.cluster_enabled,
+                // The partition a cluster mode enabled group's keyspace is divided into,
+                // and the slots THIS node's own shard serves — read off the group's shards
+                // and its members' published endpoints, so a command for a key another
+                // shard owns is answered with that shard's own address.
+                cluster_slots: if group.cluster_enabled {
+                    shard_routing(store, group)
+                } else {
+                    Vec::new()
+                },
+                serving_slots: group
+                    .cluster_enabled
+                    .then(|| serving_slots(group, cache_cluster_id))
+                    .flatten(),
+                node_cluster_id: cache_cluster_id.clone(),
                 auth_token_digests: group.auth_token_digests.clone(),
                 user_group_id: group.user_group_ids.first().cloned(),
                 limits,
@@ -448,6 +479,11 @@ pub fn cache_facts(
                 // what makes that endpoint the read role's own.
                 writable: !matches!(identity, CacheIdentity::ServerlessCacheReader { .. }),
                 cluster_enabled: false,
+                // A serverless cache is one cache with one keyspace: ElastiCache scales it
+                // rather than partitioning it across shards a client routes between.
+                cluster_slots: Vec::new(),
+                serving_slots: None,
+                node_cluster_id: String::new(),
                 auth_token_digests: Vec::new(),
                 user_group_id: cache.user_group_id.clone(),
                 limits: Limits::of(keyspace::MAX_KEYSPACE_BYTES_U64, &policy),
@@ -467,6 +503,88 @@ pub fn cache_facts(
 /// A serverless cache publishes no parameter group, so there is no caller-set policy to
 /// read: the engine's own default is what it runs under.
 pub const SERVERLESS_MAXMEMORY_POLICY: &str = "volatile-lru";
+
+/// The whole partition of the cluster mode enabled group `group`: one entry per shard, in
+/// the order the group holds its shards, with the slots it serves and the address of each of
+/// its members.
+///
+/// Derived from the group's own shards and from each member cluster's published node
+/// endpoint — the address that member's socket answers at — so the map a client builds from
+/// `CLUSTER SLOTS` names the very sockets it then connects to, and a member whose role or
+/// address has changed is reported as it is NOW.
+fn shard_routing(
+    store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    group: &super::ReplicationGroupRecord,
+) -> Vec<slot_routing::ShardRouting> {
+    let shards = group.node_groups.len();
+    group
+        .node_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shard)| {
+            Some(slot_routing::ShardRouting {
+                node_group_id: shard.node_group_id.clone(),
+                slots: shard_slots(shard, index, shards)?,
+                nodes: shard
+                    .nodes_by_role()
+                    .into_iter()
+                    // A member this store holds no cluster record for has no endpoint to
+                    // publish, so it is left out rather than named at an address nothing
+                    // answers at: the map a client builds from `CLUSTER SLOTS` is the set of
+                    // nodes it can really reach.
+                    .filter_map(|(cache_cluster_id, primary)| {
+                        let served = store.cache_clusters.get(&cache_cluster_id)?;
+                        (!served.endpoint_address.is_empty()).then(|| slot_routing::RoutedNode {
+                            host: served.endpoint_address.clone(),
+                            port: served.endpoint_port,
+                            cache_cluster_id,
+                            primary,
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// The slots the shard the member cluster `cache_cluster_id` belongs to serves, or `None`
+/// when no shard of `group` holds it.
+fn serving_slots(
+    group: &super::ReplicationGroupRecord,
+    cache_cluster_id: &str,
+) -> Option<(u16, u16)> {
+    let shards = group.node_groups.len();
+    group
+        .node_groups
+        .iter()
+        .enumerate()
+        .find(|(_, shard)| {
+            shard
+                .members
+                .iter()
+                .any(|member| member.cache_cluster_id == cache_cluster_id)
+        })
+        .and_then(|(index, shard)| shard_slots(shard, index, shards))
+}
+
+/// The first and last slot one shard serves: `NodeGroup$Slots` as the record carries it
+/// ("the keyspace for this node group (shard)"), and the even division of the keyspace this
+/// service gives a shard whose record carries none
+/// ([`crate::state::default_slots`]).
+fn shard_slots(
+    shard: &super::NodeGroupRecord,
+    index: usize,
+    shards: usize,
+) -> Option<(u16, u16)> {
+    let written = shard.slots.clone().unwrap_or_else(|| {
+        super::default_slots(
+            i32::try_from(shards).unwrap_or(1),
+            i32::try_from(index).unwrap_or(0),
+        )
+    });
+    let (start, end) = super::slot_range(&written).ok()?;
+    Some((u16::try_from(start).ok()?, u16::try_from(end).ok()?))
+}
 
 /// How the slow log of a cache running under the parameter group `group_name` on
 /// `node_type` is kept: the `slowlog-log-slower-than` and `slowlog-max-len` values
@@ -974,31 +1092,61 @@ pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
             if !engine_speaks_resp(&group.engine) {
                 return;
             }
-            let members = group.member_clusters();
-            // The keyspace the group already serves, if any of its members is already
-            // open: every member of a group reads and writes the one keyspace, which is
-            // what makes a replica answer what the primary wrote. The FIRST member opened
-            // takes the data set this call was given, so a restored group is served what
-            // its snapshot captured.
-            let keyspace = members
+            let shards = group.node_groups.len();
+            // The next member that has no socket, and the SHARD it belongs to.
+            let next = group
+                .node_groups
                 .iter()
-                .map(|member| CacheIdentity::ReplicationGroupMember {
-                    replication_group_id: replication_group_id.to_string(),
-                    cache_cluster_id: member.clone(),
+                .enumerate()
+                .flat_map(|(index, shard)| {
+                    shard.members.iter().map(move |member| {
+                        (
+                            index,
+                            shard,
+                            CacheIdentity::ReplicationGroupMember {
+                                replication_group_id: replication_group_id.to_string(),
+                                cache_cluster_id: member.cache_cluster_id.clone(),
+                            },
+                        )
+                    })
                 })
-                .find_map(|identity| store.cache_data_planes.get(&identity))
-                .map(|plane| Arc::clone(plane.keyspace()))
-                .or_else(|| restored.as_ref().map(Arc::clone));
-            let next = members
-                .iter()
-                .map(|member| CacheIdentity::ReplicationGroupMember {
-                    replication_group_id: replication_group_id.to_string(),
-                    cache_cluster_id: member.clone(),
-                })
-                .find(|identity| store.cache_data_planes.get(identity).is_none());
-            let Some(identity) = next else {
+                .find(|(_, _, identity)| store.cache_data_planes.get(identity).is_none());
+            let Some((index, shard, identity)) = next else {
                 return;
             };
+            // The keyspace this member reads and writes: the one already open for a member
+            // of ITS OWN SHARD, which is what makes a replica answer what its primary
+            // wrote — and what keeps the shards of a partitioned group the separate
+            // keyspaces the partition is. A group whose keyspace is not partitioned has one
+            // shard, so its members all share the one keyspace.
+            let held = shard
+                .members
+                .iter()
+                .map(|member| CacheIdentity::ReplicationGroupMember {
+                    replication_group_id: replication_group_id.to_string(),
+                    cache_cluster_id: member.cache_cluster_id.clone(),
+                })
+                .find_map(|identity| store.cache_data_planes.get(&identity))
+                .map(|plane| Arc::clone(plane.keyspace()));
+            // The FIRST member of a shard takes the data set this call was given, so a
+            // restored group is served what its snapshot captured — narrowed to the slots
+            // this shard serves, because a key belongs to the shard its slot belongs to and
+            // to no other.
+            let keyspace = held.or_else(|| {
+                let restored = restored.as_ref()?;
+                let Some(slots) = group
+                    .cluster_enabled
+                    .then(|| shard_slots(shard, index, shards))
+                    .flatten()
+                else {
+                    return Some(Arc::clone(restored));
+                };
+                let held = Keyspace::holding_only(&lock_keyspace(restored), |key| {
+                    let slot = slot_routing::key_slot(key);
+                    slot >= slots.0 && slot <= slots.1
+                });
+                Some(Arc::new(Mutex::new(held)))
+            });
             (identity, keyspace, group.transit_encryption_enabled)
         };
         let CacheIdentity::ReplicationGroupMember {

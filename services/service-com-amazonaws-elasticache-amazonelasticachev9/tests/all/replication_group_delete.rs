@@ -15,11 +15,14 @@
 //! The rule under test: a delete is served only while the group AND every member cluster it
 //! is made of are in a state a delete may begin from (`available`); a member in any other
 //! state — one being snapshotted, one still `creating`, one `modifying` — is refused
-//! `InvalidReplicationGroupState` (HTTP 400) naming THAT member cluster, a group that is
-//! itself in another state is refused the same fault naming the group and the status it
-//! carries, and either way the group is left exactly as it was. Once the clock has settled
-//! the work that status stood for, the same call is served: the group answers `deleting` and
-//! it and its member clusters are gone.
+//! `InvalidReplicationGroupState` (HTTP 400) naming THAT member cluster, a group every
+//! member of which admits a delete but which is itself in another state is refused the same
+//! fault naming the group and the status it carries, and either way the group is left exactly
+//! as it was. An id this account holds no group under is refused `ReplicationGroupNotFound`
+//! (HTTP 404) with the delete's OWN sentence. Once the clock has settled the work the status
+//! stood for, the same call is served: the group answers `deleting`, it and its member
+//! clusters are still reported in that status while the teardown runs, and only then does the
+//! id stop resolving.
 //!
 //! The tables span what the rule generalises over: WHICH member of the group is held
 //! (its only member, the primary of a shard that has a replica, a replica, the primary of
@@ -29,12 +32,12 @@
 
 use std::time::Duration;
 
-use service_com_amazonaws_elasticache_amazonelasticachev9::state;
+use service_com_amazonaws_elasticache_amazonelasticachev9::{service, state};
 
 use crate::cache_data_plane::{command, endpoint_of, open, Resp};
 use crate::harness::{
-    assert_refusal, every_pending_change_due_in, params, poll_until, Emulator, Reply,
-    HELD_OUT_OF_REACH, REGION,
+    assert_refusal, every_pending_change_due_in, params, poll_until, release_pending_changes,
+    Emulator, Reply, HELD_OUT_OF_REACH, REGION,
 };
 
 /// Create one replication group and answer the create's reply.
@@ -109,24 +112,39 @@ async fn snapshot_member(emulator: &Emulator, case: &str, name: &str, cluster: &
     );
 }
 
-/// Assert the group `id` is gone: every reader of one answers the modelled not-found fault,
-/// and so does a second delete of the same id.
+/// Assert the group `id` is gone once its teardown has run: every reader of one answers the
+/// modelled not-found fault, and so does a second delete of the same id.
+///
+/// An accepted delete only BEGINS the teardown — the group answers `deleting` until the
+/// clock has carried it through — so the reader is looked at again until the id stops
+/// resolving rather than once, and the window itself is what
+/// [`the_deleting_window_is_observable_until_the_teardown_completes`] is about.
 async fn assert_group_gone(emulator: &Emulator, case: &str, id: &str) {
-    let described = describe_group(emulator, id).await;
+    release_pending_changes(emulator);
+    let described = poll_until(
+        emulator,
+        REGION,
+        case,
+        "the deleted group stopping resolving",
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.status == 404,
+    )
+    .await;
     assert_eq!(
-        (described.status, described.error_code()),
-        (404, "ReplicationGroupNotFoundFault"),
+        described.error_code(),
+        "ReplicationGroupNotFoundFault",
         "case {case:?}: the deleted group must be gone, got {} {}",
         described.status,
         described.body
     );
     let again = delete_group(emulator, id, &[]).await;
-    assert_eq!(
-        (again.status, again.error_code()),
-        (404, "ReplicationGroupNotFoundFault"),
-        "case {case:?}: deleting it twice must answer the not-found fault, got {} {}",
-        again.status,
-        again.body
+    assert_refusal(
+        case,
+        &again,
+        404,
+        "ReplicationGroupNotFoundFault",
+        service::replication_group_not_found::DELETE_MESSAGE,
     );
 }
 
@@ -245,11 +263,11 @@ async fn a_delete_is_refused_while_a_member_cluster_is_being_snapshotted() {
 }
 
 #[tokio::test]
-async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_own_words() {
+async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused() {
     let emulator = Emulator::new();
     // The axis: HOW the group came to carry a status other than `available` — a create the
     // clock has not carried through, and a change in flight — and how the request spells the
-    // id, because the refusal names the group as the service STORES it ("this value is
+    // id, because the refusal names the resource as the service STORES it ("this value is
     // stored as a lowercase string") rather than as the request spelled it.
     let created = create_group(&emulator, "Fresh-RG", &[("ReplicasPerNodeGroup", "0")]).await;
     assert_eq!(
@@ -259,25 +277,19 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
     );
     every_pending_change_due_in(&emulator, HELD_OUT_OF_REACH);
     let refused = delete_group(&emulator, "FRESH-RG", &[]).await;
-    assert_eq!(
-        (refused.status, refused.error_code()),
-        (400, "InvalidReplicationGroupState"),
-        "a group that is still creating must be refused, got {} {}",
-        refused.status,
-        refused.body
-    );
-    assert_eq!(
-        refused.error_message(),
-        format!(
-            "Replication group fresh-rg has status {} which is not valid for deletion.",
-            state::STATUS_CREATING
-        ),
-        "the refusal must name the stored group id and the status it carries, got {}",
-        refused.body
+    assert_refusal(
+        "a group that is still creating",
+        &refused,
+        400,
+        "InvalidReplicationGroupState",
+        // The group's members are still being provisioned, so the member cluster that
+        // cannot be deleted yet is what the refusal names.
+        "Cache cluster fresh-rg-001 is not in a valid state to be deleted.",
     );
     every_pending_change_due_in(&emulator, Duration::ZERO);
 
-    // A change in flight: the group answers `modifying` until the clock owes it `available`.
+    // A change in flight: the group answers `modifying` until the clock owes it `available`,
+    // and the replica being added is `creating` until then.
     available_group(
         &emulator,
         "scaling-rg",
@@ -302,21 +314,12 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
     );
     every_pending_change_due_in(&emulator, HELD_OUT_OF_REACH);
     let refused = delete_group(&emulator, "scaling-rg", &[]).await;
-    assert_eq!(
-        (refused.status, refused.error_code()),
-        (400, "InvalidReplicationGroupState"),
-        "a group that is still modifying must be refused, got {} {}",
-        refused.status,
-        refused.body
-    );
-    assert_eq!(
-        refused.error_message(),
-        format!(
-            "Replication group scaling-rg has status {} which is not valid for deletion.",
-            state::STATUS_MODIFYING
-        ),
-        "the refusal must name the stored group id and the status it carries, got {}",
-        refused.body
+    assert_refusal(
+        "a group that is still modifying",
+        &refused,
+        400,
+        "InvalidReplicationGroupState",
+        "Cache cluster scaling-rg-002 is not in a valid state to be deleted.",
     );
 
     // Both groups are deletable once the clock has settled them.
@@ -346,7 +349,9 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
 
 /// One status-gate row: the case, the group id, the pairs that create it, the ACTION that
 /// takes the group out of `available` (the `awsQuery` action name, empty when the row holds
-/// the create itself) with the pairs that call it, and the status the group then carries.
+/// the create itself) with the pairs that call it, the status the group then carries, and the
+/// MEMBER cluster the refusal names — empty for a row where every member still admits a
+/// delete and the group's own status is what blocks it.
 type StatusGateCase = (
     &'static str,
     &'static str,
@@ -354,17 +359,20 @@ type StatusGateCase = (
     &'static str,
     &'static [(&'static str, &'static str)],
     &'static str,
+    &'static str,
 );
 
 #[tokio::test]
-async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
+async fn the_state_gate_refusal_names_the_resource_that_blocks_the_delete() {
     let emulator = Emulator::new();
     // The axis: WHICH outstanding piece of work the group's status stands for when the
     // delete arrives — a create the clock has not carried through, a data migration in
-    // flight, a failover setting being applied, a replica being added. The refusal is the
-    // one sentence for all of them, and its status is read off the group's own record, so
-    // each row asserts the sentence built from the status `DescribeReplicationGroups`
-    // reports rather than from a literal.
+    // flight, a failover setting being applied, a replica being added — and therefore WHICH
+    // resource blocks the delete. A delete takes the group's member CLUSTERS with it, so a
+    // member that is not in a state a delete may begin from is what the refusal names; only
+    // when every member admits a delete and the GROUP alone is not in `available` — a
+    // migration being the case, because the sync is work of the group rather than of its
+    // nodes — does the refusal name the group and the status its own record carries.
     let cases: [StatusGateCase; 4] = [
         (
             "a create the clock has not carried through",
@@ -373,6 +381,7 @@ async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
             "",
             &[],
             state::STATUS_CREATING,
+            "gate-fresh-rg-001",
         ),
         (
             "a data migration in flight",
@@ -384,6 +393,7 @@ async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
                 ("CustomerNodeEndpointList.member.1.Port", "6379"),
             ],
             state::STATUS_MODIFYING,
+            "",
         ),
         (
             "a failover setting being applied",
@@ -395,6 +405,7 @@ async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
                 ("ApplyImmediately", "true"),
             ],
             state::STATUS_MODIFYING,
+            "gate-failover-rg-001",
         ),
         (
             "a replica being added",
@@ -403,10 +414,11 @@ async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
             "IncreaseReplicaCount",
             &[("NewReplicaCount", "1"), ("ApplyImmediately", "true")],
             state::STATUS_MODIFYING,
+            "gate-grow-rg-002",
         ),
     ];
 
-    for (case, id, extra, action, action_pairs, expected_status) in cases {
+    for (case, id, extra, action, action_pairs, expected_status, blocking_member) in cases {
         if action.is_empty() {
             let created = create_group(&emulator, id, extra).await;
             assert_eq!(
@@ -441,15 +453,14 @@ async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
         );
 
         let refused = delete_group(&emulator, id, &[]).await;
-        assert_refusal(
-            case,
-            &refused,
-            400,
-            "InvalidReplicationGroupState",
-            &format!(
+        let expected = if blocking_member.is_empty() {
+            format!(
                 "Replication group {id} has status {reported} which is not valid for deletion."
-            ),
-        );
+            )
+        } else {
+            format!("Cache cluster {blocking_member} is not in a valid state to be deleted.")
+        };
+        assert_refusal(case, &refused, 400, "InvalidReplicationGroupState", &expected);
         // "The group must survive the refusal": exactly the one group is still reported,
         // in the status it was in.
         let still = describe_group(&emulator, id).await;
@@ -925,5 +936,127 @@ async fn retaining_the_primary_of_a_partitioned_group_is_refused() {
             still.status,
             still.body
         );
+    }
+}
+
+/// One teardown-window row: the case, the group id, the pairs that create it, and the member
+/// cluster ids the delete takes with it.
+type TeardownCase = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+);
+
+#[tokio::test]
+async fn the_deleting_window_is_observable_until_the_teardown_completes() {
+    let emulator = Emulator::new();
+    // "When you receive a successful response from this operation, Amazon ElastiCache
+    // immediately BEGINS deleting the selected resources": `ReplicationGroup$Status` is
+    // documented "creating, available, modifying, deleting, create-failed, snapshotting", so
+    // a group whose teardown has begun is reported in `deleting` by every reader of one —
+    // and stops resolving only once the teardown the clock owes has run.
+    //
+    // The axis: the group's SHAPE, because the window is the group's and not one member's —
+    // one cluster, a pair, and two shards with a replica each.
+    let cases: [TeardownCase; 3] = [
+        (
+            "one cluster",
+            "window-single-rg",
+            &[("ReplicasPerNodeGroup", "0")],
+            &["window-single-rg-001"],
+        ),
+        (
+            "a primary and a replica",
+            "window-pair-rg",
+            &[("NumCacheClusters", "2")],
+            &["window-pair-rg-001", "window-pair-rg-002"],
+        ),
+        (
+            "two shards with a replica each",
+            "window-split-rg",
+            &[("NumNodeGroups", "2"), ("ReplicasPerNodeGroup", "1")],
+            &[
+                "window-split-rg-0001-001",
+                "window-split-rg-0001-002",
+                "window-split-rg-0002-001",
+                "window-split-rg-0002-002",
+            ],
+        ),
+    ];
+
+    for (case, id, extra, members) in cases {
+        available_group(&emulator, case, id, extra).await;
+        let deleted = delete_group(&emulator, id, &[]).await;
+        assert_eq!(
+            (deleted.status, deleted.text("ReplicationGroup/Status")),
+            (200, Some(state::STATUS_DELETING)),
+            "case {case:?}: the delete must answer the group going away, got {} {}",
+            deleted.status,
+            deleted.body
+        );
+        // The teardown is held out of reach, so the window really is open when the reads
+        // below arrive, whatever the host is doing.
+        every_pending_change_due_in(&emulator, HELD_OUT_OF_REACH);
+
+        let described = describe_group(&emulator, id).await;
+        assert_eq!(
+            (described.status, described.text("ReplicationGroup/Status")),
+            (200, Some(state::STATUS_DELETING)),
+            "case {case:?}: the group must still be reported, in `deleting`, got {} {}",
+            described.status,
+            described.body
+        );
+        assert_eq!(
+            described.all("ReplicationGroup/ReplicationGroupId"),
+            vec![id],
+            "case {case:?}: exactly the one group must be reported, got {}",
+            described.body
+        );
+        let shard_statuses = described.all("NodeGroup/Status");
+        assert!(
+            !shard_statuses.is_empty()
+                && shard_statuses
+                    .iter()
+                    .all(|status| *status == state::STATUS_DELETING),
+            "case {case:?}: every shard must report going away, got {shard_statuses:?}"
+        );
+        // A second delete inside the window is refused for the member clusters that are
+        // already going away, rather than answered as a group that was never there.
+        let again = delete_group(&emulator, id, &[]).await;
+        assert_eq!(
+            (again.status, again.error_code()),
+            (400, "InvalidReplicationGroupState"),
+            "case {case:?}: a second delete inside the window must be refused, got {} {}",
+            again.status,
+            again.body
+        );
+        for member in members {
+            let cluster = describe_cluster(&emulator, member).await;
+            assert_eq!(
+                (
+                    cluster.status,
+                    cluster.text("CacheCluster/CacheClusterStatus")
+                ),
+                (200, Some(state::STATUS_DELETING)),
+                "case {case:?}: {member} must still be reported, in `deleting`, got {} {}",
+                cluster.status,
+                cluster.body
+            );
+        }
+
+        // Once the clock has carried the teardown through, the id stops resolving — and so
+        // does every member cluster that went with the group.
+        assert_group_gone(&emulator, case, id).await;
+        for member in members {
+            let cluster = describe_cluster(&emulator, member).await;
+            assert_eq!(
+                (cluster.status, cluster.error_code()),
+                (404, "CacheClusterNotFound"),
+                "case {case:?}: {member} must be gone with the group, got {} {}",
+                cluster.status,
+                cluster.body
+            );
+        }
     }
 }

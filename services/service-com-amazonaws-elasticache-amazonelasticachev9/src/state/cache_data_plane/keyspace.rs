@@ -230,6 +230,27 @@ impl Keyspace {
         }
     }
 
+    /// A keyspace holding only the keys of `other` that `keep` admits.
+    ///
+    /// What a PARTITIONED cache's shard is served of a data set restored into the group: a
+    /// key belongs to the shard whose slots its own slot falls in and to no other, so each
+    /// shard is given the part of the set that is its own rather than a copy of the whole.
+    pub fn holding_only(other: &Keyspace, keep: impl Fn(&str) -> bool) -> Self {
+        let entries: BTreeMap<String, Entry> = other
+            .entries
+            .iter()
+            .filter(|(key, _)| keep(key))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        let bytes = entries.values().map(Entry::bytes).sum();
+        Self {
+            entries,
+            bytes,
+            clock: other.clock,
+            ..Self::default()
+        }
+    }
+
     /// Lay the keys `other` holds over the ones this keyspace already holds, the later
     /// copy of a key winning — what restoring a cache from more than one snapshot does.
     ///

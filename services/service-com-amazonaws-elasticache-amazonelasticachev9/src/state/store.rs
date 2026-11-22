@@ -408,6 +408,10 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             let Some(cache) = self.serverless_caches.remove(&name) else {
                 continue;
             };
+            // The sockets that cache was served on close with it, for the reason
+            // [`Self::purge_deleted_replication_groups`] gives: nothing answers for a cache
+            // that is gone.
+            close_serverless_cache_data_plane(self, &name);
             if let Some(id) = cache.user_group_id {
                 if let Some(group) = self.user_groups.get_mut(&id) {
                     group
@@ -559,6 +563,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         // anything is reported from it.
         self.purge_deleted_serverless_caches(now);
         self.purge_deleted_snapshots(now);
+        self.purge_deleted_replication_groups(now);
         let mut settled: Vec<(String, SettledClusterTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {
@@ -785,8 +790,58 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
 
     /// Materialise every status change the clock owes a replication group.
     pub fn settle_replication_groups(&mut self, now: SystemTime) {
+        self.purge_deleted_replication_groups(now);
         for group in self.replication_groups.values_mut() {
             group.settle(now);
+        }
+    }
+
+    /// Drop every replication group whose teardown the clock has carried through
+    /// — the groups a `DeleteReplicationGroup` put into [`STATUS_DELETING`] at
+    /// least [`REPLICATION_GROUP_TEARDOWN`] ago — together with the member
+    /// CLUSTERS that are going away with them.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change — see [`Self::purge_deleted_snapshots`], the
+    /// same rule for the other resource a delete only begins. Until it falls due
+    /// the group and its members are still reported, in the `deleting` status the
+    /// delete put them in, which is what a client waiting out a teardown polls.
+    pub fn purge_deleted_replication_groups(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .replication_groups
+            .values()
+            .filter(|group| group.pending_removal.is_some_and(|at| now >= at))
+            .map(|group| group.replication_group_id.clone())
+            .collect();
+        for key in due {
+            let Some(group) = self.replication_groups.remove(&key) else {
+                continue;
+            };
+            // Only the members this delete took: a primary the delete RETAINED
+            // was taken out of the group's membership and left behind as a
+            // standalone cluster by the call itself, so it is not here.
+            for member in group.member_clusters() {
+                self.cache_clusters.remove(&member);
+                // The socket that member was served on closes with it: dropping
+                // the handle closes the port and severs every connection on it,
+                // so nothing keeps answering for a node that is gone. The delete
+                // that began the teardown closed them too, and closing one twice
+                // is the same as closing it once.
+                close_cache_cluster_data_plane(self, &member, Some(&key));
+            }
+            // A Global datastore cannot report a member that no longer exists.
+            if let Some(global_key) = group
+                .global_replication_group_id
+                .as_ref()
+                .map(|id| id.to_ascii_lowercase())
+            {
+                if let Some(datastore) = self.global_replication_groups.get_mut(&global_key) {
+                    datastore
+                        .members
+                        .retain(|member| !member.replication_group_id.eq_ignore_ascii_case(&key));
+                }
+            }
         }
     }
 
@@ -804,6 +859,10 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         id: &str,
         now: SystemTime,
     ) -> Option<&mut ReplicationGroupRecord> {
+        // A group whose teardown the clock has carried through is gone, so it
+        // resolves to nothing rather than to a record reporting `deleting` for
+        // ever; see [`Self::purge_deleted_replication_groups`].
+        self.purge_deleted_replication_groups(now);
         let group = self.replication_groups.get_mut(id)?;
         group.settle(now);
         Some(group)
@@ -1418,6 +1477,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 due: new.now + CLUSTER_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // Nothing has asked to delete a group that is only being created.
+            pending_removal: None,
             created_at: new.now,
             dns_token,
             port: new.port,

@@ -34,6 +34,7 @@ use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::access_control::AccessRules;
 use super::resp_frame::{encoded, next_command, FrameError, Reply};
+use super::slot_routing;
 use super::slow_log::{SlowLogEntry, UNKNOWN_CLIENT_ADDRESS};
 use super::{commands, CacheFacts, CacheIdentity, SharedKeyspace, SharedSlowLog};
 
@@ -312,6 +313,18 @@ impl Session {
                 false,
             );
         }
+        // A PARTITIONED keyspace is served per shard: each shard serves only the slots its
+        // `Slots` names, so a command whose key belongs to another shard is answered with
+        // the engine's own `-MOVED` naming the node that owns it, and one whose keys
+        // straddle the partition with `-CROSSSLOT`. Both are read off the group's own shards
+        // and their published endpoints ([`slot_routing`]).
+        if facts.cluster_enabled {
+            if let Some(refusal) =
+                slot_routing::slot_refusal(&keys, facts.serving_slots, &facts.cluster_slots)
+            {
+                return (Some(refusal.reply()), false);
+            }
+        }
         // The command is about to be EXECUTED, and how long that takes is what the engine's
         // slow log records it by.
         let started = Instant::now();
@@ -335,7 +348,7 @@ impl Session {
             "command" => command_command(arguments),
             "info" => Reply::Bulk(self.info(&facts).into_bytes()),
             "config" => self.config_command(&facts, arguments),
-            "cluster" => cluster_command(&facts, arguments),
+            "cluster" => self.cluster_command(&facts, arguments),
             "slowlog" => self.slowlog_command(arguments),
             _ => {
                 let now = SystemTime::now();
@@ -671,31 +684,74 @@ impl Session {
             cluster = i32::from(facts.cluster_enabled),
         )
     }
-}
 
-/// `CLUSTER INFO`: whether this cache is partitioned, and that its one shard is serving.
-fn cluster_command(facts: &CacheFacts, arguments: &[Vec<u8>]) -> Reply {
-    match String::from_utf8_lossy(&arguments[1])
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "info" => Reply::Bulk(
-            format!(
-                "cluster_enabled:{}\r\ncluster_state:ok\r\ncluster_slots_assigned:{}\r\n\
-                 cluster_known_nodes:1\r\ncluster_size:1\r\n",
-                i32::from(facts.cluster_enabled),
-                if facts.cluster_enabled { 16384 } else { 0 }
-            )
-            .into_bytes(),
-        ),
-        other => Reply::Error(format!(
-            "ERR This instance has cluster support {} — unknown CLUSTER subcommand '{other}'",
-            if facts.cluster_enabled {
-                "enabled"
-            } else {
-                "disabled"
+    /// `CLUSTER <subcommand>`: what this cache's own partition is, as a cluster-aware
+    /// client discovers it.
+    ///
+    /// Every answer is built from the slot map the control plane holds for this cache
+    /// ([`slot_routing`]): the shards, the slots each serves and the published address of
+    /// each of its nodes. A cache whose keyspace is not partitioned has no shards to report
+    /// and answers the empty map, which is what the engine answers with cluster support
+    /// disabled.
+    fn cluster_command(&self, facts: &CacheFacts, arguments: &[Vec<u8>]) -> Reply {
+        let map = &facts.cluster_slots;
+        match String::from_utf8_lossy(&arguments[1])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "info" => {
+                let assigned: u32 = map
+                    .iter()
+                    .map(|shard| u32::from(shard.slots.1 - shard.slots.0) + 1)
+                    .sum();
+                let nodes: usize = map.iter().map(|shard| shard.nodes.len()).sum();
+                Reply::Bulk(
+                    format!(
+                        "cluster_enabled:{}\r\ncluster_state:ok\r\ncluster_slots_assigned:{}\r\n\
+                         cluster_known_nodes:{}\r\ncluster_size:{}\r\n",
+                        i32::from(facts.cluster_enabled),
+                        assigned,
+                        nodes.max(1),
+                        map.len().max(1),
+                    )
+                    .into_bytes(),
+                )
             }
-        )),
+            "slots" => slot_routing::cluster_slots_reply(map),
+            "shards" => slot_routing::cluster_shards_reply(map),
+            "nodes" => slot_routing::cluster_nodes_reply(map, Some(&facts.node_cluster_id)),
+            "myid" => Reply::text(slot_routing::node_name(&facts.node_cluster_id)),
+            "keyslot" => match arguments.get(2) {
+                Some(key) => Reply::Integer(i64::from(slot_routing::key_slot(
+                    &String::from_utf8_lossy(key),
+                ))),
+                None => commands::wrong_arity("cluster|keyslot"),
+            },
+            "countkeysinslot" => match arguments
+                .get(2)
+                .map(|slot| String::from_utf8_lossy(slot).trim().parse::<u16>())
+            {
+                Some(Ok(slot)) if u32::from(slot) < u32::try_from(crate::state::KEYSPACE_SLOTS).unwrap_or(u32::MAX) => {
+                    let now = SystemTime::now();
+                    let mut keyspace = super::lock_keyspace(&self.socket.keyspace);
+                    let held = keyspace
+                        .keys(now)
+                        .into_iter()
+                        .filter(|key| slot_routing::key_slot(key) == slot)
+                        .count();
+                    Reply::Integer(i64::try_from(held).unwrap_or(i64::MAX))
+                }
+                _ => Reply::Error("ERR Invalid slot".to_string()),
+            },
+            other => Reply::Error(format!(
+                "ERR This instance has cluster support {} — unknown CLUSTER subcommand '{other}'",
+                if facts.cluster_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )),
+        }
     }
 }
 

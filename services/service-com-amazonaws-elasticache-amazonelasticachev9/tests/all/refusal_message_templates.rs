@@ -16,10 +16,14 @@
 //!    `ResetCacheParameterGroup` answer the first, `ModifyCacheParameterGroup` and
 //!    `CreateCacheCluster`'s resolution of the member answer the second, and
 //!    `DescribeCacheParameterGroups` answers the third.
-//! 2. `ModifyReplicationGroup` words its `ReplicationGroupNotFoundFault`
-//!    `Replication group '<id>' not found` — the id single-quoted, no trailing stop —
-//!    while `DescribeReplicationGroups`, asserted beside it on the same id, keeps the
-//!    other template the service has for that fault, `ReplicationGroup <id> not found.`
+//! 2. A `ReplicationGroupNotFoundFault` is worded PER OPERATION, and the wordings are
+//!    observable apart on the live service: `ModifyReplicationGroup` and
+//!    `ModifyReplicationGroupShardConfiguration` answer `Replication group '<id>' not found`
+//!    — the id single-quoted, no trailing stop — `TestFailover` answers `Replication group
+//!    <id> does not exist.`, `DeleteReplicationGroup` answers the wholly fixed `Specified
+//!    replication group does not exist`, which names no id at all, and
+//!    `DescribeReplicationGroups`, asserted beside them on the same id, keeps
+//!    `ReplicationGroup <id> not found.`
 //! 3. A parameter value the row's published `Parameter$AllowedValues` do not cover is
 //!    refused in whichever of TWO sibling templates that published set's own kind calls
 //!    for: a set that bounds a number is reported `value:<the value> is outside of
@@ -215,12 +219,17 @@ async fn each_operation_words_the_parameter_group_not_found_fault_with_its_own_t
     assert_both_templates(&emulator, rows.len(), "a deleted name", deleted).await;
 }
 
+/// One per-operation wording row: the `awsQuery` action, the pairs it sends beside the id,
+/// and the sentence it words `ReplicationGroupNotFoundFault` with.
+type WordingCase = (&'static str, Vec<(String, String)>, String);
+
 #[tokio::test]
-async fn modify_replication_group_words_its_not_found_fault_its_own_way() {
+async fn each_operation_words_the_replication_group_not_found_fault_its_own_way() {
     let emulator = Emulator::new();
 
     // The axis: the FORM of the id — its length (one letter, and one at the bound a
-    // lookup admits), its case, and the characters it carries.
+    // lookup admits), its case, and the characters it carries — crossed with the OPERATION
+    // that resolves it, because the wording is the operation's own.
     let at_bound = format!("r{}", "g".repeat(state::REPLICATION_GROUP_ID_MAX_LEN - 1));
     let ids = [
         "absent-rg",
@@ -231,21 +240,44 @@ async fn modify_replication_group_words_its_not_found_fault_its_own_way() {
     ];
 
     for id in ids {
-        let modified = emulator
-            .call(
+        // (the operation, the pairs beside the id, the sentence it words the fault with)
+        let wordings: [WordingCase; 4] = [
+            (
                 "ModifyReplicationGroup",
-                &params(&[("ReplicationGroupId", id), ("ApplyImmediately", "true")]),
-            )
-            .await;
-        assert_refusal(
-            &format!("{id} through ModifyReplicationGroup"),
-            &modified,
-            404,
-            "ReplicationGroupNotFoundFault",
-            &format!("Replication group '{id}' not found"),
-        );
+                params(&[("ApplyImmediately", "true")]),
+                format!("Replication group '{id}' not found"),
+            ),
+            (
+                "ModifyReplicationGroupShardConfiguration",
+                params(&[("ApplyImmediately", "true"), ("NodeGroupCount", "2")]),
+                format!("Replication group '{id}' not found"),
+            ),
+            (
+                "TestFailover",
+                params(&[("NodeGroupId", "0001")]),
+                format!("Replication group {id} does not exist."),
+            ),
+            (
+                "DeleteReplicationGroup",
+                Vec::new(),
+                // Wholly fixed: the delete names no id at all.
+                "Specified replication group does not exist".to_string(),
+            ),
+        ];
+        for (action, extra, message) in wordings {
+            let mut pairs = params(&[("ReplicationGroupId", id)]);
+            pairs.extend(extra);
+            let refused = emulator.call(action, &pairs).await;
+            assert_refusal(
+                &format!("{id} through {action}"),
+                &refused,
+                404,
+                "ReplicationGroupNotFoundFault",
+                &message,
+            );
+        }
 
-        // The same id through the read, which words the fault the OTHER way: the two
+        // The same id through the read, which words the fault another way again: the
         // operations are told apart by their message on the live service, so a single
         // template for the service cannot be right.
         let described = emulator

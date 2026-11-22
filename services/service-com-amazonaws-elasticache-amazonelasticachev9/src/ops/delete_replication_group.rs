@@ -208,28 +208,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The group, with whatever status change the clock owes it already
             // materialised.
-            let (members, shards, group_engine, group_node_type, group_kms_key_id, global_key) = {
+            let (
+                members,
+                shards,
+                group_status,
+                group_engine,
+                group_node_type,
+                group_kms_key_id,
+            ) = {
                 let Some(group) = store.settled_replication_group_mut(&key, now) else {
                     return Err(DeleteReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                         ReplicationGroupNotFoundFault {
-                            message: Some(crate::state::replication_group_not_found_message(
-                                &input.replication_group_id,
-                            )),
+                            message: Some(
+                                crate::service::replication_group_not_found::DELETE_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into());
                 };
-                // A delete begins from the group's settled, usable status: one
-                // still `creating`, or `modifying` from a change the clock has
-                // not carried through (a migration in flight among them), is
-                // refused with the modelled state fault — naming the status the
-                // group's own record carries — and the group is left exactly as
-                // it was.
-                if group.status != crate::state::STATUS_AVAILABLE {
-                    return Err(invalid_state(
-                        crate::state::replication_group_delete_state_refusal(&key, &group.status),
-                    ));
-                }
                 let members: Vec<(String, bool)> = group
                     .node_groups
                     .iter()
@@ -244,18 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (
                     members,
                     group.node_groups.len(),
+                    group.status.clone(),
                     group.engine.clone(),
                     group.cache_node_type.clone(),
                     group.kms_key_id.clone(),
-                    group.global_replication_group_id.clone(),
                 )
             };
 
             // Deleting the group deletes the CLUSTERS it is made of, so every
             // one of them has to be in a state a delete may begin from: a member
             // being snapshotted, still `creating`, or `modifying` from a change
-            // that has not settled, blocks the call. The refusal names the
-            // member that blocks it, read off the group's own membership.
+            // that has not settled, blocks the call. The MEMBERS are judged
+            // first, and the refusal names the one that blocks it, read off the
+            // group's own membership — so a group whose own status stands for
+            // work its nodes are still doing is refused for the node that is
+            // doing it rather than for the group.
             for (member, _) in &members {
                 let blocked = store
                     .settled_cluster_mut(member, now)
@@ -265,6 +265,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::cache_cluster_delete_state_refusal(member),
                     ));
                 }
+            }
+
+            // Only then the GROUP's own status: a group every member of which
+            // admits a delete, but which is itself in a status that does not —
+            // `modifying` from a change of the group alone, a migration in
+            // flight among them — is refused naming the group and the status its
+            // own record carries, and is left exactly as it was.
+            if group_status != crate::state::STATUS_AVAILABLE {
+                return Err(invalid_state(
+                    crate::state::replication_group_delete_state_refusal(&key, &group_status),
+                ));
             }
 
             // "If the replication group has only one primary, you can
@@ -371,9 +382,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The group is leaving: it answers `deleting` from this call, and so
             // do the clusters it is made of, and the answer is read back out of
-            // the store rather than built beside it.
+            // the store rather than built beside it. The RECORD stays while the
+            // teardown runs — the status the shape documents for exactly this —
+            // and is dropped by whichever later call finds its removal due
+            // (`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_replication_groups`).
             if let Some(group) = store.replication_groups.get_mut(&key) {
-                group.begin_deletion();
+                group.begin_deletion(now);
             }
             for (member, primary) in &members {
                 if retain_primary && *primary {
@@ -425,32 +439,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Cache cluster deleted",
                     now,
                 );
-                store.cache_clusters.remove(member);
             }
             // A retained primary is a standalone cluster from here on: it
             // belongs to no replication group, so `DescribeCacheClusters` stops
-            // reporting one for it.
+            // reporting one for it — and it is taken out of the group's
+            // membership, so the teardown that takes the group's members does
+            // not take the one the request asked to keep.
             if let Some((member, _)) = retained.as_ref() {
                 if let Some(cluster) = store.cache_clusters.get_mut(member) {
                     cluster.replication_group_id = None;
                     cluster.replication_group_log_delivery_enabled = None;
                 }
-            }
-            store.replication_groups.remove(&key);
-            // A Global datastore cannot report a member that no longer exists,
-            // so the membership goes with the group — the pair
-            // `DisassociateGlobalReplicationGroup` clears, cleared here by the
-            // delete instead.
-            if let Some(global_key) = global_key.map(|id| id.to_ascii_lowercase()) {
-                if let Some(datastore) = store.global_replication_groups.get_mut(&global_key) {
-                    datastore
-                        .members
-                        .retain(|member| !member.replication_group_id.eq_ignore_ascii_case(&key));
+                if let Some(group) = store.replication_groups.get_mut(&key) {
+                    for shard in &mut group.node_groups {
+                        shard
+                            .members
+                            .retain(|held| &held.cache_cluster_id != member);
+                    }
                 }
             }
             // The final snapshot outlives the group it was taken of: it is
-            // stored after the group is gone, and a later `DescribeSnapshots`
-            // still reports it.
+            // stored while the group is going away, and a later
+            // `DescribeSnapshots` still reports it.
             if let Some(record) = final_snapshot {
                 let stored = store.insert_snapshot(record);
                 let snapshot_name = stored.snapshot_name.clone();

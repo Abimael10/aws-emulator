@@ -64,7 +64,9 @@ impl Resp {
 ///
 /// The assertion is what pins the endpoint to this machine: the core binds its listeners
 /// on the operator-chosen interface, loopback by default, so the address a cache publishes
-/// is this machine's own loopback address — and that is the address dialled.
+/// is this machine's own loopback address — and that is the address dialled. The nodes of one
+/// group are told apart by the PORT each of their own sockets answers on, which is what
+/// [`crate::cluster_mode_slot_routing`] asserts over a partitioned group's shards.
 pub(crate) async fn open(case: &str, address: &str, port: &str) -> Session {
     assert_eq!(
         address, "127.0.0.1",

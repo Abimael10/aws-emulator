@@ -446,6 +446,26 @@ impl NodeGroupRecord {
         Some((demoted, promoted))
     }
 
+    /// This shard's members as a cluster-aware client routes to them: the member cluster id
+    /// of each and whether it holds the PRIMARY role, the primary first.
+    ///
+    /// The role rather than the stored order is what decides it, so a shard that has been
+    /// failed over reports the member holding the role now.
+    pub fn nodes_by_role(&self) -> Vec<(String, bool)> {
+        let mut nodes: Vec<(String, bool)> = self
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.cache_cluster_id.clone(),
+                    member.current_role == ROLE_PRIMARY,
+                )
+            })
+            .collect();
+        nodes.sort_by_key(|(_, primary)| !*primary);
+        nodes
+    }
+
     /// This shard as the modelled `NodeGroup`.
     ///
     /// `PrimaryEndpoint` / `ReaderEndpoint` are the cluster mode DISABLED
@@ -664,6 +684,10 @@ pub struct ReplicationGroupRecord {
     pub status: String,
     /// The status change the clock owes this group, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the teardown a `DeleteReplicationGroup` began completes, after which
+    /// the group stops resolving at all; see [`ReplicationGroupRecord::begin_deletion`].
+    /// `None` for a group nothing has asked to delete.
+    pub pending_removal: Option<SystemTime>,
     pub created_at: SystemTime,
     /// The DNS label every endpoint of this group carries, minted once and
     /// stored, so an endpoint is stable across reads.
@@ -911,17 +935,22 @@ impl ReplicationGroupRecord {
         }
     }
 
-    /// Put this group and its shards into [`STATUS_DELETING`].
+    /// Put this group and its shards into [`STATUS_DELETING`], and start the span
+    /// after which the teardown is complete and the group stops resolving.
     ///
     /// `DeleteReplicationGroup` documents exactly this: "when you receive a
     /// successful response from this operation, Amazon ElastiCache immediately
     /// begins deleting the selected resources; you cannot cancel or revert this
-    /// operation" — so the answer a caller is handed reports the group going
-    /// away. Any status change that was still pending is dropped: a group that is
-    /// going away is not owed `available` any more.
-    pub fn begin_deletion(&mut self) {
+    /// operation" — a delete that is only BEGUN, so `Status` is one of the states
+    /// the shape documents ("creating, available, modifying, deleting, …") and
+    /// every reader still reports the group in it until the removal the clock owes
+    /// falls due ([`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_replication_groups`]).
+    /// Any status change that was still pending is dropped: a group that is going
+    /// away is not owed `available` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
         self.status = STATUS_DELETING.to_string();
         self.pending_status = None;
+        self.pending_removal = Some(now + REPLICATION_GROUP_TEARDOWN);
         for shard in &mut self.node_groups {
             shard.status = STATUS_DELETING.to_string();
         }

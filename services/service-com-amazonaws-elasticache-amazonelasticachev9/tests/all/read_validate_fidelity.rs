@@ -888,7 +888,10 @@ async fn the_not_found_and_already_exists_refusals_carry_the_service_templates()
             ],
             404,
             "ReplicationGroupNotFoundFault",
-            "ReplicationGroup ghost-group not found.",
+            // The failover test words the fault its own way; see
+            // `crate::refusal_message_templates`, where the per-operation wordings of this
+            // one fault are the rule under test.
+            "Replication group ghost-group does not exist.",
         ),
         (
             "a replication group id already taken",

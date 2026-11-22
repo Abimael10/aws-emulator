@@ -197,6 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One lock spans the checks and the removal, so of two concurrent deletes of
         // the same name exactly one can be the one that found it present.
         let mut store = state.lock();
+        // A resource whose removal the clock already owes is GONE before the
+        // association check below reads it: a replication group whose teardown has
+        // run carries no parameter group any more, so the group it ran under is
+        // free. The removal is due at its instant whether or not anybody called,
+        // which is what makes it this call's to materialise.
+        store.settle_all(now);
 
         // "The requested cache parameter group name does not refer to an existing
         // cache parameter group" is the modelled 404, resolved through the one

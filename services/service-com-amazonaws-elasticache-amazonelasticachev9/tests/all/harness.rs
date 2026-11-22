@@ -72,6 +72,9 @@ pub fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
             if let Some(pending) = group.pending_status.as_mut() {
                 pending.due = due;
             }
+            if group.pending_removal.is_some() {
+                group.pending_removal = Some(due);
+            }
         }
         for group in store.global_replication_groups.values_mut() {
             if let Some(pending) = group.pending_status.as_mut() {

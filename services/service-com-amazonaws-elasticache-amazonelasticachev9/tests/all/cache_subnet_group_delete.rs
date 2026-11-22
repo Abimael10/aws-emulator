@@ -36,7 +36,9 @@
 use crate::cache_cluster_lifecycle::{
     account_subnet_ids, create_available_cluster, subnet_group_params,
 };
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{
+    params, poll_until, release_pending_changes, settle_pending_changes, Emulator, Reply, REGION,
+};
 
 /// Create one cache subnet group holding `subnets`, with whatever tags `tags`
 /// names.
@@ -492,7 +494,9 @@ async fn a_subnet_group_in_use_cannot_be_deleted() {
         "the replication group must be created, got {} {}",
         group.status, group.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    // Both resources are settled before the rows below, so each row's refusal is about the
+    // resource being PLACED in the group rather than about work still outstanding on it.
+    settle_pending_changes(&emulator);
 
     // Each row: the case, the subnet group a resource holds, the action that
     // releases it, and that action's form pairs.
@@ -573,12 +577,21 @@ async fn a_subnet_group_in_use_cannot_be_deleted() {
             );
             continue;
         }
-        let deleted = delete_group(&emulator, name).await;
-        assert_eq!(
-            deleted.status, 200,
-            "case {case:?}: the delete must succeed once the group is free, got {} {}",
-            deleted.status, deleted.body
-        );
+        // A delete of a replication group only BEGINS its teardown: the group is still
+        // placed in the subnet group while it is `deleting`, so the subnet group is free
+        // once the teardown the clock owes has run — which the row waits for by looking
+        // again rather than by assuming it has happened by now.
+        release_pending_changes(&emulator);
+        poll_until(
+            &emulator,
+            REGION,
+            case,
+            "the subnet group being released by the resource placed in it",
+            "DeleteCacheSubnetGroup",
+            &params(&[("CacheSubnetGroupName", name)]),
+            |reply| reply.status == 200,
+        )
+        .await;
         assert_absent(&emulator, case, name).await;
     }
 }

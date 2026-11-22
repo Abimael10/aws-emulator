@@ -435,12 +435,12 @@ async fn a_mutation_issued_while_a_resource_is_still_being_created_is_refused() 
             refused: "DeleteReplicationGroup",
             refused_request: params(&[("ReplicationGroupId", "gate-del-group")]),
             code: "InvalidReplicationGroupState",
-            // The refusal names the group as the service stores it and the status its own
-            // record carries.
-            message: Some(format!(
-                "Replication group gate-del-group has status {} which is not valid for deletion.",
-                state::STATUS_CREATING
-            )),
+            // A delete takes the group's member clusters with it, so the member that is
+            // still being provisioned is the resource the refusal names.
+            message: Some(
+                "Cache cluster gate-del-group-001 is not in a valid state to be deleted."
+                    .to_string(),
+            ),
         },
         Gate {
             case: "a membership change to a user group that is still being created",

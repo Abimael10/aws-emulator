@@ -475,6 +475,17 @@ pub const CLUSTER_TRANSITION: Duration = Duration::from_secs(3);
 /// are reachable, and a client waiting for it to settle converges in a poll or two.
 pub const SNAPSHOT_TRANSITION: Duration = CLUSTER_TRANSITION;
 
+/// How long the TEARDOWN a `DeleteReplicationGroup` began takes: the span the group and the
+/// member clusters it is made of stay readable in [`STATUS_DELETING`] before the clock owes
+/// their removal and the id stops resolving at all.
+///
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`] — and the counterpart of
+/// [`SNAPSHOT_TRANSITION`] for the other resource a delete only BEGINS: a client that deletes
+/// a group and reads it straight back sees it going away, which is the status
+/// `ReplicationGroup$Status` documents for exactly that phase, and a client waiting the
+/// teardown out converges in a poll or two.
+pub const REPLICATION_GROUP_TEARDOWN: Duration = CLUSTER_TRANSITION;
+
 /// How many clusters, and how many subnet groups, the store holds before a
 /// create is refused with the modelled quota fault.
 ///
