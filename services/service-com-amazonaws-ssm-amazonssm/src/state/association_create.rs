@@ -38,6 +38,18 @@ pub const FAULT_CLIENT: &str = "Client";
 /// entry at all (`crate::ops::types::FAULT_VALUES`).
 pub const FAULT_SERVER: &str = "Server";
 
+/// How State Manager states that the document an association call named is not one this
+/// endpoint holds.
+///
+/// `InvalidDocument` is "the specified SSM document doesn't exist" (its own documentation),
+/// and the sentence the association operations answer with is fixed text FOLLOWED by the
+/// name the request carried: `Document does not exist: <name>`. One function, so every call
+/// that associates a document — a single create, an entry of a batch and an update — reports
+/// a document it cannot resolve in the same words, with nothing but that name interpolated.
+pub fn association_document_not_found(name: &str) -> String {
+    format!("Document does not exist: {name}")
+}
+
 /// How this service states an output location that names no bucket.
 /// `InvalidOutputLocation`'s own documentation is "The output location isn't valid or
 /// doesn't exist.", and the error itself carries no message member, so this is the
@@ -154,7 +166,7 @@ impl AssociationCreateRejection {
     /// batch entry either way.
     pub fn message(&self) -> String {
         match self {
-            Self::InvalidDocument { name } => format!("Document {name} doesn't exist"),
+            Self::InvalidDocument { name } => association_document_not_found(name),
             Self::InvalidDocumentVersion { document, version } => {
                 format!("Document {document} has no version '{version}'")
             }
@@ -250,11 +262,12 @@ impl ComAmazonawsSsmAmazonssmState {
         // versions the document holds, and a number it does not hold names none. A request
         // that names none associates the document's default version.
         let requested_version = super::non_empty(version.document_version.as_deref())
-            .unwrap_or(super::DOCUMENT_VERSION_DEFAULT);
-        let Some(document_version) = document.select(requested_version) else {
+            .unwrap_or(super::DOCUMENT_VERSION_DEFAULT)
+            .to_string();
+        let Some(document_version) = document.select(&requested_version) else {
             return Err(AssociationCreateRejection::InvalidDocumentVersion {
                 document: document.name.clone(),
-                version: requested_version.to_string(),
+                version: requested_version,
             });
         };
         // "You must specify values for all required parameters in the Amazon Web Services
@@ -307,6 +320,12 @@ impl ComAmazonawsSsmAmazonssmState {
             return Err(rejection);
         }
 
+        // The association is pinned to the document version this call RESOLVED, which is the
+        // default version where the request named none: "Can be a specific version or the
+        // default version" (`DocumentVersion`), so what the association holds is the selector
+        // it tracks rather than the absence of one, and every read of it reports which version
+        // it was pinned to.
+        version.document_version = Some(requested_version);
         // The version the association is created with is also the version it is DESCRIBED
         // from, so it is read here rather than selected back out of the record: a create
         // reports the version it minted, never none.

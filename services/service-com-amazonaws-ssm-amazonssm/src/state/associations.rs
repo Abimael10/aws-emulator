@@ -26,8 +26,8 @@
 //! ([`ASSOCIATION_EXECUTION_DELAY`]) rather than written by a read, so two callers see the
 //! same thing whether or not either of them called. An association whose targets select NO
 //! registered node has nothing to dispatch to, and its execution is over as soon as that has
-//! been evaluated: it settles `Success` like any other, over no count of targets by status,
-//! because a count of targets by status is a count over executions and there were none.
+//! been evaluated: it settles `Success` like any other, reporting a count of targets by
+//! status over the none of them it reached.
 //!
 //! An association keeps the runs it has had, oldest first ([`AssociationRecord::executions`]),
 //! because every one of them is an EXECUTION of it: "Views all executions for a specific
@@ -470,8 +470,8 @@ impl AssociationRunRecord {
     /// A run that reached NO node finishes like any other: State Manager evaluates the
     /// association's targets, has nothing to dispatch the document to, and the execution is
     /// over — so the association settles rather than reporting progress for ever. What such
-    /// a run reports is the result of a run over no node: no count of targets by status,
-    /// because there were none ([`AssociationRecord::overview`]).
+    /// a run reports is the result of a run over no node: a count of targets by status over
+    /// the none of them it reached ([`AssociationRecord::overview`]).
     pub fn has_finished(&self, now: SystemTime) -> bool {
         now >= self.finished_at()
     }
@@ -661,12 +661,13 @@ impl AssociationRecord {
     /// run have got.
     ///
     /// A run that has FINISHED ([`AssociationRunRecord`]) is the association's result:
-    /// `Success`, over the count of nodes it was dispatched to — and over no count at all
-    /// for a run that was dispatched to none, since a count of targets by status is a count
-    /// over executions and there were none. Until then the status is `Pending` — no
+    /// `Success`, over the count of nodes it was dispatched to — which for a run dispatched
+    /// to none is an EMPTY count, present because the association has executed and empty
+    /// because that execution reached no target. Until then the status is `Pending` — no
     /// execution has reported a result — and the detail is `Creating` for as long as the
     /// create is still settling ([`ASSOCIATION_CREATION_DELAY`]) and `InProgress` while a
-    /// dispatched run is still being worked through.
+    /// dispatched run is still being worked through, with no count of targets by status,
+    /// because nothing has reported one yet.
     pub fn overview(&self, now: SystemTime) -> AssociationOverview {
         // A status a managed node has REPORTED for the association is the association's own
         // result, whatever a run of it was owed: "UpdateAssociationStatus is primarily used
@@ -690,14 +691,21 @@ impl AssociationRecord {
             return AssociationOverview {
                 status: Some(ASSOCIATION_STATUS_SUCCESS.to_string()),
                 detailed_status: Some(ASSOCIATION_DETAILED_STATUS_SUCCESS.to_string()),
-                association_status_aggregated_count: (!run.nodes.is_empty()).then(|| {
-                    [(
-                        ASSOCIATION_STATUS_SUCCESS.to_string(),
-                        i32::try_from(run.nodes.len()).unwrap_or(i32::MAX),
-                    )]
-                    .into_iter()
-                    .collect()
-                }),
+                // The count is REPORTED once the association has executed, whatever its
+                // targets selected: it counts the nodes the run reached by the status it
+                // reached them with, which over no node is a count of nothing rather than no
+                // count at all.
+                association_status_aggregated_count: Some(
+                    (!run.nodes.is_empty())
+                        .then(|| {
+                            (
+                                ASSOCIATION_STATUS_SUCCESS.to_string(),
+                                i32::try_from(run.nodes.len()).unwrap_or(i32::MAX),
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
+                ),
             };
         }
         let creating = now < self.created_at + ASSOCIATION_CREATION_DELAY;
@@ -710,8 +718,7 @@ impl AssociationRecord {
             Some(ASSOCIATION_DETAILED_STATUS_IN_PROGRESS.to_string())
         } else {
             // Neither being created nor working through a run: there is no further detail
-            // to report, and the aggregated count stays empty because a count of targets by
-            // status is a count over executions and there are none.
+            // to report.
             None
         };
         AssociationOverview {

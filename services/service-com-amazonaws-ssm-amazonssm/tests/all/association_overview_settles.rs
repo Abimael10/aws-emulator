@@ -6,9 +6,9 @@
 //! execution is over once its targets have been evaluated and the document applied on the
 //! nodes they selected — so the overview an account polls reaches a terminal value within
 //! one transient window, `Status`/`DetailedStatus` `Success`, whether or not any managed
-//! node matched the targets. The count of targets by status is a count over EXECUTIONS, so
-//! an association that reached no node settles with none, and one that reached nodes settles
-//! with one count per node.
+//! node matched the targets. The count of targets by status is a count over the nodes the
+//! execution reached, so an association that reached no node settles with an empty count and
+//! one that reached nodes settles with one count per node.
 //!
 //! Every case goes through the front door a client uses — `POST /` with
 //! `X-Amz-Target: AmazonSSM.<Operation>` and an `awsJson1_1` body (`OPERATIONS.md`, "Wire
@@ -118,7 +118,7 @@ async fn an_association_settles_its_overview_whatever_its_targets_select() {
         (
             "a tag no registered node carries",
             json!([{ "Key": format!("tag:{TAG}"), "Values": [UNMATCHED] }]),
-            Value::Null,
+            json!({}),
         ),
         (
             "a tag both registered nodes carry",
@@ -138,7 +138,7 @@ async fn an_association_settles_its_overview_whatever_its_targets_select() {
         (
             "a node id no node is registered under",
             json!([{ "Key": "InstanceIds", "Values": ["i-0dead999"] }]),
-            Value::Null,
+            json!({}),
         ),
     ];
 

@@ -199,9 +199,10 @@ async fn assert_settled_over_no_node(
         json!("Success"),
         "case {case:?}: expected the detail of a finished run, got {held}"
     );
-    assert!(
-        held["Overview"]["AssociationStatusAggregatedCount"].is_null(),
-        "case {case:?}: expected no count of targets by status, got {held}"
+    assert_eq!(
+        held["Overview"]["AssociationStatusAggregatedCount"],
+        json!({}),
+        "case {case:?}: expected a count of targets by status over no node, got {held}"
     );
 }
 
@@ -345,8 +346,8 @@ async fn a_request_runs_every_association_it_names_on_the_nodes_its_targets_sele
             continue;
         }
         if *nodes == 0 {
-            // Dispatched to no node: this run settles over no count of targets by status,
-            // the way the create's did.
+            // Dispatched to no node: this run settles over an empty count of targets by
+            // status, the way the create's did.
             assert_settled_over_no_node(&router, case, REGION, id).await;
             continue;
         }

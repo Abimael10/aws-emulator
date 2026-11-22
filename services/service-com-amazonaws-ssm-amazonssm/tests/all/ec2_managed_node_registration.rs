@@ -856,7 +856,7 @@ async fn an_association_runs_on_the_nodes_its_targets_select() {
 
     // The association that reached no node settles too: its execution is over as soon as
     // the targets have been evaluated, and it reports the result of a run over no node —
-    // `Success`, with no count of targets by status, because there were no targets.
+    // `Success`, over a count of targets by status that counts the none of them it reached.
     //
     // Its settle is a span of ITS OWN, so this looks again for it — the helper returns only
     // once the association reports `Success`, and fails naming the body otherwise — instead
@@ -869,9 +869,9 @@ async fn an_association_runs_on_the_nodes_its_targets_select() {
         "case \"an unregistered node\": expected the detail of a finished run, got \
          {reached_nothing}"
     );
-    assert!(
-        reached_nothing["Overview"]["AssociationStatusAggregatedCount"].is_null(),
-        "case \"an unregistered node\": expected no count of targets by status, got \
+    assert_eq!(
+        reached_nothing["Overview"]["AssociationStatusAggregatedCount"], json!({}),
+        "case \"an unregistered node\": expected an empty count of targets by status, got \
          {reached_nothing}"
     );
 

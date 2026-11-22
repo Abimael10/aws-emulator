@@ -417,7 +417,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 UpdateAssociationErrorModeled::InvalidDocument(InvalidDocument {
-                    message: Some(format!("Document {requested_document} doesn't exist")),
+                    message: Some(
+                        crate::state::association_create::association_document_not_found(
+                            &requested_document,
+                        ),
+                    ),
                 })
                 .into(),
             );
@@ -497,7 +501,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // spelling named it — and a call that named none applies the document the
             // association already applied.
             document_name: document.name.clone(),
-            document_version: input.document_version.clone(),
+            // The version the association is pinned to is the one this call RESOLVED against
+            // that document — the default version where the request named none, the way a
+            // create resolves it — so a read reports which version the association tracks
+            // rather than the absence of a selector.
+            document_version: Some(requested_version.to_string()),
             parameters,
             targets,
             schedule_expression: input.schedule_expression.clone(),

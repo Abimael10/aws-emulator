@@ -350,13 +350,15 @@ fn identities() -> Vec<Identity> {
         Identity {
             case: "neither a document version nor an association name",
             members: json!({}),
-            document_version: Value::Null,
+            // A create that names no version associates the document's DEFAULT version, so
+            // the association is pinned to that selector and the entry reports it.
+            document_version: json!("$DEFAULT"),
             association_name: Value::Null,
         },
         Identity {
             case: "an association name",
             members: json!({"AssociationName": "nightly-agent"}),
-            document_version: Value::Null,
+            document_version: json!("$DEFAULT"),
             association_name: json!("nightly-agent"),
         },
         Identity {

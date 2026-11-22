@@ -269,7 +269,7 @@ fn failure_rows() -> Vec<FailureRow> {
             case: "a document that doesn't exist",
             prepared: None,
             entry: json!({"Name": "no-such-document"}),
-            message: "Document no-such-document doesn't exist".to_string(),
+            message: "Document does not exist: no-such-document".to_string(),
             code: "InvalidDocument",
         },
         FailureRow {
