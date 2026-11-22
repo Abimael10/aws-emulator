@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserJourneys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserJourneys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserJourneys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the user journeys STORED inside one system's record — the ones
+//! `CreateUserJourney` wrote there — in creation order, a page at a time. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserJourneys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserJourneysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserJourneys"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListUserJourneysErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` must be one this service issued; anything else is a bad request,
+        // not an empty page. `None` means "start from the beginning".
+        let resume_from: Option<u64> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(
+                        ListUserJourneysErrorModeled::ValidationException(forged_token()).into()
+                    );
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100` with a default of 100, so the boundary
+        // refuses anything outside the range and supplies the default for a request that
+        // omits it. A value that still arrives outside the range is refused here rather
+        // than quietly served at some other page size.
+        let page_size = if (crate::state::MAX_RESULTS_MIN..=crate::state::MAX_RESULTS_MAX)
+            .contains(&input.max_results)
+        {
+            input.max_results as usize
+        } else {
+            return Err(ListUserJourneysErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "maxResults must be between {} and {}",
+                        crate::state::MAX_RESULTS_MIN,
+                        crate::state::MAX_RESULTS_MAX
+                    ),
+                    reason: Some("INVALID_FIELD_VALUE".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "maxResults".to_string(),
+                        message: format!(
+                            "must be between {} and {}",
+                            crate::state::MAX_RESULTS_MIN,
+                            crate::state::MAX_RESULTS_MAX
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        };
+
+        // This operation is @readonly: it projects the stored records and writes nothing.
+        let store = state.lock();
+
+        // A token is valid only if it names a position this store actually handed out
+        // (positions start at 1), so a well-formed token this service never issued is
+        // refused rather than answered with a page.
+        if let Some(position) = resume_from {
+            if position == 0 || position > store.highest_sequence() {
+                return Err(
+                    ListUserJourneysErrorModeled::ValidationException(forged_token()).into()
+                );
+            }
+        }
+
+        // Journeys live inside their system's record, so a `systemArn` naming no system is
+        // a 404 — not an empty list, which would claim the system exists and holds no
+        // journeys. The ARN's length and `Arn` pattern are modelled, so a malformed one is
+        // already refused with a 400 `ValidationException` before this handler runs.
+        let Some(system) = store.systems.get(&input.system_arn) else {
+            return Err(ListUserJourneysErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SYSTEM_RESOURCE_TYPE,
+                    &input.system_arn,
+                ),
+            )
+            .into());
+        };
+
+        let matched: Vec<&crate::state::UserJourneyRecord> = system
+            .user_journeys_in_creation_order()
+            .into_iter()
+            .filter(|journey| journey.sequence >= resume_from.unwrap_or(0))
+            .collect();
+
+        Ok(ListUserJourneysOutput {
+            user_journey_summaries: matched
+                .iter()
+                .take(page_size)
+                .map(|journey| journey.to_summary())
+                .collect(),
+            // The token names where the NEXT page resumes, and is emitted only when there
+            // is one: the last page carries no token.
+            next_token: matched
+                .get(page_size)
+                .map(|journey| crate::state::encode_page_token(journey.sequence)),
+        })
+    }
+}
+
+/// The refusal for a `nextToken` this service did not issue: the member is named and its
+/// rule stated, the way the boundary validator words a refusal.
+fn forged_token() -> ValidationException {
+    ValidationException {
+        message: "nextToken is not a token this service issued".to_string(),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: "must be a nextToken returned by a previous ListUserJourneys call"
+                .to_string(),
+        }]),
     }
 }

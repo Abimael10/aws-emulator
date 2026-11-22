@@ -20,7 +20,7 @@
 
 use std::time::SystemTime;
 
-use crate::ops::types::{ResourceNotFoundException, UserJourney};
+use crate::ops::types::{ResourceNotFoundException, UserJourney, UserJourneySummary};
 
 use super::{not_found_message, to_date_time, SystemRecord};
 
@@ -69,6 +69,21 @@ impl UserJourneyRecord {
             name: self.name.clone(),
             description: self.description.clone(),
             policy_arn: self.policy_arn.clone(),
+            created_at: Some(to_date_time(self.created_at)),
+            updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+
+    /// This record as the `UserJourneySummary` shape `ListUserJourneys` emits.
+    ///
+    /// `UserJourneySummary` declares only `userJourneyId`, `name`, `createdAt` and
+    /// `updatedAt`, so a summary reports those four from the SAME record
+    /// [`Self::to_user_journey`] projects — the listing and the read cannot drift — and
+    /// reports nothing the summary shape does not declare.
+    pub fn to_summary(&self) -> UserJourneySummary {
+        UserJourneySummary {
+            user_journey_id: self.user_journey_id.clone(),
+            name: self.name.clone(),
             created_at: Some(to_date_time(self.created_at)),
             updated_at: Some(to_date_time(self.updated_at)),
         }
