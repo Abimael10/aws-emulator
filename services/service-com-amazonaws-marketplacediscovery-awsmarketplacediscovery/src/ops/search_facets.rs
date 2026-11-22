@@ -420,13 +420,16 @@ fn listing_facet_values(
                 )
             })
             .collect(),
-        "PRICING_MODEL" => listing
-            .pricing_models
+        // A listing is sold through its OFFERS, so the pricing models and units it is
+        // offered under are the de-duplicated union of theirs — the same projection the
+        // `PRICING_MODEL` / `PRICING_UNIT` filters and `ListingSummary` read.
+        "PRICING_MODEL" => state
+            .listing_pricing_models(listing)
             .iter()
             .map(|model| (model.pricing_model_type.clone(), model.display_name.clone()))
             .collect(),
-        "PRICING_UNIT" => listing
-            .pricing_units
+        "PRICING_UNIT" => state
+            .listing_pricing_units(listing)
             .iter()
             .map(|unit| (unit.pricing_unit_type.clone(), unit.display_name.clone()))
             .collect(),

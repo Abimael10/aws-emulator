@@ -484,14 +484,14 @@ pub struct Listing {
     pub integration_guide: Option<String>,
     pub categories: Vec<Category>,
     pub highlights: Vec<String>,
-    pub pricing_models: Vec<PricingModel>,
-    pub pricing_units: Vec<PricingUnit>,
     /// Products this listing is associated with; every one of them points back here
     /// through [`Product::listing_id`]. A listing's fulfillment option summaries are
     /// derived from these products' fulfillment options
     /// ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_fulfillment_option_summaries`]).
     pub product_ids: Vec<String>,
-    /// Offers this listing is associated with.
+    /// Offers this listing is associated with. A listing's pricing models and pricing units
+    /// are derived from these offers
+    /// ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_pricing_models`]).
     pub offer_ids: Vec<String>,
     pub publisher: SellerInformation,
     pub promotional_media: Vec<PromotionalMedia>,
@@ -621,7 +621,15 @@ pub struct Offer {
     pub offer_set_id: Option<String>,
     pub agreement_proposal_id: String,
     pub replacement_agreement_id: Option<String>,
+    /// How buyers are charged for this offer, which is what `OfferInformation$pricingModel`
+    /// reports and one of the models the listing it belongs to restates.
     pub pricing_model: PricingModel,
+    /// The billing dimensions this offer's pricing is expressed in — the units its pricing
+    /// terms meter or size the entitlement by. `GetListingOutput$pricingUnits` is "[t]he
+    /// pricing units that define the billing dimensions for offers associated with this
+    /// listing", so they belong to the OFFER and the listing restates them
+    /// ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_pricing_units`]).
+    pub pricing_units: Vec<PricingUnit>,
     pub visibility_scope: String,
 }
 
@@ -836,8 +844,8 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             categories: listing.categories.clone(),
             badges: self.listing_badges(listing),
             review_summary: ReviewSummary::default(),
-            pricing_models: listing.pricing_models.clone(),
-            pricing_units: listing.pricing_units.clone(),
+            pricing_models: self.listing_pricing_models(listing),
+            pricing_units: self.listing_pricing_units(listing),
             associated_entities: listing
                 .product_ids
                 .iter()
@@ -847,6 +855,58 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                 })
                 .collect(),
         }
+    }
+
+    /// The pricing models a listing reports: one per distinct pricing model of the OFFERS it
+    /// associates, in offer order.
+    ///
+    /// `GetListingOutput$pricingModels` is "[t]he pricing models for offers associated with
+    /// this listing" (`smithy_query(query="shape",shape="GetListingOutput")`), so the list
+    /// is the de-duplicated union of those offers' own pricing rather than a second record
+    /// beside them — a listing can no longer advertise a pricing model (a free tier, say) no
+    /// offer a buyer can accept actually carries, nor omit one an offer of it does.
+    pub fn listing_pricing_models(&self, listing: &Listing) -> Vec<PricingModel> {
+        let mut models: Vec<PricingModel> = Vec::new();
+        for offer in self.listing_offers(listing) {
+            if !models
+                .iter()
+                .any(|held| held.pricing_model_type == offer.pricing_model.pricing_model_type)
+            {
+                models.push(offer.pricing_model.clone());
+            }
+        }
+        models
+    }
+
+    /// The pricing units a listing reports: one per distinct billing dimension of the OFFERS
+    /// it associates, in offer order.
+    ///
+    /// `GetListingOutput$pricingUnits` is "[t]he pricing units that define the billing
+    /// dimensions for offers associated with this listing", so these are the dimensions those
+    /// offers' pricing is expressed in ([`Offer::pricing_units`]), de-duplicated, and not a
+    /// list that could claim a dimension none of them meters.
+    pub fn listing_pricing_units(&self, listing: &Listing) -> Vec<PricingUnit> {
+        let mut units: Vec<PricingUnit> = Vec::new();
+        for offer in self.listing_offers(listing) {
+            for unit in &offer.pricing_units {
+                if !units
+                    .iter()
+                    .any(|held| held.pricing_unit_type == unit.pricing_unit_type)
+                {
+                    units.push(unit.clone());
+                }
+            }
+        }
+        units
+    }
+
+    /// The stored offers a listing associates, in the order the listing names them.
+    fn listing_offers(&self, listing: &Listing) -> Vec<&Offer> {
+        listing
+            .offer_ids
+            .iter()
+            .filter_map(|offer_id| self.offers.get(offer_id))
+            .collect()
     }
 
     /// The badges a listing reports: one per special attribute the listing's OWN records
@@ -896,8 +956,8 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                     .any(|term| matches!(term, OfferTerm::freeTrialPricingTerm(_)))
             })
         });
-        let free_tier = listing
-            .pricing_models
+        let free_tier = self
+            .listing_pricing_models(listing)
             .iter()
             .any(|model| model.pricing_model_type == "FREE");
 
@@ -1592,12 +1652,12 @@ pub fn matches_every_search_filter(
                 .listing_fulfillment_option_summaries(listing)
                 .iter()
                 .any(|option| values.contains(&option.fulfillment_option_type)),
-            "PRICING_MODEL" => listing
-                .pricing_models
+            "PRICING_MODEL" => state
+                .listing_pricing_models(listing)
                 .iter()
                 .any(|model| values.contains(&model.pricing_model_type)),
-            "PRICING_UNIT" => listing
-                .pricing_units
+            "PRICING_UNIT" => state
+                .listing_pricing_units(listing)
                 .iter()
                 .any(|unit| values.contains(&unit.pricing_unit_type)),
             "DEPLOYED_ON_AWS" => listing.product_ids.iter().any(|product_id| {
@@ -2363,17 +2423,22 @@ fn sagemaker_model_option(
     ))
 }
 
-fn pricing_model(model_type: &str, display_name: &str) -> PricingModel {
+/// The pricing model of type `model_type`, displayed by the one name the catalog displays
+/// that type by ([`PRICING_MODEL_DISPLAY_NAMES`]), so two records can never disagree about
+/// what a pricing model is called.
+fn pricing_model(model_type: &str) -> PricingModel {
     PricingModel {
         pricing_model_type: model_type.to_string(),
-        display_name: display_name.to_string(),
+        display_name: pricing_model_display_name(model_type),
     }
 }
 
-fn pricing_unit(unit_type: &str, display_name: &str) -> PricingUnit {
+/// The pricing unit of type `unit_type`, displayed by the one name the catalog displays that
+/// type by ([`PRICING_UNIT_DISPLAY_NAMES`]).
+fn pricing_unit(unit_type: &str) -> PricingUnit {
     PricingUnit {
         pricing_unit_type: unit_type.to_string(),
-        display_name: display_name.to_string(),
+        display_name: pricing_unit_display_name(unit_type),
     }
 }
 
@@ -2669,11 +2734,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Connects to 40 data sources".to_string(),
                 "Row-level access control".to_string(),
             ],
-            pricing_models: vec![
-                pricing_model("CONTRACT", "Contract"),
-                pricing_model("USAGE", "Usage based"),
-            ],
-            pricing_units: vec![pricing_unit("USERS", "Users")],
             product_ids: vec!["p-0001-analytics-core".to_string()],
             offer_ids: vec![
                 "o-0001-analytics-annual".to_string(),
@@ -2789,7 +2849,10 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: Some("os-0001-analytics".to_string()),
             agreement_proposal_id: "ap-0001-analytics-annual".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("CONTRACT", "Contract"),
+            pricing_model: pricing_model("CONTRACT"),
+            // The dimension the contract is sized in: its free-trial grant and its
+            // recurring payment are both counted in active users.
+            pricing_units: vec![pricing_unit("USERS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2829,7 +2892,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: Some("os-0001-analytics".to_string()),
             agreement_proposal_id: "ap-0002-analytics-usage".to_string(),
             replacement_agreement_id: Some("ag-0001-analytics-legacy".to_string()),
-            pricing_model: pricing_model("USAGE", "Usage based"),
+            pricing_model: pricing_model("USAGE"),
+            // The dimension its rate card meters: active users.
+            pricing_units: vec![pricing_unit("USERS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2890,8 +2955,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             integration_guide: None,
             categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Deep packet inspection".to_string()],
-            pricing_models: vec![pricing_model("USAGE", "Usage based")],
-            pricing_units: vec![pricing_unit("HOSTS", "Hosts")],
             product_ids: vec!["p-0002-firewall-appliance".to_string()],
             offer_ids: vec!["o-0003-firewall-hourly".to_string()],
             publisher: nimbus.clone(),
@@ -2978,7 +3041,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: None,
             agreement_proposal_id: "ap-0003-firewall-hourly".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("USAGE", "Usage based"),
+            pricing_model: pricing_model("USAGE"),
+            // The dimension its rate card meters: protected hosts.
+            pricing_units: vec![pricing_unit("HOSTS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -3009,8 +3074,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             integration_guide: None,
             categories: classified_under(&["data-products"]),
             highlights: vec!["Covers 40 exchanges".to_string()],
-            pricing_models: vec![pricing_model("CONTRACT", "Contract")],
-            pricing_units: vec![pricing_unit("DATA", "Data")],
             product_ids: vec!["p-0003-datafeed-equities".to_string()],
             offer_ids: vec!["o-0004-datafeed-contract".to_string()],
             publisher: orion.clone(),
@@ -3075,7 +3138,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: None,
             agreement_proposal_id: "ap-0004-datafeed-contract".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("CONTRACT", "Contract"),
+            pricing_model: pricing_model("CONTRACT"),
+            // A data subscription: the contract is sized by the data it covers.
+            pricing_units: vec![pricing_unit("DATA")],
             visibility_scope: VISIBILITY_PRIVATE.to_string(),
         },
     );
@@ -3113,11 +3178,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "12 pre-trained models".to_string(),
                 "Runs on SageMaker".to_string(),
             ],
-            pricing_models: vec![
-                pricing_model("USAGE", "Usage based"),
-                pricing_model("FREE", "Free"),
-            ],
-            pricing_units: vec![pricing_unit("REQUESTS", "Requests")],
             product_ids: vec![
                 "p-0004-mlkit-vision".to_string(),
                 "p-0005-mlkit-nlp".to_string(),
@@ -3249,7 +3309,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: None,
             agreement_proposal_id: "ap-0005-mlkit-usage".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("USAGE", "Usage based"),
+            pricing_model: pricing_model("USAGE"),
+            // The dimension its rate card meters: inference requests.
+            pricing_units: vec![pricing_unit("REQUESTS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -3280,9 +3342,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             logo: LogoMedia::of_listing("l-0005-devtools"),
             integration_guide: None,
             categories: classified_under(&["devops"]),
-            highlights: vec!["Bring your own licence".to_string()],
-            pricing_models: vec![pricing_model("BYOL", "Bring your own licence")],
-            pricing_units: vec![pricing_unit("UNITS", "Units")],
+            highlights: vec!["Works with the licences you already own".to_string()],
             product_ids: vec!["p-0006-devtools-pipeline".to_string()],
             offer_ids: vec!["o-0006-devtools-byol".to_string()],
             publisher: helios.clone(),
@@ -3362,7 +3422,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: None,
             agreement_proposal_id: "ap-0006-devtools-byol".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("BYOL", "Bring your own licence"),
+            pricing_model: pricing_model("BYOL"),
+            // The buyer brings licences it already owns, counted in units of them.
+            pricing_units: vec![pricing_unit("UNITS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -3394,8 +3456,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             integration_guide: None,
             categories: classified_under(&["storage"]),
             highlights: vec!["Coverage reporting".to_string()],
-            pricing_models: vec![pricing_model("CONTRACT", "Contract")],
-            pricing_units: vec![pricing_unit("TIERS", "Tiers")],
             product_ids: vec!["p-0007-backup-agent".to_string()],
             offer_ids: vec!["o-0007-backup-contract".to_string()],
             publisher: vertex.clone(),
@@ -3470,7 +3530,10 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_set_id: None,
             agreement_proposal_id: "ap-0007-backup-contract".to_string(),
             replacement_agreement_id: None,
-            pricing_model: pricing_model("CONTRACT", "Contract"),
+            pricing_model: pricing_model("CONTRACT"),
+            // The dimension its free-trial grant and recurring payment are counted in:
+            // protected tiers.
+            pricing_units: vec![pricing_unit("TIERS")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -3533,19 +3596,39 @@ struct BreadthRow {
     /// one its `deployedOnAws` follows ([`Product::deployed_on_aws`]). A record that is
     /// delivered one way names one type; one a seller offers through two routes names both.
     fulfillment: &'static [&'static str],
+    /// The key features this record offers customers, which is what `highlights` ("A list of
+    /// key features that the listing offers to customers") carries for both its listing and
+    /// its product. Stated per record, because a feature is something the product DOES — not
+    /// something derivable from how it is classified or delivered.
+    highlights: &'static [&'static str],
+    /// The `PricingModelType` its offer is sold under, read off what the record is and how it
+    /// is delivered rather than from the row's position in the model's enum.
+    pricing_model: &'static str,
+    /// The `PricingUnitType` its offer's pricing is expressed in: the billing dimension its
+    /// terms meter or size the entitlement by.
+    pricing_unit: &'static str,
 }
 
 /// The catalog's breadth rows, one listing each.
 ///
 /// The set spans every top-level category of [`CATEGORY_TAXONOMY`], categories at each of
-/// its three levels, every `FulfillmentOptionType` the model declares and — through the
-/// deployment each fulfillment implies — all three `DeployedOnAwsStatus` values; the records
-/// themselves are this emulator's own seed data.
+/// its three levels, every `FulfillmentOptionType` the model declares, every
+/// `PricingModelType` and `PricingUnitType` and — through the deployment each fulfillment
+/// implies — all three `DeployedOnAwsStatus` values; the records themselves are this
+/// emulator's own seed data.
 const BREADTH_ROWS: &[BreadthRow] = &[
     BreadthRow {
         slug: "aurora-linux-hardened",
         name: "Aurora Hardened Linux",
         short_description: "Hardened Linux images with CIS benchmark profiles applied.",
+        highlights: &[
+            "CIS Level 1 and Level 2 benchmark profiles",
+            "Unattended security patching on first boot",
+            "FIPS-validated cryptographic modules",
+        ],
+        // An image the buyer runs: charged for the hosts it runs on.
+        pricing_model: "USAGE",
+        pricing_unit: "HOSTS",
         categories: &["operating-systems"],
         // Two routes this record offers: the image itself, and the Image Builder component
         // that bakes it into the buyer's own image.
@@ -3555,6 +3638,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-market-data",
         name: "Borealis Market Data Feed",
         short_description: "End-of-day and intraday reference prices for listed equities.",
+        highlights: &[
+            "Corporate action adjusted price history",
+            "Intraday snapshots every five minutes",
+            "Cross-venue instrument identifiers",
+        ],
+        // A data subscription: the contract is sized by the data it covers.
+        pricing_model: "CONTRACT",
+        pricing_unit: "DATA",
         // Two leaves of one subtree: the listing carries both paths, so its categories run
         // three levels deep and name two sibling subcategories.
         categories: &["market-data", "reference-data"],
@@ -3564,6 +3655,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-waf",
         name: "Cirrus Web Application Firewall",
         short_description: "Managed web application firewall rules for edge and VPC traffic.",
+        highlights: &[
+            "Managed rule groups updated daily",
+            "Bot and credential-stuffing detection",
+            "Per-rule request sampling and dashboards",
+        ],
+        // Inspection at the edge, charged for the traffic it inspects.
+        pricing_model: "USAGE",
+        pricing_unit: "BANDWIDTH",
         categories: &["security"],
         fulfillment: &["CLOUDFORMATION_TEMPLATE"],
     },
@@ -3571,6 +3670,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-vision-labeler",
         name: "Delta Vision Labeler",
         short_description: "Image classification models for industrial inspection.",
+        highlights: &[
+            "Defect classes trained on factory imagery",
+            "Batch and real-time inference endpoints",
+            "Confidence scores with bounding boxes",
+        ],
+        // Inference charged per request.
+        pricing_model: "USAGE",
+        pricing_unit: "REQUESTS",
         categories: &["computer-vision"],
         fulfillment: &["SAGEMAKER_MODEL"],
     },
@@ -3578,6 +3685,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-fleet-telemetry",
         name: "Equinox Fleet Telemetry",
         short_description: "Telemetry ingestion and alerting for connected equipment.",
+        highlights: &[
+            "Device shadows with offline buffering",
+            "Threshold and anomaly alert rules",
+            "Fleet-wide firmware rollout tracking",
+        ],
+        // A subscription sized by the number of connected devices it covers.
+        pricing_model: "CONTRACT",
+        pricing_unit: "UNITS",
         categories: &["iot-analytics"],
         // A hosted service the buyer subscribes to, reachable through its own API as well.
         fulfillment: &["SAAS", "API"],
@@ -3586,6 +3701,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-object-vault",
         name: "Aurora Object Vault",
         short_description: "Immutable object storage with compliance retention.",
+        highlights: &[
+            "Write-once retention locks per bucket",
+            "Server-side encryption with your own keys",
+            "Legal hold and audit export",
+        ],
+        // Charged for the data it stores.
+        pricing_model: "USAGE",
+        pricing_unit: "DATA",
         categories: &["storage"],
         // A container image and the Helm chart that installs it.
         fulfillment: &["CONTAINER", "HELM"],
@@ -3594,6 +3717,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-health-atlas",
         name: "Borealis Health Atlas",
         short_description: "De-identified claims and prescription records for research.",
+        highlights: &[
+            "Longitudinal patient journeys over ten years",
+            "HIPAA de-identification certified annually",
+            "Claims joined to prescription fills",
+        ],
+        // A data subscription: the contract is sized by the data it covers.
+        pricing_model: "CONTRACT",
+        pricing_unit: "DATA",
         categories: &["healthcare-life-sciences-data"],
         fulfillment: &["DATA_EXCHANGE"],
     },
@@ -3601,6 +3732,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-secrets-broker",
         name: "Cirrus Secrets Broker",
         short_description: "Short-lived credential brokering for cluster workloads.",
+        highlights: &[
+            "Credentials minted per workload identity",
+            "Automatic rotation without redeploys",
+            "Audit trail of every credential issued",
+        ],
+        // Charged for the hosts whose workloads it brokers for.
+        pricing_model: "USAGE",
+        pricing_unit: "HOSTS",
         categories: &["security"],
         fulfillment: &["HELM"],
     },
@@ -3608,6 +3747,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-speech-studio",
         name: "Delta Speech Studio",
         short_description: "Speech transcription and diarisation for contact centres.",
+        highlights: &[
+            "Speaker diarisation for multi-party calls",
+            "Custom vocabulary per queue",
+            "Word-level timestamps and confidence",
+        ],
+        // Training and inference charged per request.
+        pricing_model: "USAGE",
+        pricing_unit: "REQUESTS",
         categories: &["speech-recognition"],
         fulfillment: &["SAGEMAKER_ALGORITHM"],
     },
@@ -3615,6 +3762,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-grid-forecast",
         name: "Equinox Grid Forecast",
         short_description: "Load and generation forecasting for energy networks.",
+        highlights: &[
+            "Day-ahead and intraday forecast horizons",
+            "Weather-adjusted demand curves",
+            "Backtesting against metered history",
+        ],
+        // An API charged per call.
+        pricing_model: "USAGE",
+        pricing_unit: "REQUESTS",
         categories: &["energy"],
         fulfillment: &["API"],
     },
@@ -3622,6 +3777,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-build-cache",
         name: "Aurora Build Cache",
         short_description: "Distributed build caching for large monorepos.",
+        highlights: &[
+            "Content-addressed artefact reuse across branches",
+            "Remote execution for cold caches",
+            "Cache hit reporting per pipeline",
+        ],
+        // Free to install: the buyer pays nothing for the add-on itself.
+        pricing_model: "FREE",
+        pricing_unit: "UNITS",
         categories: &["application-development"],
         fulfillment: &["EKS_ADD_ON"],
     },
@@ -3629,6 +3792,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-climate-grid",
         name: "Borealis Climate Grid",
         short_description: "Gridded climate observations and reanalysis series.",
+        highlights: &[
+            "Half-degree global grids since 1950",
+            "Reanalysis and observation series aligned",
+            "Zarr and NetCDF distributions",
+        ],
+        // Published at no charge, in the data it distributes.
+        pricing_model: "FREE",
+        pricing_unit: "DATA",
         categories: &["environmental-data"],
         fulfillment: &["DATA_EXCHANGE"],
     },
@@ -3636,6 +3807,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-migration-studio",
         name: "Cirrus Migration Studio",
         short_description: "Assessment and replatforming services for legacy estates.",
+        highlights: &[
+            "Estate discovery and dependency mapping",
+            "Wave plan with cutover runbooks",
+            "Hypercare for the first month after cutover",
+        ],
+        // An engagement sold as a contract, in units of work.
+        pricing_model: "CONTRACT",
+        pricing_unit: "UNITS",
         categories: &["migration"],
         fulfillment: &["PROFESSIONAL_SERVICES"],
     },
@@ -3643,6 +3822,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-forms-reader",
         name: "Delta Forms Reader",
         short_description: "Document understanding for structured and semi-structured forms.",
+        highlights: &[
+            "Table and key-value extraction from scans",
+            "Handwriting recognition on form fields",
+            "Confidence thresholds per extracted field",
+        ],
+        // Inference charged per request.
+        pricing_model: "USAGE",
+        pricing_unit: "REQUESTS",
         categories: &["natural-language-processing"],
         fulfillment: &["SAGEMAKER_MODEL"],
     },
@@ -3650,6 +3837,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-retail-planner",
         name: "Equinox Retail Planner",
         short_description: "Assortment and replenishment planning for retailers.",
+        highlights: &[
+            "Store-level assortment recommendations",
+            "Replenishment plans from live sell-through",
+            "Promotion lift modelling",
+        ],
+        // Seller-hosted software licensed per planner using it.
+        pricing_model: "CONTRACT",
+        pricing_unit: "USERS",
         categories: &["retail"],
         fulfillment: &["SAAS"],
     },
@@ -3657,6 +3852,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-golden-images",
         name: "Aurora Golden Images",
         short_description: "Image pipeline components for compliant base images.",
+        highlights: &[
+            "Hardening components for Image Builder recipes",
+            "Compliance evidence written to the build log",
+            "Versioned components pinned per recipe",
+        ],
+        // The buyer builds under licences it already owns.
+        pricing_model: "BYOL",
+        pricing_unit: "UNITS",
         categories: &["infrastructure-as-code"],
         fulfillment: &["EC2_IMAGE_BUILDER_COMPONENT"],
     },
@@ -3664,6 +3867,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-spectrum-usage",
         name: "Borealis Spectrum Usage",
         short_description: "Mobile network coverage and spectrum usage records.",
+        highlights: &[
+            "Cell-level coverage polygons per operator",
+            "Spectrum assignments with licence expiry",
+            "Monthly refresh with change deltas",
+        ],
+        // A data subscription: the contract is sized by the data it covers.
+        pricing_model: "CONTRACT",
+        pricing_unit: "DATA",
         categories: &["telecommunications-data"],
         fulfillment: &["DATA_EXCHANGE"],
     },
@@ -3671,6 +3882,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-observability",
         name: "Cirrus Observability Stack",
         short_description: "Metrics, traces and log correlation for microservices.",
+        highlights: &[
+            "Trace-to-log correlation on one timeline",
+            "Service level objective burn-rate alerts",
+            "Cardinality guards on metric ingestion",
+        ],
+        // Charged for the hosts it observes.
+        pricing_model: "USAGE",
+        pricing_unit: "HOSTS",
         categories: &["monitoring"],
         fulfillment: &["HELM"],
     },
@@ -3678,6 +3897,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "delta-crm-sync",
         name: "Delta CRM Sync",
         short_description: "Two-way synchronisation between CRM and billing systems.",
+        highlights: &[
+            "Field-level mapping with conflict rules",
+            "Replay of failed synchronisations",
+            "Change history per synchronised record",
+        ],
+        // Seller-hosted software sold in capability tiers.
+        pricing_model: "CONTRACT",
+        pricing_unit: "TIERS",
         categories: &["crm"],
         fulfillment: &["SAAS"],
     },
@@ -3685,6 +3912,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "equinox-hpc-solver",
         name: "Equinox HPC Solver",
         short_description: "Finite element solver for structural simulation.",
+        highlights: &[
+            "Implicit and explicit solvers in one image",
+            "MPI scaling across cluster placement groups",
+            "Checkpoint and restart of long runs",
+        ],
+        // Run under the licences the buyer already holds, per solver host.
+        pricing_model: "BYOL",
+        pricing_unit: "HOSTS",
         categories: &["high-performance-computing"],
         fulfillment: &["AMAZON_MACHINE_IMAGE"],
     },
@@ -3692,6 +3927,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "aurora-training-labs",
         name: "Aurora Training Labs",
         short_description: "Instructor-led enablement for platform engineering teams.",
+        highlights: &[
+            "Hands-on labs in a sandbox account",
+            "Curriculum tailored to your platform",
+            "Knowledge check and completion report",
+        ],
+        // An engagement sold as a contract, in units of delivered training.
+        pricing_model: "CONTRACT",
+        pricing_unit: "UNITS",
         categories: &["training"],
         fulfillment: &["PROFESSIONAL_SERVICES"],
     },
@@ -3699,6 +3942,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "borealis-data-prep",
         name: "Borealis Data Prep Studio",
         short_description: "Profiling, cleansing and join authoring for analytics data sets.",
+        highlights: &[
+            "Column profiles with outlier detection",
+            "Join authoring against sampled data",
+            "Repeatable recipes promoted between environments",
+        ],
+        // Seller-hosted software charged for the analysts using it.
+        pricing_model: "USAGE",
+        pricing_unit: "USERS",
         // Both sibling leaves of Data Analytics, so the listing carries the taxonomy's
         // deepest path twice over: four categories across three levels.
         categories: &["data-integration", "data-preparation"],
@@ -3708,6 +3959,14 @@ const BREADTH_ROWS: &[BreadthRow] = &[
         slug: "cirrus-query-lens",
         name: "Cirrus Query Lens",
         short_description: "Interactive dashboards over warehouse and lakehouse tables.",
+        highlights: &[
+            "Push-down queries to the warehouse",
+            "Row-level access from your directory groups",
+            "Scheduled dashboard snapshots by email",
+        ],
+        // Licensed per dashboard author and viewer.
+        pricing_model: "CONTRACT",
+        pricing_unit: "USERS",
         categories: &["data-visualization"],
         fulfillment: &["CONTAINER"],
     },
@@ -3722,25 +3981,26 @@ const BREADTH_SELLERS: &[(&str, &str)] = &[
     ("sp-equinox", "Equinox Industrial"),
 ];
 
-/// Every pricing model with the name the catalog displays it by.
+/// Every pricing model with the name the catalog displays it by, which is what
+/// `PricingModel$displayName` ("The human-readable name of the pricing model") carries.
 ///
 /// Source: the `PricingModelType` enum
 /// (`smithy_query(query="shape",shape="PricingModelType")`), generated as
-/// `PRICING_MODEL_TYPE_VALUES`; the display names are the catalog's own wording and are the
-/// same ones the hand-written records above use.
-const PRICING_MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[
+/// `PRICING_MODEL_TYPE_VALUES`, paired with AWS Marketplace's own label for each value.
+pub const PRICING_MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("USAGE", "Usage based"),
     ("CONTRACT", "Contract"),
-    ("BYOL", "Bring your own licence"),
+    ("BYOL", "Bring your own license"),
     ("FREE", "Free"),
 ];
 
-/// Every pricing unit with the name the catalog displays it by.
+/// Every pricing unit with the name the catalog displays it by, which is what
+/// `PricingUnit$displayName` ("The human-readable name of the pricing unit") carries.
 ///
 /// Source: the `PricingUnitType` enum
 /// (`smithy_query(query="shape",shape="PricingUnitType")`), generated as
 /// `PRICING_UNIT_TYPE_VALUES`.
-const PRICING_UNIT_DISPLAY_NAMES: &[(&str, &str)] = &[
+pub const PRICING_UNIT_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("USERS", "Users"),
     ("HOSTS", "Hosts"),
     ("BANDWIDTH", "Bandwidth"),
@@ -3749,6 +4009,25 @@ const PRICING_UNIT_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("REQUESTS", "Requests"),
     ("UNITS", "Units"),
 ];
+
+/// The name the catalog displays the pricing model `model_type` by, or the type itself when
+/// the model grows a value the table above does not name yet — which keeps
+/// `PricingModel$displayName` (required, non-blank) satisfiable for it.
+pub fn pricing_model_display_name(model_type: &str) -> String {
+    PRICING_MODEL_DISPLAY_NAMES
+        .iter()
+        .find(|(value, _)| *value == model_type)
+        .map_or_else(|| model_type.to_string(), |(_, name)| (*name).to_string())
+}
+
+/// The name the catalog displays the pricing unit `unit_type` by, or the type itself when the
+/// model grows a value the table above does not name yet.
+pub fn pricing_unit_display_name(unit_type: &str) -> String {
+    PRICING_UNIT_DISPLAY_NAMES
+        .iter()
+        .find(|(value, _)| *value == unit_type)
+        .map_or_else(|| unit_type.to_string(), |(_, name)| (*name).to_string())
+}
 
 /// One review record a seeded row carries: what the catalog's review source holds for its
 /// listing.
@@ -3949,9 +4228,13 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
             short_description: row.short_description,
             categories: row.categories,
             fulfillment: row.fulfillment,
+            highlights: row.highlights,
             seller: BREADTH_SELLERS[index % BREADTH_SELLERS.len()],
-            pricing_model: PRICING_MODEL_DISPLAY_NAMES[index % PRICING_MODEL_DISPLAY_NAMES.len()],
-            pricing_unit: PRICING_UNIT_DISPLAY_NAMES[index % PRICING_UNIT_DISPLAY_NAMES.len()],
+            // The pricing the ROW states: how that kind of record is sold and what its
+            // pricing is metered in, rather than a rotation of the model's enums by the
+            // row's position in this table.
+            pricing_model: row.pricing_model,
+            pricing_unit: row.pricing_unit,
             reviews: BREADTH_REVIEWS[index % BREADTH_REVIEWS.len()],
             support_phone: &phones[index],
             // Every third row's offer belongs to an offer set, so `OFFERSET` purchase
@@ -3982,12 +4265,16 @@ pub(crate) struct CatalogRow<'a> {
     /// The `FulfillmentOptionType`s its single product is fulfilled through: the options
     /// the record offers, the first being the one its prose names.
     pub fulfillment: &'a [&'a str],
+    /// The key features the record offers customers, which both its listing and its product
+    /// report as `highlights` ("A list of key features that the listing offers to
+    /// customers", `HighlightList` @length ..10).
+    pub highlights: &'a [&'a str],
     /// The seller it is published by, as `(sellerProfileId, displayName)`.
     pub seller: (&'a str, &'a str),
-    /// Its pricing model, as `(PricingModelType, displayName)`.
-    pub pricing_model: (&'a str, &'a str),
-    /// Its pricing unit, as `(PricingUnitType, displayName)`.
-    pub pricing_unit: (&'a str, &'a str),
+    /// The `PricingModelType` its offer is sold under.
+    pub pricing_model: &'a str,
+    /// The `PricingUnitType` its offer's pricing is expressed in.
+    pub pricing_unit: &'a str,
     /// What the catalog's review source holds for its listing.
     pub reviews: ReviewSeed,
     /// Its fictional support telephone number.
@@ -4016,31 +4303,38 @@ fn seed_rows(
         // pages over several options of one product wherever the record offers several, the
         // way the modelled one-to-many relation allows.
         let option_types = row.fulfillment;
-        // The route the record's prose names: the first option it offers. A row that names
-        // none would seed a product nothing can be fulfilled through, so it fails here
-        // rather than storing a blank record.
-        let primary = *option_types
-            .first()
-            .expect("a catalog row names the route its product is fulfilled through");
+        // A row that names no route would seed a product nothing can be fulfilled through,
+        // so it fails here rather than storing a blank record.
+        assert!(
+            !option_types.is_empty(),
+            "a catalog row names the route its product is fulfilled through"
+        );
 
         let (seller_profile_id, seller_name) = row.seller;
         let publisher = seller(seller_profile_id, seller_name);
-        let (model_type, model_name) = row.pricing_model;
-        let (unit_type, unit_name) = row.pricing_unit;
+        let model_type = row.pricing_model;
+        let unit_type = row.pricing_unit;
+        let unit_name = pricing_unit_display_name(unit_type);
 
         let categories = classified_under(row.categories);
-        // The row's own deepest category, which is the one its prose names: the expanded
-        // list also holds the ancestors that came with it.
-        let category_name = row
-            .categories
+        // The key features the record offers customers, which its listing and its single
+        // product both report: a feature is something the product DOES, so neither is a
+        // sentence restating how the record is classified or delivered, and the product's
+        // list is not a shortened copy of the listing's.
+        let highlights: Vec<String> = row
+            .highlights
             .iter()
-            .next_back()
-            .map_or_else(String::new, |leaf| taxonomy_category(leaf).display_name);
-        let fulfillment_name = fulfillment_option_display_name(primary);
-        let long_description = format!(
-            "{} {} is listed under {category_name} and fulfilled as {fulfillment_name}.",
-            row.short_description, row.name
-        );
+            .map(|feature| (*feature).to_string())
+            .collect();
+        // The record's own prose: what it offers, followed by the features it offers it
+        // through. Nothing here restates the record's classification or its fulfillment,
+        // both of which the response already carries as `categories` and
+        // `fulfillmentOptionSummaries`.
+        let long_description = if highlights.is_empty() {
+            row.short_description.to_string()
+        } else {
+            format!("{} {}.", row.short_description, highlights.join(". "))
+        };
         let listing_text = Localized {
             default: text(row.name, row.short_description, &long_description),
             translations: BTreeMap::new(),
@@ -4053,8 +4347,10 @@ fn seed_rows(
         let support_phone = row.support_phone;
         let contact = format!("https://example.com/{slug}/contact");
 
-        // A badge is not seeded: `listing_badges` derives each one from the records it
-        // restates, so this row's deployment status and pricing model decide them.
+        // Neither a badge nor the listing's pricing is seeded: `listing_badges`,
+        // `listing_pricing_models` and `listing_pricing_units` derive each from the records
+        // the listing restates, so this row's deployment status and its offer's pricing
+        // decide them.
 
         state.listings.insert(
             listing_id.clone(),
@@ -4064,12 +4360,7 @@ fn seed_rows(
                 logo: logo.clone(),
                 integration_guide: None,
                 categories: categories.clone(),
-                highlights: vec![
-                    format!("Fulfilled as {fulfillment_name}"),
-                    format!("Listed under {category_name}"),
-                ],
-                pricing_models: vec![pricing_model(model_type, model_name)],
-                pricing_units: vec![pricing_unit(unit_type, unit_name)],
+                highlights: highlights.clone(),
                 product_ids: vec![product_id.clone()],
                 offer_ids: vec![offer_id.clone()],
                 publisher: publisher.clone(),
@@ -4084,8 +4375,9 @@ fn seed_rows(
                     slug,
                     row.name,
                     &format!(
-                        "{} Listed under {category_name}.",
-                        row.short_description
+                        "{} {}",
+                        row.short_description,
+                        highlights.first().cloned().unwrap_or_default()
                     ),
                 )],
                 reviews: reviews(
@@ -4106,7 +4398,10 @@ fn seed_rows(
                 manufacturer: publisher.clone(),
                 logo,
                 categories,
-                highlights: vec![format!("Fulfilled as {fulfillment_name}")],
+                // The product's own key features, which for a single-product listing are
+                // the features that listing offers: one record, one set of features, and
+                // neither view shortens the other's.
+                highlights,
                 promotional_media: Vec::new(),
                 resources: support_resources(&support_email, support_phone, &docs),
                 seller_engagements: engagements(&contact),
@@ -4133,7 +4428,11 @@ fn seed_rows(
             offer_id.clone(),
             Offer {
                 offer_id: offer_id.clone(),
-                offer_name: Some(format!("{} — {model_name}", row.name)),
+                offer_name: Some(format!(
+                    "{} — {}",
+                    row.name,
+                    pricing_model_display_name(model_type)
+                )),
                 name_translations: BTreeMap::new(),
                 expiration_time: Some(next_year),
                 available_from_time: Some(month_ago),
@@ -4142,7 +4441,10 @@ fn seed_rows(
                 offer_set_id: offer_set_id.clone(),
                 agreement_proposal_id: format!("ap-{sequence:04}-{slug}"),
                 replacement_agreement_id: None,
-                pricing_model: pricing_model(model_type, model_name),
+                pricing_model: pricing_model(model_type),
+                // The dimension this offer's pricing is expressed in, which the listing it
+                // belongs to restates as its `pricingUnits`.
+                pricing_units: vec![pricing_unit(unit_type)],
                 visibility_scope: VISIBILITY_PUBLIC.to_string(),
             },
         );
@@ -4157,8 +4459,8 @@ fn seed_rows(
             "USAGE" => terms.push(usage_based_term(
                 &format!("t-{sequence:04}-usage"),
                 unit_type,
-                unit_name,
-                unit_name,
+                &unit_name,
+                &unit_name,
                 "0.05",
             )),
             "CONTRACT" => {

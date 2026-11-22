@@ -109,6 +109,108 @@ const KIND_FULFILLMENT: &[(&str, &[&str])] = &[
     ("Studio", &["SAAS"]),
 ];
 
+/// How a row of this tier is PRICED, by the kind of product it is: `(kind,
+/// PricingModelType, PricingUnitType)`.
+///
+/// A record's pricing is a property of the record — `GetListingOutput$pricingModels` is
+/// "[t]he pricing models for offers associated with this listing" and `$pricingUnits` "[t]he
+/// pricing units that define the billing dimensions for offers associated with this
+/// listing" (`smithy_query(query="shape",shape="GetListingOutput")`) — so this tier reads it
+/// off the same thing the rest of the row is derived from, what the product IS and how it is
+/// delivered, rather than from the row's position in the model's enums: seller-hosted
+/// software is subscribed to for the people, seats or tiers that use it; an API-reachable
+/// platform is metered by the requests it answers; software that runs in the buyer's own
+/// cluster or on its own hosts is metered per host; build components the buyer bakes into its
+/// own images are run under licences it already owns; a toolkit a seller publishes at no
+/// charge is free.
+///
+/// Spanning every `PricingModelType` and `PricingUnitType` the model declares is
+/// [`BREADTH_ROWS`]' job, which states each row's pricing one by one.
+const KIND_PRICING: &[(&str, &str, &str)] = &[
+    ("Platform", "USAGE", "REQUESTS"),
+    ("Suite", "CONTRACT", "USERS"),
+    ("Service", "CONTRACT", "USERS"),
+    ("Hub", "USAGE", "HOSTS"),
+    ("Workbench", "BYOL", "HOSTS"),
+    ("Toolkit", "FREE", "UNITS"),
+    ("Gateway", "USAGE", "BANDWIDTH"),
+    ("Studio", "CONTRACT", "TIERS"),
+];
+
+/// The key features a product of `kind` offers customers, which is what `highlights` ("A
+/// list of key features that the listing offers to customers") carries for both its listing
+/// and its product.
+///
+/// A feature is something the product DOES, so it is stated per kind of product rather than
+/// composed from how the record is classified or delivered — a response already carries both
+/// of those, as `categories` and `fulfillmentOptionSummaries`.
+const KIND_HIGHLIGHTS: &[(&str, &[&str])] = &[
+    (
+        "Platform",
+        &[
+            "One control plane across every account you own",
+            "Single sign-on with role-based access control",
+            "Usage and cost reporting per team",
+        ],
+    ),
+    (
+        "Suite",
+        &[
+            "Modules that share one data model",
+            "Approval workflows with full audit history",
+            "Scheduled exports to your warehouse",
+        ],
+    ),
+    (
+        "Service",
+        &[
+            "Managed by the seller, with a published uptime target",
+            "Private connectivity from your own VPC",
+            "Hourly backups with point-in-time restore",
+        ],
+    ),
+    (
+        "Hub",
+        &[
+            "Runs beside your workloads in your own cluster",
+            "Horizontal autoscaling under load",
+            "Policy enforcement at admission time",
+        ],
+    ),
+    (
+        "Workbench",
+        &[
+            "Pre-installed toolchain ready at first boot",
+            "Reproducible environments from a pinned manifest",
+            "Notebook sessions resumable after a restart",
+        ],
+    ),
+    (
+        "Toolkit",
+        &[
+            "Composable components you add to your own pipeline",
+            "Deterministic builds from a locked manifest",
+            "Signed artefacts with provenance attestations",
+        ],
+    ),
+    (
+        "Gateway",
+        &[
+            "Terminates and inspects traffic at your edge",
+            "Rate limiting and quota enforcement per client",
+            "Failover across availability zones",
+        ],
+    ),
+    (
+        "Studio",
+        &[
+            "Visual authoring with versioned drafts",
+            "Review and comment before publishing",
+            "Publish to staging and production separately",
+        ],
+    ),
+];
+
 /// The `FulfillmentOptionType`s a product of `kind` is delivered through, per
 /// [`KIND_FULFILLMENT`], the first of them being the route the row's prose names.
 ///
@@ -119,6 +221,30 @@ fn fulfillment_for_kind(kind: &str) -> &'static [&'static str] {
         .iter()
         .find(|(candidate, _)| *candidate == kind)
         .map_or(&["SAAS"], |(_, option_types)| *option_types)
+}
+
+/// The pricing a product of `kind` is sold under, per [`KIND_PRICING`], as
+/// `(PricingModelType, PricingUnitType)`.
+///
+/// A kind this table does not name is sold the way seller-hosted software with no other
+/// stated pricing is: a subscription contract sized in units.
+fn pricing_for_kind(kind: &str) -> (&'static str, &'static str) {
+    KIND_PRICING
+        .iter()
+        .find(|(candidate, _, _)| *candidate == kind)
+        .map_or(("CONTRACT", "UNITS"), |(_, model, unit)| (*model, *unit))
+}
+
+/// The key features a product of `kind` offers, per [`KIND_HIGHLIGHTS`].
+///
+/// A kind this table does not name states no feature, and then the record reports none:
+/// `highlights` is a list, and an empty one claims nothing rather than claiming a feature
+/// the record has not stated.
+fn highlights_for_kind(kind: &str) -> &'static [&'static str] {
+    KIND_HIGHLIGHTS
+        .iter()
+        .find(|(candidate, _)| *candidate == kind)
+        .map_or(&[], |(_, features)| *features)
 }
 
 /// Seed one listing (with its product, offer and terms) per subcategory of the taxonomy.
@@ -184,6 +310,12 @@ struct BuiltRow {
     /// row of a multi-route kind offers several options and one of a single-route kind
     /// offers one.
     fulfillment: Vec<&'static str>,
+    /// The key features its record offers customers, read off the kind of product it is
+    /// ([`highlights_for_kind`]).
+    highlights: Vec<&'static str>,
+    /// How its offer is priced and what that pricing is metered in, read off the kind of
+    /// product it is ([`pricing_for_kind`]).
+    pricing: (&'static str, &'static str),
     support_phone: String,
 }
 
@@ -208,6 +340,8 @@ impl BuiltRow {
             ),
             categories: vec![category, paired],
             fulfillment: fulfillment_for_kind(kind).to_vec(),
+            highlights: highlights_for_kind(kind).to_vec(),
+            pricing: pricing_for_kind(kind),
             support_phone: format!(
                 "+1-{}-555-{:04}",
                 PHONE_AREA_CODES[(index / PHONE_LINES) % PHONE_AREA_CODES.len()],
@@ -228,13 +362,13 @@ impl BuiltRow {
             // The options the record offers, which this tier reads off the kind of product
             // the row is rather than from the row's position in the model's enum.
             fulfillment: &self.fulfillment,
+            highlights: &self.highlights,
             seller: BREADTH_SELLERS[index % BREADTH_SELLERS.len()],
-            // The pricing model, unit and review summary are offset from one another, so two
-            // rows of this tier rarely carry the same combination of them.
-            pricing_model: PRICING_MODEL_DISPLAY_NAMES
-                [(index + 1) % PRICING_MODEL_DISPLAY_NAMES.len()],
-            pricing_unit: PRICING_UNIT_DISPLAY_NAMES
-                [(index + 3) % PRICING_UNIT_DISPLAY_NAMES.len()],
+            // The pricing the record is sold under, read off the kind of product the row is
+            // for the same reason its fulfillment is: both are properties of the record, not
+            // of where it happens to sit in this tier.
+            pricing_model: self.pricing.0,
+            pricing_unit: self.pricing.1,
             reviews: BREADTH_REVIEWS[(index + 2) % BREADTH_REVIEWS.len()],
             support_phone: &self.support_phone,
             // Every sixth row's offer belongs to an offer set, so this tier reaches
