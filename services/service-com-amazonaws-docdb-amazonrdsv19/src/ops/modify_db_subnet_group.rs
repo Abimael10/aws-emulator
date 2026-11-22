@@ -254,11 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // See `create_db_subnet_group.rs`: an identifier the account has no subnet for can
-        // make up no group, and the refusal names the identifiers it could not use.
-        let absent = resolved.absent(&subnet_ids);
-        if !absent.is_empty() {
+        // make up no group, and the refusal names the whole list the request asked about.
+        if !resolved.absent(&subnet_ids).is_empty() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                docdb::invalid_subnets_message(&absent),
+                docdb::invalid_subnets_message(&subnet_ids),
             ));
         }
         // A subnet group belongs to the VPC its subnets are in, and this call changes WHICH
@@ -276,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default();
         if !outside_the_group.is_empty() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                docdb::invalid_subnets_message(&outside_the_group),
+                docdb::invalid_subnets_message(&subnet_ids),
             ));
         }
         if resolved.vpcs(&subnet_ids).len() > 1 {

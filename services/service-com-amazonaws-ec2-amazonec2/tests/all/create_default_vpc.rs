@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use ec2::state::{
-    is_catalog_region, ComAmazonawsEc2Amazonec2State as Ec2State, AVAILABILITY_ZONES_PER_REGION,
+    is_catalog_region, ComAmazonawsEc2Amazonec2State as Ec2State,
     DEFAULT_VPC_ALREADY_EXISTS, DEFAULT_VPC_CIDR_BLOCK,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -327,7 +327,9 @@ async fn create_default_vpc_creates_the_regions_network_after_the_previous_one_w
         let zones = zone_names(case, &router, region).await;
         assert_eq!(
             zones.len(),
-            AVAILABILITY_ZONES_PER_REGION,
+            // The zones that Region PUBLISHES, from the table this tree keeps them in: three
+            // for most Regions, more for several of them.
+            service_common::aws_availability_zones::zone_letters(region).len(),
             "case {case:?}: expected the Region's zones, got {zones:?}"
         );
         let deleted = delete_the_default_network(case, &router, region, &engine).await;
@@ -397,7 +399,7 @@ async fn create_default_vpc_creates_the_regions_network_after_the_previous_one_w
         let subnet_ids = elements(&subnets, "subnetId");
         assert_eq!(
             subnet_ids.len(),
-            AVAILABILITY_ZONES_PER_REGION,
+            zones.len(),
             "case {case:?}: expected one default subnet per zone, got {subnets}"
         );
         let subnet_zones: BTreeSet<String> = elements(&subnets, "availabilityZone")

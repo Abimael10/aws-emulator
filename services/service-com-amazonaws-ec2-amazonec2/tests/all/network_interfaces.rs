@@ -1130,8 +1130,9 @@ async fn a_create_is_refused_with_the_code_the_request_earns() {
 
 /// What one seeded interface is created with, beyond the ids the service mints itself.
 struct InterfaceFixture {
-    /// The index into [`Seeded::subnet_ids`] of the subnet it sits in.
-    subnet_index: usize,
+    /// The index into the account's DEFAULT subnets of the subnet it sits in, or `None`
+    /// for the subnet this suite created in its own VPC.
+    subnet_index: Option<usize>,
     description: &'static str,
     interface_type: &'static str,
     addresses: usize,
@@ -1142,7 +1143,8 @@ struct InterfaceFixture {
 struct Seeded {
     /// Every interface id, in store order.
     ids: Vec<String>,
-    /// Every subnet id, in store order: the three default ones then the fixture subnet.
+    /// Every subnet id, in store order: the account's default subnets — one per zone the
+    /// Region publishes — then the fixture subnet.
     subnet_ids: Vec<String>,
     /// The VPC the fixture subnet is in.
     fixture_vpc_id: String,
@@ -1164,35 +1166,35 @@ struct Seeded {
 fn interface_fixtures() -> Vec<InterfaceFixture> {
     vec![
         InterfaceFixture {
-            subnet_index: 0,
+            subnet_index: Some(0),
             description: "web",
             interface_type: "interface",
             addresses: 1,
             tags: vec![tag("Name", "web"), tag("Owner", "TeamA")],
         },
         InterfaceFixture {
-            subnet_index: 0,
+            subnet_index: Some(0),
             description: "batch",
             interface_type: "interface",
             addresses: 2,
             tags: vec![tag("Name", "batch")],
         },
         InterfaceFixture {
-            subnet_index: 1,
+            subnet_index: Some(1),
             description: "public",
             interface_type: "interface",
             addresses: 1,
             tags: Vec::new(),
         },
         InterfaceFixture {
-            subnet_index: 3,
+            subnet_index: None,
             description: "nat",
             interface_type: "efa",
             addresses: 1,
             tags: vec![tag("Name", "nat")],
         },
         InterfaceFixture {
-            subnet_index: 3,
+            subnet_index: None,
             description: "managed",
             interface_type: "interface",
             addresses: 1,
@@ -1237,7 +1239,15 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
 
     let mut ids = Vec::new();
     for fixture in interface_fixtures() {
-        let subnet_id = subnets[fixture.subnet_index].clone();
+        // The fixture subnet follows the account's default subnets — one per zone the
+        // Region publishes — so it is the LAST one in store order.
+        let subnet_id = match fixture.subnet_index {
+            Some(index) => subnets[index].clone(),
+            None => subnets
+                .last()
+                .cloned()
+                .expect("the fixture subnet was written above"),
+        };
         let subnet = guard
             .subnets
             .get(&subnet_id)
@@ -1256,7 +1266,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                     })
             })
             .collect();
-        let group_id = if fixture.subnet_index == 3 {
+        let group_id = if fixture.subnet_index.is_none() {
             fixture_group_id.clone()
         } else {
             default_group_id.clone()

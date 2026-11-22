@@ -717,13 +717,20 @@ pub struct ReservationRecord {
     pub instance_ids: Vec<String>,
 }
 
-/// How many Availability Zones a Region reports.
+/// The most Availability Zones a Region reports.
 ///
-/// AWS gives a standard Region at least three Availability Zones; the exact count
-/// varies by Region and the zone-name -> zone-id mapping varies by account, neither of
-/// which a request carries, so every Region here reports exactly that guaranteed
-/// minimum with a stable name -> id mapping.
-pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
+/// WHICH zones a Region has are the ones AWS publishes for it
+/// ([`availability_zones_in_region`], over `service_common::aws_availability_zones`): most
+/// Regions expose three and several expose more, the widest published list being the oldest
+/// Region's six. A bound over "one record, or one request entry, per zone of a Region" is
+/// taken against that widest list, so no Region's own count can overflow it.
+pub const MAX_AVAILABILITY_ZONES_PER_REGION: usize = 6;
+
+/// The FEWEST Availability Zones a Region reports: AWS gives a standard Region at least
+/// three, which is also what most of them expose
+/// (`service_common::aws_availability_zones`). A figure that must be the SAME for every
+/// Region of one answer is scaled by this floor rather than by one Region's own count.
+pub const MIN_AVAILABILITY_ZONES_PER_REGION: usize = 3;
 
 /// `AvailabilityZone$ZoneType` for an Availability Zone, as opposed to a Local Zone or
 /// a Wavelength Zone. From the member's own doc ("Valid values:

@@ -200,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // SNAPSHOT's, so every pair it is named in reports it, under that snapshot's id in
         // the per-pair channel. The answer is bounded well below the two caps multiplied
         // together: every zone left here is a distinct zone of the signed Region, of which
-        // there are `AVAILABILITY_ZONES_PER_REGION`, so a request can ask for at most
-        // `MAX_RESOURCE_IDS * AVAILABILITY_ZONES_PER_REGION` pairs.
+        // there are at most `MAX_AVAILABILITY_ZONES_PER_REGION`, so a request can ask for
+        // at most `MAX_RESOURCE_IDS * MAX_AVAILABILITY_ZONES_PER_REGION` pairs.
         let now = ::std::time::SystemTime::now();
         // ONE instant for the whole answer, so a call that straddles a transition's due
         // instant cannot report two of its own pairs at different phases.

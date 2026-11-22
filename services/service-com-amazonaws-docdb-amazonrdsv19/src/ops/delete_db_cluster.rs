@@ -185,11 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `SkipFinalSnapshot`: "If false is specified, a cluster snapshot is created
         // before the DB cluster is deleted ... If SkipFinalSnapshot is false, you must
-        // specify a FinalDBSnapshotIdentifier parameter. Default: false."
+        // specify a FinalDBSnapshotIdentifier parameter. Default: false." Exactly one of
+        // the two members has to be given, and a request that gives neither is refused with
+        // the sentence this front door words that combination with
+        // (`docdb::FINAL_SNAPSHOT_MEMBER_REQUIRED`), which is fixed text: it names the two
+        // members and nothing of the request.
         let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
         if !skip_final_snapshot && input.final_db_snapshot_identifier.is_none() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "FinalDBSnapshotIdentifier is required when SkipFinalSnapshot is false",
+                docdb::FINAL_SNAPSHOT_MEMBER_REQUIRED,
             ));
         }
         // The mirror of that combination: skipping the final snapshot means no snapshot is

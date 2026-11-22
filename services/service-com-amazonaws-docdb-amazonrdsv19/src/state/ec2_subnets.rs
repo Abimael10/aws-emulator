@@ -66,17 +66,18 @@ pub const NETWORK_TYPE_DUAL: &str = "DUAL";
 /// What a request naming subnets that cannot make up a subnet group — ones the account does
 /// not hold — is refused with.
 ///
-/// This front door states the identifiers it could NOT use inside the brackets,
-/// comma-separated and in the order the request named them: the subnets it found no record
-/// of, or (on a modification) the ones outside the group's own VPC — never a subnet it did
-/// resolve. The fixed text around them, whose spacing (the space before the colon, none
-/// after it) is AWS's own, is left as AWS words it, and the sibling view of this same front
-/// door (`services/service-com-amazonaws-rds-amazonrdsv19/src/state/ec2_subnets.rs`) fills
+/// The variable part is the request's WHOLE `SubnetIds` list, in the order it named them and
+/// including the identifiers that DID resolve: the sentence reports which subnets the
+/// service was asked about and says that SOME of them are invalid, not which ones, so a
+/// client that diffs the bracketed list against what it submitted reads its own list back.
+/// The fixed text around them, whose spacing (the space before the colon, none after it) is
+/// AWS's own, is left as AWS words it, and the sibling view of this same front door
+/// (`services/service-com-amazonaws-rds-amazonrdsv19/src/state/ec2_subnets.rs`) fills
 /// the same template the same way.
-pub fn invalid_subnets_message(subnet_ids: &[String]) -> String {
+pub fn invalid_subnets_message(requested_subnet_ids: &[String]) -> String {
     format!(
         "Some input subnets in :[{}] are invalid.",
-        subnet_ids.join(", ")
+        requested_subnet_ids.join(", ")
     )
 }
 

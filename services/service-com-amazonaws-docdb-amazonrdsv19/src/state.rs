@@ -95,6 +95,21 @@ pub const MAX_IDENTIFIER_LEN: usize = 63;
 /// be a letter. Cannot end with a hyphen or contain two consecutive hyphens."
 pub const MAX_SNAPSHOT_IDENTIFIER_LEN: usize = 255;
 
+/// What a `DeleteDBCluster` that names NEITHER of its two final-snapshot members is refused
+/// with.
+///
+/// `SkipFinalSnapshot`: "If false is specified, a cluster snapshot is created before the DB
+/// cluster is deleted … If SkipFinalSnapshot is false, you must specify a
+/// FinalDBSnapshotIdentifier parameter. Default: false" — so exactly one of the two has to
+/// be given, which is what the sentence states: an imperative naming the member the request
+/// has to carry and the member that waives it, with no terminal period. ENTIRELY fixed text,
+/// so no identifier, value or limit of the request or of the store is substituted into it,
+/// and the sibling view of this same front door
+/// (`services/service-com-amazonaws-rds-amazonrdsv19/src/state/published_values.rs`) words
+/// the cluster-level delete with the same sentence.
+pub const FINAL_SNAPSHOT_MEMBER_REQUIRED: &str =
+    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
+
 /// `CreateDBClusterMessage$MasterUsername`: "Must be from 1 to 63 letters or numbers. The
 /// first character must be a letter."
 pub const MAX_MASTER_USERNAME_LEN: usize = 63;

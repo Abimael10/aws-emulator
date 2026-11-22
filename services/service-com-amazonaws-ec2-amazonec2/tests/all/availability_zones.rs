@@ -129,6 +129,18 @@ fn zone_names(case: &str, body: &str) -> Vec<String> {
     zones(case, body).into_iter().map(|zone| zone.name).collect()
 }
 
+/// Every zone name `region` PUBLISHES, sorted: the Region's own letters from the table this
+/// tree keeps AWS's published zone names in, so a Region that exposes four or six zones is
+/// expected to report four or six.
+fn published_zone_names(region: &str) -> Vec<String> {
+    let mut names: Vec<String> = service_common::aws_availability_zones::zone_letters(region)
+        .iter()
+        .map(|letter| format!("{region}{letter}"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// One row of a selector table: the case name, the `ZoneNames` and `ZoneIds` the
 /// request carries, and the zone names expected back.
 type SelectorCase<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
@@ -145,13 +157,14 @@ type FilterCase<'a> = (&'a str, &'a [(&'a str, &'a [&'a str])], &'a [&'a str]);
 // Rule 1: a Region reports its own zones
 // ---------------------------------------------------------------------------
 
-/// Each Region answers three Availability Zones of its own, named for the Region and
+/// Each Region answers the Availability Zones it publishes, named for the Region and
 /// identified by the Region's zone-id prefix, each carrying the display data AWS
 /// publishes for that Region.
 ///
 /// The rows differ in the SHAPE of the Region name the zones are derived from: a
 /// plain direction, a compound direction (`northeast`), a `central` Region, and a
-/// three-component Region (`us-gov-west-1`). The expected prefixes are the ones AWS
+/// three-component Region (`us-gov-west-1`) — and in how many zones the Region exposes,
+/// since most publish three and several publish more. The expected prefixes are the ones AWS
 /// publishes for these Regions; `us-east-1` -> `use1` is the example in the
 /// operation's own `zone-id` filter doc. The expected zone-group long names, geographies
 /// and sub-geographies are the display data AWS publishes for each Region
@@ -221,13 +234,17 @@ async fn each_region_reports_its_own_availability_zones() {
             "case {region:?}: expected 200, got {status} {body}"
         );
         let zones = zones(region, &body);
+        // The zones that Region PUBLISHES: three for most Regions, four for us-west-2 and
+        // six for us-east-1, and a Region whose letters skip one (ap-northeast-1: a, c, d).
+        let letters = service_common::aws_availability_zones::zone_letters(region);
         assert_eq!(
             zones.len(),
-            3,
-            "case {region:?}: expected three zones, got {zones:?}"
+            letters.len(),
+            "case {region:?}: expected the {} zones the Region publishes, got {zones:?}",
+            letters.len()
         );
         for (index, zone) in zones.iter().enumerate() {
-            let letter = char::from(b'a' + index as u8);
+            let letter = letters[index];
             let expected_name = format!("{region}{letter}");
             let expected_id = format!("{prefix}-az{}", index + 1);
             assert_eq!(
@@ -324,8 +341,7 @@ async fn all_availability_zones_reports_the_same_opt_in_not_required_zones() {
 #[tokio::test]
 async fn zone_names_and_zone_ids_select_the_zones_they_name() {
     let router = emulator();
-    let cases: [SelectorCase; 6] = [
-        ("neither selector", &[], &[], &["us-east-1a", "us-east-1b", "us-east-1c"]),
+    let cases: [SelectorCase; 5] = [
         ("one name", &["us-east-1b"], &[], &["us-east-1b"]),
         (
             "two names",
@@ -347,6 +363,18 @@ async fn zone_names_and_zone_ids_select_the_zones_they_name() {
             &["us-east-1a", "us-east-1c"],
         ),
     ];
+
+    // Naming no selector at all reports every zone the Region publishes.
+    let (status, body) = describe(&router, "us-east-1", &[]).await;
+    assert_eq!(
+        status, 200,
+        "case \"neither selector\": expected 200, got {status} {body}"
+    );
+    assert_eq!(
+        zone_names("neither selector", &body),
+        published_zone_names("us-east-1"),
+        "case \"neither selector\": expected every zone the Region publishes, got {body}"
+    );
 
     for (case, names, ids, expected) in cases {
         let mut params = indexed("ZoneName", names);
@@ -420,7 +448,10 @@ async fn an_unknown_zone_selector_is_refused() {
 #[tokio::test]
 async fn filters_are_anded_and_their_values_ored() {
     let router = emulator();
-    let all = &["us-west-2a", "us-west-2b", "us-west-2c"][..];
+    // Every zone the Region publishes: the rows whose filter matches them all name this.
+    let published = published_zone_names("us-west-2");
+    let every_zone: Vec<&str> = published.iter().map(String::as_str).collect();
+    let all = &every_zone[..];
     let cases: [FilterCase; 19] = [
         ("zone-name exact", &[("zone-name", &["us-west-2b"])], &["us-west-2b"]),
         (
@@ -514,7 +545,7 @@ async fn a_filter_on_a_member_an_availability_zone_lacks_matches_nothing() {
         assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {body}");
         assert_eq!(
             zone_names(case, &body),
-            owned(&["us-west-2a", "us-west-2b", "us-west-2c"]),
+            published_zone_names("us-west-2"),
             "case {case:?}: expected the Region's zone group to match every zone, got {body}"
         );
     }
@@ -647,7 +678,7 @@ async fn a_dry_run_is_refused_with_dry_run_operation() {
     assert_eq!(status, 200, "case \"DryRun=false\": expected 200, got {status} {body}");
     assert_eq!(
         zone_names("DryRun=false", &body),
-        owned(&["us-east-1a", "us-east-1b", "us-east-1c"]),
+        published_zone_names("us-east-1"),
         "case \"DryRun=false\": expected every zone of the Region, got {body}"
     );
 }
@@ -661,7 +692,7 @@ async fn a_dry_run_is_refused_with_dry_run_operation() {
 #[tokio::test]
 async fn describing_zones_does_not_change_what_a_later_caller_sees() {
     let router = emulator();
-    let expected = owned(&["us-east-1a", "us-east-1b", "us-east-1c"]);
+    let expected = published_zone_names("us-east-1");
 
     let (_, first) = describe(&router, "us-east-1", &[]).await;
     assert_eq!(

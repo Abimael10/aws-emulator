@@ -22,7 +22,7 @@
 
 use ec2::state::{
     availability_zones_in_region, is_catalog_region, ComAmazonawsEc2Amazonec2State as Ec2State,
-    SubnetSpec, AVAILABILITY_ZONES_PER_REGION, DEFAULT_VPC_CIDR_BLOCK, SUBNET_STATE_AVAILABLE,
+    SubnetSpec, DEFAULT_VPC_CIDR_BLOCK, SUBNET_STATE_AVAILABLE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -140,7 +140,9 @@ async fn every_region_reports_one_default_subnet_per_zone_of_that_region() {
         let zones = availability_zones_in_region(region);
         assert_eq!(
             zones.len(),
-            AVAILABILITY_ZONES_PER_REGION,
+            // The zones that Region PUBLISHES, from the table this tree keeps them in: three
+            // for most Regions, more for several of them.
+            service_common::aws_availability_zones::zone_letters(region).len(),
             "case {region:?}: expected the Region's zone count, got {zones:?}"
         );
 
@@ -250,7 +252,7 @@ async fn no_two_regions_share_the_default_network() {
         let subnet_ids = subnets_of(&router, region).await;
         assert_eq!(
             subnet_ids.len(),
-            AVAILABILITY_ZONES_PER_REGION,
+            availability_zones_in_region(region).len(),
             "case {region:?}: expected one default subnet per zone, got {subnet_ids:?}"
         );
         networks.push((region, vpc_id, subnet_ids));

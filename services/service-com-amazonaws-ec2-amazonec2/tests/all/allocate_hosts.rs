@@ -22,7 +22,7 @@
 use ec2::state::{
     availability_zones_in_region, host_id_is_well_formed, instance_family_is_modelled,
     instance_family_of, instance_type_is_modelled, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
-    ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED, AVAILABILITY_ZONES_PER_REGION,
+    ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
     DEDICATED_HOST_TAGGABLE_RESOURCE, DEFAULT_AUTO_PLACEMENT, DEFAULT_HOST_RECOVERY,
     HOST_LIMIT_EXCEEDED, HOST_STATE_AVAILABLE, INVALID_PARAMETER_VALUE,
     MAX_STORED_DEDICATED_HOSTS,
@@ -510,8 +510,9 @@ async fn allocate_hosts_mints_quantity_hosts_configured_by_the_request() {
 /// allocated either way sits in the same zone and reports both of its spellings.
 #[tokio::test]
 async fn the_zone_may_be_named_by_its_name_or_by_its_id() {
-    // Every zone of the Region, so the rule is checked on each one rather than on the first.
-    for zone in 0..AVAILABILITY_ZONES_PER_REGION {
+    // Every zone of the Region, as the Region publishes them, so the rule is checked on each
+    // one rather than on the first.
+    for zone in 0..availability_zones_in_region(REGION).len() {
         let case = format!("zone {zone} of {REGION}");
         let (router, _engine) = super::ec2_query::emulator();
 

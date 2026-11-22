@@ -19,7 +19,8 @@
 //!      rules (a trailing hyphen, two consecutive hyphens) is refused instead with the one
 //!      sentence pair that names the member at fault and states the whole rule, which echoes
 //!      NOTHING the request carried — while a DB CLUSTER identifier keeps its subject there
-//!      too, which is how the two create paths differ.
+//!      and states that rule for a value carrying a character the identifier ALPHABET
+//!      excludes, which is how the two create paths differ.
 //!
 //!    Both wordings are the Query API's `InvalidParameterValue` at HTTP 400.
 //! 2. A global database cluster's `Engine` / `EngineVersion` that no global database can run
@@ -37,9 +38,10 @@ use crate::sibling_global_databases::GLOBAL_DATABASE_ENGINES;
 /// member accepts.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
-/// The sentence pair Amazon RDS refuses a DB instance identifier with where the value is a
-/// token of the member's shape and breaks one of the two hyphen rules. Spelled out here so
-/// the wording is pinned by the test rather than by the code under test.
+/// The sentence pair Amazon RDS refuses an identifier with where the value broke the clause
+/// its member states the rule for: one of the two hyphen rules for a DB instance's
+/// identifier, the ALPHABET for a DB cluster's. Spelled out here so the wording is pinned by
+/// the test rather than by the code under test.
 fn states_the_rule(member: &str) -> String {
     format!(
         "The parameter {member} is not a valid identifier. Identifiers must begin with a \
@@ -69,6 +71,10 @@ struct IdentifierPath {
     /// answering its subject there, which is what the DB instance identifier does and the DB
     /// cluster identifier does not.
     states_the_rule_for_a_hyphen_rule: bool,
+    /// Whether this member states the RULE for a value carrying a character the identifier
+    /// alphabet excludes instead of answering its subject there, which is what the DB
+    /// cluster identifier does and the DB instance identifier does not.
+    states_the_rule_outside_the_alphabet: bool,
 }
 
 /// The two create paths this rule is about: the DB instance's and the DB cluster's, the two
@@ -81,6 +87,7 @@ const IDENTIFIER_PATHS: &[IdentifierPath] = &[
         rest: &[("Engine", "postgres"), ("DBInstanceClass", "db.m5.large")],
         max_len: 63,
         states_the_rule_for_a_hyphen_rule: true,
+        states_the_rule_outside_the_alphabet: false,
     },
     IdentifierPath {
         action: "CreateDBCluster",
@@ -89,15 +96,17 @@ const IDENTIFIER_PATHS: &[IdentifierPath] = &[
         rest: &[("Engine", "aurora-mysql")],
         max_len: 63,
         states_the_rule_for_a_hyphen_rule: false,
+        states_the_rule_outside_the_alphabet: true,
     },
 ];
 
-/// One value under test: which clause of the grammar it breaks, and whether that clause is
-/// one of the two HYPHEN rules — the clauses the DB instance identifier states the rule for.
+/// One value under test: which clause of the grammar it breaks — whether that clause is one
+/// of the two HYPHEN rules, or the ALPHABET, the two clauses a member may state the rule for.
 struct ValueCase {
     case: &'static str,
     value: String,
     hyphen_rule: bool,
+    outside_the_alphabet: bool,
 }
 
 /// The values the table runs over, spanning every clause of the grammar in both directions
@@ -111,41 +120,49 @@ fn value_cases(max_len: usize) -> Vec<ValueCase> {
             case: "a leading digit",
             value: "1emu-create-wording".to_string(),
             hyphen_rule: false,
+            outside_the_alphabet: false,
         },
         ValueCase {
             case: "a leading hyphen",
             value: "-emu-create-wording".to_string(),
             hyphen_rule: false,
+            outside_the_alphabet: false,
         },
         ValueCase {
             case: "a mixed-case value with a leading digit",
             value: "9EMU-Create-Wording".to_string(),
             hyphen_rule: false,
+            outside_the_alphabet: false,
         },
         ValueCase {
             case: "an underscore, outside the alphabet",
             value: "emu_create_wording".to_string(),
             hyphen_rule: false,
+            outside_the_alphabet: true,
         },
         ValueCase {
             case: "a multi-byte character",
             value: "emu-create-café".to_string(),
             hyphen_rule: false,
+            outside_the_alphabet: true,
         },
         ValueCase {
             case: "one character past the length bound",
             value: format!("e{}", "a".repeat(max_len)),
             hyphen_rule: false,
+            outside_the_alphabet: false,
         },
         ValueCase {
             case: "a trailing hyphen",
             value: "emu-create-wording-".to_string(),
             hyphen_rule: true,
+            outside_the_alphabet: false,
         },
         ValueCase {
             case: "two consecutive hyphens",
             value: "emu--create-wording".to_string(),
             hyphen_rule: true,
+            outside_the_alphabet: false,
         },
     ]
 }
@@ -166,7 +183,10 @@ async fn an_identifier_refusal_is_worded_by_the_clause_it_broke_and_the_member_i
                 INVALID_PARAMETER_VALUE,
             );
             let message = text(&body, "Message");
-            if row.hyphen_rule && path.states_the_rule_for_a_hyphen_rule {
+            let states_the_rule_here = (row.hyphen_rule
+                && path.states_the_rule_for_a_hyphen_rule)
+                || (row.outside_the_alphabet && path.states_the_rule_outside_the_alphabet);
+            if states_the_rule_here {
                 let expected = states_the_rule(path.member);
                 assert_eq!(
                     message, expected,

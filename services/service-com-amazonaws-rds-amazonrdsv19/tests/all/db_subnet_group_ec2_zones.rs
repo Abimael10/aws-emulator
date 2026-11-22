@@ -581,7 +581,8 @@ async fn a_group_keeps_the_zone_of_a_subnet_the_account_no_longer_holds() {
         "InvalidParameterValue",
     );
     let message = text(&body, "Message");
-    let expected = invalid_subnets_message(&[doomed.as_str()]);
+    let named: Vec<&str> = before.iter().map(String::as_str).collect();
+    let expected = invalid_subnets_message(&named);
     assert_eq!(
         message, expected,
         "case {case:?}: the account has no subnet {doomed} any more, so the list naming it \
@@ -621,18 +622,21 @@ async fn a_multi_az_cluster_is_placed_by_the_zones_its_subnet_group_covers() {
     // the old distinct-SUBNET reading got wrong, since three subnets in two zones still
     // cover two) and three.
     //
-    // `uncovered` is the zones of the Region the group does not cover, which the refusal
-    // names; a row that covers them all is served instead.
+    // `uncovered` is EVERY zone the Region publishes that the group does not cover, which
+    // the refusal names: the zones the owner of zones answered with, minus the two the
+    // group's own subnets lie in. A Region that publishes more than three of them is why
+    // that list can hold more than one zone.
     struct MultiAzRow {
         case: &'static str,
         subnets: Vec<String>,
         uncovered: Vec<String>,
     }
+    let beyond_the_first_two: Vec<String> = zones.iter().skip(2).cloned().collect();
     let rows: [MultiAzRow; 3] = [
         MultiAzRow {
             case: "a group covering two zones",
             subnets: vec![network.first_zone[0].clone(), network.second_zone.clone()],
-            uncovered: vec![zones[2].clone()],
+            uncovered: beyond_the_first_two.clone(),
         },
         MultiAzRow {
             case: "a group of three subnets covering two zones",
@@ -641,7 +645,7 @@ async fn a_multi_az_cluster_is_placed_by_the_zones_its_subnet_group_covers() {
                 network.first_zone[1].clone(),
                 network.second_zone.clone(),
             ],
-            uncovered: vec![zones[2].clone()],
+            uncovered: beyond_the_first_two.clone(),
         },
         MultiAzRow {
             case: "a group covering three zones",

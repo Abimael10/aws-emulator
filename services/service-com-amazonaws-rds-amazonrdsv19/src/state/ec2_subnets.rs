@@ -55,13 +55,16 @@ const SUBNET_IDS_PER_HOP: usize = 64;
 /// What a request naming subnets that cannot make up a DB subnet group — ones the account
 /// does not hold, or ones outside the group's VPC — is refused with.
 ///
-/// Amazon RDS states the identifiers it could not use inside the brackets, comma-separated
-/// and in the order the request named them, and leaves the fixed text around them, whose
-/// spacing (the space before the colon, none after it) is AWS's own.
-pub fn invalid_subnets_message(subnet_ids: &[String]) -> String {
+/// The variable part is the request's WHOLE `SubnetIds` list, in the order it was sent and
+/// including the identifiers that DID resolve: the sentence reports which subnets the
+/// service was asked about and says that SOME of them are invalid, not which ones, so a
+/// client that diffs the bracketed list against what it submitted reads its own list back.
+/// The fixed text around them, whose spacing (the space before the colon, none after it) is
+/// AWS's own, is left as AWS words it.
+pub fn invalid_subnets_message(requested_subnet_ids: &[String]) -> String {
     format!(
         "Some input subnets in :[{}] are invalid.",
-        subnet_ids.join(", ")
+        requested_subnet_ids.join(", ")
     )
 }
 

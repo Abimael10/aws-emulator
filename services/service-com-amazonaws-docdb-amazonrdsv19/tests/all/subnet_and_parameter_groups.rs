@@ -935,8 +935,9 @@ async fn a_modify_rewrites_the_placement_from_the_subnets_it_names() {
 
 /// The message AWS refuses a `SubnetIds` list it cannot use with, written here from the
 /// recorded template rather than from the handler's own helper: the fixed text
-/// "Some input subnets in :[" … "] are invalid." around the subnet ids the service could
-/// NOT use, comma-separated in the order the request named them.
+/// "Some input subnets in :[" … "] are invalid." around the subnet ids the REQUEST named,
+/// comma-separated in the order it named them — the sentence says that SOME of the subnets
+/// it was asked about are invalid, so the ones that did resolve are named too.
 fn expected_invalid_subnets_message(subnet_ids: &[String]) -> String {
     format!(
         "Some input subnets in :[{}] are invalid.",
@@ -946,7 +947,7 @@ fn expected_invalid_subnets_message(subnet_ids: &[String]) -> String {
 
 /// A `SubnetIds` member the account has no subnet for names no subnet at all, so the
 /// request is refused with awsQuery's `InvalidParameterValue` quoting the subnets the
-/// request named — and nothing is written.
+/// request named — all of them, the ones that resolved included — and nothing is written.
 ///
 /// The rows differ along what the rule generalises over: how many identifiers do not
 /// resolve, where in the list they sit, whether one is repeated, and whether the identifier
@@ -965,17 +966,17 @@ async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
     net.delete_subnet(&removed).await;
 
     // (case, the subnets the request names, the identifiers the refusal must name — the
-    // ones the account holds no subnet for, each named once, in request order)
+    // request's own list, each named once, in request order)
     let rows: [(&str, Vec<String>, Vec<String>); 5] = [
         (
             "an unheld id in second place",
             vec![held_a.clone(), UNHELD_SUBNET_A.to_string()],
-            vec![UNHELD_SUBNET_A.to_string()],
+            vec![held_a.clone(), UNHELD_SUBNET_A.to_string()],
         ),
         (
             "an unheld id first",
             vec![UNHELD_SUBNET_A.to_string(), held_a.clone()],
-            vec![UNHELD_SUBNET_A.to_string()],
+            vec![UNHELD_SUBNET_A.to_string(), held_a.clone()],
         ),
         (
             "two unheld ids",
@@ -991,16 +992,16 @@ async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
                 UNHELD_SUBNET_A.to_string(),
             ],
             // One subnet named twice is one subnet, so it is named once.
-            vec![UNHELD_SUBNET_A.to_string()],
+            vec![held_a.clone(), UNHELD_SUBNET_A.to_string()],
         ),
         (
             "a subnet the account removed",
             vec![held_a.clone(), removed.clone()],
-            vec![removed.clone()],
+            vec![held_a.clone(), removed.clone()],
         ),
     ];
 
-    for (index, (case, subnets, invalid)) in rows.iter().enumerate() {
+    for (index, (case, subnets, named)) in rows.iter().enumerate() {
         let name = format!("unheld-{index}");
         let members = group_members(&name, Some("a group of unheld subnets"), subnets);
         let reply = net
@@ -1016,8 +1017,8 @@ async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
         );
         assert_eq!(
             text(&reply.xml, "Message"),
-            expected_invalid_subnets_message(invalid),
-            "case {case:?}: the refusal names the subnets the account holds none of, got {}",
+            expected_invalid_subnets_message(named),
+            "case {case:?}: the refusal names the subnets the request asked about, got {}",
             reply.xml
         );
 
@@ -1063,9 +1064,9 @@ async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
     );
     assert_eq!(
         text(&reply.xml, "Message"),
-        expected_invalid_subnets_message(&[UNHELD_SUBNET_A.to_string()]),
-        "case \"modify to an unheld subnet\": the refusal names the subnet the account holds \
-         none of, got {}",
+        expected_invalid_subnets_message(&[held_a.clone(), UNHELD_SUBNET_A.to_string()]),
+        "case \"modify to an unheld subnet\": the refusal names the subnets the request asked \
+         about, got {}",
         reply.xml
     );
     let described = net
@@ -1086,8 +1087,8 @@ async fn a_subnet_the_account_does_not_hold_is_refused_and_nothing_is_stored() {
 /// A subnet group holds the subnets of ONE VPC. On the create, a list whose subnets lie in
 /// two is the modelled `InvalidSubnet`, worded with the sentence that fault itself states.
 /// On the modify that one VPC is the group's OWN, so a list naming a subnet of another VPC
-/// is refused as awsQuery's `InvalidParameterValue` naming exactly those subnets. Either way
-/// nothing is written.
+/// is refused as awsQuery's `InvalidParameterValue` naming the subnets the request asked
+/// about. Either way nothing is written.
 #[tokio::test]
 async fn subnets_of_two_vpcs_cannot_make_one_group() {
     let net = Network::new();
@@ -1161,13 +1162,13 @@ async fn subnets_of_two_vpcs_cannot_make_one_group() {
 
     // The same rule on the modify path, and one step stricter there: the group belongs to
     // the VPC it was built in, so a list that names a subnet of ANOTHER VPC is refused even
-    // when every subnet it names lies in one VPC of its own — and the refusal names exactly
-    // the subnets that are outside the group's VPC.
+    // when every subnet it names lies in one VPC of its own — and the refusal names the
+    // subnets the request asked about, as the unheld-subnet refusal does.
     let rows: [(&str, Vec<String>, Vec<String>); 2] = [
         (
             "a modify list straddling two VPCs",
             vec![left_a.clone(), right_b.clone()],
-            vec![right_b.clone()],
+            vec![left_a.clone(), right_b.clone()],
         ),
         (
             "a modify list wholly inside another VPC",
@@ -1175,7 +1176,7 @@ async fn subnets_of_two_vpcs_cannot_make_one_group() {
             vec![right_a.clone(), right_b.clone()],
         ),
     ];
-    for (index, (case, subnets, outside)) in rows.iter().enumerate() {
+    for (index, (case, subnets, named)) in rows.iter().enumerate() {
         let name = format!("modify-two-vpcs-{index}");
         let seed = group_members(
             &name,
@@ -1199,8 +1200,8 @@ async fn subnets_of_two_vpcs_cannot_make_one_group() {
         );
         assert_eq!(
             text(&reply.xml, "Message"),
-            expected_invalid_subnets_message(outside),
-            "case {case:?}: the refusal names the subnets outside the group's own VPC, got {}",
+            expected_invalid_subnets_message(named),
+            "case {case:?}: the refusal names the subnets the request asked about, got {}",
             reply.xml
         );
         let described = net

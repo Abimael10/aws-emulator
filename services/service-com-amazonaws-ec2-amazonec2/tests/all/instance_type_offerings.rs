@@ -163,21 +163,34 @@ fn location_type(value: &str) -> Vec<(String, String)> {
 /// the location tests. None of them is cited by the issue this suite closes, and they
 /// span four generations and three architectures — and every one of them is CURRENT
 /// generation, so the zones that offer them are the ones
-/// [`ZONES_OFFERING_CURRENT_GENERATION`] names.
+/// [`zones_offering_current_generation`] names.
 const CATALOG_SAMPLE: [&str; 4] = ["t2.nano", "m5.large", "c6g.medium", "r7iz.32xlarge"];
 
-/// The zone LETTERS of a Region that offer the current-generation instance types.
+/// The zones of `region` that offer the current-generation instance types: every zone that
+/// Region PUBLISHES except its last.
 ///
 /// AWS does not offer every instance type in every Availability Zone, which is why a
 /// `LocationType` of `availability-zone` reports per zone at all; this emulator places that
 /// boundary at the LAST zone of a Region, which offers only the previous generations
-/// (`crate::state::location_offers_instance_type`). A Region here has three zones, so the
-/// current generation is offered in the first two.
-const ZONES_OFFERING_CURRENT_GENERATION: [&str; 2] = ["a", "b"];
+/// (`crate::state::location_offers_instance_type`). So a Region publishing three zones
+/// offers the current generation in two of them, and one publishing six offers it in five.
+fn zones_offering_current_generation(region: &str) -> BTreeSet<String> {
+    let letters = service_common::aws_availability_zones::zone_letters(region);
+    letters
+        .iter()
+        .take(letters.len().saturating_sub(1))
+        .map(|letter| format!("{region}{letter}"))
+        .collect()
+}
 
-/// The AZ-ID indices matching [`ZONES_OFFERING_CURRENT_GENERATION`] — `<prefix>-az1` is the
-/// Region's first zone, so the two letters above are indices 1 and 2.
-const ZONE_IDS_OFFERING_CURRENT_GENERATION: [u32; 2] = [1, 2];
+/// The AZ-IDs matching [`zones_offering_current_generation`] — `<prefix>-az1` is the
+/// Region's first zone, so they are the indices from 1 up to that Region's zone count.
+fn zone_ids_offering_current_generation(region: &str, prefix: &str) -> BTreeSet<String> {
+    let count = service_common::aws_availability_zones::zone_letters(region).len();
+    (1..count)
+        .map(|index| format!("{prefix}-az{index}"))
+        .collect()
+}
 
 /// One row of the location-type table: the case name, the `LocationType` form fields the
 /// request carries, and the locations the Region is expected to report.
@@ -220,12 +233,7 @@ async fn each_location_type_reports_the_locations_of_its_own_kind() {
         (
             "availability-zone",
             location_type("availability-zone"),
-            |region| {
-                ZONES_OFFERING_CURRENT_GENERATION
-                    .iter()
-                    .map(|letter| format!("{region}{letter}"))
-                    .collect()
-            },
+            zones_offering_current_generation,
         ),
         (
             "availability-zone-id",
@@ -238,10 +246,7 @@ async fn each_location_type_reports_the_locations_of_its_own_kind() {
                     "ap-northeast-2" => "apne2",
                     other => panic!("no zone-id prefix pinned for {other:?}"),
                 };
-                ZONE_IDS_OFFERING_CURRENT_GENERATION
-                    .iter()
-                    .map(|index| format!("{prefix}-az{index}"))
-                    .collect()
+                zone_ids_offering_current_generation(region, prefix)
             },
         ),
         // An Outpost is hardware in a customer's own facility and no operation of this
@@ -386,17 +391,14 @@ async fn an_unknown_location_type_is_refused() {
 ///
 /// The LOCATIONS a row reports follow the per-zone offerings: a row narrowed to
 /// current-generation types only reports the zones
-/// [`ZONES_OFFERING_CURRENT_GENERATION`] names, while one whose wildcard also matches a
+/// [`zones_offering_current_generation`] names, while one whose wildcard also matches a
 /// previous-generation family reports every zone of the Region, the previous generations
 /// being offered everywhere.
 #[tokio::test]
 async fn filters_and_over_names_and_or_over_values() {
     let (router, _engine) = super::ec2_query::emulator();
     let region = "eu-west-1";
-    let current_generation_zones: BTreeSet<String> = ZONES_OFFERING_CURRENT_GENERATION
-        .iter()
-        .map(|letter| format!("{region}{letter}"))
-        .collect();
+    let current_generation_zones = zones_offering_current_generation(region);
     let every_zone = owned(&["eu-west-1a", "eu-west-1b", "eu-west-1c"]);
     let catalog = ec2::ops::types::INSTANCE_TYPE_VALUES;
 

@@ -973,7 +973,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             availability_zones: match (requested_availability_zones, source.availability_zones) {
                 (requested, _) if !requested.is_empty() => requested,
                 (_, recorded) if !recorded.is_empty() => recorded,
-                _ => crate::state::region_availability_zones(&region),
+                _ => crate::state::cluster_placement_zones(&region),
             },
             // `BackupRetentionPeriod` and `PreferredBackupWindow`: "Default: Uses existing
             // setting" — the setting the source carried when the snapshot was taken.

@@ -1185,10 +1185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instances in the DB cluster" — a cluster the request names none for spans the
             // zones RDS picks for it, which for both cluster types is three ("the request
             // creates a writer and two reader DB instances for you, each in a different
-            // Availability Zone"). This emulator picks the region's first three, named the
-            // way AWS names a zone of a region.
+            // Availability Zone"): the Region's first three
+            // ([`crate::state::cluster_placement_zones`]), whatever the number the Region
+            // itself exposes.
             availability_zones: if availability_zones.is_empty() {
-                crate::state::region_availability_zones(&region)
+                crate::state::cluster_placement_zones(&region)
             } else {
                 availability_zones
             },

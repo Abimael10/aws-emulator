@@ -226,6 +226,31 @@ fn ids_at(seeded: &Seeded, indices: &[usize]) -> Vec<String> {
         .collect()
 }
 
+/// The store indices of the account's DEFAULT subnets: one per Availability Zone [`REGION`]
+/// publishes, created with the default VPC and held before anything this suite seeds.
+fn default_indices() -> Vec<usize> {
+    (0..availability_zones_in_region(REGION).len()).collect()
+}
+
+/// The store index of the `nth` subnet [`seeded_fixtures`] writes: the account's default
+/// subnets come first in store order, so the fixtures follow them.
+fn fixture(nth: usize) -> usize {
+    availability_zones_in_region(REGION).len() + nth
+}
+
+/// The store indices of the fixtures at `nths`, in the order given.
+fn fixtures(nths: &[usize]) -> Vec<usize> {
+    nths.iter().map(|nth| fixture(*nth)).collect()
+}
+
+/// Every default subnet's index, then the fixtures at `nths`: ascending store order, which
+/// is the order the report answers in.
+fn defaults_and_fixtures(nths: &[usize]) -> Vec<usize> {
+    let mut indices = default_indices();
+    indices.extend(fixtures(nths));
+    indices
+}
+
 // ---------------------------------------------------------------------------
 // The store is what is reported
 // ---------------------------------------------------------------------------
@@ -263,7 +288,6 @@ async fn a_fresh_account_reports_the_default_subnet_of_each_zone_and_reading_cha
 
     // Zone n gets the n-th /20 block of the default VPC's 172.31.0.0/16, and a default
     // subnet is `DefaultForAz` with the auto-assign public IPv4 attribute set.
-    let expected_blocks = ["172.31.0.0/20", "172.31.16.0/20", "172.31.32.0/20"];
     for (index, zone) in zones.iter().enumerate() {
         let case = format!("default subnet in {}", zone.zone_name);
         let body = describe_one(&router, &case, &first_ids[index]).await;
@@ -271,7 +295,7 @@ async fn a_fresh_account_reports_the_default_subnet_of_each_zone_and_reading_cha
         let expected_members = [
             ("availabilityZone", zone.zone_name.clone()),
             ("availabilityZoneId", zone.zone_id.clone()),
-            ("cidrBlock", expected_blocks[index].to_string()),
+            ("cidrBlock", format!("172.31.{}.0/20", index * 16)),
             ("availableIpAddressCount", "4091".to_string()),
             ("defaultForAz", "true".to_string()),
             ("mapPublicIpOnLaunch", "true".to_string()),
@@ -427,150 +451,191 @@ async fn each_documented_filter_selects_the_subnets_whose_attribute_equals_a_val
     let account = engine::emulator_account_id().to_string();
     let zones = availability_zones_in_region(REGION);
     let all: Vec<usize> = (0..seeded.ids.len()).collect();
-    let subnet_arn = engine::emulator_arn("ec2", REGION, &format!("subnet/{}", seeded.ids[4]));
+    let subnet_arn =
+        engine::emulator_arn("ec2", REGION, &format!("subnet/{}", seeded.ids[fixture(1)]));
 
     // One row per filter name `DescribeSubnetsRequest$Filters` documents, each asserted on
-    // a subnet the issue never cited.
+    // a subnet the issue never cited. The expectations are written as the account's DEFAULT
+    // subnets (one per zone the Region publishes) and the fixtures this suite seeded, so a
+    // Region exposing four or six zones shifts no row.
     let cases: Vec<(&str, Vec<String>, Vec<usize>)> = vec![
         (
             "availability-zone",
             vec![zones[0].zone_name.clone()],
-            vec![0, 3, 6],
+            vec![0, fixture(0), fixture(3)],
         ),
         // "You can also use availabilityZone as the filter name."
         (
             "availabilityZone",
             vec![zones[1].zone_name.clone()],
-            vec![1, 4, 7],
+            vec![1, fixture(1), fixture(4)],
         ),
         (
             "availability-zone-id",
             vec![zones[2].zone_id.clone()],
-            vec![2, 5],
+            vec![2, fixture(2)],
         ),
         // "You can also use availabilityZoneId as the filter name."
         (
             "availabilityZoneId",
             vec![zones[0].zone_id.clone()],
-            vec![0, 3, 6],
+            vec![0, fixture(0), fixture(3)],
         ),
         // Two zones in one filter: joined with OR.
         (
             "availability-zone",
             vec![zones[1].zone_name.clone(), zones[2].zone_name.clone()],
-            vec![1, 2, 4, 5, 7],
+            vec![1, 2, fixture(1), fixture(2), fixture(4)],
         ),
         // A /20 holds 4091 available addresses, a /24 251 and a /28 11.
-        ("available-ip-address-count", vec!["4091".into()], vec![
-            0, 1, 2, 3,
-        ]),
-        ("available-ip-address-count", vec!["251".into()], vec![
-            4, 6, 7,
-        ]),
-        ("available-ip-address-count", vec!["11".into()], vec![5]),
+        (
+            "available-ip-address-count",
+            vec!["4091".into()],
+            defaults_and_fixtures(&[0]),
+        ),
+        (
+            "available-ip-address-count",
+            vec!["251".into()],
+            fixtures(&[1, 3, 4]),
+        ),
+        (
+            "available-ip-address-count",
+            vec!["11".into()],
+            fixtures(&[2]),
+        ),
         ("available-ip-address-count", vec!["4092".into()], vec![]),
-        ("cidr-block", vec!["10.0.0.0/20".into()], vec![3]),
+        ("cidr-block", vec!["10.0.0.0/20".into()], fixtures(&[0])),
         // "You can also use cidr or cidrBlock as the filter names."
         ("cidr", vec!["172.31.16.0/20".into()], vec![1]),
-        ("cidrBlock", vec!["10.0.17.0/28".into()], vec![5]),
+        ("cidrBlock", vec!["10.0.17.0/28".into()], fixtures(&[2])),
         // A CIDR block no subnet has: an empty set, not an error.
         ("cidr-block", vec!["10.9.0.0/24".into()], vec![]),
         (
             "customer-owned-ipv4-pool",
             vec![SEEDED_COIP_POOL.into()],
-            vec![6],
+            fixtures(&[3]),
         ),
-        ("default-for-az", vec!["true".into()], vec![0, 1, 2]),
-        ("default-for-az", vec!["false".into()], vec![3, 4, 5, 6, 7]),
+        ("default-for-az", vec!["true".into()], default_indices()),
+        (
+            "default-for-az",
+            vec!["false".into()],
+            fixtures(&[0, 1, 2, 3, 4]),
+        ),
         // "You can also use defaultForAz as the filter name."
-        ("defaultForAz", vec!["true".into()], vec![0, 1, 2]),
-        ("enable-dns64", vec!["true".into()], vec![7]),
-        ("enable-dns64", vec!["false".into()], vec![
-            0, 1, 2, 3, 4, 5, 6,
-        ]),
-        ("enable-lni-at-device-index", vec!["1".into()], vec![6]),
+        ("defaultForAz", vec!["true".into()], default_indices()),
+        ("enable-dns64", vec!["true".into()], fixtures(&[4])),
+        (
+            "enable-dns64",
+            vec!["false".into()],
+            defaults_and_fixtures(&[0, 1, 2, 3]),
+        ),
+        (
+            "enable-lni-at-device-index",
+            vec!["1".into()],
+            fixtures(&[3]),
+        ),
         ("enable-lni-at-device-index", vec!["0".into()], vec![]),
         (
             "ipv6-cidr-block-association.ipv6-cidr-block",
             vec![SEEDED_IPV6_CIDR_BLOCK.into()],
-            vec![4],
+            fixtures(&[1]),
         ),
         (
             "ipv6-cidr-block-association.association-id",
             vec![seeded.ipv6_association_id.clone()],
-            vec![4],
+            fixtures(&[1]),
         ),
         (
             "ipv6-cidr-block-association.state",
             vec!["associated".into()],
-            vec![4],
+            fixtures(&[1]),
         ),
-        ("ipv6-native", vec!["true".into()], vec![7]),
-        ("ipv6-native", vec!["false".into()], vec![
-            0, 1, 2, 3, 4, 5, 6,
-        ]),
+        ("ipv6-native", vec!["true".into()], fixtures(&[4])),
+        (
+            "ipv6-native",
+            vec!["false".into()],
+            defaults_and_fixtures(&[0, 1, 2, 3]),
+        ),
         (
             "map-customer-owned-ip-on-launch",
             vec!["true".into()],
-            vec![6],
+            fixtures(&[3]),
         ),
-        ("map-public-ip-on-launch", vec!["true".into()], vec![
-            0, 1, 2, 4,
-        ]),
-        ("outpost-arn", vec![SEEDED_OUTPOST_ARN.into()], vec![6]),
+        (
+            "map-public-ip-on-launch",
+            vec!["true".into()],
+            defaults_and_fixtures(&[1]),
+        ),
+        (
+            "outpost-arn",
+            vec![SEEDED_OUTPOST_ARN.into()],
+            fixtures(&[3]),
+        ),
         ("owner-id", vec![account], all.clone()),
         ("owner-id", vec!["111122223333".into()], vec![]),
         (
             "private-dns-name-options-on-launch.hostname-type",
             vec!["resource-name".into()],
-            vec![7],
+            fixtures(&[4]),
         ),
         (
             "private-dns-name-options-on-launch.hostname-type",
             vec!["ip-name".into()],
-            vec![0, 1, 2, 3, 4, 5, 6],
+            defaults_and_fixtures(&[0, 1, 2, 3]),
         ),
         (
             "private-dns-name-options-on-launch.enable-resource-name-dns-a-record",
             vec!["true".into()],
-            vec![7],
+            fixtures(&[4]),
         ),
         (
             "private-dns-name-options-on-launch.enable-resource-name-dns-aaaa-record",
             vec!["true".into()],
-            vec![7],
+            fixtures(&[4]),
         ),
-        ("state", vec!["pending".into()], vec![5]),
+        ("state", vec!["pending".into()], fixtures(&[2])),
         (
             "state",
             vec!["available".into(), "pending".into()],
             all.clone(),
         ),
-        ("subnet-arn", vec![subnet_arn], vec![4]),
-        ("subnet-id", vec![seeded.ids[6].clone()], vec![6]),
+        ("subnet-arn", vec![subnet_arn], fixtures(&[1])),
         (
             "subnet-id",
-            vec![seeded.ids[0].clone(), seeded.ids[3].clone()],
-            vec![0, 3],
+            vec![seeded.ids[fixture(3)].clone()],
+            fixtures(&[3]),
         ),
-        ("tag-key", vec!["Owner".into()], vec![3, 4]),
-        ("tag-key", vec!["Project".into()], vec![7]),
-        ("tag:Name", vec!["web".into()], vec![3, 5]),
-        ("tag:Owner", vec!["TeamA".into()], vec![3]),
+        (
+            "subnet-id",
+            vec![seeded.ids[0].clone(), seeded.ids[fixture(0)].clone()],
+            vec![0, fixture(0)],
+        ),
+        ("tag-key", vec!["Owner".into()], fixtures(&[0, 1])),
+        ("tag-key", vec!["Project".into()], fixtures(&[4])),
+        ("tag:Name", vec!["web".into()], fixtures(&[0, 2])),
+        ("tag:Owner", vec!["TeamA".into()], fixtures(&[0])),
         // "Filter values are case-sensitive" (`Filter$Values`).
         ("tag:Owner", vec!["teama".into()], vec![]),
-        ("vpc-id", vec![seeded.default_vpc_id.clone()], vec![0, 1, 2]),
-        ("vpc-id", vec![seeded.fixture_vpc_id.clone()], vec![
-            3, 4, 5, 6, 7,
-        ]),
+        (
+            "vpc-id",
+            vec![seeded.default_vpc_id.clone()],
+            default_indices(),
+        ),
+        (
+            "vpc-id",
+            vec![seeded.fixture_vpc_id.clone()],
+            fixtures(&[0, 1, 2, 3, 4]),
+        ),
         // Filter values carry EC2's wildcards: `*` for zero or more characters, `?` for
         // exactly one ("List and filter using the CLI and API", the guide the modelled
         // `Filter` shape links to).
-        ("cidr-block", vec!["10.*".into()], vec![3, 4, 5, 6, 7]),
+        ("cidr-block", vec!["10.*".into()], fixtures(&[0, 1, 2, 3, 4])),
+        // The default subnet of the Region's FIRST zone is the only one whose /20 block
+        // carries a single digit there (the next zones' blocks are 16, 32, …).
         ("cidr-block", vec!["172.31.?.0/20".into()], vec![0]),
-        ("tag:Name", vec!["we*".into()], vec![3, 5]),
-        ("tag:Name", vec!["*atch".into()], vec![4]),
-        ("tag-key", vec!["*".into()], vec![3, 4, 5, 7]),
+        ("tag:Name", vec!["we*".into()], fixtures(&[0, 2])),
+        ("tag:Name", vec!["*atch".into()], fixtures(&[1])),
+        ("tag-key", vec!["*".into()], fixtures(&[0, 1, 2, 4])),
         // A documented filter carrying no value at all: there is no value for the
         // attribute to match, so it selects nothing rather than everything.
         ("state", vec![], vec![]),
@@ -606,7 +671,7 @@ async fn several_filters_are_joined_with_an_and() {
                 ("default-for-az", &["false"][..]),
                 ("tag:Name", &["web"][..]),
             ],
-            vec![3, 5],
+            fixtures(&[0, 2]),
         ),
         (
             vec![
@@ -614,7 +679,7 @@ async fn several_filters_are_joined_with_an_and() {
                 ("tag:Name", &["web"][..]),
                 ("cidr-block", &["10.0.0.0/20"][..]),
             ],
-            vec![3],
+            fixtures(&[0]),
         ),
         // Each filter matches something, but no subnet matches both.
         (
@@ -690,10 +755,10 @@ async fn subnet_ids_narrow_the_report_to_the_ids_named() {
     // Rows differ in count and in the order the ids are asked for.
     let cases: Vec<Vec<usize>> = vec![
         vec![0],
-        vec![7],
-        vec![2, 4],
-        vec![4, 2],
-        vec![5, 1, 3],
+        fixtures(&[4]),
+        vec![2, fixture(1)],
+        vec![fixture(1), 2],
+        vec![fixture(2), 1, fixture(0)],
         (0..seeded.ids.len()).collect(),
     ];
     for asked in cases {
@@ -811,7 +876,7 @@ async fn a_page_is_cut_from_the_filtered_set() {
     let first = described_ids(&router, "filtered first page", &params).await;
     assert_eq!(
         first,
-        ids_at(&seeded, &[3, 4, 5, 6, 7]),
+        ids_at(&seeded, &fixtures(&[0, 1, 2, 3, 4])),
         "filtered first page: expected the five non-default subnets, got {first:?}"
     );
 
@@ -827,7 +892,7 @@ async fn a_page_is_cut_from_the_filtered_set() {
     let page = described_ids(&router, "one VPC's subnets", &narrower).await;
     assert_eq!(
         page,
-        ids_at(&seeded, &[3, 4, 5, 6, 7]),
+        ids_at(&seeded, &fixtures(&[0, 1, 2, 3, 4])),
         "one VPC's subnets: expected the fixture VPC's subnets, got {page:?}"
     );
 }
@@ -849,9 +914,10 @@ async fn a_token_is_issued_only_when_a_subnet_follows_the_page() {
     let mut params = max_results_param(5);
     params.push(("NextToken".to_string(), token));
     let second = described_ids(&router, "second page", &params).await;
+    let after_the_first_five: Vec<usize> = (5..seeded.ids.len()).collect();
     assert_eq!(
         second,
-        ids_at(&seeded, &[5, 6, 7]),
+        ids_at(&seeded, &after_the_first_five[..5.min(after_the_first_five.len())]),
         "second page: expected the subnets after the first five, got {second:?}"
     );
 }

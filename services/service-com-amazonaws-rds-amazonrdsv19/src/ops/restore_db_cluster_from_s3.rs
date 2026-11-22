@@ -888,7 +888,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // can be created": the request's, else the zones RDS picks for a cluster nobody
             // named any for.
             availability_zones: if requested_availability_zones.is_empty() {
-                crate::state::region_availability_zones(&region)
+                crate::state::cluster_placement_zones(&region)
             } else {
                 requested_availability_zones
             },

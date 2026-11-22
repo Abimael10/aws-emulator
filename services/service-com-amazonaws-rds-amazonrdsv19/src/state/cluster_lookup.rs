@@ -13,8 +13,9 @@
 //! to 63 letters, numbers, or hyphens. First character must be a letter. Can't end with a
 //! hyphen or contain two consecutive hyphens") cannot name a DB cluster at all — not one that
 //! exists, and not one that ever could — so it is refused as a parameter VALUE the member
-//! does not accept, with the subject wording this front door words that member's refusals
-//! with ([`check_identifier`]), before any record is read. The modelled
+//! does not accept, with the subject wording this front door words a REFERENCE's refusals
+//! with for every clause ([`check_identifier_reference`]), before any record is read. The
+//! modelled
 //! `DBClusterNotFoundFault` is then what it is modelled for: a WELL-FORMED identifier that
 //! names nothing. The two refusals are different answers to a caller — a not-found invites a
 //! create-or-retry, while a refused value says the request itself has to change — so a
@@ -26,7 +27,7 @@
 use super::*;
 
 /// The member whose published rule every DB cluster reference is held to, and whose subject
-/// wording its refusal carries ([`crate::state::check_identifier`]).
+/// wording its refusal carries ([`crate::state::check_identifier_reference`]).
 ///
 /// One spelling of the member name for this crate: the pre-boundary reference gate
 /// (`crate::service::unresolved_reference`) names the same member and reads it from here, so
@@ -66,7 +67,7 @@ pub fn db_cluster_lookup_identifier(named: &str) -> Result<&str, String> {
     if identifier.is_empty() {
         return Ok(identifier);
     }
-    check_identifier(
+    check_identifier_reference(
         DB_CLUSTER_IDENTIFIER_MEMBER,
         identifier,
         MAX_DB_CLUSTER_LOOKUP_IDENTIFIER_LEN,

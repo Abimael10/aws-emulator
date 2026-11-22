@@ -221,12 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An identifier EC2 answered it holds no subnet for names no subnet of the account,
         // so it can make up no group: a value the request carried that cannot be used, which
         // is the query protocol's common `InvalidParameterValue` rather than one of this
-        // operation's modelled faults. The refusal names the identifiers it could not use,
-        // and nothing is written.
-        let absent = resolved.absent(&subnet_ids);
-        if !absent.is_empty() {
+        // operation's modelled faults. The refusal names the whole list the request asked
+        // about — the sentence says SOME of those subnets are invalid — and nothing is
+        // written.
+        if !resolved.absent(&subnet_ids).is_empty() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                docdb::invalid_subnets_message(&absent),
+                docdb::invalid_subnets_message(&subnet_ids),
             ));
         }
         // A subnet group is a set of subnets of ONE VPC — the VPC it reports — so a list

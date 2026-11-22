@@ -536,8 +536,12 @@ pub fn spot_placement_scores(
     instance_type_count: usize,
     single_availability_zone: bool,
 ) -> Vec<SpotPlacementScoreRecord> {
-    let per_zone_capacity =
-        capacity.saturating_mul(u64::try_from(AVAILABILITY_ZONES_PER_REGION).unwrap_or(1));
+    // The capacity a Region's zones would otherwise SHARE, carried by one of them. It is
+    // scaled by the number of zones EVERY Region has at least
+    // ([`MIN_AVAILABILITY_ZONES_PER_REGION`]) rather than by one Region's own count, so one
+    // request scores every location it names alike however many zones each of them exposes.
+    let per_zone_capacity = capacity
+        .saturating_mul(u64::try_from(MIN_AVAILABILITY_ZONES_PER_REGION).unwrap_or(1));
     let mut scored: Vec<SpotPlacementScoreRecord> = regions
         .iter()
         .flat_map(|region| {

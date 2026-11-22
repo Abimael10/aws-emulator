@@ -23,8 +23,8 @@
 //!
 //! A pair is keyed by a snapshot of [`ComAmazonawsEc2Amazonec2State::snapshots`] and a zone
 //! of the signed Region, so the store cannot hold more records than there are stored
-//! snapshots times [`super::AVAILABILITY_ZONES_PER_REGION`], and every string one retains is
-//! either a zone name the service chose or a snapshot id read back out of that store —
+//! snapshots times [`super::MAX_AVAILABILITY_ZONES_PER_REGION`], and every string one retains
+//! is either a zone name the service chose or a snapshot id read back out of that store —
 //! nothing caller-sized — so no byte charge is made for one.
 
 use std::collections::btree_map::Entry;

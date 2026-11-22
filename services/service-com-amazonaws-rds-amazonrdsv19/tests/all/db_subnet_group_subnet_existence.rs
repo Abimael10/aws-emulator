@@ -6,7 +6,8 @@
 //!
 //! RULE: a `SubnetIds` list naming an identifier the service that OWNS subnets answered it
 //! holds no subnet for is refused — HTTP 400 with the query protocol's `InvalidParameterValue`
-//! and the sentence naming exactly those identifiers — whichever operation carries the list,
+//! and the sentence naming the identifiers the REQUEST asked about, the ones that did resolve
+//! included — whichever operation carries the list,
 //! and BEFORE the zones the list covers are counted, since an identifier that names no subnet
 //! contributes no zone to count. A subnet of a VPC other than the one the group a
 //! modification addresses is in is not a subnet that group can be made of, so it is refused
@@ -43,8 +44,9 @@ const UNHELD_SECOND: &str = "subnet-00000000deadbeef1";
 const UNHELD_SHORT: &str = "subnet-0000beef";
 
 /// The sentence Amazon RDS refuses a `SubnetIds` list it cannot make a DB subnet group of
-/// with: the identifiers it could not use inside the brackets, comma-separated and in the
-/// order the request named them, and the fixed text around them.
+/// with: the identifiers the REQUEST named inside the brackets, comma-separated and in the
+/// order it named them — the ones that resolved included, since the sentence says that SOME
+/// of the subnets it was asked about are invalid — and the fixed text around them.
 ///
 /// Spelled out here rather than read from the code under test, so the assertion is made
 /// against the wording and not against the emulator's own helper.
@@ -64,12 +66,11 @@ fn subnet_ids_of(group: &str) -> Vec<String> {
     texts(group, "SubnetIdentifier")
 }
 
-/// One row of the table: the case, the list the request carries, and the identifiers among
-/// them the refusal must name — in the order the request named them, without repetition.
+/// One row of the table: the case and the list the request carries, which is also the list
+/// the refusal names — every identifier the request asked about, in the order it named them.
 struct Row {
     case: &'static str,
     subnets: Vec<String>,
-    invalid: Vec<&'static str>,
 }
 
 /// The rows, built against a network EC2 minted: `held` are identifiers the account has.
@@ -78,17 +79,14 @@ fn rows(held: &[String; 2]) -> Vec<Row> {
         Row {
             case: "an identifier the account holds no subnet for, named first",
             subnets: vec![UNHELD_LONG.to_string(), held[1].clone()],
-            invalid: vec![UNHELD_LONG],
         },
         Row {
             case: "the same identifier after a subnet the account does hold",
             subnets: vec![held[0].clone(), UNHELD_LONG.to_string()],
-            invalid: vec![UNHELD_LONG],
         },
         Row {
             case: "two identifiers the account holds no subnet for, in both published forms",
             subnets: vec![UNHELD_LONG.to_string(), UNHELD_SHORT.to_string()],
-            invalid: vec![UNHELD_LONG, UNHELD_SHORT],
         },
         Row {
             case: "three identifiers, two of them unheld, around a subnet it does hold",
@@ -97,16 +95,16 @@ fn rows(held: &[String; 2]) -> Vec<Row> {
                 held[0].clone(),
                 UNHELD_SHORT.to_string(),
             ],
-            invalid: vec![UNHELD_SECOND, UNHELD_SHORT],
         },
         Row {
+            // A repeated identifier is still an identifier the request asked about, so the
+            // sentence echoes the list as it was sent.
             case: "the same unheld identifier named twice",
             subnets: vec![
                 UNHELD_LONG.to_string(),
                 held[1].clone(),
                 UNHELD_LONG.to_string(),
             ],
-            invalid: vec![UNHELD_LONG],
         },
         Row {
             // ONE identifier, which covers no zone at all: the list is refused for the
@@ -114,17 +112,18 @@ fn rows(held: &[String; 2]) -> Vec<Row> {
             // which is what fixes the order of the two gates.
             case: "a single unheld identifier, which covers no Availability Zone either",
             subnets: vec![UNHELD_LONG.to_string()],
-            invalid: vec![UNHELD_LONG],
         },
     ]
 }
 
-/// Assert one answer is the refusal the rule prescribes, naming `invalid`.
-fn assert_refused(case: &str, label: &str, response: (u16, String), invalid: &[&str]) {
+/// Assert one answer is the refusal the rule prescribes, naming every identifier in
+/// `requested`.
+fn assert_refused(case: &str, label: &str, response: (u16, String), requested: &[String]) {
     let case = format!("{case} ({label})");
     let body = expect_error(&case, response, 400, "InvalidParameterValue");
     let message = text(&body, "Message");
-    let expected = invalid_subnets_message(invalid);
+    let named: Vec<&str> = requested.iter().map(String::as_str).collect();
+    let expected = invalid_subnets_message(&named);
     assert_eq!(
         message, expected,
         "case {case:?}: expected {expected:?}, got {message:?}"
@@ -132,8 +131,8 @@ fn assert_refused(case: &str, label: &str, response: (u16, String), invalid: &[&
 }
 
 /// RULE: every operation that takes a `SubnetIds` list refuses one naming an identifier the
-/// account holds no subnet for, with `InvalidParameterValue` naming exactly those
-/// identifiers — and a refused modification leaves the stored group as it was.
+/// account holds no subnet for, with `InvalidParameterValue` naming the identifiers the
+/// request asked about — and a refused modification leaves the stored group as it was.
 #[tokio::test]
 async fn a_subnet_the_account_does_not_hold_is_refused_on_create_and_on_modify() {
     let network = Network::build().await;
@@ -163,7 +162,7 @@ async fn a_subnet_the_account_does_not_hold_is_refused_on_create_and_on_modify()
             row.case,
             "CreateDBSubnetGroup",
             network.account.create_group(&name, &row.subnets).await,
-            &row.invalid,
+            &row.subnets,
         );
         // Nothing was stored for the refused name: the group does not exist.
         let (status, body) = network.account.describe_group(&name).await;
@@ -177,7 +176,7 @@ async fn a_subnet_the_account_does_not_hold_is_refused_on_create_and_on_modify()
             row.case,
             "ModifyDBSubnetGroup",
             network.account.modify_group(BASE, &row.subnets).await,
-            &row.invalid,
+            &row.subnets,
         );
         // …and the group the refused modification addressed still holds what it held.
         let read_back = expect_ok(row.case, network.account.describe_group(BASE).await);
@@ -292,35 +291,34 @@ async fn the_subnets_of_a_group_are_subnets_of_one_vpc() {
     }
 
     // The group a modification addresses is in ONE VPC, and the rows differ along how many
-    // of the named subnets are outside it and where they sit in the list.
+    // of the named subnets are outside it and where they sit in the list. The refusal names
+    // the list the request asked about, as it does for an identifier the account holds no
+    // subnet for.
     const BASE: &str = "emu-subnet-vpc-base";
     expect_ok(
         "a group over subnets of one VPC",
         network.account.create_group(BASE, &held).await,
     );
-    let rows: [(&str, Vec<String>, Vec<&str>); 3] = [
+    let rows: [(&str, Vec<String>); 3] = [
         (
             "a modification to the subnets of the other VPC",
             vec![other[0].clone(), other[1].clone()],
-            vec![other[0].as_str(), other[1].as_str()],
         ),
         (
             "a modification keeping one subnet and taking one from the other VPC",
             vec![held[0].clone(), other[1].clone()],
-            vec![other[1].as_str()],
         ),
         (
             "the same list in the other order",
             vec![other[0].clone(), held[1].clone()],
-            vec![other[0].as_str()],
         ),
     ];
-    for (case, subnets, invalid) in rows {
+    for (case, subnets) in rows {
         assert_refused(
             case,
             "ModifyDBSubnetGroup",
             network.account.modify_group(BASE, &subnets).await,
-            &invalid,
+            &subnets,
         );
         let read_back = expect_ok(case, network.account.describe_group(BASE).await);
         assert_eq!(

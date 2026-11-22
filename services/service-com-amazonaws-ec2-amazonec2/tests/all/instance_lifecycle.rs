@@ -1928,8 +1928,8 @@ async fn an_explicit_private_address_is_used_once_and_then_refused() {
 async fn placement_must_name_a_zone_the_region_has() {
     let ec2 = Ec2::new();
     // The Region's zones, by the naming rule `state::availability_zones_in_region`
-    // owns: `<region>` plus a letter from `a`, one per zone.
-    for zone in ["us-west-2a", "us-west-2b", "us-west-2c"] {
+    // owns: `<region>` plus each letter that Region publishes. us-west-2 publishes four.
+    for zone in ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"] {
         let instance_id = launch_one(&ec2, vec![p("Placement.AvailabilityZone", zone)]).await;
         assert_eq!(
             describe_one(&ec2, &instance_id).await.availability_zone.as_deref(),
@@ -1938,7 +1938,9 @@ async fn placement_must_name_a_zone_the_region_has() {
         );
     }
 
-    for zone in ["us-west-2d", "eu-north-1a", "not-a-zone"] {
+    // A letter past the Region's published zones, a zone of ANOTHER Region, and a value
+    // that is no zone name at all.
+    for zone in ["us-west-2z", "eu-north-1a", "not-a-zone"] {
         let answer = ec2
             .call(
                 "RunInstances",

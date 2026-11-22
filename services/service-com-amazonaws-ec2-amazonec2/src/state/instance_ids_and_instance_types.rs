@@ -1120,18 +1120,22 @@ impl AvailabilityZoneRecord {
 
 /// The Availability Zones Region `region` has.
 ///
-/// Zone `n` (counting from 1) is named `<region><letter>` with the letters running
-/// from `a` — `us-east-1a` — and carries the zone id `<prefix>-az<n>` built from
-/// [`zone_id_prefix`]; both forms are the ones the operation's `Filters` doc gives
-/// for the `zone-name` and `zone-id` filters. Every zone is an
+/// The zones a Region exposes are the ones AWS publishes for it, read off the one table this
+/// tree keeps them in (`service_common::aws_availability_zones`): most Regions expose three,
+/// several expose more, and a Region's zone letters are not always the first letters of the
+/// alphabet. Zone `n` (counting from 1) is named `<region><letter>` with that Region's `n`th
+/// published letter — `us-east-1a`, `ap-northeast-1c` — and carries the zone id
+/// `<prefix>-az<n>` built from [`zone_id_prefix`]; both forms are the ones the operation's
+/// `Filters` doc gives for the `zone-name` and `zone-id` filters. Every zone is an
 /// `availability-zone`, which is `opt-in-not-required`, so it is reported whether or
 /// not the request sets `AllAvailabilityZones`.
 pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord> {
     let prefix = zone_id_prefix(region);
     let display = region_display(region);
-    (0..AVAILABILITY_ZONES_PER_REGION)
-        .map(|index| {
-            let letter = char::from(b'a' + u8::try_from(index).unwrap_or(0));
+    ::service_common::aws_availability_zones::zone_letters(region)
+        .iter()
+        .enumerate()
+        .map(|(index, letter)| {
             // The zone group a Region's standard zones belong to, named the way every
             // report of one names it (`service_common::aws_availability_zones`).
             let group_name = ::service_common::aws_availability_zones::zone_group(region);

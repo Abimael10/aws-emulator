@@ -12,10 +12,11 @@
 //!   answer — "DB subnet group '<name>' does not exist." — whichever engine's cluster the
 //!   create was placing in it;
 //! * an identifier outside the identifier rule is refused in the wording its MEMBER carries
-//!   — the subject wording this front door answers for a DB cluster's identifier, whichever
-//!   clause the value broke, and for a DB instance's where the value is no identifier TOKEN
-//!   of that member at all — whichever control plane's engine the request's `Engine` names,
-//!   because one front door answers them all;
+//!   — the subject wording this front door answers for a DB cluster's identifier drawn from
+//!   the identifier alphabet, whichever clause it broke, and for a DB instance's where the
+//!   value is no identifier TOKEN of that member at all, against the sentence that states
+//!   the whole rule for the clause each member states it for — whichever control plane's
+//!   engine the request's `Engine` names, because one front door answers them all;
 //! * a Multi-AZ DB cluster whose named DB subnet group covers fewer than three Availability
 //!   Zones is the modelled 400 `InvalidVPCNetworkStateFault`, and its message names the
 //!   zones of the Region that group does not cover yet — read off the group's stored
@@ -207,9 +208,10 @@ const ENGINE_WORDINGS: &[EngineWording] = &[
     },
 ];
 
-/// The identifier-rule refusal a DB INSTANCE identifier that is a token of its member's
-/// shape and breaks one of the two hyphen rules answers with: it names the request member
-/// at fault and states the whole rule, echoing nothing the request carried.
+/// The identifier-rule refusal a member states where the value broke the clause that member
+/// states the rule for — the ALPHABET for a DB cluster's identifier, one of the two hyphen
+/// rules for a DB instance's: it names the request member at fault and states the whole
+/// rule, echoing nothing the request carried.
 fn states_the_rule(member: &str) -> String {
     format!(
         "The parameter {member} is not a valid identifier. Identifiers must begin with a \
@@ -225,18 +227,21 @@ async fn an_identifier_refusal_is_worded_by_the_member_it_names() {
     // Values spanning the clauses of the identifier rule: a leading digit, a character
     // outside the alphabet, a trailing hyphen, two consecutive hyphens and one past the
     // length its own member bounds. The DB CLUSTER identifier answers its subject for every
-    // one of them.
+    // value DRAWN FROM the identifier alphabet, whichever clause it broke; a value carrying a
+    // character the alphabet excludes is the one case it states the rule for instead, since
+    // the alphabet is the clause the front door states rather than names a subject for.
     let too_long = format!("e{}", "a".repeat(64));
-    let values: [(&str, &str); 5] = [
-        ("a leading digit", "1emu-wording-cl"),
-        ("a character outside the alphabet", "emu_wording_cl"),
-        ("a trailing hyphen", "emu-wording-cl-"),
-        ("two consecutive hyphens", "emu--wording-cl"),
-        ("one character past the length bound", too_long.as_str()),
+    let values: [(&str, &str, bool); 6] = [
+        ("a leading digit", "1emu-wording-cl", true),
+        ("a character outside the alphabet", "emu_wording_cl", false),
+        ("a multi-byte character", "emu-wording-clé", false),
+        ("a trailing hyphen", "emu-wording-cl-", true),
+        ("two consecutive hyphens", "emu--wording-cl", true),
+        ("one character past the length bound", too_long.as_str(), true),
     ];
 
     for row in ENGINE_WORDINGS {
-        for (value_case, value) in values {
+        for (value_case, value, from_the_alphabet) in values {
             let case = format!("{}, {value_case}", row.case);
             let body = expect_error(
                 &case,
@@ -250,8 +255,12 @@ async fn an_identifier_refusal_is_worded_by_the_member_it_names() {
                 "InvalidParameterValue",
             );
             let message = text(&body, "Message");
-            // The two spaces after the colon are part of that wording.
-            let expected = format!("Invalid {}:  {value}", row.subject);
+            let expected = if from_the_alphabet {
+                // The two spaces after the colon are part of that wording.
+                format!("Invalid {}:  {value}", row.subject)
+            } else {
+                states_the_rule("DBClusterIdentifier")
+            };
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"

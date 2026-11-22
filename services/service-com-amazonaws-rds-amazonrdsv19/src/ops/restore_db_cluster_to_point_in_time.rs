@@ -1015,7 +1015,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The zones the source cluster spans, since this operation names none of its own,
             // and the zones RDS picks for a cluster whose source recorded none.
             availability_zones: if source.availability_zones.is_empty() {
-                crate::state::region_availability_zones(&region)
+                crate::state::cluster_placement_zones(&region)
             } else {
                 source.availability_zones.clone()
             },

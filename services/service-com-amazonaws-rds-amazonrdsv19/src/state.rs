@@ -3237,16 +3237,19 @@ pub fn check_db_subnet_group_subnet_list(
 ///
 /// A hop the owner of subnets never answered refuses nothing: the identifiers are then
 /// unknown rather than absent (see [`SubnetZones::absent`]).
+///
+/// The refusal names the request's WHOLE list rather than the absent subset
+/// ([`invalid_subnets_message`]): the sentence says that SOME of the subnets it was asked
+/// about are invalid.
 pub fn check_db_subnet_group_subnets_exist(
     subnet_ids: &[String],
     zones: &SubnetZones,
 ) -> Result<(), SubnetListRejection> {
-    let absent = zones.absent(subnet_ids);
-    if absent.is_empty() {
+    if zones.absent(subnet_ids).is_empty() {
         return Ok(());
     }
     Err(SubnetListRejection::UnusableSubnets(
-        invalid_subnets_message(&absent),
+        invalid_subnets_message(subnet_ids),
     ))
 }
 
@@ -3291,19 +3294,19 @@ pub fn subnets_in_different_vpcs_message(first_vpc_id: &str, second_vpc_id: &str
 ///
 /// A DB subnet group belongs to the VPC its subnets are in, and a modification changes which
 /// subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC is not one this
-/// group can be made of, so it is reported invalid the way an identifier the account holds no
-/// subnet for is ([`invalid_subnets_message`]).
+/// group can be made of, so it is reported the way an identifier the account holds no
+/// subnet for is — one sentence naming the whole list the request asked about
+/// ([`invalid_subnets_message`]).
 pub fn check_db_subnet_group_subnets_in_vpc(
     subnet_ids: &[String],
     zones: &SubnetZones,
     vpc_id: &str,
 ) -> Result<(), SubnetListRejection> {
-    let outside = zones.outside_vpc(subnet_ids, vpc_id);
-    if outside.is_empty() {
+    if zones.outside_vpc(subnet_ids, vpc_id).is_empty() {
         return Ok(());
     }
     Err(SubnetListRejection::UnusableSubnets(
-        invalid_subnets_message(&outside),
+        invalid_subnets_message(subnet_ids),
     ))
 }
 
@@ -3795,21 +3798,36 @@ pub fn default_security_group_id(region: &str) -> String {
 /// (`vpc-0a1b2c3d4e5f60718`, `sg-0a1b2c3d4e5f60718`).
 const EC2_ID_WIDTH: usize = 17;
 
-/// How AWS names the Availability Zones of a region: the region's name and a letter.
-pub const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
-
 /// The Availability Zones of `region`, in the order the region publishes them.
 ///
-/// The zones a Region HAS, which is what a cluster reports as the zones it spans and what a
-/// refusal names as the zones a DB subnet group does not cover yet. Which of them a given
-/// SUBNET lies in is a different question, and not one this service answers: that is read
-/// off the subnet's own record in the service that owns subnets
-/// ([`crate::state::subnet_zones`]).
+/// The zones a Region HAS: the names AWS publishes for that Region, read off the one table
+/// this tree keeps them in (`::service_common::aws_availability_zones`), so a Region that
+/// exposes four or six zones answers four or six and not a fixed three. That is what a
+/// refusal names as the zones a DB subnet group does not cover YET — the zones a caller can
+/// add a subnet in — and the zones a standby may be placed in.
+///
+/// How many of them ONE DB cluster is placed across is a different question
+/// ([`cluster_placement_zones`]), and which of them a given SUBNET lies in is not one this
+/// service answers at all: that is read off the subnet's own record in the service that owns
+/// subnets ([`crate::state::subnet_zones`]).
 pub fn region_availability_zones(region: &str) -> Vec<String> {
-    AVAILABILITY_ZONE_SUFFIXES
-        .iter()
-        .map(|suffix| format!("{region}{suffix}"))
-        .collect()
+    ::service_common::aws_availability_zones::availability_zones(region)
+}
+
+/// How many Availability Zones a DB cluster whose request named none is placed across.
+///
+/// `CreateDBCluster` places "a writer and two reader DB instances … each in a different
+/// Availability Zone", so a cluster spans THREE zones however many the Region exposes —
+/// which is why the placement is a prefix of [`region_availability_zones`] and not the whole
+/// list.
+pub const CLUSTER_PLACEMENT_ZONE_COUNT: usize = 3;
+
+/// The Availability Zones a DB cluster in `region` whose request named none is placed
+/// across: the first [`CLUSTER_PLACEMENT_ZONE_COUNT`] zones the Region publishes.
+pub fn cluster_placement_zones(region: &str) -> Vec<String> {
+    let mut zones = region_availability_zones(region);
+    zones.truncate(CLUSTER_PLACEMENT_ZONE_COUNT);
+    zones
 }
 
 /// The network types a DB subnet group of this service supports.
@@ -4250,6 +4268,16 @@ enum IdentifierWording {
     /// it at all; a token of that shape which still breaks one of the two HYPHEN rules is
     /// refused with the sentence pair instead.
     SubjectForAValueThatIsNoToken(&'static str),
+    /// This member is refused by its subject only where the value is drawn from the
+    /// identifier ALPHABET ([`is_drawn_from_the_identifier_alphabet`]) — so a leading digit,
+    /// a trailing hyphen, two consecutive hyphens and a value past the member's bound all
+    /// answer the subject — while a value carrying a character that alphabet excludes is
+    /// refused with the sentence pair instead.
+    ///
+    /// The split applies to a value a request OFFERS as an identifier to be stored
+    /// ([`check_identifier`]), not to a REFERENCE being resolved
+    /// ([`check_identifier_reference`]), which keeps the subject for every clause.
+    SubjectForAValueFromTheAlphabet(&'static str),
     /// This member is refused with the sentence pair whichever clause the value broke.
     TheRule,
 }
@@ -4265,10 +4293,12 @@ fn identifier_wording(member: &str) -> IdentifierWording {
             IdentifierWording::SubjectForAValueThatIsNoToken("database identifier")
         }
         // The identifier of a DB cluster, which RDS words by its own subject rather than
-        // by the DB instance's — the two refusals differ in that one word — and words that
-        // way for every clause, including the ones the instance path states the rule for.
+        // by the DB instance's — the two refusals differ in that one word — for every clause
+        // a value drawn from the identifier alphabet can break, including the ones the
+        // instance path states the rule for. A value carrying a character the alphabet
+        // excludes is the one clause it answers with the rule instead.
         "DBClusterIdentifier" | "NewDBClusterIdentifier" => {
-            IdentifierWording::Subject("database cluster identifier")
+            IdentifierWording::SubjectForAValueFromTheAlphabet("database cluster identifier")
         }
         // The name of a DB SUBNET group, which RDS words by its own subject — the one it
         // calls that member by, which names neither the resource type's `DB` nor the member
@@ -4326,9 +4356,14 @@ pub const MAX_GLOBAL_CLUSTER_IDENTIFIER_LEN: usize = 63;
 /// hyphens. First character must be a letter. Can't end with a hyphen or contain two
 /// consecutive hyphens."
 ///
-/// Returns the message to refuse the request with: the MEMBER, and for one member the
-/// CLAUSE the value broke, settle which of the two wordings Amazon RDS answers with (see
-/// [`IdentifierWording`]).
+/// Returns the message to refuse the request with: the MEMBER, and for the members that
+/// split them the CLAUSE the value broke, settle which of the two wordings Amazon RDS
+/// answers with (see [`IdentifierWording`]).
+///
+/// This is the gate for a value a request OFFERS as the identifier of a resource it creates,
+/// copies, restores or renames. A REFERENCE being resolved — the identifier a request names
+/// an EXISTING resource by — goes through [`check_identifier_reference`], which words every
+/// clause by the member's subject.
 ///
 /// The wording is the MEMBER's and the CLAUSE's, not the engine's: the same member is
 /// refused the same way whichever control plane's engine the request named, which is what
@@ -4341,7 +4376,44 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
     if identifier_is_well_formed(value, max_len) {
         return Ok(());
     }
+    Err(offered_identifier_refusal_message(member, value, max_len))
+}
+
+/// Refuse a REFERENCE that is no identifier of its member at all: the value a request names
+/// an EXISTING resource by, as opposed to one it offers to be stored ([`check_identifier`]).
+///
+/// The grammar is the same walk ([`identifier_is_well_formed`]); what differs is the
+/// WORDING, because a reference gate's recorded answers carry the member's subject for every
+/// clause — a character the identifier alphabet excludes included — where the value a create
+/// offers is held to the alphabet by the front door's own statement of the rule
+/// ([`IdentifierWording::SubjectForAValueFromTheAlphabet`]).
+pub fn check_identifier_reference(
+    member: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), String> {
+    if identifier_is_well_formed(value, max_len) {
+        return Ok(());
+    }
     Err(identifier_refusal_message(member, value, max_len))
+}
+
+/// The message a value a request OFFERS as an identifier is refused with: the member's own
+/// wording ([`identifier_refusal_message`]), except where that member answers the sentence
+/// pair for a value carrying a character the identifier alphabet excludes.
+///
+/// A member whose wording splits on the alphabet states the whole rule there — the sentence
+/// that names the member and echoes nothing — because the alphabet is the one clause the
+/// front door states rather than names a subject for.
+fn offered_identifier_refusal_message(member: &str, value: &str, max_len: usize) -> String {
+    match identifier_wording(member) {
+        IdentifierWording::SubjectForAValueFromTheAlphabet(_)
+            if !is_drawn_from_the_identifier_alphabet(value) =>
+        {
+            not_a_valid_identifier_message(member)
+        }
+        _ => identifier_refusal_message(member, value, max_len),
+    }
 }
 
 /// The message a value outside its identifier member's rule is refused with: the wording
@@ -4354,7 +4426,10 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
 /// this one place, so no two of them can disagree about what a member is called.
 fn identifier_refusal_message(member: &str, value: &str, max_len: usize) -> String {
     match identifier_wording(member) {
-        IdentifierWording::Subject(subject) => format!("Invalid {subject}:  {value}"),
+        IdentifierWording::Subject(subject)
+        | IdentifierWording::SubjectForAValueFromTheAlphabet(subject) => {
+            format!("Invalid {subject}:  {value}")
+        }
         IdentifierWording::SubjectForAValueThatIsNoToken(subject)
             if !is_an_identifier_token(value, max_len) =>
         {
@@ -4440,8 +4515,18 @@ fn db_subnet_group_name_is_well_formed(value: &str) -> bool {
 /// which a value of this shape can still break.
 fn is_an_identifier_token(value: &str, max_len: usize) -> bool {
     value.starts_with(|c: char| c.is_ascii_alphabetic())
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && is_drawn_from_the_identifier_alphabet(value)
         && value.chars().count() <= max_len
+}
+
+/// Whether every character of `value` is one an identifier of this front door is WRITTEN IN:
+/// the ASCII letters, the digits and the hyphen, the alphabet every identifier member states
+/// ("must contain only ASCII letters, digits, and hyphens").
+///
+/// A value with no characters at all is drawn from no alphabet: there is nothing in it to be
+/// inside or outside this one.
+fn is_drawn_from_the_identifier_alphabet(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// The constraint walk behind [`check_identifier`]: whether `value` satisfies every clause
