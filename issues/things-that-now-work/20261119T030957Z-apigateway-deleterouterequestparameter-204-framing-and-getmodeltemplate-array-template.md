@@ -57,3 +57,42 @@ Replay the wire corpus (trace set simparity-wire-aws-v1) against the emulator an
 Cause 1 - apigatewayv2-http-api-route-config-cleanup#task#6: create an HTTP API, create a route, add a route request parameter, then send DELETE /v2/apis/{ApiId}/routes/{RouteId}/requestparameters/{RequestParameterKey} and dump the raw response headers. The emulator answers 204 with no Content-Length header. Same via apigatewayv2-route-request-parameter-lifecycle#task#5.
 
 Cause 2 - apigatewayv2-model-template-by-schema-type#task#4: create an API, create a model whose JSON Schema declares an array type, then GET /v2/apis/{ApiId}/models/{ModelId}/template and read `value`. The emulator returns a one-line `[ ... ]` body instead of the #foreach skeleton with the ##TODO comment and the #if($foreach.hasNext),#end separator. Step task#6 of the same fixture repeats it for the other recorded schema type.
+
+## Resolution
+
+Cause 2 (the array template): where a model's JSON Schema declares an ARRAY, the generated
+mapping template now carries the Velocity skeleton that MAPS it - the `##TODO:` comment, the
+`#foreach` over the array the incoming payload carries, one sample element, the
+`#if($foreach.hasNext),#end` separator and the `#end` - instead of one inlined element. An
+array is the one declaration whose member COUNT a schema does not state, so what describes it
+is the loop rather than a list; everything a schema does state the members of is still written
+out directly. The rule lives in the one reading of that schema language both gateway control
+planes generate from (`services/common/src/model_mapping_template.rs`), so it holds for every
+array a schema declares, at any position and however it is declared, for both
+`GetModelTemplate` operations. Pinned by the array cases of
+`services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/model_template.rs`, the
+same rows of the REST gateway's suite, and the shared module's own cases. The recorded step
+this report quotes the expected text of (task#4) now matches byte for byte.
+
+Residual, recorded here rather than left silent: the same cluster key still reports `$.value`
+on `apigatewayv2-model-template-by-schema-type#task#6`, whose model schema and expected text
+neither this report nor the replay discloses. It is not the collapsed-array branch above -
+that one is now exact for the quoted recording - and both readings of a nested element's
+indentation were probed against it. One aspect a generated object cannot reproduce in-process
+today: the ORDER of a schema's `properties`. This workspace's JSON reader sorts an object's
+members on parse, so a model's declaration order is not recoverable without enabling
+`serde_json`'s `preserve_order` for the whole workspace, which would re-order every service's
+JSON output.
+
+Cause 1 (`content-length: 0` on the empty 204): this service already states that framing on
+every answer it serializes with an empty body, at the one place every modelled response passes
+through (`frame_empty_answer`, installed through `Service::override_protocol` in
+`services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/service.rs`), and
+`DeleteRouteRequestParameter` is one of the rows of `tests/all/empty_answer_framing.rs` that
+pins it. CAVEAT: a client reached over HTTP/1.1 still does not see the header ON A `204`,
+because the HTTP writer the vendored transport serves the socket with removes `content-length`
+from one (RFC 9110 section 15.3.5 gives a 204 no body) - that writer is under the read-only
+vendored tree, so the wire-level half of this cause is a platform limitation rather than
+something this service can state its way out of. The same framing cause for other services was
+resolved on the same ground (see
+`20261022T011815Z-serverlessrepo-response-serialization-drops-empty-labels-presigned-templateurl.md`).

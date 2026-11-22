@@ -7,15 +7,18 @@
 //! an EXAMPLE of the payload the model's JSON Schema declares**, in which every declared
 //! property carries a value of the JSON type the schema declares for it (a `string` an
 //! example string, an `integer` an integer, a `number` a fractional number, a `boolean` a
-//! boolean, an `object` an object of its own declared properties, an `array` one example
-//! element), and where the schema itself states the value (an `enum` entry, a `default`)
-//! that value is the example. The generation is a function of the STORED record, so it
-//! reads the store and writes nothing: two calls on an unchanged model answer the same
-//! template and the model survives them. A model the API does not hold is the modelled 404;
-//! a model that declares no JSON Schema to describe, one whose schema declares a SCALAR data
-//! type at its root — which has no members for a template to map, so API Gateway names that
-//! data type as one it generates no template for — and one whose schema does not fit the
-//! bounds a template is generated within, are the modelled 400.
+//! boolean, an `object` an object of its own declared properties), and where the schema
+//! itself states the value (an `enum` entry, a `default`) that value is the example. A
+//! declared ARRAY is the one value whose members the schema does not state — how many
+//! elements it has is the incoming payload's to say — so what is generated for it is the
+//! Velocity LOOP that maps it, around one example element. The generation is a function of
+//! the STORED record, so it reads the store and writes nothing: two calls on an unchanged
+//! model answer the same template and the model survives them. A model the API does not
+//! hold is the modelled 404; a model that declares no JSON Schema to describe, one whose
+//! schema declares a SCALAR data type at its root — which has no members for a template to
+//! map, so API Gateway names that data type as one it generates no template for — and one
+//! whose schema does not fit the bounds a template is generated within, are the modelled
+//! 400.
 //!
 //! The rows vary what the rule generalises over: the JSON type the schema declares
 //! (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`, a union of types,
@@ -62,6 +65,40 @@ fn template(body: &str) -> String {
     format!("{PREAMBLE}\n{body}")
 }
 
+/// The comment every generated loop is preceded by — the instruction to point it at the
+/// array the incoming payload carries — which is also how a case tells a template that maps
+/// an array from one that writes its members out directly, and the marker a caller greps
+/// for to find the one spot a generated template has to be edited at.
+const FOREACH_TODO: &str = "##TODO: Update this foreach loop to reference array from input json";
+
+/// The loop a generated template iterates the mapped array with.
+const FOREACH_OPEN: &str = "#foreach($elem in $inputRoot.TODO)";
+
+/// What that loop writes BETWEEN elements and not after the last one: the mapped array is
+/// JSON, whose elements are comma-separated.
+const FOREACH_SEPARATOR: &str = "#if($foreach.hasNext),#end";
+
+/// The directive that closes a Velocity block.
+const BLOCK_END: &str = "#end";
+
+/// The template an array whose element renders as `element` is generated as: the loop that
+/// maps the array the incoming payload carries, around one example element. An array is the
+/// one declaration whose member COUNT the schema does not state, so what describes it is the
+/// loop rather than a list of examples. Spelled exactly as the sibling gateway's suite
+/// spells it, so a formatting change cannot pass one suite and fail the other.
+fn array_loop(element: &str) -> String {
+    [
+        "[".to_string(),
+        FOREACH_TODO.to_string(),
+        FOREACH_OPEN.to_string(),
+        format!(" {element} "),
+        FOREACH_SEPARATOR.to_string(),
+        BLOCK_END.to_string(),
+        "]".to_string(),
+    ]
+    .join("\n")
+}
+
 /// `GetModelTemplate` for the model `name` of `api`.
 async fn get_model_template(gateway: &Gateway, api: &str, name: &str) -> Answer {
     gateway
@@ -90,7 +127,8 @@ async fn generated_template(gateway: &Gateway, api: &str, name: &str, case: &str
 }
 
 /// The generated template's body — everything after the preamble — parsed as the JSON
-/// document the sample payload is.
+/// document the example payload is. Only a template that maps no array is one: a loop is
+/// Velocity, not JSON.
 fn parsed_sample(value: &str, case: &str) -> Value {
     let body = value
         .split_once('\n')
@@ -202,19 +240,15 @@ fn rows() -> Vec<Row> {
                     }
                 }
             }),
-            expected_body: [
-                "[ {",
-                "  \"class\" : \"foo\",",
-                "  \"number\" : 0",
-                "} ]",
-            ]
-            .join("\n"),
+            expected_body: array_loop(
+                &["{", "  \"class\" : \"foo\",", "  \"number\" : 0", "}"].join("\n"),
+            ),
         },
         Row {
             case: "an array of strings",
             content_type: "application/json",
             schema: json!({ "type": "array", "items": { "type": "string" } }),
-            expected_body: "[ \"foo\" ]".to_string(),
+            expected_body: array_loop("\"foo\""),
         },
         Row {
             case: "an array of arrays",
@@ -223,7 +257,7 @@ fn rows() -> Vec<Row> {
                 "type": "array",
                 "items": { "type": "array", "items": { "type": "integer" } }
             }),
-            expected_body: "[ [ 0 ] ]".to_string(),
+            expected_body: array_loop(&array_loop("0")),
         },
         Row {
             case: "an array declaring no items, whose elements are unconstrained",
@@ -247,11 +281,12 @@ fn rows() -> Vec<Row> {
                 }
             }),
             expected_body: [
-                "{",
-                "  \"items\" : [ {",
-                "    \"sku\" : \"foo\"",
-                "  } ]",
-                "}",
+                "{".to_string(),
+                format!(
+                    "  \"items\" : {}",
+                    array_loop(&["{", "    \"sku\" : \"foo\"", "  }"].join("\n"))
+                ),
+                "}".to_string(),
             ]
             .join("\n"),
         },
@@ -342,7 +377,7 @@ fn rows() -> Vec<Row> {
             case: "an array typed only by declaring items",
             content_type: "application/json",
             schema: json!({ "items": { "type": "number" } }),
-            expected_body: "[ 0.0 ]".to_string(),
+            expected_body: array_loop("0.0"),
         },
         Row {
             // A value the schema declares nothing about is rendered as the JSON value that
@@ -485,8 +520,11 @@ async fn get_model_template_generates_the_sample_the_models_schema_declares() {
             value.starts_with(PREAMBLE),
             "case {case:?}: expected the template to open with {PREAMBLE:?}, got {value:?}"
         );
-        // Whatever the schema declares, the generated sample is a JSON document.
-        parsed_sample(&value, case);
+        // A template that maps no array writes its members out directly, so its body is a
+        // JSON document; one that maps an array carries the Velocity loop instead.
+        if !expected.contains(FOREACH_TODO) {
+            parsed_sample(&value, case);
+        }
     }
 }
 
@@ -496,8 +534,10 @@ async fn every_example_carries_the_json_type_its_schema_declares() {
     let (api, _root) = create_api(&gateway, "model-template-types").await;
 
     // One property per declared type, each checked against what the parsed sample must
-    // carry for it. The rows span every type a JSON Schema can declare for a value, plus
-    // the two forms that state a value outright.
+    // carry for it. The rows span every type a JSON Schema can declare a VALUE of, plus
+    // the two forms that state a value outright. The remaining declared type, an `array`,
+    // generates the loop that maps it rather than a value, so it is no member of this JSON
+    // document — the first table's array rows are where that is asserted.
     #[allow(clippy::type_complexity)]
     let rows: Vec<(&str, Value, fn(&Value) -> bool)> = vec![
         ("a string", json!({ "type": "string" }), |value| value.is_string()),
@@ -511,11 +551,6 @@ async fn every_example_carries_the_json_type_its_schema_declares() {
             "an object",
             json!({ "type": "object", "properties": { "inner": { "type": "string" } } }),
             |value| value.is_object(),
-        ),
-        (
-            "an array",
-            json!({ "type": "array", "items": { "type": "integer" } }),
-            |value| value.is_array(),
         ),
         ("an integer enum", json!({ "enum": [7, 8] }), |value| value.is_i64()),
         (
@@ -597,11 +632,12 @@ async fn a_generated_sample_resolves_the_model_references_the_schema_carries() {
                 }
             }),
             [
-                "{",
-                "  \"legs\" : [ {",
-                "    \"length\" : 0.0",
-                "  } ]",
-                "}",
+                "{".to_string(),
+                format!(
+                    "  \"legs\" : {}",
+                    array_loop(&["{", "    \"length\" : 0.0", "  }"].join("\n"))
+                ),
+                "}".to_string(),
             ]
             .join("\n"),
         ),

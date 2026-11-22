@@ -13,10 +13,17 @@
 //! [`generate_sample_payload`] is what each of them generates from that reading: the
 //! preamble followed by a SAMPLE PAYLOAD in the structure the schema declares, in which
 //! every declared property carries an example value of the type declared FOR THAT PROPERTY,
-//! so the generated document is itself JSON and illustrates each property's declared type.
-//! That is what the recorded calls of both control planes answer — a template whose body
-//! parses as JSON and whose example for an `integer` property is an integer — so the one
-//! rendering is stated here rather than once per service.
+//! so the generated document illustrates each property's declared type. That is what the
+//! recorded calls of both control planes answer — a template whose example for an `integer`
+//! property is an integer — so the one rendering is stated here rather than once per
+//! service.
+//!
+//! A generated document is a TEMPLATE and not itself a payload, so where the schema declares
+//! a value whose members a template cannot write out one by one — an ARRAY, whose element
+//! count is the incoming payload's and not the schema's — what is generated is the Velocity
+//! SKELETON that maps it: the loop over the array the payload carries, the example of one
+//! element inside it, and the comma the loop writes between elements. Everything a schema
+//! does state the members of is written out directly.
 //!
 //! It is a PURE function of the document — the same schema generates the same text, and
 //! nothing is read or written beside it — and it is bounded in descent ([`MAX_DEPTH`]),
@@ -40,6 +47,29 @@ const INPUT_ROOT: &str = "$inputRoot";
 
 /// One indentation step of a generated document's nested lines.
 const INDENT: &str = "  ";
+
+/// The loop variable a generated `#foreach` binds each element of the mapped array to.
+const FOREACH_ELEMENT: &str = "$elem";
+
+/// What a generated loop iterates: a member of the incoming payload the CALLER has to name,
+/// because the schema declares the elements of an array and not where in the payload that
+/// array sits. It is left as a placeholder member of [`INPUT_ROOT`], which is what
+/// [`FOREACH_TODO`] tells the caller to replace.
+const FOREACH_SOURCE_MEMBER: &str = "TODO";
+
+/// The comment a generated loop is preceded by: the instruction to point the loop at the
+/// array the incoming payload carries. A Velocity line comment (`##`), so it is none of the
+/// body the template writes, and the marker a caller greps for to find the one spot a
+/// generated template has to be edited at.
+const FOREACH_TODO: &str = "##TODO: Update this foreach loop to reference array from input json";
+
+/// The separator a generated loop writes BETWEEN elements and not after the last one: the
+/// array it maps is JSON, whose elements are comma-separated, and how many of them there are
+/// is the incoming payload's to say.
+const FOREACH_SEPARATOR: &str = "#if($foreach.hasNext),#end";
+
+/// The directive that closes a Velocity block.
+const BLOCK_END: &str = "#end";
 
 /// The example value a declared `string` carries in a generated sample payload: the
 /// placeholder string the gateway fills a string leaf with, which a caller replaces with a
@@ -161,9 +191,12 @@ impl Writer {
 ///
 /// Every declared property carries a value of the JSON type the schema declares for it — a
 /// `string` an example string, an `integer` an integer, a `number` a fractional number, a
-/// `boolean` a boolean, an `object` an object of its own declared properties and an `array`
-/// one example element — so the generated document is an example of the structure a caller
-/// is mapping a payload onto. A schema COMPOSED of subschemas (`allOf`, `anyOf`, `oneOf`)
+/// `boolean` a boolean, an `object` an object of its own declared properties — so the
+/// generated document is an example of the structure a caller is mapping a payload onto. An
+/// `array`, whose element COUNT the schema does not state, is generated as the Velocity loop
+/// that maps it: the `#foreach` over the array the incoming payload carries, one example
+/// element inside it, and the comma the loop writes between elements (see
+/// [`render_sample_array`]). A schema COMPOSED of subschemas (`allOf`, `anyOf`, `oneOf`)
 /// is read through them, so the example describes what the instance must satisfy and not
 /// only the keywords the outer schema carries itself. Where the schema itself states a
 /// value (an `enum`'s first entry, a `default`), THAT value is the example, because the
@@ -533,12 +566,21 @@ fn render_sample_object(
     writer.push("}")
 }
 
-/// Render an example array: ONE example element, which is what the `items` schema declares
-/// every element to look like.
+/// Render an example array: the Velocity LOOP that maps it, around one example element.
+///
+/// An array is the one declaration whose members the schema does not state: how many
+/// elements the mapped array has is the incoming payload's to say, so what describes it is
+/// not a list of examples but the loop that writes one per element — the [`FOREACH_TODO`]
+/// comment naming what the caller has to point the loop at, the `#foreach` over that array,
+/// the example of ONE element (which is what the `items` schema declares every element to
+/// look like), the [`FOREACH_SEPARATOR`] that commas them, and the `#end` that closes the
+/// loop. The brackets around it are the array's own, so a generated loop sits exactly where
+/// the array it maps does.
 ///
 /// `items` may be a single schema (every element) or, in draft-04, a tuple of schemas
 /// (section 5.3.1), of which the first describes the element rendered here. An array
-/// declaring no `items` constrains no element, so the example is empty.
+/// declaring no `items` constrains no element, so there is no element expression to loop
+/// over and the example is the empty array.
 fn render_sample_array(
     root: &::serde_json::Value,
     declared: &[&::serde_json::Value],
@@ -549,9 +591,20 @@ fn render_sample_array(
     let Some(items) = declared.iter().find_map(|source| declared_items(source)) else {
         return writer.push("[ ]");
     };
-    writer.push("[ ")?;
+    // Written as the two halves of the skeleton around the element, so the exact lines and
+    // the spacing the generated document carries are readable in one place.
+    writer.push(&format!(
+        "[\n\
+         {FOREACH_TODO}\n\
+         #foreach({FOREACH_ELEMENT} in {INPUT_ROOT}.{FOREACH_SOURCE_MEMBER})\n "
+    ))?;
     render_sample(root, items, indent, depth + 1, writer)?;
-    writer.push(" ]")
+    writer.push(&format!(
+        " \n\
+         {FOREACH_SEPARATOR}\n\
+         {BLOCK_END}\n\
+         ]"
+    ))
 }
 
 /// The schema a `$ref` names, when it resolves inside this document.
@@ -706,6 +759,139 @@ fn compact(value: &::serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lines a generated loop carries, written out here rather than read from the
+    /// constants above: a case that re-asserted the module's own literal would pass however
+    /// that literal changed, and what these pin is the recorded text.
+    const LOOP_COMMENT: &str = "##TODO: Update this foreach loop to reference array from input json";
+    const LOOP_OPEN: &str = "#foreach($elem in $inputRoot.TODO)";
+    const LOOP_SEPARATOR: &str = "#if($foreach.hasNext),#end";
+    const LOOP_CLOSE: &str = "#end";
+
+    /// Every array a generated document carries, WHEREVER the schema declares it, is the
+    /// loop that maps it rather than a collapsed list of one example.
+    #[test]
+    fn an_array_is_generated_as_the_loop_that_maps_it() {
+        // The rows span where the array sits and how it is declared: at the document's
+        // root, as a property of an object, nested inside another array, with its elements
+        // declared inline, as a tuple (draft-04 section 5.3.1), through a reference
+        // (section 7), by a union naming the array type (section 5.5.2), and by `items`
+        // alone (section 5.3.1).
+        let rows: &[(&str, ::serde_json::Value)] = &[
+            (
+                "a root array of strings",
+                ::serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "a root array of objects",
+                ::serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "object", "properties": { "id": { "type": "string" } } }
+                }),
+            ),
+            (
+                "an array declared as a property of an object",
+                ::serde_json::json!({
+                    "type": "object",
+                    "properties": { "lines": { "type": "array", "items": { "type": "integer" } } }
+                }),
+            ),
+            (
+                "an array whose items are declared as a tuple",
+                ::serde_json::json!({ "type": "array", "items": [{ "type": "boolean" }] }),
+            ),
+            (
+                "an array whose items are stated by a reference",
+                ::serde_json::json!({
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Leg" },
+                    "definitions": { "Leg": { "type": "number" } }
+                }),
+            ),
+            (
+                "an array declared by a union naming the array type",
+                ::serde_json::json!({
+                    "type": ["null", "array"],
+                    "items": { "type": "string" }
+                }),
+            ),
+            (
+                "an array typed only by declaring items",
+                ::serde_json::json!({ "items": { "type": "string" } }),
+            ),
+        ];
+        for (case, document) in rows {
+            let generated = generate_sample_payload(document)
+                .unwrap_or_else(|_| panic!("case {case:?}: expected a generated template"));
+            for required in [LOOP_COMMENT, LOOP_OPEN, LOOP_SEPARATOR, LOOP_CLOSE] {
+                assert!(
+                    generated.contains(required),
+                    "case {case:?}: expected the generated template to carry {required:?}, \
+                     got {generated:?}"
+                );
+            }
+        }
+    }
+
+    /// Each array of a document is one loop, and an array that constrains no element has no
+    /// element expression for a loop to wrap.
+    #[test]
+    fn a_document_carries_one_loop_per_array_it_declares() {
+        let rows: &[(&str, ::serde_json::Value, usize)] = &[
+            (
+                "no array at all",
+                ::serde_json::json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } }
+                }),
+                0,
+            ),
+            (
+                "an array declaring no items, which constrains no element",
+                ::serde_json::json!({ "type": "array" }),
+                0,
+            ),
+            (
+                "one array",
+                ::serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+                1,
+            ),
+            (
+                "an array nested in an array",
+                ::serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "array", "items": { "type": "string" } }
+                }),
+                2,
+            ),
+            (
+                "two arrays declared beside each other",
+                ::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "first": { "type": "array", "items": { "type": "string" } },
+                        "second": { "type": "array", "items": { "type": "integer" } }
+                    }
+                }),
+                2,
+            ),
+        ];
+        for (case, document, loops) in rows {
+            let generated = generate_sample_payload(document)
+                .unwrap_or_else(|_| panic!("case {case:?}: expected a generated template"));
+            let counted = generated.matches(LOOP_COMMENT).count();
+            assert_eq!(
+                counted, *loops,
+                "case {case:?}: expected {loops} loop(s), got {counted} in {generated:?}"
+            );
+            let separators = generated.matches(LOOP_SEPARATOR).count();
+            assert_eq!(
+                separators, *loops,
+                "case {case:?}: expected {loops} separator(s), got {separators} in \
+                 {generated:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_roots_data_type_is_read_through_the_references_and_compositions_it_is_stated_by() {

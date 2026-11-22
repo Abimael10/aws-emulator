@@ -8,19 +8,23 @@
 //! model's JSON Schema declares, in which every declared property carries a sample value of
 //! the JSON type declared for that property (a `string` a sample string, an `integer` an
 //! integer, a `number` a fractional number, a `boolean` a boolean, an `object` an object of
-//! its own declared properties, an `array` one sample element), and where the schema itself
-//! states the value (an `enum` entry, a `default`) that value is the sample. The value slot
-//! is therefore never a reference into the incoming payload: it illustrates the declared
-//! type. It reads the store and writes nothing, so two calls on an unchanged model answer
-//! the same template; a model the api does not hold is 404 `NotFoundException`.
+//! its own declared properties), and where the schema itself states the value (an `enum`
+//! entry, a `default`) that value is the sample. A declared ARRAY is the one value whose
+//! members the schema does not state — how many elements it has is the incoming payload's
+//! to say — so what is generated for it is the Velocity LOOP that maps it, around one
+//! sample element. It reads the store and writes nothing, so two calls on an unchanged
+//! model answer the same template; a model the api does not hold is 404 `NotFoundException`.
 //!
 //! The rows vary what the rule generalises over: the JSON type the schema declares
 //! (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`, a union of types,
 //! a type implied by `properties`/`items`/`enum`, a type stated by a composition, none at
 //! all), how deeply the declaration nests, how many properties it declares, how a property
-//! is named, and whether the schema is reached directly or through a `$ref`. The recorded
-//! case that filed the issue — one `GetModelTemplate` on a JSON Schema model declaring a
-//! single string property — is one row of the first table.
+//! is named, and whether the schema is reached directly or through a `$ref`. The last three
+//! cases are the array half of the rule on its own: WHERE the mapped array sits, what its
+//! elements are, and how it is declared. The recorded cases that filed the issue — one
+//! `GetModelTemplate` on a JSON Schema model declaring a single string property, and one on
+//! a model whose schema declares an array at its root — are rows of the first table and of
+//! the array table.
 
 use serde_json::{json, Value};
 
@@ -35,8 +39,40 @@ fn template(body: &str) -> String {
     format!("{PREAMBLE}\n{body}")
 }
 
+/// The comment every generated loop is preceded by — the instruction to point it at the
+/// array the incoming payload carries — which is also how a case tells a template that maps
+/// an array from one that writes its members out directly, and the marker a caller greps
+/// for to find the one spot a generated template has to be edited at.
+const FOREACH_TODO: &str = "##TODO: Update this foreach loop to reference array from input json";
+
+/// The loop a generated template iterates the mapped array with.
+const FOREACH_OPEN: &str = "#foreach($elem in $inputRoot.TODO)";
+
+/// What that loop writes BETWEEN elements and not after the last one: the mapped array is
+/// JSON, whose elements are comma-separated.
+const FOREACH_SEPARATOR: &str = "#if($foreach.hasNext),#end";
+
+/// The directive that closes a Velocity block.
+const BLOCK_END: &str = "#end";
+
+/// The template an array whose element renders as `element` is generated as: the loop that
+/// maps the array the incoming payload carries, around one sample element.
+fn array_loop(element: &str) -> String {
+    [
+        "[".to_string(),
+        FOREACH_TODO.to_string(),
+        FOREACH_OPEN.to_string(),
+        format!(" {element} "),
+        FOREACH_SEPARATOR.to_string(),
+        BLOCK_END.to_string(),
+        "]".to_string(),
+    ]
+    .join("\n")
+}
+
 /// The generated template's body — everything after the preamble — parsed as the JSON
-/// document the sample payload is.
+/// document the sample payload is. Only a template that maps no array is one: a loop is
+/// Velocity, not JSON.
 fn parsed_sample(value: &str, case: &str) -> Value {
     let body = value
         .split_once('\n')
@@ -131,30 +167,27 @@ fn rows() -> Vec<Row> {
                     }
                 }
             }),
-            expected_body: [
-                "[ {",
-                "  \"class\" : \"foo\",",
-                "  \"number\" : 0",
-                "} ]",
-            ]
-            .join("\n"),
+            expected_body: array_loop(
+                &["{", "  \"class\" : \"foo\",", "  \"number\" : 0", "}"].join("\n"),
+            ),
         },
         Row {
             case: "an array of strings",
             content_type: Some("application/json"),
             schema: json!({ "type": "array", "items": { "type": "string" } }),
-            expected_body: "[ \"foo\" ]".to_string(),
+            expected_body: array_loop("\"foo\""),
         },
         Row {
             // One sample element, whatever the element itself is: an array of arrays
-            // describes one array of one integer.
+            // describes one array of one integer, so the loop that maps the outer array
+            // carries the loop that maps the inner one.
             case: "an array of arrays",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "array",
                 "items": { "type": "array", "items": { "type": "integer" } }
             }),
-            expected_body: "[ [ 0 ] ]".to_string(),
+            expected_body: array_loop(&array_loop("0")),
         },
         Row {
             case: "an object whose property is an array of objects",
@@ -172,11 +205,12 @@ fn rows() -> Vec<Row> {
                 }
             }),
             expected_body: [
-                "{",
-                "  \"items\" : [ {",
-                "    \"sku\" : \"foo\"",
-                "  } ]",
-                "}",
+                "{".to_string(),
+                format!(
+                    "  \"items\" : {}",
+                    array_loop(&["{", "    \"sku\" : \"foo\"", "  }"].join("\n"))
+                ),
+                "}".to_string(),
             ]
             .join("\n"),
         },
@@ -341,7 +375,7 @@ fn rows() -> Vec<Row> {
             case: "an array typed only by declaring items",
             content_type: Some("application/json"),
             schema: json!({ "items": { "type": "number" } }),
-            expected_body: "[ 0.0 ]".to_string(),
+            expected_body: array_loop("0.0"),
         },
         Row {
             // An array declaring no items constrains no element, so there is none to
@@ -476,9 +510,13 @@ async fn get_model_template_generates_the_template_the_models_schema_declares() 
             "case {:?}: expected the template to open with {PREAMBLE:?}, got {value:?}",
             row.case
         );
-        // Whatever the schema declares, the generated sample is itself a JSON document:
-        // each value slot carries an example value, never a reference into the payload.
-        parsed_sample(&value, row.case);
+        // A template that maps no array writes its members out directly, so its body is
+        // itself a JSON document: each value slot carries a sample value, never a reference
+        // into the payload. One that maps an array carries the Velocity loop instead, which
+        // the array cases below assert.
+        if !row.expected_body.contains(FOREACH_TODO) {
+            parsed_sample(&value, row.case);
+        }
     }
 }
 
@@ -488,8 +526,10 @@ async fn every_sample_value_carries_the_json_type_its_schema_declares() {
     let api_id = create_api(&emulator, "the typed api", "model-template-types").await;
 
     // One property per declared type, each checked against what the parsed sample must
-    // carry for it. The rows span every type a JSON Schema declares for a value, plus the
-    // two forms that state a value outright and the union spelling.
+    // carry for it. The rows span every type a JSON Schema declares a VALUE of, plus the
+    // two forms that state a value outright and the union spelling. The remaining declared
+    // type, an `array`, generates the loop that maps it rather than a value — so it is no
+    // member of this JSON document, and the array cases below are where it is asserted.
     #[allow(clippy::type_complexity)]
     let rows: Vec<(&str, Value, fn(&Value) -> bool)> = vec![
         ("a string", json!({ "type": "string" }), |value| {
@@ -509,11 +549,6 @@ async fn every_sample_value_carries_the_json_type_its_schema_declares() {
             "an object",
             json!({ "type": "object", "properties": { "inner": { "type": "string" } } }),
             |value| value.is_object(),
-        ),
-        (
-            "an array",
-            json!({ "type": "array", "items": { "type": "integer" } }),
-            |value| value.is_array(),
         ),
         ("an integer enum", json!({ "enum": [7, 8] }), |value| {
             value.is_i64()
@@ -950,4 +985,339 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
         template(&["{", "  \"id\" : \"foo\"", "}"].join("\n")),
         "expected the sample its schema declares, got {value:?}"
     );
+}
+
+/// One array case: a schema declaring at least one array, the text of the sample element the
+/// innermost loop wraps, and how many arrays the schema declares.
+struct ArrayRow {
+    case: &'static str,
+    schema: Value,
+    /// The sample element of the INNERMOST loop, which is what that array's `items` schema
+    /// declares every one of its elements to look like.
+    element: String,
+    /// How many arrays the generated template maps — one loop each.
+    loops: usize,
+}
+
+/// The cases the array half of the rule is asserted over. They vary WHERE the array sits
+/// (the document's root, a property of an object, a property two levels down, an element of
+/// another array, two beside each other), what its elements are (a string, an integer, a
+/// number, a boolean, an object, an array) and HOW it is declared (a `type` keyword, a union
+/// naming the array type, `items` alone, a tuple of item schemas, an item schema reached
+/// through a `$ref`).
+fn array_rows() -> Vec<ArrayRow> {
+    vec![
+        ArrayRow {
+            // The recorded shape: a model whose JSON Schema declares an array at its root.
+            case: "an array of strings at the document's root",
+            schema: json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "title": "Tags",
+                "type": "array",
+                "items": { "type": "string" }
+            }),
+            element: "\"foo\"".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array of integers",
+            schema: json!({ "type": "array", "items": { "type": "integer" } }),
+            element: "0".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array of numbers",
+            schema: json!({ "type": "array", "items": { "type": "number" } }),
+            element: "0.0".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array of booleans",
+            schema: json!({ "type": "array", "items": { "type": "boolean" } }),
+            element: "true".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array of objects",
+            schema: json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": { "sku": { "type": "string" } }
+                }
+            }),
+            element: ["{", "  \"sku\" : \"foo\"", "}"].join("\n"),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array of arrays",
+            schema: json!({
+                "type": "array",
+                "items": { "type": "array", "items": { "type": "string" } }
+            }),
+            element: "\"foo\"".to_string(),
+            loops: 2,
+        },
+        ArrayRow {
+            case: "an array declared as a property of an object",
+            schema: json!({
+                "type": "object",
+                "properties": { "lines": { "type": "array", "items": { "type": "string" } } }
+            }),
+            element: "\"foo\"".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            case: "an array declared two levels down",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "order": {
+                        "type": "object",
+                        "properties": {
+                            "lines": { "type": "array", "items": { "type": "integer" } }
+                        }
+                    }
+                }
+            }),
+            element: "0".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            // Two arrays beside each other: each one is mapped by its own loop.
+            case: "two arrays declared beside each other",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "first": { "type": "array", "items": { "type": "string" } },
+                    "second": { "type": "array", "items": { "type": "string" } }
+                }
+            }),
+            element: "\"foo\"".to_string(),
+            loops: 2,
+        },
+        ArrayRow {
+            // JSON Schema draft-04 section 5.5.2 allows a union of type names; the first
+            // that is not `null` is the one the template is generated for.
+            case: "an array declared by a union naming the array type",
+            schema: json!({ "type": ["null", "array"], "items": { "type": "string" } }),
+            element: "\"foo\"".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            // Section 5.3.1: `items` only applies to an array, so it declares one on its
+            // own.
+            case: "an array typed only by declaring items",
+            schema: json!({ "items": { "type": "boolean" } }),
+            element: "true".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            // And `items` written as a TUPLE of schemas (section 5.3.1), of which the first
+            // describes the element the template samples.
+            case: "an array whose items are declared as a tuple",
+            schema: json!({ "type": "array", "items": [{ "type": "integer" }] }),
+            element: "0".to_string(),
+            loops: 1,
+        },
+        ArrayRow {
+            // Section 7: an in-document reference states the schema of the element.
+            case: "an array whose items are stated by a reference",
+            schema: json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "array",
+                "items": { "$ref": "#/definitions/Leg" },
+                "definitions": {
+                    "Leg": {
+                        "type": "object",
+                        "properties": { "length": { "type": "number" } }
+                    }
+                }
+            }),
+            element: ["{", "  \"length\" : 0.0", "}"].join("\n"),
+            loops: 1,
+        },
+    ]
+}
+
+/// Where a schema declares an ARRAY, what is generated for it is the Velocity skeleton that
+/// MAPS that array — the `##TODO:` comment, the `#foreach` over the array the incoming
+/// payload carries, one sample element inside the loop, the separator that commas the
+/// elements and the `#end` that closes it — and never a collapsed list of one element: how
+/// many elements the mapped array has is the payload's to say, so a template that writes one
+/// element out maps every payload onto a one-element array.
+#[tokio::test]
+async fn every_declared_array_is_generated_as_the_loop_that_maps_it() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the array templates api", "model-template-arrays").await;
+
+    for (index, row) in array_rows().into_iter().enumerate() {
+        let model_id = create_model(
+            &emulator,
+            row.case,
+            &api_id,
+            &format!("ArrayTemplate{index}"),
+            Some("application/json"),
+            &row.schema.to_string(),
+        )
+        .await;
+        let (status, body) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/models/{model_id}/template"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200 from GetModelTemplate, got {status} {body}",
+            row.case
+        );
+        let value = as_str(&body, "value");
+        assert!(
+            value.starts_with(PREAMBLE),
+            "case {:?}: expected the template to open with {PREAMBLE:?}, got {value:?}",
+            row.case
+        );
+        // One loop per declared array, and one separator inside each of them.
+        for (part, expected) in [
+            (FOREACH_TODO, row.loops),
+            (FOREACH_OPEN, row.loops),
+            (FOREACH_SEPARATOR, row.loops),
+        ] {
+            let counted = value.matches(part).count();
+            assert_eq!(
+                counted, expected,
+                "case {:?}: expected {expected} occurrence(s) of {part:?}, got {counted} in \
+                 {value:?}",
+                row.case
+            );
+        }
+        // The innermost loop wraps the sample element its `items` schema declares, with the
+        // pieces around it in the order a Velocity reader needs them.
+        let loop_text = array_loop(&row.element);
+        assert!(
+            value.contains(&loop_text),
+            "case {:?}: expected the template to carry the loop {loop_text:?}, got {value:?}",
+            row.case
+        );
+        // And nothing of the collapsed form a template that writes one element out has.
+        let collapsed = format!("[ {} ]", row.element);
+        assert!(
+            !value.contains(&collapsed),
+            "case {:?}: expected no collapsed array {collapsed:?}, got {value:?}",
+            row.case
+        );
+        // The generated document is a Velocity template, so it is one the language reads:
+        // this is the parser the gateways read a caller's own mapping template with.
+        service_common::velocity_template::parse(&value).unwrap_or_else(|error| {
+            panic!(
+                "case {:?}: expected the generated template to parse as Velocity, got \
+                 {error:?} for {value:?}",
+                row.case
+            )
+        });
+    }
+}
+
+/// The recorded case as whole text: a model whose schema declares an array at its root is
+/// answered with the preamble and the skeleton, line for line.
+#[tokio::test]
+async fn a_root_array_is_generated_as_the_whole_skeleton() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the skeleton api", "model-template-skeleton").await;
+
+    let case = "an array of strings at the document's root";
+    let model_id = create_model(
+        &emulator,
+        case,
+        &api_id,
+        "RootArray",
+        Some("application/json"),
+        &json!({
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "title": "Tags",
+            "type": "array",
+            "items": { "type": "string" }
+        })
+        .to_string(),
+    )
+    .await;
+    let (status, body) = call(
+        &emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/models/{model_id}/template"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetModelTemplate, got {status} {body}"
+    );
+    let value = as_str(&body, "value");
+    let expected = [
+        PREAMBLE,
+        "[",
+        FOREACH_TODO,
+        FOREACH_OPEN,
+        " \"foo\" ",
+        FOREACH_SEPARATOR,
+        BLOCK_END,
+        "]",
+    ]
+    .join("\n");
+    assert_eq!(
+        value, expected,
+        "case {case:?}: expected the generated skeleton, got {value:?}"
+    );
+}
+
+/// An array declaring no `items` constrains no element, so there is no element expression
+/// for a loop to wrap and the sample is the empty array.
+#[tokio::test]
+async fn an_array_that_constrains_no_element_has_no_loop_to_generate() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the unconstrained api", "model-template-open").await;
+
+    for (index, (case, schema)) in [
+        ("an array declaring no items", json!({ "type": "array" })),
+        (
+            "an array property declaring no items",
+            json!({ "type": "object", "properties": { "lines": { "type": "array" } } }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let model_id = create_model(
+            &emulator,
+            case,
+            &api_id,
+            &format!("Open{index}"),
+            Some("application/json"),
+            &schema.to_string(),
+        )
+        .await;
+        let (status, body) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/models/{model_id}/template"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetModelTemplate, got {status} {body}"
+        );
+        let value = as_str(&body, "value");
+        assert!(
+            value.contains("[ ]"),
+            "case {case:?}: expected the empty array, got {value:?}"
+        );
+        assert!(
+            !value.contains(FOREACH_OPEN),
+            "case {case:?}: expected no loop over elements nothing is declared about, got \
+             {value:?}"
+        );
+    }
 }
