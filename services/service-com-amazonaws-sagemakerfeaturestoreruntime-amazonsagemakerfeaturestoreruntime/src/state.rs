@@ -178,11 +178,21 @@ impl FeatureGroupStore {
         if is_new && self.records.len() >= MAX_RECORDS_PER_GROUP {
             return false;
         }
-        if let Some(at) = record.expires_at_secs {
-            self.next_expiry_secs = Some(self.next_expiry_secs.map_or(at, |earliest| earliest.min(at)));
-        }
+        self.note_expiry(record.expires_at_secs);
         self.records.insert(record.identifier.clone(), record);
         true
+    }
+
+    /// Account for a record that expires at `at` in [`Self::next_expiry_secs`].
+    ///
+    /// That member is a LOWER BOUND, so an expiry earlier than it lowers it and anything
+    /// else leaves it standing: a bound left too low only costs the one scan that
+    /// recomputes it, while a bound left too HIGH would skip an expiry the clock owes.
+    fn note_expiry(&mut self, at: Option<f64>) {
+        if let Some(at) = at {
+            self.next_expiry_secs =
+                Some(self.next_expiry_secs.map_or(at, |earliest| earliest.min(at)));
+        }
     }
 
     /// Offer a prepared record to this group's online store: the one INGESTION every
@@ -232,6 +242,13 @@ impl FeatureGroupStore {
     /// `RecordIdentifierFeatureName` and `EventTimeFeatureName`, which the caller reads
     /// from the group's definition ([`resolve_group`]) and passes in: this store holds no
     /// definition of its own, and a group that resolves always has both names.
+    ///
+    /// The record's time-to-live is not one of those "other feature values": the duration
+    /// the record was written under ([`StoredRecord::ttl_secs`]) stays with it, and
+    /// `ExpiresAt` is RE-DERIVED from that duration and the event time this call just
+    /// moved ([`StoredRecord::recompute_expiry`]), as it is by every call that moves a
+    /// record's event time — so the tombstone is still hard-deleted once its expiry falls
+    /// due, which is what the model documents a `TtlDuration` for.
     pub fn soft_delete_record(
         &mut self,
         identifier: &str,
@@ -239,23 +256,24 @@ impl FeatureGroupStore {
         identifier_feature: &str,
         event_time_feature: &str,
     ) {
-        if let Some(record) = self.records.get_mut(identifier) {
-            record.soft_deleted = true;
-            record.event_time = Some(event_time.to_owned());
-            record.expires_at = None;
-            record.expires_at_secs = None;
-            record.ttl_secs = None;
-            record.features.retain(|feature| {
-                identifier_feature == feature.feature_name
-                    || event_time_feature == feature.feature_name
-            });
-            for feature in &mut record.features {
-                if event_time_feature == feature.feature_name {
-                    feature.value_as_string = Some(event_time.to_owned());
-                    feature.value_as_string_list = None;
-                }
+        let Some(record) = self.records.get_mut(identifier) else {
+            return;
+        };
+        record.soft_deleted = true;
+        record.event_time = Some(event_time.to_owned());
+        record.recompute_expiry();
+        record.features.retain(|feature| {
+            identifier_feature == feature.feature_name
+                || event_time_feature == feature.feature_name
+        });
+        for feature in &mut record.features {
+            if event_time_feature == feature.feature_name {
+                feature.value_as_string = Some(event_time.to_owned());
+                feature.value_as_string_list = None;
             }
         }
+        let expires_at_secs = record.expires_at_secs;
+        self.note_expiry(expires_at_secs);
     }
 
     /// Re-derive the expiry bound from the records that remain.

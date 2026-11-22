@@ -2,7 +2,8 @@
 
 //! End-to-end HTTP tests for the TTL a record of a feature group is stored under: the
 //! duration the write states when it states one, and otherwise the DEFAULT the group's
-//! `OnlineStoreConfig.TtlDuration` configures.
+//! `OnlineStoreConfig.TtlDuration` configures — and what every later call that moves the
+//! record's event time, an update or a soft delete, re-derives its `ExpiresAt` to.
 //!
 //! Every case goes through the real front door — the multi-service router, the restJson1
 //! protocol, the modelled constraint validation — so what is asserted is the wire
@@ -15,7 +16,11 @@ use serde_json::{json, Value};
 use service_common::feature_store_groups::{FeatureGroupDirectory, FeatureGroupRecord};
 use smithy_server_runtime::{http, MultiServiceRouter};
 
-use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::EmulatedService;
+use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::state::StoredRecord;
+use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::{
+    ComAmazonawsSagemakerfeaturestoreruntimeAmazonsagemakerfeaturestoreruntimeState as OnlineStore,
+    EmulatedService,
+};
 
 /// The feature whose value identifies a record in every group these suites create.
 const IDENTIFIER_FEATURE: &str = "customer_id";
@@ -122,6 +127,36 @@ impl Emulator {
             Some(json!({})),
         )
         .await
+    }
+
+    /// `ListRecords` asking for the soft-deleted records too, which is the one call that
+    /// reports a tombstone a `SoftDelete` left behind.
+    async fn list_records_including_soft_deleted(&self, group: &str) -> (u16, Value) {
+        self.send(
+            "POST",
+            &format!("/FeatureGroup/{group}/ListRecords"),
+            Some(json!({ "IncludeSoftDeletedRecords": true })),
+        )
+        .await
+    }
+
+    async fn delete_record(&self, group: &str, query: &str) -> (u16, Value) {
+        self.send("DELETE", &format!("/FeatureGroup/{group}?{query}"), None)
+            .await
+    }
+
+    /// The record `identifier` names in `group`'s online store, read through the store's
+    /// OWN API ([`OnlineStore`]) rather than off the wire.
+    ///
+    /// A soft-deleted record is served by no operation of this data plane — `GetRecord`
+    /// and `BatchGetRecord` withhold it and `ListRecords` reports only its identifier — so
+    /// the TTL state a tombstone keeps is read here, from the same store the handlers
+    /// write. That this IS that store is shown by every other assertion in these suites,
+    /// each of which goes through the front door.
+    fn stored_record(&self, group: &str, identifier: &str) -> Option<StoredRecord> {
+        let state = self.engine.state::<OnlineStore>();
+        let mut store = state.lock();
+        store.group_mut(group)?.record(identifier).cloned()
     }
 }
 
@@ -522,6 +557,233 @@ async fn an_update_re_derives_the_expiry_from_the_ttl_in_force() {
             &body,
             &later,
             Some(expected),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_soft_delete_re_derives_the_expiry_from_the_ttl_the_record_was_written_under() {
+    let emulator = Emulator::new();
+    let ingested_at = tomorrow_iso();
+    // The delete's own `EventTime`, an hour after the record's: a `SoftDelete` moves the
+    // record's event time to it, so it is the instant the expiry is measured from.
+    let deleted_at = DateTime::from_secs_f64(tomorrow() + 3_600.0)
+        .fmt(Format::DateTime)
+        .expect("format an ISO-8601 event time");
+
+    for (index, (case, unit, value, expected)) in DEFAULT_TTL_ROWS.iter().enumerate() {
+        // The same duration from each of the two sources a record can be under one from,
+        // so neither the write's own `TtlDuration` nor the group's default is lost.
+        let sources: [(&str, Option<f64>, Option<Value>); 2] = [
+            (
+                "a record-level TtlDuration",
+                None,
+                Some(json!({ "Unit": unit, "Value": value })),
+            ),
+            ("the feature group's default TTL", Some(*expected), None),
+        ];
+        for (source, group_default, request_ttl) in sources {
+            let group = format!("softdelete{index}{}", group_default.is_some() as u8);
+            let case = format!("{case} as {source}");
+            emulator.create_feature_group(&group, group_default);
+
+            let mut request = json!({ "Record": [
+                feature(IDENTIFIER_FEATURE, "C1"),
+                feature(EVENT_TIME_FEATURE, &ingested_at),
+                feature("city", "Seattle")
+            ] });
+            if let Some(ttl) = request_ttl {
+                request["TtlDuration"] = ttl;
+            }
+            let (status, body) = emulator.put_record(&group, request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected PutRecord 200, got {status} ({body})"
+            );
+            let (_, body) = emulator.get_record(&group, "C1").await;
+            assert_expiry(
+                &format!("{case}: the ingested record"),
+                &body,
+                &ingested_at,
+                Some(*expected),
+            );
+
+            let (status, body) = emulator
+                .delete_record(
+                    &group,
+                    &format!(
+                        "RecordIdentifierValueAsString=C1&EventTime={deleted_at}\
+                         &DeletionMode=SoftDelete"
+                    ),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteRecord 200, got {status} ({body})"
+            );
+
+            let stored = emulator
+                .stored_record(&group, "C1")
+                .unwrap_or_else(|| panic!("case {case:?}: the tombstone must still be held"));
+            assert!(
+                stored.soft_deleted,
+                "case {case:?}: expected a soft-deleted record, got {stored:?}"
+            );
+            assert_eq!(
+                stored.ttl_secs,
+                Some(*expected),
+                "case {case:?}: expected the tombstone to keep the duration of {expected} s, \
+                 got {:?}",
+                stored.ttl_secs
+            );
+            let at = stored.expires_at_secs.unwrap_or_else(|| {
+                panic!("case {case:?}: expected the tombstone to carry an expiry, got {stored:?}")
+            });
+            let delta = at - secs(&deleted_at);
+            assert!(
+                (delta - *expected).abs() < 0.001,
+                "case {case:?}: expected the expiry {expected} s after the delete's event \
+                 time, got {delta} s"
+            );
+            // The ISO-8601 member and the seconds one are the same instant.
+            let iso = stored
+                .expires_at
+                .clone()
+                .unwrap_or_else(|| panic!("case {case:?}: expected an ExpiresAt, got {stored:?}"));
+            assert!(
+                (secs(&iso) - at).abs() < 0.001,
+                "case {case:?}: expected ExpiresAt {iso:?} to be the stored instant {at}"
+            );
+        }
+    }
+}
+
+/// One row of the tombstone-expiry table: which of the two TTL sources the deleted record
+/// is under, the `EventTime` the delete states, and whether the tombstone the delete
+/// leaves outlives the next read of its feature group.
+struct TombstoneRow {
+    case: &'static str,
+    /// The `OnlineStoreConfig.TtlDuration` the feature group is created with, in seconds.
+    group_default_secs: Option<f64>,
+    /// The `TtlDuration` the write of the record states, when it states one.
+    request_ttl: Option<Value>,
+    deleted_at: String,
+    outlives: bool,
+}
+
+#[tokio::test]
+async fn a_soft_deleted_record_is_hard_deleted_once_its_re_derived_expiry_falls_due() {
+    // An instant long past: a tombstone whose event time is this one has an expiry
+    // already due under any duration, so the hard delete the clock owes is materialised
+    // by the next read — no waiting on a clock.
+    const LONG_PAST: &str = "2000-01-01T00:00:00Z";
+    let a_day_out = tomorrow_iso();
+
+    // Each record below is written with NO value for the group's event-time feature, so
+    // the record itself is under a duration but at no instant, and the first event time
+    // it has is the one the delete states: that is what makes the re-derived expiry of a
+    // tombstone observable without waiting for one to fall due.
+    let rows = vec![
+        TombstoneRow {
+            case: "a one-second record TTL, deleted long past",
+            group_default_secs: None,
+            request_ttl: Some(json!({ "Unit": "Seconds", "Value": 1 })),
+            deleted_at: LONG_PAST.to_owned(),
+            outlives: false,
+        },
+        TombstoneRow {
+            case: "an hour's record TTL, deleted long past",
+            group_default_secs: None,
+            request_ttl: Some(json!({ "Unit": "Hours", "Value": 1 })),
+            deleted_at: LONG_PAST.to_owned(),
+            outlives: false,
+        },
+        TombstoneRow {
+            case: "a 52-week record TTL, deleted long past",
+            group_default_secs: None,
+            request_ttl: Some(json!({ "Unit": "Weeks", "Value": 52 })),
+            deleted_at: LONG_PAST.to_owned(),
+            outlives: false,
+        },
+        TombstoneRow {
+            case: "the feature group's default TTL, deleted long past",
+            group_default_secs: Some(1.0),
+            request_ttl: None,
+            deleted_at: LONG_PAST.to_owned(),
+            outlives: false,
+        },
+        TombstoneRow {
+            case: "a 52-week record TTL, deleted a day out",
+            group_default_secs: None,
+            request_ttl: Some(json!({ "Unit": "Weeks", "Value": 52 })),
+            deleted_at: a_day_out,
+            outlives: true,
+        },
+        TombstoneRow {
+            case: "no TTL in force at all",
+            group_default_secs: None,
+            request_ttl: None,
+            deleted_at: LONG_PAST.to_owned(),
+            outlives: true,
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let TombstoneRow {
+            case,
+            group_default_secs,
+            request_ttl,
+            deleted_at,
+            outlives,
+        } = row;
+        let emulator = Emulator::new();
+        let group = format!("tombstone{index}");
+        emulator.create_feature_group(&group, group_default_secs);
+
+        let mut request = json!({ "Record": [
+            feature(IDENTIFIER_FEATURE, "C1"),
+            feature("city", "Seattle")
+        ] });
+        if let Some(ttl) = request_ttl {
+            request["TtlDuration"] = ttl;
+        }
+        let (status, body) = emulator.put_record(&group, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected PutRecord 200, got {status} ({body})"
+        );
+        let (_, body) = emulator.list_records_including_soft_deleted(&group).await;
+        assert_eq!(
+            body["RecordIdentifiers"],
+            json!(["C1"]),
+            "case {case:?}: expected the written identifier to be listed, got {}",
+            body["RecordIdentifiers"]
+        );
+
+        let (status, body) = emulator
+            .delete_record(
+                &group,
+                &format!(
+                    "RecordIdentifierValueAsString=C1&EventTime={deleted_at}\
+                     &DeletionMode=SoftDelete"
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteRecord 200, got {status} ({body})"
+        );
+
+        let (status, body) = emulator.list_records_including_soft_deleted(&group).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListRecords 200, got {status} ({body})"
+        );
+        let expected = if outlives { json!(["C1"]) } else { json!([]) };
+        assert_eq!(
+            body["RecordIdentifiers"], expected,
+            "case {case:?}: expected the soft-deleted identifiers {expected}, got {}",
+            body["RecordIdentifiers"]
         );
     }
 }
