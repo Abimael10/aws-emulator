@@ -9,6 +9,13 @@
 //! page stopped, and the account's own Data Catalog among them where the request asks for
 //! it. Reporting only — nothing is written.
 //!
+//! A `ParentCatalogId` whose catalog-name part carries a character no catalog name may
+//! ([`crate::state::malformed_catalog_path_segment`]) addresses no catalog at all, so it is
+//! refused as a MALFORMED request — the constraint report the boundary validator answers a
+//! value outside a `@pattern` with (HTTP 400, `ValidationException`), naming the catalog's
+//! own `name` ([`crate::state::messages::catalog_name_outside_its_pattern`]) — before the
+//! store is read.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,6 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CatalogId` of this service resolves to.
         let parent_id = crate::state::resolve_catalog_id(input.parent_catalog_id.as_ref());
         let parent = crate::state::parse_catalog_reference(&parent_id);
+        // Every segment of that path is a catalog NAME, so a segment outside the grammar a
+        // name has to satisfy (`CatalogNameString`'s `@pattern`) addresses no catalog that
+        // could ever have been created: the request is MALFORMED rather than a miss, and it is
+        // refused with the constraint report the boundary validator answers a value outside a
+        // `@pattern` with — naming the catalog's own `name` and echoing that expression as the
+        // model spells it. Decided from the request alone, so it comes before authorization
+        // and before the store is read, exactly as the single-catalog read decides it. The
+        // nesting separator itself is part of the ADDRESS and not of a name
+        // (`crate::state::CATALOG_PATH_SEPARATOR`), so a nested parent still resolves and
+        // reports its own miss below.
+        if let Some(segment) = crate::state::malformed_catalog_path_segment(&parent.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::messages::catalog_name_outside_its_pattern(segment),
+            ));
+        }
         // Authorization comes BEFORE the entity lookup, exactly as the single-catalog read
         // does it: a catalog in another account's Data Catalog is reachable on the real
         // service only through that catalog's own resource-based policy, and this store can

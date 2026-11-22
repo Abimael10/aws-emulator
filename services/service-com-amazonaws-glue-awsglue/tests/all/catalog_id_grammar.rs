@@ -28,14 +28,21 @@ use crate::wire::{
 /// (`smithy_query(query="operation",operation="CreateCatalog")` reports `Name` as
 /// `CatalogNameString` with `@pattern ^(?!(.*[.\/\\]|aws:)).*$`). Written here
 /// independently of the handler, so this suite pins the text a refusal echoes.
-const CATALOG_NAME_PATTERN: &str = r"^(?!(.*[.\/\\]|aws:)).*$";
+///
+/// One copy, shared with [`crate::catalog_address_name_grammar`], which pins the same rule
+/// over every surface that takes such an id.
+pub const CATALOG_NAME_PATTERN: &str = r"^(?!(.*[.\/\\]|aws:)).*$";
 
 /// The catalog miss sentence, written here independently of the handler.
-const CATALOG_NOT_FOUND: &str = "Catalog not found.";
+///
+/// One copy, shared with [`crate::catalog_address_name_grammar`].
+pub const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
 /// The refusal a `CatalogId` whose catalog name is `name` earns: AWS's constraint report
 /// over one violation, at the catalog's own `name` and quoting the name that failed.
-fn expected_refusal(name: &str) -> String {
+///
+/// One copy, shared with [`crate::catalog_address_name_grammar`].
+pub fn expected_refusal(name: &str) -> String {
     format!(
         "1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: \
          Member must satisfy regular expression pattern: {CATALOG_NAME_PATTERN}"

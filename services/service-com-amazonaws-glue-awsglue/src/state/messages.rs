@@ -1242,8 +1242,9 @@ pub const CATALOG_NAME_NOT_ALLOWED: &str =
 /// cased the way every clause of this envelope spells a member.
 const CATALOG_NAME_MEMBER: &str = "name";
 
-/// An operation that addresses ONE catalog resource by its `CatalogId` (`GetCatalog`,
-/// `DeleteCatalog`) whose id carries a path segment that is no catalog NAME
+/// An operation that addresses a catalog resource by a `CatalogId` (`GetCatalog`,
+/// `DeleteCatalog`, `UpdateCatalog`, and `GetCatalogs` by the parent it lists) whose id
+/// carries a path segment that is no catalog NAME
 /// ([`super::malformed_catalog_path_segment`]).
 ///
 /// RECORDED template, and nothing of its wording is spelled here: the envelope is the
