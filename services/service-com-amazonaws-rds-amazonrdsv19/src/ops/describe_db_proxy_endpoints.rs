@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBProxyEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBProxyEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBProxyEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the endpoints of the RDS proxies this service holds in the region the request is
+//! signed for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBProxyEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBProxyEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBProxyEndpoints"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBProxyEndpointsError::validation)?;
+        // "Default: 100 Constraints: Minimum 20, maximum 100."
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBProxyEndpointsError::invalid_parameter_value)?;
+        // This operation's `Filters` member documents "this parameter is not currently
+        // supported", so there is nothing to match on: a request that carries one is
+        // refused rather than served a list the filter was meant to narrow.
+        if let Some(filter) = input.filters.unwrap_or_default().first() {
+            return Err(DescribeDBProxyEndpointsError::invalid_parameter_value(
+                crate::state::unrecognized_filter_name_message(&filter.name),
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the proxies of the region it was signed for.
+        // "The name of the DB proxy whose endpoints you want to describe" narrows the report
+        // to one proxy, and names one that has to exist; "if you omit this parameter, the
+        // output includes information about all DB proxy endpoints associated with all your
+        // DB proxies".
+        let proxies: Vec<&crate::state::DbProxyRecord> = match &input.db_proxy_name {
+            Some(named) => {
+                let proxy = store
+                    .db_proxies
+                    .get(&(region.clone(), named.clone()))
+                    .ok_or_else(|| {
+                        DescribeDBProxyEndpointsErrorModeled::DBProxyNotFoundFault(
+                            DBProxyNotFoundFault {
+                                message: Some(crate::state::db_proxy_not_found_message(named)),
+                            },
+                        )
+                    })?;
+                vec![proxy]
+            }
+            None => store.db_proxies_in(&region),
+        };
+
+        // Every endpoint of each proxy in scope: "RDS automatically creates one endpoint for
+        // each DB proxy", the default endpoint that exists without a create
+        // ([`crate::state::default_proxy_endpoint`]). Each is keyed by the proxy it belongs
+        // to — one endpoint apiece, and the proxies are walked in their own key order — so
+        // the keys ascend in the order the report serves them and a marker resumes where the
+        // caller left off ([`crate::state::paginate`]).
+        let mut reported: Vec<(String, DBProxyEndpoint)> = Vec::new();
+        for proxy in proxies {
+            reported.push((
+                proxy.name.clone(),
+                crate::state::default_proxy_endpoint(proxy),
+            ));
+        }
+
+        // "The name of a DB proxy endpoint to describe": a report narrowed to one endpoint
+        // reports that endpoint alone, and a name that resolves none of the endpoints in
+        // scope is the fault this operation models for it rather than an empty list.
+        if let Some(named) = &input.db_proxy_endpoint_name {
+            reported.retain(|(_, endpoint)| {
+                endpoint.db_proxy_endpoint_name.as_deref() == Some(named.as_str())
+            });
+            if reported.is_empty() {
+                return Err(
+                    DescribeDBProxyEndpointsErrorModeled::DBProxyEndpointNotFoundFault(
+                        DBProxyEndpointNotFoundFault {
+                            message: Some(crate::state::db_proxy_endpoint_not_found_message(
+                                named,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBProxyEndpointsError::invalid_parameter_value)?;
+        Ok(DescribeDBProxyEndpointsOutput {
+            db_proxy_endpoints: Some(page.items),
+            marker: page.next_marker,
+        })
     }
 }

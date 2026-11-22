@@ -169,6 +169,9 @@ mod certificates;
 // The CUSTOM endpoints of a DB cluster: their record, their projection, and the two
 // endpoints every cluster publishes without a create.
 mod cluster_endpoints;
+// The endpoints of an RDS PROXY: the one every proxy publishes without a create, and the
+// projection the proxy-endpoint report answers with.
+mod proxy_endpoints;
 mod default_catalog;
 mod event_catalog;
 mod recommendations;
@@ -192,6 +195,7 @@ mod sns_topics;
 pub use associated_roles::*;
 pub use certificates::*;
 pub use cluster_endpoints::*;
+pub use proxy_endpoints::*;
 pub use default_catalog::*;
 pub use event_catalog::*;
 pub use recommendations::*;
