@@ -375,6 +375,16 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # The key service a durable function's `DurableConfig` names a key in, mounted beside
 # lambda so a key really is disabled when the test says it is.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The two services that own what a VPC's own resolver answers a handler inside that VPC:
+# Route 53 holds the PRIVATE hosted zones and their VPC associations, and Route 53 Resolver owns
+# the in-VPC DNS data plane that reads them. Both are mounted beside lambda on ONE engine in the
+# private-zone suite, so the name the handler resolves is answered out of the records those
+# services' own operations wrote.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+service-com-amazonaws-route53resolver-route53resolver = { workspace = true }
+# The client that builds, signs and parses those Route 53 `restXml` calls over the in-process
+# callback, the way the EC2 client of the VPC-attachment suites does for `ec2Query`.
+aws-sdk-route53 = { version = "1", default-features = false }
 # A deployment package the invoke tests upload is a .zip archive they write in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle

@@ -21,17 +21,24 @@
 //!   environment the VPC holds an interface for. It answers the queries the function sends it
 //!   while the VPC's `enableDnsSupport` attribute is on: "If … enableDnsSupport is false, the
 //!   Amazon Route 53 Resolver server cannot resolve … DNS hostnames"
-//!   (`ModifyVpcAttributeRequest$EnableDnsSupport`).
+//!   (`ModifyVpcAttributeRequest$EnableDnsSupport`). It answers at that port over EITHER
+//!   transport — a query carried in a datagram ([`VpcAttachment::dns_reply`]) and a query
+//!   carried on a connection the client opened to it ([`VpcAttachment::carry_dns_connection`]),
+//!   which is the transport a client falls back to for an answer that will not fit in a
+//!   datagram — out of the same zones, because the transport decides the framing and nothing
+//!   else.
 //!
 //! What that resolver answers is the VPC's OWN internal zone — the Region's private DNS domain
 //! (`ec2.internal` in `us-east-1`, `<region>.compute.internal` elsewhere), whose
 //! Amazon-provided hostnames name an address in the VPC. So a query for such a hostname of an
 //! address in this VPC is answered with that address, a reverse query for such an address with
 //! that hostname, a name of the internal zone that names no address in the VPC with
-//! `NXDOMAIN`, and a name of any other zone — one the resolver would have to recurse for,
-//! which reaches nothing from this emulator — with `SERVFAIL`. The DNS messages themselves are
-//! read and written by the `simple-dns` crate, so what travels is a real DNS exchange rather
-//! than a shape of this module's own.
+//! `NXDOMAIN`, and a name of another zone — one the resolver recurses for — with what that
+//! recursion can establish from this emulator: a name the public namespace fixes as absent
+//! (`::service_common::vpc_private_dns::established_not_to_exist`) does not exist, so it is
+//! `NXDOMAIN`, and every other such name is one nothing here can answer, so it is `SERVFAIL`.
+//! The DNS messages themselves are read and written by the `simple-dns` crate, so what travels
+//! is a real DNS exchange rather than a shape of this module's own.
 //!
 //! Before the resolver reads anything for a query, the DNS FIREWALL filtering that VPC decides
 //! it: the rule groups that reach the VPC — its own associations, and the Route 53 Profiles
@@ -55,8 +62,8 @@ use ::service_common::vpc_dns_firewall::{
     FirewallDecision, VpcQueryFilters, OVERRIDE_DNS_TYPE_CNAME,
 };
 use ::service_common::vpc_private_dns::{
-    InVpcQuerySource, PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord, QueryAdmission,
-    VpcPrivateDnsPlane, PROTOCOL_UDP,
+    established_not_to_exist, InVpcQuerySource, PrivateZoneAnswer, PrivateZoneCode,
+    PrivateZoneRecord, QueryAdmission, VpcPrivateDnsPlane, PROTOCOL_UDP,
 };
 use ::simple_dns::rdata::{RData, A, AAAA, CNAME, MX, NS, PTR, TXT};
 use ::simple_dns::{
@@ -381,6 +388,11 @@ impl VpcAttachment {
                     reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
                     code = RESPONSE_NAME_ERROR;
                 }
+                Answer::Nonexistent => {
+                    // The name is under no zone of this resolver, so the answer is not its own
+                    // authority's: what establishes the name does not exist is the recursion.
+                    code = RESPONSE_NAME_ERROR;
+                }
                 Answer::Elsewhere => {
                     code = RESPONSE_SERVER_FAILURE;
                 }
@@ -480,20 +492,25 @@ impl VpcAttachment {
         plane.zone_answer(&self.vpc_id, &question.qname.to_string(), record_type)
     }
 
-    /// The reply a DATAGRAM addressed to `destination`:`port` from inside this VPC is answered
-    /// with, and `None` when nothing comes back at all.
+    /// Whether DNS is answered at `destination`:`port` for a query this attachment carries over
+    /// `protocol`, and whether such a query is admitted to the server that answers there.
     ///
     /// Two kinds of address answer DNS in a VPC and they are gated differently. The VPC's own
     /// resolver ([`Self::is_resolver`]) is behind no interface of the account and answers every
     /// client of the VPC. An INBOUND Resolver endpoint adds addresses of its own, on elastic
     /// network interfaces behind the endpoint's security groups: a query reaching one is
     /// delivered only where a rule of those groups admits its protocol and port from this
-    /// attachment's own address, and one no rule admits is DROPPED — so nothing comes back at
-    /// all, which is what revoking such a rule looks like to the client. Which addresses those
-    /// are and what they admit is the Resolver service's own decision, read out of the register
-    /// that owns it ([`::service_common::vpc_private_dns`]).
+    /// attachment's own address, and one no rule admits is DROPPED rather than refused — which
+    /// is what revoking such a rule looks like to the client. Which addresses those are and what
+    /// they admit is the Resolver service's own decision, read out of the register that owns it
+    /// ([`::service_common::vpc_private_dns`]).
     #[must_use]
-    pub fn dns_reply(&self, destination: Ipv4Addr, port: u16, query: &[u8]) -> Option<Vec<u8>> {
+    pub fn dns_admission(
+        &self,
+        destination: Ipv4Addr,
+        port: u16,
+        protocol: &str,
+    ) -> QueryAdmission {
         let source_ip = self.private_address().map(|address| address.to_string());
         let admission = match (self.plane.as_ref(), source_ip.as_deref()) {
             (Some(plane), Some(source_ip)) => plane.admission(
@@ -504,23 +521,79 @@ impl VpcAttachment {
                 },
                 destination,
                 port,
-                // A datagram is a query carried over UDP, which is the protocol a rule on the
-                // addressed interface has to admit for it to be delivered.
-                PROTOCOL_UDP,
+                protocol,
             ),
             _unregistered => QueryAdmission::NoServer,
         };
         match admission {
-            // A resolver of the VPC answers there and the query is admitted to it.
-            QueryAdmission::Admitted => self.resolved(query),
-            // One answers there and no rule admits this query: the packet is dropped.
-            QueryAdmission::Dropped => None,
             // No Resolver endpoint answers there — which leaves the VPC's own resolver, at the
-            // two addresses it is reached at.
-            QueryAdmission::NoServer => self
-                .is_resolver(destination, port)
-                .then(|| self.resolved(query))
-                .flatten(),
+            // two addresses it is reached at, which stands behind no interface and so admits
+            // every client of the VPC whichever protocol carries the query.
+            QueryAdmission::NoServer if self.is_resolver(destination, port) => {
+                QueryAdmission::Admitted
+            }
+            decided => decided,
+        }
+    }
+
+    /// The reply a DATAGRAM addressed to `destination`:`port` from inside this VPC is answered
+    /// with, and `None` when nothing comes back at all — an address nothing of the VPC answers
+    /// DNS at, and one a rule of the addressed interface does not admit this query to, whose
+    /// datagram is dropped.
+    #[must_use]
+    pub fn dns_reply(&self, destination: Ipv4Addr, port: u16, query: &[u8]) -> Option<Vec<u8>> {
+        // A datagram is a query carried over UDP, which is the protocol a rule on the addressed
+        // interface has to admit for it to be delivered.
+        match self.dns_admission(destination, port, PROTOCOL_UDP) {
+            QueryAdmission::Admitted => self.resolved(query),
+            QueryAdmission::Dropped | QueryAdmission::NoServer => None,
+        }
+    }
+
+    /// Answer DNS on `wire` for as long as the client holds it open: the queries a client of
+    /// this VPC carries on a CONNECTION it opened to an address the VPC's DNS is served at.
+    ///
+    /// A resolver answers at the same port over either transport, and a client uses the
+    /// connection when the answer it wants will not fit in a datagram, when it is asking for a
+    /// zone transfer, or simply because its own stub resolver was told to: "Messages sent over
+    /// TCP connections use server port 53 (decimal). The message is prefixed with a two byte
+    /// length field which gives the message length" (RFC 1035 §4.2.2), one message after
+    /// another on the one connection. What each message is answered with is the same reading of
+    /// the same zones a datagram's is ([`Self::resolved`]) — the transport decides the framing
+    /// and nothing else.
+    ///
+    /// The connection is carried until the client closes it, which is the end of file a read
+    /// here reports; a message the server cannot answer at all ends it the same way, because a
+    /// connection carries no way to say nothing. Every bound on it belongs to the caller: how
+    /// many bytes the run may carry and how long any one of its calls may wait
+    /// ([`super::guest_socket`]), plus the two-byte prefix, which cannot frame a message longer
+    /// than it can count.
+    pub async fn carry_dns_connection<S>(&self, wire: &mut S)
+    where
+        S: ::tokio::io::AsyncRead + ::tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        loop {
+            let mut prefix = [0_u8; 2];
+            if wire.read_exact(&mut prefix).await.is_err() {
+                return;
+            }
+            let mut query = vec![0_u8; usize::from(u16::from_be_bytes(prefix))];
+            if !query.is_empty() && wire.read_exact(&mut query).await.is_err() {
+                return;
+            }
+            let Some(reply) = self.resolved(&query) else {
+                return;
+            };
+            let Ok(length) = u16::try_from(reply.len()) else {
+                return;
+            };
+            if wire.write_all(&length.to_be_bytes()).await.is_err()
+                || wire.write_all(&reply).await.is_err()
+                || wire.flush().await.is_err()
+            {
+                return;
+            }
         }
     }
 
@@ -532,9 +605,18 @@ impl VpcAttachment {
             return self.reverse_answer(asked, labels, kind, &internal);
         }
         let Some(host) = name.strip_suffix(&format!(".{internal}")) else {
-            // A name of another zone: the resolver would have to recurse for it, and nothing
-            // of this emulator answers out there.
-            return Answer::Elsewhere;
+            // A name of another zone, which the resolver recurses for. What a recursion comes
+            // to is the public namespace, and the only part of it this emulator can read is
+            // the part a STANDARD fixes: a name the public namespace establishes does not
+            // exist is answered as one that does not
+            // ([`::service_common::vpc_private_dns::established_not_to_exist`], the one reading
+            // of that question every in-VPC resolver here takes), and every other name is one
+            // this emulator cannot establish anything about.
+            return if established_not_to_exist(&name) {
+                Answer::Nonexistent
+            } else {
+                Answer::Elsewhere
+            };
         };
         let Some(address) = address_in_name(host).filter(|address| self.holds(*address)) else {
             return Answer::Absent;
@@ -698,8 +780,8 @@ fn private_zone_record(record: &PrivateZoneRecord) -> Option<ResourceRecord<'sta
 }
 
 /// What one question came to in the resolver's own zone: a record, a name of its own zone with
-/// no record of the type asked about, a name of that zone it holds nothing under, or a name of
-/// another zone.
+/// no record of the type asked about, a name of that zone it holds nothing under, a name the
+/// public namespace establishes does not exist, or a name of another zone.
 enum Answer {
     /// The record itself.
     Found(Box<ResourceRecord<'static>>),
@@ -707,6 +789,10 @@ enum Answer {
     Empty,
     /// The zone is the resolver's and holds no such name.
     Absent,
+    /// The name belongs to NO zone, and the public namespace establishes as much
+    /// ([`::service_common::vpc_private_dns::established_not_to_exist`]): the name does not
+    /// exist, and this resolver is not the authority that says so — the recursion is.
+    Nonexistent,
     /// The name belongs to another zone, which this resolver would have to recurse for.
     Elsewhere,
 }

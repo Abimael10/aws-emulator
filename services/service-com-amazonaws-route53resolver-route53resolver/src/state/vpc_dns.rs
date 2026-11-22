@@ -39,9 +39,12 @@
 //! the name asked for ("Route 53 … uses the most specific zone"), authoritatively, since the
 //! Resolver is the authority for a private zone. A name that zone holds nothing at is
 //! [`ResponseCode::NxDomain`], a name it holds other types at is answered with no records,
-//! and a name under NO zone of the VPC is one this emulator has no answer for
-//! ([`ResponseCode::ServFail`]): a query it cannot answer from the account's own records
-//! would have to leave this process to be answered, and nothing here does that.
+//! and a name under NO zone of the VPC is one the Resolver recurses for — which leaves this
+//! process, and nothing here does that, so what it is answered with is the only part of the
+//! public namespace this emulator can read: a name that namespace establishes does not exist
+//! ([`::service_common::vpc_private_dns::established_not_to_exist`]) is
+//! [`ResponseCode::NxDomain`], and every other one is a query this resolver could not answer
+//! ([`ResponseCode::ServFail`]).
 //!
 //! # A VIEW, not a live resolver
 //!
@@ -59,6 +62,7 @@ use ::service_com_amazonaws_route53_awsdnsv20130401::ops::types::shared_types::R
 use ::service_com_amazonaws_route53_awsdnsv20130401::state as route53;
 
 use ::service_common::vpc_dns_firewall::FirewallDecision;
+use ::service_common::vpc_private_dns::established_not_to_exist;
 
 use super::dns_firewall::{qtype_number, FirewallView};
 use super::{ec2, ENDPOINT_STATUS_OPERATIONAL, IP_STATUS_ATTACHED};
@@ -297,6 +301,13 @@ impl VpcDnsView {
 
     /// The answer itself: what the DNS Firewall decides about the name, and otherwise the zone
     /// the name falls in and what that zone holds for it.
+    ///
+    /// A name NO zone of this VPC holds is one the resolver recurses for, and what a recursion
+    /// comes to here is the only part of the public namespace this emulator can read: a name
+    /// that namespace establishes does not exist
+    /// ([`::service_common::vpc_private_dns::established_not_to_exist`], the one reading of that
+    /// question every in-VPC resolver takes) is answered as one that does not, and every other
+    /// name is one this resolver could not answer ([`ResponseCode::ServFail`]).
     fn resolved(&self, name: &str, record_type: &str) -> Answer {
         let asked = route53::canonical_dns_name(name);
         let record_type = record_type.trim().to_ascii_uppercase();
@@ -305,11 +316,16 @@ impl VpcDnsView {
         if let Some(blocked) = self.blocked(&asked, &record_type) {
             return blocked;
         }
-        self.zone_answer(&asked, &record_type).unwrap_or(Answer {
-            code: ResponseCode::ServFail,
-            authoritative: false,
-            records: Vec::new(),
-        })
+        self.zone_answer(&asked, &record_type)
+            .unwrap_or_else(|| Answer {
+                code: if established_not_to_exist(&asked) {
+                    ResponseCode::NxDomain
+                } else {
+                    ResponseCode::ServFail
+                },
+                authoritative: false,
+                records: Vec::new(),
+            })
     }
 
     /// What the PRIVATE HOSTED ZONES of this VPC hold for the canonical name `asked` of
@@ -1022,13 +1038,40 @@ mod tests {
                 }),
             ),
             (
-                "a name under no zone of the VPC",
+                "a name under a zone somebody owns, which the resolver recurses for",
                 &link_local,
                 "example.com",
                 TYPE_A,
                 PROTOCOL_UDP,
                 Resolution::Answered(Answer {
                     code: ResponseCode::ServFail,
+                    authoritative: false,
+                    records: Vec::new(),
+                }),
+            ),
+            (
+                // The public namespace establishes that a name under one of the top-level
+                // domains the root zone never delegates does not exist, which is what the
+                // recursion for it comes to.
+                "a name under a top-level domain the root zone never delegates",
+                &link_local,
+                "ledger.nothing-here.invalid",
+                TYPE_A,
+                PROTOCOL_UDP,
+                Resolution::Answered(Answer {
+                    code: ResponseCode::NxDomain,
+                    authoritative: false,
+                    records: Vec::new(),
+                }),
+            ),
+            (
+                "a name under another of them, fully qualified",
+                &link_local,
+                "db.probe.example.test.",
+                TYPE_A,
+                PROTOCOL_UDP,
+                Resolution::Answered(Answer {
+                    code: ResponseCode::NxDomain,
                     authoritative: false,
                     records: Vec::new(),
                 }),

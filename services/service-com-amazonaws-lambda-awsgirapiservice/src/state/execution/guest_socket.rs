@@ -17,16 +17,18 @@
 //!
 //! * NO SOCKET IS OPENED, on any path. The destination is a data plane this emulator itself
 //!   opened, which the service that opened it recorded under the address it published
-//!   ([`::service_common::dialable_data_planes`]), and a connection to it is a PIPE whose
-//!   other end that plane's own protocol handler is serving — in this process, exactly as a
-//!   request a handler sends over HTTP is carried by the in-process callback. So the whole of
-//!   what a run can reach is what a service put in that register, nothing it opens leaves
-//!   this process, no host port is dialled and no name is resolved against a host name service
-//!   — a name is resolved by this environment's own resolver ([`super::guest_resolver`]) and an
-//!   address is a KEY here, not something to connect to. An address no plane of this emulator
-//!   answers at is answered the way a host answers one — a refused connection for an address
-//!   of this machine, no route for an address of another host, an unresolvable name for a
-//!   name — and nothing is opened for it.
+//!   ([`::service_common::dialable_data_planes`]), or the DNS of the VPC the function is
+//!   ATTACHED to, which answers at its port over a connection as well as over a datagram
+//!   ([`VpcAttachment::carry_dns_connection`]) — and a connection to either is a PIPE whose
+//!   other end that plane's own protocol handler, or that resolver, is serving in this process,
+//!   exactly as a request a handler sends over HTTP is carried by the in-process callback. So
+//!   the whole of what a run can reach is what a service put in that register and the resolver
+//!   of its own VPC, nothing it opens leaves this process, no host port is dialled and no name
+//!   is resolved against a host name service — a name is resolved by this environment's own
+//!   resolver ([`super::guest_resolver`]) and an address is a KEY here, not something to
+//!   connect to. An address neither answers at is answered the way a host answers one — a
+//!   refused connection for an address of this machine, no route for an address of another
+//!   host, an unresolvable name for a name — and nothing is opened for it.
 //! * The guest holds no descriptor and no socket object of the host: what it is handed is a
 //!   HANDLE, which is valid for the invocation that opened it and names a connection this
 //!   module owns. Every connection an invocation opened is closed when that invocation ends
@@ -54,6 +56,7 @@ use ::base64::Engine as _;
 use ::emulator_server::ListenerConn;
 use ::serde_json::{json, Value};
 use ::service_common::dialable_data_planes::{DialablePlanes, Dialed};
+use ::service_common::vpc_private_dns::{QueryAdmission, PROTOCOL_TCP};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ::tokio::runtime::Handle;
 
@@ -102,6 +105,12 @@ const EPHEMERAL_PORT_LAST: u16 = 60999;
 /// call still cannot wait without end, and what is left of the run's deadline bounds it
 /// besides ([`clamped`]).
 const WAIT_CEILING: Duration = Duration::from_secs(30);
+
+/// How many bytes may be in flight on each half of the pipe a query to the VPC's own DNS runs
+/// on ([`dns_connection`]): one whole DNS message and the two-byte length prefix framing it
+/// (RFC 1035 §4.2.2), which is the largest message that prefix can count — so neither end has
+/// to wait on the other inside one message.
+const DNS_PIPE_BYTES: usize = u16::MAX as usize + 2;
 
 // The numbers a host answers these failures with, as a Python program reads them off
 // `errno`: what a client branches on to tell a refused connection from a reset one.
@@ -167,6 +176,23 @@ struct Connection {
     wire: Option<ListenerConn>,
     /// Whether a TLS session is negotiated on it.
     secured: bool,
+    /// The task answering the OTHER end, for a connection this seam itself serves — the DNS of
+    /// the function's own VPC ([`dns_connection`]) — and `None` for a connection whose other end
+    /// a data plane's own handler serves. It is ABORTED when the connection is dropped
+    /// ([`Connection::drop`]), so no task of a closed connection, or of an invocation that has
+    /// ended, is left running.
+    answering: Option<::tokio::task::JoinHandle<()>>,
+}
+
+/// Dropping a connection ends BOTH halves of it: the client end goes, which is what a plane's
+/// own handler reads as the end of file, and a task this seam spawned to answer the other end is
+/// stopped rather than left to notice.
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(answering) = self.answering.take() {
+            answering.abort();
+        }
+    }
 }
 
 impl Connection {
@@ -524,14 +550,12 @@ impl Sockets {
             }
         }
         // WHERE it may go: a plane this emulator itself opened, recorded under the address it
-        // published, and nothing else — there is nothing else it COULD go to, because what is
-        // opened is a pipe to that plane's handler. An address no plane answers at is answered
-        // as a host answers one.
-        let Some(Dialed { authority, plane, .. }) =
-            dialing.and_then(|dialing| dialing.dialable(&host, port))
-        else {
-            return Err(nothing_answers(inside, &host));
-        };
+        // published — there is nothing else such a connection COULD go to, because what is
+        // opened is a pipe to that plane's handler — or the DNS of the function's own VPC,
+        // which answers a query carried on a connection to its port as well as one carried in
+        // a datagram ([`dns_connection`]). An address neither answers at is answered as a host
+        // answers one.
+        let dialed = dialing.and_then(|dialing| dialing.dialable(&host, port));
         let waiting = clamped(asked, within);
         // Where the connection LEAVES from, read off the same route a datagram's is
         // ([`Self::source_toward`]): the private address of the interface the function's VPC
@@ -561,13 +585,25 @@ impl Sockets {
                     .map_or_else(|| self.lent_port(), |(_address, port)| *port),
             )
         });
-        let wire = runtime.block_on(async {
-            match ::tokio::time::timeout(waiting, plane.dial(from)).await {
-                Ok(Ok(wire)) => Ok(wire),
-                Ok(Err(error)) => Err(Failure::of_io(&error)),
-                Err(_elapsed) => Err(Failure::timed_out()),
+        let (authority, wire, answering) = match dialed {
+            Some(Dialed { authority, plane, .. }) => {
+                let wire = runtime.block_on(async {
+                    match ::tokio::time::timeout(waiting, plane.dial(from)).await {
+                        Ok(Ok(wire)) => Ok(wire),
+                        Ok(Err(error)) => Err(Failure::of_io(&error)),
+                        Err(_elapsed) => Err(Failure::timed_out()),
+                    }
+                })?;
+                (authority, wire, None)
             }
-        })?;
+            None => match dns_connection(inside, &host, port, runtime) {
+                Some(answered) => {
+                    let (authority, wire, answering) = answered?;
+                    (authority, wire, Some(answering))
+                }
+                None => return Err(nothing_answers(inside, &host)),
+            },
+        };
         let mut held = self.locked();
         held.handed += 1;
         held.opened += 1;
@@ -577,6 +613,7 @@ impl Sockets {
             Connection {
                 wire: Some(wire),
                 secured: false,
+                answering,
             },
         );
         let (peer_host, peer_port) = peer_of(&authority, &host, port);
@@ -823,6 +860,61 @@ impl Sockets {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// The connection a query carried to the DNS of the function's OWN VPC runs on: the client end
+/// of a pipe whose other end that VPC's resolver answers on
+/// ([`VpcAttachment::carry_dns_connection`]).
+///
+/// `None` when the address this call names is not one the function's VPC answers DNS at, which
+/// leaves the connection to be answered the way a host answers one with nothing there. An `Err`
+/// when it IS such an address but no rule of the interface it sits behind admits a connection to
+/// it from this function: the packet that would open the connection is dropped, so the client
+/// waits for an answer that never comes — the same stop a dropped datagram comes to.
+///
+/// The address is read the way every other destination of this seam is: through the resolver of
+/// this execution environment ([`super::guest_resolver`]), so a connection is opened toward the
+/// same address a handler resolving the name itself would then address.
+fn dns_connection(
+    inside: Option<&VpcAttachment>,
+    host: &str,
+    port: u16,
+    runtime: &Handle,
+) -> Option<Result<ServedConnection, Failure>> {
+    let inside = inside?;
+    let ::std::net::IpAddr::V4(destination) =
+        super::guest_resolver::addresses_of(Some(inside), host)
+            .into_iter()
+            .next()?
+    else {
+        return None;
+    };
+    match inside.dns_admission(destination, port, PROTOCOL_TCP) {
+        QueryAdmission::NoServer => None,
+        QueryAdmission::Dropped => Some(Err(Failure::timed_out())),
+        QueryAdmission::Admitted => {
+            let (client_end, server_end) = ::tokio::io::duplex(DNS_PIPE_BYTES);
+            let answering = inside.clone();
+            // The resolver's own end, answering for as long as the client holds the connection
+            // open. It is stopped when that connection is dropped — which closing it and the
+            // invocation's own release both do ([`Sockets::release`], [`Connection::drop`]) — so
+            // nothing of it outlives the run, and it does work only when the client writes.
+            let serving = runtime.spawn(async move {
+                let mut server_end = server_end;
+                answering.carry_dns_connection(&mut server_end).await;
+            });
+            Some(Ok((
+                format!("{destination}:{port}"),
+                Box::new(client_end),
+                serving,
+            )))
+        }
+    }
+}
+
+/// A connection this seam serves the OTHER end of itself ([`dns_connection`]): the authority it
+/// is reported to the guest under, the client end the guest is handed, and the task answering
+/// the other end.
+type ServedConnection = (String, ListenerConn, ::tokio::task::JoinHandle<()>);
 
 /// What a connection to an address NO plane of this emulator answers at comes to, as a host
 /// answers it, read off the address the destination RESOLVES to

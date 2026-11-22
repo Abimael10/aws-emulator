@@ -16,6 +16,10 @@
 //! * WHAT the PRIVATE HOSTED ZONES associated with the VPC hold for the name asked for, which is
 //!   what such a query is answered out of ahead of anything the VPC's own internal zone holds.
 //!
+//! Beside them it carries the ONE reading of what a name NO zone reaching the VPC holds comes to
+//! ([`established_not_to_exist`]), because every resolver of such a query decides that the same
+//! way and none of them recurses anywhere.
+//!
 //! This register is how a component that carries an in-VPC query asks for them: the owning
 //! service records its data plane when it is mounted on the engine, and whatever carries a query
 //! — the datagram a running function sends, the query a command run on an instance makes — reads
@@ -42,6 +46,41 @@ pub const PROTOCOL_UDP: &str = "udp";
 
 /// The protocol keyword of a query carried on a connection, as a rule states one.
 pub const PROTOCOL_TCP: &str = "tcp";
+
+/// The top-level domains the root zone NEVER delegates, so a name under one of them is
+/// established NOT to exist rather than left unanswered.
+///
+/// Source: RFC 6761 §6, "Domain Name Reservation Considerations" — `invalid`, whose names "are
+/// guaranteed not to exist", `test`, "intended for testing of current or new DNS related code",
+/// and `example`, reserved for documentation. For each of them "DNS Registries/Registrars MUST
+/// NOT grant requests to register" such a name, so no zone under one is ever delegated and a
+/// recursion for it ends at the root with a name that does not exist.
+///
+/// `localhost` is reserved by the same section and is deliberately NOT here: that is a name the
+/// standard fixes as EXISTING — it names the loopback interface of the machine asking — rather
+/// than one it fixes as absent.
+pub const NEVER_DELEGATED_TLDS: &[&str] = &["invalid", "test", "example"];
+
+/// Whether the public namespace ESTABLISHES that `name` does not exist, which is the one part of
+/// it a resolver of this emulator can answer for without recursing anywhere: a name under one of
+/// [`NEVER_DELEGATED_TLDS`], or one of those domains itself.
+///
+/// This is the ONE reading of that question, asked by every in-VPC resolver of this emulator:
+/// what each of them answers for a name no zone reaching the VPC holds is what a recursion would
+/// have come to, and this says when that is a name that does not exist. A name under a zone
+/// somebody OWNS is not one of them — nothing here can establish either that it exists or that
+/// it does not — so such a name stays a query the resolver could not answer.
+///
+/// `name` may be spelled with the trailing dot of a fully qualified name and in any case.
+#[must_use]
+pub fn established_not_to_exist(name: &str) -> bool {
+    let named = name.trim();
+    let named = named.strip_suffix('.').unwrap_or(named);
+    let last = named.split('.').next_back().unwrap_or_default();
+    NEVER_DELEGATED_TLDS
+        .iter()
+        .any(|reserved| last.eq_ignore_ascii_case(reserved))
+}
 
 /// Where a query asked inside a VPC comes FROM: the three facts a security group on the
 /// addressed interface is matched against.
@@ -219,6 +258,39 @@ impl VpcPrivateDnsPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RULE: the public namespace establishes that a name under a top-level domain the root zone
+    /// never delegates does not exist, and establishes nothing about a name under a domain
+    /// somebody owns.
+    ///
+    /// The rows span the catalog ([`NEVER_DELEGATED_TLDS`], RFC 6761 §6) and the forms a name is
+    /// written in: each reserved domain itself and a name under it, the spelling with a trailing
+    /// dot, mixed case, and the `localhost` the same section reserves as a name that DOES exist.
+    #[test]
+    fn only_a_name_the_root_zone_never_delegates_is_established_not_to_exist() {
+        // (case, the name as it is asked, whether the namespace establishes it does not exist)
+        let rows: &[(&str, &str, bool)] = &[
+            ("a name under the reserved invalid domain", "db.nothing.invalid", true),
+            ("the reserved invalid domain itself", "invalid", true),
+            ("a name under the reserved test domain", "db.probe.example.test", true),
+            ("the same name fully qualified", "db.probe.example.test.", true),
+            ("a name under the reserved example domain", "host.example", true),
+            ("one spelled in mixed case", "Host.INVALID", true),
+            ("a name under a domain somebody owns", "broker.example.com", false),
+            ("one under another such domain", "www.example.net", false),
+            ("the loopback domain the same section reserves", "db.localhost", false),
+            ("a name of a private zone under no reserved domain", "app.probe.internal", false),
+            ("no name at all", "", false),
+        ];
+        for (case, name, expected) in rows {
+            let decided = established_not_to_exist(name);
+            assert_eq!(
+                decided, *expected,
+                "case {case:?}: expected established_not_to_exist({name:?}) to be {expected}, \
+                 got {decided}"
+            );
+        }
+    }
 
     /// A plane holding one endpoint address and one name in one VPC, for the rows below.
     struct OneEndpoint {
