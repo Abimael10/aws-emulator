@@ -1,0 +1,55 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: route53resolver.system-rule-overrides-the-forward-rule-for-the-subdomain
+Issue-Shape-Id: com.amazonaws.route53resolver#Route53Resolver
+Issue-Key: route53resolver.system-rule-overrides-the-forward-rule-for-the-subdomain|_poll_dns#20|Timeout|time.sleep(5)
+Issue-Commit: 99b4003ffaa9702facb506eecc4da0e295bc99f1
+
+# route53resolver: a SYSTEM ResolverRule never overrides the FORWARD rule covering its parent domain — the in-VPC DNS data plane ignores resolver-rule precedence and the check never converges
+
+> _Note: this issue was identified against the code base at commit `99b4003ffaa9702facb506eecc4da0e295bc99f1`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateResolverRule
+
+## Description
+One net-new root cause, reached by 1 check listed under `### route53resolver`.
+
+Cause 1 of 1: Resolver-rule PRECEDENCE is not emulated in the VPC DNS data plane. A FORWARD rule on a parent domain plus a SYSTEM rule on one of its subdomains, both associated to the same VPC and both reporting association Status=COMPLETE, must produce two DIFFERENT answers for the two names in the same query batch (parent forwarded, subdomain resolved recursively). The emulator never reaches that state: the in-VPC answers never change after the rules are associated, so the check's bounded polls never satisfy their predicates and the check is cut off by the harness budget with no graded result. Failing check: route53resolver.system-rule-overrides-the-forward-rule-for-the-subdomain.
+
+RELATION TO OPEN ISSUES — this is NOT covered by any of them. 20261121T162722Z-route53resolver-an-associated-forward-resolverrule-never-diverts-queries.md is keyed to a different check (forward-rule-diverts-only-the-matched-domain-and-disassociation-restores-it) and describes only the FORWARD leg: a single rule's effect on its own DomainName. It says nothing about SUBDOMAIN matching of a FORWARD rule, nor about SYSTEM precedence over it, nor about scoping the override so the parent stays forwarded — the behaviors this check exists to pin, and which a fix for the single-rule FORWARD leg can leave entirely unimplemented. 20261120T050704Z-route53resolver-in-vpc-dns-data-plane-serves-no.md covers public/private names answering at all, which this check needs as a precondition and which its baseline leg exercises first.
+
+AWS: Smithy (services/service-com-amazonaws-route53resolver-route53resolver) documents the precedence rule on ResolverRule.RuleType verbatim: "If a query matches multiple Resolver rules (example.com and www.example.com), outbound DNS queries are routed using the Resolver rule that contains the most specific domain name (www.example.com)." and "When you have a forwarding rule to forward DNS queries for a domain to your network and you want Resolver to process queries for a subdomain of that domain, specify SYSTEM." So: (a) a FORWARD rule on example.com also matches www.example.com; (b) a SYSTEM rule on www.example.com makes Resolver process that subdomain itself while example.com stays forwarded; (c) removing the SYSTEM rule's association puts the subdomain back under the parent's FORWARD rule. The DNS answers themselves are recorded behavior only — no Smithy shape models a DNS response. What the recording shows, for queries issued from inside the VPC through the Amazon-provided resolver (169.254.169.253): before any rule, both the parent and the subdomain answer NOERROR with answer records; with only the FORWARD rule (TargetIps = an in-subnet address with nothing listening on 53) associated and COMPLETE, BOTH names come back with an EMPTY answer section (rcode SERVFAIL or a client timeout are both acceptable — the rcode is not part of the requirement); after additionally associating the SYSTEM rule for the subdomain, the subdomain answers NOERROR with answer records again while the parent still has an empty answer section; after DisassociateResolverRule for the SYSTEM rule, the subdomain goes back to an empty answer section and the parent stays empty.
+
+Emulator: the answers never diverge between the two names and never change in response to the associations. The check's barrier poll (300 s budget, re-querying every 5 s, predicate = the parent has no answer records) and its subsequent SYSTEM-rule poll (predicate = the subdomain HAS answer records) both keep seeing the same unchanged answer set, so neither predicate is ever met and the body makes no progress; the run is terminated by the harness with `Check timed out after 60.0s` [mismatch] without the check ever producing its own assertion message. Nothing in the emulator's control plane is wrong here — CreateResolverRule accepts both RuleType=FORWARD and RuleType=SYSTEM and the associations reach COMPLETE; the rules are simply never consulted when an answer is produced, so no amount of polling can observe the documented precedence.
+
+Why: a client cannot test hybrid-DNS routing or the carve-outs it depends on. The SYSTEM rule is the ONLY mechanism for exempting a subdomain from a forwarded parent domain (e.g. forwarding corp.example.com to on-premises resolvers while keeping svc.corp.example.com on AWS-internal resolution), and against this emulator an application sees identical answers whether that exemption exists, is mis-scoped, or is absent. A flat rule map that takes the first or last match — rather than the longest DomainName suffix — passes a single-rule test and gets exactly one of these two names wrong; because the emulator applies no rule at all, that class of bug is invisible, as is the restore-on-disassociate semantics.
+
+Fix: the VPC DNS resolver data plane — the component answering queries addressed to the VPC resolver — must, before answering from its own zones/recursive path, select among the querying VPC's ResolverRuleAssociations the rule whose DomainName is the LONGEST matching suffix of the queried name, then act on that rule's RuleType: FORWARD sends the query to the rule's TargetIps (an unreachable target yielding an empty answer section), SYSTEM/RECURSIVE resolves locally as if no forwarding rule applied. Selection must be per-query-name, so a parent and a subdomain in the same batch can take different branches, and a rule must stop applying as soon as its association is removed. Secondarily, the check also needs its setup legs (VPC-attached querier reaching Active, OUTBOUND endpoint reaching OPERATIONAL, associations reaching COMPLETE) to settle promptly so the body is not spent waiting; the recorded run reaches the barrier poll and then stalls there.
+
+Traces: route53resolver.system-rule-overrides-the-forward-rule-for-the-subdomain, as an example.
+
+## Evidence
+Expected (recorded AWS behavior). All queries are issued from inside a VPC with EnableDnsSupport and EnableDnsHostnames on, through the Amazon-provided resolver, with parent = a public apex (example.com) and child = a subdomain of it (www.example.com), and the two names queried in the SAME batch:
+  1. Baseline, no rules: parent -> answers non-empty; child -> answers non-empty.
+  2. CreateResolverRule(RuleType="FORWARD", DomainName=parent, ResolverEndpointId=<OUTBOUND endpoint>, TargetIps=[{Ip: <in-subnet address with nothing listening>, Port: 53}]) + AssociateResolverRule(VPCId=<vpc>) reaching Status=COMPLETE: parent -> EMPTY answer section; child -> EMPTY answer section too (a FORWARD rule on example.com matches www.example.com).
+  3. CreateResolverRule(RuleType="SYSTEM", DomainName=child) + AssociateResolverRule reaching COMPLETE: child -> rcode NOERROR with answer records; parent -> still EMPTY (the override is scoped to the subdomain).
+  4. DisassociateResolverRule for the SYSTEM rule: child -> EMPTY again (back under the parent's FORWARD rule); parent -> still EMPTY.
+
+Actual (emulator), route53resolver.system-rule-overrides-the-forward-rule-for-the-subdomain [mismatch]:
+  The answers for the two names never diverge and never change after either association, so step 2's barrier poll (predicate: parent has no answer records, 300 s budget, re-queried every 5 s) and step 3's poll (predicate: child HAS answer records) are never satisfied; the body makes no further progress and the harness terminates the check:
+    Check timed out after 60.0s
+  No step after the associations is ever graded, and the check never emits its own diagnosis ("the FORWARD rule for <parent> never diverted <parent> away from the resolver's own recursive answer" / "the SYSTEM rule for <child> never overrode the FORWARD rule for <parent>").
+
+The diverging behavior is the ANSWER CONTENT per queried name once rules are associated: AWS makes the parent and the subdomain answer differently depending on the most-specific matching rule; the emulator serves one unchanged answer for both regardless of the rules. In the messages above, the fixed text is the quoted sentence; the domain names, VPC/subnet CIDRs, the .250 forward-target address, the endpoint/rule/association ids and all generated names are per-run values from the request and the emulator's state, and are not part of the requirement.
+
+## Steps to Reproduce
+1. ec2 CreateVpc (e.g. 10.60.0.0/16) with EnableDnsSupport=true and EnableDnsHostnames=true; create two subnets in distinct AZs; take the VPC's default security group.
+2. Stand up an in-VPC querier (a VPC-attached Lambda in subnet[0] with that security group) that sends UDP DNS queries to 169.254.169.253 and returns {rcode, answers} per queried name; wait for its State to be Active.
+3. BASELINE: query (example.com, A) and (www.example.com, A) in one batch. EXPECTED: both return non-empty answers.
+4. route53resolver CreateResolverEndpoint(Direction="OUTBOUND", IpAddresses=[{SubnetId: subnet[0]}, {SubnetId: subnet[1]}], SecurityGroupIds=[<default sg>]); poll GetResolverEndpoint until Status=OPERATIONAL and IpAddressCount == 2.
+5. CreateResolverRule(RuleType="FORWARD", DomainName="example.com", ResolverEndpointId=<endpoint>, TargetIps=[{"Ip": "<subnet-prefix>.250", "Port": 53}]) — an in-subnet address with nothing listening on 53 — then AssociateResolverRule(ResolverRuleId=<rule>, VPCId=<vpc>) and poll GetResolverRuleAssociation until Status=COMPLETE.
+6. Re-query both names from inside the VPC, polling up to 300 s. EXPECTED: BOTH example.com and www.example.com return an empty answer section (the FORWARD rule matches the subdomain too). OBSERVED: both keep returning the unchanged pre-rule answers, the poll never converges, and the check is cut off (`Check timed out after 60.0s`).
+7. CreateResolverRule(RuleType="SYSTEM", DomainName="www.example.com") and AssociateResolverRule to the same VPC; poll to COMPLETE. Re-query both names. EXPECTED: www.example.com -> NOERROR with answers, example.com -> still empty. (Unreachable today.)
+8. DisassociateResolverRule for the SYSTEM rule and re-query. EXPECTED: www.example.com back to an empty answer section, example.com still empty. (Unreachable today.)
