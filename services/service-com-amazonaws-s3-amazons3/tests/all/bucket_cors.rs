@@ -46,6 +46,17 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, send_bytes, Answer};
 use super::bucket_website::{content, reported};
 
+/// How `PutBucketCors` JUDGES the configuration it is given — which documents it refuses,
+/// what each refusal says, and that a refused document changes nothing.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is — and this is the module whose payload writer and rule builders it spells its
+/// configurations with. The `#[path]` is relative to this file's own directory, and is
+/// needed because `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "bucket_cors/rule_validation.rs"]
+mod rule_validation;
+
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 

@@ -76,7 +76,11 @@ const VARY_VALUE: &str = "Origin, Access-Control-Request-Headers, Access-Control
 
 /// The value an `AllowedOrigin` or an `AllowedHeader` admits everything with, and the
 /// character either may carry "at most one" of (`CORSRule$AllowedOrigins`).
-const WILDCARD: &str = "*";
+///
+/// The store's own spelling, which is also what `PutBucketCors` counts a pattern's wildcards
+/// against ([`crate::state::CORS_WILDCARD`]): the matcher below and the validation that
+/// admits a pattern into the configuration at all read the same character.
+const WILDCARD: &str = crate::state::CORS_WILDCARD;
 
 /// The most entries of a preflight's `Access-Control-Request-Headers` one answer is matched
 /// against.

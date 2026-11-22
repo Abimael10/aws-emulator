@@ -248,7 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 rejection.code(),
                 CORS_REJECTION_STATUS,
-                rejection.to_string(),
+                // The `<Message>` S3 publishes for the refusal: the code's own fixed
+                // sentence where the code is `MalformedXML`, and the sentence stating the
+                // limit the document broke otherwise — never this emulator's prose about
+                // the member path the rules arrived on or the count they arrived in.
+                rejection.message(),
             ));
         }
 
