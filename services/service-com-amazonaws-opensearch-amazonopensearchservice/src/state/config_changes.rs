@@ -42,6 +42,16 @@ pub struct ConfigChange {
     pub revert_to: Option<DomainOptions>,
     /// Whether this change was cancelled before it landed.
     pub cancelled: bool,
+    /// The stages the deployment of this change goes through, in the order the
+    /// service performs them — `ChangeProgressStages`, reported with the
+    /// `TotalNumberOfStages` this list is the length of.
+    ///
+    /// Recorded by [`Domain::begin_change`] for a change the service has BEGUN
+    /// applying to a provisioned cluster, and advanced by the clock ([`ChangeStage`]).
+    /// EMPTY for a change that deploys nothing: the one a create starts, which waits
+    /// for the cluster it would be applied to, and the one a delete records, which
+    /// applies no configuration at all.
+    pub stages: Vec<ChangeStage>,
 }
 
 impl ConfigChange {
@@ -51,7 +61,13 @@ impl ConfigChange {
     /// The completion is dated at the DUE instant rather than at `now`, so the
     /// `LastUpdatedTime` a caller reads does not move with the moment it happened to
     /// look.
+    ///
+    /// The STAGES of the change are owed their own movements by the same clock, each
+    /// on its own share of the change's window, so they are materialised here too:
+    /// what a caller reads about the change and what it reads about the stages of the
+    /// change are then always as of the same instant.
     pub(super) fn settle(&mut self, now: SystemTime) {
+        self.settle_stages(now);
         let Some(due) = self.completes_at else {
             return;
         };
@@ -60,6 +76,24 @@ impl ConfigChange {
         }
         self.completes_at = None;
         self.last_updated_at = due;
+    }
+
+    /// Materialise whatever the clock owes this change's STAGES at `now`: each one is
+    /// being worked on once its own share of the change's window has begun and done
+    /// once that share has passed ([`ChangeStage::settle`]).
+    fn settle_stages(&mut self, now: SystemTime) {
+        for stage in &mut self.stages {
+            stage.settle(now);
+        }
+    }
+
+    /// Stop every stage of this change that had not been performed at `now`: the
+    /// change was cancelled, so the work those stages stood for is not going to be
+    /// performed.
+    pub(super) fn fail_stages(&mut self, now: SystemTime) {
+        for stage in &mut self.stages {
+            stage.fail(now);
+        }
     }
 
     /// Whether this change is still being applied.
@@ -86,9 +120,11 @@ impl ConfigChange {
         }
     }
 
-    /// `ConfigChangeStatus` for this change: the emulator applies a change in one
-    /// step, so it is `ApplyingChanges` until the change falls due and `Completed`
-    /// after — or `Cancelled` where a cancel stopped it before it landed.
+    /// `ConfigChangeStatus` for this change: it is `ApplyingChanges` for as long as the
+    /// deployment applying it is under way — until the change falls due — and
+    /// `Completed` after, or `Cancelled` where a cancel stopped it before it landed.
+    /// Which stage of that deployment it is on is reported beside this, per stage
+    /// ([`ChangeStage`]).
     pub fn config_change_status(&self) -> &'static str {
         if self.in_progress() {
             CONFIG_CHANGE_APPLYING_CHANGES
@@ -117,12 +153,16 @@ impl ConfigChange {
             status: Some(self.status().to_string()),
             pending_properties: Some(pending),
             completed_properties: Some(completed),
-            // OpenSearch Service's blue/green deployment stages are not published,
-            // and this emulator applies a configuration change in ONE step rather
-            // than walking a sequence of stages — so no stage list is invented and
-            // the total stays at the member's own modelled default.
-            total_number_of_stages: 0,
-            change_progress_stages: None,
+            // "The total number of stages required for the configuration change" is
+            // the number of stages the change reports, so the denominator a caller
+            // renders progress against is the list beside it — a change that deploys
+            // nothing reports no stage and the total stays at the member's own
+            // modelled default. The container is reported either way, empty rather
+            // than absent, so a caller walking the stages has a list to walk.
+            total_number_of_stages: i32::try_from(self.stages.len()).unwrap_or(i32::MAX),
+            change_progress_stages: Some(
+                self.stages.iter().map(ChangeStage::to_stage).collect(),
+            ),
             last_updated_time: Some(datetime(self.last_updated_at)),
             config_change_status: Some(self.config_change_status().to_string()),
             initiated_by: Some(self.initiated_by.clone()),

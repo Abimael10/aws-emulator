@@ -503,17 +503,10 @@ pub fn reported_change_progress(
         progress.config_change_status = Some(CONFIG_CHANGE_PENDING.to_string());
         progress.status = Some(CHANGE_STATUS_PENDING.to_string());
     }
-    // "The specific stages that the domain is going through to perform the
-    // configuration change": the service publishes none for a change it has not begun
-    // applying, which is an empty list rather than no list at all — a caller walking
-    // the stages has a list to walk. "The total number of stages required for the
-    // configuration change" is the number of stages that list carries, so the
-    // denominator a caller renders progress against is the stages the change reports:
-    // this emulator applies a change in ONE step and publishes no stage, so the list is
-    // empty and the total is zero.
-    progress.total_number_of_stages = 0;
-    progress.change_progress_stages = Some(Vec::new());
-    // Both lists name the same properties the same way; which of the two a property
+    // The stages the change is going through, and the total beside them, are the
+    // change's own record of the deployment applying it ([`ConfigChange::stages`]).
+    //
+    // Both property lists name the same properties the same way; which of the two a property
     // sits in is `ConfigChange`'s own answer.
     if let Some(pending) = progress.pending_properties.take() {
         progress.pending_properties = Some(reported_properties(domain, &pending));

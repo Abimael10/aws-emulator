@@ -420,6 +420,14 @@ impl Domain {
     /// timestamp, so two calls landing on one clock tick still record one change
     /// each, with its own properties. They are stored sorted and deduplicated, so the
     /// same change reports the same list twice.
+    ///
+    /// A change the service BEGINS APPLYING to a running cluster is applied by
+    /// deploying that cluster anew, so the record carries the stages that deployment
+    /// goes through ([`stage_plan`]) and the clock advances them over the change's own
+    /// window. A change that deploys nothing records none: the one a create starts has
+    /// no cluster to apply anything to yet — it waits for one, and says so through
+    /// every descriptor of the domain — and the one a delete records applies no
+    /// configuration at all.
     pub fn begin_change(&mut self, status: &str, properties: &[&str], now: SystemTime) {
         self.processing = true;
         self.processing_status = status.to_string();
@@ -428,17 +436,24 @@ impl Domain {
             properties.iter().map(|option| option.to_string()).collect();
         properties.sort();
         properties.dedup();
+        let completes_at = self.processing_until;
+        let deploys = self.cluster_is_up() && !properties.is_empty();
+        let stages = match (deploys, completes_at) {
+            (true, Some(due)) => stage_plan(now, due),
+            _ => Vec::new(),
+        };
         self.changes.push_back(ConfigChange {
             change_id: new_change_id(),
             properties,
             started_at: now,
             last_updated_at: now,
-            completes_at: self.processing_until,
+            completes_at,
             initiated_by: INITIATED_BY_CUSTOMER.to_string(),
             // Where this change can be gone back from, the call that started it
             // records the configuration it started from ([`Self::record_revert`]).
             revert_to: None,
             cancelled: false,
+            stages,
         });
         // The history is bounded: past its cap the oldest change is dropped, so a
         // domain updated forever holds a fixed number of records.
@@ -490,6 +505,10 @@ impl Domain {
             change.cancelled = true;
             change.last_updated_at = now;
             change.revert_to = None;
+            // The deployment this change was being applied by stops where the cancel
+            // found it: a stage already performed stays performed, and one the
+            // deployment had not finished is not going to be.
+            change.fail_stages(now);
         }
         if let Some(options) = revert {
             options.restore(self);

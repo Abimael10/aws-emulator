@@ -34,6 +34,15 @@ use super::domain_lifecycle::{
 #[path = "change_progress/change_status_reported_consistently.rs"]
 mod change_status_reported_consistently;
 
+/// The same change record read stage by stage: not which properties a change names or what
+/// status it is in as a whole, but the STAGES of the deployment applying it — the list
+/// `ChangeProgressStages` reports, the count beside it and the order they advance in.
+///
+/// The `#[path]` is what points this child at its own directory, for the reason stated
+/// above.
+#[path = "change_progress/deployment_stages.rs"]
+mod deployment_stages;
+
 /// A well-formed `GUID` that names no change: the id space is 128 bits wide and the
 /// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
 const ABSENT_CHANGE_ID: &str = "00000000-0000-4000-8000-000000000000";

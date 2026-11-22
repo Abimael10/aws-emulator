@@ -143,6 +143,9 @@ mod whole_value_pattern;
 
 /// An accepted configuration change of a domain, and a dry run of one.
 mod config_changes;
+/// The stages the deployment of an accepted configuration change goes through, and
+/// where the clock has got them to.
+mod change_stages;
 /// A domain's service software and the engine-version upgrades it is put through.
 mod service_software;
 /// A change a domain has queued rather than taken yet.
@@ -152,6 +155,7 @@ mod connections;
 /// Insights of an account or a domain, and the feedback left on one.
 mod insights;
 
+pub use change_stages::*;
 pub use config_changes::*;
 pub use connections::*;
 pub use insights::*;
@@ -247,7 +251,8 @@ use crate::ops::types::{
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions, BaseException,
     CapabilityBaseRequestConfig, CapabilityBaseResponseConfig, CapabilityExtendedResponseConfig,
-    ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
+    ChangeProgressDetails, ChangeProgressStage, ChangeProgressStatusDetails, ClusterConfig,
+    ClusterConfigStatus,
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
