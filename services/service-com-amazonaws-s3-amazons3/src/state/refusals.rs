@@ -2670,12 +2670,15 @@ pub const EXPIRED_TOKEN_MESSAGE: &str = "The provided token has expired.";
 /// codes: "InvalidAccessKeyId — The AWS access key ID that you provided does not exist in our
 /// records", HTTP 403).
 ///
-/// What a session credential whose principal is GONE earns — a role session whose role the
-/// account no longer holds (`sts_store::Caller::principal_is_withdrawn`) — and it is answered
-/// at credential resolution, before any policy is read: the two codes mean opposite things to
-/// a client, since this one is terminal and tells a credential provider to stop using the
-/// credential, while [`ACCESS_DENIED_CODE`] says the credential is still believed valid and
-/// only the grant is missing.
+/// What a request presenting a key id the emulator resolves to NOTHING earns — one it never
+/// issued, one `iam:DeleteAccessKey` withdrew, one presented to a service it was not scoped
+/// for ([`crate::service::sigv4`] answers that from the authentication layer's own verdict) —
+/// and what a session credential whose principal is GONE earns as well: a role session whose
+/// role the account no longer holds (`sts_store::Caller::principal_is_withdrawn`). Both are
+/// answered at credential resolution, before any policy is read: the two codes mean opposite
+/// things to a client, since this one is terminal and tells a credential provider to stop
+/// using the credential, while [`ACCESS_DENIED_CODE`] says the credential is still believed
+/// valid and only the grant is missing.
 pub const INVALID_ACCESS_KEY_ID_CODE: &str = "InvalidAccessKeyId";
 /// See [`INVALID_ACCESS_KEY_ID_CODE`].
 pub const INVALID_ACCESS_KEY_ID_STATUS: u16 = 403;

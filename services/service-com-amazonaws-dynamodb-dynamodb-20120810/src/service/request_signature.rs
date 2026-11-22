@@ -349,8 +349,10 @@ fn stated_fault(req: &RtRequest, reported: &str) -> Option<RtResponse> {
     // A complete presentation the verifier recomputed and did not match: the class and the
     // sentence the shared layer owns for that failure
     // (`service_common::authentication_refusal`), restated here only in the STATUS — a
-    // signature that does not match is a fault in the request that carried it.
-    let stated: Refused = super::AUTHENTICATION_REFUSAL.stated(reported)?;
+    // signature that does not match is a fault in the request that carried it. What the
+    // request presented is read through that same layer, so one reading answers for both.
+    let presented = ::service_common::authentication_refusal::presented_credential(req);
+    let stated: Refused = super::AUTHENTICATION_REFUSAL.stated(reported, presented)?;
     (stated.code == super::AUTHENTICATION_REFUSAL.signature_mismatch)
         .then(|| fault_response(req, &SignatureFault::Unverified(stated.message)))
 }

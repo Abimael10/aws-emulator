@@ -56,11 +56,22 @@
 //! the identity service's OWN accessor over the records its `CreateAccessKey` /
 //! `UpdateAccessKey` wrote — the same store this service's authorization reads its
 //! principal's documents from ([`crate::state::authorization`]).
+//!
+//! A key the account DELETED is not a record with a status at all: it resolves to no
+//! credential, which the emulator's authentication layer decides before any operation runs
+//! and reports as ONE structural refusal carrying its own generic code. That refusal is
+//! stated in this service's vocabulary by the shared layer the entry is wrapped in
+//! ([`::service_common::authentication_refusal`], [`AUTHENTICATION_REFUSAL`]), so a caller
+//! whose key is gone reads the same unknown-credential code as one whose key was deactivated
+//! instead of an authorization denial.
 
-use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
+use smithy_server_runtime::{http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service};
 use std::sync::Arc;
 
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+use ::service_common::authentication_refusal::{
+    AuthenticationRefusalDefinition, StatedAuthenticationRefusal,
+};
 use ::service_common::unusable_credential::UnusableCredential;
 
 mod validation;
@@ -72,13 +83,33 @@ mod validation;
 /// so it is the code an SDK's credential-refresh path keys on.
 const UNUSABLE_CREDENTIAL_CODE: &str = "UnrecognizedClientException";
 
+/// The codes this service answers a request the emulator's authentication layer refused with
+/// (see [`::service_common::authentication_refusal`], which owns the rule and the sentences):
+/// the `awsJson` unknown-credential code — the same one the withdrawn-key refusal above
+/// answers with, because a credential the account will not accept and one that resolves to
+/// nothing are the same failure to the caller — for an access key id that resolves to no
+/// credential, and the `awsJson` signature code for one that resolves and whose signature
+/// does not verify. Neither is `AccessDenied`, which is an authorization verdict about a
+/// principal this service DID resolve.
+///
+/// A request that presented NO credential at all is not an unknown credential, so none is
+/// named here and such a request keeps the answer the front door already gives it.
+const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthenticationRefusal {
+    unresolved_credential: UNUSABLE_CREDENTIAL_CODE,
+    signature_mismatch: "InvalidSignatureException",
+    missing_credential: None,
+};
+
 /// The `com-amazonaws-secretsmanager-secretsmanager` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, wrapped in the layer that states an authentication refusal in
+    /// this service's own codes ([`AUTHENTICATION_REFUSAL`]); identity, the protocol and the
+    /// routing table are the generated entry's untouched.
+    entry: AuthenticationRefusalDefinition<crate::ServiceDefinition<Eng>>,
     /// The SAME shared engine the generated entry threaded into every operation, kept here
     /// too because the pre-dispatch credential check below has to read the access keys the
     /// identity service's own operations wrote. Never a store of its own: it is the `Arc`
@@ -94,7 +125,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry: AuthenticationRefusalDefinition::new(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                AUTHENTICATION_REFUSAL,
+            ),
             engine,
             unusable_credential: UnusableCredential::stated_as(UNUSABLE_CREDENTIAL_CODE),
         }

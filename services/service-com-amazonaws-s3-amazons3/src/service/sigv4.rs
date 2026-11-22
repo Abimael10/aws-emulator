@@ -10,7 +10,7 @@
 //! ([`remember`], called from this service's routing seam, which the framework reaches
 //! before it authenticates) and answered once ([`refusal_for`]).
 //!
-//! Five conditions, each with its own answer:
+//! Six conditions, each with its own answer:
 //!
 //! 1. The validity window a SigV4 QUERY-authenticated (presigned) URL asks for is outside
 //!    the range query-string authentication accepts — `X-Amz-Expires` must be a
@@ -35,15 +35,22 @@
 //!    signature computes to — [`CLOCK_SKEW_CODE`], with the request's own instant and the
 //!    service's beside the window, which is what tells a caller whose clock has drifted that
 //!    the clock is what to fix.
-//! 4. The credential resolves — the key id names one this emulator ISSUED — so the caller
-//!    is known and what failed is the signature computed under that credential's secret.
+//! 4. The key id resolves to NO credential this emulator holds — never issued, deleted, or
+//!    scoped for another service — so no principal was found and nothing could be
+//!    authorized. S3 answers that at credential RESOLUTION with the code its published error
+//!    list carries for it ([`crate::state::INVALID_ACCESS_KEY_ID_CODE`]) and that code's
+//!    fixed sentence, naming neither the key nor the account: the code is terminal, telling
+//!    an SDK's credential provider to stop using the credential, where an authorization
+//!    denial says the credential stands and only the grant is missing.
+//! 5. The credential DOES resolve, so the caller is known and what failed is the signature
+//!    computed under that credential's secret.
 //!    S3's answer to that one carries, beside the code and the sentence, the SIGNING
 //!    DIAGNOSTICS: the access key id the request named, the string S3 signed, the canonical
 //!    request it built it from, each also as the bytes it hashed, and the signature the
 //!    request itself presented. They are the only way a caller (or a human debugging a
 //!    presigner) can tell WHICH canonical request the service signed from a wrong secret
 //!    key, so they are what makes a signing bug diagnosable at all.
-//! 5. The request presented NO credential at all — the ANONYMOUS caller, which is a caller
+//! 6. The request presented NO credential at all — the ANONYMOUS caller, which is a caller
 //!    S3 serves ("if you grant READ access to the anonymous user, the `GetObject` operation
 //!    returns the object without using an authorization header", `GetObject`'s own
 //!    documentation) rather than one that failed to sign. Nothing was signed, so there is no
@@ -55,18 +62,20 @@
 //!    the same rule an operation's own authorization answers with once a request reaches a
 //!    handler).
 //!
-//! Every one of them is derived from the request as received. Nothing here reads a secret:
-//! the signing key is never named, the signature the service COMPUTED is never answered
-//! (only the one the request carried, which its sender already holds), and nothing is
-//! written anywhere. Every value copied out of a request passes through [`bounded`], and the
-//! signed-header set through [`MAX_SIGNED_HEADERS`], so neither the work one request can ask
-//! for nor the document it is answered with grows with the head it sent; the derivation
-//! itself runs only on the refusal path ([`Diagnostics::of`]).
+//! The first four of those follow from the request as received; which of the last two a
+//! refusal is cannot, because both are complete presentations of a well-formed credential, so
+//! that one bit is read from the layer's OWN verdict (the code it reports, which resolves the
+//! key id before it recomputes any signature). Nothing here reads a secret: the signing key
+//! is never named, the signature the service COMPUTED is never answered (only the one the
+//! request carried, which its sender already holds), and nothing is written anywhere. Every
+//! value copied out of a request passes through [`bounded`], and the signed-header set
+//! through [`MAX_SIGNED_HEADERS`], so neither the work one request can ask for nor the
+//! document it is answered with grows with the head it sent; the derivation itself runs only
+//! on the refusal path ([`Diagnostics::of`]).
 //!
 //! A refusal this module declines to word ([`refusal_for`] answering `None`) keeps the
-//! framework's own, which is what leaves a credential that resolves to nothing — refused
-//! for the credential, not for the signature or the window — to the boundary that already
-//! words it.
+//! framework's own, which is what leaves the verdicts this layer does not answer for — a
+//! security token that resolved to no session — to the boundary that already words them.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -127,6 +136,16 @@ const QUERY_PARAMETERS_STATUS: u16 = 400;
 /// The status every other authentication refusal carries, which is the one the framework
 /// renders them with too.
 const UNAUTHENTICATED_STATUS: u16 = 403;
+
+/// The code the emulator's authentication layer reports for a request whose access key id
+/// resolved to NO credential it holds — its own generic verdict, which is why this service
+/// restates it in the code S3 publishes for that condition
+/// ([`crate::state::INVALID_ACCESS_KEY_ID_CODE`]) rather than answering it as written.
+const REPORTED_UNRESOLVED_CREDENTIAL: &str = "AccessDenied";
+
+/// The code it reports when the key id DID resolve and the signature computed under that
+/// credential's secret is not the one the request carried.
+const REPORTED_SIGNATURE_MISMATCH: &str = "SignatureDoesNotMatch";
 
 /// The sentence AWS answers a presigned URL asking for a validity window longer than
 /// [`MAX_PRESIGNED_EXPIRES_SECS`]. Fixed text in full, the ceiling included: it states the
@@ -737,21 +756,28 @@ fn amz_instant(stamp: &str) -> Option<SystemTime> {
 }
 
 /// How this service answers the authentication refusal of the request `presented` describes,
-/// `issued` answering whether an access key id names a credential this emulator ISSUED and
-/// `anonymous_message` the sentence an ANONYMOUS request against the bucket it addresses is
-/// refused with; or `None` for a refusal this service does not word, which keeps the
-/// framework's own.
+/// `reported` carrying the verdict the emulator's authentication layer reached
+/// ([`REPORTED_UNRESOLVED_CREDENTIAL`]) and `anonymous_message` the sentence an ANONYMOUS
+/// request against the bucket it addresses is refused with; or `None` for a refusal this
+/// service does not word, which keeps the framework's own.
 ///
 /// The order is AWS's: a query string the service cannot use is answered before anything
 /// about the caller, so a presigned URL whose window is outside the accepted range is
 /// refused for the URL whether or not its signature verifies; then the window that has
 /// passed, which refuses an intact signature; then the signing INSTANT, which a signature
 /// cannot rescue either; then the request that presented no credential at all, which has
-/// neither; and last the signature itself, which is the only condition left once the
+/// neither; then the key id that resolved to NO credential, which is a refusal of the
+/// CALLER; and last the signature itself, which is the only condition left once the
 /// credential has resolved.
+///
+/// WHICH of the last two a refusal is, is not derivable from the request — both are complete
+/// presentations of a well-formed credential — so it is read from the layer's own verdict:
+/// the layer resolves the key id before it recomputes a signature, and reports its generic
+/// unresolved-credential code for a key id it could not resolve and the signature code for
+/// one it could.
 pub(super) fn refusal_for(
     presented: &Presented,
-    issued: &dyn Fn(&str) -> bool,
+    reported: &str,
     anonymous_message: &dyn Fn(Option<&str>) -> &'static str,
 ) -> Option<AuthRefusal> {
     let now = SystemTime::now();
@@ -808,7 +834,23 @@ pub(super) fn refusal_for(
             expiry: None,
         });
     }
-    if !issued(&presented.access_key_id) {
+    // The CALLER rather than the request: the layer resolved the presented key id to no
+    // credential this emulator holds — never issued, deleted, or scoped for another service
+    // — so no principal was found and no policy was read. S3 answers that at credential
+    // resolution with its own code for it, which is terminal: it tells a credential provider
+    // to stop using the credential, where an authorization denial says the credential stands
+    // and only the grant is missing.
+    if reported == REPORTED_UNRESOLVED_CREDENTIAL {
+        return Some(AuthRefusal {
+            code: crate::state::INVALID_ACCESS_KEY_ID_CODE,
+            status: crate::state::INVALID_ACCESS_KEY_ID_STATUS,
+            message: crate::state::INVALID_ACCESS_KEY_ID_MESSAGE,
+            diagnostics: None,
+            skew: None,
+            expiry: None,
+        });
+    }
+    if reported != REPORTED_SIGNATURE_MISMATCH {
         return None;
     }
     Some(AuthRefusal {

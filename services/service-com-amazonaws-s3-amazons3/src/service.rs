@@ -1511,10 +1511,9 @@ fn front_door<Eng: Send + Sync + 'static>(
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The SAME shared engine the generated entry threaded into every operation, kept here
-    /// too because the refusal wording below has to ask whether this service ISSUED the
-    /// credential a refused request presented, and the sessions that answer that are the
-    /// ones `CreateSession` recorded ([`Self::issued_credential`]). Never a store of its
-    /// own: it is the `Arc` the router handed to `new`.
+    /// too because several seams of this file read this service's own store — the bucket a
+    /// refused anonymous request addressed ([`Self::anonymous_refusal_message`]) among them.
+    /// Never a store of its own: it is the `Arc` the router handed to `new`.
     engine: Arc<Eng>,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it. See [`wire`] for what it
@@ -1675,23 +1674,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 None => Cow::Borrowed(path),
             },
         }
-    }
-
-    /// Whether `access_key_id` names a credential this emulator ISSUED, and so one an
-    /// authentication refusal has RESOLVED: the key pair the process publishes at start, or
-    /// a session `CreateSession` vended and has not released.
-    ///
-    /// Each is read from the record that owns it rather than from a copy, so a session that
-    /// has expired stops resolving at the moment its own record goes
-    /// ([`crate::state::ComAmazonawsS3Amazons3State::release_expired_sessions`]).
-    fn issued_credential(&self, access_key_id: &str) -> bool {
-        if ::emulator_server::request_authentication::SigV4Authenticator::minted_credentials()
-            .is_some_and(|published| published.access_key_id == access_key_id)
-        {
-            return true;
-        }
-        crate::state::service_state(&*self.engine)
-            .is_some_and(|state| state.lock().holds_vended_session(access_key_id))
     }
 
     /// Whether `req` presents a session credential whose PRINCIPAL is gone, so its access key
@@ -1969,12 +1951,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .or_else(|| self.entry.routing_table().get(operation))
     }
 
-    /// How this service answers the AUTHENTICATION refusal of the request it is serving, or
-    /// `None` for a refusal this service does not word — which keeps the framework's own.
+    /// How this service answers the AUTHENTICATION refusal of the request it is serving,
+    /// `reported` carrying the verdict the emulator's authentication layer reached, or `None`
+    /// for a refusal this service does not word — which keeps the framework's own.
     ///
     /// The framework's structural refusal says only that authentication refused the caller,
     /// so which refusal it is follows from what the REQUEST presented, which [`sigv4`] read
-    /// once for this request and answers from. Rendered through THIS service's own protocol,
+    /// once for this request and answers from, together with that verdict — the one bit the
+    /// request itself cannot tell, since a key id that resolves to nothing and one whose
+    /// signature does not verify present alike. Rendered through THIS service's own protocol,
     /// in the same channel every other refusal of this service goes out in, so the envelope
     /// a client parses — the bare `<Error>` root with its `<Code>`, `<Message>` and
     /// request-correlation elements, and the matching `x-amz-request-id` / `x-amz-id-2`
@@ -1985,13 +1970,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// `None` also on the serializer failure fixed text cannot actually provoke, which
     /// leaves the framework's own refusal to answer rather than panicking in the request
     /// path.
-    fn authentication_refusal_response(&self) -> Option<RtResponse> {
+    fn authentication_refusal_response(&self, reported: &str) -> Option<RtResponse> {
         let presented = sigv4::presented()?;
-        let refusal = sigv4::refusal_for(
-            &presented,
-            &|access_key_id| self.issued_credential(access_key_id),
-            &|bucket| self.anonymous_refusal_message(bucket),
-        )?;
+        let refusal = sigv4::refusal_for(&presented, reported, &|bucket| {
+            self.anonymous_refusal_message(bucket)
+        })?;
         self.protocol
             .serialize_error(
                 &refusal,
@@ -2545,8 +2528,8 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         // Anything else — and an authentication refusal this service declines to word — falls
         // through to the ENTRY's renderer, `chosen` included, so a wording chosen through
         // `override_refusal` is never dropped on the way past.
-        if matches!(error, ProtocolError::Unauthenticated { .. }) {
-            if let Some(response) = self.authentication_refusal_response() {
+        if let ProtocolError::Unauthenticated { code, .. } = &error {
+            if let Some(response) = self.authentication_refusal_response(code) {
                 return response;
             }
         }

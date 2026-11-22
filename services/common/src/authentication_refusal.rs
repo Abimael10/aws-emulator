@@ -12,7 +12,10 @@
 //! * a request that presents NO credential at all — neither of SigV4's two presentations
 //!   (`crate::sigv4_presentation`) — never named a caller to look up, and is answered with
 //!   the service's missing-credential code, the one code that says "you sent no
-//!   credentials" and sends a client to credential DISCOVERY rather than to key validity;
+//!   credentials" and sends a client to credential DISCOVERY rather than to key validity.
+//!   It is never answered with the unknown-credential code: nothing was presented, so
+//!   nothing could be unknown, and a service that words that class at its own front door
+//!   (naming none here) keeps the answer it already has;
 //! * an access key id that resolves to NO credential — never issued, deleted, or presented
 //!   to a service it was not scoped for — and a SECURITY TOKEN that is not the one issued
 //!   for the credential presenting it, failed AUTHENTICATION: no principal was found, so
@@ -129,15 +132,29 @@ pub struct StatedAuthenticationRefusal {
 }
 
 impl StatedAuthenticationRefusal {
-    /// How this service words the refusal the authentication layer reported as `reported`.
+    /// How this service words the refusal the authentication layer reported as `reported`,
+    /// for a request that presented `presented`
+    /// ([`crate::sigv4_presentation`], the one thing about the request this reads).
+    ///
+    /// The layer reports its generic unknown-credential verdict for a key id that resolved to
+    /// nothing AND for a request that offered nothing to resolve, so the two are told apart
+    /// by WHAT was presented: a credential that WAS presented is the unknown-credential
+    /// class, and a request that presented none is the missing-credential class, which
+    /// [`Self::restated`] answers where this service names a class for it and which keeps the
+    /// words it already has where this service names none — a caller that sent no credentials
+    /// is never told the key it did not send is unknown.
     ///
     /// `None` for anything else: a code that is already a service's own (a pre-dispatch
     /// refusal a service rendered itself) keeps the words it was given rather than being
     /// mapped a second time.
     #[must_use]
-    pub fn stated(&self, reported: &str) -> Option<Refused> {
+    pub fn stated(
+        &self,
+        reported: &str,
+        presented: crate::sigv4_presentation::PresentedCredential,
+    ) -> Option<Refused> {
         let (code, message) = match reported {
-            REPORTED_UNRESOLVED_CREDENTIAL => (
+            REPORTED_UNRESOLVED_CREDENTIAL if presented.credential => (
                 self.unresolved_credential,
                 UNRESOLVED_CREDENTIAL_MESSAGE,
             ),
@@ -201,7 +218,12 @@ impl StatedAuthenticationRefusal {
 
 /// What `req` presented to authenticate with, read through the tree's one reading of that
 /// rule ([`crate::sigv4_presentation`]) over the places SigV4 puts a presentation.
-fn presented_credential(
+///
+/// `pub`: a service's own refusal layer that states one of these failures itself asks
+/// [`StatedAuthenticationRefusal::stated`] the same question about the same request, and one
+/// reading of a presentation keeps the two from disagreeing about what a request offered.
+#[must_use]
+pub fn presented_credential(
     req: &RtRequest,
 ) -> crate::sigv4_presentation::PresentedCredential {
     let query = req.uri().split_once('?').map(|(_, query)| query);
@@ -263,10 +285,11 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuthenticationRefus
         // stated only where the service worded nothing.
         let stated = match &error {
             ProtocolError::Unauthenticated { code, .. } => {
-                let named = self.stated.restated(code, presented_credential(req));
+                let presented = presented_credential(req);
+                let named = self.stated.restated(code, presented);
                 match (named, &chosen) {
                     (named @ Some(_), _) => named,
-                    (None, None) => self.stated.stated(code),
+                    (None, None) => self.stated.stated(code, presented),
                     (None, Some(_)) => None,
                 }
             }
@@ -302,13 +325,28 @@ mod tests {
         missing_credential: None,
     };
 
-    /// One row: the service's vocabulary, the code the authentication layer reported, and the
-    /// code and message that service answers for it (`None` where it answers with the words it
-    /// was given).
+    /// What a request of each shape presented.
+    const NOTHING: PresentedCredential = PresentedCredential {
+        credential: false,
+        security_token: false,
+    };
+    const LONG_TERM: PresentedCredential = PresentedCredential {
+        credential: true,
+        security_token: false,
+    };
+    const TEMPORARY: PresentedCredential = PresentedCredential {
+        credential: true,
+        security_token: true,
+    };
+
+    /// One row: the service's vocabulary, the code the authentication layer reported, what the
+    /// request presented, and the code and message that service answers for it (`None` where
+    /// it answers with the words it was given).
     struct Row {
         case: &'static str,
         vocabulary: StatedAuthenticationRefusal,
         reported: &'static str,
+        presented: PresentedCredential,
         stated: Option<(&'static str, &'static str)>,
     }
 
@@ -322,25 +360,56 @@ mod tests {
                 case: "a query service, a credential that resolved to nothing",
                 vocabulary: QUERY,
                 reported: "AccessDenied",
+                presented: LONG_TERM,
                 stated: Some(("InvalidClientTokenId", UNRESOLVED_CREDENTIAL_MESSAGE)),
             },
             Row {
                 case: "a query service, a signature that did not verify",
                 vocabulary: QUERY,
                 reported: "SignatureDoesNotMatch",
+                presented: LONG_TERM,
                 stated: Some(("SignatureDoesNotMatch", SIGNATURE_MISMATCH_MESSAGE)),
             },
             Row {
                 case: "a json service, a credential that resolved to nothing",
                 vocabulary: JSON,
                 reported: "AccessDenied",
+                presented: LONG_TERM,
+                stated: Some(("UnrecognizedClientException", UNRESOLVED_CREDENTIAL_MESSAGE)),
+            },
+            Row {
+                // The same verdict for a TEMPORARY credential: what resolved to nothing is
+                // the key id the request presented, whichever form of credential it is.
+                case: "a json service, a temporary credential that resolved to nothing",
+                vocabulary: JSON,
+                reported: "AccessDenied",
+                presented: TEMPORARY,
                 stated: Some(("UnrecognizedClientException", UNRESOLVED_CREDENTIAL_MESSAGE)),
             },
             Row {
                 case: "a json service, a signature that did not verify",
                 vocabulary: JSON,
                 reported: "SignatureDoesNotMatch",
+                presented: LONG_TERM,
                 stated: Some(("InvalidSignatureException", SIGNATURE_MISMATCH_MESSAGE)),
+            },
+            Row {
+                // Nothing was presented, so nothing could be unknown: a service naming a
+                // missing-credential class has it restated (the table below), and one naming
+                // none keeps the answer it already has rather than being told its key is
+                // unknown.
+                case: "a json service wording the missing class itself, nothing presented",
+                vocabulary: JSON,
+                reported: "AccessDenied",
+                presented: NOTHING,
+                stated: None,
+            },
+            Row {
+                case: "a query service, nothing presented",
+                vocabulary: QUERY,
+                reported: "AccessDenied",
+                presented: NOTHING,
+                stated: None,
             },
             Row {
                 // The stage that resolves the SECURITY TOKEN is restated from the layer's own
@@ -349,6 +418,7 @@ mod tests {
                 case: "a query service, the layer's security-token verdict",
                 vocabulary: QUERY,
                 reported: "InvalidClientTokenId",
+                presented: TEMPORARY,
                 stated: None,
             },
             Row {
@@ -356,12 +426,14 @@ mod tests {
                 case: "a json service, a refusal already worded by the service",
                 vocabulary: JSON,
                 reported: "UnrecognizedClientException",
+                presented: LONG_TERM,
                 stated: None,
             },
             Row {
                 case: "a verdict the layer does not report for a credential",
                 vocabulary: QUERY,
                 reported: "RequestTimeTooSkewed",
+                presented: LONG_TERM,
                 stated: None,
             },
         ];
@@ -370,10 +442,11 @@ mod tests {
             case,
             vocabulary,
             reported,
+            presented,
             stated: expected,
         } in rows
         {
-            let stated = vocabulary.stated(reported);
+            let stated = vocabulary.stated(reported, presented);
             let actual = stated
                 .as_ref()
                 .map(|refused| (refused.code.as_str(), refused.message.as_str()));
@@ -404,19 +477,6 @@ mod tests {
             presented: PresentedCredential,
             restated: Option<(&'static str, &'static str)>,
         }
-        /// What a request of each shape presented.
-        const NOTHING: PresentedCredential = PresentedCredential {
-            credential: false,
-            security_token: false,
-        };
-        const LONG_TERM: PresentedCredential = PresentedCredential {
-            credential: true,
-            security_token: false,
-        };
-        const TEMPORARY: PresentedCredential = PresentedCredential {
-            credential: true,
-            security_token: true,
-        };
         let rows = vec![
             Named {
                 case: "a query service, nothing presented",
