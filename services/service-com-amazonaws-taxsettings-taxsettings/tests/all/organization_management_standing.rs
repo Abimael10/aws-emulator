@@ -22,12 +22,18 @@
 //! account manages (two ids, at both ends of the account-id range) — each against both
 //! `HeritageStatus` values.
 //!
+//! The refusal is asserted as a restJson1 client reads it: the status, the
+//! `x-amzn-errortype` header the error shape is resolved from, and the body — so
+//! the error identity is pinned on both of the places that carry it, not only in
+//! the body.
+//!
 //! The one world with no wire path is the organization another account manages:
 //! Organizations makes the account that creates an organization its management
 //! account, so that world is arranged through the crate's one shared helper
 //! (`record_management_account`), which writes the organization's own stored
 //! record — the very state its handlers answer from.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -38,7 +44,9 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::tax_registration_lifecycle::{call, field_list, mount_on, record_management_account};
+use crate::tax_registration_lifecycle::{
+    call, field_list, mount_on, record_management_account, ERROR_TYPE_HEADER,
+};
 
 /// Every value of the model's `HeritageStatus` enum
 /// (`smithy_query(query="shape", shape="HeritageStatus")`: `OptIn | OptOut`).
@@ -51,6 +59,25 @@ const REGION: &str = "us-east-1";
 /// The `X-Amz-Target` prefix the Organizations emulator routes on (that crate's
 /// `OPERATIONS.md`, "Wire protocol").
 const ORGANIZATIONS_TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
+
+/// The response header a restJson1 client resolves the error SHAPE from is read
+/// by the shared `call` helper into `Answer::error_type`; `ERROR_TYPE_HEADER`
+/// names it in the assertions below.
+///
+/// The error shape the standing gate refuses with, and the status the model gives
+/// it (`smithy_query(query="operation", operation="PutTaxInheritance")`:
+/// `ValidationException`, `httpError` 400).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// See [`VALIDATION_EXCEPTION`].
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The sentence AWS words this refusal with, in full. It is fixed text for the
+/// error class — it names no account, no election and no limit — so it is pinned
+/// here literally rather than read back from the constant the service carries,
+/// which would make the assertion follow a change to the wording instead of
+/// catching it.
+const MANAGEMENT_ACCOUNT_ONLY_SENTENCE: &str =
+    "Only AWS orgs management account is allowed to set tax inheritance.";
 
 /// How the organization the emulated account belongs to is established, if at all.
 #[derive(Debug, Clone, Copy)]
@@ -341,6 +368,103 @@ async fn a_caller_that_manages_no_organization_records_no_election() {
             );
         }
     }
+}
+
+/// RULE: the gate's refusal is the operation's modelled `ValidationException` — the
+/// status the model gives that shape, the shape's name in the header a restJson1
+/// client resolves it from as well as in the body's `__type`, the fixed
+/// `FieldValidationFailed` code and no `fieldList`, because the caller's standing is
+/// not a parameter of the request — and its message is fixed text that interpolates
+/// nothing, so every refused caller is told the same sentence; the served world
+/// carries no error identity at all.
+///
+/// Asserted over every world of [`WORLDS`] (no control plane, no organization, an
+/// organization another account manages at both ends of the account-id range, and
+/// one this account created) against both `HeritageStatus` values.
+#[tokio::test]
+async fn the_refusal_carries_the_modelled_error_identity_on_the_wire() {
+    // What each refused world was told, so the sentences can be compared with one
+    // another and not only with the expected text: fixed text interpolates
+    // nothing, so there must be exactly ONE of them however the call was refused.
+    let mut sentences: BTreeMap<String, String> = BTreeMap::new();
+
+    for world in WORLDS {
+        for election in HERITAGE_STATUSES {
+            let emulator = Emulator::new(world).await;
+            let case = format!("{} / {election}", world.case);
+            let answer = call(
+                &emulator.router,
+                "PutTaxInheritance",
+                &json!({ "heritageStatus": election }),
+            )
+            .await;
+
+            if world.served {
+                assert_eq!(
+                    (answer.status, answer.error_type.as_deref()),
+                    (200, None),
+                    "case {case:?}: expected a served write to carry no error identity, got \
+                     {answer:?}"
+                );
+                assert_eq!(
+                    answer.body,
+                    json!({}),
+                    "case {case:?}: expected the modelled empty body, got {:?}",
+                    answer.body
+                );
+                continue;
+            }
+
+            assert_eq!(
+                answer.status, VALIDATION_EXCEPTION_STATUS,
+                "case {case:?}: expected the status the model gives ValidationException, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some(VALIDATION_EXCEPTION),
+                "case {case:?}: expected {ERROR_TYPE_HEADER} {VALIDATION_EXCEPTION:?}, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code, VALIDATION_EXCEPTION,
+                "case {case:?}: expected the body to name the same shape, got {answer:?}"
+            );
+            assert_eq!(
+                answer.get("errorCode").as_str(),
+                Some(ERROR_CODE_FIELD_VALIDATION_FAILED),
+                "case {case:?}: expected the FieldValidationFailed code, got {:?}",
+                answer.body
+            );
+            assert!(
+                field_list(&answer).is_empty(),
+                "case {case:?}: expected no fieldList, got {:?}",
+                answer.body
+            );
+
+            let sentence = answer
+                .get("message")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            sentences.insert(case, sentence);
+        }
+    }
+
+    // One fixed sentence, and it is the one AWS words this refusal with: the
+    // worlds differ in whether an organization exists and in which account
+    // manages it, and none of that reaches the answer.
+    let distinct: BTreeSet<&str> = sentences.values().map(String::as_str).collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "expected one fixed refusal sentence across every refused world, got {sentences:?}"
+    );
+    assert_eq!(
+        distinct.into_iter().next(),
+        Some(MANAGEMENT_ACCOUNT_ONLY_SENTENCE),
+        "expected the refusal to state the rule, got {sentences:?}"
+    );
 }
 
 /// RULE: the gate reads the standing per call, so an account that is put in an

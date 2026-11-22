@@ -29,6 +29,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::declared_member_defaults::{address_as_stored, country_block_as_stored};
 
+/// The response header a restJson1 client resolves an error's SHAPE from, beside
+/// the body's `__type`. Read by [`call`] into [`Answer::error_type`], so every
+/// suite reads the wire the same way.
+pub(crate) const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
 /// One emulator: this service mounted on one shared engine. Each test builds its
 /// own, so no test observes another's writes.
 pub(crate) fn emulator() -> MultiServiceRouter {
@@ -132,11 +137,14 @@ pub(crate) fn record_management_account(
 }
 
 /// What one TaxSettings call answered: the HTTP status, the restJson1 `__type`
-/// error code (empty on success) and the parsed JSON body.
+/// error code (empty on success), the `x-amzn-errortype` header a restJson1
+/// client resolves the error SHAPE from (`None` when the answer carries none)
+/// and the parsed JSON body.
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) error_code: String,
+    pub(crate) error_type: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -186,6 +194,11 @@ pub(crate) async fn call(
         .expect("a valid request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get(ERROR_TYPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(std::string::ToString::to_string);
     let raw = response.into_body();
     let body: Value = if raw.is_empty() {
         Value::Null
@@ -200,6 +213,7 @@ pub(crate) async fn call(
     Answer {
         status,
         error_code,
+        error_type,
         body,
     }
 }
