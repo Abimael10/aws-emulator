@@ -17,6 +17,8 @@ Issue-Commit: 0e3e027770f68a801846f0512bd9649d89ae04a7
 
 > _Note: this issue was identified against the code base at commit `0e3e027770f68a801846f0512bd9649d89ae04a7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: all five causes are CLOSED, and every recorded step of the three fixtures replays clean. Causes 1 and 2 (index-scan `ConsumedCapacity`) were already served when this was picked up: a scan of a secondary index is charged a whole read unit per 4 KB of each entry it evaluated, on that index's own arm. Causes 3, 4 and 5 are the `ItemResponse` envelope: whether that structure carries an `Item` follows how many projected pairs the element came to, not whether a key held an item — a key holding no item and a projection naming no location of the item it found are both answered as the object with nothing in it. That rule lives once in `crate::state::item_response_item` and is taken by both readers that answer in the envelope, `TransactGetItems` and the PartiQL read transaction; it landed on mainline from the sibling report `20261120T093536Z-dynamodb-3-net-new-causes-the-transactitems-100.md` while this fix was in review, so what this change adds beside it is `tests/all/transactional_item_response_object.rs`, which pins that the two envelope readers answer the same object for the same item and projection. The readers whose answer IS the projected map (`GetItem`, `BatchGetItem`, and the list elements of `Query` and `Scan`) keep reporting the empty map, which is what AWS answers there._
+
 ## Operation
 Scan
 
