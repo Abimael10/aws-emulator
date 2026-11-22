@@ -730,6 +730,223 @@ async fn an_edit_settles_the_record_at_the_status_its_curation_state_decides() {
     }
 }
 
+/// Submit a record into its registry's approval workflow, asserting the submission was
+/// accepted.
+async fn submit_for_approval(
+    router: &MultiServiceRouter,
+    case: &str,
+    registry: &str,
+    record: &str,
+) -> Reply {
+    let submitted = call(
+        router,
+        "POST",
+        &format!(
+            "/registries/{}/records/{}/submit-for-approval",
+            encode_label(registry),
+            encode_label(record)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        submitted.status, 202,
+        "case {case:?}: SubmitRegistryRecordForApproval must answer 202, got {} {:?}",
+        submitted.status, submitted.body
+    );
+    submitted
+}
+
+/// One row of the withdrawal table: the workflow status the record holds when an edit
+/// arrives, and the form that edit takes.
+struct WithdrawalRow {
+    case: &'static str,
+    /// The approval-workflow status the record is in when the edit arrives.
+    start_status: &'static str,
+    /// The edit's request body.
+    patch: Value,
+    /// The members the edited record reports afterwards, over what it was created with; a
+    /// `null` expectation means the member is absent.
+    changes: Value,
+}
+
+/// An edit of a record that is inside its registry's approval workflow WITHDRAWS it from
+/// that workflow: the record goes through the asynchronous `UPDATING` status, settles at
+/// `DRAFT` carrying no status reason, serves the edited members on every read path, and can
+/// be submitted for approval again — whichever workflow status the edit arrived in and
+/// whichever members it carried.
+#[tokio::test]
+async fn an_edit_inside_the_approval_workflow_withdraws_the_record_to_draft() {
+    let (router, _engine) = router();
+    // No approval configuration, so a submission goes to a curator rather than being
+    // approved outright: that is what puts a row's record under review.
+    let (registry_id, _registry_arn) = ready_registry(
+        &router,
+        "withdrawal",
+        json!({ "name": "withdrawal-registry" }),
+    )
+    .await;
+
+    // The reason a curator's rejection leaves on the record, so a row that starts from
+    // `REJECTED` can show the edit clears it.
+    let rejection_reason = "the descriptor names no reachable endpoint";
+
+    // The rows span BOTH workflow statuses an edit can withdraw a record from and the form
+    // of the edit: a leaf replaced, a leaf unset, two members at once, a map replaced and a
+    // nested descriptor patched. The wrapper shapes are the model's, as above.
+    let rows: Vec<WithdrawalRow> = vec![
+        WithdrawalRow {
+            case: "a description replaced while the record waits for review",
+            start_status: "PENDING_APPROVAL",
+            patch: json!({ "description": { "optionalValue": "coastal flood alerts" } }),
+            changes: json!({ "description": "coastal flood alerts" }),
+        },
+        WithdrawalRow {
+            case: "a description unset while the record waits for review",
+            start_status: "PENDING_APPROVAL",
+            patch: json!({ "description": {} }),
+            changes: json!({ "description": null }),
+        },
+        WithdrawalRow {
+            case: "a version and a display name changed while the record waits for review",
+            start_status: "PENDING_APPROVAL",
+            patch: json!({
+                "recordVersion": "3.1.4",
+                "displayName": { "optionalValue": "edited under review" }
+            }),
+            changes: json!({ "recordVersion": "3.1.4", "displayName": "edited under review" }),
+        },
+        WithdrawalRow {
+            case: "a description replaced after the record was rejected",
+            start_status: "REJECTED",
+            patch: json!({ "description": { "optionalValue": "river gauge alerts" } }),
+            changes: json!({ "description": "river gauge alerts" }),
+        },
+        WithdrawalRow {
+            case: "the custom metadata replaced after the record was rejected",
+            start_status: "REJECTED",
+            patch: json!({ "customMetadata": { "optionalValue": { "team": "weather", "critical": false } } }),
+            changes: json!({ "customMetadata": { "team": "weather", "critical": false } }),
+        },
+        WithdrawalRow {
+            case: "a descriptor leaf patched after the record was rejected",
+            start_status: "REJECTED",
+            patch: json!({
+                "descriptors": {
+                    "optionalValue": {
+                        "custom": { "optionalValue": { "data": { "optionalValue": "{\"edited\":true}" } } }
+                    }
+                }
+            }),
+            changes: json!({ "descriptors": { "custom": { "data": "{\"edited\":true}" } } }),
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let WithdrawalRow {
+            case,
+            start_status,
+            patch,
+            changes,
+        } = row;
+        let name = format!("withdrawal-probe-{index}");
+        let (record_id, _record_arn) = draft_record(&router, case, &registry_id, &name).await;
+
+        // Into the workflow: a submission puts the record under review, and a curator's
+        // rejection is the second workflow status an edit can arrive in.
+        submit_for_approval(&router, case, &registry_id, &record_id).await;
+        if start_status == "REJECTED" {
+            let rejected = call(
+                &router,
+                "PATCH",
+                &format!(
+                    "/registries/{}/records/{}/status",
+                    encode_label(&registry_id),
+                    encode_label(&record_id)
+                ),
+                Some(json!({ "status": "REJECTED", "statusReason": rejection_reason })),
+            )
+            .await;
+            assert_eq!(
+                rejected.status, 202,
+                "case {case:?}: UpdateRegistryRecordStatus must answer 202, got {} {:?}",
+                rejected.status, rejected.body
+            );
+        }
+        let under_review =
+            record_reaching(&router, case, &registry_id, &record_id, start_status).await;
+        assert_eq!(
+            under_review.body.get("statusReason").and_then(Value::as_str),
+            (start_status == "REJECTED").then_some(rejection_reason),
+            "case {case:?}: the record must be in the workflow before the edit, got {:?}",
+            under_review.body
+        );
+
+        // What the withdrawn record must report: what it was created with, overwritten by
+        // the row's edit.
+        let mut expected: Map<String, Value> =
+            created_with(&name).as_object().expect("an object").clone();
+        for (member, value) in changes.as_object().expect("an object") {
+            expected.insert(member.clone(), value.clone());
+        }
+
+        let updated = update_record(&router, &registry_id, &record_id, patch).await;
+        assert_eq!(
+            (updated.status, updated.str_field("status")),
+            (202, "UPDATING"),
+            "case {case:?}: an accepted edit reports the asynchronous status, got {} {:?}",
+            updated.status,
+            updated.body
+        );
+
+        // The edit takes the record out of the approval workflow: it settles at DRAFT,
+        // carries no reason for a workflow status it is no longer in, and serves the edit.
+        let settled = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+        assert_members(case, &settled.body, &expected, "GetRegistryRecord");
+        assert_eq!(
+            settled.body.get("statusReason").and_then(Value::as_str),
+            None,
+            "case {case:?}: a withdrawn record keeps no status reason, got {:?}",
+            settled.body
+        );
+
+        // The list path projects the same stored record, so the withdrawal and the edit are
+        // visible there too.
+        let listed = list_records(&router, &registry_id).await;
+        let summary = listed.body["registryRecords"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .find(|record| record["recordId"].as_str() == Some(record_id.as_str()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut summarised: Map<String, Value> =
+            ["name", "displayName", "description", "recordType", "recordVersion"]
+                .into_iter()
+                .map(|member| {
+                    (
+                        member.to_string(),
+                        expected.get(member).cloned().unwrap_or(Value::Null),
+                    )
+                })
+                .collect();
+        summarised.insert("status".to_string(), json!("DRAFT"));
+        assert_members(case, &summary, &summarised, "the ListRegistryRecords summary");
+
+        // A withdrawn record is a draft again, so the workflow accepts it anew — which is
+        // what a client that edits a record under review waits for DRAFT in order to do.
+        submit_for_approval(&router, case, &registry_id, &record_id).await;
+        let resubmitted =
+            record_reaching(&router, case, &registry_id, &record_id, "PENDING_APPROVAL").await;
+        assert_eq!(
+            resubmitted.str_field("status"),
+            "PENDING_APPROVAL",
+            "case {case:?}: a withdrawn record can be submitted for approval again, got {:?}",
+            resubmitted.body
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_update_this_service_cannot_apply_is_refused_and_writes_nothing() {
     let (router, engine) = router();
