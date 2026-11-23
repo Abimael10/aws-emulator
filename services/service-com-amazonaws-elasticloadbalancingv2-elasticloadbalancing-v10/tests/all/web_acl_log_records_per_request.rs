@@ -46,14 +46,14 @@ use crate::web_acl_enforcement::{byte_match, waf_ok, BLOCK_STATUS};
 
 /// The body the listener's default action answers with: the request reached the load balancer's
 /// own configuration, so the web ACL let it through.
-const SERVED_BODY: &str = "served-by-the-listener";
+pub(crate) const SERVED_BODY: &str = "served-by-the-listener";
 
 /// The status that answer carries.
-const SERVED_STATUS: u16 = 200;
+pub(crate) const SERVED_STATUS: u16 = 200;
 
 /// The header every request carries, and the two values a request is driven with: the one the
 /// rule inside the rule group matches, and one it does not.
-const PROBE_HEADER: &str = "x-waf-probe";
+pub(crate) const PROBE_HEADER: &str = "x-waf-probe";
 const MATCHING_PROBE: &str = "deny-me";
 const UNMATCHED_PROBE: &str = "let-me-in";
 
@@ -67,17 +67,17 @@ const RUNS_THE_GROUP: &str = "run-the-group";
 /// The `terminatingRuleId` of a request no rule terminated, which the web ACL's `DefaultAction`
 /// decided — "the action to perform if none of the Rules contained in the WebACL match"
 /// (`WebACL$DefaultAction`).
-const DEFAULT_ACTION_RULE: &str = "Default_Action";
+pub(crate) const DEFAULT_ACTION_RULE: &str = "Default_Action";
 
 /// The `terminatingRuleType` of the web ACL's own `DefaultAction`, and the one of a rule that
 /// runs a rule group this account owns.
-const REGULAR_TYPE: &str = "REGULAR";
-const GROUP_TYPE: &str = "GROUP";
+pub(crate) const REGULAR_TYPE: &str = "REGULAR";
+pub(crate) const GROUP_TYPE: &str = "GROUP";
 
 /// The prefix the name of a logging destination must begin with
 /// (`smithy_query(query="doc",shape="LoggingConfiguration")`: "the name that you give the
 /// destination must start with `aws-waf-logs-`").
-const WAF_LOGS_PREFIX: &str = "aws-waf-logs-";
+pub(crate) const WAF_LOGS_PREFIX: &str = "aws-waf-logs-";
 
 /// How long a delivered record is given to be readable in its destination group, and how long to
 /// wait between two looks. Generous on purpose: a row waits for the RECORDS, never for a
@@ -89,7 +89,7 @@ const LOOK_AGAIN: Duration = Duration::from_millis(20);
 /// record, and the CloudWatch Logs that holds the destination — all over ONE engine. All three
 /// are needed: a record is only produced when the traffic, the web ACL and the destination live
 /// in one emulator.
-fn emulator_with_waf_and_logs() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_waf_and_logs() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -141,7 +141,7 @@ async fn logs_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> V
 
 /// Create the log group `name` through CloudWatch Logs' own API and answer the ARN a logging
 /// configuration names it by, so the destination is a group the account really holds.
-async fn log_destination(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn log_destination(router: &MultiServiceRouter, name: &str) -> String {
     assert!(
         name.starts_with(WAF_LOGS_PREFIX),
         "setup: a WAF logging destination's name must start with {WAF_LOGS_PREFIX:?}, got {name:?}"
@@ -170,7 +170,7 @@ async fn in_log_group(router: &MultiServiceRouter, name: &str) -> Vec<Value> {
 
 /// Look in the log group until it holds `want` records, which is what a reader of the destination
 /// waits for, and answer every record it holds then.
-async fn records_in(
+pub(crate) async fn records_in(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -201,9 +201,38 @@ fn visibility(metric: &str) -> Value {
     })
 }
 
-/// The rule group this account owns, whose one rule BLOCKS a request carrying the matching probe;
-/// answers its ARN.
-async fn blocking_rule_group(router: &MultiServiceRouter, name: &str) -> String {
+/// One rule of a rule group this account owns: its name, the value of [`PROBE_HEADER`] it matches
+/// EXACTLY, and the `Action` it carries.
+pub(crate) struct GroupRule<'rule> {
+    pub(crate) name: &'rule str,
+    pub(crate) probe: &'rule str,
+    pub(crate) action: Value,
+}
+
+/// The rule group this account owns holding `rules`, each matching its own probe value on the
+/// probe header; answers the ARN a web ACL references it by.
+pub(crate) async fn rule_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    rules: &[GroupRule<'_>],
+) -> String {
+    let declared: Vec<Value> = rules
+        .iter()
+        .enumerate()
+        .map(|(priority, inner)| {
+            json!({
+                "Name": inner.name,
+                "Priority": priority,
+                "Statement": byte_match(
+                    json!({ "SingleHeader": { "Name": PROBE_HEADER } }),
+                    inner.probe,
+                    "EXACTLY",
+                ),
+                "Action": inner.action,
+                "VisibilityConfig": visibility(inner.name),
+            })
+        })
+        .collect();
     let created = waf_ok(
         router,
         "CreateRuleGroup",
@@ -212,17 +241,7 @@ async fn blocking_rule_group(router: &MultiServiceRouter, name: &str) -> String 
             "Scope": "REGIONAL",
             "Capacity": 100,
             "VisibilityConfig": visibility(name),
-            "Rules": [{
-                "Name": GROUP_RULE,
-                "Priority": 0,
-                "Statement": byte_match(
-                    json!({ "SingleHeader": { "Name": PROBE_HEADER } }),
-                    MATCHING_PROBE,
-                    "EXACTLY",
-                ),
-                "Action": { "Block": {} },
-                "VisibilityConfig": visibility(GROUP_RULE),
-            }],
+            "Rules": declared,
         }),
     )
     .await;
@@ -232,12 +251,24 @@ async fn blocking_rule_group(router: &MultiServiceRouter, name: &str) -> String 
         .to_string()
 }
 
-/// A web ACL that allows by default and runs the rule group `group_arn`, created and put in front
-/// of `lb_arn`; answers its ARN.
-async fn web_acl_in_front(
+/// One web ACL rule that RUNS the referenced rule group `group_arn`, at `priority`, with the
+/// group's own rule actions left in force (`OverrideAction` `None`).
+pub(crate) fn runs_the_group(name: &str, priority: usize, group_arn: &str) -> Value {
+    json!({
+        "Name": name,
+        "Priority": priority,
+        "Statement": { "RuleGroupReferenceStatement": { "ARN": group_arn } },
+        "OverrideAction": { "None": {} },
+        "VisibilityConfig": visibility(name),
+    })
+}
+
+/// A web ACL that allows by default and carries `rules`, created and put in front of `lb_arn`;
+/// answers its ARN.
+pub(crate) async fn web_acl_in_front(
     router: &MultiServiceRouter,
     name: &str,
-    group_arn: &str,
+    rules: Value,
     lb_arn: &str,
 ) -> String {
     let created = waf_ok(
@@ -248,13 +279,7 @@ async fn web_acl_in_front(
             "Scope": "REGIONAL",
             "DefaultAction": { "Allow": {} },
             "VisibilityConfig": visibility(name),
-            "Rules": [{
-                "Name": RUNS_THE_GROUP,
-                "Priority": 0,
-                "Statement": { "RuleGroupReferenceStatement": { "ARN": group_arn } },
-                "OverrideAction": { "None": {} },
-                "VisibilityConfig": visibility(RUNS_THE_GROUP),
-            }],
+            "Rules": rules,
         }),
     )
     .await;
@@ -272,7 +297,7 @@ async fn web_acl_in_front(
 }
 
 /// Point the logging of the web ACL `web_acl` at `destination`.
-async fn log_to(router: &MultiServiceRouter, web_acl: &str, destination: &str) {
+pub(crate) async fn log_to(router: &MultiServiceRouter, web_acl: &str, destination: &str) {
     waf_ok(
         router,
         "PutLoggingConfiguration",
@@ -288,7 +313,7 @@ async fn log_to(router: &MultiServiceRouter, web_acl: &str, destination: &str) {
 
 /// The HTTP:80 listener every request the web ACL lets through is answered by: one default
 /// `fixed-response` of [`SERVED_STATUS`] carrying [`SERVED_BODY`].
-async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) {
+pub(crate) async fn create_listener(router: &MultiServiceRouter, lb_arn: &str) {
     let mut form = action("CreateListener");
     form.push(p("LoadBalancerArn", lb_arn));
     form.push(p("Protocol", "HTTP"));
@@ -327,8 +352,23 @@ async fn deployed(name: &str) -> Deployed {
     let (lb_arn, dns_name) = create_load_balancer(&router, name).await;
     create_listener(&router, &lb_arn).await;
     settle(&engine, &lb_arn, SystemTime::now() - Duration::from_secs(1));
-    let group_arn = blocking_rule_group(&router, &format!("{WAF_LOGS_PREFIX}{name}-group")).await;
-    let web_acl = web_acl_in_front(&router, name, &group_arn, &lb_arn).await;
+    let group_arn = rule_group(
+        &router,
+        &format!("{WAF_LOGS_PREFIX}{name}-group"),
+        &[GroupRule {
+            name: GROUP_RULE,
+            probe: MATCHING_PROBE,
+            action: json!({ "Block": {} }),
+        }],
+    )
+    .await;
+    let web_acl = web_acl_in_front(
+        &router,
+        name,
+        json!([runs_the_group(RUNS_THE_GROUP, 0, &group_arn)]),
+        &lb_arn,
+    )
+    .await;
     Deployed {
         router,
         dns_name,
@@ -450,12 +490,12 @@ fn rows() -> Vec<Row> {
 /// The path the request at position `index` of a sequence asks for, which is what its own record
 /// is found by: every request of a row addresses its own path, so no record can stand in for
 /// another's.
-fn path_of(index: usize) -> String {
+pub(crate) fn path_of(index: usize) -> String {
     format!("/probe-{index}")
 }
 
 /// The one record of `records` whose `httpRequest` describes the request for `path`.
-fn record_for<'a>(case: &str, records: &'a [Value], path: &str) -> &'a Value {
+pub(crate) fn record_for<'a>(case: &str, records: &'a [Value], path: &str) -> &'a Value {
     let matching: Vec<&Value> = records
         .iter()
         .filter(|record| record["httpRequest"]["uri"] == json!(path))
