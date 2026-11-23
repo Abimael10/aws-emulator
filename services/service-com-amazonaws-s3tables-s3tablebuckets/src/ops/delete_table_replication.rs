@@ -236,10 +236,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current one means the configuration was written since the caller read
         // it, which is the conflict with a previous write the model's
         // `ConflictException` (HTTP 409) names, and nothing is removed.
+        //
+        // The refusal is stated against the TABLE this delete addresses, so it
+        // carries the sentence this service words that class with
+        // (`TABLE_VERSION_TOKEN_MISMATCH_MESSAGE`) and not the one the PUTS of
+        // a configuration word theirs with.
         if input.version_token != configuration.version_token {
             return Err(DeleteTableReplicationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::VERSION_TOKEN_MISMATCH_MESSAGE.to_string()),
+                    message: Some(crate::state::TABLE_VERSION_TOKEN_MISMATCH_MESSAGE.to_string()),
                 },
             )
             .into());

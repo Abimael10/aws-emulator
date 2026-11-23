@@ -43,8 +43,9 @@ const NO_REPLICATION_CONFIGURATION: &str = "The specified replication configurat
 const NO_TABLE: &str = "The specified table does not exist.";
 
 /// The fixed sentence this service states a presented version token that is not
-/// the configuration's with.
-const STALE_VERSION_TOKEN: &str = "The specified version token does not match the configuration.";
+/// the current one with when the refusal is stated against the TABLE the delete
+/// addresses, as `DeleteTableReplication`'s is.
+const STALE_VERSION_TOKEN: &str = "Provided version token does not match the table version token.";
 
 /// One row: a table in `bucket` whose own configuration names `role` and
 /// `destinations` destination table buckets and is written `writes` times before

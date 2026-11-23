@@ -1670,6 +1670,15 @@ pub const NOTHING_TO_RENAME_MESSAGE: &str =
 /// configuration it addresses currently carries: the conflict with a previous
 /// write the model's `ConflictException` (HTTP 409) names. FIXED text — the
 /// token is neither echoed nor named.
+///
+/// This is the sentence of the operations that WRITE a replication
+/// configuration under a precondition — `PutTableReplication` and
+/// `PutTableBucketReplication` — and of `DeleteTableBucketReplication`, whose
+/// token names a bucket's configuration and no table. An operation whose
+/// refusal is stated against the TABLE it addresses carries
+/// [`TABLE_VERSION_TOKEN_MISMATCH_MESSAGE`] instead; the two sentences are each
+/// the one their own operations are recorded stating, so neither stands in for
+/// the other.
 pub const VERSION_TOKEN_MISMATCH_MESSAGE: &str =
     "The specified version token does not match the configuration.";
 
@@ -1678,6 +1687,11 @@ pub const VERSION_TOKEN_MISMATCH_MESSAGE: &str =
 /// [`VERSION_TOKEN_MISMATCH_MESSAGE`]: the conflict with a previous write the
 /// model's `ConflictException` (HTTP 409) names. FIXED text — the token is
 /// neither echoed nor named, and neither is the table.
+///
+/// This is the sentence of every operation whose version-token refusal is
+/// stated against the table the request addresses: `DeleteTable`,
+/// `RenameTable`, `UpdateTableMetadataLocation` and the delete of a table's own
+/// replication record, `DeleteTableReplication`.
 pub const TABLE_VERSION_TOKEN_MISMATCH_MESSAGE: &str =
     "Provided version token does not match the table version token.";
 
