@@ -625,7 +625,20 @@ pub fn check_reserved_attribute_name(member: &str, word: &str) -> Result<(), Req
 ///
 /// Matched without regard to case, the way the keywords of the expression languages are
 /// ("The operator and section keywords are case-insensitive").
+///
+/// A word the expression language spells as one of its OWN FUNCTIONS is not held to the
+/// list, however: the text names that function ([`function_signature`] holds every one of
+/// them), so where the grammar wants a name the word is read as the attribute it names and
+/// the request is served rather than refused — exactly as an operator keyword written in a
+/// name position is read as the operator it spells ([`is_expression_operator_keyword`])
+/// rather than as a reserved attribute name. The function names are matched AS WRITTEN,
+/// because "These function names are case-sensitive" (the `ConditionExpression` function
+/// reference), so a word that only differs from one in case names no function of this
+/// language and the list above decides it.
 fn is_reserved_word(word: &str) -> bool {
+    if function_signature(word).is_some() {
+        return false;
+    }
     let upper = word.to_ascii_uppercase();
     RESERVED_WORDS.binary_search(&upper.as_str()).is_ok()
 }
