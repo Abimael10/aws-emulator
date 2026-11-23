@@ -99,6 +99,36 @@ pub(crate) async fn call_query(
         .await
 }
 
+/// [`call_query`] for a provider whose own control plane SHARES the signing name with the
+/// service that owns it, where nothing on the wire tells the two apart.
+///
+/// `sdk_service` is the name this type's provider reports the called service under — the name
+/// of the SDK client that provider holds — which is what the exception a refused call raises
+/// states ([`sdk_diagnostics::sdk_diagnostic_as`]). Everything else is [`call_query`]'s: the
+/// request is signed, routed and read exactly the same way, and the answer a successful call
+/// returns is the same document.
+pub(crate) async fn call_query_as(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    sdk_service: &str,
+    region: &str,
+    version: &str,
+    action: &str,
+    parameters: &[(String, String)],
+) -> Result<String, Refusal> {
+    query(
+        ctx,
+        signing_name,
+        Some(sdk_service),
+        region,
+        version,
+        action,
+        parameters,
+        Vec::new(),
+    )
+    .await
+}
+
 /// [`call_query`], with HEADERS the caller adds to the request beside the ones the wire needs.
 ///
 /// For a call whose CHAIN matters: the nested-stack provider carries the deployment a call is
@@ -107,6 +137,32 @@ pub(crate) async fn call_query(
 pub(crate) async fn call_query_carrying(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
+    region: &str,
+    version: &str,
+    action: &str,
+    parameters: &[(String, String)],
+    carried: Vec<(&'static str, String)>,
+) -> Result<String, Refusal> {
+    query(
+        ctx,
+        signing_name,
+        None,
+        region,
+        version,
+        action,
+        parameters,
+        carried,
+    )
+    .await
+}
+
+/// The ONE awsQuery call the three above are, so none of them can sign, route or read an
+/// answer differently from the others. `sdk_service` is [`call_query_as`]'s.
+#[allow(clippy::too_many_arguments)]
+async fn query(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    sdk_service: Option<&str>,
     region: &str,
     version: &str,
     action: &str,
@@ -157,10 +213,10 @@ pub(crate) async fn call_query_carrying(
     let code = xml_element(&document, "Code")
         .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     Err(Refusal {
-        message: sdk_message_of(
+        message: sdk_message_as(
+            sdk_service,
             signing_name,
             Some(action),
-            None,
             status,
             &code,
             &xml_element(&document, "Message").unwrap_or_default(),

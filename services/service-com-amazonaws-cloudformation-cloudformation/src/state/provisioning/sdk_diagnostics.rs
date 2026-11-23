@@ -856,6 +856,33 @@ pub(super) fn sdk_diagnostic(
     status: u16,
     code: &str,
 ) -> Option<String> {
+    sdk_diagnostic_as(None, signing_name, operation, uri, status, code)
+}
+
+/// [`sdk_diagnostic`] for a provider that STATES the SDK name its own client reports the
+/// called service under, which nothing about the call itself says.
+///
+/// The tables above tell the claimants of a shared signing name apart by the call — its
+/// operation ([`SDK_SHARED_NAME_SERVICES`]) or its URI ([`SDK_SHARED_NAME_PREFIXES`]) — and
+/// that answers only where those differ. Three control planes of one relational front door
+/// are not such a set: they share the signing name, the API version, the one path an
+/// awsQuery request is bound to AND the action names, so nothing on the wire says which of
+/// them a provider called. What does is the provider itself: a resource provider is a
+/// per-TYPE artifact built against ONE service's SDK client, and that client's name is what
+/// the exception it raises states — so the arm that makes the call passes it
+/// ([`in_process_calls::call_query_as`]).
+///
+/// `sdk_service` is that name; `None` is [`sdk_diagnostic`], which reads the name off the
+/// tables. Only the NAME is stated: the shape, the ids and the attempt count are the called
+/// service's own and are computed exactly as they are for every other call.
+pub(super) fn sdk_diagnostic_as(
+    sdk_service: Option<&str>,
+    signing_name: &str,
+    operation: Option<&str>,
+    uri: Option<&str>,
+    status: u16,
+    code: &str,
+) -> Option<String> {
     // The SURFACE of a shared signing name the call was made on, which names its own service
     // whatever the name resolves to otherwise.
     let surface = shared_name_service_at(signing_name, uri);
@@ -886,6 +913,9 @@ pub(super) fn sdk_diagnostic(
         Some(_) => service,
         None => provider_service_name(signing_name, operation).unwrap_or(service),
     };
+    // And the name the CALLER stated, where it stated one: the provider knows which SDK
+    // client it holds where nothing on the wire does.
+    let service = sdk_service.unwrap_or(service);
     // The envelope the two comma-separated shapes open with, written once so the two cannot
     // state the service, the status and the call's id differently.
     let envelope = || {
@@ -954,6 +984,23 @@ pub(super) fn sdk_attempt_count(code: &str) -> u32 {
 /// ([`sdk_diagnostic`]).
 pub(crate) fn sdk_message(signing_name: &str, status: u16, code: &str, message: &str) -> String {
     sdk_message_of(signing_name, None, None, status, code, message)
+}
+
+/// [`sdk_message_of`] for a provider that states the SDK name its own client reports the
+/// called service under ([`sdk_diagnostic_as`]).
+pub(crate) fn sdk_message_as(
+    sdk_service: Option<&str>,
+    signing_name: &str,
+    operation: Option<&str>,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> String {
+    match sdk_diagnostic_as(sdk_service, signing_name, operation, None, status, code) {
+        Some(diagnostic) if message.is_empty() => diagnostic,
+        Some(diagnostic) => format!("{message} {diagnostic}"),
+        None => message.to_string(),
+    }
 }
 
 /// The member an error DOCUMENT attributes its refusal to, as the wire spells that member:

@@ -81,6 +81,10 @@
 use super::provisioner::client_vpn::{
     EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
 };
+use super::provisioner::neptune_relational::{
+    NEPTUNE_DB_CLUSTER_PARAMETER_GROUP, NEPTUNE_DB_PARAMETER_GROUP, NEPTUNE_DB_SUBNET_GROUP,
+    NEPTUNE_GLOBAL_CLUSTER,
+};
 use super::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION;
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
 use super::provisioner::redshift_serverless::{
@@ -803,12 +807,17 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::MemoryDB::ParameterGroup",
     "AWS::MemoryDB::SubnetGroup",
     "AWS::MemoryDB::User",
-    // Amazon Neptune
+    // Amazon Neptune. The parameter groups of either level, the subnet group and the global
+    // database are created in the owning control plane (`super::provisioner`), which is served
+    // by the one relational front door this emulator mounts for the `rds` signing name:
+    // `CreateDBClusterParameterGroup`, `CreateDBParameterGroup`, `CreateDBSubnetGroup` and
+    // `CreateGlobalCluster`.
     "AWS::Neptune::DBCluster",
-    "AWS::Neptune::DBClusterParameterGroup",
+    NEPTUNE_DB_CLUSTER_PARAMETER_GROUP,
     "AWS::Neptune::DBInstance",
-    "AWS::Neptune::DBParameterGroup",
-    "AWS::Neptune::DBSubnetGroup",
+    NEPTUNE_DB_PARAMETER_GROUP,
+    NEPTUNE_DB_SUBNET_GROUP,
+    NEPTUNE_GLOBAL_CLUSTER,
     // Neptune Analytics — a different service from Amazon Neptune above, reached by the
     // `neptune-graph` signing name. Both types are created in the owning service
     // (`super::provisioner`): `CreateGraph` POST /graphs and `CreateGraphSnapshot` POST

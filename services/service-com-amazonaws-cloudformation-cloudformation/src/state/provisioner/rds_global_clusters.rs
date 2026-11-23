@@ -60,19 +60,27 @@ const GLOBAL_CLUSTER_PROPERTIES_NOT_SENT: &[&str] = &["GlobalClusterIdentifier",
 /// list's own naming rather than the protocol's default `member`.
 const GLOBAL_CLUSTER_ENTRY_ELEMENT: &str = "GlobalClusterMember";
 
-/// Create the global database an `AWS::RDS::GlobalCluster` declares.
+/// Create the global database a declaration of either control plane's global-cluster type
+/// asks for — `AWS::RDS::GlobalCluster` and the `AWS::Neptune::GlobalCluster` whose
+/// declaration is the same document against the same call.
+///
+/// `resource_type` is the declared type, which a property outside the create's catalogue is
+/// refused by name and whose ARN attributes are spelled from, and `sdk_service` the name this
+/// type's provider reports the called service under ([`call_query_as`]).
 pub(crate) async fn create_global_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     propagated: &[(String, String)],
+    resource_type: &'static str,
+    sdk_service: &'static str,
 ) -> Result<Created, Refusal> {
     let mut parameters = query_members(
         &resource.properties,
         CREATE_GLOBAL_CLUSTER_MEMBERS,
         &[],
         GLOBAL_CLUSTER_PROPERTIES_NOT_SENT,
-        RDS_GLOBAL_CLUSTER,
+        resource_type,
     )?;
     parameters.push((
         "GlobalClusterIdentifier".to_string(),
@@ -84,9 +92,10 @@ pub(crate) async fn create_global_cluster(
         "Tag",
         &tags_of(&resource.properties, propagated),
     );
-    let answered = call_query(
+    let answered = call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "CreateGlobalCluster",
@@ -100,7 +109,7 @@ pub(crate) async fn create_global_cluster(
         // publishes its ARN under is re-pointed at the one Amazon RDS reports
         // ([`super::template::arn_attributes`]), under the conventional spellings and under
         // the member the owning API reports it as.
-        attributes.extend(super::template::arn_attributes(RDS_GLOBAL_CLUSTER, &arn));
+        attributes.extend(super::template::arn_attributes(resource_type, &arn));
         attributes.insert("GlobalClusterArn".to_string(), arn);
     }
     if let Some(resource_id) =
@@ -123,14 +132,16 @@ pub(crate) async fn read_global_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    sdk_service: &'static str,
 ) -> Result<Option<Value>, Refusal> {
     let parameters = vec![(
         "GlobalClusterIdentifier".to_string(),
         physical_resource_id.to_string(),
     )];
-    let answered = match call_query(
+    let answered = match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "DescribeGlobalClusters",
@@ -156,14 +167,16 @@ pub(crate) async fn delete_global_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    sdk_service: &'static str,
 ) -> Result<(), Refusal> {
     let parameters = vec![(
         "GlobalClusterIdentifier".to_string(),
         physical_resource_id.to_string(),
     )];
-    match call_query(
+    match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "DeleteGlobalCluster",

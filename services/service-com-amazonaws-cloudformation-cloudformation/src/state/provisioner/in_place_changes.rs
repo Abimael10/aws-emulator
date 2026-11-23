@@ -190,6 +190,30 @@ impl Provisioner {
                 )
                 .await
             }
+            // The Amazon Neptune parameter groups are in exactly that position: their
+            // `Parameters` map is the one part of either declaration the owning front door can
+            // change on a group that exists, through the same modify their create makes for the
+            // declared values.
+            Self::NeptuneDbParameterGroup => {
+                update_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    neptune_relational::NEPTUNE_DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbClusterParameterGroup => {
+                update_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
             // A Redshift parameter group's `Parameters` are the one part of its declaration
             // Amazon Redshift can change on a group that exists, and the modify is the call
             // that changes it — the same call the create makes for the declared values — so a

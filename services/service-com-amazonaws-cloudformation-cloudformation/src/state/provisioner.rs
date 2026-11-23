@@ -464,7 +464,7 @@ pub(super) use super::{
 };
 
 use super::provisioning::{
-    call_json_rpc, call_query, call_rest_json, call_rest_json_named, call_rest_xml,
+    call_json_rpc, call_query, call_query_as, call_rest_json, call_rest_json_named, call_rest_xml,
     modelled_declaration, percent_encoded, published_instant, xml_element, xml_elements,
     xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
     Created, ModelledScalar, Readiness,
@@ -1019,6 +1019,26 @@ pub(super) enum Provisioner {
     /// reports the one a completed stack declared, so a stack declaring one has to create it
     /// there for real.
     RdsGlobalCluster,
+    /// `AWS::Neptune::DBParameterGroup` and `AWS::Neptune::DBClusterParameterGroup`: the two
+    /// levels of Amazon Neptune parameter group, created, written, read and deleted by the
+    /// parameter-group operations of the one relational front door that serves this engine's
+    /// control plane ([`neptune_relational`]) — so a client's own
+    /// `DescribeDBClusterParameterGroups` after the stack reports `CREATE_COMPLETE` reports
+    /// the group the template declared, with the values it declared, and that engine's own
+    /// catalogue is what refuses a declared value outside a parameter's published range.
+    NeptuneDbParameterGroup,
+    NeptuneDbClusterParameterGroup,
+    /// `AWS::Neptune::DBSubnetGroup`: the subnet group a Neptune DB cluster is launched into,
+    /// whose declaration is the same document `AWS::RDS::DBSubnetGroup` states against the
+    /// same `CreateDBSubnetGroup` — so it is created through that arm, under this type's own
+    /// name.
+    NeptuneDbSubnetGroup,
+    /// `AWS::Neptune::GlobalCluster`: a Neptune global database, which `CreateGlobalCluster`
+    /// creates under the identifier the declaration states — the identifier this type's `Ref`
+    /// returns — `DescribeGlobalClusters` reports and `DeleteGlobalCluster` deletes. A DB
+    /// cluster joins a global database by naming it, so a stack declaring one has to create it
+    /// for real.
+    NeptuneGlobalCluster,
     /// `AWS::RDS::DBProxy`: an RDS proxy, which `CreateDBProxy` creates under the name the
     /// template states and `DeleteDBProxy` deletes. The create answers the proxy
     /// `creating`, so its creation is held open until Amazon RDS reports it `available`.
@@ -1732,6 +1752,14 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::RdsDbClusterEndpoint)
         }
         rds_global_clusters::RDS_GLOBAL_CLUSTER => Some(Provisioner::RdsGlobalCluster),
+        neptune_relational::NEPTUNE_DB_PARAMETER_GROUP => {
+            Some(Provisioner::NeptuneDbParameterGroup)
+        }
+        neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP => {
+            Some(Provisioner::NeptuneDbClusterParameterGroup)
+        }
+        neptune_relational::NEPTUNE_DB_SUBNET_GROUP => Some(Provisioner::NeptuneDbSubnetGroup),
+        neptune_relational::NEPTUNE_GLOBAL_CLUSTER => Some(Provisioner::NeptuneGlobalCluster),
         RDS_DB_PROXY => Some(Provisioner::RdsDbProxy),
         RDS_DB_PROXY_TARGET_GROUP => Some(Provisioner::RdsDbProxyTargetGroup),
         REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
@@ -2313,7 +2341,15 @@ impl Provisioner {
                 Box::pin(create_event_subscription(ctx, region, resource, propagated)).await
             }
             Self::RdsDbSubnetGroup => {
-                create_db_subnet_group(ctx, region, resource, propagated).await
+                create_db_subnet_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    RDS_DB_SUBNET_GROUP,
+                    RDS_SDK_SERVICE,
+                )
+                .await
             }
             // `AWS::RDS::OptionGroup` publishes `Tags` as the `{Key, Value}` list
             // `CreateOptionGroup`'s own `Tags` member takes, so a group a stack creates
@@ -2389,6 +2425,55 @@ impl Provisioner {
                     region,
                     resource,
                     propagated,
+                    rds_global_clusters::RDS_GLOBAL_CLUSTER,
+                    RDS_SDK_SERVICE,
+                ))
+                .await
+            }
+            // Every one of the Amazon Neptune relational types publishes `Tags` as the
+            // `{Key, Value}` list its own create's `Tags` member takes, so a group, a subnet
+            // group and a global database a stack creates each carry the tags CloudFormation
+            // gives them beside the declared ones — the position the Amazon RDS types of the
+            // same document above are in, whose arms these are.
+            Self::NeptuneDbParameterGroup => {
+                create_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    neptune_relational::NEPTUNE_DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbClusterParameterGroup => {
+                create_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbSubnetGroup => {
+                create_db_subnet_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    neptune_relational::NEPTUNE_DB_SUBNET_GROUP,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
+                )
+                .await
+            }
+            Self::NeptuneGlobalCluster => {
+                Box::pin(rds_global_clusters::create_global_cluster(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    neptune_relational::NEPTUNE_GLOBAL_CLUSTER,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
                 ))
                 .await
             }
@@ -3634,7 +3719,7 @@ impl Provisioner {
                 delete_event_subscription(ctx, region, physical_resource_id).await
             }
             Self::RdsDbSubnetGroup => {
-                delete_db_subnet_group(ctx, region, physical_resource_id).await
+                delete_db_subnet_group(ctx, region, physical_resource_id, RDS_SDK_SERVICE).await
             }
             Self::RdsOptionGroup => {
                 rds_option_groups::delete_option_group(ctx, region, physical_resource_id).await
@@ -3686,7 +3771,51 @@ impl Provisioner {
             // The global database is addressed by the identifier it was created under, which
             // is this resource's physical id.
             Self::RdsGlobalCluster => {
-                rds_global_clusters::delete_global_cluster(ctx, region, physical_resource_id).await
+                rds_global_clusters::delete_global_cluster(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    RDS_SDK_SERVICE,
+                )
+                .await
+            }
+            // Each Amazon Neptune relational resource is addressed by the name or identifier
+            // it was created under, which is this resource's physical id.
+            Self::NeptuneDbParameterGroup => {
+                delete_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbClusterParameterGroup => {
+                delete_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbSubnetGroup => {
+                delete_db_subnet_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
+                )
+                .await
+            }
+            Self::NeptuneGlobalCluster => {
+                rds_global_clusters::delete_global_cluster(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
+                )
+                .await
             }
             // The proxy is addressed by the name it was created under, which is this
             // resource's physical id.
@@ -4450,6 +4579,12 @@ pub(in crate::state) mod rds_cluster_endpoints;
 /// declares, created in the service that owns it so a DB cluster that joins it and a client's
 /// own read of that service resolve the one the stack publishes.
 pub(in crate::state) mod rds_global_clusters;
+/// The Amazon Neptune RELATIONAL arms: the two parameter-group levels, the subnet group and
+/// the global database an `AWS::Neptune::*` type declares, each registered against the arm the
+/// Amazon RDS type of the same document has — one front door serves both control planes.
+/// Visible to the rest of this service's state because the types' own NAMES live here, beside
+/// the registrations, and the naming rules and the type catalogue key their entries by them.
+pub(in crate::state) mod neptune_relational;
 pub(super) mod redshift_parameter_groups;
 /// The Amazon Redshift SNAPSHOT COPY GRANT arm: the grant an
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a

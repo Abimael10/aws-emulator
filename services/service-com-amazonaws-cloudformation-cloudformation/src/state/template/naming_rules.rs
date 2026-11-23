@@ -305,7 +305,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         "AWS::RDS::DBParameterGroup"
         | "AWS::RDS::DBClusterParameterGroup"
         | crate::state::provisioner::rds_option_groups::RDS_OPTION_GROUP
-        | "AWS::RDS::DBSubnetGroup" => rules(255, Characters::LowercaseAlphanumeric),
+        | "AWS::RDS::DBSubnetGroup"
+        // Amazon Neptune's groups are the same members of the same front door, so a name
+        // CloudFormation generates for one is held to the same rules
+        // ([`crate::state::provisioner::neptune_relational`]).
+        | crate::state::provisioner::neptune_relational::NEPTUNE_DB_PARAMETER_GROUP
+        | crate::state::provisioner::neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP
+        | crate::state::provisioner::neptune_relational::NEPTUNE_DB_SUBNET_GROUP => {
+            rules(255, Characters::LowercaseAlphanumeric)
+        }
         // Amazon RDS `CreateDBSnapshot.DBSnapshotIdentifier`: "must contain from 1 to 255
         // letters, numbers, or hyphens", "first character must be a letter" and "can't end
         // with a hyphen or contain two consecutive hyphens" (that member's own doc) — RDS's
@@ -325,7 +333,9 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // group names above are in.
         crate::state::provisioner::rds_snapshots::RDS_CLUSTER_SNAPSHOT
         | crate::state::provisioner::rds_cluster_endpoints::RDS_DB_CLUSTER_ENDPOINT
-        | crate::state::provisioner::rds_global_clusters::RDS_GLOBAL_CLUSTER => {
+        | crate::state::provisioner::rds_global_clusters::RDS_GLOBAL_CLUSTER
+        // Amazon Neptune's global database is the same member of the same call.
+        | crate::state::provisioner::neptune_relational::NEPTUNE_GLOBAL_CLUSTER => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
         // Amazon RDS `CreateDBProxy.DBProxyName`: `@length(min: 1, max: 63)` with pattern

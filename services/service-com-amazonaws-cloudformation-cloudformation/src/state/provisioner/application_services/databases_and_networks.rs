@@ -1045,6 +1045,13 @@ pub(crate) async fn delete_workspace(
 pub(crate) const RDS_SIGNING_NAME: &str = "rds";
 pub(crate) const RDS_API_VERSION: &str = "2014-10-31";
 
+/// The name an `AWS::RDS::*` type's provider reports that service under, which is the name
+/// its own SDK client carries (`Rds`, this model's `sdkId` written as one word with a capital
+/// initial) — see [`call_query_as`] for why the name travels with the TYPE rather than with
+/// the signing name, and the sibling control planes' own constants
+/// (`super::super::neptune_relational::NEPTUNE_SDK_SERVICE`) for the other views of this door.
+pub(crate) const RDS_SDK_SERVICE: &str = "Rds";
+
 /// The error codes Amazon RDS answers for resources it does not hold:
 /// `DBInstanceNotFoundFault`'s and `DBSubnetGroupNotFoundFault`'s own `awsQueryError`
 /// codes, which is what an awsQuery client branches on.
@@ -1242,9 +1249,24 @@ pub(crate) struct ParameterGroupCalls {
     /// The resource type, which a property outside the create's catalogue is refused by
     /// name ([`query_members`]).
     pub(crate) resource_type: &'static str,
+    /// The name the provider of that type reports the called service under: the name of the
+    /// SDK client it holds, which the exception a refused call raises states
+    /// ([`call_query_as`]). It is not the signing name's: three control planes share this
+    /// front door, so the service a type belongs to is the type's, not the wire's.
+    pub(crate) sdk_service: &'static str,
     /// The member every one of these calls addresses the group by, which is also what this
     /// type's `Ref` returns and so this resource's physical id.
     pub(crate) name_member: &'static str,
+    /// The PROPERTY the declaration states that name in, which the walk does not turn into a
+    /// create member — the arm pushes [`Self::name_member`] from the resource's physical id
+    /// instead ([`Self::properties_not_sent`]).
+    ///
+    /// The Amazon RDS types spell it as the API member itself
+    /// (`AWS::RDS::DBClusterParameterGroup`'s `DBClusterParameterGroupName`); Amazon
+    /// Neptune's publish plain `Name`. So the property and the member are two things, and a
+    /// declaration stating a property this type does not publish is refused rather than
+    /// dropped ([`query_members`]).
+    pub(crate) name_property: &'static str,
     /// The members the create takes, from Amazon RDS's own model, with each list's element
     /// name from its list shape's member `@xmlName`
     /// (`smithy_query(query="shape", shape="TagList")`).
@@ -1259,11 +1281,12 @@ pub(crate) struct ParameterGroupCalls {
 
 impl ParameterGroupCalls {
     /// The declared properties the walk does NOT turn into a create member: the name
-    /// CloudFormation decides and the tag list it merges, as for the two types above, plus
-    /// the `Parameters` MAP, which is no member of the create at all — a group's parameter
-    /// values are written by the modify [`modify_parameters`] makes next.
+    /// CloudFormation decides ([`Self::name_property`]) and the tag list it merges, as for
+    /// the two types above, plus the `Parameters` MAP, which is no member of the create at
+    /// all — a group's parameter values are written by the modify [`modify_parameters`] makes
+    /// next.
     pub(crate) fn properties_not_sent(&self) -> [&'static str; 3] {
-        [self.name_member, "Parameters", "Tags"]
+        [self.name_property, "Parameters", "Tags"]
     }
 }
 
@@ -1272,7 +1295,9 @@ impl ParameterGroupCalls {
 /// (`smithy_query(query="operation", operation="CreateDBParameterGroup")`).
 pub(crate) const DB_PARAMETER_GROUP_CALLS: ParameterGroupCalls = ParameterGroupCalls {
     resource_type: RDS_DB_PARAMETER_GROUP,
+    sdk_service: RDS_SDK_SERVICE,
     name_member: "DBParameterGroupName",
+    name_property: "DBParameterGroupName",
     create_members: &[
         ("DBParameterGroupFamily", QueryMember::Scalar),
         ("DBParameterGroupName", QueryMember::Scalar),
@@ -1293,7 +1318,9 @@ pub(crate) const DB_PARAMETER_GROUP_CALLS: ParameterGroupCalls = ParameterGroupC
 /// (`smithy_query(query="operation", operation="CreateDBClusterParameterGroup")`).
 pub(crate) const DB_CLUSTER_PARAMETER_GROUP_CALLS: ParameterGroupCalls = ParameterGroupCalls {
     resource_type: RDS_DB_CLUSTER_PARAMETER_GROUP,
+    sdk_service: RDS_SDK_SERVICE,
     name_member: "DBClusterParameterGroupName",
+    name_property: "DBClusterParameterGroupName",
     create_members: &[
         ("DBClusterParameterGroupName", QueryMember::Scalar),
         ("DBParameterGroupFamily", QueryMember::Scalar),
@@ -2365,7 +2392,9 @@ pub(crate) async fn describe_cluster_subnet_group(
     }
 }
 
-/// Create the DB subnet group an `AWS::RDS::DBSubnetGroup` declares.
+/// Create the DB subnet group a declaration of either control plane's subnet-group type asks
+/// for — `AWS::RDS::DBSubnetGroup` and the `AWS::Neptune::DBSubnetGroup` whose declaration is
+/// the same document against the same call.
 ///
 /// The type's four properties are `CreateDBSubnetGroup`'s own members, named identically on
 /// both sides, with the name CloudFormation decides and the merged tag list pushed by this
@@ -2374,18 +2403,24 @@ pub(crate) async fn describe_cluster_subnet_group(
 /// instance (`DBSubnetGroupNotFoundFault`), so a stack that declares both has to create
 /// this one for real too — under the name that service answered it stored the group as
 /// ([`stored_identity`]), which is this resource's physical id.
+///
+/// `resource_type` is the declared type, which a property outside the create's catalogue is
+/// refused by name and whose ARN attributes are spelled from, and `sdk_service` the name this
+/// type's provider reports the called service under ([`call_query_as`]).
 pub(crate) async fn create_db_subnet_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     propagated: &[(String, String)],
+    resource_type: &'static str,
+    sdk_service: &'static str,
 ) -> Result<Created, Refusal> {
     let mut parameters = query_members(
         &resource.properties,
         CREATE_DB_SUBNET_GROUP_MEMBERS,
         &[],
         DB_SUBNET_GROUP_PROPERTIES_NOT_SENT,
-        RDS_DB_SUBNET_GROUP,
+        resource_type,
     )?;
     parameters.push((
         "DBSubnetGroupName".to_string(),
@@ -2397,9 +2432,10 @@ pub(crate) async fn create_db_subnet_group(
         "Tag",
         &tags_of(&resource.properties, propagated),
     );
-    let answered = call_query(
+    let answered = call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "CreateDBSubnetGroup",
@@ -2412,7 +2448,7 @@ pub(crate) async fn create_db_subnet_group(
         // The group's own ARN, which is the resource's: every name the type publishes its ARN
         // under is re-pointed at the one Amazon RDS reports
         // ([`super::template::arn_attributes`]).
-        attributes.extend(super::template::arn_attributes(RDS_DB_SUBNET_GROUP, &arn));
+        attributes.extend(super::template::arn_attributes(resource_type, &arn));
     }
     Ok(Created {
         physical_resource_id: stored_identity(&answered, "DBSubnetGroupName"),
@@ -2427,14 +2463,16 @@ pub(crate) async fn delete_db_subnet_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    sdk_service: &'static str,
 ) -> Result<(), Refusal> {
     let parameters = vec![(
         "DBSubnetGroupName".to_string(),
         physical_resource_id.to_string(),
     )];
-    match call_query(
+    match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "DeleteDBSubnetGroup",
@@ -2459,14 +2497,16 @@ pub(crate) async fn describe_db_subnet_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    sdk_service: &'static str,
 ) -> Result<Option<Value>, Refusal> {
     let parameters = vec![(
         "DBSubnetGroupName".to_string(),
         physical_resource_id.to_string(),
     )];
-    match call_query(
+    match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        sdk_service,
         region,
         RDS_API_VERSION,
         "DescribeDBSubnetGroups",
@@ -2483,17 +2523,28 @@ pub(crate) async fn describe_db_subnet_group(
     }
 }
 
-/// Create the parameter group a declaration of either RDS parameter-group type asks for.
+/// Create the parameter group a declaration of either control plane's parameter-group type
+/// asks for.
 ///
 /// The type's properties are its create's own members ([`ParameterGroupCalls`]) but for the
-/// one Amazon RDS spells differently ([`PARAMETER_GROUP_RENAMED_PROPERTIES`]), with the name
-/// CloudFormation decides — what this type's `Ref` returns, this resource's physical id,
-/// which becomes the name that service answered it stored the group as ([`stored_identity`])
-/// — and the merged tag list pushed by this arm the way the two types above push theirs.
+/// one this front door spells differently ([`PARAMETER_GROUP_RENAMED_PROPERTIES`]) and the
+/// name property each control plane publishes ([`ParameterGroupCalls::name_property`]), with
+/// the name CloudFormation decides — what this type's `Ref` returns, this resource's physical
+/// id, which becomes the name that service answered it stored the group as
+/// ([`stored_identity`]) — and the merged tag list pushed by this arm the way the two types
+/// above push theirs.
 ///
 /// The declared `Parameters` are a SECOND call ([`modify_parameters`]), the same pair a
 /// client makes: a group is created carrying none of its own parameters, and the values a
 /// template declares are what the describe of the group's parameters then reports for it.
+///
+/// A create is therefore a CHAIN, and a chain that is refused part way through leaves nothing
+/// behind: a value outside a parameter's published domain is refused by the modify, after the
+/// group exists, and a group carrying none of the values the template declared is not the
+/// resource the stack asked for. So the group this arm created is removed again before the
+/// refusal is reported ([`delete_parameter_group`]), which is what makes the create either the
+/// whole declaration or nothing at all — and is what a client's own read of that service finds
+/// once the stack has rolled back.
 pub(crate) async fn create_parameter_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -2518,23 +2569,33 @@ pub(crate) async fn create_parameter_group(
         "Tag",
         &tags_of(&resource.properties, propagated),
     );
-    let answered = call_query(
+    let answered = call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        calls.sdk_service,
         region,
         RDS_API_VERSION,
         calls.create,
         &parameters,
     )
     .await?;
-    modify_parameters(
+    if let Err(refused) = modify_parameters(
         ctx,
         region,
         &resource.physical_resource_id,
         &declared_parameters(&resource.properties),
         calls,
     )
-    .await?;
+    .await
+    {
+        // The group this chain had already created is removed again, so a refused create
+        // leaves nothing of itself behind. The refusal REPORTED is the one that stopped the
+        // create — what a caller has to fix — never anything about the removal: that is this
+        // arm undoing its own work, and a service that would not carry it out leaves the group
+        // for the stack's own rollback to take down.
+        let _ = delete_parameter_group(ctx, region, &resource.physical_resource_id, calls).await;
+        return Err(refused);
+    }
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) =
@@ -2589,9 +2650,10 @@ pub(crate) async fn modify_parameters(
                 attribute_text(value),
             ));
         }
-        call_query(
+        call_query_as(
             ctx,
             RDS_SIGNING_NAME,
+            calls.sdk_service,
             region,
             RDS_API_VERSION,
             calls.modify,
@@ -2712,9 +2774,10 @@ pub(crate) async fn delete_parameter_group(
         calls.name_member.to_string(),
         physical_resource_id.to_string(),
     )];
-    match call_query(
+    match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        calls.sdk_service,
         region,
         RDS_API_VERSION,
         calls.delete,
@@ -2747,9 +2810,10 @@ pub(crate) async fn describe_parameter_group(
         calls.name_member.to_string(),
         physical_resource_id.to_string(),
     )];
-    match call_query(
+    match call_query_as(
         ctx,
         RDS_SIGNING_NAME,
+        calls.sdk_service,
         region,
         RDS_API_VERSION,
         calls.describe,

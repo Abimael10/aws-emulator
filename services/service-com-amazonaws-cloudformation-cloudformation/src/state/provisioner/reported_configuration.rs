@@ -282,7 +282,7 @@ impl Provisioner {
                 Box::pin(read_db_cluster(ctx, region, physical_resource_id)).await
             }
             Self::RdsDbSubnetGroup => {
-                describe_db_subnet_group(ctx, region, physical_resource_id).await
+                describe_db_subnet_group(ctx, region, physical_resource_id, RDS_SDK_SERVICE).await
             }
             // Amazon RDS's own read of the option group, by the name it was created under.
             Self::RdsOptionGroup => {
@@ -347,6 +347,45 @@ impl Provisioner {
                     ctx,
                     region,
                     physical_resource_id,
+                    RDS_SDK_SERVICE,
+                ))
+                .await
+            }
+            // The same front door's own reads of the Amazon Neptune relational resources, each
+            // by the name or identifier it was created under.
+            Self::NeptuneDbParameterGroup => {
+                describe_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbClusterParameterGroup => {
+                describe_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::NeptuneDbSubnetGroup => {
+                describe_db_subnet_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
+                )
+                .await
+            }
+            Self::NeptuneGlobalCluster => {
+                Box::pin(rds_global_clusters::read_global_cluster(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    neptune_relational::NEPTUNE_SDK_SERVICE,
                 ))
                 .await
             }
