@@ -30,10 +30,11 @@
 //!   [`UNKNOWN_OPERATION_STATUS`];
 //! - the endpoint binds NO route for the path at all — the ingest route `/putMedia`, bound
 //!   at the media plane's announced address alone, asked for at any other address of this
-//!   emulator, and a CONTROL route asked for at an address announced for a data plane
-//!   ([`super::data_plane_address`], which adds the class in `x-amzn-errortype` for the
-//!   client that has an endpoint to re-discover): [`unrouted_path_response`], the 404 whose
-//!   whole body is [`UNROUTED_PATH_BODY`].
+//!   emulator: [`unrouted_path_response`], the 404 whose whole body is
+//!   [`UNROUTED_PATH_BODY`] — and a CONTROL route asked for at an address announced for a
+//!   data plane ([`super::data_plane_address`], the same 404 with the class in
+//!   `x-amzn-errortype` for the client that has an endpoint to re-discover, over a JSON
+//!   error document that words nothing).
 //!
 //! The first reply is served both as a plain response (the routing-error seam, which
 //! answers one) and as the [`ErasedOperation`] below (the `override_operation` seam, which
@@ -73,8 +74,9 @@ pub const UNKNOWN_OPERATION_CODE: &str = "UnknownOperationException";
 /// The version of the front door's own envelope, which wraps the fault in `Output`.
 const ENVELOPE_VERSION: &str = "1.0";
 
-/// The media type the envelope is written in.
-const JSON_CONTENT_TYPE: &str = "application/json";
+/// The media type the envelope is written in — and every other JSON document this front
+/// door answers with ([`super::data_plane_address`]).
+pub(crate) const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// The envelope's bytes, built through the JSON writer rather than written out as a
 /// literal, so the one wording above is the only place its text lives.

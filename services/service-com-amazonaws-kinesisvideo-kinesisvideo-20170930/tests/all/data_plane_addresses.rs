@@ -30,6 +30,16 @@ const CONTROL_AUTHORITY: &str = "127.0.0.1:9297";
 /// The region of the credential scope every request carries.
 const REGION: &str = "us-east-1";
 
+/// The WHOLE body the refusal at an announced data address carries, written out as the wire
+/// carries it rather than read off the code under test, so a drift away from it must fail
+/// here: a JSON error document whose message member is the explicit `null` of an answer that
+/// words nothing.
+///
+/// `null` rather than an omitted member, and never the empty string: an SDK reading a JSON
+/// error document substitutes the empty string for a message member the document does not
+/// carry, and reports NO message only for a member whose value is null.
+const WORDS_NOTHING: &str = r#"{"Message":null}"#;
+
 /// A router carrying only this service, over an engine this suite keeps a handle on — the
 /// store the announced addresses are recorded in.
 struct Harness {
@@ -162,10 +172,10 @@ async fn an_announced_address_maps_back_to_the_plane_that_serves_its_api() {
 /// RULE: this service's own routes are served at the endpoint a control call arrives on
 /// and not at an address it announced for a data plane — a control call that reached a
 /// plane's address reached an endpoint that routes nothing for its path, so it is answered
-/// with the status this family gives such a path, with no body of any kind and its
-/// `x-amzn-errortype` naming the refusal's class where a restJson1 client reads a failure's
-/// code, and nothing in the store changes, while the same call at the control-plane address
-/// is served.
+/// with the status this family gives such a path, with its `x-amzn-errortype` naming the
+/// refusal's class where a restJson1 client reads a failure's code and a body that words
+/// nothing at all, and nothing in the store changes, while the same call at the
+/// control-plane address is served.
 ///
 /// The rows differ in the control operation asked for (a read, a list and the discovery
 /// call itself) and in the plane whose address it is asked at (the live media endpoint and
@@ -217,9 +227,9 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
             );
             assert_eq!(
                 String::from_utf8_lossy(response.body()).as_ref(),
-                "",
-                "case {case:?}: the refusal carries no body, and so no message member of any \
-                 kind, got {:?}",
+                WORDS_NOTHING,
+                "case {case:?}: the refusal words nothing, so its message member is the \
+                 explicit null a client reports NO message for, got {:?}",
                 String::from_utf8_lossy(response.body())
             );
         }
@@ -235,6 +245,173 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
              got {status} with {answered:?}"
         );
     }
+}
+
+/// RULE: a refusal of this family that WORDS NOTHING reports no message to the client: the
+/// body it carries is a JSON error document whose message member is present as the explicit
+/// JSON `null`, because an SDK reading a JSON error document substitutes the EMPTY STRING
+/// for a message member the document does not carry and reports no message only for a member
+/// whose value is null. The refusal a control route earns at an address this service
+/// announced for a data plane is such an answer: it identifies its CLASS in
+/// `x-amzn-errortype`, words nothing at all, states nothing of the request, and touches
+/// nothing in the store.
+///
+/// The rows span what the rule generalises over: the control route asked for — a read in
+/// each identifier form, a list, the discovery call itself, a tag WRITE, a DELETE, and a
+/// request the route itself would refuse for carrying no identifier at all — crossed with
+/// the plane whose announced address it was asked at, which is every `APIName` the model
+/// publishes and so both media endpoints. The answer is therefore a property of the address
+/// rather than of one operation, one identifier form, one request body or one plane.
+#[tokio::test]
+async fn the_refusal_at_an_announced_address_reports_no_message_and_changes_nothing() {
+    let harness = Harness::new();
+    let arn = harness.create_stream("worded-nothing").await;
+    // A second stream, so the reads at the end cannot pass against an empty store.
+    harness.create_stream("worded-nothing-other").await;
+
+    // (what was asked, the control path, the body it carried).
+    let calls: Vec<(&str, &str, serde_json::Value)> = vec![
+        (
+            "a read by name",
+            "/describeStream",
+            serde_json::json!({ "StreamName": "worded-nothing" }),
+        ),
+        (
+            "a read by ARN",
+            "/describeStream",
+            serde_json::json!({ "StreamARN": arn }),
+        ),
+        ("a list", "/listStreams", serde_json::json!({})),
+        (
+            "the discovery call itself",
+            "/getDataEndpoint",
+            serde_json::json!({ "StreamName": "worded-nothing", "APIName": "GET_MEDIA" }),
+        ),
+        (
+            "a tag write",
+            "/tagStream",
+            serde_json::json!({ "StreamName": "worded-nothing", "Tags": { "plane": "wrong" } }),
+        ),
+        (
+            "a delete",
+            "/deleteStream",
+            serde_json::json!({ "StreamARN": arn }),
+        ),
+        (
+            "a request the route itself would refuse, carrying no identifier at all",
+            "/describeStream",
+            serde_json::json!({}),
+        ),
+    ];
+
+    for api_name in kvs::ops::types::A_P_I_NAME_VALUES {
+        let authority = harness
+            .announced_authority(
+                serde_json::json!({ "StreamName": "worded-nothing" }),
+                api_name,
+            )
+            .await;
+        for (asked, path, body) in &calls {
+            let case = format!("{asked} at the address announced for {api_name}");
+            let response = harness.call_at(&authority, path, body.clone()).await;
+            let answered = String::from_utf8_lossy(response.body()).to_string();
+
+            assert_eq!(
+                response.status().as_u16(),
+                404,
+                "case {case:?}: a data plane's address routes no control operation, got {} \
+                 {answered:?}",
+                response.status()
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-amzn-errortype")
+                    .and_then(|value| value.to_str().ok()),
+                Some(kvs::service::unknown_operation::UNKNOWN_OPERATION_CODE),
+                "case {case:?}: the refusal's class is the whole of its identification, and \
+                 is stated where a restJson1 client reads a failure's code, got {:?}",
+                response.headers().get("x-amzn-errortype")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "case {case:?}: the body is a JSON error document, so it is typed as one, \
+                 got {:?}",
+                response.headers().get("content-type")
+            );
+            assert_eq!(
+                answered, WORDS_NOTHING,
+                "case {case:?}: expected the message-free error document as the whole body, \
+                 got {answered:?}"
+            );
+
+            // The same thing read as a client reads it: the member is PRESENT and null — an
+            // omitted member reaches a client as the empty string, and an empty string is a
+            // reason this refusal never states.
+            let document: serde_json::Value =
+                serde_json::from_str(&answered).unwrap_or_else(|error| {
+                    panic!("case {case:?}: the body must be a JSON document ({error}): {answered:?}")
+                });
+            assert_eq!(
+                document.get("Message"),
+                Some(&serde_json::Value::Null),
+                "case {case:?}: a client reports no message only for a message member whose \
+                 value is null, got {document}"
+            );
+            assert_eq!(
+                document.as_object().map(serde_json::Map::len),
+                Some(1),
+                "case {case:?}: the refusal words nothing beside that one member, got \
+                 {document}"
+            );
+
+            // Nothing of the request is in it: no stream name, ARN, path or operation name.
+            for stated in [
+                "worded-nothing",
+                arn.as_str(),
+                path.trim_start_matches('/'),
+                "plane",
+            ] {
+                assert!(
+                    !answered.contains(stated),
+                    "case {case:?}: the refusal states nothing from the request, got \
+                     {stated:?} in {answered:?}"
+                );
+            }
+        }
+    }
+
+    // And nothing those calls asked for happened: the stream a delete named is still there,
+    // the tag a write named was never applied, and the control endpoint still serves the
+    // whole surface.
+    for name in ["worded-nothing", "worded-nothing-other"] {
+        let (status, body) = harness
+            .call("/describeStream", serde_json::json!({ "StreamName": name }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: a call refused at a data plane's address changes nothing, so the \
+             stream is still read at the control endpoint, got {status} with {body:?}"
+        );
+    }
+    let (status, tags) = harness
+        .call(
+            "/listTagsForStream",
+            serde_json::json!({ "StreamName": "worded-nothing" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from ListTagsForStream, got {status} with {tags:?}"
+    );
+    assert!(
+        tags["Tags"].get("plane").is_none(),
+        "a tag write refused at a data plane's address applies no tag, got {tags:?}"
+    );
 }
 
 /// RULE: an announced address OUTLIVES the stream it was announced for — the listener stays
