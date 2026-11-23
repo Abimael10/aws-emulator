@@ -495,6 +495,10 @@ pub mod guest_resolver;
 /// package out of, answered from the build that node reports.
 pub mod guest_packages;
 
+/// The PYTHON INTERPRETER in a node's guest, which runs the inline program a command's script
+/// hands it in the one contained engine this workspace embeds.
+pub mod guest_python;
+
 /// Where this service's EC2-facing work lives: the registration half and the delivery half,
 /// and why they are separate.
 pub mod ec2_managed_nodes;

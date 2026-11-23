@@ -570,8 +570,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // THIS document that the node's platform runs, with the document's parameters
         // resolved. Read while the node inventory is to hand, performed below with no guard
         // of this store held.
+        //
+        // Bounded before the document is read, the way the patch-baseline list below is and for
+        // the same reason: a send selects its nodes by criteria the caller writes
+        // (`Key=InstanceIds,Values=*` selects every node of the Region) and resolving the step
+        // parses the document's content, so the nodes one request can make this process do that
+        // for are capped at the deliveries it performs
+        // (`commands::MAX_GUEST_DELIVERIES_PER_SEND`) rather than after the whole list has been
+        // built. A node past the cap is left as the delivery below leaves it.
         let scripts: Vec<(String, crate::state::guest_execution::ShellStep)> = resolved
             .iter()
+            .take(crate::state::commands::MAX_GUEST_DELIVERIES_PER_SEND)
             .filter_map(|id| {
                 let node = store.managed_node(&region, id)?;
                 let platform = node.properties.platform_type.as_deref()?;
@@ -673,6 +682,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let due_at = now + crate::state::commands::INVOCATION_COMPLETES_AFTER;
         let undelivered_at = record.expires_after();
         let mut ran_on: Vec<String> = Vec::new();
+        // What the GUEST PROGRAMS of this one request may spend between them
+        // (`crate::state::guest_python::ProgramAllowance`): made here, before the first
+        // delivery, and handed to every one of them — so the programs a request's script runs
+        // are bounded across its deliveries rather than per delivery.
+        let programs = crate::state::guest_python::ProgramAllowance::for_one_request();
         for (id, step) in scripts
             .into_iter()
             .take(crate::state::commands::MAX_GUEST_DELIVERIES_PER_SEND)
@@ -681,14 +695,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is what keeps this handler's task cancellable and the runtime responsive while
             // a send to many nodes is being delivered.
             ::tokio::task::yield_now().await;
-            let Some(run) = crate::state::guest_execution::perform_in_guest(
+            // What this delivery installs in that guest, resolved with THIS request's own
+            // context (`guest_execution::delivery_in_guest`), so the run itself borrows
+            // nothing of the request.
+            let delivery = crate::state::guest_execution::delivery_in_guest(
                 &*self.engine,
                 ctx.credential_store(),
                 &region,
                 &id,
-                &step.commands,
                 now,
-            ) else {
+                &programs,
+            );
+            // The RUN is synchronous and CPU-bound — the guest's shell session is performed
+            // with the store guard of the service that owns the guest held, and a program of
+            // the guest may wait a bounded span for an interpreter of this process — so it
+            // happens on a BLOCKING thread rather than on a worker of this runtime: that is
+            // what keeps this request cancellable and the runtime responsive while it runs.
+            let engine = ::std::sync::Arc::clone(&self.engine);
+            let node = id.clone();
+            let commands = step.commands.clone();
+            let performed = ::tokio::task::spawn_blocking(move || {
+                crate::state::guest_execution::perform_delivery(
+                    &*engine, &node, &commands, delivery,
+                )
+            })
+            .await;
+            // A run this process could not perform at all — no thread for it, or a thread that
+            // ended without answering — is a node nothing was delivered to, exactly as one
+            // with no guest to run in is.
+            let Some(run) = performed.ok().flatten() else {
                 continue;
             };
             if let Some(invocation) = invocations.get_mut(&id) {

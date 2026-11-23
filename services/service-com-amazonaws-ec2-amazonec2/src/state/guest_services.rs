@@ -45,7 +45,9 @@
 use ::std::collections::{BTreeMap, BTreeSet};
 use ::std::sync::{Arc, Mutex, PoisonError};
 
-use ::service_common::posix_shell_session::{EnvironmentPrograms, ProgramFiles, ProgramOutcome};
+use ::service_common::posix_shell_session::{
+    EnvironmentPrograms, ProgramFiles, ProgramInvocation, ProgramOutcome, ProgramStreams,
+};
 // The ONE reading this workspace has of which web server an invocation names, what its shipped
 // configuration serves, and what an interpreter's own HTTP server module was invoked for —
 // shared with every other service that runs a caller-supplied program and then has to answer an
@@ -84,8 +86,8 @@ const APACHE_CONTROL: &str = "apachectl";
 const APACHE_UNIT: &str = "httpd";
 
 /// The directory the interpreter's own HTTP server module serves when no `--directory` names
-/// one: the working directory of the session the command was written in — which, for a session
-/// with no `cd` to change it, is the root of the machine's tree.
+/// one and the caller of this module's programs states none: the ROOT of the machine's tree,
+/// which is the directory a session nothing has changed with `cd` is in.
 const SESSION_WORKING_DIRECTORY: &str = "/";
 
 /// The status a program of this guest exits with when it did what it was asked.
@@ -531,12 +533,13 @@ impl GuestServices {
     /// Serve a directory with the interpreter's own HTTP server module, read through the ONE
     /// reading of that invocation this workspace has
     /// ([`::service_common::static_web_servers::served_module`]): the port it was given and the
-    /// directory `--directory` names, else this session's working directory.
+    /// directory `--directory` names, else `working_directory` — the directory the session that
+    /// invoked it is IN, which is what the module's own default ("the current directory") is.
     ///
     /// `None` for every other invocation of the interpreter: this guest performs the module
     /// below and nothing else of it.
-    fn serve_module(&self, arguments: &[String]) -> Option<ProgramOutcome> {
-        let served = module_invocation(arguments, SESSION_WORKING_DIRECTORY)?;
+    fn serve_module(&self, arguments: &[String], working_directory: &str) -> Option<ProgramOutcome> {
+        let served = module_invocation(arguments, working_directory)?;
         // The module LISTS a directory that holds no index document, which is what
         // `SimpleHTTPRequestHandler` answers such a request with.
         self.held()
@@ -604,7 +607,13 @@ impl EnvironmentPrograms for GuestEnvironment {
         if let Some(outcome) = self.metadata.run(name, arguments, files) {
             return Some(outcome);
         }
-        self.service_program(name, arguments, files)
+        // What this form of the seam reports is the program's standard OUTPUT alone, which is
+        // what a caller asking it reads; the form the session asks carries both streams.
+        self.service_program(name, arguments, SESSION_WORKING_DIRECTORY, files)
+            .map(|streams| ProgramOutcome {
+                status: streams.status,
+                output: streams.output,
+            })
     }
 
     fn run_with_input(
@@ -620,19 +629,47 @@ impl EnvironmentPrograms for GuestEnvironment {
         {
             return Some(outcome);
         }
-        self.service_program(name, arguments, files)
+        self.service_program(name, arguments, SESSION_WORKING_DIRECTORY, files)
+            .map(|streams| ProgramOutcome {
+                status: streams.status,
+                output: streams.output,
+            })
+    }
+
+    /// The form the session asks, which is answered on BOTH streams: what one of these
+    /// programs REPORTED IT COULD NOT DO is a diagnostic, and a diagnostic is not part of what
+    /// the program wrote to standard output.
+    fn run_invocation(
+        &self,
+        invocation: &ProgramInvocation<'_>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramStreams> {
+        if let Some(outcome) = self.metadata.run_invocation(invocation, files) {
+            return Some(outcome);
+        }
+        self.service_program(
+            invocation.name,
+            invocation.arguments,
+            invocation.working_directory,
+            files,
+        )
     }
 }
 
 impl GuestEnvironment {
     /// What one of this guest's service programs answers for `name`, or `None` when this
     /// guest has no program of that name — or performs nothing of that invocation of it.
+    ///
+    /// `working_directory` is the directory the session is in, which is what a program whose
+    /// own default is the directory it was started in serves out of
+    /// ([`GuestServices::serve_module`]).
     fn service_program(
         &self,
         name: &str,
         arguments: &[String],
+        working_directory: &str,
         files: &mut dyn ProgramFiles,
-    ) -> Option<ProgramOutcome> {
+    ) -> Option<ProgramStreams> {
         // A path of this machine's OWN storage holding an agent's installer is a program of
         // this guest: running it installs that agent ([`super::guest_agents`]). Asked before
         // the name is read as a program name, because what makes it one is the file at the
@@ -640,7 +677,7 @@ impl GuestEnvironment {
         if let Some(outcome) = super::guest_agents::installer_outcome(name, &*files, |agent| {
             self.services.install_agent_and_start(agent);
         }) {
-            return Some(outcome);
+            return Some(written(outcome));
         }
         // A program named by its absolute path is the same program: `/usr/sbin/httpd` and
         // `httpd` are one, as a shell resolving a name on `PATH` finds.
@@ -653,28 +690,45 @@ impl GuestEnvironment {
         if name == super::guest_agents::DOWNLOAD_PROGRAM
             || name == super::guest_agents::TRANSFER_PROGRAM
         {
-            return super::guest_agents::downloaded(name, arguments, files);
+            // A request to an address of this machine's OWN loopback interface is answered by
+            // the server of THIS guest listening there ([`super::guest_http_client`]): the
+            // client and the server are in one machine, which is the one request a machine
+            // makes entirely inside itself.
+            let listening = self.held().listening.clone();
+            if let Some(streams) =
+                super::guest_http_client::fetched(name, arguments, files, &listening)
+            {
+                return Some(streams);
+            }
+            return super::guest_agents::downloaded(name, arguments, files).map(written);
         }
         if name == super::guest_agents::MODE_PROGRAM {
             return super::guest_agents::mode_changed(arguments, files);
         }
         if name == INIT_CONTROL {
             let (verb, operands, now) = invocation(arguments);
-            return self.services.control(verb?, operands.first().copied()?, now);
+            return self
+                .services
+                .control(verb?, operands.first().copied()?, now)
+                .map(written);
         }
         if name == SERVICE_CONTROL {
             // `service <unit> <verb>`: the operands are the other way round.
             let (unit, operands, now) = invocation(arguments);
             return self
                 .services
-                .control(operands.first().copied()?, unit?, now);
+                .control(operands.first().copied()?, unit?, now)
+                .map(written);
         }
         if name == APACHE_CONTROL {
             let (verb, _, now) = invocation(arguments);
-            return self.services.control(verb?, APACHE_UNIT, now);
+            return self.services.control(verb?, APACHE_UNIT, now).map(written);
         }
         if ::service_common::static_web_servers::INTERPRETERS.contains(&name) {
-            return self.services.serve_module(arguments);
+            return self
+                .services
+                .serve_module(arguments, working_directory)
+                .map(written);
         }
         if let Some(package) = package_named(name) {
             // The server itself, invoked with no option: every other form is one this guest
@@ -682,9 +736,14 @@ impl GuestEnvironment {
             if !arguments.is_empty() {
                 return None;
             }
-            return self.services.start_daemon(package);
+            return self.services.start_daemon(package).map(written);
         }
         None
+    }
+
+    /// The services of this guest, for a program that reads what it is listening with.
+    fn held(&self) -> ::std::sync::MutexGuard<'_, GuestRuntime> {
+        self.services.held()
     }
 
     /// One package-manager invocation: its subcommand decides what it does, and the operands
@@ -693,30 +752,44 @@ impl GuestEnvironment {
         &self,
         arguments: &[String],
         files: &mut dyn ProgramFiles,
-    ) -> ProgramOutcome {
+    ) -> ProgramStreams {
         let (subcommand, packages, _) = invocation(arguments);
         match subcommand.unwrap_or_default() {
-            "install" | "reinstall" | "localinstall" => self.services.install(&packages, files),
-            "remove" | "erase" | "autoremove" => self.services.remove(&packages),
+            "install" | "reinstall" | "localinstall" => written(self.services.install(&packages, files)),
+            "remove" | "erase" | "autoremove" => written(self.services.remove(&packages)),
             // A manager asked to refresh its view of what it could install changes nothing
             // about this guest: every package it has is installed by name above.
             "update" | "upgrade" | "makecache" | "clean" | "check-update" | "list" => {
-                ProgramOutcome {
+                ProgramStreams {
                     status: SUCCESS,
                     output: vec!["Nothing to do.".to_string()],
+                    errors: Vec::new(),
                 }
             }
-            // An invocation naming no subcommand at all does nothing and says so, as a
-            // manager that was given no command to run does.
-            "" => ProgramOutcome {
+            // An invocation naming no subcommand at all does nothing and SAYS so, as a
+            // manager that was given no command to run does — on standard error, where what a
+            // program reports it could not do goes.
+            "" => ProgramStreams {
                 status: NO_SUCH_PACKAGE,
-                output: vec!["No command given.".to_string()],
+                output: Vec::new(),
+                errors: vec!["No command given.".to_string()],
             },
-            unknown => ProgramOutcome {
+            unknown => ProgramStreams {
                 status: NO_SUCH_PACKAGE,
-                output: vec![format!("No such command: {unknown}.")],
+                output: Vec::new(),
+                errors: vec![format!("No such command: {unknown}.")],
             },
         }
+    }
+}
+
+/// What a program that writes its answer to standard OUTPUT alone came to, as the two streams
+/// the session takes ([`ProgramStreams`]): the lines it wrote and the status it exited with.
+fn written(outcome: ProgramOutcome) -> ProgramStreams {
+    ProgramStreams {
+        status: outcome.status,
+        output: outcome.output,
+        errors: Vec::new(),
     }
 }
 
@@ -779,6 +852,23 @@ pub fn served_by(
     method: &str,
     path: &str,
 ) -> GuestHttpResponse {
+    served_from(server, &HeldFiles(files), method, path)
+}
+
+/// [`served_by`] over the tree as a PROGRAM of that guest reaches it
+/// ([`ProgramFiles`]) — the LIVE tree of the session a command runs in, which is how a program
+/// inside the machine reaches a server of the same machine
+/// ([`super::guest_http_client`]) and sees the document the command before it wrote.
+///
+/// The ONE reading of what a guest's static server answers, so a request made from inside the
+/// machine and one forwarded to it from outside cannot be answered two ways.
+#[must_use]
+pub fn served_from(
+    server: &GuestServer,
+    files: &dyn ProgramFiles,
+    method: &str,
+    path: &str,
+) -> GuestHttpResponse {
     let method = method.trim().to_ascii_uppercase();
     if method != GET_METHOD && method != HEAD_METHOD {
         return GuestHttpResponse {
@@ -789,28 +879,28 @@ pub fn served_by(
     }
     let requested = path.split(['?', '#']).next().unwrap_or(path);
     let under = resolved_path(&server.document_root, requested);
-    let (status, served) = match files.get(&under) {
+    let (status, served) = match files.read(&under) {
         Some(contents) => (
             GUEST_HTTP_OK,
             Some((
                 ::service_common::web_media_type::media_type_of_path(&under).to_string(),
-                contents.clone(),
+                contents,
             )),
         ),
         None => {
             let index = format!("{}/{INDEX_DOCUMENT}", under.trim_end_matches('/'));
-            match files.get(&index) {
+            match files.read(&index) {
                 Some(contents) => (
                     GUEST_HTTP_OK,
                     Some((
                         ::service_common::web_media_type::media_type_of_path(&index).to_string(),
-                        contents.clone(),
+                        contents,
                     )),
                 ),
                 // A directory the root holds without an index document: a server that LISTS
                 // one answers what it holds, and one that does not will not serve it. Every
                 // other path the root holds nothing at.
-                None if holds_directory(files, &under) => {
+                None if !files.entries_in(&under).is_empty() => {
                     if server.lists_directories {
                         (
                             GUEST_HTTP_OK,
@@ -843,6 +933,45 @@ pub fn served_by(
     }
 }
 
+/// The files an instance HOLDS, as the seam a server reads them through: the map that
+/// instance's storage is kept in ([`InstanceRecord::guest_files`]), which is what a caller
+/// OUTSIDE the machine serves a request out of ([`served_by`]).
+///
+/// Read-only: serving a request writes nothing and removes nothing, so the writing half of the
+/// seam does nothing and says so.
+struct HeldFiles<'a>(&'a BTreeMap<String, String>);
+
+impl ProgramFiles for HeldFiles<'_> {
+    fn read(&self, path: &str) -> Option<String> {
+        self.0.get(path).cloned()
+    }
+
+    fn write(&mut self, _path: &str, _contents: &str) -> bool {
+        false
+    }
+
+    fn remove(&mut self, _path: &str) -> bool {
+        false
+    }
+
+    fn entries_in(&self, path: &str) -> Vec<String> {
+        let under = format!("{}/", path.trim_end_matches('/'));
+        let mut names: Vec<String> = Vec::new();
+        for held in self.0.keys() {
+            let Some(rest) = held.strip_prefix(&under) else {
+                continue;
+            };
+            // Only what lies DIRECTLY under the directory is an entry of it: a deeper path
+            // names the directory between them instead.
+            let name = rest.split('/').next().unwrap_or(rest).to_string();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+}
+
 /// The media type a directory LISTING is served as, as the module that writes one declares
 /// it.
 const LISTING_MEDIA_TYPE: &str = "text/html; charset=utf-8";
@@ -854,22 +983,22 @@ const LISTING_MEDIA_TYPE: &str = "text/html; charset=utf-8";
 /// The shape is the one `SimpleHTTPRequestHandler` writes: the directory's own name as the
 /// title and heading, and one link per entry. Every entry is a file of the guest's own
 /// storage; nothing is listed that the storage does not hold.
-fn listing(files: &BTreeMap<String, String>, path: &str) -> String {
+fn listing(files: &dyn ProgramFiles, path: &str) -> String {
     let under = format!("{}/", path.trim_end_matches('/'));
     let mut entries: Vec<String> = Vec::new();
-    for held in files.keys() {
-        let Some(rest) = held.strip_prefix(&under) else {
-            continue;
-        };
-        let entry = match rest.split_once('/') {
-            // A path deeper than this directory names the DIRECTORY it is under.
-            Some((directory, _)) => format!("{directory}/"),
-            None => rest.to_string(),
+    for name in files.entries_in(path) {
+        // A DIRECTORY of that directory is named with the trailing separator a listing gives
+        // one, which is what makes it a link to the listing below it.
+        let entry = if files.entries_in(&format!("{under}{name}")).is_empty() {
+            name
+        } else {
+            format!("{name}/")
         };
         if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
+    entries.sort();
     let title = format!("Directory listing for {under}");
     let items: String = entries
         .iter()
@@ -901,12 +1030,6 @@ fn resolved_path(root: &str, path: &str) -> String {
         return root.to_string();
     }
     format!("{root}/{}", segments.join("/"))
-}
-
-/// Whether the guest's files hold a DIRECTORY at `path`: some file lies under it.
-fn holds_directory(files: &BTreeMap<String, String>, path: &str) -> bool {
-    let under = format!("{}/", path.trim_end_matches('/'));
-    files.keys().any(|held| held.starts_with(&under))
 }
 
 impl ComAmazonawsEc2Amazonec2State {

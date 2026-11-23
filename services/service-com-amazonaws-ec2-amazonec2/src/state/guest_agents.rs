@@ -45,7 +45,7 @@
 //! Nothing is started, installed or reported for an agent nothing installed, and nothing here
 //! starts a process or reaches a host path.
 
-use ::service_common::posix_shell_session::{ProgramFiles, ProgramOutcome};
+use ::service_common::posix_shell_session::{ProgramFiles, ProgramOutcome, ProgramStreams};
 
 /// One agent a guest of this emulator can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,12 +315,16 @@ pub fn downloaded(
 
 /// What the file-mode program answers for `arguments`: the machine's tree holds no mode, so a
 /// path it HAS is a change that leaves nothing behind, and a path it does not is the command's
-/// own failure, in the wording that program reports one in.
+/// own failure — reported in the wording that program reports one in, on standard ERROR, where
+/// what a program reports it could not do goes.
 ///
 /// `None` for an invocation naming no path at all, which is a form this program performs
 /// nothing of.
 #[must_use]
-pub fn mode_changed(arguments: &[String], files: &mut dyn ProgramFiles) -> Option<ProgramOutcome> {
+pub fn mode_changed(
+    arguments: &[String],
+    files: &mut dyn ProgramFiles,
+) -> Option<ProgramStreams> {
     let mut named = arguments.iter().filter(|word| !word.starts_with('-'));
     // The first operand is the mode and the rest are the paths it applies to.
     let _mode = named.next()?;
@@ -328,19 +332,23 @@ pub fn mode_changed(arguments: &[String], files: &mut dyn ProgramFiles) -> Optio
     if paths.is_empty() {
         return None;
     }
-    let mut output: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     let mut status = 0;
     for path in paths {
         let held = machine_path(path);
         let held = held.as_deref().unwrap_or_default();
         if files.read(held).is_none() && files.entries_in(held).is_empty() {
-            output.push(format!(
+            errors.push(format!(
                 "chmod: cannot access '{path}': No such file or directory"
             ));
             status = 1;
         }
     }
-    Some(ProgramOutcome { status, output })
+    Some(ProgramStreams {
+        status,
+        output: Vec::new(),
+        errors,
+    })
 }
 
 /// What running the file `path` names answers, where that file is the agent's installer and
@@ -540,7 +548,9 @@ mod tests {
         );
     }
 
-    /// RULE: a mode change names a path the machine has or reports the one it does not.
+    /// RULE: a mode change names a path the machine has or reports the one it does not — on
+    /// standard ERROR, where what a program reports it could not do goes, so a caller reading
+    /// what the program wrote reads none of it.
     #[test]
     fn a_mode_change_reports_a_path_the_machine_does_not_hold() {
         let mut tree = Tree::default();
@@ -560,9 +570,14 @@ mod tests {
             answered.status
         );
         assert_eq!(
-            answered.output,
+            answered.errors,
             ["chmod: cannot access '/tmp/absent': No such file or directory"],
-            "expected the program's own wording, got {:?}",
+            "expected the program's own wording on standard error, got {:?}",
+            answered.errors
+        );
+        assert!(
+            answered.output.is_empty(),
+            "expected nothing on standard output for a diagnostic, got {:?}",
             answered.output
         );
     }

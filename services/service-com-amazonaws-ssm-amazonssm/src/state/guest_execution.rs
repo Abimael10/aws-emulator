@@ -250,9 +250,16 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// ([`super::guest_resolver`]): a script that resolves a name is answered by the DNS of the
 /// VPC the node is in, which is read ONCE here — before the store that owns the guest is
 /// taken — because answering a query reads three stores and running the script holds one. The
-/// guest's package-query client travels the same way ([`super::guest_packages`]): which build
-/// of the agent its package database holds is a fact of the NODE, which this service holds and
-/// the service that owns the guest cannot read.
+/// the guest's package-query client travels the same way ([`super::guest_packages`]): which
+/// build of the agent its package database holds is a fact of the NODE, which this service holds
+/// and the service that owns the guest cannot read. So does the guest's PYTHON INTERPRETER
+/// ([`super::guest_python`]), which runs the inline program a script that reports a computed
+/// line ends in: the one contained engine this workspace embeds for caller-supplied Python is
+/// reachable from this crate and not from the one that owns the guest. `programs` is what the
+/// programs of ONE REQUEST may spend between them
+/// ([`super::guest_python::ProgramAllowance`]) — made once per request and handed to every
+/// delivery of it, which is what bounds the product of the commands a script carries and the
+/// nodes a send selects.
 ///
 /// The machine's own IDENTITY travels the same way: which role the instance's instance
 /// profile carries is a fact IAM holds, so that service's own records answer it
@@ -270,7 +277,52 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     instance_id: &str,
     commands: &[String],
     now: SystemTime,
+    programs: &::std::sync::Arc<super::guest_python::ProgramAllowance>,
 ) -> Option<ec2_store::GuestRun> {
+    let delivery = delivery_in_guest(engine, credentials, region, instance_id, now, programs);
+    perform_delivery(engine, instance_id, commands, delivery)
+}
+
+/// Everything ONE DELIVERY needs to perform a script in a guest, OWNED: the programs the
+/// caller installs in that guest beside the machine's own, and the part of the machine's
+/// identity another service holds.
+///
+/// Resolved with the REQUEST's own context ([`delivery_in_guest`], which reads this service's
+/// store, the account's DNS, the VPC's file systems and the emulator's credential store) so
+/// that the RUN itself ([`perform_delivery`]) borrows nothing of the request and can be
+/// performed on a thread of its own — which is what lets a caller keep the asynchronous runtime
+/// responsive while a script runs.
+pub struct GuestDelivery {
+    /// The programs the caller installs in the guest beside the machine's own.
+    supplied: Option<Box<dyn ::service_common::posix_shell_session::EnvironmentPrograms>>,
+    /// The part of the machine's own identity another service owns.
+    identity: ec2_store::GuestIdentity,
+}
+
+impl ::std::fmt::Debug for GuestDelivery {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("GuestDelivery")
+            .field("supplied", &self.supplied)
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+/// The delivery for the node `instance_id` names: the programs this service installs in that
+/// guest ([`GuestDelivery`]) and the machine's own identity, read with the request's context.
+///
+/// Every read here happens BEFORE the store that owns the guest is taken, and none of them is
+/// held across the run.
+#[must_use]
+pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    credentials: &::emulator_server::CredentialStore,
+    region: &str,
+    instance_id: &str,
+    now: SystemTime,
+    programs: &::std::sync::Arc<super::guest_python::ProgramAllowance>,
+) -> GuestDelivery {
     let resolver = ::service_com_amazonaws_route53resolver_route53resolver::state::vpc_dns::view_from_instance(
         engine, instance_id,
     )
@@ -288,19 +340,44 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
         now,
         node_vpc_id(engine, instance_id).as_deref(),
     );
-    let supplied = [resolver, packages, nfs]
-        .into_iter()
-        .flatten()
-        .reduce(::service_common::posix_shell_session::layered);
-    let identity = ec2_store::GuestIdentity {
-        iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
-        iam_role_credentials: ec2_store::instance_role_credentials(
-            engine,
-            credentials,
-            instance_id,
-            now,
-        ),
-    };
+    // ... and the PYTHON INTERPRETER the inline programs of such a script are written in
+    // ([`super::guest_python`]): the one contained engine this workspace embeds for running
+    // caller-supplied Python, which the service that owns the guest cannot reach. It spends
+    // from `programs`, the allowance the REQUEST's own programs share, so what one request can
+    // make this process run is bounded across every command of every script it delivers.
+    let interpreter = Some(super::guest_python::interpreter_programs(programs));
+    GuestDelivery {
+        supplied: [resolver, packages, nfs, interpreter]
+            .into_iter()
+            .flatten()
+            .reduce(::service_common::posix_shell_session::layered),
+        identity: ec2_store::GuestIdentity {
+            iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
+            iam_role_credentials: ec2_store::instance_role_credentials(
+                engine,
+                credentials,
+                instance_id,
+                now,
+            ),
+        },
+    }
+}
+
+/// Perform `commands` in the guest of the instance `instance_id` names, with `delivery` as
+/// what the caller installs in it — the run itself, which borrows nothing of the request.
+///
+/// SYNCHRONOUS and CPU-bound: the script is performed by the shell session of the service that
+/// owns the guest, with that store's guard held, and a program of the guest may wait a bounded
+/// span for an interpreter of this process. A caller serving a request therefore performs it on
+/// a BLOCKING thread rather than on a worker of the asynchronous runtime
+/// (`crate::ops::send_command`).
+#[must_use]
+pub fn perform_delivery<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_id: &str,
+    commands: &[String],
+    delivery: GuestDelivery,
+) -> Option<ec2_store::GuestRun> {
     let ec2 = ec2_store::service_state(engine)?;
     let mut store = ec2.lock();
     // The moves that service already owed the instance — its launch reaching `running` and
@@ -308,7 +385,12 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // and a script runs in the guest that boot brought up. Materialising them is EC2's own
     // write, through its own one-stop materialiser.
     store.materialize_due_transitions();
-    store.run_in_instance_guest_with(instance_id, commands, supplied, &identity)
+    store.run_in_instance_guest_with(
+        instance_id,
+        commands,
+        delivery.supplied,
+        &delivery.identity,
+    )
 }
 
 /// The VPC the node `instance_id` names is IN, as the service that owns instances reports it

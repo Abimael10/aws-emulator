@@ -2804,6 +2804,12 @@ pub use guest_services::*;
 pub mod guest_agents;
 pub use guest_agents::*;
 
+/// The HTTP CLIENT in an instance's guest, reaching a server of the SAME machine through its
+/// loopback interface — the one request a machine makes entirely inside itself. A SUBMODULE for
+/// the same reason [`image_usage_reports`] is one.
+pub mod guest_http_client;
+pub use guest_http_client::*;
+
 /// Whether the security groups on an interface ADMIT one arriving packet — the one decision
 /// every service whose resource is reached through an interface of this account asks of this
 /// crate. A SUBMODULE for the same reason [`image_usage_reports`] is one.

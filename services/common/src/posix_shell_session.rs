@@ -118,13 +118,16 @@
 //! specification selected, and a session with nothing installed provides nothing beyond the
 //! catalog. A caller that has such programs hands this session an
 //! [`EnvironmentPrograms`], which is asked for a command the catalog does not name and
-//! answers either the status and output of the program it provides for it, or `None` for a
-//! name it provides none for — and `None` is the same closed failure as before. Nothing here
+//! answers either what the program it provides for it came to — the status it exited with and
+//! what it wrote on EACH of its two streams ([`ProgramStreams`]) — or `None` for a name it
+//! provides none for, and `None` is the same closed failure as before. Nothing here
 //! resolves a command against a host `PATH`, and an [`EnvironmentPrograms`] is handed no way
-//! to reach a process, a file or the host: it answers out of what its own caller holds, and
-//! the FILES of this session's own tree ([`ProgramFiles`]), which is what a program whose
-//! work is to carry a file somewhere reads and writes — still the one tree above, where a
-//! path is a key and no host path is reachable.
+//! to reach a process, a file or the host: it answers out of what its own caller holds, the
+//! FILES of this session's own tree ([`ProgramFiles`]), which is what a program whose work is
+//! to carry a file somewhere reads and writes — still the one tree above, where a path is a
+//! key and no host path is reachable — and the VARIABLES this session holds, which are the
+//! environment the command runs with ([`ProgramInvocation`]), the way a program a shell runs
+//! is given the shell's own environment.
 //!
 //! # The programs the TREE holds
 //!
@@ -343,6 +346,70 @@ pub trait EnvironmentPrograms: ::std::fmt::Debug + Send + Sync {
         let _ = standard_input;
         self.run(name, arguments, files)
     }
+
+    /// [`Self::run_with_input`] for one whole INVOCATION: the form the session ASKS, which
+    /// carries the environment the command runs with ([`ProgramInvocation::environment`]) and
+    /// is answered on both of the program's streams ([`ProgramStreams`]).
+    ///
+    /// A program that reads the variables the session holds, or that writes a diagnostic of
+    /// its own, overrides this; the default performs the invocation through
+    /// [`Self::run_with_input`] and reports what it answered as standard output alone, which
+    /// is what a program that reads no environment and writes no diagnostic does.
+    fn run_invocation(
+        &self,
+        invocation: &ProgramInvocation<'_>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramStreams> {
+        self.run_with_input(
+            invocation.name,
+            invocation.arguments,
+            invocation.standard_input,
+            files,
+        )
+        .map(|outcome| ProgramStreams {
+            status: outcome.status,
+            output: outcome.output,
+            errors: Vec::new(),
+        })
+    }
+}
+
+/// ONE invocation of a program the environment provides, as the session performs it.
+///
+/// It carries everything of the command that is not the session itself: the name it was
+/// written with, the words after it, what it reads on standard input, and the VARIABLES the
+/// session holds — which is the environment a program the shell runs is given, so an
+/// interpreter or a utility that reads one is answered by what the lines before it set.
+#[derive(Debug)]
+pub struct ProgramInvocation<'a> {
+    /// The name the command was written with ([`EnvironmentPrograms::run`]'s `name`).
+    pub name: &'a str,
+    /// The words after it.
+    pub arguments: &'a [String],
+    /// What the stage before it in a pipeline wrote, the text a here-document carries, or the
+    /// file standard input was redirected from — `None` when the command was given none.
+    pub standard_input: Option<&'a str>,
+    /// The DIRECTORY the session is in, which is what a path the command names without one is
+    /// resolved against — and what a program whose own default is "the directory I was started
+    /// in" is started in.
+    pub working_directory: &'a str,
+    /// The variables the session holds, which are the environment this invocation runs with.
+    pub environment: &'a BTreeMap<String, String>,
+}
+
+/// What one program answered on BOTH of its streams
+/// ([`EnvironmentPrograms::run_invocation`]).
+#[derive(Debug, Clone, Default)]
+pub struct ProgramStreams {
+    /// The status the program exited with, which is the status the command carrying it
+    /// answers.
+    pub status: i32,
+    /// The lines it wrote to standard output, in the order it wrote them.
+    pub output: Vec<String>,
+    /// The lines it wrote to standard ERROR, in the order it wrote them — taken by the
+    /// session's error stream, apart from the output above, so what a program reported it
+    /// could not do is not part of what it wrote.
+    pub errors: Vec<String>,
 }
 
 /// The programs of TWO environments over one session, asked in order.
@@ -395,6 +462,16 @@ impl EnvironmentPrograms for LayeredPrograms {
                 self.supplied
                     .run_with_input(name, arguments, standard_input, files)
             })
+    }
+
+    fn run_invocation(
+        &self,
+        invocation: &ProgramInvocation<'_>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramStreams> {
+        self.own
+            .run_invocation(invocation, files)
+            .or_else(|| self.supplied.run_invocation(invocation, files))
     }
 }
 
@@ -1076,6 +1153,10 @@ pub struct ShellSession {
     /// `None` while no `break` or `continue` is in flight. Set by those built-ins and taken by
     /// the loop that honours it ([`Self::run_loop_control`]).
     loop_control: Option<LoopControl>,
+    /// The status of the most recent PIPELINE this session performed, which is what `$?`
+    /// expands to ([`Self::expand_parameter`]). Zero before the first one, which is the status
+    /// a shell reads before it has run anything.
+    last_status: i32,
     /// The POSITIONAL PARAMETERS the program was given ([`Self::with_arguments`]): the name it
     /// was invoked under (`$0`) and the operands after it (`$1`, `$2`, …), which is what a
     /// caller that runs a SCRIPT with arguments hands it. Empty for a program invoked with
@@ -1261,6 +1342,7 @@ impl ShellSession {
             compound_depth: 0,
             loop_depth: 0,
             loop_control: None,
+            last_status: 0,
             positional: Vec::new(),
             config,
         };
@@ -1613,6 +1695,15 @@ impl ShellSession {
     /// command to exit with a non-zero status, or zero if all commands exit successfully"
     /// instead — read before a `!` negates it, the way the shell reads it.
     fn run_pipeline(&mut self, pipeline: &::brush_parser::ast::Pipeline) -> i32 {
+        let status = self.performed_pipeline(pipeline);
+        // "?: Expands to the decimal exit status of the most recent pipeline" — which is this
+        // one, from here until the next pipeline runs.
+        self.last_status = status;
+        status
+    }
+
+    /// [`Self::run_pipeline`] itself, around which that status is recorded.
+    fn performed_pipeline(&mut self, pipeline: &::brush_parser::ast::Pipeline) -> i32 {
         let mut status = self.config.statuses.success;
         // The rightmost stage that failed, which is the pipeline's status under
         // [`ShellOption::PipeFail`].
@@ -2545,7 +2636,15 @@ impl ShellSession {
     /// work is to carry a file somewhere reads the one the commands around it wrote and
     /// leaves the one they read back. The programs are taken OFF the session while it runs
     /// and put back after, which is what lets it be handed the session's tree at the same
-    /// time; nothing else of the session is reachable from it.
+    /// time; the VARIABLES the session holds travel the same way, because they are the
+    /// environment the program runs with ([`ProgramInvocation::environment`]) and the tree
+    /// is reached through the session itself. Nothing else of the session is reachable from
+    /// it.
+    ///
+    /// What the program wrote on EACH of its two streams is written where that stream goes
+    /// ([`ProgramStreams`]): its output to standard output, and a diagnostic of its own to
+    /// standard error, so what a caller reads as the program's output is what the program
+    /// wrote there and nothing else.
     fn run_environment_program(
         &mut self,
         name: &str,
@@ -2681,10 +2780,27 @@ impl ShellSession {
         // asked: a name this environment provides no program for falls back to a utility of
         // this session, which reads that same input.
         let input = self.peeked_standard_input(redirections);
+        // The variables are the ENVIRONMENT this invocation runs with, taken off the session
+        // while it runs and put back after for the same reason the programs are: the session
+        // itself is handed over as the program's tree, and nothing of it is reachable from
+        // the program besides those files. A program changes none of them — a variable one
+        // sets is its own process's — so what goes back is what came off.
+        let environment = ::std::mem::take(&mut self.variables);
+        // The directory the session is IN, which a program resolves its own relative paths
+        // against: a copy, because the session itself is handed over as the program's tree.
+        let working_directory = self.working_directory.clone();
         let answered = {
+            let invocation = ProgramInvocation {
+                name,
+                arguments,
+                standard_input: input.as_deref(),
+                working_directory: &working_directory,
+                environment: &environment,
+            };
             let mut files = SessionFiles { session: self };
-            programs.run_with_input(name, arguments, input.as_deref(), &mut files)
+            programs.run_invocation(&invocation, &mut files)
         };
+        self.variables = environment;
         self.programs = Some(programs);
         let outcome = answered?;
         // The program performed the invocation, so the stream it was handed is consumed: a
@@ -2692,6 +2808,13 @@ impl ShellSession {
         let _ = self.standard_input(redirections);
         for line in outcome.output {
             if !self.write_stdout(&format!("{line}\n"), redirections) {
+                return Some(self.config.statuses.failure);
+            }
+        }
+        // What the program reported it could not do goes where a command's diagnostics go,
+        // which is not where its output goes.
+        for line in outcome.errors {
+            if !self.write_stderr(&format!("{line}\n"), redirections) {
                 return Some(self.config.statuses.failure);
             }
         }
@@ -3862,9 +3985,11 @@ impl ShellSession {
     /// was given at that position ([`Self::with_arguments`]), and the special parameters a
     /// program reads its own operands through are the three that are about them: `$#` is how
     /// many it was given, and `$@` and `$*` are those operands joined by one space, because
-    /// field splitting is a form no session performs. Every other form — a substring, a
-    /// replacement, a length, an indirection, another special parameter — is one this session
-    /// does not resolve.
+    /// field splitting is a form no session performs. `$?` is resolved beside them — "the
+    /// decimal exit status of the most recent pipeline", which is how a script reads whether
+    /// the command before it succeeded. Every other form — a substring, a replacement, a
+    /// length, an indirection, another special parameter — is one this session does not
+    /// resolve.
     ///
     /// While [`ShellOption::NoUnset`] is on, the plain form of a variable this session holds
     /// NONE of is an error instead: "the shell shall write a message to standard error …
@@ -3924,13 +4049,14 @@ impl ShellSession {
             .unwrap_or_default()
     }
 
-    /// The value of one of the SPECIAL parameters that are about the program's own operands,
-    /// and `None` for every other one — a parameter this session does not resolve, so the
-    /// command carrying it is not run.
+    /// The value of one of the SPECIAL parameters that are about the program's own operands or
+    /// about what this session has done, and `None` for every other one — a parameter this
+    /// session does not resolve, so the command carrying it is not run.
     ///
     /// `$#` is "the number of positional parameters", which is the operands and not the name
     /// the program was invoked under; `$@` and `$*` are those operands, joined by one space,
-    /// because this session performs no field splitting.
+    /// because this session performs no field splitting; and `$?` is "the decimal exit status
+    /// of the most recent pipeline" this session performed.
     fn special_parameter(
         &self,
         special: &::brush_parser::word::SpecialParameter,
@@ -3944,6 +4070,9 @@ impl ShellSession {
             }
             ::brush_parser::word::SpecialParameter::ShellName => {
                 Some(self.positional.first().cloned().unwrap_or_default())
+            }
+            ::brush_parser::word::SpecialParameter::LastExitStatus => {
+                Some(self.last_status.to_string())
             }
             _ => None,
         }
