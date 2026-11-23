@@ -28,7 +28,9 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::resource_tagging::{glue_arn, map_of, read_tags, resource_arn};
+use crate::resource_tagging::{
+    glue_arn, map_of, read_tags, resource_arn, UNPLACEABLE_RESOURCE_ARN_NOT_FOUND,
+};
 use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID, REGION};
 
 /// The IAM role the kinds that name one are created with. A role is account-global, so one
@@ -67,10 +69,6 @@ pub fn read_miss_message(segment: &str, name: &str) -> String {
         _ => ENTITY_NOT_FOUND.to_string(),
     }
 }
-
-/// What [`error_message`] answers for a refusal that carries NO prose at all, which is how
-/// the tagging surface refuses an ARN that names none of its resources.
-const NO_PROSE: &str = "<no Message>";
 
 /// Every kind of Glue resource that carries a tag set, as its ARN's resource-type segment.
 ///
@@ -507,8 +505,11 @@ async fn an_arn_of_a_taggable_kind_naming_nothing_is_a_miss() {
     }
 }
 
-/// A `ResourceArn` that names no taggable Glue resource at all is a bad parameter: 400
-/// `InvalidInputException`, carrying no prose.
+/// A `ResourceArn` that is a Glue resource ARN but places no entity of this service at all is
+/// a MISS: 400 `EntityNotFoundException` carrying the sentence recorded for that ARN form,
+/// which no owning surface words. The ARN is a legal address — the member's modelled
+/// constraint pins the Glue prefix and nothing more — so what it names is a lookup, and a
+/// lookup that places nothing is an absence rather than a bad parameter.
 ///
 /// The rows are Glue ARNs whose resource portion names a kind that carries no tag set at
 /// all — a catalog table (`CreateTable` models no `Tags`), a user defined function, a
@@ -516,7 +517,7 @@ async fn an_arn_of_a_taggable_kind_naming_nothing_is_a_miss() {
 /// taggable kind but no one resource of it: a type segment with nothing after it, a
 /// one-segment kind carrying a second segment, and a schema set missing one of its two.
 #[tokio::test]
-async fn an_arn_that_names_no_taggable_kind_is_a_bad_parameter() {
+async fn an_arn_that_names_no_taggable_kind_is_a_miss() {
     let router = emulator();
     let created = every_kind(&router).await;
 
@@ -546,18 +547,18 @@ async fn an_arn_that_names_no_taggable_kind_is_a_bad_parameter() {
             let (status, answer) = call(&router, operation, &body).await;
             assert_eq!(
                 status, 400,
-                "case {resource:?} / {operation}: a value that is no taggable Glue resource \
-                 must be refused, got {status} with {answer}"
+                "case {resource:?} / {operation}: a Glue ARN that places no entity must be \
+                 refused, got {status} with {answer}"
             );
             assert!(
-                error_code(&answer).ends_with("InvalidInputException"),
-                "case {resource:?} / {operation}: expected InvalidInputException, got {}",
+                error_code(&answer).ends_with("EntityNotFoundException"),
+                "case {resource:?} / {operation}: expected EntityNotFoundException, got {}",
                 error_code(&answer)
             );
             assert_eq!(
                 error_message(&answer),
-                NO_PROSE,
-                "case {resource:?} / {operation}: that refusal carries no prose at all"
+                UNPLACEABLE_RESOURCE_ARN_NOT_FOUND,
+                "case {resource:?} / {operation}: unexpected wording for a tagging miss"
             );
         }
     }

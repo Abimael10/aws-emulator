@@ -618,9 +618,10 @@ async fn an_attribute_outside_the_modelled_enum_is_the_catalogs_own_input_error(
 /// A `ResourceArn` that is no Glue resource ARN at all is the catalog's own input error on
 /// every tagging operation — not the framework's `ValidationException` for the member's
 /// `@pattern` — and that refusal carries the code alone, with no prose at all, which is how
-/// the tagging surface words it. A well-formed ARN still reaches the lookup: one naming a
-/// resource this store holds none of is the modelled `EntityNotFoundException`, and one
-/// naming a stored resource is served.
+/// the tagging surface words it. A Glue ARN still reaches the lookup, whatever it names: one
+/// naming a resource this store holds none of, and one naming no entity of this service at
+/// all, are the modelled `EntityNotFoundException`, and one naming a stored resource is
+/// served.
 #[tokio::test]
 async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
     let router = emulator();
@@ -634,10 +635,9 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
     )
     .await;
 
-    // (case, the ResourceArn sent). Every row is outside `GlueResourceArn`'s modelled
-    // `@pattern` or names no taggable Glue resource: a bare resource name, another
-    // service's namespace, an ARN missing fields, the empty string, and a Glue ARN whose
-    // resource portion names no type at all.
+    // (case, the ResourceArn sent). Every row is no Glue resource ARN: a bare resource
+    // name, another service's namespace, an ARN missing a field and the empty string. A
+    // Glue ARN that IS one but names no entity is a MISS instead, asserted below.
     let arns: Vec<(&str, String)> = vec![
         ("a bare resource name", "tagged_db".to_string()),
         (
@@ -649,14 +649,6 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}"),
         ),
         ("the empty string", String::new()),
-        (
-            "a Glue ARN whose resource names no type",
-            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:tagged_db"),
-        ),
-        (
-            "a Glue ARN of a resource kind the catalog tags none of",
-            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/tagged_db/orders"),
-        ),
     ];
 
     for (case, arn) in &arns {
@@ -670,7 +662,7 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
             let case = format!("{operation} with {case}");
             assert_eq!(
                 status, 400,
-                "case {case}: an ARN that names no taggable Glue resource is refused with \
+                "case {case}: a value that is no Glue resource ARN is refused with \
                  400, got {status} with {body}"
             );
             assert!(
@@ -686,6 +678,32 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
                 "case {case}: the refusal states no message, got {body}"
             );
         }
+    }
+
+    // A Glue ARN this service places no entity under — a kind it tags none of, a resource
+    // portion naming no type — is an ABSENCE and not a bad parameter: the member is a legal
+    // address, there is just nothing at it.
+    for (case, arn) in [
+        (
+            "a Glue ARN whose resource names no type",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:tagged_db"),
+        ),
+        (
+            "a Glue ARN of a resource kind the catalog tags none of",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/tagged_db/orders"),
+        ),
+    ] {
+        let (status, body) = call(&router, "GetTags", &json!({ "ResourceArn": arn })).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: a Glue ARN naming no entity is refused with 400, got {status} with \
+             {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("EntityNotFoundException"),
+            "case {case}: expected EntityNotFoundException, got {} in {body}",
+            error_code(&body)
+        );
     }
 
     // A well-formed ARN of a taggable kind this store holds nothing for is a MISS, not a

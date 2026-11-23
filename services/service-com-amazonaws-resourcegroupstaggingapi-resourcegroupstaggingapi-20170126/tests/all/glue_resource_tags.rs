@@ -467,14 +467,15 @@ async fn glue_tags_live_in_glues_own_records() {
 }
 
 /// A Glue ARN this API cannot resolve is answered per RESOURCE, with Glue's own refusal:
-/// a well-formed ARN of a taggable kind that names nothing gets that service's
-/// `EntityNotFoundException`, and an ARN naming no taggable Glue resource at all gets its
-/// `InvalidInputException` — both with `StatusCode` 400, and the other ARNs of the same
-/// batch are tagged.
+/// a Glue ARN that names nothing — a resource of a taggable kind that was never created, a
+/// Glue resource type that carries no tag set, or a resource portion with no type at all —
+/// gets that service's `EntityNotFoundException` with `StatusCode` 400, and the other ARNs
+/// of the same batch are tagged. A Glue ARN is an address Glue looks an entity up by, so
+/// everything it fails to place is an absence rather than a bad parameter.
 ///
 /// The rows differ along the kind named and along WHY the ARN resolves to nothing: a
-/// missing resource of each kind, a Glue resource type that carries no tag set, and a
-/// Glue ARN with no resource type at all.
+/// missing resource of each kind, another account's catalog, a Glue resource type that
+/// carries no tag set, and a Glue ARN with no resource type at all.
 #[tokio::test]
 async fn an_unresolvable_glue_arn_fails_with_glues_own_refusal() {
     let router = emulator();
@@ -513,15 +514,16 @@ async fn an_unresolvable_glue_arn_fails_with_glues_own_refusal() {
             "EntityNotFoundException",
         ),
         (
-            // A Glue table carries no `Tags` member on its create, so no tag set.
+            // A Glue table carries no `Tags` member on its create, so this service places
+            // no taggable entity under that ARN at all: an absence, not a bad parameter.
             "a Glue resource type that holds no tags",
             glue_arn("table/present-db/orders"),
-            "InvalidInputException",
+            "EntityNotFoundException",
         ),
         (
             "a Glue ARN with no resource type",
             glue_arn("catalog"),
-            "InvalidInputException",
+            "EntityNotFoundException",
         ),
     ];
     for (case, arn, want) in cases {

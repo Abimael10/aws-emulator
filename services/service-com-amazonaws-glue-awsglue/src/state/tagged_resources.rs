@@ -218,6 +218,97 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
     })
 }
 
+/// What a tagging call's `ResourceArn` addresses, resolved ONCE for the three operations
+/// of the tagging surface (`GetTags`, `TagResource`, `UntagResource`) so none of them can
+/// tell a bad parameter from an absence its own way.
+///
+/// The member targets `GlueResourceArn`, whose modelled constraint is a length bound and
+/// the prefix every Glue ARN shares and NOTHING else — it names no resource type. So a
+/// value is either not a Glue resource ARN at all ([`is_glue_resource_arn`]), in which case
+/// the member itself is what is refused, or it is an ARN this surface looks an entity up
+/// BY: the ARN's GRAMMAR is what the operation's `InvalidInputException` answers, and
+/// whether an entity is THERE is what its `EntityNotFoundException` answers. A legal ARN
+/// that resolves to nothing is an absence, never a bad parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResourceAddress {
+    /// The ARN names one resource of one taggable kind ([`parse_tagged_resource`]).
+    /// Whether this store HOLDS that resource is
+    /// [`ComAmazonawsGlueAwsglueState::resource_tags`]'s answer; the READ words a miss
+    /// through the surface that owns the kind ([`tag_read_not_found_message`]) and the
+    /// WRITES through their own fixed sentence ([`messages::TAGGED_RESOURCE_NOT_FOUND`]).
+    Resource(TaggedResource),
+    /// A Glue resource ARN under which this service places no entity at all: a resource
+    /// type it dispatches no lookup for — a catalog table, a table version, a user defined
+    /// function, a partition, each of which carries no tag set of its own — or a resource
+    /// portion that names no single resource of the kind it spells. There is nothing there,
+    /// which is an absence and not a bad parameter
+    /// ([`messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`]).
+    NoEntity,
+    /// A value that is no Glue resource ARN ([`is_glue_resource_arn`]) — a bare resource
+    /// name, an ARN of another service, an ARN missing a field, a value that is no ARN at
+    /// all. There is no address to look anything up by, so the member is refused
+    /// ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+    NotGlueResourceArn,
+}
+
+/// How many characters a `ResourceArn` may carry: the modelled `@length` bound of
+/// `GlueResourceArn` (1..10240), the shape every tagging call's `ResourceArn` targets.
+pub const MAX_GLUE_RESOURCE_ARN_LENGTH: usize = 10240;
+
+/// The partitions `GlueResourceArn`'s modelled `@pattern` admits before this service's
+/// namespace: `^arn:aws(-(cn|us-gov|iso(-[bef])?))?:glue:`, written out as the values that
+/// alternation accepts.
+pub const GLUE_RESOURCE_ARN_PARTITIONS: [&str; 7] = [
+    "aws",
+    "aws-cn",
+    "aws-us-gov",
+    "aws-iso",
+    "aws-iso-b",
+    "aws-iso-e",
+    "aws-iso-f",
+];
+
+/// Whether `value` is spelled as a Glue resource ARN — the GRAMMAR of a tagging call's
+/// `ResourceArn`, which is the one thing about the member a refusal of the member itself can
+/// be about:
+///
+/// * the modelled `@length` bound ([`MAX_GLUE_RESOURCE_ARN_LENGTH`]) and `@pattern`, which
+///   pins the `arn:` prefix, one of the partitions it spells
+///   ([`GLUE_RESOURCE_ARN_PARTITIONS`]) and this service's namespace ([`ARN_NAMESPACE`]);
+/// * and the six fields an ARN IS — the pattern is anchored at the start alone, so it pins
+///   the first three of them and says nothing about the rest, and a value matching it can
+///   still be missing a field.
+///
+/// Read off the ONE split of the ARN form this crate does ([`arn_fields`]), so the partition
+/// and the namespace are the fields that split names and cannot drift from it. What the ARN
+/// then NAMES is a lookup rather than a grammar question ([`resolve_tagged_resource`]).
+pub fn is_glue_resource_arn(value: &str) -> bool {
+    let length = value.chars().count();
+    if !(1..=MAX_GLUE_RESOURCE_ARN_LENGTH).contains(&length) {
+        return false;
+    }
+    let Some(fields) = arn_fields(value) else {
+        return false;
+    };
+    fields[2] == ARN_NAMESPACE
+        && GLUE_RESOURCE_ARN_PARTITIONS
+            .iter()
+            .any(|partition| fields[1] == *partition)
+}
+
+/// What the tagging surface's `ResourceArn` addresses: the Glue resource it names, the
+/// absence of any entity under a Glue ARN that names none, or a value that is no Glue
+/// resource ARN at all. See [`TaggedResourceAddress`].
+pub fn resolve_tagged_resource(resource_arn: &str) -> TaggedResourceAddress {
+    if !is_glue_resource_arn(resource_arn) {
+        return TaggedResourceAddress::NotGlueResourceArn;
+    }
+    match parse_tagged_resource(resource_arn) {
+        Some(resource) => TaggedResourceAddress::Resource(resource),
+        None => TaggedResourceAddress::NoEntity,
+    }
+}
+
 /// The message a refusal carries for a `ResourceArn` of a known kind that names no
 /// resource this store holds, for the operations OUTSIDE the tagging surface that resolve
 /// one ([`parse_tagged_resource`]).
@@ -228,8 +319,10 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
 /// states take a sentence DERIVED from the request instead: it names the ARN that resolved
 /// to nothing, and what is pinned is the behaviour — 400 with `EntityNotFoundException`.
 ///
-/// The three TAGGING operations do not word their miss per kind: theirs is the recorded
-/// fixed sentence ([`messages::TAGGED_RESOURCE_NOT_FOUND`]).
+/// The three TAGGING operations word a resolved kind's miss their own way: the READ through
+/// the surface that owns the kind ([`tag_read_not_found_message`]) and the WRITES through
+/// their own recorded fixed sentence ([`messages::TAGGED_RESOURCE_NOT_FOUND`]), rather than
+/// the sentence below.
 pub fn tagged_resource_not_found_message(resource: &TaggedResource, resource_arn: &str) -> String {
     match resource.kind {
         TaggedResourceKind::Database => messages::database_not_found(&resource.name),

@@ -1627,28 +1627,37 @@ impl ComAmazonawsGlueAwsglueState {
     /// ONE resolution for the two operations that decide that schedule's state
     /// (`StartColumnStatisticsTaskRunSchedule` and `StopColumnStatisticsTaskRunSchedule`), so
     /// the address a start is refused for and the address a stop is refused for cannot drift
-    /// apart. Both ADDRESS a table by `DatabaseName` plus `TableName`, so that part of the
-    /// address is resolved by the catalog's own table resolution
-    /// ([`Self::catalog_table_miss`]) rather than walked again here, and is reported in its
-    /// wordings. Past the table, the schedule hangs on that table's column statistics task
-    /// settings, so a stored table no create has written settings for is that entry's own
-    /// recorded miss ([`messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND`], the settings
-    /// read's and delete's), and settings that exist while carrying no cron expression
-    /// ([`ColumnStatisticsTaskSettingsEntry::has_schedule`]) are the schedule that does not
-    /// exist ([`messages::COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND`]).
+    /// apart.
+    ///
+    /// The schedule those two act on is a member of the column statistics task SETTINGS of
+    /// the addressed table, so the settings record is the entity they look up and the entity
+    /// whose absence they report — in the record's own account-qualified key
+    /// ([`messages::column_statistics_task_settings_key_not_found`]), whatever the catalog
+    /// holds under the database and the table name on the way to it. A database the catalog
+    /// does not hold and a table it does not hold are not reported here, because neither is
+    /// the entity this address names: no settings exist under either, and the missing
+    /// settings are what the caller has to create ([`messages::database_not_found`] and
+    /// [`messages::table_not_found`] stay with the operations that address a database or a
+    /// table itself).
+    ///
+    /// Settings that exist while carrying no cron expression
+    /// ([`ColumnStatisticsTaskSettingsEntry::has_schedule`]) are the SCHEDULE that does not
+    /// exist ([`messages::COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND`]) — the record is
+    /// there, the thing these operations act on is not.
     pub fn column_statistics_task_run_schedule_miss(
         &self,
         catalog_id: &str,
         database_name: &str,
         table_name: &str,
     ) -> Option<String> {
-        if let Some(message) = self.catalog_table_miss(catalog_id, database_name, table_name) {
-            return Some(message);
-        }
         let Some(settings) =
             self.column_statistics_task_settings(catalog_id, database_name, table_name)
         else {
-            return Some(messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string());
+            return Some(messages::column_statistics_task_settings_key_not_found(
+                catalog_id,
+                database_name,
+                table_name,
+            ));
         };
         (!settings.has_schedule())
             .then(|| messages::COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND.to_string())

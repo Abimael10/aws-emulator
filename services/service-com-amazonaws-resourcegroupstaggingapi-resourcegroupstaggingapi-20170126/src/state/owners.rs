@@ -1142,7 +1142,7 @@ fn events<Eng: Send + Sync + 'static>(
 /// so that set is the one this API reads and writes.
 ///
 /// The ARN is resolved against those records by the Glue crate's OWN resolver
-/// ([`owner_glue::state::parse_tagged_resource`] plus `resource_tags_mut`), so the kinds
+/// ([`owner_glue::state::resolve_tagged_resource`] plus `resource_tags_mut`), so the kinds
 /// this API can tag, the record each ARN resolves to and the refusal a missing one gets
 /// are that service's own, with no second copy here to drift from it.
 fn glue<Eng: Send + Sync + 'static>(
@@ -1153,16 +1153,26 @@ fn glue<Eng: Send + Sync + 'static>(
     let Some(state) = owner_glue::state::service_state(engine) else {
         return Resolution::Unowned;
     };
-    // A `glue` ARN that resolver does not recognise as a taggable resource of that
-    // service is NOT a missing resource: it is a request Glue refuses, so the
-    // per-resource failure carries that refusal — the code Glue's `TagResource` models
-    // for a bad input, and the prose Glue states with it, which for this refusal is none
+    // A `glue` ARN is an address Glue looks an entity up BY, so what it places is that
+    // service's answer: an ARN naming no entity of it at all is a per-resource MISS in
+    // Glue's own generic wording, and only a value that is no Glue resource ARN is the
+    // request Glue refuses — the code its tag write models for a bad input, with the prose
+    // it states, which for that refusal is none
     // ([`owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE`]).
-    let Some(resource) = owner_glue::state::parse_tagged_resource(&arn.arn) else {
-        return absent_stating(
-            "InvalidInputException",
-            owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE,
-        );
+    let resource = match owner_glue::state::resolve_tagged_resource(&arn.arn) {
+        owner_glue::state::TaggedResourceAddress::Resource(resource) => resource,
+        owner_glue::state::TaggedResourceAddress::NoEntity => {
+            return absent(
+                "EntityNotFoundException",
+                owner_glue::state::messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND.to_string(),
+            );
+        }
+        owner_glue::state::TaggedResourceAddress::NotGlueResourceArn => {
+            return absent_stating(
+                "InvalidInputException",
+                owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE,
+            );
+        }
     };
     let mut state = state.lock();
     // A tag write never brings a resource into being, so an ARN that service holds no

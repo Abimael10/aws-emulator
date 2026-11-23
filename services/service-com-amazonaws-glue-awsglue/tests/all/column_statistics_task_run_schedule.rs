@@ -13,16 +13,19 @@
 //! LAST start or stop of it — a start puts the schedule in force (`SCHEDULED`) and a stop
 //! suspends it (`NOT_SCHEDULED`) while leaving the expression on the settings — so either
 //! write repeated is served and changes nothing further, and neither starts a statistics run.
-//! An address that holds no such schedule — a database the catalog does not hold, a table
-//! that database does not hold, a stored table no create has written settings for, or
-//! settings carrying no cron expression — is refused with `EntityNotFoundException`, in the
-//! wording that names the part of the address that missed, and leaves the stored settings
-//! exactly as they were.
+//! An address that holds no such schedule is refused with `EntityNotFoundException` and
+//! leaves the stored settings exactly as they were. WHICH entity the refusal names follows
+//! what these two operations look up: the schedule is a member of the table's column
+//! statistics task SETTINGS, so an address holding no settings — whether the catalog holds
+//! no such database, no such table, or a table no create has written settings for — is the
+//! absence of the SETTINGS record, named by its account-qualified key, while settings that
+//! exist carrying no cron expression are the schedule that does not exist.
 //!
-//! The recorded case — a start addressed at a table the catalog does not hold — is ONE row of
-//! the refusal table below; the rows differ along WHICH part of the address misses and which
-//! of the two operations is asked. The state rows differ along the cron expression, the
-//! casing the schedule is addressed in, and whether the request names a catalog id.
+//! The recorded case — a start addressed at a table with no settings — is ONE row of the
+//! refusal table below; the rows differ along WHICH part of the address is absent, whether
+//! the request names a catalog id, and which of the two operations is asked. The state rows
+//! differ along the cron expression, the casing the schedule is addressed in, and whether the
+//! request names a catalog id.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
@@ -43,28 +46,20 @@ const SCHEDULE_OPERATIONS: [&str; 2] = [
 ];
 
 // The sentences the refusals below must carry, spelled out HERE rather than read off the
-// implementation, so a row fails when the wording moves. Each is the sentence the service
-// states for that step of the address: the catalog's own refusal of a database it does not
-// hold and of a table a database does not hold, the settings read's and delete's refusal of a
-// table carrying no settings entry, the service's sentence for a schedule that was not found
-// (the one its crawler-schedule pair answers for a record with no expression to run), and the
-// catalog miss.
+// implementation, so a row fails when the wording moves: the absence of the settings record
+// these two operations look up, named by its own key; the service's sentence for a schedule
+// that was not found (the one its crawler-schedule pair answers for a record with no
+// expression to run); and the catalog miss.
 
-/// The catalog's refusal of a `DatabaseName` it holds no database under, whose one variable
-/// part is that name folded the way the catalog stores it.
-fn database_not_found(name: &str) -> String {
-    format!("Database {} not found.", name.to_lowercase())
+/// The absence of the column statistics task settings an address names, as the schedule
+/// start and stop report it: fixed text around the record's composite key — the catalog the
+/// request addressed, the account whose estate it is in, and the database and table the
+/// settings would belong to, as the request named them.
+fn settings_not_found(catalog_id: &str, database: &str, table: &str) -> String {
+    format!(
+        "ColumnStatisticsTaskSettings {catalog_id}:{ACCOUNT_ID}:{database}-{table} not found."
+    )
 }
-
-/// The catalog's refusal of a `TableName` the addressed database holds no table under, folded
-/// the same way.
-fn table_not_found(name: &str) -> String {
-    format!("Table {} not found.", name.to_lowercase())
-}
-
-/// A stored table no create has written column statistics task settings for.
-const SETTINGS_NOT_FOUND: &str =
-    "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
 
 /// Settings that exist while carrying no cron expression: there is no schedule.
 const NO_SCHEDULE_FOUND: &str = "No schedule found.";
@@ -363,14 +358,20 @@ async fn an_address_that_holds_no_schedule_is_refused() {
 
     let cases: Vec<RefusalCase<'_>> = vec![
         RefusalCase {
-            // The recorded case: the table the request names is not one the catalog holds.
+            // The recorded case: no settings exist for the pair the request names, because
+            // the table it names is not one the catalog holds. The SETTINGS are what these
+            // operations look up, so they are what the refusal names.
             case: "a table the database does not hold",
             database: "refusal_db",
             table: "no_such_table",
             extra: json!({}),
             start_code: "EntityNotFoundException",
             stop_code: "EntityNotFoundException",
-            expected_message: Some(table_not_found("no_such_table")),
+            expected_message: Some(settings_not_found(
+                ACCOUNT_ID,
+                "refusal_db",
+                "no_such_table",
+            )),
         },
         RefusalCase {
             case: "a database the catalog does not hold",
@@ -379,7 +380,7 @@ async fn an_address_that_holds_no_schedule_is_refused() {
             extra: json!({}),
             start_code: "EntityNotFoundException",
             stop_code: "EntityNotFoundException",
-            expected_message: Some(database_not_found("no_such_db")),
+            expected_message: Some(settings_not_found(ACCOUNT_ID, "no_such_db", "scheduled")),
         },
         RefusalCase {
             case: "a stored table no create has written settings for",
@@ -388,7 +389,18 @@ async fn an_address_that_holds_no_schedule_is_refused() {
             extra: json!({}),
             start_code: "EntityNotFoundException",
             stop_code: "EntityNotFoundException",
-            expected_message: Some(SETTINGS_NOT_FOUND.to_string()),
+            expected_message: Some(settings_not_found(ACCOUNT_ID, "refusal_db", "no_settings")),
+        },
+        RefusalCase {
+            // The catalog component of the key comes from the request when it states one,
+            // which for this account's own Data Catalog is its account id.
+            case: "a stored table with no settings, with the catalog stated",
+            database: "refusal_db",
+            table: "no_settings",
+            extra: json!({ "CatalogID": ACCOUNT_ID }),
+            start_code: "EntityNotFoundException",
+            stop_code: "EntityNotFoundException",
+            expected_message: Some(settings_not_found(ACCOUNT_ID, "refusal_db", "no_settings")),
         },
         RefusalCase {
             case: "settings carrying no cron expression",

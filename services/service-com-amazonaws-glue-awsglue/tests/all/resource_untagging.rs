@@ -33,7 +33,7 @@ use service_com_amazonaws_glue_awsglue::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::resource_tagging::{
     create_request, glue_arn, map_of, read_tags, resource_arn, tags_of, ARN_WRONG_REGION,
-    OTHER_REGIONS, TAGGING_ENTITY_NOT_FOUND,
+    OTHER_REGIONS, TAGGING_ENTITY_NOT_FOUND, UNPLACEABLE_RESOURCE_ARN_NOT_FOUND,
 };
 use crate::wire::{call, call_in_region, emulator, error_code, error_message, ok, ACCOUNT_ID, REGION};
 
@@ -468,9 +468,10 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
-    // A Glue ARN whose resource portion names no kind that carries a tag set. Everything
-    // outside the kinds a tagging call accepts is a bad parameter, and that refusal states
-    // NO prose at all — the code alone. Which kinds those are is pinned per kind by
+    // A Glue ARN whose resource portion names no kind that carries a tag set, or names a
+    // taggable kind but no one resource of it. The ARN is a legal address, so the surface
+    // looks it up and finds nothing there: a MISS, worded with the sentence recorded for an
+    // ARN no surface owns. Which kinds carry a tag set is pinned per kind by
     // [`crate::tagging_resource_kinds`].
     for resource in [
         "table/untag_refusal_db/orders",
@@ -483,21 +484,44 @@ fn refusal_rows() -> Vec<RefusalRow> {
         rows.push(RefusalRow {
             case: format!("an ARN whose resource portion is {resource:?}"),
             region: REGION,
-            message: Some(NO_PROSE.to_string()),
+            message: Some(UNPLACEABLE_RESOURCE_ARN_NOT_FOUND.to_string()),
             arn,
+            code: "EntityNotFoundException",
+        });
+    }
+
+    // A value that is no Glue resource ARN at all: no address to look anything up by, so the
+    // member itself is refused — the code alone, with no prose.
+    for (case, value) in [
+        ("a bare resource name", "untag_refusal_db".to_string()),
+        (
+            "another service's namespace",
+            format!("arn:aws:s3:::{REGION}-lake"),
+        ),
+        (
+            "a Glue ARN missing its resource field",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}"),
+        ),
+    ] {
+        rows.push(RefusalRow {
+            case: format!("{case}: {value:?}"),
+            region: REGION,
+            message: Some(NO_PROSE.to_string()),
+            arn: value,
             code: "InvalidInputException",
         });
     }
 
     // An ARN of a taggable kind that resolves to no stored resource: a miss, worded with the
-    // fixed sentence the tagging surface answers one with whatever the kind is.
+    // one fixed sentence a tag removal answers whatever the kind is.
     for segment in ["database", "crawler", "connection", "job"] {
+        let arn = resource_arn(segment, "never-created");
         rows.push(RefusalRow {
             case: format!("a {segment} name this account holds nothing under"),
             region: REGION,
-            arn: resource_arn(segment, "never-created"),
-            code: "EntityNotFoundException",
             message: Some(TAGGING_ENTITY_NOT_FOUND.to_string()),
+            arn,
+            code: "EntityNotFoundException",
         });
     }
 

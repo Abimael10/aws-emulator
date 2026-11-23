@@ -522,10 +522,18 @@ async fn a_write_past_the_tag_bound_is_refused_and_stores_nothing() {
 /// modelled `Message` member absent from the body.
 const NO_PROSE: &str = "<no Message>";
 
-/// The `Message` the tagging surface answers for an ARN of a taggable kind that names no
-/// resource this endpoint holds. Recorded wording: the fixed, generic sentence, which names
-/// neither the ARN, nor the kind, nor the name inside it.
+/// The `Message` a tagging WRITE answers for an ARN of a taggable kind that names no
+/// resource this endpoint holds — `TagResource` and `UntagResource` answer it whatever the
+/// kind is. Recorded wording: the fixed, generic sentence, which names neither the ARN, nor
+/// the kind, nor the name inside it.
 pub const TAGGING_ENTITY_NOT_FOUND: &str = "Entity not found";
+
+/// The `Message` any tagging call answers for a `ResourceArn` that IS a Glue resource ARN
+/// but under which this service places no entity at all — a resource type it dispatches no
+/// lookup for, a type Glue has none of, or a resource portion naming no one resource of the
+/// kind it spells. Recorded wording, which differs in case from the sentence above: there is
+/// no owning surface to word this miss.
+pub const UNPLACEABLE_RESOURCE_ARN_NOT_FOUND: &str = "Entity Not Found";
 
 /// One refused tag write: the Region the request is served in, the ARN it names, and the
 /// refusal it earns.
@@ -581,10 +589,30 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
+    // A value that is no Glue resource ARN at all: no address to look anything up by, so
+    // the member itself is refused — the code alone, with no prose.
+    for (case, value) in [
+        ("a bare resource name", "refusal_db".to_string()),
+        ("another service's namespace", format!("arn:aws:s3:::{REGION}-lake")),
+        (
+            "a Glue ARN missing its resource field",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}"),
+        ),
+    ] {
+        rows.push(RefusalRow {
+            case: format!("{case}: {value:?}"),
+            region: REGION,
+            message: Some(NO_PROSE.to_string()),
+            arn: value,
+            code: "InvalidInputException",
+        });
+    }
+
     // A Glue ARN whose resource portion names no kind that carries a tag set, or names a
-    // taggable kind but no one resource of it. Everything outside the kinds a tag write
-    // accepts is a bad parameter, and that refusal states NO prose at all — the code alone.
-    // Which kinds those are is pinned per kind by [`crate::tagging_resource_kinds`].
+    // taggable kind but no one resource of it. The ARN is a legal address, so the surface
+    // looks it up and finds nothing there: a MISS, worded with the sentence recorded for an
+    // ARN no surface owns. Which kinds carry a tag set is pinned per kind by
+    // [`crate::tagging_resource_kinds`].
     for resource in [
         "table/refusal_db/orders",
         "devEndpoint/dev-1",
@@ -596,21 +624,22 @@ fn refusal_rows() -> Vec<RefusalRow> {
         rows.push(RefusalRow {
             case: format!("an ARN whose resource portion is {resource:?}"),
             region: REGION,
-            message: Some(NO_PROSE.to_string()),
+            message: Some(UNPLACEABLE_RESOURCE_ARN_NOT_FOUND.to_string()),
             arn,
-            code: "InvalidInputException",
+            code: "EntityNotFoundException",
         });
     }
 
-    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded with
-    // the fixed sentence the tagging surface answers one with whatever the kind is.
+    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded with the
+    // one fixed sentence a tag WRITE answers whatever the kind is.
     for segment in ["database", "crawler", "connection", "job"] {
+        let arn = resource_arn(segment, "never-created");
         rows.push(RefusalRow {
             case: format!("a {segment} name this account holds nothing under"),
             region: REGION,
-            arn: resource_arn(segment, "never-created"),
-            code: "EntityNotFoundException",
             message: Some(TAGGING_ENTITY_NOT_FOUND.to_string()),
+            arn,
+            code: "EntityNotFoundException",
         });
     }
 
@@ -631,8 +660,9 @@ fn refusal_rows() -> Vec<RefusalRow> {
 }
 
 /// A tag write whose `ResourceArn` does not address a resource this endpoint serves is
-/// refused — as a bad parameter when the ARN's Region or resource type is not this
-/// endpoint's, and as a miss when it resolves to no stored resource — and stores nothing.
+/// refused — as a bad parameter when the ARN's Region is not this endpoint's or the value is
+/// no Glue resource ARN at all, and as a miss when it is a legal ARN that resolves to no
+/// stored resource — and stores nothing.
 #[tokio::test]
 async fn a_tag_write_for_an_arn_this_endpoint_does_not_serve_is_refused() {
     let router = emulator();

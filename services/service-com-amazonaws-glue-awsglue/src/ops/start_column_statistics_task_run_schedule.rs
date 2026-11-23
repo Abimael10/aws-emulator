@@ -9,13 +9,15 @@
 //! of the same record and nothing else.
 //!
 //! The schedule is addressed by the same two members the settings read, write and delete
-//! address the settings by, so every address that holds no schedule — a database the catalog
-//! does not hold, a table that database does not hold, a stored table no create has written
-//! settings for, or settings carrying no cron expression to run — is the operation's modelled
-//! `EntityNotFoundException` and writes nothing: there is no schedule there to start. WHICH
-//! part of the address missed is resolved once for this operation and the stop alike
-//! ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]),
-//! each part in its own wording.
+//! address the settings by, and the schedule itself is a member of those settings — so the
+//! SETTINGS record is the entity this operation looks up, and an address holding none of
+//! them is that record's own absence, reported in its account-qualified key whatever the
+//! catalog holds under the database and the table name on the way to it. Settings that
+//! carry no cron expression to run are the schedule that does not exist. Either way the
+//! refusal is the operation's modelled `EntityNotFoundException` and nothing is written:
+//! there is no schedule there to start. WHICH of the two it is is resolved once for this
+//! operation and the stop alike
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]).
 //!
 //! A schedule ALREADY in force is left in force — the state this call writes is the state it
 //! stands in — so the write is idempotent, exactly as `StartCrawlerSchedule` is. Starting a
@@ -202,9 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request names, so whether there is a schedule to start at all is resolved FIRST,
         // through the resolution this operation shares with the stop
         // ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]):
-        // it reports whichever step of the address missed in that step's own wording, and
-        // settings carrying no cron expression have no schedule to put in force either — the
-        // expression is what a schedule IS, and this call carries none of its own.
+        // the SETTINGS record is the entity looked up, and settings carrying no cron
+        // expression have no schedule to put in force either — the expression is what a
+        // schedule IS, and this call carries none of its own.
         if let Some(message) = store.column_statistics_task_run_schedule_miss(
             &catalog_id,
             &input.database_name,
@@ -218,10 +220,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.table_name,
         ) else {
             // The resolution above walked the SAME address under the SAME guard, so this is
-            // unreachable; the entry's own miss is reported rather than a shape invented for
-            // it.
+            // unreachable; the settings record's own miss is reported rather than a shape
+            // invented for it.
             return Err(not_found(
-                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+                crate::state::messages::column_statistics_task_settings_key_not_found(
+                    &catalog_id,
+                    &input.database_name,
+                    &input.table_name,
+                ),
             ));
         };
         // A schedule already in force is left in force: the state this call writes is the

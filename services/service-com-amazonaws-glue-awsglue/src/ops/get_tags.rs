@@ -8,26 +8,34 @@
 //! record in [`crate::state::ComAmazonawsGlueAwsglueState`] — the tag set its create
 //! recorded and every later tag write updated — so the tags a create carried are the
 //! tags this read reports. The ARN is resolved through
-//! [`crate::state::parse_tagged_resource`] plus
+//! [`crate::state::resolve_tagged_resource`] plus
 //! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags`], the one resolution
 //! every tag read in this emulator goes through — and that resolution covers every kind of
 //! Glue resource whose record carries a tag set, a registry, a schema set, a session, a
 //! workflow and the rest among them, because the modelled `ResourceArn` places no
 //! restriction on which kind of Glue resource the ARN names.
 //!
-//! An ARN that names no taggable Glue resource at all earns the modelled client-input
-//! refusal; one of a known kind this store holds no resource for earns the modelled
-//! `EntityNotFoundException` carrying the miss sentence of the surface that OWNS that kind
-//! ([`crate::state::tag_read_not_found_message`]), as does one naming another
-//! Region's or another account's estate.
+//! An ARN that IS a Glue resource ARN but names no resource this endpoint holds earns the
+//! modelled `EntityNotFoundException` carrying the miss sentence of the surface that OWNS
+//! that kind ([`crate::state::tag_read_not_found_message`]) — the read dispatches on the
+//! resource type to the lookup of a resource of that kind, so the refusal says WHICH lookup
+//! failed — as does one naming another Region's or another account's estate. A Glue resource
+//! ARN this service places no entity under AT ALL (a catalog table, a partition, a resource
+//! type it tags nothing of, a resource portion naming no one resource of its kind) is an
+//! absence too, and there is no owning surface to word it, so it carries the generic
+//! sentence recorded for exactly that ARN form
+//! ([`crate::state::messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`]).
 //!
-//! That client-input refusal is this handler's, not the framework boundary's
-//! (`skip_validation` on `GetTagsRequest` in `src/ops/types/`): a `ResourceArn` outside
-//! `GlueResourceArn`'s modelled `@pattern` or `@length` — a bare resource name, an ARN of
-//! another service — is no taggable Glue resource either, so it is answered by the one
-//! resolution above with this operation's own `InvalidInputException`, and never with the
-//! cross-service `ValidationException`. That refusal carries NO prose at all, which is how
-//! the tagging surface words it ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
+//! The modelled client-input refusal is this handler's, not the framework boundary's
+//! (`skip_validation` on `GetTagsRequest` in `src/ops/types/`), and it is reserved for the
+//! member's GRAMMAR: a `ResourceArn` that is no Glue resource ARN — one outside
+//! `GlueResourceArn`'s modelled `@pattern` or `@length`, a bare resource name, an ARN of
+//! another service, an ARN missing a field — is no address to look anything up by
+//! ([`crate::state::is_glue_resource_arn`]), so it is answered with this operation's own
+//! `InvalidInputException`, and
+//! never with the cross-service `ValidationException`. That refusal carries NO prose at
+//! all, which is how the tagging surface words it
+//! ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -171,21 +179,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // A `ResourceArn` this service tags NO resource of is a bad parameter, not a
-        // miss: the modelled constraint admits any Glue ARN, so the resource type it
-        // carries is what is checked here.
-        let Some(resource) = crate::state::parse_tagged_resource(&input.resource_arn) else {
-            return Err(GetTagsErrorModeled::InvalidInputException(InvalidInputException {
-                message: crate::state::INVALID_RESOURCE_ARN_MESSAGE,
-                from_federation_source: None,
-            })
-            .into());
+        // Whether the value is a Glue resource ARN at all is this member's whole GRAMMAR —
+        // the modelled length bound and prefix, over the six fields an ARN is — so a value
+        // that is none is the one thing that is a bad parameter here, whatever it names. A
+        // value that IS one is an ARN this surface looks an entity up BY, so anything it
+        // fails to place is an absence and not a bad parameter.
+        let resource = match crate::state::resolve_tagged_resource(&input.resource_arn) {
+            crate::state::TaggedResourceAddress::Resource(resource) => resource,
+            // A Glue resource ARN this service places no entity under at all: an absence,
+            // not a refusal of the member, and one no owning surface words.
+            crate::state::TaggedResourceAddress::NoEntity => {
+                return Err(GetTagsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            crate::state::TaggedResourceAddress::NotGlueResourceArn => {
+                return Err(GetTagsErrorModeled::InvalidInputException(InvalidInputException {
+                    message: crate::state::INVALID_RESOURCE_ARN_MESSAGE,
+                    from_federation_source: None,
+                })
+                .into());
+            }
         };
+        // The read resolves the ARN through the surface that owns the kind, so the miss
+        // carries that surface's own sentence.
         let not_found = || {
             GetTagsErrorModeled::EntityNotFoundException(EntityNotFoundException {
-                // The read resolves the ARN through the surface that owns the kind, so the
-                // miss carries that surface's own sentence
-                // ([`crate::state::tag_read_not_found_message`]).
                 message: Some(crate::state::tag_read_not_found_message(&resource)),
                 from_federation_source: None,
             })

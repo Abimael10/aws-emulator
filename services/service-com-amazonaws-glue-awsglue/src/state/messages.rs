@@ -674,10 +674,34 @@ pub const DASHBOARD_URL_RESOURCE_NOT_FOUND: &str = "Entity not found";
 /// miss is recorded to read this way — the workflow's, whose surface answers exactly this
 /// text ([`WORKFLOW_NOT_FOUND`]).
 ///
-/// It reads the same as other surfaces' generic misses ([`WORKFLOW_NOT_FOUND`],
-/// [`DASHBOARD_URL_RESOURCE_NOT_FOUND`]) and is a separate constant all the same, for the
-/// reason those two are: each surface is recorded independently.
+/// It is NOT the sentence a tagging call answers for an ARN under which this service places
+/// no entity AT ALL, which no owning surface words
+/// ([`UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`], recorded in a different case).
 pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Entity not found";
+
+/// The miss a tagging call answers for a `ResourceArn` that IS a Glue resource ARN
+/// ([`crate::state::is_glue_resource_arn`]) under which this service places no entity at
+/// all: a resource type it dispatches no lookup for (a catalog table, a table version, a
+/// user defined function, a partition — none of which carries a tag set), a resource type
+/// Glue has none of, and a resource portion that names no one resource of the kind it
+/// spells.
+///
+/// RECORDED constant, and the whole message: the surface answers its modelled
+/// `EntityNotFoundException` with this fixed sentence — it names neither the ARN it was
+/// handed, nor a resource type, nor a name, and carries no trailing period. There is no
+/// owning surface to take a sentence from, which is why this is a constant and not a
+/// per-kind lookup, and why it is a SEPARATE constant from the surface's miss of a kind it
+/// does place ([`TAGGED_RESOURCE_NOT_FOUND`]): the two are recorded independently and the
+/// recordings differ in case.
+///
+/// A value that is no Glue resource ARN at all is no entity lookup to begin with: it earns
+/// the operation's `InvalidInputException`, which carries no prose
+/// ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
+///
+/// It reads the same as the catalog's own table read's miss ([`TABLE_ENTITY_NOT_FOUND`]) and
+/// is a separate constant all the same, for the reason every other repeated sentence of this
+/// module is: each surface is recorded independently.
+pub const UNPLACEABLE_RESOURCE_ARN_NOT_FOUND: &str = "Entity Not Found";
 
 /// A session lookup addressed by `Id` for an id this account holds no session under —
 /// `GetSession`'s miss, and the miss of every operation that resolves a session the same
@@ -1720,6 +1744,32 @@ pub fn column_statistics_limit_exceeded(limit: usize) -> String {
 /// values it sent, so neither the database nor the table name appears in it.
 pub const COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND: &str =
     "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
+
+/// The absence of the column statistics task settings a SCHEDULE operation addresses —
+/// `StartColumnStatisticsTaskRunSchedule` and `StopColumnStatisticsTaskRunSchedule`, which
+/// act on the schedule those settings carry and so report the SETTINGS record as the entity
+/// that is missing, whatever the catalog holds under the names on the way to it.
+///
+/// RECORDED template: the fixed text is "ColumnStatisticsTaskSettings " and " not found.",
+/// and the variable part between them is the record's own composite key — the catalog the
+/// request addressed, the account whose estate that catalog is in, then the database and the
+/// table the settings belong to, as the request named them. For the default catalog both id
+/// components are the account's own id, because that id is what the catalog is addressed by
+/// ([`super::resolve_catalog_id`]).
+///
+/// The settings READ, WRITE and DELETE word the same absence their own way
+/// ([`COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND`]): each operation's wording is recorded on
+/// its own, which is why the two are two strings.
+pub fn column_statistics_task_settings_key_not_found(
+    catalog_id: &str,
+    database_name: &str,
+    table_name: &str,
+) -> String {
+    format!(
+        "ColumnStatisticsTaskSettings {catalog_id}:{}:{database_name}-{table_name} not found.",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// `StartColumnStatisticsTaskRunSchedule` or `StopColumnStatisticsTaskRunSchedule` for a
 /// stored table whose column statistics task settings carry NO cron expression

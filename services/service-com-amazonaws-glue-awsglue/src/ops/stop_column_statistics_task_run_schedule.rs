@@ -14,11 +14,13 @@
 //! is what `StopColumnStatisticsTaskRun` does.
 //!
 //! The schedule is addressed by the same two members the settings read, write and delete
-//! address the settings by, so every address that holds no schedule — a database the catalog
-//! does not hold, a table that database does not hold, a stored table no create has written
-//! settings for, or settings carrying no cron expression to run — is the operation's modelled
-//! `EntityNotFoundException` and writes nothing. WHICH part of the address missed is resolved
-//! once for this operation and the start alike
+//! address the settings by, and the schedule itself is a member of those settings — so the
+//! SETTINGS record is the entity this operation looks up, and an address holding none of
+//! them is that record's own absence, reported in its account-qualified key whatever the
+//! catalog holds under the database and the table name on the way to it. Settings that
+//! carry no cron expression are the schedule that does not exist. Either way the refusal is
+//! the operation's modelled `EntityNotFoundException` and nothing is written; WHICH of the
+//! two it is is resolved once for this operation and the start alike
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]).
 //! A schedule ALREADY suspended is served, for the reason the start is: the state this call
 //! writes is the state it stands in.
@@ -216,10 +218,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.table_name,
         ) else {
             // The resolution above walked the SAME address under the SAME guard, so this is
-            // unreachable; the entry's own miss is reported rather than a shape invented for
-            // it.
+            // unreachable; the settings record's own miss is reported rather than a shape
+            // invented for it.
             return Err(not_found(
-                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+                crate::state::messages::column_statistics_task_settings_key_not_found(
+                    &catalog_id,
+                    &input.database_name,
+                    &input.table_name,
+                ),
             ));
         };
         // A schedule already suspended is left suspended: the state this call writes is the
