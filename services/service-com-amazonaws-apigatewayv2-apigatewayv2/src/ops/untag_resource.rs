@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the tags the request names off the resource its `ResourceArn` names: the ARN is
+//! read into the record it addresses by [`crate::state::parse_tagged_resource`] — the one
+//! place this service reads a `ResourceArn` — and the keys are removed from that record's
+//! own tag collection, the very one the resource's reader reports.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UntagResource",
+            ));
+        };
+
+        // The ARN is read BEFORE the store lock is taken. A value that is no ARN of this
+        // service's namespace, or whose resource portion names a kind this service does
+        // not tag, addresses nothing here at all: that is a bad REQUEST — permanent and
+        // caller-side — rather than a resource that happens to be missing.
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn).ok_or_else(|| {
+            UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let Some(stored) = store.tags_of_mut(&resource) else {
+            // The ARN is well formed and names a kind this service tags, so what it
+            // addresses is a resource that is not there — including one a delete has
+            // already taken away. The sentence is the ARN-level one every tag operation
+            // answers, not the kind-specific sentence the typed operations report.
+            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+        // "Deletes a Tag" is stated as the RESULT it asks for — the resource carries no
+        // tag under this key — so a key the resource does not carry is already in that
+        // state and the request succeeds, leaving every other tag as it was. The modelled
+        // `NotFoundException` is about the RESOURCE the ARN names (resolved above), never
+        // about a key within it, which is what makes a repeated removal, and one issued
+        // without first reading the tag set, idempotent.
+        for key in &input.tag_keys {
+            stored.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

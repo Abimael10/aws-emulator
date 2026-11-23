@@ -3404,6 +3404,13 @@ pub mod portal_products;
 
 pub use portal_products::*;
 
+/// Which resource a caller-supplied `ResourceArn` names, and the tag collection stored on
+/// it, live in [`tagged_resource`] — re-exported in full, like every other part of this
+/// module, so a tag handler reaches them the way it reaches the records themselves.
+pub mod tagged_resource;
+
+pub use tagged_resource::*;
+
 /// Whether the REST endpoint a product REST endpoint page documents resolves at all is a
 /// question for the service that OWNS REST APIs, so it is asked there, in
 /// [`rest_endpoint`] — re-exported in full, like every other part of this module.
