@@ -305,12 +305,40 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         true,
     ),
     entry(
+        "AWSRAMDefaultPermissionImageBuilderComponent",
+        "imagebuilder:Component",
+        &[
+            "imagebuilder:GetComponent",
+            "imagebuilder:ListComponentBuildVersions",
+            "imagebuilder:ListComponents",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionImageBuilderContainerRecipe",
+        "imagebuilder:ContainerRecipe",
+        &[
+            "imagebuilder:GetContainerRecipe",
+            "imagebuilder:ListContainerRecipes",
+        ],
+        true,
+    ),
+    entry(
         "AWSRAMDefaultPermissionImageBuilderImage",
         "imagebuilder:Image",
         &[
             "imagebuilder:GetImage",
             "imagebuilder:ListImageBuildVersions",
             "imagebuilder:ListImages",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionImageBuilderImageRecipe",
+        "imagebuilder:ImageRecipe",
+        &[
+            "imagebuilder:GetImageRecipe",
+            "imagebuilder:ListImageRecipes",
         ],
         true,
     ),

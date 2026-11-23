@@ -74,11 +74,15 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::harness::*;
 
 /// The resource type the recorded lifecycle shared a customer managed permission for.
-/// `ListResourceTypes` reports it (`RESOURCE_TYPES`) and the AWS managed catalog
-/// publishes no permission for it, so a share of one carries no derived default.
+/// `ListResourceTypes` reports it (`RESOURCE_TYPES`), so a share of one is governed by
+/// the permission the AWS managed catalog publishes as its default
+/// ([`COMPONENT_TYPE_DEFAULT`]) until a permission attached by name stands in for it.
 const COMPONENT_TYPE: &str = "imagebuilder:Component";
 /// An Image Builder component: a resource of [`COMPONENT_TYPE`].
 const COMPONENT: &str = "arn:aws:imagebuilder:us-west-2:000000000000:component/hardening/1.0.0/1";
+/// The permission Amazon Web Services publishes as [`COMPONENT_TYPE`]'s default, which
+/// therefore governs a share that shares a component and names none of its own.
+const COMPONENT_TYPE_DEFAULT: &str = "AWSRAMDefaultPermissionImageBuilderComponent";
 /// A Glue database, a resource type the catalog publishes two permissions for.
 const GLUE_DATABASE: &str = "arn:aws:glue:us-west-2:000000000000:database/analytics";
 
@@ -345,7 +349,7 @@ async fn an_attached_managed_permission_joins_the_shares_permission_set() {
             ],
         },
         AttachRow {
-            case: "a shared resource type the catalog publishes no permission for",
+            case: "an attachment standing in for the published default of the type it shares",
             resource_arns: vec![COMPONENT],
             created_with: vec![],
             attached: vec![component_reader.clone()],
@@ -412,8 +416,9 @@ async fn an_attached_permission_reads_back_as_the_permission_that_was_attached()
     .await;
     assert_eq!(
         listed_arns(&router, case, &share_arn).await,
-        Vec::<String>::new(),
-        "case {case:?}: the share carries nothing before the attach"
+        vec![managed(COMPONENT_TYPE_DEFAULT)],
+        "case {case:?}: before the attach the share is governed by the published default of \
+         the type it shares"
     );
 
     attach_ok(&router, case, &share_arn, &permission_arn).await;
@@ -724,10 +729,11 @@ async fn an_attach_that_cannot_be_made_is_refused_and_attaches_nothing() {
         }
     }
 
-    // Not one of those requests attached anything: the share still carries nothing.
+    // Not one of those requests attached anything: the share is still governed by the
+    // published default of the type it shares, and by nothing else.
     assert_eq!(
         listed_arns(&router, "refused attaches change nothing", &share_arn).await,
-        Vec::<String>::new(),
+        vec![managed(COMPONENT_TYPE_DEFAULT)],
         "case \"refused attaches change nothing\": the share's permission set is untouched"
     );
 
@@ -1411,8 +1417,9 @@ async fn an_attachment_is_the_state_of_the_one_share_it_was_made_to() {
     );
     assert_eq!(
         listed_arns(&router, case, &untouched).await,
-        Vec::<String>::new(),
-        "case {case:?}: the share the attach did not name carries nothing"
+        vec![managed(COMPONENT_TYPE_DEFAULT)],
+        "case {case:?}: the share the attach did not name carries no attachment of its own, so \
+         the published default of the type it shares is all it is governed by"
     );
 
     // The same permission attached to the second share too: each share's permission set
@@ -1818,7 +1825,10 @@ async fn a_removal_is_served_once_the_share_shares_no_resource_of_the_permission
             attached: vec![component_reader.clone()],
             drop_resources: true,
             removed: component_reader.clone(),
-            outcome: Removal::Served(vec![]),
+            // The removal takes away the attachment it names, not the published default
+            // of the type the share shares, which governs it once nothing stands in for
+            // it.
+            outcome: Removal::Served(vec![managed(COMPONENT_TYPE_DEFAULT)]),
         },
         RemovalRow {
             case: "one of two permissions held for types the share shares nothing of",
