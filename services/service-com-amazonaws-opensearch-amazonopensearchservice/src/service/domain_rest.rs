@@ -4390,9 +4390,24 @@ impl<'a> Terms<'a> {
     ///
     /// Addressed through the index's own mappings, so a MULTI-FIELD reads the values of the
     /// field above it — a write stores nothing at a multi-field's own path, because a
-    /// multi-field is another analysis of its parent's value.
+    /// multi-field is another analysis of its parent's value. That holds for the IMPLICIT
+    /// `keyword` sub-field dynamic mapping gives a string field no mapping covers exactly as
+    /// it does for a declared one ([`state::analysis::IndexAnalysis::dynamic_keyword_source`]):
+    /// the document holds nothing at `<field>.keyword`, so the values that sub-field indexes
+    /// are the ones its parent holds ([`state::analysis::dynamic_keyword_values`]). A path
+    /// the document DOES hold a value at is that value, so a document carrying a member
+    /// literally named `keyword` is read as the member it is.
     fn held(&self, source: &Value, field: &str) -> Vec<Value> {
-        held_values(source, &self.source_field(field))
+        let held = held_values(source, &self.source_field(field));
+        if !held.is_empty() {
+            return held;
+        }
+        match self.analysis.dynamic_keyword_source(field) {
+            Some(parent) => {
+                state::analysis::dynamic_keyword_values(held_values(source, parent))
+            }
+            None => held,
+        }
     }
 
     /// Those values as the TEXTS a term is compared against.

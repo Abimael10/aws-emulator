@@ -730,6 +730,34 @@ const MAPPING_PROPERTIES: &str = MAPPING_CONTAINERS[0];
 /// field above it rather than a member of the document.
 const MAPPING_MULTI_FIELDS: &str = MAPPING_CONTAINERS[1];
 
+/// The name of the sub-field DYNAMIC mapping adds beside a string field no mapping covers:
+/// such a field is mapped as `text` with a `keyword` sub-field under this name, so
+/// `<field>.keyword` is where that field's exact unanalysed term is indexed.
+pub const DYNAMIC_KEYWORD_FIELD: &str = "keyword";
+
+/// How long a value that sub-field indexes may be, in characters: the dynamic template maps
+/// it with `ignore_above` at 256, and a string longer than a `keyword` field's
+/// `ignore_above` "will not be indexed" — so a longer value carries no exact term for a
+/// query, a sort key or a bucket to find it by, while the document itself keeps it whole.
+pub const DYNAMIC_KEYWORD_IGNORE_ABOVE: usize = 256;
+
+/// The values the implicit `keyword` sub-field of a dynamically mapped field indexes, out of
+/// the values `held` its parent path holds.
+///
+/// Dynamic mapping adds that sub-field for a STRING, so only a string value of the parent
+/// has a term in it — a number, a boolean and an object are mapped as themselves and carry
+/// no `keyword` sibling — and a string past the sub-field's `ignore_above`
+/// ([`DYNAMIC_KEYWORD_IGNORE_ABOVE`]) is not indexed.
+#[must_use]
+pub fn dynamic_keyword_values(held: Vec<Value>) -> Vec<Value> {
+    held.into_iter()
+        .filter(|value| match value {
+            Value::String(text) => text.chars().count() <= DYNAMIC_KEYWORD_IGNORE_ABOVE,
+            _ => false,
+        })
+        .collect()
+}
+
 /// The analyzers, filters and tokenizers an index's `analysis` settings DEFINE, plus its
 /// field mappings — everything a chain for one of its fields is built from.
 ///
@@ -1130,6 +1158,26 @@ impl IndexAnalysis {
             return field.to_string();
         }
         path.join(".")
+    }
+
+    /// The path whose values the IMPLICIT `keyword` sub-field `field` names indexes, or
+    /// `None` where `field` names no such sub-field.
+    ///
+    /// A string field no mapping and no template covers is mapped by the WRITE that
+    /// introduced it: dynamic mapping maps it as `text` with a `keyword` sub-field named
+    /// [`DYNAMIC_KEYWORD_FIELD`], which is what holds the field's exact unanalysed value.
+    /// So `<path>.keyword`, where the mappings map nothing at `<path>`, is another indexing
+    /// OF that path rather than a member the document holds under it — the same reading a
+    /// DECLARED multi-field gets ([`Self::source_field`]) — and the values it indexes are
+    /// that path's own ([`dynamic_keyword_values`]).
+    ///
+    /// A path the mappings DO map states its own sub-fields, so nothing is implicit about it
+    /// and this answers `None` for it.
+    #[must_use]
+    pub fn dynamic_keyword_source<'f>(&self, field: &'f str) -> Option<&'f str> {
+        let (parent, sub) = field.rsplit_once('.')?;
+        (sub == DYNAMIC_KEYWORD_FIELD && !parent.is_empty() && self.field(parent).is_none())
+            .then_some(parent)
     }
 
     /// The TYPE the mappings map `field` as, or `None` where they map no such field or give
