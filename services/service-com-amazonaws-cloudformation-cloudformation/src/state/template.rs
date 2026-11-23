@@ -3130,6 +3130,12 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     EFS_FILE_SYSTEM,
     EFS_ACCESS_POINT,
     EFS_MOUNT_TARGET,
+    // The three Amazon SageMaker AI Studio types, each publishing the handles its own create
+    // answers with: the domain's ARN, the `DomainId` that service minted and its Studio URL,
+    // the user profile's ARN, and the space's ARN beside the address it is served at.
+    crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN,
+    crate::state::provisioning::sagemaker_studio::SAGEMAKER_USER_PROFILE,
+    crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE,
     crate::state::provisioner::ecs_task_sets::ECS_TASK_SET,
     EKS_CLUSTER,
     EKS_ADDON,

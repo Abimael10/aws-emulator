@@ -285,6 +285,13 @@ impl Owner {
             Self::EfsResource(kind) => {
                 efs_resources::create(ctx, region, kind, resource, propagated).await
             }
+            // All three Studio types are taggable: each publishes a `Tags` property and its
+            // create takes that list, so the domain, the user profile and the space a stack
+            // creates carry the tags CloudFormation gives them beside the declared ones
+            // ([`sagemaker_studio::create`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -480,6 +487,12 @@ impl Owner {
             // answers, and none of the three shapes publishes a state a brand-new one is still
             // coming up in ([`mediaconvert_resources::ready`]).
             Self::MediaConvert(_) => Ok(mediaconvert_resources::ready()),
+            // Each of the three Studio resources is answered `Pending` — a domain in that status
+            // admits no member, and neither member can be launched — so that arm asks until
+            // SageMaker reports it `InService` ([`sagemaker_studio::readiness`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::readiness(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -584,6 +597,13 @@ impl Owner {
             // created them under and the ARN their own create answered with, so there is
             // nothing left to read once one is up.
             Self::MediaConvert(_) => Ok(BTreeMap::new()),
+            // A Studio DOMAIN publishes the ARN and the Studio URL its own create answered
+            // with, and a user profile its own ARN; a SPACE's address is no member of
+            // `CreateSpace`'s answer at all, so that one is read off the space SageMaker now
+            // holds ([`sagemaker_studio::ready_attributes`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::ready_attributes(ctx, region, kind, physical_resource_id).await
+            }
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
             Self::EcsTaskDefinition => Ok(BTreeMap::new()),
@@ -842,6 +862,12 @@ impl Owner {
             // as they answer, so there is nothing to wait for
             // ([`mediaconvert_resources::removal`]).
             Self::MediaConvert(_) => Ok(mediaconvert_resources::removal()),
+            // Every Studio delete is asynchronous: SageMaker reports the resource `Deleting` and
+            // goes on answering reads of it until the removal is through, so that arm asks until
+            // that service no longer holds it ([`sagemaker_studio::removal`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::removal(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -1091,6 +1117,12 @@ impl Owner {
             Self::MediaConvert(kind) => {
                 mediaconvert_resources::update(ctx, region, kind, resource, declared).await
             }
+            // No Studio type is changed in place by an arm here yet: `UpdateDomain`,
+            // `UpdateUserProfile` and `UpdateSpace` are each still one of this emulator's stubs,
+            // so there is no call that could apply a changed declaration to the resource that
+            // exists — and the deployment reports the change as NOT APPLIED rather than as a
+            // success that left the caller's change nowhere.
+            Self::SageMakerStudio(_) => Ok(None),
         }
     }
 
@@ -1258,6 +1290,11 @@ impl Owner {
             // reconciled by no arm here yet ([`Provisioner::retag`]'s own default), so nothing
             // is asked about them.
             Self::MediaConvert(_) => Ok(()),
+            // The tags of a Studio domain, user profile or space that already exists are
+            // reconciled by no arm here yet — each create's tag list applies to the resource it
+            // created, and that service's `AddTags`/`DeleteTags` are not asked here — so nothing
+            // is asked about them.
+            Self::SageMakerStudio(_) => Ok(()),
         }
     }
 
@@ -1485,6 +1522,13 @@ impl Owner {
             Self::MediaConvert(kind) => {
                 mediaconvert_resources::delete(ctx, region, kind, resource).await
             }
+            // SageMaker takes no snapshot of a Studio domain, a user profile or a space on the
+            // way out: there is no such call, so a `Snapshot` deletion policy on one of them
+            // deletes the resource with no snapshot invented for it
+            // ([`sagemaker_studio::delete`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1675,6 +1719,11 @@ impl Owner {
             // the declaration would report drift that is not there. This arm reads nothing back,
             // so no one's configuration is guessed at.
             Self::MediaConvert(_) => return Ok(ActualConfiguration::Unchecked),
+            // Each Studio type's description answers the create's own members under those same
+            // names, so the read IS the configuration ([`sagemaker_studio::actual_configuration`]).
+            Self::SageMakerStudio(kind) => {
+                sagemaker_studio::actual_configuration(ctx, region, kind, resource).await?
+            }
         };
         Ok(ActualConfiguration::read(reported))
     }
@@ -1782,6 +1831,8 @@ impl Owner {
             Self::SsmPatchBaseline => message.to_string(),
             // And so do Amazon EFS's three providers.
             Self::EfsResource(_) => message.to_string(),
+            // And so do Amazon SageMaker AI's three Studio providers.
+            Self::SageMakerStudio(_) => message.to_string(),
         }
     }
 

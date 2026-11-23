@@ -4832,6 +4832,12 @@ mod in_place_changes;
 /// and the target prefix are read in ONE place and the two cannot drift apart.
 pub(in crate::state) use data_and_storage::{CLOUDWATCH_SIGNING_NAME, CLOUDWATCH_TARGET_PREFIX};
 
+/// Amazon SageMaker AI's wire identity, for the STUDIO types provisioned beside this catalogue
+/// ([`super::provisioning::sagemaker_studio`]): that module calls the same control plane this
+/// catalogue's own `AWS::SageMaker::*` arms call, so the signing name and the target prefix are
+/// read in ONE place and the two cannot drift apart.
+pub(in crate::state) use application_services::{SAGEMAKER_SIGNING_NAME, SAGEMAKER_TARGET_PREFIX};
+
 /// The STATIC-WEBSITE configuration an `AWS::S3::Bucket` declares, read by the per-type
 /// provider's UPDATE half beside this catalogue ([`super::provisioning::s3_bucket`]): the
 /// create and a changed declaration send the SAME translated request, so the template's

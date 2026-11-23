@@ -172,6 +172,16 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG => {
             &["NotebookInstanceLifecycleConfigName"]
         }
+        // The three Studio types, each publishing the handles its own create answers with: the
+        // domain's ARN, the `DomainId` SageMaker minted and its Studio URL, the user profile's
+        // ARN, and the space's ARN beside the address that service serves it at.
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN => {
+            &["DomainArn", "DomainId", "Url"]
+        }
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_USER_PROFILE => {
+            &["UserProfileArn"]
+        }
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE => &["SpaceArn", "Url"],
         "AWS::S3::Bucket" => &[
             "Arn",
             "DomainName",
@@ -941,6 +951,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == EFS_FILE_SYSTEM
         || resource_type == EFS_ACCESS_POINT
         || resource_type == EFS_MOUNT_TARGET
+        // A SageMaker AI Studio DOMAIN is in the same position: `CreateDomain` takes the
+        // domain's `DomainName` and no identifier for it, and answers the `d-…` `DomainId`
+        // SageMaker assigned — "Ref returns the domain ID", which is the handle
+        // `DescribeDomain`, `DeleteDomain` and every member's own create take, and which the
+        // type's `DomainId` pattern (`^d-(-*[a-z0-9]){1,61}$`) constrains so that a name is a
+        // value that API rejects where an id is required
+        // ([`crate::state::provisioning::sagemaker_studio`]). (A USER PROFILE and a SPACE are
+        // NOT in it: each is identified by the PAIR its own API addresses it by, which the
+        // declaration itself states — see [`composite_identity_properties`].)
+        || resource_type == crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN
         || resource_type == AOSS_COLLECTION
         // An OpenSearch Serverless managed interface ENDPOINT is the same case:
         // `CreateVpcEndpoint` takes the endpoint's `name` and no identifier for it, and
@@ -1537,6 +1557,20 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         }
         crate::state::provisioner::ecs_task_sets::ECS_TASK_SET => {
             crate::state::provisioner::ecs_task_sets::ECS_TASK_SET_IDENTITY
+        }
+        // The two MEMBERS of a SageMaker AI Studio domain: a user profile is
+        // `<UserProfileName>|<DomainId>` and a space `<DomainId>|<SpaceName>`, the pair
+        // `CreateUserProfile`/`CreateSpace`, their reads and their deletes each take to address
+        // one — SageMaker mints no identifier for either, and the member's own name identifies
+        // it only within the domain that holds it, so two domains may hold the same name. Each
+        // type's own order is the one its `Ref` reports the pair in, which is the order its
+        // schema states the two parts of its primary identifier in: the profile's own name
+        // leads, the space's domain does.
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_USER_PROFILE => {
+            &["UserProfileName", "DomainId"]
+        }
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE => {
+            &["DomainId", "SpaceName"]
         }
         _ => &[],
     }

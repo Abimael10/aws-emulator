@@ -104,6 +104,16 @@ pub const RESILIENCY_MODEL_VALUES: &[&str] = &[
     "basic-resiliency",
 ];
 
+/// The `enum` the registry schema of `AWS::SageMaker::Domain` states for the mode the
+/// domain's members authenticate with, in the order that schema states them.
+///
+/// These are the values of SageMaker's own `AuthMode` (`smithy_query(query="shape",
+/// shape="AuthMode")` of the `sagemaker` model), the enum `CreateDomain$AuthMode` targets:
+/// "The mode of authentication that members use to access the domain" is either IAM Identity
+/// Center or IAM itself. The order is the one a refusal lists them back in, since what the
+/// author has to act on is the set as the schema publishes it.
+pub const SAGEMAKER_AUTH_MODE_VALUES: &[&str] = &["SSO", "IAM"];
+
 /// The properties this stage knows a schema-stated value set of.
 ///
 /// Source for each row: the `enum` the resource type's REGISTRY SCHEMA states for the
@@ -121,7 +131,8 @@ pub const RESILIENCY_MODEL_VALUES: &[&str] = &[
 /// `AWS::DirectConnect::ResiliencyGroup` is created to meet ([`RESILIENCY_MODEL_VALUES`]).
 /// The fourth is the `MergeType` of an `AWS::AppSync::SourceApiAssociation`'s merge
 /// configuration ([`APPSYNC_MERGE_TYPE_VALUES`]), a member nested one level down in that
-/// property's structure.
+/// property's structure. The fifth is the `AuthMode` an `AWS::SageMaker::Domain`'s members
+/// authenticate with ([`SAGEMAKER_AUTH_MODE_VALUES`]).
 pub const ENUM_PROPERTIES: &[EnumProperty] = &[
     EnumProperty {
         resource_type:
@@ -151,6 +162,15 @@ pub const ENUM_PROPERTIES: &[EnumProperty] = &[
         resource_type: crate::state::template::APPSYNC_SOURCE_API_ASSOCIATION,
         property: &["SourceApiAssociationConfig", "MergeType"],
         values: APPSYNC_MERGE_TYPE_VALUES,
+    },
+    // The mode an `AWS::SageMaker::Domain`'s members authenticate with: a value outside that
+    // enum is one no handler of the type could be given, so the schema validation refuses it
+    // before the domain is created anywhere — which is what rolls the stack back rather than
+    // leaving a domain the owning service would have refused.
+    EnumProperty {
+        resource_type: crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN,
+        property: &["AuthMode"],
+        values: SAGEMAKER_AUTH_MODE_VALUES,
     },
 ];
 

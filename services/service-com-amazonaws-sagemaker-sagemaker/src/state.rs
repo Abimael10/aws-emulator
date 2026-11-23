@@ -1456,6 +1456,7 @@ tag_accessors!(
     code_repositories,
     compute_quotas,
     contexts,
+    domains,
     endpoint_configs,
     endpoints,
     experiments,

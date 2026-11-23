@@ -211,6 +211,51 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // The three Amazon SageMaker AI STUDIO types `super::provisioning` creates in that
+        // control plane ([`crate::state::provisioning::sagemaker_studio`]). What each publishes
+        // is the handle its own create answers with, and none of those is computable from a
+        // template: a domain's `DomainId` is the `d-…` id SageMaker mints, its `DomainArn` and
+        // its `Url` are built around that id, and a member's ARN and address carry it too — so
+        // each of those stands in ([`service_assigned_document`]) until the create has answered
+        // and `super::super::provisioning` re-points it at what that service really reported.
+        //
+        // A DOMAIN's `DomainId` is the exception, and it is the resource's own IDENTITY: `Ref`
+        // returns the domain id, so before the create it carries the identifier the naming rules
+        // computed — exactly as it does for every other type whose id its owning service assigns
+        // — and adopting the minted id brings `Ref` and this attribute over together
+        // ([`crate::state::template::adopt_identity`]).
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN => {
+            attributes.insert(
+                "DomainArn".to_string(),
+                service_assigned_document(name, "DomainArn"),
+            );
+            attributes.insert("DomainId".to_string(), name.to_string());
+            attributes.insert("Url".to_string(), service_assigned_document(name, "Url"));
+            (name.to_string(), attributes)
+        }
+        // A USER PROFILE publishes the one ARN `CreateUserProfile` answers with, which carries
+        // the domain the profile belongs to. Its identity is the PAIR its own API addresses it
+        // by, composed from the resolved declaration
+        // ([`crate::state::template::composite_identity_properties`]), so the identifier this
+        // arm answers is only what the naming rules computed until that composition runs.
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_USER_PROFILE => {
+            attributes.insert(
+                "UserProfileArn".to_string(),
+                service_assigned_document(name, "UserProfileArn"),
+            );
+            (name.to_string(), attributes)
+        }
+        // A SPACE publishes the ARN `CreateSpace` answers with and the address that service
+        // serves the space at, which `DescribeSpace` reports once the space is up. Its identity
+        // is a pair for the same reason the user profile's is.
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE => {
+            attributes.insert(
+                "SpaceArn".to_string(),
+                service_assigned_document(name, "SpaceArn"),
+            );
+            attributes.insert("Url".to_string(), service_assigned_document(name, "Url"));
+            (name.to_string(), attributes)
+        }
         // "Ref returns the user pool ID"; Fn::GetAtt: Arn
         // ("arn:aws:cognito-idp:us-east-1:123412341234:userpool/us-east-1_123412341"),
         // ProviderName ("The provider name of the Amazon Cognito user pool") and

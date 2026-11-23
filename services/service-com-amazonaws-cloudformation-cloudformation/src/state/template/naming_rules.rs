@@ -114,6 +114,18 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG => {
             rules(63, Characters::AsGenerated)
         }
+        // The same service's `CreateDomain.DomainName`, `CreateUserProfile.UserProfileName` and
+        // `CreateSpace.SpaceName`: each `@length(min: 0, max: 63)` with that same pattern
+        // (`^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`, in SageMaker's own Smithy model), which a
+        // generated name is already inside and may only be longer than. The domain's name is
+        // the one CloudFormation generates for a declaration that states none; a member of a
+        // domain is identified by its own name, so a declaration states that
+        // ([`crate::state::provisioning::model_validation`]).
+        crate::state::provisioning::sagemaker_studio::SAGEMAKER_DOMAIN
+        | crate::state::provisioning::sagemaker_studio::SAGEMAKER_USER_PROFILE
+        | crate::state::provisioning::sagemaker_studio::SAGEMAKER_SPACE => {
+            rules(63, Characters::AsGenerated)
+        }
         // AWS IoT `CreateAuthorizer.authorizerName`: `AuthorizerName`,
         // `@length(min: 1, max: 128)` with pattern `^[\w=,@-]+$` (AWS IoT's own Smithy
         // model), which a generated name is already inside — letters, digits and the hyphen

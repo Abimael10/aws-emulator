@@ -28,6 +28,22 @@ pub const SPACE_ARN_KIND: &str = "space";
 /// space cannot grow the store without end.
 pub const SPACE_QUOTA: usize = 1_000;
 
+/// The page `ListSpaces` serves when the request names no `MaxResults`: its `MaxResults` doc
+/// says "The default value for MaxResults is 10". [`MAX_PAGE_SIZE`] still caps the page above
+/// it, as it does for every listing here.
+pub const SPACE_DEFAULT_PAGE_SIZE: i32 = 10;
+
+/// How a page token names one space: the domain it lives in and its name, the pair that
+/// identifies it.
+///
+/// A listing's `NextToken` names the item the page stopped at ([`encode_page_token`]), so the
+/// id has to identify one space across calls without depending on the Region the caller
+/// signed for — which a space's ARN does carry. The same reading
+/// [`user_profile_page_id`] gives the other member of a domain.
+pub fn space_page_id(domain_id: &str, space_name: &str) -> String {
+    format!("{domain_id}/{space_name}")
+}
+
 /// `SpaceStatus`'s members a space of this emulator moves through. The modelled enum also
 /// carries the update and failure states, which no implemented operation reaches yet
 /// (`smithy_query(query="shape", shape="SpaceStatus")`).

@@ -3459,8 +3459,14 @@ pub(super) async fn describe_subscription(
 // ---------------------------------------------------------------------------
 /// SageMaker's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name:
 /// sagemaker`, service shape `SageMaker`), which speaks `awsJson1_1`.
-pub(super) const SAGEMAKER_SIGNING_NAME: &str = "sagemaker";
-pub(super) const SAGEMAKER_TARGET_PREFIX: &str = "SageMaker";
+///
+/// Visible to the rest of this service's state because the STUDIO types provisioned beside
+/// this catalogue call the same control plane ([`super::super::provisioning::sagemaker_studio`],
+/// which reads them through [`super`]'s own re-export), so the wire identity is read in ONE
+/// place and the two cannot drift apart.
+pub(in crate::state) const SAGEMAKER_SIGNING_NAME: &str = "sagemaker";
+/// See [`SAGEMAKER_SIGNING_NAME`].
+pub(in crate::state) const SAGEMAKER_TARGET_PREFIX: &str = "SageMaker";
 
 /// The property `AWS::SageMaker::ModelPackageGroup` carries the model group's resource
 /// policy under.

@@ -91,6 +91,7 @@ use super::provisioner::redshift_serverless::{
     REDSHIFT_SERVERLESS_NAMESPACE, REDSHIFT_SERVERLESS_SNAPSHOT, REDSHIFT_SERVERLESS_WORKGROUP,
 };
 use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
+use super::provisioning::sagemaker_studio::SAGEMAKER_SPACE;
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
@@ -1005,6 +1006,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // names, which the resource reference publishes beside the instance itself.
     "AWS::SageMaker::NotebookInstanceLifecycleConfig",
     "AWS::SageMaker::Pipeline",
+    // The Studio estate: the domain, a user profile of one and a shared space in one, each
+    // created in that control plane (`super::provisioning::sagemaker_studio`).
+    SAGEMAKER_SPACE,
     "AWS::SageMaker::UserProfile",
     // Amazon EventBridge Scheduler
     "AWS::Scheduler::Schedule",

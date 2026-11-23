@@ -194,6 +194,29 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: crate::state::template::MEDIACONVERT_PRESET,
         required: &["SettingsJson"],
     },
+    // The two MEMBERS of a SageMaker AI Studio domain are each created IN one, under a name of
+    // their own: `CreateUserProfile` and `CreateSpace` each declare the `DomainId` and the
+    // member's own name required, both types publish them "Required: Yes", and neither name is
+    // one CloudFormation generates — the pair IS the resource's identity
+    // ([`crate::state::template::composite_identity_properties`]), so a declaration missing
+    // either half names no resource at all. The DOMAIN's own are the four its type publishes
+    // "Required: Yes" beside the name CloudFormation generates for a declaration that states
+    // none: the mode its members authenticate with, the settings a user profile of it is
+    // created with, and the VPC and the subnets its traffic goes through — the last two being
+    // required of the TYPE even though that service's own model leaves them optional for a
+    // domain created from Amazon SageMaker Unified Studio.
+    RequiredProperties {
+        resource_type: super::sagemaker_studio::SAGEMAKER_DOMAIN,
+        required: &["AuthMode", "DefaultUserSettings", "SubnetIds", "VpcId"],
+    },
+    RequiredProperties {
+        resource_type: super::sagemaker_studio::SAGEMAKER_USER_PROFILE,
+        required: &["DomainId", "UserProfileName"],
+    },
+    RequiredProperties {
+        resource_type: super::sagemaker_studio::SAGEMAKER_SPACE,
+        required: &["DomainId", "SpaceName"],
+    },
     // `AWS::SecretsManager::ResourcePolicy` IS a policy ON a secret: `PutResourcePolicy`
     // declares both the document and the secret required, and the type publishes both
     // "Required: Yes".

@@ -255,6 +255,12 @@ mod modelled_declaration;
 // the call THEY make types members as numbers and booleans too, so they read a declaration
 // through this one walk rather than a second copy of it.
 pub(in crate::state) use modelled_declaration::{modelled_declaration, ModelledScalar};
+/// The three Amazon SageMaker AI Studio types a stack declares — the domain, a user profile of
+/// one and a shared space in one: created in that control plane itself ([`sagemaker_studio`]).
+/// Visible to the rest of this service's state because the types' own NAMES live here, beside
+/// the arms that provision them (the return-value rules name all three, the model validation the
+/// properties each one requires).
+pub(in crate::state) mod sagemaker_studio;
 /// The five `AWS::ServiceDiscovery::*` types a Cloud Map namespace's estate is declared with —
 /// an HTTP, a public DNS and a private DNS namespace, a service of one, and an instance
 /// registered in a service: created in AWS Cloud Map itself ([`service_discovery`]).
@@ -1424,6 +1430,11 @@ pub(super) enum Owner {
     /// Systems Manager mints for the resource, together with the patch groups the declaration
     /// registers it for.
     SsmPatchBaseline,
+    /// One of the three `AWS::SageMaker::*` Studio types [`sagemaker_studio`] creates in the
+    /// Amazon SageMaker AI control plane: the domain, a user profile of one, and a shared space
+    /// in one. Which of them it is travels with the owner, so the algorithm resolves the type
+    /// once.
+    SageMakerStudio(sagemaker_studio::Kind),
     /// One of the three `AWS::EFS::*` types [`efs_resources`] creates in Amazon EFS: the file
     /// system, an access point of one, and the mount target a VPC's subnet reaches it through.
     /// Which of them it is travels with the owner, so the algorithm resolves the type once.
@@ -1552,6 +1563,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = efs_resources::kind_of(resource_type) {
         return Some(Owner::EfsResource(kind));
+    }
+    if let Some(kind) = sagemaker_studio::kind_of(resource_type) {
+        return Some(Owner::SageMakerStudio(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

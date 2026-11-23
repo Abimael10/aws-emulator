@@ -77,6 +77,13 @@ pub fn tagged_resource_not_found(region: &str, resource_arn: &str) -> String {
         // own readers reduce an ARN form to ([`name_from_arn_or_name`]).
         HUB_KIND => hub_not_found(name),
         FEATURE_GROUP_ARN_KIND => feature_group_not_found(name),
+        // A Studio DOMAIN is addressed by the `DomainId` inside its ARN, which is the name
+        // segment here, and its own readers word the fact over the ARN that id resolves to
+        // ([`domain_not_found`]) — the same sentence `DescribeDomain` and `DeleteDomain`
+        // answer. (Its two MEMBER kinds are in the composite-identity group above: a user
+        // profile's and a space's ARNs carry the domain AND the member's name, which the kind
+        // segment alone does not resolve.)
+        DOMAIN_ARN_KIND => domain_not_found(region, name),
         _ => does_not_exist(TAGGED_RESOURCE_ENTITY, resource_arn),
     }
 }
