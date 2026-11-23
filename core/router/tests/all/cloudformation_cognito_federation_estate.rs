@@ -78,12 +78,20 @@ const STS_API_VERSION: &str = "2011-06-15";
 /// The access key id every signed call carries. The signature is never checked — this router
 /// runs with request authentication off — so what the credential scope carries is the key id
 /// and the Region each handler reads.
-const SETUP_KEY_ID: &str = "AKIDTEST";
+///
+/// Visible to the other suites of this target for the reason [`Wire`] is: a sibling signing a
+/// setup call through this harness signs it with the same key id rather than with a second
+/// spelling of it.
+pub(crate) const SETUP_KEY_ID: &str = "AKIDTEST";
 
 /// The terminal `StackStatus` a create every resource of which was created rests in — the one
 /// a create whose resource failed never reaches, the default `OnFailure=ROLLBACK` taking it to
 /// `ROLLBACK_COMPLETE` instead.
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+
+/// The terminal `StackStatus` an in-place update that applied every change it declared rests
+/// in, which is what [`Wire::update_stack`] holds an update to.
+const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 
 /// The `RoleSessionName` every session an identity pool vends carries, as AWS publishes it in
 /// such a session's caller ARN
@@ -269,6 +277,41 @@ impl Wire<'_> {
         elements(&answered.text(), "ResourceStatusReason")
     }
 
+    /// Poll `stack` until it reports a status that is not an in-progress one, and answer the
+    /// `DescribeStacks` body it was read from.
+    ///
+    /// The transition out of an `*_IN_PROGRESS` status is owed on the stack's own clock, so
+    /// what this waits for is the CONDITION: look again until the status is no longer an
+    /// in-progress one, or the generous deadline passes.
+    ///
+    /// Visible to the other suites of this target: one settle loop, called by every operation
+    /// below that waits for one and by every sibling that drives a deployment through this
+    /// harness, so no second copy can drift from it.
+    pub(crate) fn settled(&self, region: &str, stack: &str, case: &str) -> String {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let answered = self.cloudformation(region, "DescribeStacks", &[("StackName", stack)]);
+            assert_eq!(
+                answered.status,
+                200,
+                "case {case:?}: expected HTTP 200 from DescribeStacks, got {} with body {:?}",
+                answered.status,
+                answered.text()
+            );
+            let described = answered.text();
+            let reported = opt_element(&described, "StackStatus").unwrap_or_default();
+            if !reported.ends_with("_IN_PROGRESS") {
+                return described;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the stack never settled; it still reports {reported:?}"
+            );
+            self.runtime
+                .block_on(async { tokio::time::sleep(SETTLE_INTERVAL).await });
+        }
+    }
+
     /// Deploy `template` as `stack`, wait for it to settle, and answer the outputs the
     /// completed stack publishes.
     ///
@@ -299,35 +342,50 @@ impl Wire<'_> {
             created.text()
         );
 
-        // The transition out of `CREATE_IN_PROGRESS` is owed on the stack's own clock, so
-        // what this waits for is the CONDITION: look again until the status is no longer an
-        // in-progress one, or the generous deadline passes.
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        let described = loop {
-            let answered = self.cloudformation(region, "DescribeStacks", &[("StackName", stack)]);
-            assert_eq!(
-                answered.status,
-                200,
-                "case {case:?}: expected HTTP 200 from DescribeStacks, got {} with body {:?}",
-                answered.status,
-                answered.text()
-            );
-            let described = answered.text();
-            let reported = opt_element(&described, "StackStatus").unwrap_or_default();
-            if !reported.ends_with("_IN_PROGRESS") {
-                break described;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "case {case:?}: the stack never settled; it still reports {reported:?}"
-            );
-            self.runtime
-                .block_on(async { tokio::time::sleep(SETTLE_INTERVAL).await });
-        };
+        let described = self.settled(region, stack, case);
         assert_eq!(
             opt_element(&described, "StackStatus").as_deref(),
             Some(CREATE_COMPLETE),
             "case {case:?}: expected the estate to reach {CREATE_COMPLETE:?}; the stack \
+             recorded {:?}",
+            self.event_reasons(region, stack)
+        );
+        outputs_of(&described)
+    }
+
+    /// Apply `template` to the stack already deployed under `stack`, wait for the update to
+    /// settle, and answer the outputs the updated stack publishes.
+    ///
+    /// The same acknowledgement the create carries: an update states the whole template, so a
+    /// stack whose create needed the capability needs it again.
+    pub(crate) fn update_stack(
+        &self,
+        region: &str,
+        stack: &str,
+        template: &str,
+        case: &str,
+    ) -> BTreeMap<String, String> {
+        let answered = self.cloudformation(
+            region,
+            "UpdateStack",
+            &[
+                ("StackName", stack),
+                ("TemplateBody", template),
+                ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+            ],
+        );
+        assert_eq!(
+            answered.status,
+            200,
+            "case {case:?}: expected HTTP 200 from UpdateStack, got {} with body {:?}",
+            answered.status,
+            answered.text()
+        );
+        let described = self.settled(region, stack, case);
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some(UPDATE_COMPLETE),
+            "case {case:?}: expected the update to reach {UPDATE_COMPLETE:?}; the stack \
              recorded {:?}",
             self.event_reasons(region, stack)
         );
