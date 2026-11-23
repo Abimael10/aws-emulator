@@ -392,7 +392,12 @@ pub(crate) async fn waiting(router: &MultiServiceRouter, url: &str) -> usize {
 }
 
 /// A definition whose one `Task` state makes `resource`'s call with `parameters`.
-fn definition(resource: &str, parameters: &Value) -> String {
+///
+/// `pub(crate)` for the same reason the rest of this harness is: `tests/all/main.rs` is one
+/// crate root, so every suite here that drives one `Task` state over an integration — this
+/// one through [`machine`], `all/cfn_deployed_sfn_least_privilege_task_denial.rs` through a
+/// template's `DefinitionString` — names it the same way, from one place.
+pub(crate) fn definition(resource: &str, parameters: &Value) -> String {
     json!({
         "StartAt": "Call",
         "States": {
