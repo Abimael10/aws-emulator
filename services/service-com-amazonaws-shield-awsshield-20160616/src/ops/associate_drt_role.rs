@@ -167,6 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // "To use the services of the SRT and make an AssociateDRTRole request, you must be
+        // subscribed to the Business Support plan or the Enterprise Support plan": the
+        // account's Support plan decides whether this request can ever work, so it is
+        // judged first — ahead of Shield Advanced's own state, whose refusal would
+        // otherwise send the caller down the subscribe-and-retry path instead.
+        if !crate::state::srt_access_permitted(&*self.engine) {
+            return Err(AssociateDRTRoleErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(crate::state::SUPPORT_PLAN_INVALID_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AssociateDRTRoleErrorModeled::InternalErrorException(
                 InternalErrorException {

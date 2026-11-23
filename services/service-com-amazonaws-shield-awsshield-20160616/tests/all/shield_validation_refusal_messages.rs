@@ -26,8 +26,12 @@
 //!   with `InvalidParameterException` and the fixed sentence stating the requirement,
 //!   which carries nothing from the request;
 //! * a protection addressed on an account with no live subscription reports the
-//!   account-level absence, and one that is simply not there reports the resource class
-//!   rather than the identifier the call carried.
+//!   account-level absence where what the call reads is the account's own protections
+//!   (`DescribeProtection`), while `DeleteProtection` — whose required `ProtectionId` is
+//!   the only resource it addresses — reports that protection's absence for an id the
+//!   account holds nothing under, whatever its subscription state; and an address that is
+//!   simply not there reports the resource class rather than the identifier the call
+//!   carried.
 //!
 //! The tables span what each rule generalises over: the constraint kind, the operation,
 //! the member (top-level and nested), the number of refused inputs, each published
@@ -206,6 +210,15 @@ impl Emulator {
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case CreateProtection {name}: no ProtectionId in {reply:?}"))
             .to_string()
+    }
+
+    /// Whether the store holds a protection under `protection_id`. Reaches the store
+    /// directly so that what a REFUSED request left behind can be checked without a read
+    /// that would be refused for the same reason.
+    fn holds_protection(&self, protection_id: &str) -> bool {
+        let state = service_state(&*self.engine).expect("the shield store");
+        let guard = state.lock();
+        guard.protections.contains_key(protection_id)
     }
 
     /// Move the stored subscription's end to `end_time`, the way the passage of time
@@ -1016,10 +1029,10 @@ const UNSUBSCRIBED_STATES: &[(&str, Option<Duration>)] = &[
 ];
 
 #[tokio::test]
-async fn addressing_a_protection_without_a_subscription_reports_the_account_level_absence() {
-    // A protection is something a subscription grants, so the absence an unsubscribed
-    // account reports is the account's, not the protection's — whichever address the
-    // call used, and whether or not the id was ever held.
+async fn describing_a_protection_without_a_subscription_reports_the_account_level_absence() {
+    // What `DescribeProtection` reads is the account's own protections, so the absence an
+    // unsubscribed account reports is the account's, not the protection's — whichever
+    // address the call used, and whether or not the id was ever held.
     for (state_case, lapsed_by) in UNSUBSCRIBED_STATES {
         for (call_case, operation, request) in [
             (
@@ -1031,11 +1044,6 @@ async fn addressing_a_protection_without_a_subscription_reports_the_account_leve
                 "DescribeProtection by arn",
                 "DescribeProtection",
                 json!({ "ResourceArn": PROTECTED_RESOURCE_ARN }),
-            ),
-            (
-                "DeleteProtection",
-                "DeleteProtection",
-                json!({ "ProtectionId": UNHELD_PROTECTION_ID }),
             ),
         ] {
             let emulator = Emulator::new();
@@ -1057,6 +1065,84 @@ async fn addressing_a_protection_without_a_subscription_reports_the_account_leve
             );
         }
     }
+}
+
+#[tokio::test]
+async fn deleting_an_unheld_protection_reports_the_protection_and_not_the_account() {
+    // `DeleteProtection` addresses exactly one resource: the protection its required
+    // `ProtectionId` names. An id the account holds no protection under therefore reports
+    // THAT protection's absence, whatever the account's subscription state is — a caller
+    // is told its id resolves to nothing rather than told to subscribe. The ids span the
+    // `ProtectionId` constraint (`len 36..36`, `^[a-zA-Z0-9\-]*$`): the shape this service
+    // mints, an all-digit one, an all-letter one and one of only hyphens.
+    let unheld_ids: &[(&str, &str)] = &[
+        ("the shape this service mints", UNHELD_PROTECTION_ID),
+        ("all digits", "123456789012345678901234567890123456"),
+        ("all letters", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"),
+        ("all hyphens", "------------------------------------"),
+    ];
+
+    for (state_case, lapsed_by) in UNSUBSCRIBED_STATES {
+        for (id_case, protection_id) in unheld_ids {
+            let emulator = Emulator::new();
+            if let Some(lapsed_by) = lapsed_by {
+                emulator.subscribe().await;
+                emulator.set_subscription_end(SystemTime::now() - *lapsed_by);
+            }
+
+            let reply = emulator
+                .call("DeleteProtection", &json!({ "ProtectionId": protection_id }))
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code(), reply.error_message()),
+                (
+                    400,
+                    "ResourceNotFoundException",
+                    PROTECTION_NOT_FOUND_MESSAGE
+                ),
+                "case {id_case} on an account {state_case}: expected HTTP 400 \
+                 ResourceNotFoundException {PROTECTION_NOT_FOUND_MESSAGE:?}, got {reply:?}"
+            );
+            assert!(
+                !reply.error_message().contains(protection_id),
+                "case {id_case} on an account {state_case}: the refusal must carry no \
+                 address from the request, got {:?}",
+                reply.error_message()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_protection_left_by_a_lapsed_subscription_is_not_released() {
+    // The id DOES resolve to a stored protection here, so the precondition that fails is
+    // the account's: there is no live subscription to release it from. The record is left
+    // exactly where it was, which is what proves the refusal happened before the removal.
+    let emulator = Emulator::new();
+    emulator.subscribe().await;
+    let held = emulator
+        .create_protection("kept", PROTECTED_RESOURCE_ARN)
+        .await;
+    emulator.set_subscription_end(SystemTime::now() - Duration::from_secs(60));
+
+    let reply = emulator
+        .call("DeleteProtection", &json!({ "ProtectionId": held }))
+        .await;
+    assert_eq!(
+        (reply.status, reply.error_code(), reply.error_message()),
+        (
+            400,
+            "ResourceNotFoundException",
+            SUBSCRIPTION_NOT_FOUND_MESSAGE
+        ),
+        "case release a protection under a lapsed subscription: expected HTTP 400 \
+         ResourceNotFoundException {SUBSCRIPTION_NOT_FOUND_MESSAGE:?}, got {reply:?}"
+    );
+    assert!(
+        emulator.holds_protection(&held),
+        "case release a protection under a lapsed subscription: the refused request must \
+         leave the protection {held} in the store"
+    );
 }
 
 #[tokio::test]

@@ -32,6 +32,13 @@ use crate::ops::types::{
 pub mod target_resources;
 pub use target_resources::*;
 
+/// Whether the account may use the services of the Shield Response Team — the Amazon Web
+/// Services Support plan it holds, a fact the Support service owns rather than this one, so
+/// it is its own concern; its names are re-exported so every caller keeps reaching them
+/// through `crate::state`.
+pub mod srt_support_plan;
+pub use srt_support_plan::*;
+
 /// The `SubscriptionState` an account with a live Shield Advanced subscription is in.
 pub const SUBSCRIPTION_STATE_ACTIVE: &str = "ACTIVE";
 /// The `SubscriptionState` an account without a live subscription is in.

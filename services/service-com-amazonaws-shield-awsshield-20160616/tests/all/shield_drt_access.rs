@@ -12,6 +12,12 @@
 //!
 //! The rules under test, each grounded in this service's Smithy model:
 //!
+//! * authorizing the Shield Response Team requires the account's Amazon Web Services
+//!   Support plan to admit the team's services (`AssociateDRTRole`: "To use the services
+//!   of the SRT and make an AssociateDRTRole request, you must be subscribed to the
+//!   Business Support plan or the Enterprise Support plan"), and that plan is judged
+//!   before anything about Shield Advanced, so an account on another plan is told its plan
+//!   is wrong rather than told to subscribe;
 //! * the access this read reports is granted on the account's subscription, so while the
 //!   account holds no active subscription the read refuses with the account-level
 //!   not-found wording — whatever else the store holds;
@@ -29,6 +35,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_shield_awsshield_20160616::state::{service_state, MAX_DRT_LOG_BUCKETS};
 use service_com_amazonaws_shield_awsshield_20160616::EmulatedService;
+use service_com_amazonaws_support_awssupport_20130415::state as support;
 
 /// The `X-Amz-Target` prefix from this crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "AWSShield_20160616.";
@@ -36,6 +43,28 @@ const TARGET_PREFIX: &str = "AWSShield_20160616.";
 /// How AWS words the account-level absence, shared by every operation whose only
 /// addressable resource is the account's subscription.
 const SUBSCRIPTION_NOT_FOUND: &str = "The subscription does not exist.";
+
+/// How AWS words the refusal of an account whose Support plan does not admit the services
+/// of the Shield Response Team, spelled out here rather than read from the service's own
+/// constant so the wording itself is pinned.
+const SUPPORT_PLAN_INVALID: &str = "Operation is invalid for your AWS Support plan.";
+
+/// A Support plan that admits the services of the Shield Response Team, as an operator
+/// records the account's plan (`SUPPORT_PLAN=enterprise`).
+pub(crate) const SRT_SUPPORT_PLAN: &str = "enterprise";
+
+/// Record `plan` as the Amazon Web Services Support plan this emulated account holds.
+///
+/// The plan lives in the Support service's OWN store — the one place that account fact
+/// lives, which an operator fills out of band — so a suite that needs the account on a
+/// particular plan writes it there rather than anywhere in this service's state. `None` is
+/// an account holding no plan at all, which is what a new account has.
+pub(crate) fn grant_support_plan(engine: &engine::InMemoryEngine, plan: Option<&str>) {
+    support::service_state(engine)
+        .expect("the support store")
+        .lock()
+        .support_plan = plan.map(str::to_string);
+}
 
 /// Every `RoleArn` in this suite's table, each admitted by the pattern the model puts on
 /// `AssociateDRTRoleRequest$RoleArn` and `DescribeDRTAccessResponse$RoleArn`
@@ -106,13 +135,22 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// An emulator whose account is on a Support plan that admits the services of the
+    /// Shield Response Team, so nothing but the subscription and the store decides what
+    /// the cases below answer.
     fn new() -> Self {
+        Self::on_support_plan(Some(SRT_SUPPORT_PLAN))
+    }
+
+    /// An emulator whose account holds `plan`.
+    fn on_support_plan(plan: Option<&str>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         // Signature verification is the emulator's concern, not this service's; the
         // routing key still comes from the `Authorization` header below.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        grant_support_plan(&engine, plan);
         Self { router, engine }
     }
 
@@ -215,6 +253,126 @@ fn log_bucket_names(count: usize) -> Vec<String> {
     (0..count)
         .map(|index| format!("shield-srt-access-logs-{index}"))
         .collect()
+}
+
+#[tokio::test]
+async fn authorizing_the_response_team_requires_a_support_plan_that_admits_its_services() {
+    // One row per Support plan the account may hold, each on a SUBSCRIBED account so that
+    // nothing but the plan can decide the answer: the premium tiers the operation names
+    // admit the team's services, under whichever spelling the plan is recorded in, and
+    // every other plan — including none at all — does not.
+    let rows: &[(&str, Option<&str>, bool)] = &[
+        ("no plan at all", None, false),
+        ("the Basic plan", Some("Basic"), false),
+        ("the Developer plan", Some("developer"), false),
+        ("the Business plan", Some("Business"), true),
+        ("the Enterprise plan", Some("Enterprise Support"), true),
+        // A tier the operation's own sentence does not name.
+        ("the Enterprise On-Ramp plan", Some("Enterprise On-Ramp"), false),
+        (
+            "the Business tier under its current name",
+            Some("AWS Business Support+"),
+            true,
+        ),
+    ];
+
+    for (case, plan, admits) in rows {
+        let emulator = Emulator::on_support_plan(*plan);
+        emulator.subscribe().await;
+
+        let reply = emulator
+            .call("AssociateDRTRole", &json!({ "RoleArn": ROLE_ARNS[0] }))
+            .await;
+        if *admits {
+            reply.expect_ok(case);
+        } else {
+            reply.expect_error(case, 400, "InvalidOperationException", SUPPORT_PLAN_INVALID);
+        }
+        let read = emulator.describe_drt_access().await;
+        let body = read.expect_ok(case).clone();
+        let expected = if *admits { Some(ROLE_ARNS[0]) } else { None };
+        assert_eq!(
+            reported_role(&body).as_deref(),
+            expected,
+            "case {case}: expected the stored role to be {expected:?}, got {body}"
+        );
+    }
+}
+
+/// One row of the precedence table: the account's Support plan and whether it holds a live
+/// Shield Advanced subscription, with the answer `AssociateDRTRole` is then due.
+struct PrecedenceRow {
+    case: &'static str,
+    plan: Option<&'static str>,
+    subscribed: bool,
+    status: u16,
+    /// The modelled error code, or `""` where the request succeeds.
+    code: &'static str,
+    /// The refusal's sentence, or `""` where the request succeeds.
+    message: &'static str,
+}
+
+#[tokio::test]
+async fn the_support_plan_is_judged_before_the_shield_advanced_subscription() {
+    // The two refusals ask the caller for different things — change the Support plan, or
+    // subscribe to Shield Advanced and retry — so which one an account draws is settled by
+    // its plan first: an account whose plan admits no SRT access is told about its plan
+    // whether or not it holds a subscription, and only an account whose plan admits them
+    // can be told to subscribe.
+    let rows: &[PrecedenceRow] = &[
+        PrecedenceRow {
+            case: "no plan and no subscription",
+            plan: None,
+            subscribed: false,
+            status: 400,
+            code: "InvalidOperationException",
+            message: SUPPORT_PLAN_INVALID,
+        },
+        PrecedenceRow {
+            case: "no plan but a live subscription",
+            plan: None,
+            subscribed: true,
+            status: 400,
+            code: "InvalidOperationException",
+            message: SUPPORT_PLAN_INVALID,
+        },
+        PrecedenceRow {
+            case: "an admitting plan and no subscription",
+            plan: Some(SRT_SUPPORT_PLAN),
+            subscribed: false,
+            status: 400,
+            code: "ResourceNotFoundException",
+            message: SUBSCRIPTION_NOT_FOUND,
+        },
+        PrecedenceRow {
+            case: "an admitting plan and a live subscription",
+            plan: Some(SRT_SUPPORT_PLAN),
+            subscribed: true,
+            status: 200,
+            code: "",
+            message: "",
+        },
+    ];
+
+    for row in rows {
+        let emulator = Emulator::on_support_plan(row.plan);
+        if row.subscribed {
+            emulator.subscribe().await;
+        }
+
+        let reply = emulator
+            .call("AssociateDRTRole", &json!({ "RoleArn": ROLE_ARNS[0] }))
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code(), reply.error_message()),
+            (row.status, row.code, row.message),
+            "case {}: expected HTTP {} {:?} {:?}, got {reply:?}",
+            row.case,
+            row.status,
+            row.code,
+            row.message
+        );
+    }
 }
 
 #[tokio::test]

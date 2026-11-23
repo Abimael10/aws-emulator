@@ -37,6 +37,10 @@ aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, feat
 aws-sdk-cloudfront = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-globalaccelerator = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-route53 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Support store holds the account's Amazon Web Services Support plan, which an operator
+# grants out of band: the operations that need the Shield Response Team's services read the
+# plan from that store rather than keeping a second copy of the account's plan.
+service-com-amazonaws-support-awssupport-20130415 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

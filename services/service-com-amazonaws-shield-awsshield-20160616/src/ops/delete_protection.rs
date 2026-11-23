@@ -148,9 +148,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // The only resource this call addresses is the protection its required
+        // `ProtectionId` names, so an id the account holds no protection under — never
+        // created, or already deleted — is reported as THAT protection's absence, ahead of
+        // anything about the account. The refusal names the resource class, not the
+        // identifier the call carried.
+        if guard.protection_by_id(&input.protection_id).is_none() {
+            return Err(DeleteProtectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::PROTECTION_NOT_FOUND_MESSAGE.to_string()),
+                    resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A protection is something a Shield Advanced subscription grants, so an account
-        // holding no live subscription holds no protection to release: the absence it
-        // reports is the account-level one, decided before any protection is looked up.
+        // holding no live subscription has no subscription to release one from: a
+        // protection left over from a lapsed subscription stays where it is, and the
+        // absence reported is the account-level one.
         if guard.subscription_state_at(::std::time::SystemTime::now())
             != crate::state::SUBSCRIPTION_STATE_ACTIVE
         {
@@ -163,18 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Deleting is not idempotent here: a protection that is not in the store —
-        // never created, or already deleted — cannot be found. The refusal names the
-        // resource class, not the identifier the call carried.
-        if guard.remove_protection(&input.protection_id).is_none() {
-            return Err(DeleteProtectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::PROTECTION_NOT_FOUND_MESSAGE.to_string()),
-                    resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
-                },
-            )
-            .into());
-        }
+        // Deleting is not idempotent here: the record found above is removed, so a second
+        // call for the same id finds nothing and reports the protection's absence.
+        guard.remove_protection(&input.protection_id);
 
         Ok(DeleteProtectionOutput {})
     }

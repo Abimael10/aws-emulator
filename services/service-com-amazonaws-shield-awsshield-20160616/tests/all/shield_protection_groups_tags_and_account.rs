@@ -41,6 +41,8 @@ use service_com_amazonaws_shield_awsshield_20160616::state::{
 };
 use service_com_amazonaws_shield_awsshield_20160616::EmulatedService;
 
+use crate::shield_drt_access::{grant_support_plan, SRT_SUPPORT_PLAN};
+
 /// The `X-Amz-Target` prefix from this crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "AWSShield_20160616.";
 
@@ -128,6 +130,11 @@ impl Emulator {
         // routing key still comes from the `Authorization` header below.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // `AssociateDRTRole` requires the account's Support plan to admit the services of
+        // the Shield Response Team before it looks at Shield Advanced at all, so the
+        // account here holds such a plan: the rows below are about the account-level
+        // subscription gate, which only a request that gets past the plan reaches.
+        grant_support_plan(&engine, Some(SRT_SUPPORT_PLAN));
         Self { router, engine }
     }
 
