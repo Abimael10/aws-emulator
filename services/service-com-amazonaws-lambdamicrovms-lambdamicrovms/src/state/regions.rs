@@ -235,11 +235,14 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// `baseImageVersion` is "the specific version of the base MicroVM image to use", so
     /// the service RESOLVES one from the base image the request named rather than
     /// recording a constant: the version that base image currently publishes, in the
-    /// label form it publishes it in. Which record publishes it follows from the
-    /// namespace the reference is in — an image of this account publishes the version it
-    /// is serving ([`MicrovmImage::latest_active_image_version`]), and an AWS-managed
-    /// base image publishes its generations through the catalogue, whose newest one is
-    /// what a build on it is placed on ([`latest_managed_base_image_version`]).
+    /// `major.minor` label form a base-image version is published in. Which record
+    /// publishes it follows from the namespace the reference is in — an image of this
+    /// account publishes the version it is serving
+    /// ([`MicrovmImage::latest_active_image_version`]), and an AWS-managed base image
+    /// publishes its releases through the catalogue, whose newest generation ships the
+    /// label a build on it is placed on ([`latest_managed_base_image_version_label`]).
+    /// The catalogue's own generation COUNTER (how an entry is addressed, and what a
+    /// client pins) is not that label, so a resolved pedigree is never a bare generation.
     ///
     /// A base image that publishes NO version — an own image whose every build failed, a
     /// reference into neither namespace — leaves nothing to resolve, so the record takes
@@ -252,8 +255,8 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         {
             return active;
         }
-        if let Some(published) =
-            managed_microvm_image_id(base_image_arn).and_then(latest_managed_base_image_version)
+        if let Some(published) = managed_microvm_image_id(base_image_arn)
+            .and_then(latest_managed_base_image_version_label)
         {
             return published.to_string();
         }

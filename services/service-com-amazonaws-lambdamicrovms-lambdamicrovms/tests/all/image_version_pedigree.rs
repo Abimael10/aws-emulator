@@ -6,10 +6,13 @@
 //!
 //! RULE 1: a version's `baseImageVersion` is the base image version that version is built
 //! from — the version the request pinned when it pinned one, and otherwise the version the
-//! base image the request named currently publishes: the version an account's own image is
-//! serving when the base image is one of its own, the newest generation the AWS-managed
-//! catalogue publishes when it is a managed one, and the `major.minor` initial version
-//! when the base image it named publishes nothing at all.
+//! base image the request named currently publishes, in the `major.minor` label form a
+//! base-image version is published in: the version an account's own image is serving when
+//! the base image is one of its own, the release the newest generation of an AWS-managed
+//! base image's catalogue entry ships when it is a managed one, and the `major.minor`
+//! initial version when the base image it named publishes nothing at all. The catalogue's
+//! own generation counter — how an entry is addressed, and what a client pins — is never
+//! what a resolution returns.
 //!
 //! RULE 2: `latestFailedImageVersion` names the latest version of the image that settled
 //! on the failed branch, so a configuration update's own 200 names the version that was
@@ -32,9 +35,11 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::code_artifact::BUCKET_ABSENT_REASON;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    managed_base_image_arn, published_managed_base_image_versions, FIRST_IMAGE_VERSION,
+    latest_managed_base_image_version, latest_managed_base_image_version_label,
+    managed_base_image_arn, managed_base_image_version_label,
+    published_managed_base_image_versions, version_order, FIRST_IMAGE_VERSION,
     MANAGED_BASE_IMAGE_IDS, VERSION_STATE_FAILED, VERSION_STATE_SUCCESSFUL,
-    VERSION_STATUS_INACTIVE,
+    VERSION_STATUS_ACTIVE, VERSION_STATUS_INACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -199,9 +204,9 @@ async fn settled_version(
 
 /// RULE: a version's `baseImageVersion` is the base image version it is built from — the
 /// one the request pinned, and otherwise the version the base image it named publishes
-/// (the version an own image is serving, the newest generation a managed base image's
-/// catalogue entry publishes, and the `major.minor` initial version for a base image
-/// publishing none) — reported identically by the create, the version read and the
+/// (the version an own image is serving, the release the newest generation of a managed
+/// base image's catalogue entry ships, and the `major.minor` initial version for a base
+/// image publishing none) — reported identically by the create, the version read and the
 /// listing row.
 #[tokio::test]
 async fn a_version_records_the_base_image_version_it_is_built_from() {
@@ -210,14 +215,13 @@ async fn a_version_records_the_base_image_version_it_is_built_from() {
 
     // The AWS-managed base image the harness builds on, and the generations its catalogue
     // entry publishes (`state::published_managed_base_image_versions`): a client may PIN
-    // any of them, and the NEWEST one is what an unpinned build on that base image is
-    // resolved to.
+    // any of them, and the release the NEWEST one ships
+    // (`state::latest_managed_base_image_version_label`) is what an unpinned build on that
+    // base image is resolved to.
     let managed_id = MANAGED_BASE_IMAGE_IDS[0];
     let managed_base = managed_base_image_arn(REGION, managed_id);
     let published = published_managed_base_image_versions(managed_id);
-    let newest_generation = published
-        .first()
-        .copied()
+    let newest_release = latest_managed_base_image_version_label(managed_id)
         .unwrap_or_else(|| panic!("the catalogue publishes a generation of {managed_id}"))
         .to_string();
     let oldest_generation = published
@@ -301,7 +305,7 @@ async fn a_version_records_the_base_image_version_it_is_built_from() {
             "unpinned, on the AWS-managed base image",
             "pedigree-managed",
             json!({"baseImageArn": managed_base.clone()}),
-            newest_generation.clone(),
+            newest_release.clone(),
         ),
         (
             "unpinned, on an own image serving its first version",
@@ -563,13 +567,12 @@ async fn every_row_of_a_version_listing_reports_its_own_resolved_base_image_vers
     stage_object(&router, ARTIFACT_BUCKET, ARTIFACT_KEY).await;
 
     // The AWS-managed base image and the generations its catalogue entry publishes: the
-    // newest is what an unpinned build on it resolves to, any of them may be pinned.
+    // release the newest generation ships is what an unpinned build on it resolves to, any
+    // generation may be pinned.
     let managed_id = MANAGED_BASE_IMAGE_IDS[0];
     let managed_base = managed_base_image_arn(REGION, managed_id);
     let published = published_managed_base_image_versions(managed_id);
-    let newest_generation = published
-        .first()
-        .copied()
+    let newest_release = latest_managed_base_image_version_label(managed_id)
         .unwrap_or_else(|| panic!("the catalogue publishes a generation of {managed_id}"))
         .to_string();
     let oldest_generation = published
@@ -611,7 +614,7 @@ async fn every_row_of_a_version_listing_reports_its_own_resolved_base_image_vers
     let image_arn = text(&created, "imageArn");
     let mut expected: Vec<(String, String, String)> = vec![(
         text(&created, "imageVersion"),
-        newest_generation.clone(),
+        newest_release.clone(),
         "unpinned, on the AWS-managed base image".to_string(),
     )];
 
@@ -702,5 +705,242 @@ async fn every_row_of_a_version_listing_reports_its_own_resolved_base_image_vers
             "case {case:?}: expected the version read of {image_version} to report \
              {resolved:?}, got {served:?}"
         );
+    }
+}
+
+/// Whether `version` is the `major.minor` label form a version of this API is published
+/// in: two dot-separated decimal components and nothing else (`state::FIRST_IMAGE_VERSION`
+/// is the form's own example).
+fn is_major_minor(version: &str) -> bool {
+    version
+        .split_once('.')
+        .is_some_and(|(major, minor)| {
+            major.parse::<u64>().is_ok() && minor.parse::<u64>().is_ok()
+        })
+}
+
+/// The rows `ListManagedMicrovmImageVersions` serves for the base image `image_id`.
+async fn managed_catalogue_rows(
+    router: &MultiServiceRouter,
+    image_id: &str,
+    case: &str,
+) -> Vec<Value> {
+    let uri = format!(
+        "/2025-09-09/managed-microvm-images/{}/versions",
+        as_uri_value(image_id)
+    );
+    let (status, body) = call(router, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the catalogue listing got {status} {body}"
+    );
+    body["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// RULE: the AWS-managed catalogue ADDRESSES each published generation of a base image by
+/// an integer counter — the `imageVersion` of the row `ListManagedMicrovmImageVersions`
+/// serves, which is what a client pins — while each generation SHIPS a release of that
+/// base image whose version is a `major.minor` label
+/// (`state::managed_base_image_version_label`). The two forms are distinct, every
+/// generation ships a label, and the labels are ordered as the generations are, so the
+/// newest generation ships the release an unpinned build on that base image resolves to.
+#[tokio::test]
+async fn every_published_generation_ships_a_major_minor_base_image_release() {
+    let router = emulator();
+
+    // Rows: every generation of every base image the catalogue publishes — read off the
+    // catalogue itself (`state::published_managed_base_image_versions`) rather than named
+    // here, so an entry added to the table is covered without touching this test.
+    for image_id in MANAGED_BASE_IMAGE_IDS {
+        let generations = published_managed_base_image_versions(image_id);
+        assert!(
+            !generations.is_empty(),
+            "case {image_id:?}: the catalogue publishes a generation of this base image"
+        );
+
+        let addressed: Vec<String> = managed_catalogue_rows(&router, image_id, image_id)
+            .await
+            .iter()
+            .map(|row| text(row, "imageVersion"))
+            .collect();
+        assert_eq!(
+            addressed,
+            generations
+                .iter()
+                .map(|generation| (*generation).to_string())
+                .collect::<Vec<_>>(),
+            "case {image_id:?}: the listing addresses the generations the catalogue \
+             publishes, got {addressed:?}"
+        );
+
+        for generation in &generations {
+            let case = format!("{image_id} generation {generation}");
+            assert!(
+                generation.parse::<u64>().is_ok(),
+                "case {case:?}: a generation is addressed by an integer counter, got \
+                 {generation:?}"
+            );
+            let label = managed_base_image_version_label(image_id, generation)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the catalogue publishes the release it ships")
+                });
+            assert!(
+                is_major_minor(label),
+                "case {case:?}: expected a major.minor base-image release, got {label:?}"
+            );
+            assert_ne!(
+                label, *generation,
+                "case {case:?}: the release a generation ships is not the counter it is \
+                 addressed by"
+            );
+        }
+
+        // A later generation ships a later release, so the pedigree of two builds on the
+        // same base image orders as the generations they sit on do.
+        for pair in generations.windows(2) {
+            let (newer, older) = (
+                managed_base_image_version_label(image_id, pair[0]).unwrap_or_default(),
+                managed_base_image_version_label(image_id, pair[1]).unwrap_or_default(),
+            );
+            assert!(
+                version_order(newer) > version_order(older),
+                "case {image_id:?}: expected generation {:?}'s release {newer:?} above \
+                 generation {:?}'s {older:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // What an unpinned build resolves to is the release of the generation the listing
+        // serves FIRST, so the resolution and the catalogue cannot disagree.
+        let newest = latest_managed_base_image_version(image_id)
+            .unwrap_or_else(|| panic!("case {image_id:?}: the catalogue publishes a generation"));
+        assert_eq!(
+            latest_managed_base_image_version_label(image_id),
+            managed_base_image_version_label(image_id, newest),
+            "case {image_id:?}: expected the newest generation {newest:?}'s own release"
+        );
+    }
+}
+
+/// RULE: a version record's `baseImageVersion` is the version the request pinned, and
+/// otherwise the version the base image it named publishes — for an AWS-managed base image
+/// the `major.minor` release its newest published generation ships, never the integer
+/// counter the catalogue addresses that generation by — and EVERY projection of the record
+/// reports the stored value unchanged: the create, the version read, the listing row, a
+/// status publication (which changes only `status`) and a configuration update's own
+/// resolution.
+#[tokio::test]
+async fn every_projection_of_a_version_reports_its_resolved_base_image_release() {
+    let router = emulator();
+    stage_object(&router, ARTIFACT_BUCKET, ARTIFACT_KEY).await;
+
+    for image_id in MANAGED_BASE_IMAGE_IDS {
+        let base = managed_base_image_arn(REGION, image_id);
+        let release = latest_managed_base_image_version_label(image_id)
+            .unwrap_or_else(|| panic!("the catalogue publishes a generation of {image_id}"))
+            .to_string();
+
+        // Rows: what the request says about the base-image version — nothing at all
+        // (resolved), each generation the catalogue addresses (recorded verbatim), and a
+        // `major.minor` release of the caller's own choosing (recorded verbatim). Pinning
+        // is unaffected by the resolution, which is what isolates the resolution.
+        let mut rows: Vec<(String, Value, String)> = vec![(
+            format!("{image_id}: unpinned"),
+            json!({"baseImageArn": base.clone()}),
+            release.clone(),
+        )];
+        for generation in published_managed_base_image_versions(image_id) {
+            rows.push((
+                format!("{image_id}: pinned to generation {generation}"),
+                json!({"baseImageArn": base.clone(), "baseImageVersion": generation}),
+                generation.to_string(),
+            ));
+        }
+        rows.push((
+            format!("{image_id}: pinned to a release of the caller's own choosing"),
+            json!({"baseImageArn": base.clone(), "baseImageVersion": "7.3"}),
+            "7.3".to_string(),
+        ));
+
+        for (index, (case, extra, expected)) in rows.iter().enumerate() {
+            let name = format!("release-pedigree-{index}");
+            let created = create(&router, &name, extra.clone()).await;
+            let answered = text(&created, "baseImageVersion");
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected baseImageVersion {expected:?}, got {answered:?}"
+            );
+            assert!(
+                *expected != release || is_major_minor(&answered),
+                "case {case:?}: a RESOLVED pedigree is a major.minor release, got \
+                 {answered:?}"
+            );
+
+            let image_arn = text(&created, "imageArn");
+            let image_version = text(&created, "imageVersion");
+            settled_version(&router, &image_arn, &image_version, case).await;
+
+            let (status, read) = get_version(&router, &image_arn, &image_version).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the version read got {status} {read}"
+            );
+            let served = text(&read, "baseImageVersion");
+            assert_eq!(
+                served, *expected,
+                "case {case:?}: expected the version read to report {expected:?}, got \
+                 {served:?}"
+            );
+            let row = version_row(&router, &image_arn, &image_version, case).await;
+            let listed = text(&row, "baseImageVersion");
+            assert_eq!(
+                listed, *expected,
+                "case {case:?}: expected the listing row to report {expected:?}, got \
+                 {listed:?}"
+            );
+
+            // A status publication changes only `status`, so its own 200 is the stored
+            // pedigree unchanged — whichever status it moves the version to.
+            for status_value in [VERSION_STATUS_ACTIVE, VERSION_STATUS_INACTIVE] {
+                let published =
+                    publish_status(&router, &image_arn, &image_version, status_value, case).await;
+                let echoed = text(&published, "baseImageVersion");
+                assert_eq!(
+                    echoed, *expected,
+                    "case {case:?}: expected the {status_value} publication to report \
+                     {expected:?}, got {echoed:?}"
+                );
+            }
+
+            // A configuration update that pins no version mints a version whose pedigree
+            // is resolved the same way, and that version reads back with it.
+            let updated = update(
+                &router,
+                &image_arn,
+                &name,
+                json!({"baseImageArn": base.clone()}),
+                case,
+            )
+            .await;
+            let resolved = text(&updated, "baseImageVersion");
+            assert_eq!(
+                resolved, release,
+                "case {case:?}: expected the update to resolve {release:?}, got {resolved:?}"
+            );
+            let minted = text(&updated, "imageVersion");
+            settled_version(&router, &image_arn, &minted, case).await;
+            let (status, minted_read) = get_version(&router, &image_arn, &minted).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the read of the minted version got {status} {minted_read}"
+            );
+            let minted_version = text(&minted_read, "baseImageVersion");
+            assert_eq!(
+                minted_version, release,
+                "case {case:?}: expected the minted version to report {release:?}, got \
+                 {minted_version:?}"
+            );
+        }
     }
 }

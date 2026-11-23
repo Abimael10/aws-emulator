@@ -98,8 +98,8 @@ const BASE_IMAGE_ARN: &str = "arn:aws:lambda:us-west-2:aws:microvm-image:al2023-
 const BUILD_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/microvm-build";
 
 /// The base-image version a create that pins NO `baseImageVersion` is resolved to on the
-/// base image above: the newest version that base image publishes, which for an
-/// AWS-managed one is the newest generation its catalogue entry publishes
+/// base image above: the version that base image publishes, which for an AWS-managed one
+/// is the `major.minor` release the newest generation of its catalogue entry ships
 /// (`state::resolve_base_image_version`). Read off the catalogue rather than written as a
 /// literal, so a suite asserts the resolution rather than one published label.
 pub(crate) fn resolved_base_image_version() -> String {
@@ -107,7 +107,7 @@ pub(crate) fn resolved_base_image_version() -> String {
         .rsplit_once(':')
         .map(|(_, image_id)| image_id)
         .unwrap_or_default();
-    service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::latest_managed_base_image_version(
+    service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::latest_managed_base_image_version_label(
         image_id,
     )
     .unwrap_or_else(|| panic!("the catalogue publishes a generation of {image_id:?}"))

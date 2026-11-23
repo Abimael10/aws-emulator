@@ -559,38 +559,46 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 }
 
 /// The generations the AWS-managed catalogue publishes, as `(base image id,
-/// generation, the instant AWS published that generation as epoch seconds, the CPU
-/// architectures that generation supports)`.
+/// generation, the base-image version that generation ships, the instant AWS published
+/// that generation as epoch seconds, the CPU architectures that generation supports)`.
 ///
-/// An AWS-PUBLISHED base image is versioned by a plain integer GENERATION counter —
-/// not the `major.minor` form this service mints for an account's own images
+/// An entry of the catalogue is ADDRESSED by a plain integer GENERATION counter — not
+/// the `major.minor` form this service mints for an account's own images
 /// ([`FIRST_IMAGE_VERSION`]) — and AWS publishes several generations of one base image
 /// at once, so a client can pin an older generation for a reproducible build.
-/// `ListManagedMicrovmImageVersions` serves this table, so what a client DISCOVERS to
-/// pin as `CreateMicrovmImage$baseImageVersion` ("The specific version of the base
-/// MicroVM image to use") is what the table publishes. A create's own version is not
-/// checked against it — the service records whatever version the request pinned — while
-/// a create that pins NONE is RESOLVED from it, against the newest generation the table
-/// publishes for the base image the request named; see
-/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`].
+/// `ListManagedMicrovmImageVersions` serves that counter as a row's `imageVersion`, so
+/// what a client DISCOVERS to pin as `CreateMicrovmImage$baseImageVersion` ("The
+/// specific version of the base MicroVM image to use") is what the table publishes. A
+/// create's own version is not checked against it — the service records whatever version
+/// the request pinned.
+///
+/// Each generation SHIPS a release of the base image, whose own version is the
+/// `major.minor` label the base image is published under. That label, not the generation
+/// counter, is the base-image PEDIGREE a version record carries: a create or a
+/// configuration update that pins no `baseImageVersion` is resolved to the label of the
+/// newest generation the named base image publishes; see
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`] and
+/// [`latest_managed_base_image_version_label`].
 ///
 /// Each generation also publishes the architectures a MicroVM built on it can target,
 /// which is how a caller selects a base image by architecture; the catalogue's images
 /// support every architecture this API models (`ARCHITECTURE_VALUES`, the values
 /// `smithy_query(query="shape",shape="Architecture")` lists).
 ///
-/// A generation's publication INSTANT is published metadata of AWS's own catalogue, not
-/// anything this emulator or an account does, so it is a constant of this table: the
-/// same value on every read, for the life of the entry. The instants below are chosen
-/// (this emulator does not hold AWS's own publication dates), anchored on the API
-/// version this service serves the catalogue under, and ordered as the generations are:
-/// a later generation is published later.
-pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, i64, &[&str])] = &[
-    // Generation 1, published 2025-10-14T00:00:00Z.
-    ("al2023-1", "1", 1_760_400_000, ARCHITECTURE_VALUES),
-    // Generation 0, published 2025-09-09T00:00:00Z — the service's own API version date,
-    // the first instant it could have published a base image under.
-    ("al2023-1", "0", 1_757_376_000, ARCHITECTURE_VALUES),
+/// A generation's version label and its publication INSTANT are both published metadata
+/// of AWS's own catalogue, not anything this emulator or an account does, so each is a
+/// constant of this table: the same value on every read, for the life of the entry. The
+/// labels and instants below are chosen (this emulator holds neither AWS's own release
+/// labels nor its publication dates), the instants anchored on the API version this
+/// service serves the catalogue under, and both ordered as the generations are: a later
+/// generation ships a later release and is published later.
+pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, &str, i64, &[&str])] = &[
+    // Generation 1, shipping base-image release 1.0, published 2025-10-14T00:00:00Z.
+    ("al2023-1", "1", "1.0", 1_760_400_000, ARCHITECTURE_VALUES),
+    // Generation 0, shipping the pre-release 0.1 of the same base image, published
+    // 2025-09-09T00:00:00Z — the service's own API version date, the first instant it
+    // could have published a base image under.
+    ("al2023-1", "0", "0.1", 1_757_376_000, ARCHITECTURE_VALUES),
 ];
 
 /// A `ManagedMicrovmImageVersionStatus` value
@@ -611,7 +619,7 @@ pub fn published_managed_base_image_versions(image_id: &str) -> Vec<&'static str
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
             .filter(|(id, ..)| *id == image_id)
-            .map(|(_, version, ..)| *version)
+            .map(|(_, generation, ..)| *generation)
             .collect(),
         false => Vec::new(),
     };
@@ -629,7 +637,7 @@ pub fn managed_base_image_supported_architectures(
 ) -> Vec<CpuConfiguration> {
     MANAGED_BASE_IMAGE_VERSIONS
         .iter()
-        .filter(|(id, version, ..)| *id == image_id && *version == image_version)
+        .filter(|(id, generation, ..)| *id == image_id && *generation == image_version)
         .flat_map(|(.., architectures)| architectures.iter())
         .map(|architecture| CpuConfiguration {
             architecture: (*architecture).to_string(),
@@ -651,10 +659,40 @@ pub fn managed_base_image_version_published_at(
     match is_published_managed_base_image(image_id) {
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
-            .find(|(id, version, ..)| *id == image_id && *version == image_version)
-            .map(|(_, _, published_at, _)| DateTime::from_secs(*published_at)),
+            .find(|(id, generation, ..)| *id == image_id && *generation == image_version)
+            .map(|(.., published_at, _)| DateTime::from_secs(*published_at)),
         false => None,
     }
+}
+
+/// The base-image version the generation `image_version` of the base image `image_id`
+/// SHIPS: the `major.minor` label that release of the base image is published under,
+/// which is the pedigree a version built on it records
+/// ([`MANAGED_BASE_IMAGE_VERSIONS`]). `None` for a generation the catalogue does not
+/// publish, which ships nothing.
+pub fn managed_base_image_version_label(
+    image_id: &str,
+    image_version: &str,
+) -> Option<&'static str> {
+    match is_published_managed_base_image(image_id) {
+        true => MANAGED_BASE_IMAGE_VERSIONS
+            .iter()
+            .find(|(id, generation, ..)| *id == image_id && *generation == image_version)
+            .map(|(_, _, label, ..)| *label),
+        false => None,
+    }
+}
+
+/// The base-image version the NEWEST generation the catalogue publishes for `image_id`
+/// ships — the label a build on that base image that pins no version is resolved to
+/// ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]).
+///
+/// Read from the one catalogue table, so the pedigree a version records and the entry a
+/// client discovers that base image in cannot disagree about which release the build
+/// sits on. `None` for an id the catalogue does not publish.
+pub fn latest_managed_base_image_version_label(image_id: &str) -> Option<&'static str> {
+    let generation = latest_managed_base_image_version(image_id)?;
+    managed_base_image_version_label(image_id, generation)
 }
 
 /// When the catalogue entry for the base image `image_id` was published and when it was
@@ -672,7 +710,7 @@ pub fn managed_base_image_publication(image_id: &str) -> Option<(DateTime, DateT
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
             .filter(|(id, ..)| *id == image_id)
-            .map(|(_, _, published_at, _)| *published_at)
+            .map(|(.., published_at, _)| *published_at)
             .collect(),
         false => Vec::new(),
     };
@@ -689,11 +727,12 @@ pub fn managed_base_image_publication(image_id: &str) -> Option<(DateTime, DateT
 /// published order is newest first ([`published_managed_base_image_versions`]), so this
 /// is the first row `ListManagedMicrovmImageVersions` serves for it.
 ///
-/// This is also the generation an unpinned build on that base image is placed on
-/// ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]): the
-/// newest version the named base image publishes, read from the one table the catalogue
-/// listing serves, so the pedigree a version records and the catalogue a client
-/// discovers that version in cannot disagree.
+/// This is also the generation whose SHIPPED base-image version an unpinned build on
+/// that base image is placed on
+/// ([`latest_managed_base_image_version_label`], read by
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]): both
+/// come from the one table the catalogue listing serves, so the pedigree a version
+/// records and the catalogue a client discovers that base image in cannot disagree.
 pub fn latest_managed_base_image_version(image_id: &str) -> Option<&'static str> {
     published_managed_base_image_versions(image_id)
         .into_iter()
@@ -2505,10 +2544,13 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     ///
     /// The same catalogue [`Self::managed_base_images`] serves, read one image deep
     /// ([`MANAGED_BASE_IMAGE_VERSIONS`]), so a listing of an image's versions, the
-    /// version a build that pins none resolves to, and the images the catalogue
-    /// publishes cannot disagree. Each version reports the instant the catalogue
-    /// published that generation ([`managed_base_image_version_published_at`]), a
-    /// constant of the catalogue rather than a clock this store reads.
+    /// base-image version a build that pins none resolves to, and the images the
+    /// catalogue publishes cannot disagree. A row reports the GENERATION it is addressed
+    /// by as its `imageVersion` — the release that generation ships is the pedigree a
+    /// build records ([`latest_managed_base_image_version_label`]) — and the instant the
+    /// catalogue published that generation
+    /// ([`managed_base_image_version_published_at`]), a constant of the catalogue rather
+    /// than a clock this store reads.
     pub fn managed_base_image_versions(
         &self,
         image_id: &str,

@@ -28,8 +28,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_not_found_message,
-    image_not_updatable_message, invalid_arn_format_message, latest_managed_base_image_version,
-    managed_base_image_arn, managed_network_connector_arn, next_image_version, service_state,
+    image_not_updatable_message, invalid_arn_format_message,
+    latest_managed_base_image_version_label, managed_base_image_arn,
+    managed_network_connector_arn, next_image_version, service_state,
     too_many_image_versions_message, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
     DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB, IMAGE_STATE_CREATED,
     IMAGE_STATE_CREATE_FAILED, IMAGE_STATE_UPDATED, IMAGE_STATE_UPDATING, MANAGED_BASE_IMAGE_IDS,
@@ -154,9 +155,11 @@ fn service_supplied(name: &str, member: &str) -> Value {
     match member {
         // A build that pins no `baseImageVersion` records the version the base image it
         // named publishes — for the AWS-managed base image these rows build on, the
-        // newest generation its catalogue entry publishes
+        // `major.minor` release the newest generation of its catalogue entry ships
         // (`state::resolve_base_image_version`).
-        "baseImageVersion" => json!(latest_managed_base_image_version(MANAGED_BASE_IMAGE_IDS[0])),
+        "baseImageVersion" => {
+            json!(latest_managed_base_image_version_label(MANAGED_BASE_IMAGE_IDS[0]))
+        }
         "egressNetworkConnectors" => json!([managed_network_connector_arn(
             REGION,
             DEFAULT_EGRESS_NETWORK_CONNECTOR

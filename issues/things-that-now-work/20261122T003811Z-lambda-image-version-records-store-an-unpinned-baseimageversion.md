@@ -61,3 +61,25 @@ Code sightings (orientation only): src/state/regions.rs:248-261 (resolve_base_im
 3. Cause 1: CreateMicrovmImage(name=<unique>, baseImageArn=base, buildRoleArn=<an IAM role arn>, codeArtifact={'uri': 's3://<unique>/code.zip'}) with NO baseImageVersion. AWS: the 201 reports the version resolved for `base` as a dotted label (recorded '1.0'). Emulator: '1', for every create and every base image.
 4. Let the version's build settle, then Cause 2: UpdateMicrovmImageVersion(imageIdentifier=<imageArn>, imageVersion='1.0', status='INACTIVE') — the 200 echoes baseImageVersion '1' from the stored version record instead of the pedigree the version was built from.
 5. Re-replay fixture lambda-microvms-image-lifecycle steps task#2 and task#18 to confirm: both must report baseImageVersion as the version resolved from the named base image, in the dotted label form a base-image version is published in.
+
+## Fix status
+
+Both causes FIXED, by the one change the two share: a base-image version an unpinned create or
+configuration update is resolved to is now the `major.minor` RELEASE the named base image publishes,
+never the integer counter the AWS-managed catalogue addresses a published generation by.
+
+The catalogue table keeps the generation labels the corpus value-asserts for
+`ListManagedMicrovmImageVersions` (`'1'` and `'0'`, recorded behaviour — see
+`20261030T024426Z-lambda-microvms-managed-microvm-image-catalog-is-synthesized.md`, Cause 1) and
+each of its rows now also publishes the base-image release that generation ships, so the two
+recorded facts no longer contradict each other: the listing serves the counter a client pins, while
+the resolution (`resolve_base_image_version`) returns the release label a build's pedigree is
+recorded as. The release labels, like the publication instants beside them, are chosen catalogue
+metadata — the live labels AWS's own catalogue publishes drift between recordings of this corpus
+(`'1.0'` at task#2 and `'3.1'` at task#18 for the same image's same version), so no stored value can
+reproduce one run's literal and none is hard-coded anywhere.
+
+A pinned `baseImageVersion` is still recorded verbatim, and every projection of a version record
+(the create, the configuration update, the status publication, the version read and the listing row)
+reports the stored value unchanged. `tests/all/image_version_pedigree.rs` pins both halves over the
+whole catalogue.

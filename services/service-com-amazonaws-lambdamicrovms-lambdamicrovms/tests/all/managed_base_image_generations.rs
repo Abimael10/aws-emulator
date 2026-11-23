@@ -26,9 +26,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::ops::types::ARCHITECTURE_VALUES;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    latest_managed_base_image_version, managed_base_image_arn,
-    managed_base_image_supported_architectures, published_managed_base_image_versions,
-    version_order, MANAGED_BASE_IMAGE_IDS,
+    latest_managed_base_image_version, latest_managed_base_image_version_label,
+    managed_base_image_arn, managed_base_image_supported_architectures,
+    published_managed_base_image_versions, version_order, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -208,8 +208,8 @@ async fn every_published_generation_reports_the_architectures_it_supports() {
 
 /// RULE: the catalogue is the ONE table both sides of the service read — a create that
 /// pins a generation the catalogue publishes is accepted and records that generation, one
-/// that pins none records the newest generation the catalogue publishes for the base image
-/// it named, and neither changes what the catalogue publishes.
+/// that pins none records the base-image release the newest generation of the base image
+/// it named ships, and neither changes what the catalogue publishes.
 #[tokio::test]
 async fn a_build_pins_any_published_generation() {
     let router = emulator();
@@ -236,10 +236,11 @@ async fn a_build_pins_any_published_generation() {
     rows.push((
         "unpinned".to_string(),
         json!({"baseImageArn": base_image_arn}),
-        // A build that pins no generation is RESOLVED against the catalogue: it records
-        // the newest generation published for the base image it named
-        // (`state::resolve_base_image_version`).
-        latest_managed_base_image_version(image_id)
+        // A build that pins no version is RESOLVED against the catalogue: it records the
+        // `major.minor` release the newest generation published for the base image it
+        // named ships (`state::resolve_base_image_version`), never the generation counter
+        // that generation is addressed by.
+        latest_managed_base_image_version_label(image_id)
             .unwrap_or_else(|| panic!("the catalogue publishes a generation of {image_id}"))
             .to_string(),
     ));
@@ -256,7 +257,7 @@ async fn a_build_pins_any_published_generation() {
         assert_eq!(
             created["baseImageVersion"].as_str(),
             Some(expected.as_str()),
-            "case {name:?}: expected the generation the build resolves to, got {:?}",
+            "case {name:?}: expected the base-image version the build resolves to, got {:?}",
             created["baseImageVersion"]
         );
     }
