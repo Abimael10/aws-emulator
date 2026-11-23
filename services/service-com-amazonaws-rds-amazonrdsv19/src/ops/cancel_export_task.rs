@@ -191,15 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "You can't cancel an export task that has completed" — nor one that has already
         // stopped for any other reason, nor one whose cancellation this service has
-        // already accepted: the status it reports is what makes the request refusable, and
-        // the fault names it.
+        // already accepted: the status it reports is what makes the request refusable. The
+        // refusal names the EXPORT and nothing else; the status a caller wants is answered
+        // by `DescribeExportTasks`
+        // ([`crate::state::export_task_not_cancelable_message`]).
         if !task.is_cancelable() {
             return Err(CancelExportTaskErrorModeled::InvalidExportTaskStateFault(
                 InvalidExportTaskStateFault {
-                    message: Some(format!(
-                        "ExportTask {requested} is in state {} and can't be canceled",
-                        task.status
-                    )),
+                    message: Some(crate::state::export_task_not_cancelable_message(&requested)),
                 },
             )
             .into());

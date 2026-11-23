@@ -1044,9 +1044,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             // "The parameter group name itself is changed immediately, but the actual
             // parameter changes are not applied until you reboot the instance without
-            // failover": the switch is recorded on the instance, which reports the group
-            // `applying` while RDS attaches it and `pending-reboot` after that until the
-            // reboot happens ([`crate::state::DbInstanceRecord::switch_db_parameter_group`]).
+            // failover. … However, if you modify dynamic parameters in the newly associated
+            // DB parameter group, these changes are applied immediately without a reboot":
+            // the switch is recorded on the instance, which reports the group `applying`
+            // while RDS attaches it and then rests where the values that group carries put it
+            // ([`crate::state::DbInstanceRecord::switch_db_parameter_group`],
+            // [`crate::state::DbInstanceRecord::parameter_apply_status`]).
             record.switch_db_parameter_group(value);
         }
         if let Some(value) = input.option_group_name {

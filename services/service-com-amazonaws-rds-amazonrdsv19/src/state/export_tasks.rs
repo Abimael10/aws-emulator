@@ -80,6 +80,19 @@ pub fn export_task_not_found_message(named: &str) -> String {
     format!("The export task {named} doesn't exist.")
 }
 
+/// The sentence an `InvalidExportTaskStateFault` carries for an export this service will not
+/// cancel: one that has reached a terminal status, or whose cancellation it has already
+/// accepted.
+///
+/// "You can't cancel an export task that has completed" is the model's statement of the rule,
+/// and Amazon RDS words the refusal as a statement about the EXPORT — the identifier the
+/// request carried, and the fact that it cannot be canceled — with the typographic apostrophe
+/// its own sentences use. The task's STATUS is no part of it: that is what
+/// `DescribeExportTasks` answers, so a caller reads it there rather than out of this message.
+pub fn export_task_not_cancelable_message(named: &str) -> String {
+    format!("The export {named} can\u{2019}t be canceled.")
+}
+
 /// The sentence an `ExportTaskAlreadyExistsFault` carries: "You can't start an export task
 /// that's already running", named with the identifier the request asked to start a second
 /// export under.

@@ -820,10 +820,13 @@ async fn cancel_export_task_acts_only_on_a_task_that_is_still_running() {
             );
         } else {
             let body = expect_error(&case, response, 400, "InvalidExportTaskStateFault");
-            assert!(
-                text(&body, "Message").contains(spec.status),
-                "case {case:?}: the refusal names the status that makes it refusable, got \
-                 {body}"
+            // The refusal is worded about the EXPORT the request named, with no mention of
+            // the status: the status is what `DescribeExportTasks` answers, read below.
+            let expected = format!("The export {} can\u{2019}t be canceled.", spec.identifier);
+            let reported = text(&body, "Message");
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the refusal {expected:?}, got {reported:?} in {body}"
             );
             // The refused call left the record where it was.
             let after = expect_ok(

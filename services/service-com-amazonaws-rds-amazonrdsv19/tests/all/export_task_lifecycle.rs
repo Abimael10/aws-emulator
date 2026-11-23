@@ -12,7 +12,8 @@
 //! answered reported unchanged; `CancelExportTask` ends exactly the task it names, taking it
 //! through `CANCELING` to `CANCELED` and leaving the Region's other tasks to finish; and a
 //! task that has stopped takes no further cancellation — that is the modelled
-//! `InvalidExportTaskStateFault` (HTTP 400), naming the task and the status it is in.
+//! `InvalidExportTaskStateFault` (HTTP 400), worded about the export it names and about
+//! nothing else: the status a caller wants is answered by `DescribeExportTasks`.
 //!
 //! The rows span what the rule generalises over: what the request asks to be exported and
 //! where (`S3Prefix` given and omitted, `ExportOnly` naming nothing, one database and two
@@ -191,6 +192,13 @@ async fn cancel_export(fixture: &Fixture, identifier: &str) -> (u16, String) {
         &params!["ExportTaskIdentifier" => identifier],
     )
     .await
+}
+
+/// The whole sentence an `InvalidExportTaskStateFault` carries for the export `identifier`,
+/// spelled out here rather than taken from the code under test: Amazon RDS words this refusal
+/// about the export alone, with the typographic apostrophe, and names no status.
+fn cannot_be_canceled(identifier: &str) -> String {
+    format!("The export {identifier} can\u{2019}t be canceled.")
 }
 
 /// The one `<ExportTask>` subtree a report carries.
@@ -376,7 +384,7 @@ async fn a_started_export_task_settles_on_the_clock_and_round_trips_through_the_
         );
 
         // And a task that has stopped takes no cancellation: the modelled state fault, whose
-        // sentence names the task and the status it is in.
+        // sentence names the export the request asked to cancel and says it cannot be.
         let refused = expect_error(
             row.case,
             cancel_export(&fixture, row.identifier).await,
@@ -384,12 +392,12 @@ async fn a_started_export_task_settles_on_the_clock_and_round_trips_through_the_
             "InvalidExportTaskStateFault",
         );
         let message = text(&refused, "Message");
-        assert!(
-            message.contains(row.identifier) && message.contains(&status),
-            "case {:?}: expected the refusal to name the task {:?} and its status \
-             {status:?}, got {message:?}",
-            row.case,
-            row.identifier
+        let expected = cannot_be_canceled(row.identifier);
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the refusal {expected:?}, got {message:?} for a task in \
+             {status:?}",
+            row.case
         );
     }
 }
@@ -462,10 +470,11 @@ async fn cancelling_one_export_task_ends_that_one_and_leaves_the_others_running(
         "InvalidExportTaskStateFault",
     );
     let message = text(&refused, "Message");
-    assert!(
-        message.contains(TARGET) && message.contains(&status),
-        "case \"a second cancellation\": expected the refusal to name the task {TARGET:?} and \
-         its status {status:?}, got {message:?}"
+    let expected = cannot_be_canceled(TARGET);
+    assert_eq!(
+        message, expected,
+        "case \"a second cancellation\": expected the refusal {expected:?}, got {message:?} \
+         for a task in {status:?}"
     );
 
     // And the tasks it did not name finish, each in its own right.

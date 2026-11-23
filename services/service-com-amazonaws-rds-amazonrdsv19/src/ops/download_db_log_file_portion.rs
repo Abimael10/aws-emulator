@@ -11,7 +11,9 @@
 //!
 //! Log access reaches an instance only once it has FINISHED being created: against one that
 //! is still `creating`, as against an identifier that never existed, the answer is
-//! `DBInstanceNotFoundFault`.
+//! `DBInstanceNotFoundFault` — worded about the instance for the former and with the control
+//! plane's not-found sentence for the latter, since the code and the status are the same and
+//! only the sentence tells the two apart.
 //!
 //! ## Shape of an operation
 //!
@@ -191,19 +193,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // RDS is regional: only the region the request was signed for is in scope. An
         // instance that has not finished being created is not reachable through log access
-        // at all — see the module docs. Either miss is ONE error class, so both carry the
-        // single sentence this service words that class with, and an identifier that
-        // resolves to no instance is never served a portion of a log instead
-        // ([`crate::state::db_instance_not_found_message`]).
+        // at all — see the module docs. Both misses are the one `DBInstanceNotFoundFault`,
+        // with the same code and the same 404, so the SENTENCE is the only thing that tells
+        // a caller which it hit: an instance that exists but is still coming up is worded
+        // about that instance ([`crate::state::db_instance_not_found_message`]), while an
+        // identifier that resolves to no instance in this region gets the control-plane
+        // not-found sentence ([`crate::state::db_instance_not_found_colon_message`]) — and
+        // is never served a portion of another instance's log.
         let instance = match store.db_instances.get(&(region, identifier.clone())) {
             Some(instance) if instance.status != "creating" => instance,
-            _ => {
+            found => {
+                let message = if found.is_some() {
+                    crate::state::db_instance_not_found_message(&input.db_instance_identifier)
+                } else {
+                    crate::state::db_instance_not_found_colon_message(
+                        &input.db_instance_identifier,
+                    )
+                };
                 return Err(
                     DownloadDBLogFilePortionErrorModeled::DBInstanceNotFoundFault(
                         DBInstanceNotFoundFault {
-                            message: Some(crate::state::db_instance_not_found_message(
-                                &input.db_instance_identifier,
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into(),

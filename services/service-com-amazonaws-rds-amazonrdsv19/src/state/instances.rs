@@ -46,6 +46,25 @@ pub fn option_group_attachment_owed(named: Option<&str>) -> Option<Instant> {
         .map(|_| Instant::now())
 }
 
+/// Whether the value `setting` holds for the parameter `name` of the DB parameter group
+/// `group` needs this instance's engine to come up again before it takes effect: one the
+/// caller asked to apply `pending-reboot`, or one whose published apply type is static
+/// ([`change_is_pending_for`] is the documented rule, and the family's own catalog is where
+/// the apply type comes from).
+///
+/// One reader for that test, so the two halves of
+/// [`DbInstanceRecord::parameter_apply_status`] — the group a modification moved the instance
+/// to, and the group it is already in — ask the same question of a value.
+fn setting_waits_for_a_reboot(
+    group: &DbParameterGroupRecord,
+    name: &str,
+    setting: &ParameterSetting,
+) -> bool {
+    let spec = published_db_parameter(&group.family, name)
+        .map(|spec| published_spec_for_family(&group.family, spec));
+    change_is_pending_for(spec.as_ref(), &setting.apply_method)
+}
+
 /// Whether a DB cluster running `engine` MANAGES its members' storage, port, master user
 /// and initial database, so that a member of it reports that cluster's values and none of
 /// its own.
@@ -492,8 +511,8 @@ impl DbInstanceRecord {
     /// `ModifyDBInstance$DBParameterGroupName`: "The parameter group name itself is changed
     /// immediately, but the actual parameter changes are not applied until you reboot the
     /// instance without failover." So the attach is owed the span every transition this
-    /// service owes takes, and the change it carries waits for a reboot after that
-    /// ([`Self::parameter_apply_status`] reports both halves).
+    /// service owes takes, and what the membership rests at after that is decided by the
+    /// values the new group carries ([`Self::parameter_apply_status`] reports both halves).
     pub fn switch_db_parameter_group(&mut self, name: String) {
         if self.db_parameter_group_name.as_deref() == Some(name.as_str()) {
             // The group the instance is already in: nothing is attached and nothing waits
@@ -638,19 +657,21 @@ impl DbInstanceRecord {
     /// `DBParameterGroupStatus$ParameterApplyStatus` for the group this instance names:
     /// whether the values that group holds are the ones its engine is RUNNING.
     ///
-    /// Two changes leave the membership out of sync, and both are documented as waiting for a
-    /// reboot. `ModifyDBInstance$DBParameterGroupName` is the first: when a modification moves
+    /// `ModifyDBInstance$DBParameterGroupName` is the first rule: when a modification moves
     /// the instance to another group, "the parameter group name itself is changed immediately,
     /// but the actual parameter changes are not applied until you reboot the instance without
     /// failover" — so while RDS is still attaching that group the membership is `applying`,
-    /// and once attached it rests at `pending-reboot` until the engine comes up again
+    /// and what it rests at once attached is decided by what the newly associated group
+    /// carries over ([`Self::switch_waits_for_a_reboot`]): `in-sync` where every value it sets
+    /// is one applied immediately, `pending-reboot` otherwise, until the engine comes up again
     /// ([`Self::switch_db_parameter_group`], [`Self::restart_engine`]).
-    /// `ModifyDBParameterGroup` is the second: "changes to dynamic parameters are applied
-    /// immediately" while "changes to static parameters require a reboot ... before the change
-    /// can take effect", so a group holding a change this instance's engine has not come up
-    /// again since — one whose apply method or published apply type makes it pending
-    /// ([`change_is_pending_for`]), set after the engine last started — is `pending-reboot`
-    /// too. Every other membership is `in-sync`.
+    ///
+    /// `ModifyDBParameterGroup` is the second rule, for the group an instance is already in:
+    /// "changes to dynamic parameters are applied immediately" while "changes to static
+    /// parameters require a reboot ... before the change can take effect", so a group holding
+    /// a change this instance's engine has not come up again since — one that needs a reboot
+    /// ([`setting_waits_for_a_reboot`]), set after the engine last started — is
+    /// `pending-reboot` too. Every other membership is `in-sync`.
     ///
     /// The second half is decided by the SAME comparison the engine data plane makes when it
     /// picks the value it is running ([`data_plane::pg_server::running_parameters`]), so the
@@ -660,17 +681,18 @@ impl DbInstanceRecord {
         db_parameter_group: Option<&DbParameterGroupRecord>,
     ) -> &'static str {
         if let Some(attached_at) = self.db_parameter_group_attached_at {
-            return if Instant::now() < attached_at {
-                PARAMETER_APPLY_STATUS_APPLYING
-            } else {
+            if Instant::now() < attached_at {
+                return PARAMETER_APPLY_STATUS_APPLYING;
+            }
+            return if Self::switch_waits_for_a_reboot(db_parameter_group) {
                 PARAMETER_APPLY_STATUS_PENDING_REBOOT
+            } else {
+                MEMBERSHIP_IN_SYNC
             };
         }
         let pending = db_parameter_group.is_some_and(|group| {
             group.parameters.iter().any(|(name, setting)| {
-                let spec = published_db_parameter(&group.family, name)
-                    .map(|spec| published_spec_for_family(&group.family, spec));
-                change_is_pending_for(spec.as_ref(), &setting.apply_method)
+                setting_waits_for_a_reboot(group, name, setting)
                     && setting.set_at.as_secs_f64() > self.engine_started_at.as_secs_f64()
             })
         });
@@ -679,6 +701,30 @@ impl DbInstanceRecord {
         } else {
             MEMBERSHIP_IN_SYNC
         }
+    }
+
+    /// Whether the switch that attached the group `db_parameter_group` is still waiting for
+    /// the reboot documented for it.
+    ///
+    /// `ModifyDBInstance$DBParameterGroupName` states both halves: "the actual parameter
+    /// changes are not applied until you reboot the instance without failover", and then "if
+    /// you modify dynamic parameters in the newly associated DB parameter group, these changes
+    /// are applied immediately without a reboot". So what a switch carries over decides it: a
+    /// group whose values are ALL applied immediately has nothing left for a reboot to do and
+    /// the membership is in sync as soon as the group is attached, while a group holding a
+    /// value whose change needs one ([`setting_waits_for_a_reboot`]) waits for it. A group
+    /// that sets no value of its own carries no immediately applied change either: it leaves
+    /// the engine to read the group it has been moved to when it next starts, so that
+    /// membership waits as well.
+    fn switch_waits_for_a_reboot(db_parameter_group: Option<&DbParameterGroupRecord>) -> bool {
+        let Some(group) = db_parameter_group else {
+            return true;
+        };
+        group.parameters.is_empty()
+            || group
+                .parameters
+                .iter()
+                .any(|(name, setting)| setting_waits_for_a_reboot(group, name, setting))
     }
 
     /// `OptionGroupMembership$Status`: "the status of the DB instance's option group

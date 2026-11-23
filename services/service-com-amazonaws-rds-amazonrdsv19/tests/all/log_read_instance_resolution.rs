@@ -11,8 +11,9 @@
 //! The rule under test: a DB log file read resolves the `DBInstanceIdentifier` it was given
 //! against the DB instances the account holds IN THE REGION the request was signed for, and
 //! when that identifier holds none it answers the modelled `DBInstanceNotFoundFault` — 404
-//! with the query-protocol `Sender`/`DBInstanceNotFound` envelope and the sentence that
-//! error class carries — instead of a log of its own. The refusal does not depend on the
+//! with the query-protocol `Sender`/`DBInstanceNotFound` envelope and the control plane's
+//! not-found sentence for a DB instance that resolves to nothing — instead of a log of its
+//! own. The refusal does not depend on the
 //! other members: a log file name that names no file of any instance and a `Marker` no
 //! prior request issued are answered by the instance's absence just the same, because
 //! nothing of the file is reached until the instance is.
@@ -232,9 +233,11 @@ async fn a_log_read_refuses_an_identifier_that_holds_no_db_instance_in_the_regio
 
     for row in ROWS {
         arrange(&router, row).await;
-        // The one sentence this service words the class with, naming the spelling the
-        // request carried.
-        let expected_message = format!("DBInstance {} not found.", row.requested);
+        // An identifier that resolves to NO instance of this region gets the control plane's
+        // not-found sentence, naming the spelling the request carried. (The OTHER miss of
+        // these two reads — an instance that exists but has not finished being created — is
+        // worded about that instance instead, which `log_access_not_found_sentences` pins.)
+        let expected_message = format!("DBInstance not found: {}", row.requested);
 
         for (shape, extra) in DESCRIBE_SHAPES {
             let case = format!("DescribeDBLogFiles, {}, {shape}", row.case);

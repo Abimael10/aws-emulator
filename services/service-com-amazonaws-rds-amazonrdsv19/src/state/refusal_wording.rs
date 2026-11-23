@@ -206,11 +206,31 @@ pub fn db_cluster_backtrack_not_found_message(named: &str) -> String {
 /// `named` is the value the REQUEST carried, not the key the store folded it to, so a caller
 /// matching the message against what it sent finds it there.
 ///
-/// One reader for the sentence, so the reads that resolve an instance cannot drift from each
-/// other — nor word one miss of the class differently from another, which an identifier that
-/// names nothing and one whose instance is not reachable yet both are.
+/// One reader for the sentence, so the calls that reach INTO an instance cannot drift from
+/// each other. An identifier that resolves to no instance at all is a different miss, worded
+/// by [`db_instance_not_found_colon_message`]: the two misses carry the same fault, the same
+/// `DBInstanceNotFound` code and the same 404, so the sentence is the only thing that tells a
+/// caller whether waiting will clear the refusal.
 pub fn db_instance_not_found_message(named: &str) -> String {
     format!("DBInstance {named} not found.")
+}
+
+/// The message a `DBInstanceNotFoundFault` carries where the identifier resolves to NO DB
+/// instance in the request's Region: the `<resource type> not found: <id>` form this front
+/// door's control plane answers an unresolvable DB instance with, the same form a DB cluster's
+/// ([`db_cluster_not_found_colon_message`]) and a DB snapshot's
+/// ([`db_snapshot_not_found_message`]) take.
+///
+/// It is the OTHER half of the pair above: an identifier that names nothing is answered this
+/// way, while a call that found an instance it cannot reach into yet — one that has not
+/// finished being created — is answered the instance-scoped way
+/// ([`db_instance_not_found_message`]). A client telling "retry, it is still coming up" from
+/// "stop, that identifier does not exist" has only the sentence to go on.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to, so a caller
+/// matching the message against what it sent finds it there.
+pub fn db_instance_not_found_colon_message(named: &str) -> String {
+    format!("DBInstance not found: {named}")
 }
 
 /// What `RebootDBCluster` refuses an AURORA DB cluster with.

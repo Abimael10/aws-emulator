@@ -2456,8 +2456,10 @@ async fn log_file_access_does_not_reach_an_instance_that_is_still_being_created(
     let log_file_name = engine_log::log_file_name("mysql");
 
     // Both log operations answer the instance that is not yet there, and the identifier
-    // that never existed, with the same modelled fault — and, the class being one, with
-    // the one sentence the service words it with.
+    // that never existed, with the same modelled fault — and tell the two apart by the
+    // SENTENCE, which is the only thing that differs: the instance-scoped one for the
+    // instance that exists but cannot be reached into yet, and the control plane's
+    // not-found one for an identifier that resolves to no instance at all.
     for (case, action, extra) in [
         ("DescribeDBLogFiles", "DescribeDBLogFiles", &[][..]),
         (
@@ -2490,7 +2492,7 @@ async fn log_file_access_does_not_reach_an_instance_that_is_still_being_created(
         );
         assert_eq!(
             text(&refused, "Message"),
-            "DBInstance emu-log-nope not found.",
+            "DBInstance not found: emu-log-nope",
             "case {case:?}: {refused}"
         );
     }

@@ -267,7 +267,8 @@ pub use export_tasks::{
     cross_region_export_bucket_message, cross_region_export_source_message,
     export_key_grant_not_created_message, export_kms_key_not_accessible_message, export_part_id,
     export_role_missing_permissions_message, export_role_not_found_message, export_source_of,
-    export_task_already_exists_message, export_task_not_found_message, export_task_quota_message,
+    export_task_already_exists_message, export_task_not_cancelable_message,
+    export_task_not_found_message, export_task_quota_message,
     invalid_export_only_message, invalid_export_source_arn_message,
     invalid_export_source_state_message, invalid_s3_bucket_message, kms_key_not_accessible_message,
     partial_export_warning, target_kms_key_not_accessible_message, ExportTaskRecord,
@@ -3842,8 +3843,10 @@ const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 /// `ModifyDBInstance$DBParameterGroupName`).
 ///
 /// Transient, like every other change this service owes: the attach is due
-/// [`STATUS_TRANSITION_DELAY`] after the modification, after which the membership rests at
-/// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] until a reboot applies the change.
+/// [`STATUS_TRANSITION_DELAY`] after the modification, after which the membership rests
+/// where the values the newly associated group carries put it — [`MEMBERSHIP_IN_SYNC`] where
+/// each of them is applied immediately, and [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] until a
+/// reboot otherwise ([`DbInstanceRecord::parameter_apply_status`]).
 const PARAMETER_APPLY_STATUS_APPLYING: &str = "applying";
 
 /// The `OptionGroupMembership$Status` of an option group RDS has NOT applied to the

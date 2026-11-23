@@ -4,18 +4,30 @@
 //!
 //! The rule under test: `ModifyDBInstance$DBParameterGroupName` — "the parameter group name
 //! itself is changed immediately, but the actual parameter changes are not applied until you
-//! reboot the instance without failover". So a modification that moves an instance to
-//! ANOTHER group reports that group's membership `applying` while RDS attaches it, then
-//! `pending-reboot` once it is attached and for as long as the instance has not come up
-//! again — the reboot response included, because the engine restarts when the momentary
-//! outage is over and not when the call was accepted — and `in-sync` once the instance is
-//! back `available`. A modification that names the group the instance is ALREADY in changes
-//! nothing, so its membership stays in sync.
+//! reboot the instance without failover. … However, if you modify dynamic parameters in the
+//! newly associated DB parameter group, these changes are applied immediately without a
+//! reboot". So a modification that moves an instance to ANOTHER group reports that group's
+//! membership `applying` while RDS attaches it, and where it rests once attached is decided by
+//! what the newly associated group carries over:
+//!
+//! * every value it sets is one applied immediately (a dynamic parameter the caller asked no
+//!   reboot for) — nothing is left for a reboot to do, so the membership is `in-sync`;
+//! * it sets a value whose change needs a reboot — a static parameter, or one the caller asked
+//!   to apply `pending-reboot` — so the membership rests at `pending-reboot` until the engine
+//!   comes up again, the reboot response included, because the engine restarts when the
+//!   momentary outage is over and not when the reboot was accepted, and is `in-sync` once the
+//!   instance is back `available`;
+//! * it sets nothing at all, so the switch carries no immediately applied change either and
+//!   the membership waits for the engine to read the new group when it next starts.
+//!
+//! A modification that names the group the instance is ALREADY in changes nothing, so its
+//! membership stays in sync.
 //!
 //! The rows span what the rule generalises over: two engine families with their own parameter
-//! group families, a switch to a group created empty and a switch to a group carrying a
-//! static parameter change, and the no-op re-naming of the group already in effect. Every
-//! wait is a poll for the CONDITION the client waits on, through the shared poll loop.
+//! group families, a group created empty, a group carrying one dynamic value, two dynamic
+//! values, a static value, and a dynamic value the request asked to apply at the next reboot —
+//! and the no-op re-naming of the group already in effect. Every wait is a poll for the
+//! CONDITION the client waits on, through the shared poll loop.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
 //! reads the XML this emulator itself answered with.
@@ -35,7 +47,16 @@ const PENDING_REBOOT: &str = "pending-reboot";
 /// The status of a group whose values the engine is running.
 const IN_SYNC: &str = "in-sync";
 
-/// One row: the instance, the group it is switched to, and what that group holds.
+/// `Parameter$Source` of a value a CALLER set, which is what the group reports for each value
+/// a row writes into it.
+const SOURCE_USER: &str = "user";
+
+/// One `(ParameterName, ParameterValue, ApplyMethod)` a row writes into its group before the
+/// switch; the method is omitted where the row leaves it to the parameter's apply type.
+type Setting = (&'static str, &'static str, Option<&'static str>);
+
+/// One row: the instance, the group it is switched to, what that group holds, and where the
+/// membership rests once the group is attached.
 struct SwitchCase {
     case: &'static str,
     identifier: &'static str,
@@ -46,9 +67,10 @@ struct SwitchCase {
     /// The group the modification switches the instance to, and its family.
     group: &'static str,
     family: &'static str,
-    /// A `(name, value, ApplyMethod)` the group is given before the switch, for a row whose
-    /// group carries a change of its own.
-    parameter: Option<(&'static str, &'static str, &'static str)>,
+    /// The values the group is given before the switch.
+    settings: &'static [Setting],
+    /// The `ParameterApplyStatus` the membership rests at once the group is attached.
+    attached: &'static str,
 }
 
 const SWITCH_CASES: &[SwitchCase] = &[
@@ -59,7 +81,8 @@ const SWITCH_CASES: &[SwitchCase] = &[
         engine_version: "18.3",
         group: "emu-pgswitch-empty-group",
         family: "postgres18",
-        parameter: None,
+        settings: &[],
+        attached: PENDING_REBOOT,
     },
     SwitchCase {
         case: "a postgres instance switched to a group carrying a static parameter",
@@ -70,7 +93,23 @@ const SWITCH_CASES: &[SwitchCase] = &[
         family: "postgres18",
         // A static parameter: one that "requires a reboot ... before the change can take
         // effect", which is the change this switch carries over.
-        parameter: Some(("shared_buffers", "16384", "pending-reboot")),
+        settings: &[("shared_buffers", "16384", Some(PENDING_REBOOT))],
+        attached: PENDING_REBOOT,
+    },
+    SwitchCase {
+        case: "a postgres instance switched to a group carrying one dynamic parameter",
+        identifier: "emu-pgswitch-dynamic",
+        engine: "postgres",
+        engine_version: "18.3",
+        group: "emu-pgswitch-dynamic-group",
+        family: "postgres18",
+        // A dynamic parameter, left to its own apply type: "changes to dynamic parameters are
+        // applied immediately", so this switch leaves nothing for a reboot
+        // (`smithy_query(query="doc", shape="ModifyDBInstanceMessage",
+        // member="DBParameterGroupName")`; the apply type is the family's published one,
+        // `DescribeEngineDefaultParameters`).
+        settings: &[("log_min_duration_statement", "1000", None)],
+        attached: IN_SYNC,
     },
     SwitchCase {
         case: "a mysql instance switched to an empty group of its family",
@@ -79,7 +118,48 @@ const SWITCH_CASES: &[SwitchCase] = &[
         engine_version: "8.0.40",
         group: "emu-myswitch-empty-group",
         family: "mysql8.0",
-        parameter: None,
+        settings: &[],
+        attached: PENDING_REBOOT,
+    },
+    SwitchCase {
+        case: "a mysql instance switched to a group carrying two dynamic parameters",
+        identifier: "emu-myswitch-dynamic",
+        engine: "mysql",
+        engine_version: "8.0.40",
+        group: "emu-myswitch-dynamic-group",
+        family: "mysql8.0",
+        settings: &[
+            ("auto_increment_increment", "2", None),
+            ("autocommit", "0", None),
+        ],
+        attached: IN_SYNC,
+    },
+    SwitchCase {
+        case: "a mysql instance switched to a group carrying a dynamic and a static parameter",
+        identifier: "emu-myswitch-mixed",
+        engine: "mysql",
+        engine_version: "8.0.40",
+        group: "emu-myswitch-mixed-group",
+        family: "mysql8.0",
+        // `back_log` is published static, so one value of the group waits for the reboot
+        // however the others apply.
+        settings: &[
+            ("auto_increment_increment", "2", None),
+            ("back_log", "1024", None),
+        ],
+        attached: PENDING_REBOOT,
+    },
+    SwitchCase {
+        case: "a mysql instance switched to a group whose dynamic value awaits a reboot",
+        identifier: "emu-myswitch-deferred",
+        engine: "mysql",
+        engine_version: "8.0.40",
+        group: "emu-myswitch-deferred-group",
+        family: "mysql8.0",
+        // A dynamic parameter the CALLER asked to apply at the next reboot, which is what
+        // `Parameter$ApplyMethod` is for: the value waits whatever its apply type says.
+        settings: &[("auto_increment_increment", "2", Some(PENDING_REBOOT))],
+        attached: PENDING_REBOOT,
     },
 ];
 
@@ -142,20 +222,21 @@ async fn provision(router: &MultiServiceRouter, row: &SwitchCase) {
         )
         .await,
     );
-    if let Some((name, value, apply_method)) = row.parameter {
+    for (name, value, apply_method) in row.settings {
+        let mut request = vec![
+            ("DBParameterGroupName", row.group.to_string()),
+            ("Parameters.Parameter.1.ParameterName", (*name).to_string()),
+            ("Parameters.Parameter.1.ParameterValue", (*value).to_string()),
+        ];
+        if let Some(method) = apply_method {
+            request.push((
+                "Parameters.Parameter.1.ApplyMethod",
+                (*method).to_string(),
+            ));
+        }
         expect_ok(
             row.case,
-            call(
-                router,
-                "ModifyDBParameterGroup",
-                &[
-                    ("DBParameterGroupName", row.group),
-                    ("Parameters.Parameter.1.ParameterName", name),
-                    ("Parameters.Parameter.1.ParameterValue", value),
-                    ("Parameters.Parameter.1.ApplyMethod", apply_method),
-                ],
-            )
-            .await,
+            call(router, "ModifyDBParameterGroup", &request).await,
         );
     }
     await_apply_status(router, row, IN_SYNC).await;
@@ -182,8 +263,51 @@ async fn await_apply_status(
     the_instance(row.case, &body)
 }
 
+/// Every value a row wrote into its group, as the group's own read reports it: the value the
+/// row set, under `Source` `user`, which is what a client reads to confirm the configuration
+/// the switch put the instance on.
+async fn assert_group_reports_its_values(router: &MultiServiceRouter, row: &SwitchCase) {
+    if row.settings.is_empty() {
+        return;
+    }
+    let reported = expect_ok(
+        row.case,
+        call(
+            router,
+            "DescribeDBParameters",
+            &[
+                ("DBParameterGroupName", row.group),
+                ("Source", SOURCE_USER),
+            ],
+        )
+        .await,
+    );
+    let rows = subtrees(&reported, "Parameter");
+    for (name, value, _) in row.settings {
+        let found = rows
+            .iter()
+            .find(|parameter| optional_text(parameter, "ParameterName").as_deref() == Some(*name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected the group to report {name}, got {reported}",
+                    row.case
+                )
+            });
+        assert_eq!(
+            (
+                optional_text(found, "ParameterValue").as_deref(),
+                optional_text(found, "Source").as_deref(),
+            ),
+            (Some(*value), Some(SOURCE_USER)),
+            "case {:?}: expected {name} to report the value the row set under {SOURCE_USER:?}, \
+             got {found}",
+            row.case
+        );
+    }
+}
+
 #[tokio::test]
-async fn a_parameter_group_switch_is_applying_then_waits_for_a_reboot() {
+async fn a_parameter_group_switch_rests_where_the_values_it_carries_put_it() {
     let router = emulator();
 
     for row in SWITCH_CASES {
@@ -213,6 +337,7 @@ async fn a_parameter_group_switch_is_applying_then_waits_for_a_reboot() {
             "case {:?}: the modification must report the group it attached, got {reported:?}",
             row.case
         );
+        let resource_id = optional_text(&modified, "DbiResourceId");
         let status = apply_status(row.case, "modify", &modified);
         assert_eq!(
             status, APPLYING,
@@ -220,16 +345,36 @@ async fn a_parameter_group_switch_is_applying_then_waits_for_a_reboot() {
             row.case
         );
 
-        // Once attached, the membership rests at `pending-reboot`: the instance is back in
-        // service with a change only a reboot can apply.
-        let settled = await_apply_status(&router, row, PENDING_REBOOT).await;
+        // Once attached, the membership rests where the values the group carries put it.
+        let settled = await_apply_status(&router, row, row.attached).await;
         let status = apply_status(row.case, "describe", &settled);
         assert_eq!(
-            status, PENDING_REBOOT,
-            "case {:?}: expected the attached group to rest at {PENDING_REBOOT:?}, got \
-             {status:?}",
+            status, row.attached,
+            "case {:?}: expected the attached group to rest at {:?}, got {status:?}",
+            row.case, row.attached
+        );
+        let reported = optional_text(&settled, "DBParameterGroupName");
+        assert_eq!(
+            reported.as_deref(),
+            Some(row.group),
+            "case {:?}: the attached group is the one the instance reports, got {reported:?}",
             row.case
         );
+        // A switch is a modification of the instance, never a new instance: the identity it
+        // was created with is untouched by it.
+        let settled_resource_id = optional_text(&settled, "DbiResourceId");
+        assert_eq!(
+            settled_resource_id, resource_id,
+            "case {:?}: the switch must leave the instance's resource id alone, got \
+             {settled_resource_id:?} after {resource_id:?}",
+            row.case
+        );
+        // And the group reports the values the switch put the instance on.
+        assert_group_reports_its_values(&router, row).await;
+
+        if row.attached != PENDING_REBOOT {
+            continue;
+        }
 
         // The reboot answers with the instance going out of service, still carrying the
         // change it is the reboot that applies.
