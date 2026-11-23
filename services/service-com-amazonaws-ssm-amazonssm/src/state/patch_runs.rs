@@ -168,11 +168,13 @@ pub const PATCH_GROUP_TAG_KEYS: &[&str] = &["Patch Group", "PatchGroup"];
 /// The operating system a Linux node is patched against when this endpoint cannot read
 /// which distribution its image is of.
 ///
-/// A managed node reports no `PlatformName` here (nothing reads inside its guest), so the
-/// distribution is read off the name of the Amazon EC2 image the node was launched from
-/// ([`DISTRIBUTION_IMAGE_NAMES`]); this is the emulator's CHOSEN fallback for a node whose
-/// image names none — the current Amazon Linux release, which is what the images this
-/// emulator publishes are builds of.
+/// Which distribution a node is of is read off the name of the Amazon EC2 image it was
+/// launched from ([`DISTRIBUTION_IMAGE_NAMES`]), the same record the operating system a node
+/// REPORTS is read off ([`super::node_platform`]) — a node reports its own `PlatformName` and
+/// `PlatformVersion` rather than the modelled `OperatingSystem` a baseline is keyed by, so the
+/// baseline's catalog is read here. This is the emulator's CHOSEN fallback for a node whose
+/// image names no distribution of that catalog — the current Amazon Linux release, which is
+/// what the images this emulator publishes are builds of.
 pub const FALLBACK_LINUX_OPERATING_SYSTEM: &str = "AMAZON_LINUX_2023";
 
 /// How an image name names the distribution it is a build of: the prefix of the image NAME

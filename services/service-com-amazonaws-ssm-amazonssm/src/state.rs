@@ -414,6 +414,10 @@ pub mod ops_metadata;
 /// managed nodes, and the node record that registration writes.
 pub mod node_registration;
 
+/// The operating system inside a managed node's guest, as the node reports it: the
+/// `PlatformName` and `PlatformVersion` of the image the instance was launched from.
+pub mod node_platform;
+
 /// The SSM Agent builds this emulator publishes, and which of them the guest of a managed
 /// node holds — the pair `InstanceInformation$AgentVersion` and
 /// `InstanceInformation$IsLatestVersion` are answered from.

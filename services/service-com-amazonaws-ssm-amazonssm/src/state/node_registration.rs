@@ -55,7 +55,15 @@
 //!
 //! What the node then reports about the AGENT in its guest — the build it is running and
 //! whether that is the current release — is the build the AMI it was launched from bundles,
-//! which is [`super::agent_releases`]'s own reading of the image's publication instants.
+//! which is [`super::agent_releases`]'s own reading of the image's publication instants, and
+//! what it reports about the OPERATING SYSTEM in that guest is the one that AMI holds, which
+//! is [`super::node_platform`]'s reading of the image Amazon EC2 published.
+//!
+//! The node it registers IS that instance, so the row a describe serves names the same
+//! machine Amazon EC2 does: its address, host name and id are the instance's
+//! `PrivateIpAddress`, `PrivateDnsName` and instance id, and the resource it reports as its
+//! SOURCE is that instance ([`SOURCE_TYPE_EC2_INSTANCE`]) — which is what lets a client join
+//! Systems Manager's view of a machine to Amazon EC2's.
 //!
 //! ## What is written, and why a report may write it
 //!
@@ -148,6 +156,12 @@ pub const PLATFORM_TYPE_WINDOWS: &str = "Windows";
 /// whose AMI declares no `Image$Platform` at all, which is how Amazon EC2 reports every
 /// non-Windows image ("The value is `windows` for Windows AMIs; otherwise blank").
 pub const PLATFORM_TYPE_LINUX: &str = "Linux";
+
+/// The `SourceType` of a node whose source resource is an Amazon EC2 instance (from the
+/// modelled enum, `crate::ops::types::SOURCE_TYPE_VALUES`): "the type of the source
+/// resource" (`InstanceInformation$SourceType`) of a node registered by the agent on an
+/// instance of this account, whose `SourceId` is that instance.
+pub const SOURCE_TYPE_EC2_INSTANCE: &str = "AWS::EC2::Instance";
 
 /// Materialise every managed-node registration of `region` the clock already owes, so a
 /// read of the node store reports what was due whether or not anybody called.
@@ -288,6 +302,11 @@ struct ManagedInstance {
     registered_at: SystemTime,
     /// `InstanceInformation$PlatformType`, from the AMI the instance was launched from.
     platform_type: &'static str,
+    /// `InstanceInformation$PlatformName` and `$PlatformVersion`: the operating system in the
+    /// instance's guest, which is the one the image it was launched from holds
+    /// ([`super::node_platform`]). `None` for an image whose name names no operating system
+    /// this emulator can read.
+    platform: Option<super::node_platform::GuestPlatform>,
     /// `InstanceInformation$AgentVersion`: the SSM Agent build this instance's guest holds,
     /// which is the release the AMI it was launched from bundles
     /// ([`super::agent_releases`]).
@@ -328,11 +347,16 @@ impl ManagedInstance {
         let profile_arn = store
             .iam_instance_profile_of_instance(&instance.instance_id)
             .and_then(|profile| profile.arn)?;
+        let platform_type = platform_type(store, instance);
         Some(Self {
             id: instance.instance_id.clone(),
             profile_arn,
             registered_at: registered_at(instance),
-            platform_type: platform_type(store, instance),
+            platform_type,
+            platform: super::node_platform::guest_platform(
+                platform_type,
+                image_name(store, instance),
+            ),
             agent_version: bundled_agent_version(store, instance, registered_at(instance)),
             ip_address: instance.private_ip.clone(),
             computer_name: instance.private_dns_name.clone(),
@@ -349,11 +373,13 @@ impl ManagedInstance {
     /// The node record this instance registered with.
     ///
     /// Every member is a fact of the instance or of the agent this emulator runs on it. The
-    /// members an agent reports from INSIDE the guest that nothing here reads — the
-    /// operating system's own name and version (`PlatformName`, `PlatformVersion`) — are
-    /// left unset rather than invented, and so are the ones Systems Manager fills in for a
-    /// node of another kind: the `ActivationId` and `Name` of a hybrid activation's node,
-    /// and the `SourceId`/`SourceType`/`SourceLocation` of one in another cloud.
+    /// node's SOURCE is the instance itself — "the ID of the source resource"
+    /// (`InstanceInformation$SourceId`) is the instance id and its type
+    /// [`SOURCE_TYPE_EC2_INSTANCE`] — and the operating system it reports
+    /// (`PlatformName`, `PlatformVersion`) is the one in the image it was launched from
+    /// ([`super::node_platform`]). The members Systems Manager fills in for a node of another
+    /// kind are left unset rather than invented: the `ActivationId` and `Name` of a hybrid
+    /// activation's node, and the `SourceLocation` of one in a third-party cloud.
     ///
     /// `iam_role` is the name of the role the instance's instance profile carries, which is
     /// the role the node registered as and so what it reports as its own `IamRole`
@@ -364,6 +390,9 @@ impl ManagedInstance {
     /// is `Online` and one whose instance does not has lost its connection
     /// ([`agent_reaches_service`]).
     fn node(self, iam_role: Option<String>) -> ManagedNodeRecord {
+        // The id the node registers under is also the id of the resource it reports as its
+        // source, so it is taken before the record is opened with it.
+        let source_id = self.id.clone();
         let mut node =
             ManagedNodeRecord::registering(self.id, RESOURCE_TYPE_EC2_INSTANCE, self.registered_at);
         node.registered_from_instance = true;
@@ -380,6 +409,15 @@ impl ManagedInstance {
         reported.agent_version = Some(self.agent_version.to_string());
         reported.iam_role = iam_role;
         reported.platform_type = Some(self.platform_type.to_string());
+        if let Some(platform) = self.platform {
+            reported.platform_name = Some(platform.name);
+            reported.platform_version = platform.version;
+        }
+        // The node IS that instance, so the resource it reports as its source is the
+        // instance: a client joining Systems Manager's view of a machine to Amazon EC2's own
+        // reads the same id here that `DescribeInstances` reports.
+        reported.source_id = Some(source_id);
+        reported.source_type = Some(SOURCE_TYPE_EC2_INSTANCE.to_string());
         reported.ip_address = Some(self.ip_address);
         reported.computer_name = Some(self.computer_name);
         reported.instance_state = Some(NODE_STATUS_ACTIVE.to_string());
@@ -424,6 +462,20 @@ fn agent_reaches_service(
         .collect();
     group_ids.is_empty()
         || store.security_groups_admit_outbound(&group_ids, AGENT_PROTOCOL, AGENT_ENDPOINT_PORT)
+}
+
+/// The NAME Amazon EC2 published the image `instance` was launched from under, or `None` for
+/// an instance launched from no image, from one this store no longer holds, or from one
+/// published under no name — the same reading [`platform_type`] takes of an absent image.
+fn image_name<'a>(
+    store: &'a ec2::ComAmazonawsEc2Amazonec2State,
+    instance: &ec2::InstanceRecord,
+) -> Option<&'a str> {
+    instance
+        .image_id
+        .as_deref()
+        .and_then(|image_id| store.images.get(image_id))
+        .and_then(|image| image.name.as_deref())
 }
 
 /// When `instance`'s registration with Systems Manager fell due: [`REGISTRATION_DELAY`]
