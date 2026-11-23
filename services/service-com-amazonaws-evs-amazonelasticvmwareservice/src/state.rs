@@ -314,7 +314,7 @@ pub const ENTITLEMENT_CREATED: &str = "CREATED";
 
 /// The `EntitlementStatus` values in which an entitlement tracks a virtual machine's
 /// Windows Server usage NO LONGER — the two the same enum declares for a record that is
-/// finished with ([`StoredEnvironment::live_entitlements`] is what reads them).
+/// finished with ([`StoredEntitlement::tracks_usage`] is what reads them).
 ///
 /// What they mean is a property of the RECORD rather than of one operation's output: an
 /// entitlement in one of them holds its connector no longer.
@@ -1111,6 +1111,27 @@ impl StoredEntitlement {
         self.pending = None;
     }
 
+    /// Whether this record still TRACKS a virtual machine's Windows Server usage: its
+    /// `EntitlementStatus` has reached neither [`ENTITLEMENT_DELETED`] nor
+    /// [`ENTITLEMENT_REMOVED`], the two values the enum declares for a record that is
+    /// finished with.
+    ///
+    /// A record still being validated (`CREATING`) tracks usage as much as one that is
+    /// `CREATED`: it is an entitlement a caller has to remove before the connector it was
+    /// created through can be deleted. So do `AT_RISK` and `CREATE_FAILED`, which say
+    /// something about the virtual machine's licence state or its validation rather than
+    /// about the record being finished with.
+    ///
+    /// The ONE predicate every reader and writer of an entitlement resolves records by —
+    /// [`StoredEnvironment::live_entitlements`] reports them, and the two halves of an
+    /// environment deletion stop exactly the records it answers `true` for
+    /// ([`StoredEnvironment::start_dependent_deletions`],
+    /// [`StoredEnvironment::finish_dependent_deletions`]) — so a change to what counts as
+    /// a stopped entitlement is made once and every path agrees.
+    pub fn tracks_usage(&self) -> bool {
+        self.status != ENTITLEMENT_DELETED && self.status != ENTITLEMENT_REMOVED
+    }
+
     /// Apply the owed status change if `now` has reached its due instant.
     ///
     /// The change was owed at that instant whether or not anybody called, so a
@@ -1767,9 +1788,10 @@ impl StoredEnvironment {
             });
         }
         for entitlement in self.entitlements.values_mut() {
-            if entitlement.status == ENTITLEMENT_DELETED
-                || entitlement.status == ENTITLEMENT_REMOVED
-            {
+            // The same one predicate every reader and writer of an entitlement resolves
+            // records by ([`StoredEntitlement::tracks_usage`]): a record that tracks no
+            // virtual machine's usage any more is left exactly as it stands.
+            if !entitlement.tracks_usage() {
                 continue;
             }
             entitlement.stop(now_ms);
@@ -1794,9 +1816,7 @@ impl StoredEnvironment {
             connector.pending = None;
         }
         for entitlement in self.entitlements.values_mut() {
-            if entitlement.status == ENTITLEMENT_DELETED
-                || entitlement.status == ENTITLEMENT_REMOVED
-            {
+            if !entitlement.tracks_usage() {
                 continue;
             }
             entitlement.stop(settled_at_ms);
@@ -1981,18 +2001,18 @@ impl StoredEnvironment {
         self.live_hosts().count()
     }
 
-    /// The entitlements of this environment that still TRACK a virtual machine's usage:
-    /// every stored entitlement whose `EntitlementStatus` has reached neither
-    /// [`ENTITLEMENT_DELETED`] nor [`ENTITLEMENT_REMOVED`].
+    /// The entitlements of this environment that still TRACK a virtual machine's usage —
+    /// every stored entitlement [`StoredEntitlement::tracks_usage`] answers `true` for,
+    /// the one reading of that line.
     ///
     /// An entitlement that is still being validated (`CREATING`) is as present as one
     /// that is `CREATED`: both are entitlements a caller has to remove before the
     /// connector they were created through can be deleted
     /// ([`Self::entitlements_sharing_vcenter`]).
     pub fn live_entitlements(&self) -> impl Iterator<Item = &StoredEntitlement> {
-        self.entitlements.values().filter(|entitlement| {
-            entitlement.status != ENTITLEMENT_DELETED && entitlement.status != ENTITLEMENT_REMOVED
-        })
+        self.entitlements
+            .values()
+            .filter(|entitlement| entitlement.tracks_usage())
     }
 
     /// How many live entitlements of this environment are associated with the same
