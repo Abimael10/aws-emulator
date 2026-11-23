@@ -48,11 +48,17 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for and every ARN names.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` with [`STAGE`], [`RESOURCE_PATH`], [`IDENTITY_HEADER`], [`EXPLICIT_DENY`],
+/// [`UNAUTHORIZED_MESSAGE`], [`emulator`] and [`deployed`]: the sibling suite that asserts the
+/// same decisions as a client READING THE WIRE sees them
+/// ([`crate::stage_authorizer_decision_on_the_served_wire`]) stands the api up exactly once
+/// here, so neither suite can disagree with the other about the wiring under test.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The stage the api is deployed to, and the resource path of its one protected method.
-const STAGE: &str = "test";
-const RESOURCE_PATH: &str = "secure";
+pub(crate) const STAGE: &str = "test";
+pub(crate) const RESOURCE_PATH: &str = "secure";
 
 /// The two functions: the one the authorizer names, and the one behind the method.
 const AUTHORIZER_FUNCTION: &str = "token-authorizer";
@@ -66,10 +72,12 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/lambda-exec";
 const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// The header the authorizer declares as its identity source.
-const IDENTITY_HEADER: &str = "authorization";
+pub(crate) const IDENTITY_HEADER: &str = "authorization";
 
 /// The access-log destination the stage is pointed at, and the format it renders records by.
-const ACCESS_GROUP: &str = "/apigw/access/authorizer";
+///
+/// `pub(crate)` with [`delivered`] and [`awaited_message`] for the reason [`REGION`] states.
+pub(crate) const ACCESS_GROUP: &str = "/apigw/access/authorizer";
 const ACCESS_FORMAT: &str = concat!(
     r#"{"requestId":"$context.requestId","path":"$context.path","#,
     r#""status":"$context.status","principal":"$context.authorizer.principalId"}"#
@@ -90,14 +98,16 @@ const LOOK: Duration = Duration::from_millis(50);
 const BACKEND_MARKER: &str = "BACKEND-INVOKED";
 
 /// The sentence a call the returned policy explicitly DENIES is refused with.
-const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
-                             deny in an identity-based policy";
+pub(crate) const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an \
+                                       explicit deny in an identity-based policy";
 
 /// The sentence a call no statement of the returned policy allows is refused with.
-const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
+///
+/// `pub(crate)` for the reason [`REGION`] states.
+pub(crate) const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
 
 /// The body an uncustomized `UNAUTHORIZED` gateway response carries.
-const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+pub(crate) const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
 /// The header API Gateway reports the id of the request it processed in, which the
 /// access-log record's `$context.requestId` has to equal.
@@ -185,7 +195,7 @@ impl Answered {
 
 /// The three services this rule spans, over ONE engine, as `core/router/src/lib.rs` mounts
 /// them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: the control-plane calls carry a credential
@@ -349,7 +359,7 @@ fn group_arn(name: &str) -> String {
 /// The messages `FilterLogEvents` reports for `group`, or `None` when the account holds no
 /// such group at all — which is what "nothing ran and nothing was created" looks like to a
 /// client.
-async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<String>> {
+pub(crate) async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<String>> {
     let (status, body) = logs(router, "FilterLogEvents", json!({ "logGroupName": group })).await;
     if status != 200 {
         return None;
@@ -376,7 +386,7 @@ async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<Strin
 /// Look in `group` until one message satisfying `wanted` is held, and answer it; `None` once
 /// the deadline passes with none. The wait is on the CONDITION — a delivery another service
 /// makes — so it polls until it holds rather than sleeping a span.
-async fn awaited_message(
+pub(crate) async fn awaited_message(
     router: &MultiServiceRouter,
     group: &str,
     wanted: impl Fn(&str) -> bool,
@@ -487,7 +497,7 @@ async fn grant(router: &MultiServiceRouter, name: &str, statement: &str, source_
 /// The whole wiring: both functions, the api with one `CUSTOM`-authorized `GET` behind an
 /// `AWS_PROXY` integration, the grants, the deployment, the account's CloudWatch role and the
 /// stage's access logging. Answers the api id.
-async fn deployed(router: &MultiServiceRouter) -> String {
+pub(crate) async fn deployed(router: &MultiServiceRouter) -> String {
     let authorizer_arn = function(router, AUTHORIZER_FUNCTION, AUTHORIZER_SOURCE).await;
     let backend_arn = function(router, BACKEND_FUNCTION, BACKEND_SOURCE).await;
 

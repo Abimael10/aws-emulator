@@ -35,6 +35,38 @@ Cause 1: [mismatch] apigateway__lambda__logs.apigw-lambda-authorizer-deny-blocks
 
 Cause 2: [mismatch] apigateway__lambda__logs.apigw-method-level-log-level-overrides-the-stage-wide-level — AssertionError: "method-level override should be keyed '~1echo/POST' with loggingLevel INFO"; the emulator returned methodSettings {'*/*': {... 'loggingLevel': 'ERROR' ...}, 'echo/POST': {... 'loggingLevel': 'INFO' ...}} — the method override is present but keyed 'echo/POST' instead of '~1echo/POST'.
 
+## Resolution
+
+Cause 2 — FIXED, and confirmed by the replay (`apigw-method-level-log-level-overrides-the-stage-wide-level`
+passes): a stage keys one `methodSettings` entry by the method path its `UpdateStage` pointer
+SPELLED — the resource half written exactly as the request wrote it, its separators escaped `~1`
+as `PatchOperation$path` requires — so the recorded patch reads back under `~1echo/POST`. The
+keying lives in `src/ops/update_stage.rs` (`method_setting` -> `addressed_method_path` ->
+`written_tokens`, with the one-token spelling keyed by the method path it decodes to); it landed
+before this report was worked, which the issue's own drift note anticipates.
+
+Cause 1 — DECLINED: no divergence of this emulator remains. A `CUSTOM`-authorized method of a
+deployed stage answers the recorded outcomes — `403` with API Gateway's explicit-deny sentence
+and `AccessDeniedException`, `401` `{"message":"Unauthorized"}` for a request carrying nothing at
+the identity source, and the integration's own `200` for an allowing token — never performs the
+integration for a refused request, logs the authorizer's own run, and writes one access-log
+record per answer carrying the stage-qualified `$context.path`. That is pinned end to end by
+`tests/all/stage_authorizer_deny_blocks_the_backend.rs`, by
+`core/router/tests/all/apigateway_token_authorizer_deny_and_access_log.rs` on the emulator as it
+is assembled, and — added for this report —
+`tests/all/stage_authorizer_decision_on_the_served_wire.rs`, which asserts the same decisions as
+a client READING THE WIRE sees them: the router served by the framework that serves this
+emulator's data port, five rows on one keep-alive connection, each answer read by its own
+`content-length`, under both addressings of a deployed stage.
+
+What still fails on replay is the check's own wall clock: `Error: Check timed out after 60.0s`
+inside its absence-watch helper (`_stays_absent`, at `time.sleep(interval_s)`), which is a
+fixed-window watch rather than an answer of this emulator — the same check run under the earlier
+180 s cap (issue 20261107T191316Z) got PAST that helper and expired later. The emulator's whole
+share of this scenario (two functions created and Active, the authorizer invoked per request,
+two Lambda runs, the log deliveries and five served invokes) measures under four seconds in the
+wire suite above, so there is no emulator behaviour left for the check to observe differently.
+
 ## Steps to Reproduce
 1. Replay apigateway__lambda__logs.apigw-method-level-log-level-overrides-the-stage-wide-level: create a REST API with resource /echo and method POST, deploy a stage, set a stage-wide MethodSetting ('*/*') with loggingLevel ERROR and a method-level override for /echo POST with loggingLevel INFO, then call GetStage and inspect the methodSettings map keys.
 2. Replay apigateway__lambda__logs.apigw-lambda-authorizer-deny-blocks-backend-invocation: attach a TOKEN authorizer whose handler returns Effect Deny unless authorizationToken == 'allow-me', invoke the deployed method with a denying token (expect 403 and no backend log marker) and then with 'allow-me' (expect 200 plus the marker).
