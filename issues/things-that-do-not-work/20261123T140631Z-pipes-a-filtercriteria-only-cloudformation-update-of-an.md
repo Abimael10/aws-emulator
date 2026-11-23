@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: pipes.deploy-cfn-pipe-filter-update-in-place-changes-which-records-reach-the-target
+Issue-Shape-Id: com.amazonaws.pipes#Pipes
+Issue-Key: pipes|SendMessage|AWS.SimpleQueueService.NonExistentQueue
+Issue-Commit: 41b29e48122791e8b19f47cbba113042cc5c5815
+
+# pipes: a FilterCriteria-only CloudFormation update of an AWS::Pipes::Pipe leaves the stack's queue URL refused AWS.SimpleQueueService.NonExistentQueue, so the filter-update scenario never reaches a verdict
+
+> _Note: this issue was identified against the code base at commit `41b29e48122791e8b19f47cbba113042cc5c5815`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateStack
+
+## Description
+One net-new cause, grounded in a failing check the replay report lists under the `pipes` heading and that no open issue carries the replay key for.
+
+Placement note: this check is listed by the suite under the composite heading `pipes`, and get_bootstrap_status reports an EMPTY pending set (every service, including the `service-com-amazonaws-pipes-pipes` and `service-com-amazonaws-sqs-amazonsqs` crates, is bootstrapped), so this is filed rather than deferred. The service token recorded here is the suite heading of the grounding check.
+
+Cause 1 of 1: a CloudFormation stack that holds an AWS::Pipes::Pipe plus two unnamed AWS::SQS::Queue resources cannot be updated: a FilterCriteria-only change to the Pipe ends with SQS refusing the queue URL the stack itself published, so the pipe's filter-update behaviour (same ARN/CreationTime, advanced LastModifiedTime, RUNNING, new Pattern live on the poller, old-filter records dropped and consumed) is never observable at all.
+  AWS: an UpdateStack that changes only AWS::Pipes::Pipe SourceParameters.FilterCriteria is an in-place update of the pipe (Smithy pipes: UpdatePipe PUT /v1/pipes/{Name} takes SourceParameters and returns the same Arn/CreationTime with a later LastModifiedTime; DescribePipe then reports CurrentState RUNNING and the new FilterCriteria.Filters[].Pattern). Sibling resources whose template properties did not change are not touched: an AWS::SQS::Queue created by the same stack keeps its PhysicalResourceId (its queue URL), so the URL read from Ref/Outputs before the update still serves SendMessage/ReceiveMessage/GetQueueAttributes after it. Smithy (sqs): SendMessage models QueueDoesNotExist with awsQueryError code `AWS.SimpleQueueService.NonExistentQueue`, httpError 400 — AWS raises it only for a queue URL that genuinely names no queue, never for a live queue of an updated stack.
+  Emulator: the check dies inside the scenario with `botocore.errorfactory.QueueDoesNotExist: An error occurred (AWS.SimpleQueueService.NonExistentQueue) when calling the SendMessage operation: The specified queue does not exist.` — i.e. a SendMessage to the queue URL taken from this stack's own `SourceQueueUrl`/`TargetQueueUrl` Outputs (`{"Ref": "SourceQueue"}` / `{"Ref": "TargetQueue"}`) is refused 400 with error code `AWS.SimpleQueueService.NonExistentQueue`. In that message `The specified queue does not exist.` is AWS's fixed text and carries no variable part; the variable part of the exchange is the request's QueueUrl, which here is a URL the emulator published and must still resolve. Because the refusal is terminal, every assertion after it is unreached: the ARN/CreationTime-preserved check, `LastModifiedTime` advancing, `CurrentState == "RUNNING"`, `patterns == [{"body": {"k": ["b"]}}]`, the k=b probe converging, the source queue draining to 0 messages and the k=a record being dropped.
+  Hypothesis: this is the same queue-lifecycle defect described for OTHER service headings by open issue 20261123T065749Z-cloudformation-sqs-reopens-aws-sqs-queue-still-has-no-in.md, Cause 2 (an unnamed AWS::SQS::Queue is REPLACED/removed on a stack update that touches only a sibling resource, so the stack-reported queue URL afterwards answers NonExistentQueue). That issue's replay keys are scoped per heading (`cloudformation__pipes__sqs|SendMessage|AWS.SimpleQueueService.NonExistentQueue`) and do NOT include this `pipes`-heading check, so it will not be re-replayed by that issue and the pipes filter-update scenario would stay unverified; it is filed here so the pipes-side regression is not lost. The suite report does not say which SendMessage call site raised, so the alternative reading — the queue URL this stack publishes through `Ref` is never usable, failing the FIRST send before any update — is also consistent with the evidence; both resolve in the same component and both are closed by replaying this check.
+  Why: a client cannot evolve an EventBridge Pipes stack at all. The queue URL it read from the stack Outputs (or DescribeStackResources) stops serving after an unrelated in-place update, so its producers and consumers get a 400 NonExistentQueue for a queue AWS still has; worse, if the queue was replaced, every message in it is silently destroyed and the pipe's source/target ARNs point at a queue that no longer exists. No filter change can be rolled out through CloudFormation.
+  Fix: the AWS::SQS::Queue resource provider's UPDATE hook and its replacement classification in the CloudFormation service (a mutable-only diff, and a resource whose properties did not change at all, must keep the physical id — only create-only properties may classify Replacement), together with the AWS::Pipes::Pipe provider's UPDATE hook which must apply a FilterCriteria-only diff via pipes UpdatePipe against the existing pipe and must not cascade a replacement onto its source/target queues; and, for the alternative reading, the queue URL the AWS::SQS::Queue provider publishes for `Ref` must be the served URL SQS resolves.
+  Traces: pipes.deploy-cfn-pipe-filter-update-in-place-changes-which-records-reach-the-target.
+
+## Evidence
+Failing check (verdict: error) pipes.deploy-cfn-pipe-filter-update-in-place-changes-which-records-reach-the-target:
+  botocore.errorfactory.QueueDoesNotExist: An error occurred (AWS.SimpleQueueService.NonExistentQueue) when calling the SendMessage operation: The specified queue does not exist.
+
+Expected (AWS): the stack reaches CREATE_COMPLETE; SendMessage to the stack's SourceQueueUrl succeeds and the record is forwarded to TargetQueueUrl; UpdateStack with FilterCriteria changed from {"body":{"k":["a"]}} to {"body":{"k":["b"]}} reaches UPDATE_COMPLETE; DescribePipe then reports the SAME Arn and CreationTime, a strictly later LastModifiedTime, CurrentState 'RUNNING' and SourceParameters.FilterCriteria.Filters == [{"Pattern": "{\"body\": {\"k\": [\"b\"]}}"}]; a k=b record is forwarded, a k=a record is consumed from the source (ApproximateNumberOfMessages + ApproximateNumberOfMessagesNotVisible drain to 0) and never delivered to the target.
+Actual (emulator): a SendMessage on the queue URL the stack published is refused HTTP 400, error code 'AWS.SimpleQueueService.NonExistentQueue', message 'The specified queue does not exist.', so the scenario ends there and none of the above is observable.
+
+Message parts: 'The specified queue does not exist.' is AWS's fixed text for the QueueDoesNotExist class (Smithy sqs: SendMessage error QueueDoesNotExist, awsQueryError code AWS.SimpleQueueService.NonExistentQueue, httpError 400); the request-supplied part of the exchange is the QueueUrl, which in this scenario is a URL the emulator's own CloudFormation stack Outputs returned.
+
+Related open issue that does NOT carry this check's replay key (so does not cover it): 20261123T065749Z-cloudformation-sqs-reopens-aws-sqs-queue-still-has-no-in.md (Cause 2 — unnamed AWS::SQS::Queue replaced on an unrelated stack update; its keys are scoped to the cloudformation__*__sqs / sqs headings, not 'pipes').
+
+## Steps to Reproduce
+1. CreateStack (Capabilities=[CAPABILITY_IAM]) with: two UNNAMED AWS::SQS::Queue resources (SourceQueue, TargetQueue), an AWS::IAM::Role trusted by pipes.amazonaws.com granting sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes on SourceQueue and sqs:SendMessage on TargetQueue, and an AWS::Pipes::Pipe with Name=<uniq>, Source={Fn::GetAtt SourceQueue.Arn}, SourceParameters={SqsQueueParameters:{BatchSize:1}, FilterCriteria:{Filters:[{Pattern:"{\"body\":{\"k\":[\"a\"]}}"}]}}, Target={Fn::GetAtt TargetQueue.Arn}, DesiredState=RUNNING; Outputs SourceQueueUrl={Ref SourceQueue}, TargetQueueUrl={Ref TargetQueue}. Wait for CREATE_COMPLETE and record both Output URLs.
+2. DescribePipe(Name) -> CurrentState 'RUNNING'; record Arn, CreationTime, LastModifiedTime.
+3. SendMessage(QueueUrl=SourceQueueUrl, MessageBody='{"k":"a","m":"<uniq>"}') and ReceiveMessage on TargetQueueUrl until the forwarded record arrives.
+4. UpdateStack with the IDENTICAL template except FilterCriteria Pattern '{"body":{"k":["b"]}}'; wait for UPDATE_COMPLETE.
+   Expected: UPDATE_COMPLETE; DescribePipe shows the same Arn/CreationTime, a later LastModifiedTime, RUNNING and the new Pattern; both Output queue URLs keep serving SQS calls.
+5. SendMessage(QueueUrl=SourceQueueUrl, MessageBody='{"k":"b",...}') and SendMessage with '{"k":"a",...}'.
+   Expected: the k=b body reaches TargetQueueUrl, the k=a body is consumed from the source (both ApproximateNumberOfMessages and ApproximateNumberOfMessagesNotVisible reach 0) and never delivered.
+   Emulator: a SendMessage on the stack-published queue URL is refused 400 'AWS.SimpleQueueService.NonExistentQueue' — 'The specified queue does not exist.' — so the scenario cannot continue.
