@@ -301,20 +301,31 @@ async fn create_persists_a_cluster_that_get_reports_back() {
 }
 
 /// The endpoint bases this emulator can be served at, with the host a cluster's
-/// connection endpoint is announced at when it is served there.
+/// connection endpoint is announced at when it is served there and the DNS zone a
+/// per-cluster name of this emulator's own is announced in.
 ///
 /// The rows span the forms that address takes: a loopback literal with a port, a name
-/// with another port, a bracketed IPv6 literal (a host `Endpoint`'s `^[a-zA-Z0-9.-]+$`
-/// cannot carry) and the base of an emulator served on no port at all
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`, the base of one embedded in another
-/// process). The announced host is the served host itself, with the loopback zone — the
-/// interface the core binds its listeners on — standing in wherever that host is not one
-/// a hostname member can carry.
-const ENDPOINT_BASES: [(&str, &str); 4] = [
-    ("https://127.0.0.1:9297", "127.0.0.1"),
-    ("https://localhost:39355", "localhost"),
-    ("https://[::1]:8443", LOOPBACK_ZONE),
-    (smithy_server_runtime::UNSERVED_URL_BASE, LOOPBACK_ZONE),
+/// with another port, a name with no port at all, a bracketed IPv6 literal (a host
+/// `Endpoint`'s `^[a-zA-Z0-9.-]+$` cannot carry) and the base of an emulator served on no
+/// port at all (`smithy_server_runtime::UNSERVED_URL_BASE`, the base of one embedded in
+/// another process). The announced host is the served host itself, with the loopback zone
+/// — the interface the core binds its listeners on — standing in wherever that host is not
+/// one a hostname member can carry; the announced ZONE is that host's own name, and the
+/// loopback zone wherever the host names no zone of its own (an address names none).
+const ENDPOINT_BASES: [(&str, &str, &str); 5] = [
+    ("https://127.0.0.1:9297", "127.0.0.1", LOOPBACK_ZONE),
+    ("https://localhost:39355", "localhost", LOOPBACK_ZONE),
+    (
+        "https://emulator-host",
+        "emulator-host",
+        "emulator-host",
+    ),
+    ("https://[::1]:8443", LOOPBACK_ZONE, LOOPBACK_ZONE),
+    (
+        smithy_server_runtime::UNSERVED_URL_BASE,
+        LOOPBACK_ZONE,
+        LOOPBACK_ZONE,
+    ),
 ];
 
 /// Whether `value` is a host `Endpoint` and `ClusterVpcEndpoint` admit: non-empty, and
@@ -327,14 +338,15 @@ fn is_endpoint(value: &str) -> bool {
 }
 
 /// RULE: every response that reports a cluster's connection endpoint — `CreateCluster`'s
-/// own answer, the retry a repeated `clientToken` replays, `GetCluster`'s read of the
-/// stored cluster and the `clusterVpcEndpoint` `GetVpcEndpointServiceName` reports — names
-/// the host THIS emulator is served at, so a client that dials the value reaches this
-/// process; never a host in a zone Amazon Web Services publishes its own endpoints in,
-/// whatever Region the request is signed for.
+/// own answer, the retry a repeated `clientToken` replays and `GetCluster`'s read of the
+/// stored cluster — names the host THIS emulator is served at, so a client that dials the
+/// value reaches this process; and the `clusterVpcEndpoint`
+/// `GetVpcEndpointServiceName` reports is a per-cluster name in the zone this emulator
+/// announces its own names in. Never a host in a zone Amazon Web Services publishes its
+/// own endpoints in, whatever Region the request is signed for.
 #[tokio::test]
 async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
-    for (base, announced) in ENDPOINT_BASES {
+    for (base, announced, zone) in ENDPOINT_BASES {
         // Two Regions per base: the announced host is where this process answers, so it
         // follows the endpoint the emulator is served at and not the request's Region.
         for region in ["us-east-1", "eu-west-1"] {
@@ -359,19 +371,31 @@ async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
                     None,
                 )
                 .await;
-            for (member, reported) in [
-                ("CreateCluster's endpoint", created.str("endpoint")),
-                ("the replayed create's endpoint", replayed.str("endpoint")),
-                ("GetCluster's endpoint", fetched.str("endpoint")),
+            for (member, reported, wanted) in [
+                (
+                    "CreateCluster's endpoint",
+                    created.str("endpoint"),
+                    announced.to_string(),
+                ),
+                (
+                    "the replayed create's endpoint",
+                    replayed.str("endpoint"),
+                    announced.to_string(),
+                ),
+                (
+                    "GetCluster's endpoint",
+                    fetched.str("endpoint"),
+                    announced.to_string(),
+                ),
                 (
                     "GetVpcEndpointServiceName's clusterVpcEndpoint",
                     fronted.str("clusterVpcEndpoint"),
+                    format!("{identifier}.dsql-{identifier}.{region}.{zone}"),
                 ),
             ] {
                 assert_eq!(
-                    reported, announced,
-                    "case {case:?}: {member} must name this emulator's own host \
-                     {announced:?}, got {reported:?}"
+                    reported, wanted,
+                    "case {case:?}: {member} must be {wanted:?}, got {reported:?}"
                 );
                 assert!(
                     is_endpoint(&reported),

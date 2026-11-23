@@ -29,16 +29,30 @@ hex = { workspace = true }
 # readings this service resolves a caller-supplied reference through — the delivery service's
 # own streams and this account's IAM records for a `CreateStream` target, the account's KMS
 # keys for a cluster's `kmsEncryptionKey` — and the one reading of a caller-supplied ARN's
-# Region.
+# Region. `sql_wire_planes` is the shared statement of a SQL-wire data plane the cluster
+# endpoint is served on: the PostgreSQL wire, the confined in-process SQL engine and the
+# listener the core opens for it.
 service-common = { path = "../common" }
+# The instant an auth token was signed at and the one its lifetime runs out at, which the
+# token writes in the ISO 8601 basic form a presigned AWS request carries.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares a module per
+# `tests/all/<suite>.rs`, so a new suite is a new file and nothing else.
+automod = { workspace = true }
 # `time` on top of the workspace features: the clock-settling tests await the due
-# instant rather than blocking the runtime thread.
-tokio = { workspace = true, features = ["time"] }
+# instant rather than blocking the runtime thread. `net`/`io-util` are the socket and
+# stream traits the data-plane suite dials the cluster's PostgreSQL endpoint and speaks
+# the wire over.
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+# The PostgreSQL client half the data-plane suite speaks: `rustls`/`tokio-rustls` run the
+# client side of the in-band TLS upgrade the core's own upgrader answers.
+tokio-rustls = "0.26"
+rustls = { workspace = true }
 # Amazon Kinesis and IAM, mounted beside Aurora DSQL on one engine so the stream-target
 # suite resolves a `targetDefinition` against the very streams and roles a client created
 # through those services' own APIs.

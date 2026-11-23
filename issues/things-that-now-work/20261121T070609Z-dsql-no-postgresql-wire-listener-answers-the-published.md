@@ -1,13 +1,41 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dsql.expired-auth-token-rejected-open-session-survives dsql.get-vpc-endpoint-service-name-valid
+Issue-Trace-Ids: dsql.get-vpc-endpoint-service-name-valid
 Issue-Shape-Id: com.amazonaws.dsql#DSQL
-Issue-Key: dsql.expired-auth-token-rejected-open-session-survives|_connect_ready#4|AssertionError|raise AssertionError(f"no SQL connection within {_CONNECT_TIMEOUT_S}s: {exc}") from exc
 Issue-Key: dsql.get-vpc-endpoint-service-name-valid|run#11|AssertionError|assert re.fullmatch(r"[A-Za-z0-9.-]+(:\d+)?", endpoint) and endpoint.startswith(f"{identifier}."), (
 Issue-Commit: 9c4e35a7eb2cfc44174bf14b75d4647ba0e4b17d
 
-# dsql: no PostgreSQL wire listener answers the published cluster endpoint, and GetVpcEndpointServiceName's clusterVpcEndpoint is a bare loopback literal instead of the cluster's VPC-connection host
+# dsql: no PostgreSQL wire listener answers the published cluster endpoint, and GetVpcEndpointServiceName's clusterVpcEndpoint is a bare loopback literal instead of the cluster's VPC-connection host (cause 2 of 2 fixed; cause 1 is split out and still open on the port)
+
+## Resolution
+
+Cause 2 is FIXED. Cause 1's data plane is BUILT, but its check still cannot reach it, so that
+cause is SPLIT OUT into its own open report rather than counted as resolved here — its
+Issue-Key and its trace id moved with it, out of this record's header, into
+`issues/things-that-do-not-work/20261122T190000Z-dsql-the-served-cluster-data-plane-is-not-reachable-on-postgresqls-port.md`.
+
+* Cause 2 — FIXED. `GetVpcEndpointServiceName` now reports a `clusterVpcEndpoint` composed
+  from the stored cluster: its identifier as the leading label, the `dsql-<suffix>` label
+  carrying the same per-cluster endpoint-service suffix the same reply's `serviceName` carries
+  (one helper, `state::vpc_endpoint_service_suffix`, builds both), the cluster's own Region,
+  and the DNS zone this emulator may announce a name of its own in
+  (`state::announced_zone`) — never a zone Amazon Web Services serves. So the host names the
+  cluster, two clusters are never reported under one host, and the two members of one reply
+  name one endpoint service. Pinned by
+  `services/service-com-amazonaws-dsql-dsql/tests/all/vpc_endpoint_service_name.rs` and
+  `tests/all/cluster_lifecycle.rs`.
+* Cause 1 — the DATA PLANE now exists, and the check still fails at connect. A cluster opens a
+  PostgreSQL wire endpoint of its own when it is created
+  (`src/state/cluster_data_plane.rs` over `service_common::sql_wire_planes`): a core-owned
+  loopback listener, the in-band TLS upgrade, one in-process SQL engine per cluster, and a
+  login admitted on an auth token judged at CONNECT (`src/state/connection_auth.rs`) — the
+  action-to-role binding, the host it was presigned against and its lifetime, with an open
+  session left untouched when that lifetime runs out. What remains is the PORT: the recorded
+  client dials the published host on PostgreSQL's 5432, and the core assigns the port of every
+  listener a service opens (`vendor/server/src/listeners.rs`, `Listeners::tcp_plaintext` takes
+  no requested port), while `Endpoint`'s `^[a-zA-Z0-9.-]+$` admits no port in the member. See
+  the split-out report for the blocker and for what the data plane already serves.
 
 > _Note: this issue was identified against the code base at commit `9c4e35a7eb2cfc44174bf14b75d4647ba0e4b17d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

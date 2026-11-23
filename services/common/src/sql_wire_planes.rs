@@ -214,6 +214,84 @@ pub trait ServedDatabase: Send + Sync + 'static {
     fn dialect(&self) -> Option<Arc<dyn SqlDialect>> {
         None
     }
+
+    /// Whether the CREDENTIAL this login presented is one the owning service
+    /// accepts, for a database whose service holds no secret to compare it with.
+    ///
+    /// A control plane that authenticates a PRESENTED credential rather than a
+    /// stored password — one whose client mints a signed, time-limited token and
+    /// sends it as the password — is the only thing that can judge it: what makes
+    /// such a credential good is its own contents (what it was minted for, the
+    /// host it was minted against and how long it was minted for), not a
+    /// comparison with anything this store keeps. So the service answers here,
+    /// and words its own refusal ([`StatedRefusal`]), which the wire reports.
+    ///
+    /// `None` (the default) leaves the decision where it was: the master user's
+    /// current password and the credentials the control plane issued
+    /// ([`admit_issued`]).
+    fn verified_login(&self, login: &PresentedLogin<'_>) -> Option<Result<(), StatedRefusal>> {
+        let _ = login;
+        None
+    }
+}
+
+/// One login as the WIRE read it, for the owning service to judge
+/// ([`ServedDatabase::verified_login`]).
+pub struct PresentedLogin<'a> {
+    /// The account the login names.
+    pub user: &'a str,
+    /// The database it asked for, where it named one.
+    pub database: Option<&'a str>,
+    /// What it presented to prove itself.
+    pub proof: &'a PasswordProof<'a>,
+    /// Whether the connection it arrived on is encrypted — the wire's own in-band
+    /// upgrade having run before the credential was sent.
+    pub encrypted: bool,
+}
+
+/// Written by hand rather than derived: the proof carries a secret and no
+/// formatter writes it.
+impl std::fmt::Debug for PresentedLogin<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PresentedLogin")
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("encrypted", &self.encrypted)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A refusal the OWNING SERVICE words itself, for a credential it verified
+/// ([`ServedDatabase::verified_login`]).
+///
+/// A client branches on the `SQLSTATE` and reads the message; the hint is the
+/// field the protocol carries a refusal's second sentence in, which is where a
+/// product that says WHY a credential was not accepted says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatedRefusal {
+    /// The `SQLSTATE` the product reports the refusal under.
+    pub sqlstate: &'static str,
+    /// The message, as the product words it for this refusal.
+    pub message: String,
+    /// What it says in the hint field beside that message, where it says
+    /// anything.
+    pub hint: Option<String>,
+}
+
+/// Why a login did not open a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginDenial {
+    /// One of the conditions the WIRE words itself ([`LoginRefusal`]).
+    Wire(LoginRefusal),
+    /// The owning service's own refusal of a credential it verifies itself.
+    Stated(StatedRefusal),
+}
+
+impl From<LoginRefusal> for LoginDenial {
+    fn from(refusal: LoginRefusal) -> Self {
+        Self::Wire(refusal)
+    }
 }
 
 /// One credential the OWNING SERVICE issued for a database beside its master
@@ -303,6 +381,16 @@ impl SessionContext {
     #[must_use]
     pub fn dialect(&self) -> Option<Arc<dyn SqlDialect>> {
         self.served.dialect()
+    }
+
+    /// What the owning service says about the credential this login presented
+    /// ([`ServedDatabase::verified_login`]).
+    #[must_use]
+    pub fn verified_login(
+        &self,
+        login: &PresentedLogin<'_>,
+    ) -> Option<Result<(), StatedRefusal>> {
+        self.served.verified_login(login)
     }
 }
 
@@ -464,6 +552,61 @@ pub fn admit_issued(
             .unwrap_or_else(|| facts.master_database_name.clone())
     };
     let session_database = named.map_or(default_database, str::to_string);
+    if session_database != facts.master_database_name {
+        return Err(LoginRefusal::UnknownDatabase {
+            database: session_database,
+        });
+    }
+    Ok(session_database)
+}
+
+/// Admit one login on this endpoint, answering the database the session is on.
+///
+/// The ONE entry point both wires admit a login through, so a MySQL login and a
+/// PostgreSQL login are held to the same rules whichever way the resource's
+/// service authenticates one: a credential the service VERIFIES itself
+/// ([`ServedDatabase::verified_login`]) is judged by that service and the
+/// session then lands on the database the rules below leave it on, and every
+/// other login is held to the master user's current password and the credentials
+/// the control plane issued ([`admit_issued`]).
+pub fn admit_login(
+    context: &SessionContext,
+    facts: &DatabaseFacts,
+    login: &PresentedLogin<'_>,
+) -> Result<String, LoginDenial> {
+    match context.verified_login(login) {
+        Some(Ok(())) => Ok(admit_verified(facts, login.database)?),
+        Some(Err(stated)) => Err(LoginDenial::Stated(stated)),
+        None => Ok(admit_issued(
+            facts,
+            &context.issued_credentials(),
+            login.user,
+            login.database,
+            login.proof,
+        )?),
+    }
+}
+
+/// Admit a login whose CREDENTIAL the owning service has already verified
+/// ([`ServedDatabase::verified_login`]), answering the database the session is
+/// on.
+///
+/// Everything about a login that is NOT the credential is still the one decision
+/// [`admit_issued`] makes: the engine has to be running, and the database asked
+/// for has to be the one the engine holds — a login that names none is served the
+/// master database, which is the database the create made inside the engine.
+pub fn admit_verified(
+    facts: &DatabaseFacts,
+    database: Option<&str>,
+) -> Result<String, LoginRefusal> {
+    if !facts.is_serving() {
+        return Err(LoginRefusal::NotServing {
+            serving: facts.serving,
+        });
+    }
+    let session_database = database
+        .filter(|named| !named.is_empty())
+        .map_or_else(|| facts.master_database_name.clone(), str::to_string);
     if session_database != facts.master_database_name {
         return Err(LoginRefusal::UnknownDatabase {
             database: session_database,

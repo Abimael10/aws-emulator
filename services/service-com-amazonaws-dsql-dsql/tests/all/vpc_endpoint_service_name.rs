@@ -5,8 +5,11 @@
 //! The RULE under test: the operation reports the VPC endpoint service that fronts the
 //! PERSISTED cluster the `@httpLabel` `identifier` names — `com.amazonaws.{region}.dsql-`
 //! qualified by that cluster's own identifier, in that cluster's region — together with
-//! the cluster's persisted connection endpoint, and refuses a cluster this service does
-//! not hold with the modelled `ResourceNotFoundException` (404).
+//! that cluster's VPC CONNECTION endpoint: a DNS host whose leading label is the
+//! cluster's identifier, whose next label is the same `dsql-{suffix}` endpoint service
+//! the `serviceName` beside it names, then the cluster's region, in the zone this
+//! emulator announces its own names in. A cluster this service does not hold is refused
+//! with the modelled `ResourceNotFoundException` (404).
 //!
 //! Every case drives `MultiServiceRouter::dispatch` with a signed-looking restJson1
 //! request, so the route, the `@httpLabel` binding, the boundary constraint check and
@@ -79,9 +82,34 @@ impl Dsql {
 /// from the cluster rather than assumed.
 const REGIONS: &[&str] = &["us-east-1", "eu-west-1", "ap-southeast-2", "us-gov-west-1"];
 
+/// The zone this emulator announces a name of its own in when it is reached at an
+/// address — the loopback zone, which RFC 6761 reserves, with every name under it, for
+/// the loopback interface the core binds its listeners on. The harness drives the
+/// emulator in process, so this is the zone every announced name below sits in.
+const ANNOUNCED_ZONE: &str = "localhost";
+
+/// The VPC connection endpoint the rule requires for `identifier` in `region`: the
+/// cluster's identifier, the endpoint service `serviceName` names, the cluster's region
+/// and the zone this emulator announces in.
+fn expected_vpc_endpoint(region: &str, identifier: &str) -> String {
+    format!("{identifier}.dsql-{identifier}.{region}.{ANNOUNCED_ZONE}")
+}
+
+/// Whether `endpoint` and `service_name` of ONE reply name the same endpoint service:
+/// the host's second label is the `dsql`-qualified label the service name ends with.
+fn names_one_endpoint_service(endpoint: &str, service_name: &str) -> bool {
+    let Some(service_label) = service_name.rsplit('.').next() else {
+        return false;
+    };
+    endpoint
+        .split('.')
+        .nth(1)
+        .is_some_and(|label| label == service_label)
+}
+
 /// RULE: for a persisted cluster in any region, the reported service name is
 /// `com.amazonaws.{cluster region}.dsql-{cluster identifier}` and the reported VPC
-/// endpoint is the endpoint the cluster persists — which `GetCluster` reports back.
+/// connection endpoint is the host naming that cluster and that endpoint service.
 #[tokio::test]
 async fn the_service_name_names_the_persisted_cluster_and_its_region() {
     for region in REGIONS {
@@ -109,51 +137,77 @@ async fn the_service_name_names_the_persisted_cluster_and_its_region() {
                  and length, got {service_name:?}"
             );
 
-            // The endpoint is the cluster's own, so the implemented reader agrees.
-            let read_back = dsql.get(&identifier).await;
-            let endpoint = read_back.str("endpoint");
+            let wanted = expected_vpc_endpoint(region, &identifier);
             let reported = answered.str("clusterVpcEndpoint");
             assert_eq!(
-                reported, endpoint,
-                "case {case:?} in {region}: clusterVpcEndpoint must be the cluster's \
-                 persisted endpoint {endpoint:?}, got {reported:?}"
+                reported, wanted,
+                "case {case:?} in {region}: clusterVpcEndpoint must be the host naming this \
+                 cluster, {wanted:?}, got {reported:?}"
+            );
+            assert!(
+                names_one_endpoint_service(&reported, &service_name),
+                "case {case:?} in {region}: clusterVpcEndpoint {reported:?} and serviceName \
+                 {service_name:?} must name one endpoint service"
             );
             assert!(
                 is_cluster_vpc_endpoint(&reported),
                 "case {case:?} in {region}: clusterVpcEndpoint must satisfy \
                  ^[a-zA-Z0-9.-]+$, got {reported:?}"
             );
+            // The cluster the host names is the one the control plane holds, so the
+            // implemented reader agrees on its identity.
+            let read_back = dsql.get(&identifier).await;
+            assert_eq!(
+                read_back.str("identifier"),
+                identifier,
+                "case {case:?} in {region}: GetCluster must report the cluster the endpoint \
+                 names, got {:?}",
+                read_back.str("identifier")
+            );
         }
     }
 }
 
 /// RULE (invariant): the name is a property of the cluster, so distinct clusters in one
-/// region get distinct names and repeated reads of one cluster get the same name.
+/// region get distinct names and repeated reads of one cluster get the same name. The
+/// VPC connection endpoint is a property of the cluster too, so it is distinct and
+/// stable the same way — two clusters are never named by one host.
 #[tokio::test]
 async fn names_are_stable_per_cluster_and_distinct_between_clusters() {
     let dsql = Dsql::new();
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<(String, String, String)> = Vec::new();
     for _ in 0..4 {
         let identifier = dsql.create_settled().await;
         let first = dsql.vpc_endpoint_service_name(&identifier).await;
         let second = dsql.vpc_endpoint_service_name(&identifier).await;
-        assert_eq!(
+        for member in ["serviceName", "clusterVpcEndpoint"] {
+            assert_eq!(
+                first.str(member),
+                second.str(member),
+                "case {identifier:?}: two reads of one cluster must report one {member}, got \
+                 {:?} then {:?}",
+                first.str(member),
+                second.str(member)
+            );
+        }
+        seen.push((
+            identifier,
             first.str("serviceName"),
-            second.str("serviceName"),
-            "case {identifier:?}: two reads of one cluster must report one name, got {:?} \
-             then {:?}",
-            first.str("serviceName"),
-            second.str("serviceName")
-        );
-        seen.push((identifier, first.str("serviceName")));
+            first.str("clusterVpcEndpoint"),
+        ));
     }
 
-    for (left_index, (left_id, left_name)) in seen.iter().enumerate() {
-        for (right_id, right_name) in seen.iter().skip(left_index + 1) {
+    for (left_index, (left_id, left_name, left_endpoint)) in seen.iter().enumerate() {
+        for (right_id, right_name, right_endpoint) in seen.iter().skip(left_index + 1) {
             assert_ne!(
                 left_name, right_name,
                 "case {left_id:?} vs {right_id:?}: distinct clusters must get distinct \
                  service names, both got {left_name:?}"
+            );
+            assert_ne!(
+                left_endpoint, right_endpoint,
+                "case {left_id:?} vs {right_id:?}: distinct clusters must get distinct VPC \
+                 connection endpoints, both got {left_endpoint:?}"
             );
         }
     }
@@ -199,9 +253,9 @@ async fn the_region_is_the_clusters_not_the_readers() {
             );
             assert_eq!(
                 answered.str("clusterVpcEndpoint"),
-                at_home.get(&identifier).await.str("endpoint"),
-                "case {home}->{reader} read from {case}: clusterVpcEndpoint must be the \
-                 cluster's persisted endpoint, got {:?}",
+                expected_vpc_endpoint(home, &identifier),
+                "case {home}->{reader} read from {case}: clusterVpcEndpoint must stay in the \
+                 cluster's region, got {:?}",
                 answered.str("clusterVpcEndpoint")
             );
         }

@@ -91,6 +91,15 @@ pub mod kms_key;
 pub mod cluster_addressing;
 pub use cluster_addressing::*;
 
+/// The CREDENTIAL a session on a cluster's PostgreSQL endpoint presents — an auth
+/// token — and whether the cluster accepts it.
+pub mod connection_auth;
+
+/// The DATA plane of one cluster: the PostgreSQL endpoint a client connects to, and
+/// what admits a session on it.
+pub mod cluster_data_plane;
+pub use cluster_data_plane::ClusterDataPlane;
+
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
 /// the enum spells them on the wire (`smithy_query(query="shape",
 /// shape="ClusterStatus")`: CREATING | ACTIVE | IDLE | INACTIVE | UPDATING |
@@ -964,6 +973,16 @@ pub struct ComAmazonawsDsqlDsqlState {
     /// Bounded by [`MAX_RETIRED_CLUSTERS`]; written only by [`Self::settle`],
     /// never directly.
     pub retired_clusters: BTreeMap<String, Cluster>,
+    /// The open PostgreSQL data plane of each live cluster, keyed by identifier:
+    /// the listener the core opened for the cluster, the wire served on it and
+    /// the cluster's own SQL engine ([`cluster_data_plane`]).
+    ///
+    /// Held HERE, beside the record that says the cluster exists, because the
+    /// listener is what keeps the port open: the clock-settled deletion that
+    /// retires a cluster drops its plane, which closes the port, severs the
+    /// sessions on it and drops the cluster's engine. Bounded by
+    /// [`MAX_CLUSTERS`], the ceiling on the clusters that can own one.
+    pub cluster_planes: BTreeMap<String, ClusterDataPlane>,
     /// The order [`Self::retired_clusters`] was written in, so the cap evicts the
     /// oldest tombstone rather than an arbitrary one.
     retired_order: VecDeque<String>,
@@ -1104,6 +1123,12 @@ impl ComAmazonawsDsqlDsqlState {
             // `ResourceNotFoundException` and `ListClusters` stops listing it.
             if pending.next_status == STATUS_DELETED {
                 if let Some(retired) = self.clusters.remove(&identifier) {
+                    // The cluster's data plane goes with the cluster: dropping
+                    // the record closes the port the core opened for it, severs
+                    // every session on it and drops the cluster's engine with
+                    // its rows, so nothing answers at an address a retired
+                    // cluster once published.
+                    self.cluster_planes.remove(&identifier);
                     // Every resource the removal takes with it, not just the
                     // cluster: a record is keyed by the resource its call acted
                     // on, and `CreateStream` acts on the STREAM, so a token
@@ -1679,21 +1704,69 @@ fn is_arn_region_segment(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The per-cluster suffix the VPC endpoint service of a cluster is QUALIFIED by,
+/// and that the cluster's VPC connection endpoint names the same service with.
+///
+/// It IS the cluster's own identifier — a value the mint already drew once per
+/// cluster, so nothing second has to be minted or stored for a suffix to be
+/// stable across reads and distinct per cluster. What this function is for is the
+/// SEAM: an interface VPC endpoint service is named
+/// `com.amazonaws.{region}.{service}`, and Aurora DSQL qualifies that PER
+/// CLUSTER — `GetVpcEndpointServiceName` is keyed by a cluster id and answers
+/// `ResourceNotFoundException` for an unknown one, and `ServiceName`'s pattern
+/// (`smithy_query(query="shape", shape="ServiceName")`:
+/// `^com\.amazonaws\.[a-z0-9-]+\.dsql[a-z0-9-]*$`) admits exactly such a suffix
+/// after `dsql` — and BOTH members of the reply are built from here
+/// ([`vpc_endpoint_service_name`], [`cluster_vpc_endpoint`]), so the suffix the
+/// service name carries and the one the connection endpoint's host carries cannot
+/// differ however the suffix is derived later.
+#[must_use]
+pub fn vpc_endpoint_service_suffix(identifier: &str) -> &str {
+    identifier
+}
+
 /// The VPC endpoint service that fronts one cluster:
-/// `com.amazonaws.{region}.dsql-{identifier}`.
+/// `com.amazonaws.{region}.dsql-{suffix}`, for that cluster's own endpoint-service
+/// suffix ([`vpc_endpoint_service_suffix`]).
 ///
-/// An interface VPC endpoint service is named `com.amazonaws.{region}.{service}`, and
-/// Aurora DSQL qualifies that per cluster: `GetVpcEndpointServiceName` is keyed by a
-/// cluster id and answers `ResourceNotFoundException` for an unknown one, and
-/// `ServiceName`'s pattern (`smithy_query(query="shape", shape="ServiceName")`:
-/// `^com\.amazonaws\.[a-z0-9-]+\.dsql[a-z0-9-]*$`) admits exactly such a suffix after
-/// `dsql`. The cluster's own identifier is the qualifier, so the name is derived from
-/// persisted state, stable across reads and distinct per cluster.
-///
-/// `region` is at most 20 characters and `identifier` is 26, so the result is at most
-/// 66 characters — inside `ServiceName`'s `@length(1, 128)`.
+/// `region` is at most 20 characters and the suffix is the cluster's 26-character
+/// identifier, so the result is at most 66 characters — inside `ServiceName`'s
+/// `@length(1, 128)`.
 pub fn vpc_endpoint_service_name(region: &str, identifier: &str) -> String {
-    format!("com.amazonaws.{region}.dsql-{identifier}")
+    format!(
+        "com.amazonaws.{region}.dsql-{}",
+        vpc_endpoint_service_suffix(identifier)
+    )
+}
+
+/// The VPC CONNECTION endpoint of one cluster — `GetVpcEndpointServiceName`'s
+/// `clusterVpcEndpoint`, "The VPC connection endpoint for the cluster"
+/// (`smithy_query(query="doc", shape="GetVpcEndpointServiceNameOutput",
+/// member="clusterVpcEndpoint")`).
+///
+/// It is a DNS HOST, and the one a client reaches THAT cluster at through the
+/// endpoint service of the same reply, so it is laid out the way such a host is:
+/// the cluster's own identifier as its leading label, then the `dsql` label
+/// carrying the same per-cluster endpoint-service suffix the `serviceName` beside
+/// it carries ([`vpc_endpoint_service_suffix`]), then the cluster's Region — so a
+/// client that parses the host recovers the cluster, the endpoint service and the
+/// Region, and two clusters are never named by one host.
+///
+/// `zone` is the DNS zone the host sits in: the zone THIS emulator may announce a
+/// name of its own in ([`announced_zone`]), never the zone Amazon Web Services
+/// publishes its own endpoints in — a name there resolves nowhere near this
+/// process or, worse, at genuine infrastructure, so a client handed one leaves the
+/// emulated environment entirely.
+///
+/// Every label is well inside the 63 octets DNS allows one, and the whole value
+/// satisfies `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$`
+/// ([`is_endpoint_host`]) for every Region segment and zone this emulator can be
+/// reached in.
+pub fn cluster_vpc_endpoint(region: &str, identifier: &str, zone: &str) -> String {
+    format!(
+        "{identifier}.dsql-{}.{region}.{zone}",
+        vpc_endpoint_service_suffix(identifier)
+    )
 }
 
 /// The customer-managed key a `kmsEncryptionKey` names, if it names one at all.

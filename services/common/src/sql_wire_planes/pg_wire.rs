@@ -19,8 +19,10 @@
 //!    handshake, after which the startup arrives over the upgraded stream;
 //! 2. the `StartupMessage` names the user and the database; the server asks for
 //!    the password (`AuthenticationCleartextPassword`), checks it against the
-//!    stored master password and the credentials the control plane issued, and
-//!    answers `AuthenticationOk`, the backend
+//!    stored master password and the credentials the control plane issued — or,
+//!    for a resource whose service authenticates a PRESENTED credential, against
+//!    what that service says of it ([`super::ServedDatabase::verified_login`]) —
+//!    and answers `AuthenticationOk`, the backend
 //!    parameters, `BackendKeyData` and `ReadyForQuery` — or one
 //!    `ErrorResponse` carrying the SQLSTATE of the refusal, and closes;
 //! 3. the simple query protocol: `Query` is run and answered with
@@ -38,7 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::session::{Answer, Session};
 use super::sql_engine::{Cell, Column, EngineError, EngineErrorKind};
 use super::{
-    admit_issued, EngineWire, LoginRefusal, PasswordProof, Refusal, ServingState, SessionContext,
+    admit_login, EngineWire, LoginDenial, LoginRefusal, PasswordProof, PresentedLogin, Refusal,
+    ServingState, SessionContext,
 };
 
 /// The protocol version this server speaks, as a startup message declares it
@@ -187,15 +190,27 @@ async fn serve_session(
             .await
         }
     };
-    let database = match admit_issued(
-        &facts,
-        &context.issued_credentials(),
-        &user,
-        database.as_deref(),
-        &PasswordProof::Cleartext(&password),
-    ) {
+    let proof = PasswordProof::Cleartext(&password);
+    let presented = PresentedLogin {
+        user: &user,
+        database: database.as_deref(),
+        proof: &proof,
+        encrypted,
+    };
+    let database = match admit_login(&context, &facts, &presented) {
         Ok(database) => database,
-        Err(refusal) => {
+        // A credential the owning service verified itself and refused: its own
+        // words, under its own SQLSTATE, with the hint it states beside them.
+        Err(LoginDenial::Stated(stated)) => {
+            return hinted_fatal(
+                &mut conn,
+                stated.sqlstate,
+                &stated.message,
+                stated.hint.as_deref(),
+            )
+            .await
+        }
+        Err(LoginDenial::Wire(refusal)) => {
             // How the engine's own product refuses a login of its own
             // credentials, where it has its own words for it; the wire's
             // otherwise.
@@ -544,7 +559,7 @@ async fn engine_error_response(
         Some(refusal) => (refusal.sqlstate, refusal.message, refusal.detail),
         None => (sqlstate(wire, error.kind), error.message.clone(), None),
     };
-    reported(conn, "ERROR", code, &message, detail.as_deref()).await
+    reported(conn, "ERROR", code, &message, detail.as_deref(), None).await
 }
 
 /// One `ErrorResponse`.
@@ -554,16 +569,18 @@ async fn error_response(
     code: &str,
     message: &str,
 ) -> std::io::Result<()> {
-    reported(conn, severity, code, message, None).await
+    reported(conn, severity, code, message, None, None).await
 }
 
-/// One `ErrorResponse`, with the `Detail` field where the refusal carries one.
+/// One `ErrorResponse`, with the `Detail` and `Hint` fields where the refusal
+/// carries them.
 async fn reported(
     conn: &mut ::emulator_server::ListenerConn,
     severity: &str,
     code: &str,
     message: &str,
     detail: Option<&str>,
+    hint: Option<&str>,
 ) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -578,6 +595,10 @@ async fn reported(
         body.push(b'D');
         put_cstring(&mut body, detail);
     }
+    if let Some(hint) = hint {
+        body.push(b'H');
+        put_cstring(&mut body, hint);
+    }
     body.push(0);
     send(conn, b'E', &body).await?;
     conn.flush().await
@@ -590,6 +611,17 @@ async fn fatal(
     message: &str,
 ) -> std::io::Result<()> {
     error_response(conn, "FATAL", code, message).await
+}
+
+/// Report a refusal that ends the connection and carries a `Hint` beside its
+/// message — the field the protocol puts a refusal's second sentence in.
+async fn hinted_fatal(
+    conn: &mut ::emulator_server::ListenerConn,
+    code: &str,
+    message: &str,
+    hint: Option<&str>,
+) -> std::io::Result<()> {
+    reported(conn, "FATAL", code, message, None, hint).await
 }
 
 /// `ReadyForQuery` with the transaction status this session is in.

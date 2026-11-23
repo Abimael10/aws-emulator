@@ -341,6 +341,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The cluster's DATA plane, opened BEFORE any record is written: a cluster
+        // publishes a connection endpoint, and what that member carries is an
+        // address a client afterwards dials with a PostgreSQL driver, so no cluster
+        // is stored without the listener that serves it
+        // (`crate::state::cluster_data_plane`). The core owns the socket, the bind
+        // interface and the port; this hands it the wire. The plane admits a
+        // session only once the cluster's own status says it is up, which is the
+        // status the clock settles a settle span from now — and a call that ends up
+        // minting no cluster at all (an idempotent replay, a refusal below) drops
+        // the plane unused, which closes the port with it.
+        //
+        // An emulator whose engine can open no listener at all leaves the cluster
+        // without one rather than refusing a create every caller of such a host
+        // would then see: the control plane answers the same either way, and
+        // nothing reports a session it could not serve.
+        let endpoint_host = crate::state::cluster_endpoint(ctx);
+        let opened = match crate::state::cluster_data_plane::open_cluster_data_plane(
+            &*self.engine,
+            &identifier,
+            &endpoint_host,
+        )
+        .await
+        {
+            Ok(plane) => Some(plane),
+            Err(why) => {
+                ::tracing::warn!(
+                    cluster = %identifier,
+                    "the cluster's PostgreSQL data plane could not be opened: {why}"
+                );
+                None
+            }
+        };
+
         let mut state = state.lock();
 
         // `@idempotencyToken`: a repeat of the SAME request returns the result of
@@ -375,7 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Ok(replayed_cluster_output(
                             existing,
                             answered,
-                            &crate::state::cluster_endpoint(ctx),
+                            &endpoint_host,
                         ));
                     }
                 }
@@ -465,8 +498,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.policy = Some(crate::state::ClusterPolicy { document, version });
         }
 
-        let created = created_cluster_output(&cluster, &crate::state::cluster_endpoint(ctx));
+        let created = created_cluster_output(&cluster, &endpoint_host);
         state.clusters.insert(identifier.clone(), cluster);
+        // The plane goes on the store beside the record, which is what keeps its
+        // port open: it is dropped, and the port closed, when the clock-settled
+        // deletion retires the cluster.
+        if let Some(plane) = opened {
+            state.cluster_planes.insert(identifier.clone(), plane);
+        }
         if let Some(token) = input.client_token {
             let answered = crate::state::RecordedClusterCreation {
                 status: created.status.clone(),

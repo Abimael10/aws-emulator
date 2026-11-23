@@ -62,6 +62,26 @@ pub fn announced_host(served_base: &str) -> String {
     addressing::LOOPBACK_ZONE.to_string()
 }
 
+/// The DNS zone this emulator may ANNOUNCE a name of its OWN in, for the emulator
+/// serving `ctx`: the zone of the address it is reached at, and the loopback zone
+/// — the interface the core binds its listeners on — where that address names no
+/// zone of its own.
+///
+/// What a cluster announces a per-cluster NAME in, where the member carries a host
+/// built around the cluster rather than the one address this process answers at
+/// ([`crate::state::cluster_vpc_endpoint`]). The reading is the tree's one
+/// ([`addressing::announced_zone_of_authority`]): a name in a zone Amazon Web
+/// Services publishes its own endpoints in is never announced, because a client
+/// that resolves one leaves the emulated environment carrying the credentials it
+/// holds, while a name under the loopback zone — which RFC 6761 reserves, with
+/// every name under it, for the loopback interface — leads back to the interface
+/// the core opened the cluster's listener on.
+#[must_use]
+pub fn announced_zone(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    let served = addressing::served_endpoint_authority(ctx.endpoint().as_str()).unwrap_or_default();
+    addressing::announced_zone_of_authority(&served)
+}
+
 /// Whether `value` is a host `Endpoint`'s `^[a-zA-Z0-9.-]+$` admits
 /// (`smithy_query(query="shape", shape="Endpoint")`), which `ClusterVpcEndpoint` — the member
 /// `GetVpcEndpointServiceName` reports the same stored host in — declares too.

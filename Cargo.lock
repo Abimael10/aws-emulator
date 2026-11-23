@@ -13826,6 +13826,7 @@ dependencies = [
 name = "service-com-amazonaws-dsql-dsql"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -13837,9 +13838,11 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "chrono",
  "hex",
  "http",
  "percent-encoding",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kinesis-kinesis-20131202",
@@ -13847,6 +13850,7 @@ dependencies = [
  "service-common",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

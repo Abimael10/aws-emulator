@@ -34,8 +34,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::session::Session;
 use super::sql_engine::{Cell, Column, EngineError, EngineErrorKind, ResultSet};
 use super::{
-    admit_issued, client_host, DatabaseFacts, EngineWire, LoginRefusal, PasswordProof, ServingState,
-    SessionContext,
+    admit_login, client_host, DatabaseFacts, EngineWire, LoginDenial, LoginRefusal, PasswordProof,
+    PresentedLogin, ServingState, SessionContext,
 };
 
 /// How many bytes one packet may carry. The protocol allows 16 MiB per packet;
@@ -216,15 +216,30 @@ async fn serve_login(
         nonce,
         response: &login.auth_response,
     };
-    let database = match admit_issued(
-        &facts,
-        &context.issued_credentials(),
-        &login.user,
-        login.database.as_deref(),
-        &proof,
-    ) {
+    let presented = PresentedLogin {
+        user: &login.user,
+        database: login.database.as_deref(),
+        proof: &proof,
+        encrypted: capabilities & CLIENT_SSL != 0,
+    };
+    let database = match admit_login(&context, &facts, &presented) {
         Ok(database) => database,
-        Err(refusal) => {
+        // A credential the owning service verified itself and refused: its own
+        // words, under this protocol's access-denied error, which is the error a
+        // MySQL client branches on. The protocol carries no hint field, so what
+        // the service states there is not reported rather than reported
+        // somewhere it does not belong.
+        Err(LoginDenial::Stated(stated)) => {
+            return write_error(
+                &mut conn,
+                sequence.wrapping_add(1),
+                ACCESS_DENIED_ERROR,
+                ACCESS_DENIED_STATE,
+                &stated.message,
+            )
+            .await
+        }
+        Err(LoginDenial::Wire(refusal)) => {
             let (number, state, message) = refusal_sentence(&refusal);
             return write_error(&mut conn, sequence.wrapping_add(1), number, state, &message).await;
         }
@@ -604,8 +619,8 @@ fn refusal_sentence(refusal: &LoginRefusal) -> (u16, &'static str, String) {
             user,
             password_given,
         } => (
-            1045,
-            "28000",
+            ACCESS_DENIED_ERROR,
+            ACCESS_DENIED_STATE,
             format!(
                 "Access denied for user '{user}'@'{}' (using password: {})",
                 client_host(),
@@ -614,6 +629,14 @@ fn refusal_sentence(refusal: &LoginRefusal) -> (u16, &'static str, String) {
         ),
     }
 }
+
+/// `ER_ACCESS_DENIED_ERROR` and its SQLSTATE: the error a MySQL server refuses a
+/// credential it does not accept with, whoever judged the credential.
+///
+/// Source: the MySQL reference manual's "Server Error Message Reference".
+const ACCESS_DENIED_ERROR: u16 = 1045;
+/// See [`ACCESS_DENIED_ERROR`].
+const ACCESS_DENIED_STATE: &str = "28000";
 
 /// The error number and SQLSTATE a failed statement is reported under.
 ///

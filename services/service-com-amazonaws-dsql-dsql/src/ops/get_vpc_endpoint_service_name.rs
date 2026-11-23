@@ -8,10 +8,12 @@
 //! cluster. `@readonly`: the only write it performs is settling a status change the
 //! clock already owed at this instant.
 //!
-//! Both reported values are DERIVED from the persisted cluster — its region and its
-//! identifier — through [`crate::state::vpc_endpoint_service_name`] and the endpoint
-//! `CreateCluster` stored, so two reads of one cluster agree and a read invents
-//! nothing.
+//! Both reported values are DERIVED from the persisted cluster — its region, its
+//! identifier and the one endpoint-service suffix both members carry — through
+//! [`crate::state::vpc_endpoint_service_name`] and
+//! [`crate::state::cluster_vpc_endpoint`], so two reads of one cluster agree, the
+//! service name and the connection endpoint name one endpoint service, and a read
+//! invents nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -192,11 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetVpcEndpointServiceNameOutput {
             service_name: crate::state::vpc_endpoint_service_name(&region, &cluster.identifier),
-            // The VPC connection endpoint of a cluster is the host that cluster is
-            // reached at, which here is where THIS emulator answers
-            // (`crate::state::cluster_endpoint`) — the same address `GetCluster`
-            // reports for the same cluster.
-            cluster_vpc_endpoint: Some(crate::state::cluster_endpoint(ctx)),
+            // The VPC CONNECTION endpoint of a cluster is a DNS host naming that
+            // cluster: its identifier as the leading label, the endpoint service
+            // of the `serviceName` beside it, and the cluster's Region, in the
+            // zone this emulator may announce a name of its own in
+            // (`crate::state::cluster_vpc_endpoint`) — so the two members of this
+            // reply name one endpoint service, and two clusters are never
+            // reported under one host.
+            cluster_vpc_endpoint: Some(crate::state::cluster_vpc_endpoint(
+                &region,
+                &cluster.identifier,
+                &crate::state::announced_zone(ctx),
+            )),
         })
     }
 }
