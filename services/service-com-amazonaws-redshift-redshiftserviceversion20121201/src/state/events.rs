@@ -256,6 +256,13 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
              while the update is applied.",
     },
     CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3016",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description: "Amazon Redshift will reboot cluster '<cluster name>' now.",
+    },
+    CatalogEvent {
         event_id: EVENT_ID_MASTER_PASSWORD_UPDATED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_SECURITY],

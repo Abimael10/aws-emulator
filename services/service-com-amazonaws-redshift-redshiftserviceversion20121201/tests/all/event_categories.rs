@@ -277,8 +277,14 @@ async fn each_source_type_publishes_the_catalogued_events_of_its_resource() {
     // that follow the category loosely — 1000 configuration, 2000 management,
     // 3000 monitoring, 4000 security — with the published catalog, not the
     // range, deciding each event's own identifier.
-    let rows: [(&str, &str, &[&str], &str); 6] = [
+    let rows: [(&str, &str, &[&str], &str); 7] = [
         ("cluster", "REDSHIFT-EVENT-2000", &["management"], "INFO"),
+        (
+            "cluster",
+            "REDSHIFT-EVENT-3016",
+            &["monitoring"],
+            "INFO",
+        ),
         (
             "cluster-parameter-group",
             "REDSHIFT-EVENT-1003",

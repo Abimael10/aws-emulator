@@ -50,7 +50,13 @@
 //! it to a routing failure, a transport failure and a pre-dispatch refusal. Everything
 //! else about those paths — status, `<Type>`, `<Code>`, `<Message>` — stays with the
 //! framework.
+//!
+//! That same `override_operation` seam is where the operations whose response can carry a
+//! floating-point member are served behind the renderer that writes one as AWS does
+//! ([`decimal_floats`]), for the same reason: the rule belongs in the framework's XML
+//! writer, which is read-only here.
 
+pub mod decimal_floats;
 pub mod query_error_envelope;
 pub mod stated_enum_value_sets;
 
@@ -124,8 +130,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RedshiftDefinition::new(engine),
-            envelope: RequestIdEnvelopeOperation,
+            entry: RedshiftDefinition::new(Arc::clone(&engine)),
+            envelope: RequestIdEnvelopeOperation::new(&engine),
         }
     }
 }
