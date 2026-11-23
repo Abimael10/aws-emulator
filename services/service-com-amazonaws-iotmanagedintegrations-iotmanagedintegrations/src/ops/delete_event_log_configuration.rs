@@ -194,7 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !removed {
             audit(&akid, &region, "not-found");
-            // The one fixed sentence this resource's 404s carry, read and mutation alike.
+            // This path states the absence with the sentence this resource words for it, as
+            // the read path does: the only path of this service recorded stating it with no
+            // sentence at all is the update (`crate::state::bare_resource_not_found`).
             return Err(
                 DeleteEventLogConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::event_log_configuration_not_found(),

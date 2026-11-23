@@ -474,12 +474,14 @@ impl EventLogConfiguration {
 /// carries, as [`MANAGED_THING_RESOURCE_TYPE`] does for a managed thing.
 pub const EVENT_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "EventLogConfiguration";
 
-/// The one sentence this service states for an event log configuration it holds none of
-/// under the `Id` a request named, whatever operation resolved it.
+/// The one sentence the paths of this service that WORD one state for an event log
+/// configuration they hold none of under the `Id` a request named.
 ///
 /// It is FIXED text: it quotes no identifier and no other request value, so every absent
 /// configuration — never created, deleted, or created in another region — is stated the
-/// same way, the way the recorded 404 of a get after a delete words it.
+/// same way, the way the recorded 404 of a get after a delete words it. The update path
+/// words none at all, which is a property of that path and not of this sentence
+/// ([`event_log_configuration_not_found`]).
 pub const EVENT_LOG_CONFIGURATION_ABSENT_REASON: &str = "Event log configuration doesn't exist";
 
 /// The one sentence this service states when a create names a log target the account already
@@ -2418,8 +2420,9 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
     }
 }
 
-/// The modelled `ResourceNotFoundException` every operation that resolves an event log
-/// configuration by the `Id` its request carries answers when this region holds none:
+/// The modelled `ResourceNotFoundException` the paths of this service that READ an event log
+/// configuration by the `Id` its request carries — and the delete that reports finding
+/// nothing to remove — answer when this region holds none:
 /// [`EVENT_LOG_CONFIGURATION_ABSENT_REASON`] and nothing else.
 ///
 /// The `ResourceId` and `ResourceType` members the shape declares stay ABSENT: the
@@ -2427,6 +2430,14 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
 /// alone, so this resource's backend fills neither — unlike a managed thing's 404, which
 /// reports both ([`managed_thing_not_found_on_read`]). The reason names no identifier
 /// either, so this takes none — the same shape as [`custom_endpoint_not_found_on_read`].
+///
+/// The sentence belongs to the PATH that resolved the configuration, not to the resource:
+/// the recorded `UpdateEventLogConfiguration` for an `Id` a delete had just removed states
+/// the same absence with NO member at all, so that path reaches for
+/// [`bare_resource_not_found`] instead — the same per-path split an OTA task configuration's
+/// read and delete paths word two ways
+/// ([`ota_task_configuration_not_found_on_read`] beside
+/// [`ota_task_configuration_not_found_on_delete`]).
 pub fn event_log_configuration_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(EVENT_LOG_CONFIGURATION_ABSENT_REASON.to_string()),
@@ -2509,9 +2520,14 @@ fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFound
 /// (`GetDestination`, `UpdateDestination`, `DeleteDestination`) and of the
 /// notification-configuration surface (`GetNotificationConfiguration`,
 /// `UpdateNotificationConfiguration`) carry none of the three, where a managed thing's
-/// carry all of them ([`managed_thing_not_found_on_read`]). A resource stated this way is
+/// carry all of them ([`managed_thing_not_found_on_read`]). Both of those surfaces are
 /// stated this way by EVERY operation that resolves one and finds none, read and mutation
-/// alike, so those two surfaces reach for this and not for a reason of their own.
+/// alike, so they reach for this and not for a reason of their own.
+///
+/// A resource whose paths are recorded wording the SAME absence differently reaches for this
+/// on the paths that state nothing only: an event log configuration's update answers this
+/// empty body where its read words a sentence
+/// ([`event_log_configuration_not_found`]).
 pub fn bare_resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: None,

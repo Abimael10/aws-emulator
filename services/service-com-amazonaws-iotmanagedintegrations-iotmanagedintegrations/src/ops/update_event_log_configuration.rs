@@ -204,10 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(configuration) = store.event_log_configuration_in_mut(&region, &input.id) else {
             drop(store);
             audit(&akid, &region, "not-found");
-            // The one fixed sentence this resource's 404s carry, read and mutation alike.
+            // WHAT the 404 body says belongs to the PATH that resolved the configuration:
+            // this path states the absence with NONE of the exception's optional members,
+            // where the read path words the resource's own sentence
+            // (`crate::state::event_log_configuration_not_found`). So a caller that tells
+            // the two paths apart by the body reads from each what that path answers.
             return Err(
                 UpdateEventLogConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::event_log_configuration_not_found(),
+                    crate::state::bare_resource_not_found(),
                 )
                 .into(),
             );

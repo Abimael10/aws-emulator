@@ -13,11 +13,12 @@
 //! created in another region — and a request a modelled constraint refuses changes nothing.
 //!
 //! Each resource states its 404 in the words of the PATH that resolved it, which is what a
-//! client reads: an event log configuration's reason is fixed text naming nothing from the
-//! request ([`EVENT_LOG_ABSENT_REASON`]), a READ of an OTA task configuration quotes the
-//! identifier ([`ota_task_absent_reason`]) where a DELETE of one states that it found
-//! nothing to delete ([`OTA_TASK_DELETE_ABSENT_REASON`]), and none of them carries the
-//! optional `ResourceId` or `ResourceType` member of the error shape.
+//! client reads: a READ or a DELETE that resolves an event log configuration words fixed
+//! text naming nothing from the request ([`EVENT_LOG_ABSENT_REASON`]) where its UPDATE
+//! words no sentence at all, a READ of an OTA task configuration quotes the identifier
+//! ([`ota_task_absent_reason`]) where a DELETE of one states that it found nothing to delete
+//! ([`OTA_TASK_DELETE_ABSENT_REASON`]), and none of them carries the optional `ResourceId`
+//! or `ResourceType` member of the error shape.
 //!
 //! The recorded units this was derived from (a scoped and a wildcard event log
 //! configuration deleted then read, an OTA task configuration deleted then read, and a
@@ -302,6 +303,33 @@ fn assert_absent(case: &str, reply: &Reply, reason: &str) {
     }
 }
 
+/// Assert one answer is the 404 of a path that words NO sentence for the absence: the
+/// modelled status and code, the message member on the wire as JSON `null` (an omitted key
+/// reads back as the empty string), and neither other optional member of the error shape.
+fn assert_absent_without_a_sentence(case: &str, reply: &Reply) {
+    assert_refused(case, reply, 404, NOT_FOUND);
+    for member in ["Message", "ResourceId", "ResourceType"] {
+        assert_eq!(
+            reply.member(member),
+            None,
+            "case {case:?}: expected the 404 to carry no {member}, got {:?} in body {:?}",
+            reply.member(member),
+            reply.body
+        );
+    }
+    let object = reply
+        .body
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a JSON object, got {:?}", reply.body));
+    assert_eq!(
+        object.get("Message"),
+        Some(&Value::Null),
+        "case {case:?}: expected Message on the wire as JSON null, got {:?} in body {:?}",
+        object.get("Message"),
+        reply.body
+    );
+}
+
 /// Assert a get reports exactly the target and level the store should hold.
 fn assert_reports(
     case: &str,
@@ -411,10 +439,11 @@ async fn deleting_an_event_log_configuration_removes_it_from_the_store() {
             &delete_event_log(&router, &id).await,
             EVENT_LOG_ABSENT_REASON,
         );
-        assert_absent(
+        // The update is the one path of this surface that words no sentence for the
+        // absence.
+        assert_absent_without_a_sentence(
             &format!("{case}/update after the delete"),
             &update_event_log(&router, &id, "ERROR").await,
-            EVENT_LOG_ABSENT_REASON,
         );
 
         // And the target it configured is free: a create naming it again is accepted
@@ -685,10 +714,9 @@ async fn a_write_that_resolves_nothing_or_is_refused_changes_nothing() {
             &delete_event_log(&router, unknown).await,
             EVENT_LOG_ABSENT_REASON,
         );
-        assert_absent(
+        assert_absent_without_a_sentence(
             &format!("UpdateEventLogConfiguration/{why}"),
             &update_event_log(&router, unknown, "DEBUG").await,
-            EVENT_LOG_ABSENT_REASON,
         );
     }
 

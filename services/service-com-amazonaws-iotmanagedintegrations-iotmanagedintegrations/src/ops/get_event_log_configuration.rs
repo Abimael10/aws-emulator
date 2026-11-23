@@ -166,8 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = store
             .event_log_configuration_in(&region, &input.id)
             .ok_or_else(|| {
-                // One fixed sentence states an absent configuration, whatever operation
-                // resolved it and whatever made it absent.
+                // One fixed sentence states a configuration this path resolved and did not
+                // find, whatever made it absent.
                 GetEventLogConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::event_log_configuration_not_found(),
                 )
