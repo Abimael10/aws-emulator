@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBSnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBSnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation adds accounts to and removes accounts from the `restore`
+//! attribute of the manual DB snapshot the request names, and answers with the attribute as
+//! it now stands. An identifier that names no stored snapshot is the modelled
+//! `DBSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBSnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +136,27 @@ impl From<ModifyDBSnapshotAttributeErrorModeled> for ModifyDBSnapshotAttributeEr
     }
 }
 
+/// The modelled `DBSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in the
+/// one phrasing every operation of this service that resolves a DB snapshot answers
+/// (`crate::state::db_snapshot_not_found_message`).
+fn not_found(requested: &str) -> ModifyDBSnapshotAttributeError {
+    ModifyDBSnapshotAttributeErrorModeled::DBSnapshotNotFoundFault(DBSnapshotNotFoundFault {
+        message: Some(crate::state::db_snapshot_not_found_message(requested)),
+    })
+    .into()
+}
+
+/// The modelled `InvalidDBSnapshotStateFault` for a snapshot whose state does not allow
+/// sharing, carrying `why`.
+fn invalid_state(why: String) -> ModifyDBSnapshotAttributeError {
+    ModifyDBSnapshotAttributeErrorModeled::InvalidDBSnapshotStateFault(
+        InvalidDBSnapshotStateFault { message: Some(why) },
+    )
+    .into()
+}
+
 /// The `ModifyDBSnapshotAttribute` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +193,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBSnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBSnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBSnapshotAttribute"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBSnapshotAttributeError::validation)?;
+        // `AttributeName`: "To manage authorization for other Amazon Web Services accounts
+        // to copy or restore a manual DB snapshot, set this value to restore." It is the
+        // only attribute AWS defines, so any other name is refused rather than stored under
+        // a name nothing reports.
+        if input.attribute_name != crate::state::SNAPSHOT_RESTORE_ATTRIBUTE {
+            return Err(ModifyDBSnapshotAttributeError::validation(format!(
+                "invalid value '{}' for AttributeName: the only valid value is '{}'",
+                input.attribute_name,
+                crate::state::SNAPSHOT_RESTORE_ATTRIBUTE
+            )));
+        }
+        let to_add = input.values_to_add.unwrap_or_default();
+        let to_remove = input.values_to_remove.unwrap_or_default();
+        // Neither member publishes a `@length`, so their entry counts are the caller's to
+        // choose — and every check below is per-entry, running with this service's one
+        // state lock held. The counts are therefore bounded FIRST, so one request cannot
+        // make this handler's work grow without limit.
+        for (member, count) in [("ValuesToAdd", to_add.len()), ("ValuesToRemove", to_remove.len())]
+        {
+            crate::state::check_request_list_len(
+                member,
+                count,
+                crate::state::MAX_COLLECTION_ENTRIES,
+            )
+            .map_err(ModifyDBSnapshotAttributeError::validation)?;
+        }
+        for value in &to_add {
+            crate::state::check_snapshot_attribute_value("ValuesToAdd", value)
+                .map_err(ModifyDBSnapshotAttributeError::validation)?;
+        }
+        // A set, so the overlap test below costs one lookup per removed value rather than
+        // a scan of the added ones: the work stays the SUM of the two lists, never their
+        // product.
+        let adding: std::collections::BTreeSet<&str> = to_add.iter().map(String::as_str).collect();
+        for value in &to_remove {
+            crate::state::check_snapshot_attribute_value("ValuesToRemove", value)
+                .map_err(ModifyDBSnapshotAttributeError::validation)?;
+            // One call cannot both authorize and de-authorize the same account: the
+            // result would depend on the order the two lists were applied in.
+            if adding.contains(value.as_str()) {
+                return Err(ModifyDBSnapshotAttributeError::validation(format!(
+                    "value '{value}' cannot appear in both ValuesToAdd and ValuesToRemove"
+                )));
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: the snapshot is looked for in the region the request was signed
+        // for, under either the identifier it was taken as or its ARN, exactly as the
+        // matching report resolves one.
+        let requested = &input.db_snapshot_identifier;
+        let key = store
+            .resolve_db_snapshot_key(&region, requested)
+            .ok_or_else(|| not_found(requested))?;
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(record) = store.db_snapshots.get_mut(&(region, key)) else {
+            return Err(not_found(requested));
+        };
+        // This operation "adds an attribute and values to, or removes an attribute and
+        // values from, a MANUAL DB snapshot": the snapshots the service took for an
+        // instance's automated backups are not the account's to share, and the documented
+        // way to share their data is to copy one into a manual snapshot first. Sharing one
+        // is therefore the modelled state fault rather than an authorization nothing would
+        // honour.
+        if record.is_automated() {
+            return Err(invalid_state(format!(
+                "DB snapshot {} is an automated snapshot and cannot be shared; copy it to a \
+                 manual DB snapshot and share the copy",
+                record.snapshot_identifier
+            )));
+        }
+        // Only a finished snapshot can be shared: RDS answers the modelled state fault for
+        // one still being taken or copied, which is what a caller that shares straight after
+        // asking for the snapshot sees.
+        if record.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+            return Err(invalid_state(format!(
+                "DB snapshot {} is in {} state but must be {} to be shared",
+                record.snapshot_identifier,
+                record.status,
+                crate::state::SNAPSHOT_STATUS_AVAILABLE
+            )));
+        }
+
+        // The quota is on the accounts the snapshot ends up authorized for, so it is
+        // checked against the result of this call and the snapshot is left untouched when
+        // the call would exceed it. A value already present is not counted twice:
+        // `restore` is a SET of accounts, so authorizing the same account again changes
+        // nothing.
+        let mut authorized = record.restore_attribute.clone();
+        for value in &to_remove {
+            authorized.remove(value);
+        }
+        authorized.extend(to_add.iter().cloned());
+        if authorized.len() > crate::state::MAX_SNAPSHOT_SHARED_ACCOUNTS {
+            return Err(
+                ModifyDBSnapshotAttributeErrorModeled::SharedSnapshotQuotaExceededFault(
+                    SharedSnapshotQuotaExceededFault {
+                        message: Some(crate::state::shared_snapshot_quota_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        record.restore_attribute = authorized;
+
+        // The attribute is reported from the record this call just wrote, so the answer
+        // and a following `DescribeDBSnapshotAttributes` cannot disagree.
+        Ok(ModifyDBSnapshotAttributeOutput {
+            db_snapshot_attributes_result: Some(
+                crate::state::db_snapshot_restore_attribute_to_wire(record),
+            ),
+        })
     }
 }

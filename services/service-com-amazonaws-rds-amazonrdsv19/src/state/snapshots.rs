@@ -519,6 +519,27 @@ pub fn db_snapshot_not_found_message(named: &str) -> String {
     format!("DBSnapshot not found: {named}")
 }
 
+/// The `DBSnapshotAttributesResult` a DB snapshot's `restore` attribute projects onto.
+///
+/// `restore` is the one attribute AWS defines for a DB snapshot, and it is always reported:
+/// a snapshot nobody has been authorized for carries the attribute with an empty value
+/// list, which is how a caller reads "shared with no account". Both
+/// `DescribeDBSnapshotAttributes` and `ModifyDBSnapshotAttribute` answer with it, so
+/// neither can report it differently from the other — the reading
+/// [`restore_attribute_to_wire`] takes of a DB CLUSTER snapshot's attribute, onto this
+/// kind's own output shape.
+pub fn db_snapshot_restore_attribute_to_wire(
+    record: &DbSnapshotRecord,
+) -> DBSnapshotAttributesResult {
+    DBSnapshotAttributesResult {
+        db_snapshot_identifier: Some(record.snapshot_identifier.clone()),
+        db_snapshot_attributes: Some(vec![DBSnapshotAttribute {
+            attribute_name: Some(SNAPSHOT_RESTORE_ATTRIBUTE.to_string()),
+            attribute_values: Some(record.restore_attribute.iter().cloned().collect()),
+        }]),
+    }
+}
+
 /// How Amazon RDS words the DB CLUSTER snapshot not-found fault: the same
 /// `<type> not found: <name>` form [`db_snapshot_not_found_message`] words, for the cluster
 /// snapshot a request NAMED, carrying the request's own spelling of the identifier.
@@ -641,6 +662,12 @@ pub struct DbSnapshotRecord {
     /// brings back. Empty for a snapshot of a single-tenant instance, which holds none; see
     /// [`SnapshotTenantDatabaseRecord`].
     pub tenant_databases: Vec<SnapshotTenantDatabaseRecord>,
+    /// The accounts the `restore` attribute authorizes, which `ModifyDBSnapshotAttribute`
+    /// adds to and removes from and `DescribeDBSnapshotAttributes` reports; see
+    /// [`SNAPSHOT_RESTORE_ATTRIBUTE`]. A set, so authorizing an account twice changes
+    /// nothing and the report is ordered — exactly what
+    /// [`DbClusterSnapshotRecord::restore_attribute`] holds for a DB cluster snapshot.
+    pub restore_attribute: BTreeSet<String>,
     pub tags: Vec<Tag>,
 }
 
@@ -718,8 +745,18 @@ impl DbSnapshotRecord {
             snapshot_create_time: now_as_wire_timestamp(),
             storage,
             tenant_databases,
+            // A snapshot is taken authorized for nobody: `restore` carries an account only
+            // once `ModifyDBSnapshotAttribute` has put it there.
+            restore_attribute: BTreeSet::new(),
             tags,
         }
+    }
+
+    /// Whether this snapshot is public — its `restore` attribute authorizes every account;
+    /// see [`SNAPSHOT_ATTRIBUTE_ALL`]. The same reading
+    /// [`DbClusterSnapshotRecord::is_public`] takes of a DB cluster snapshot's attribute.
+    pub fn is_public(&self) -> bool {
+        self.restore_attribute.contains(SNAPSHOT_ATTRIBUTE_ALL)
     }
 
     /// `arn:aws:rds:<region>:<account>:snapshot:<identifier>`.

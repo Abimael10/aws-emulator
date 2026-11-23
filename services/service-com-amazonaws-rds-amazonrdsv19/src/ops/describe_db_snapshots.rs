@@ -232,13 +232,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|wanted| record.dbi_resource_id == *wanted)
             })
             // "If you don't specify a SnapshotType value, then both automated and
-            // manual snapshots are returned" — and this store holds no shared or
-            // public snapshots, so `IncludeShared` / `IncludePublic` add nothing.
-            .filter(|record| {
-                input
-                    .snapshot_type
-                    .as_ref()
-                    .is_none_or(|wanted| record.snapshot_type.eq_ignore_ascii_case(wanted))
+            // manual snapshots are returned". `public` selects by how the snapshot is
+            // SHARED rather than by how it came to be: the manual snapshots whose `restore`
+            // attribute carries `all`, which is what makes one "public and available for any
+            // Amazon Web Services account to copy or restore". `shared` selects none — a
+            // snapshot shared TO this account would be owned by another one, and every
+            // record here is this account's — so `IncludeShared` and `IncludePublic` widen
+            // the default with nothing a caller of this store is not already shown.
+            .filter(|record| match input.snapshot_type.as_deref() {
+                None => true,
+                Some(wanted) if wanted.eq_ignore_ascii_case("public") => record.is_public(),
+                Some(wanted) => record.snapshot_type.eq_ignore_ascii_case(wanted),
             })
             .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
             .map(|record| (record.snapshot_identifier.clone(), record.to_wire()))

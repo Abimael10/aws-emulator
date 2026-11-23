@@ -423,6 +423,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // itself, so a copy of one is a manual snapshot of the account's own, whatever
             // the source was.
             snapshot_type: crate::state::SNAPSHOT_TYPE_MANUAL.to_string(),
+            // The `restore` attribute authorizes accounts for the snapshot it is set on, so
+            // it is NOT part of what a copy carries over: the copy is shared with nobody
+            // until `ModifyDBSnapshotAttribute` authorizes an account for it.
+            restore_attribute: std::collections::BTreeSet::new(),
             ..source.clone()
         };
 
