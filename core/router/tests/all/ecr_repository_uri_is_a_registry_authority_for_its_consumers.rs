@@ -19,8 +19,9 @@
 //! infrastructure — the zone and the port of the served address are what keep the authority
 //! dialable here. That is the rule the owning crate states and its own suites pin
 //! (`services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`:
-//! `src/state/registry_address.rs`, `tests/all/repository_registry_uri.rs`), and this suite
-//! reads it where three crates have to agree on it.
+//! `src/state/registry_address.rs`'s `published_registry_authority`,
+//! `tests/all/repository_registry_uri.rs`, `tests/all/published_registry_address.rs`), and
+//! this suite reads it where three crates have to agree on it.
 //!
 //! Three crates have to agree for one of these deployments to publish that address:
 //! CloudFormation makes the create and publishes the repository's `RepositoryUri` attribute,
@@ -497,9 +498,8 @@ async fn a_published_repository_uri_names_the_registry_that_holds_it() {
             "case {case:?}: expected Amazon ECR to report the address the stack published, got \
              {reported}"
         );
-        // WHICH registry holds it is on the record beside the address: the owning account and
-        // the Region, which is what a reader recovers them from rather than from the authority
-        // it dials.
+        // WHICH registry holds it is on the record beside the address as well: the owning
+        // account and the Region, so the two readings of the one identity agree.
         let arn = held["repositoryArn"].as_str().unwrap_or_default();
         let names_the_registry = format!(":ecr:{}:{ACCOUNT}:repository/{repository}", row.region);
         assert!(

@@ -495,16 +495,26 @@ pub fn secret_arn(region: &str, name: &str) -> String {
 /// is about to create, which is the resource the action is taken on, and is why a policy
 /// scoping a create states the characters it ends in as a wildcard; nothing is stored by
 /// reading it.
+///
+/// "The ARN the account ALREADY holds a secret of that name under" is read as of `at`, the
+/// instant of the call: a secret whose permanent removal the clock has already made due
+/// ([`crate::state::Secret::purge_due`]) is held under that name no longer, so this is a
+/// create of a NEW secret and allocates it six fresh characters. Taking the removed secret's
+/// ARN instead would hand the new secret the destroyed one's identity, leaving an ARN a
+/// client, a template or a policy still holds a live handle on a secret it was never written
+/// for.
 #[must_use]
 pub fn created_secret_arn<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     name: &str,
+    at: ::std::time::SystemTime,
 ) -> String {
     let held = crate::state::service_state(engine).and_then(|state| {
         let store = state.lock();
         store
             .named(region, name)
+            .filter(|secret| !secret.purge_due(at))
             .map(|secret| secret.arn.clone())
     });
     held.unwrap_or_else(|| {

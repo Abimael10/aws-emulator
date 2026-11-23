@@ -616,6 +616,13 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
             "case {case:?}: expected each registry's repository of one name to be published \
              at the authority naming its own registry, got {other_uri:?} for both"
         );
+        for (region, uri) in [(pair.home, &home_uri), (pair.other, &other_uri)] {
+            assert!(
+                uri.contains(&format!(".{region}.")),
+                "case {case:?}: expected the published authority {uri:?} to name the Region of \
+                 the registry holding it, {region:?}"
+            );
+        }
         assert_ne!(
             other_arn, home_arn,
             "case {case:?}: expected two Regions' repositories to carry two ARNs, got \
@@ -886,9 +893,9 @@ async fn a_cached_repository_is_reported_at_the_address_it_is_published_at() {
             "case {case:?}: expected {expected:?}, got {reported:?}"
         );
 
-        // The two parts a reader splits the value into: the address it dials, and the path
-        // after the first '/', which is exactly the repository's own name — the rule's
-        // prefix and all, however many segments it carries.
+        // The two parts a reader splits the value into: the authority it dials and parses,
+        // and the path after the first '/', which is exactly the repository's own name — the
+        // rule's prefix and all, however many segments it carries.
         assert_published_address(case, &reported, import.region, &repository);
     }
 }

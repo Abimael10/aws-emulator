@@ -530,12 +530,13 @@ pub const SCHEDULE_EXPRESSION_SYNTAX: &str = "ScheduleExpression must be a rate(
 /// `AutomaticallyAfterDays` that stands for one — describe a window with no
 /// start, and the parameter is refused rather than stored.
 ///
-/// The CLASS and the status of this refusal are AWS's (`InvalidParameterException`, HTTP
-/// 400, as a recorded refusal of these rules shows); the SENTENCE states the documented
-/// rule above and is this emulator's own wording of it, since no recording of this service
-/// discloses the text — it interpolates nothing from the request either way.
+/// The CLASS, the status and the SENTENCE are AWS's (`InvalidParameterException`, HTTP 400),
+/// as a recorded refusal of these rules shows. The sentence names BOTH members that can
+/// start the window — a schedule expression and a rotation frequency — because either one
+/// satisfies the rule, and it interpolates nothing from the request.
 pub const DURATION_WITHOUT_SCHEDULE: &str =
-    "You can't specify a rotation Duration without a rotation schedule.";
+    "You must provide a schedule expression or rotation frequency when using the duration \
+     option.";
 
 /// The schedule the rules in `rules` rotate the secret on, or the
 /// `InvalidParameterException` message for rules that cannot hold together.
@@ -2171,6 +2172,22 @@ impl Secret {
         self.next_rotation_date = None;
     }
 
+    /// Whether the clock has ALREADY made this secret's permanent removal due: the
+    /// instant [`schedule_deletion`] recorded it for has passed, so the secret is one
+    /// the store owes the removal of and no longer holds under its name or its ARN.
+    ///
+    /// The one reading of "already removed", so a reader that answers from a secret and
+    /// [`expire_due`], which materialises the removal, cannot disagree about which
+    /// secrets the store still holds: a removal the clock has made due was owed at this
+    /// instant whether or not anybody called, and a name or an ARN it frees is free for
+    /// every caller at once.
+    ///
+    /// [`schedule_deletion`]: Secret::schedule_deletion
+    /// [`expire_due`]: ComAmazonawsSecretsmanagerSecretsmanagerState::expire_due
+    pub fn purge_due(&self, now: SystemTime) -> bool {
+        self.purge_at.is_some_and(|at| at <= now)
+    }
+
     /// Whether a scheduled deletion of this secret can still be cancelled.
     ///
     /// `DeletionDate` is "the date and time after which this secret Secrets
@@ -3218,7 +3235,7 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
         let due: Vec<SecretKey> = self
             .secrets
             .iter()
-            .filter(|(_, secret)| secret.purge_at.is_some_and(|at| at <= now))
+            .filter(|(_, secret)| secret.purge_due(now))
             .map(|(key, _)| key.clone())
             .collect();
         for key in due {

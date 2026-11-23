@@ -153,7 +153,10 @@
 //! element of a list that is not `@sparse` also has to be present, or one whose list members
 //! are nested inside structures, which are looked up under their own member names — states
 //! that set itself and hands it to [`aws_validation_refusal_over_elements_stating`], which
-//! keeps every other clause, the value half and the envelope here.
+//! keeps every other clause, the value half and the envelope here — or, where that service
+//! ALSO quotes the collection and withholds a `@sensitive` member's value, to
+//! [`aws_validation_refusal_over_elements_stating_quoting_withholding`], the one entry point
+//! taking all three of those choices at once.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -2050,6 +2053,40 @@ pub fn aws_validation_refusal_over_elements_stating_withholding(
         &[],
         &quote_pattern,
         &|_| None,
+        &withholds_value,
+        &element_set,
+        &|_| None,
+    )
+}
+
+/// [`aws_validation_refusal_over_elements_stating`], with BOTH the collection a grouped
+/// clause quotes and the members whose value the refusal WITHHOLDS decided by the caller —
+/// the entry point for a service that takes all three choices this module offers.
+///
+/// Each is the choice one of the entry points above takes alone, composed over the one
+/// [`grouped_refusal`] body: the nested requirement of a grouped clause
+/// ([`aws_validation_refusal_over_elements_stating`], for a service whose list members sit
+/// INSIDE structures the handed-over schemas name under their own member names, so the set
+/// cannot be looked up by the member path the clause is stated at), the collection that
+/// clause quotes ([`aws_validation_refusal_over_elements_quoting`], which only the request
+/// can answer) and the value half of every OTHER clause
+/// ([`aws_validation_refusal_over_elements_withholding`], for a refusal that withholds what
+/// a `@sensitive` member submitted). A grouped clause is never asked the last question, so
+/// the rules compose rather than overlap, and everything none of them covers — the grouping,
+/// the envelope, the member paths, the `@pattern` rendering and every other requirement — is
+/// that same body's and the framework's.
+pub fn aws_validation_refusal_over_elements_stating_quoting_withholding(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    quoted_collection: impl Fn(&str) -> Option<String>,
+    withholds_value: impl Fn(&str) -> bool,
+    element_set: impl Fn(&str) -> Option<String>,
+) -> Option<Refused> {
+    grouped_refusal(
+        refusal,
+        &[],
+        &quote_pattern,
+        &quoted_collection,
         &withholds_value,
         &element_set,
         &|_| None,

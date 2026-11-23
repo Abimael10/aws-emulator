@@ -25,7 +25,11 @@
 //!   `NextToken` outstanding on its final page — including the walk over a
 //!   selection that is empty;
 //! * an empty `Description` describes nothing, so it is indistinguishable on
-//!   read-back from a create or an update that named none.
+//!   read-back from a create or an update that named none;
+//! * the six characters a secret's ARN ends in belong to the SECRET and not to its
+//!   name, so a secret created under the name of one the service has already
+//!   removed carries six fresh ones — and every handle on the removed secret, its
+//!   ARN and the ids of the versions it held, names nothing from then on.
 //!
 //! Every test is a TABLE over the class its rule generalises: the recovery window
 //! and the rotation schedule, the form of the `SecretId` and the number of
@@ -33,10 +37,12 @@
 //! operation set the description.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::state::{
-    MAX_RECOVERY_WINDOW_DAYS, MIN_RECOVERY_WINDOW_DAYS,
+    value_version_not_found_message, ARN_SUFFIX_LEN, MAX_RECOVERY_WINDOW_DAYS,
+    MIN_RECOVERY_WINDOW_DAYS, NAME_SCHEDULED_FOR_DELETION_MESSAGE, SECRET_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -891,4 +897,278 @@ async fn an_empty_description_is_the_same_as_none_at_all() {
         empty.get("Description").is_none(),
         "expected no Description key at all, got {empty}"
     );
+}
+
+/// How long a test waits for a change the clock owes — here the permanent removal a forced
+/// delete schedules — before it gives up. Generous on purpose: the test waits for the
+/// CONDITION (the name is free again) rather than for a span, so a loaded machine only takes
+/// more turns around the loop.
+const REMOVAL_WAIT: Duration = Duration::from_secs(60);
+
+/// How often such a loop looks again.
+const LOOK_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Send one request that must be refused, and return its wire error code and message.
+async fn refusal(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> (String, String) {
+    let (status, parsed) = call(router, operation, &body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a 400 client error from {operation}, got {status} with body \
+         {parsed}"
+    );
+    let raw = parsed
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no __type in error body {parsed}"));
+    let message = parsed
+        .get("message")
+        .or_else(|| parsed.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no message in error body {parsed}"))
+        .to_string();
+    (
+        raw.split('#').next_back().unwrap_or(raw).to_string(),
+        message,
+    )
+}
+
+/// Assert that `secret_id` names nothing this service holds, through every operation that
+/// resolves a `SecretId` and has nothing else to say about it first.
+async fn assert_names_nothing(router: &MultiServiceRouter, secret_id: &str, case: &str) {
+    for operation in ["GetSecretValue", "DescribeSecret", "RestoreSecret"] {
+        let (code, message) =
+            refusal(router, operation, json!({"SecretId": secret_id}), case).await;
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected {operation} on a retired ARN to find nothing, got {code} \
+             with message {message:?}"
+        );
+        assert_eq!(
+            message, SECRET_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the secret-not-found sentence from {operation}, got \
+             {message:?}"
+        );
+    }
+}
+
+/// Create a secret under `name`, waiting out the removal a forced delete of a same-named
+/// secret owes: while that secret is still there the name is reserved and the create is
+/// refused, so the loop looks again until the create goes through or [`REMOVAL_WAIT`]
+/// passes. Answers the ARN and the version id the create staked.
+async fn create_once_the_name_is_free(
+    router: &MultiServiceRouter,
+    name: &str,
+    material: &str,
+    case: &str,
+) -> (String, String) {
+    let deadline = Instant::now() + REMOVAL_WAIT;
+    loop {
+        let (status, parsed) = call(
+            router,
+            "CreateSecret",
+            &json!({"Name": name, "SecretString": material}),
+        )
+        .await;
+        if status == 200 {
+            return (text(&parsed, "ARN", case), text(&parsed, "VersionId", case));
+        }
+        let refused = parsed
+            .get("message")
+            .or_else(|| parsed.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            refused, NAME_SCHEDULED_FOR_DELETION_MESSAGE,
+            "case {case:?}: expected the create to be refused only while the name is still \
+             reserved, got {status} with body {parsed}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the name was still reserved when the wait ran out, last answer \
+             {refused:?}"
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// The six characters a secret's ARN ends in, and the ARN up to them.
+fn suffix_of(arn: &str, case: &str) -> (String, String) {
+    let cut = arn
+        .len()
+        .checked_sub(ARN_SUFFIX_LEN + 1)
+        .unwrap_or_else(|| panic!("case {case:?}: {arn} is too short to end in a suffix"));
+    assert_eq!(
+        arn.as_bytes().get(cut),
+        Some(&b'-'),
+        "case {case:?}: expected {arn} to end in a hyphen and {ARN_SUFFIX_LEN} characters"
+    );
+    (arn[..cut].to_string(), arn[cut + 1..].to_string())
+}
+
+#[tokio::test]
+async fn a_secret_created_under_a_destroyed_secrets_name_gets_an_identity_of_its_own() {
+    // A secret's ARN ends in six random characters that belong to the SECRET, not to its
+    // name, so a secret created under the name of one the service has already removed is a
+    // new secret with a new ARN — and every handle on the removed secret (its ARN, and the
+    // ids of the versions it held) names nothing from then on.
+    //
+    // The rows differ along how the destroyed secret was removed and what it held: the
+    // forced delete alone, the same after a windowed delete was already pending, a secret
+    // holding several versions, and a name reused twice over.
+    let rows: &[(&str, bool, usize, usize)] = &[
+        ("a forced delete", false, 1_usize, 1_usize),
+        ("a forced delete over a pending window", true, 1, 1),
+        ("a forced delete of a secret holding three versions", false, 3, 1),
+        ("a name reused twice over", false, 1, 2),
+    ];
+    for (case, window_first, versions, generations) in rows {
+        let router = emulator();
+        let name = format!("reused/{}", case.replace(' ', "-"));
+        let mut retired: Vec<String> = Vec::new();
+        let mut retired_versions: Vec<String> = Vec::new();
+        let mut live = {
+            let created = ok(
+                &router,
+                "CreateSecret",
+                json!({"Name": &name, "SecretString": "original-material"}),
+                case,
+            )
+            .await;
+            let arn = text(&created, "ARN", case);
+            retired_versions.push(text(&created, "VersionId", case));
+            for version in 1..*versions {
+                let written = ok(
+                    &router,
+                    "PutSecretValue",
+                    json!({"SecretId": &arn, "SecretString": format!("material-{version}")}),
+                    case,
+                )
+                .await;
+                retired_versions.push(text(&written, "VersionId", case));
+            }
+            arn
+        };
+
+        for generation in 0..*generations {
+            if *window_first {
+                ok(
+                    &router,
+                    "DeleteSecret",
+                    json!({"SecretId": &live, "RecoveryWindowInDays": 7}),
+                    case,
+                )
+                .await;
+            }
+            ok(
+                &router,
+                "DeleteSecret",
+                json!({"SecretId": &live, "ForceDeleteWithoutRecovery": true}),
+                case,
+            )
+            .await;
+            retired.push(live.clone());
+
+            let (reborn, version) = create_once_the_name_is_free(
+                &router,
+                &name,
+                &format!("reborn-material-{generation}"),
+                case,
+            )
+            .await;
+
+            // The new secret is the same NAME in the same account and Region, so everything
+            // of the ARN but those six characters is the same — and those six are its own.
+            let (stem, fresh) = suffix_of(&reborn, case);
+            let (retired_stem, _) = suffix_of(&live, case);
+            assert_eq!(
+                stem, retired_stem,
+                "case {case:?}: expected the re-created secret's ARN to name the same secret \
+                 name, got {reborn} against {live}"
+            );
+            assert_eq!(
+                fresh.len(),
+                ARN_SUFFIX_LEN,
+                "case {case:?}: expected {ARN_SUFFIX_LEN} trailing characters, got {fresh:?}"
+            );
+            assert!(
+                fresh.chars().all(char::is_alphanumeric),
+                "case {case:?}: expected the trailing characters to be letters and digits, got \
+                 {fresh:?}"
+            );
+            for gone in &retired {
+                assert_ne!(
+                    &reborn, gone,
+                    "case {case:?}: expected the re-created secret to carry an ARN of its own, \
+                     got the destroyed secret's {gone}"
+                );
+            }
+
+            // Every handle on a destroyed secret names nothing: its ARN, and the ids of the
+            // versions it held — which the live secret of the same name does not answer for
+            // either.
+            for gone in &retired {
+                assert_names_nothing(&router, gone, case).await;
+            }
+            for gone in &retired_versions {
+                let (code, message) = refusal(
+                    &router,
+                    "GetSecretValue",
+                    json!({"SecretId": &name, "VersionId": gone}),
+                    case,
+                )
+                .await;
+                assert_eq!(
+                    code, "ResourceNotFoundException",
+                    "case {case:?}: expected a destroyed secret's version id to resolve to \
+                     nothing, got {code} with message {message:?}"
+                );
+                assert_eq!(
+                    message,
+                    value_version_not_found_message(gone),
+                    "case {case:?}: expected the version-not-found sentence naming {gone}, got \
+                     {message:?}"
+                );
+            }
+
+            // The secret that now holds the name answers from its own material, read back
+            // through its own ARN.
+            let read = ok(
+                &router,
+                "GetSecretValue",
+                json!({"SecretId": &reborn}),
+                case,
+            )
+            .await;
+            assert_eq!(
+                text(&read, "SecretString", case),
+                format!("reborn-material-{generation}"),
+                "case {case:?}: expected the re-created secret to hold its own material, got \
+                 {read}"
+            );
+            retired_versions.push(version);
+            live = reborn;
+        }
+
+        // The six characters belong to the LIVE secret for as long as it exists: the name
+        // keeps resolving to the ARN the last create allocated.
+        let described = ok(
+            &router,
+            "DescribeSecret",
+            json!({"SecretId": &name}),
+            case,
+        )
+        .await;
+        assert_eq!(
+            text(&described, "ARN", case),
+            live,
+            "case {case:?}: expected the name to keep resolving to the live secret's own ARN, \
+             got {described}"
+        );
+    }
 }

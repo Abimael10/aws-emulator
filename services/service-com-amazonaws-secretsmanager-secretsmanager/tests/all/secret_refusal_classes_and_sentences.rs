@@ -23,6 +23,10 @@
 //!    longer value as that prefix plus an elision marker — a `@pattern` without the
 //!    whole-value anchors the model writes around it, and an enumerated type's admitted
 //!    values sorted.
+//! 4. A constraint one of a LIST member's ELEMENTS broke is stated once at that list member,
+//!    quoting the whole list the member held and nesting the element shape's WHOLE declared
+//!    constraint set — the expression of a `@pattern` inside such a set as the model writes
+//!    it — so two offending elements of one list are one validation error about one member.
 //!
 //! The rows differ along what each rule generalises over: the operation and member that
 //! carried the value, the constraint class (`@length` on a string and on a blob, `@pattern`,
@@ -859,4 +863,202 @@ async fn a_constraint_refusal_states_the_member_and_bounds_what_it_echoes() {
         "case \"a tag key many times its maximum\": the clause must echo at most \
          {ECHO_BOUND} bytes of the key, got {message:?}"
     );
+}
+
+/// What every element of a `Filter`'s `Values` has to satisfy, as the clause stated at that
+/// member nests it: the whole set the element shape `FilterValueStringType` declares
+/// (`@length` 0..512 and that `@pattern`;
+/// `smithy_query(query="shape",shape="FilterValueStringType")`), with the expression as the
+/// MODEL writes it — anchors included, which is the rendering a nested set carries.
+const FILTER_VALUE_SET: &str = "Member must satisfy constraint: [Member must have length less \
+     than or equal to 512, Member must have length greater than or equal to 0, Member must \
+     satisfy regular expression pattern: ^\\!?[a-zA-Z0-9 :_@\\/\\+\\=\\.\\-\\!]*$]";
+
+/// The same for `SecretIdListType`'s element shape `SecretIdType` (`@length` 1..2048, no
+/// pattern; `smithy_query(query="shape",shape="SecretIdListType")`).
+const SECRET_ID_SET: &str = "Member must satisfy constraint: [Member must have length less than \
+     or equal to 2048, Member must have length greater than or equal to 1]";
+
+/// The same for `SecretVersionStagesType`'s element shape `SecretVersionStageType`
+/// (`@length` 1..256; `smithy_query(query="shape",shape="SecretVersionStagesType")`).
+const VERSION_STAGE_SET: &str = "Member must satisfy constraint: [Member must have length less \
+     than or equal to 256, Member must have length greater than or equal to 1]";
+
+/// The published maximum of `FilterValueStringType` (`@length` 0..512).
+const FILTER_VALUE_MAX: usize = 512;
+
+/// The published maximum of `SecretVersionStageType` (`@length` 1..256).
+const VERSION_STAGE_MAX: usize = 256;
+
+/// The clause a constraint broken by one of `member`'s elements is stated with: the member
+/// itself, the whole list the request carried there, and the element shape's whole set.
+fn element_clause(member: &str, held: &[&str], set: &str) -> String {
+    format!(
+        "Value '[{}]' at '{member}' failed to satisfy constraint: {set}",
+        held.join(", ")
+    )
+}
+
+#[tokio::test]
+async fn a_constraint_one_of_a_lists_elements_broke_is_stated_at_that_list() {
+    // A constraint declared on a list's ELEMENT shape is checked element by element, and the
+    // refusal states it once at the LIST member: the value echoed is the whole list the
+    // member held, and the requirement is the element shape's WHOLE declared set rather than
+    // the one constraint that happened to fail — so a caller is told what every element of
+    // that member has to satisfy, and two offending elements of one list are ONE validation
+    // error about one member.
+    //
+    // The rows differ along which member carried the list (three operations, three element
+    // shapes), which constraint the element broke (`@pattern` and both ends of `@length`),
+    // how many elements the list held, which position offended, and how deep the list sits
+    // (a list of its own, and one inside a structure inside a list).
+    let router = emulator();
+    create(&router, "clauses/elements", "setup").await;
+    let over_long_value = run("x", FILTER_VALUE_MAX + 1);
+    let over_long_stage = run("v", VERSION_STAGE_MAX + 1);
+    let rows: Vec<(String, &str, Value, String)> = vec![
+        (
+            "one value outside the element pattern".to_string(),
+            "ListSecrets",
+            json!({"Filters": [{"Key": "name", "Values": ["clauses*"]}]}),
+            element_clause("filters.1.member.values", &["clauses*"], FILTER_VALUE_SET),
+        ),
+        (
+            "a later value outside the element pattern".to_string(),
+            "ListSecrets",
+            json!({"Filters": [{"Key": "name", "Values": ["fine", "clauses*"]}]}),
+            element_clause(
+                "filters.1.member.values",
+                &["fine", "clauses*"],
+                FILTER_VALUE_SET,
+            ),
+        ),
+        (
+            "two values of one list outside the element pattern".to_string(),
+            "ListSecrets",
+            json!({"Filters": [{"Key": "name", "Values": ["a*", "b?"]}]}),
+            element_clause("filters.1.member.values", &["a*", "b?"], FILTER_VALUE_SET),
+        ),
+        (
+            "a value of the second filter in the list".to_string(),
+            "ListSecrets",
+            json!({
+                "Filters": [
+                    {"Key": "name", "Values": ["ok"]},
+                    {"Key": "description", "Values": ["bad*"]},
+                ],
+            }),
+            element_clause("filters.2.member.values", &["bad*"], FILTER_VALUE_SET),
+        ),
+        (
+            "a value one character past the element maximum".to_string(),
+            "ListSecrets",
+            json!({"Filters": [{"Key": "name", "Values": [over_long_value.clone()]}]}),
+            element_clause(
+                "filters.1.member.values",
+                &[over_long_value.as_str()],
+                FILTER_VALUE_SET,
+            ),
+        ),
+        (
+            "a filter value of the batched read".to_string(),
+            "BatchGetSecretValue",
+            json!({"Filters": [{"Key": "name", "Values": ["clauses!!*"]}]}),
+            element_clause("filters.1.member.values", &["clauses!!*"], FILTER_VALUE_SET),
+        ),
+        (
+            "an id below the element minimum, in a list of its own".to_string(),
+            "BatchGetSecretValue",
+            json!({"SecretIdList": ["clauses/elements", ""]}),
+            element_clause("secretIdList", &["clauses/elements", ""], SECRET_ID_SET),
+        ),
+        (
+            "a staging label past the element maximum".to_string(),
+            "PutSecretValue",
+            json!({
+                "SecretId": "clauses/elements",
+                "SecretString": "v",
+                "ClientRequestToken": token("stages"),
+                "VersionStages": [over_long_stage.clone()],
+            }),
+            element_clause(
+                "versionStages",
+                &[over_long_stage.as_str()],
+                VERSION_STAGE_SET,
+            ),
+        ),
+    ];
+    for (case, operation, body, clause) in rows {
+        let answered = err(&router, operation, body, &case).await;
+        refused(&case, answered, CONSTRAINT, &one_violation(&clause));
+    }
+
+    // A member that is not a list element keeps its own clause, so a request breaking both
+    // is two validation errors — the grouped one and the member's own.
+    let case = "a list element beside a member of its own";
+    let (_, message) = err(
+        &router,
+        "ListSecrets",
+        json!({
+            "MaxResults": MAX_RESULTS_MAX + 1,
+            "Filters": [{"Key": "name", "Values": ["both*"]}],
+        }),
+        case,
+    )
+    .await;
+    let grouped = element_clause("filters.1.member.values", &["both*"], FILTER_VALUE_SET);
+    let scalar = format!(
+        "Value '{}' at 'maxResults' failed to satisfy constraint: Member must have value less \
+         than or equal to {MAX_RESULTS_MAX}",
+        MAX_RESULTS_MAX + 1
+    );
+    assert!(
+        message.starts_with("2 validation errors detected: "),
+        "case {case:?}: expected two counted violations, got {message:?}"
+    );
+    for expected in [&grouped, &scalar] {
+        assert!(
+            message.contains(expected),
+            "case {case:?}: expected the message to carry {expected:?}, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rotation_duration_with_nothing_to_start_it_names_both_members_that_would() {
+    // Rules naming a duration and no schedule describe a window with no start, and the
+    // refusal states the rule: a schedule expression OR a rotation frequency satisfies it,
+    // so the sentence names both rather than only one of them. Fixed text, with nothing of
+    // the request interpolated — the rows run over the duration the rules named and over the
+    // secret the call addressed, since neither enters the sentence.
+    const SENTENCE: &str = "You must provide a schedule expression or rotation frequency when \
+                            using the duration option.";
+    let router = emulator();
+    assert_eq!(
+        DURATION_WITHOUT_SCHEDULE, SENTENCE,
+        "the sentence every operation raising this refusal answers with must be AWS's"
+    );
+    for (case, name) in [
+        ("a secret with no rotation configured", "duration/plain"),
+        ("a secret named by a longer name", "duration/another-secret"),
+    ] {
+        create(&router, name, case).await;
+        for duration in ["1h", "2h", "12h", "99h"] {
+            let case = format!("{case}, a window of {duration}");
+            let answered = err(
+                &router,
+                "RotateSecret",
+                json!({"SecretId": name, "RotationRules": {"Duration": duration}}),
+                &case,
+            )
+            .await;
+            assert!(
+                !answered.1.contains(duration) && !answered.1.contains(name),
+                "case {case:?}: the sentence states the rule and nothing of the request, got \
+                 {:?}",
+                answered.1
+            );
+            refused(&case, answered, PARAMETER, SENTENCE);
+        }
+    }
 }

@@ -382,11 +382,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name plus the six random characters a secret's ARN ends in. Allocated here,
         // before anything is read or stored, because it is the resource the authorization
         // decision below is made against — a create addresses the secret it creates.
+        //
+        // ONE instant stands for this whole create — the allocation, the removals the clock
+        // has already made due, and the dates the secret is stamped with — so what the ARN
+        // was allocated against and what the store holds when the secret lands cannot
+        // disagree: a name whose secret is removed as of this instant is a free name, and
+        // the secret created under it gets fresh characters.
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::authorization::created_secret_arn(
             &*self.engine,
             &region,
             &input.name,
+            now,
         );
         // IAM authorizes every call to this service against the caller's
         // identity-based policies BEFORE the operation reads or writes anything, so a
@@ -458,7 +466,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the guard is held.
         {
             let mut store = state.lock();
-            let now = ::std::time::SystemTime::now();
             store.expire_due(now);
 
             if let Some(existing) = store.named(&region, &input.name) {
@@ -585,7 +592,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replica_failures.push(failure);
         }
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A secret name belongs to one secret, and the guard was released while the
         // initial value was sealed: the name is answered against what the store
