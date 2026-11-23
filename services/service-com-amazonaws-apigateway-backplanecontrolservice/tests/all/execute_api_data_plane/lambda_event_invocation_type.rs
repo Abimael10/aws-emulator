@@ -30,7 +30,9 @@
 //! Only a cross-service suite can pin this: the function is AWS Lambda's, the item is Amazon
 //! DynamoDB's, and the api, the stage and the integration are API Gateway's. The wire harness
 //! is the sibling `proxy_binary_media_types` suite's, reused rather than stood up a second
-//! way; only the engine this one mounts a THIRD service on is its own.
+//! way; only the engine this one mounts a THIRD service on is its own — and that engine, the
+//! marker table and the polling of it are in turn reused by the sibling
+//! `accepted_invocation_method_response` suite, which is why they are visible to it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,7 +51,7 @@ use crate::proxy_binary_media_types::{
 const FUNCTION: &str = "apigw-invocation-type";
 
 /// The table the handler writes its marker item into.
-const TABLE: &str = "apigw-invocation-marks";
+pub(super) const TABLE: &str = "apigw-invocation-marks";
 
 /// The header a mapped-from-the-request method takes its invocation type from, declared on
 /// the method and mapped onto the integration request by the integration.
@@ -96,7 +98,7 @@ def lambda_handler(event, context):
 
 /// API Gateway, AWS Lambda and Amazon DynamoDB over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(super) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: the control-plane calls carry a credential
@@ -118,7 +120,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One Amazon DynamoDB call over its `awsJson1_0` wire.
-async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> Answer {
+pub(super) async fn dynamodb(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> Answer {
     dispatch(
         router,
         "POST",
@@ -136,7 +142,7 @@ async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> 
 
 /// The marker item the handler wrote for the resource path `pk`, or `None` when nothing is
 /// stored under it — which is what a function that never ran leaves behind.
-async fn marker(router: &MultiServiceRouter, case: &str, pk: &str) -> Option<Value> {
+pub(super) async fn marker(router: &MultiServiceRouter, case: &str, pk: &str) -> Option<Value> {
     let read = dynamodb(
         router,
         "GetItem",
@@ -156,7 +162,7 @@ async fn marker(router: &MultiServiceRouter, case: &str, pk: &str) -> Option<Val
 /// Wait until the marker item for `pk` is there, and answer whether it arrived: the run an
 /// accepted asynchronous invocation makes happens after the caller was answered, so the
 /// CONDITION is polled rather than a span waited out.
-async fn marked(router: &MultiServiceRouter, case: &str, pk: &str) -> bool {
+pub(super) async fn marked(router: &MultiServiceRouter, case: &str, pk: &str) -> bool {
     let looks = WAIT.as_millis() / LOOK.as_millis().max(1);
     for _ in 0..looks {
         if marker(router, case, pk).await.is_some() {
@@ -170,7 +176,7 @@ async fn marked(router: &MultiServiceRouter, case: &str, pk: &str) -> bool {
 /// Poll `DescribeTable` until DynamoDB first reports the table `ACTIVE`, which is when it
 /// serves the writes the handler makes ("you can perform read and write operations only on an
 /// ACTIVE table").
-async fn wait_until_table_active(router: &MultiServiceRouter) {
+pub(super) async fn wait_until_table_active(router: &MultiServiceRouter) {
     let looks = WAIT.as_millis() / LOOK.as_millis().max(1);
     let mut last = Value::Null;
     for _ in 0..looks {
@@ -250,9 +256,12 @@ const METHODS: &[Method] = &[
     },
 ];
 
-/// Stand the table, the function and the api up, and deploy the api to [`STAGE`]. Answers the
-/// api id.
-async fn deployed(router: &MultiServiceRouter) -> String {
+/// Create the marker table [`TABLE`] the handler of a suite of this concern writes into, keyed
+/// by the resource path a run was reached through.
+///
+/// `pub(super)` because the sibling `accepted_invocation_method_response` suite stands the same
+/// marker table up: ONE stand-up of it, so the two suites cannot drift apart.
+pub(super) async fn given_marker_table(router: &MultiServiceRouter) {
     let created = dynamodb(
         router,
         "CreateTable",
@@ -271,21 +280,32 @@ async fn deployed(router: &MultiServiceRouter) -> String {
         created.status,
         created.text()
     );
+}
 
+/// Create the function `name` running `source`, reading [`TABLE`] from its environment, and
+/// grant API Gateway the permission that admits an integration's invocation of it. Answers its
+/// `FunctionArn`.
+///
+/// `pub(super)` for the reason [`given_marker_table`] is: the sibling suite stands up a
+/// function of its own the same way.
+pub(super) async fn given_marking_function(
+    router: &MultiServiceRouter,
+    name: &str,
+    source: &str,
+) -> String {
     let function = lambda(
         router,
         "POST",
         "/2015-03-31/functions",
         Some(json!({
-            "FunctionName": FUNCTION,
+            "FunctionName": name,
             "Role": ROLE,
             "Runtime": "python3.12",
             "Handler": HANDLER,
             "Timeout": FUNCTION_TIMEOUT,
             "Environment": { "Variables": { "TABLE": TABLE } },
             "Code": {
-                "ZipFile": base64::engine::general_purpose::STANDARD
-                    .encode(package(HANDLER_SOURCE)),
+                "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(source)),
             },
         })),
     )
@@ -300,14 +320,14 @@ async fn deployed(router: &MultiServiceRouter) -> String {
     let function_arn = member("CreateFunction", &function.json(), "FunctionArn");
 
     // "Grants a principal permission to use a function" (`AddPermission`): the grant that
-    // admits every invocation below. It names no `SourceArn`, so one statement admits the
-    // call from every method of the api.
+    // admits every invocation of it. It names no `SourceArn`, so one statement admits the
+    // call from every method of an api.
     let granted = lambda(
         router,
         "POST",
-        &format!("/2015-03-31/functions/{FUNCTION}/policy"),
+        &format!("/2015-03-31/functions/{name}/policy"),
         Some(json!({
-            "StatementId": "apigw-invocation-type",
+            "StatementId": name,
             "Action": "lambda:InvokeFunction",
             "Principal": "apigateway.amazonaws.com",
         })),
@@ -320,6 +340,24 @@ async fn deployed(router: &MultiServiceRouter) -> String {
         granted.status,
         granted.text()
     );
+    function_arn
+}
+
+/// The `Integration$uri` that addresses the function-invoking action of `function_arn`:
+/// `arn:aws:apigateway:{region}:lambda:path/{version}/functions/{function-arn}/invocations`.
+///
+/// `pub(super)` for the reason [`given_marker_table`] is.
+pub(super) fn invocation_uri(function_arn: &str) -> String {
+    format!(
+        "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/{function_arn}/invocations"
+    )
+}
+
+/// Stand the table, the function and the api up, and deploy the api to [`STAGE`]. Answers the
+/// api id.
+async fn deployed(router: &MultiServiceRouter) -> String {
+    given_marker_table(router).await;
+    let function_arn = given_marking_function(router, FUNCTION, HANDLER_SOURCE).await;
 
     let created = apigw(
         router,
@@ -372,10 +410,7 @@ async fn deployed(router: &MultiServiceRouter) -> String {
             // `integrationHttpMethod` travels under its `jsonName`, which is what
             // `smithy_query(query="operation",operation="PutIntegration")` reports.
             "httpMethod": "POST",
-            "uri": format!(
-                "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/\
-                 {function_arn}/invocations"
-            ),
+            "uri": invocation_uri(&function_arn),
         });
         if let Some(mapped) = method.mapped {
             integration["requestParameters"] =
@@ -443,7 +478,7 @@ async fn deployed(router: &MultiServiceRouter) -> String {
 /// One request to the api's own invoke endpoint — the host
 /// `{rest-api-id}.execute-api.{region}.amazonaws.com` — carrying no credential at all, as a
 /// client of a public method sends none.
-async fn invoke(
+pub(super) async fn invoke(
     router: &MultiServiceRouter,
     api: &str,
     part: &str,
@@ -463,8 +498,11 @@ async fn invoke(
 }
 
 /// What the caller must be served for one row.
+///
+/// `pub(super)` because the sibling `accepted_invocation_method_response` suite asserts the same
+/// two outcomes of a method response: ONE spelling of them for both.
 #[derive(Debug, PartialEq, Eq)]
-enum Served {
+pub(super) enum Served {
     /// The document the function's own run produced, which only an invocation made FOR that
     /// answer can carry.
     TheRun,

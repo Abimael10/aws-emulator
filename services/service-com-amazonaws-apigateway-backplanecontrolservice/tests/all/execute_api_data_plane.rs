@@ -64,6 +64,12 @@ mod response_override_status_type;
 #[path = "execute_api_data_plane/lambda_event_invocation_type.rs"]
 mod lambda_event_invocation_type;
 
+/// WHAT THE CALLER IS SERVED for an invocation Lambda answers before the function has produced
+/// anything — the method response the integration's own responses map that payload-less answer
+/// onto — in its own file beside this one, declared as the siblings above are.
+#[path = "execute_api_data_plane/accepted_invocation_method_response.rs"]
+mod accepted_invocation_method_response;
+
 /// What a `TOKEN` authorizer's own `identityValidationExpression` decides about the identity a
 /// request presents, BEFORE its function is invoked, in its own file beside this one, declared
 /// as the siblings above are.
