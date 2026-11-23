@@ -48,7 +48,8 @@
 //! utility by the name `PATH` resolution would find it under, so that program's final path
 //! component is the command name the session is given. The variables the session starts with
 //! are the job's own effective `environment` ("the environment variables to pass to a
-//! container") and nothing of this process's.
+//! container") beside the ones AWS Batch sets itself ([`super::job_variables`]), and nothing
+//! of this process's.
 //!
 //! # A program nothing performed CLAIMS NOTHING
 //!
@@ -324,7 +325,8 @@ pub struct JobContainerRun {
     /// The image its container runs, as `ContainerDetail$image` holds it.
     pub image: String,
     /// The environment variables the job's effective container carries, in the order they
-    /// were merged.
+    /// were merged, followed by the ones AWS Batch sets itself
+    /// ([`super::job_variables`]).
     pub environment: Vec<(String, String)>,
 }
 
@@ -353,18 +355,22 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             })
             .filter_map(|job| {
                 let container = job.container.as_ref()?;
+                let mut environment: Vec<(String, String)> = container
+                    .environment
+                    .iter()
+                    .flatten()
+                    .filter_map(|pair| {
+                        Some((pair.name.clone()?, pair.value.clone().unwrap_or_default()))
+                    })
+                    .collect();
+                // And the variables AWS Batch sets itself, after the declared ones so the
+                // service's own prefix decides them ([`super::job_variables`]).
+                environment.extend(self.reserved_job_variables(&job.job_id));
                 Some(JobContainerRun {
                     job_id: job.job_id.clone(),
                     program: container_program(container.command.as_deref()),
                     image: container.image.clone().unwrap_or_default(),
-                    environment: container
-                        .environment
-                        .iter()
-                        .flatten()
-                        .filter_map(|pair| {
-                            Some((pair.name.clone()?, pair.value.clone().unwrap_or_default()))
-                        })
-                        .collect(),
+                    environment,
                 })
             })
             .take(MAX_CONTAINER_RUNS_PER_DRAIN)

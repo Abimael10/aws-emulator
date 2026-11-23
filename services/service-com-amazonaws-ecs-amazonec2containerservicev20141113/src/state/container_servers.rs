@@ -201,7 +201,10 @@ pub fn image_declared_command(image: &str) -> Option<Vec<String>> {
 /// The REPOSITORY one image reference names: what is left of it once the registry host the
 /// reference resolves to ([`super::image_pull::registry_host`]) and the tag or digest selecting
 /// which image of that repository to fetch are taken off.
-fn image_repository_path(image: &str) -> &str {
+///
+/// The one reading of that spelling in this crate: the catalog of entry points an image
+/// declares keys on it too ([`super::container_image_entry_points`]).
+pub(super) fn image_repository_path(image: &str) -> &str {
     let image = image.trim();
     // A digest and a tag both name WHICH image of the repository to fetch, not the repository.
     let path = image.split_once('@').map_or(image, |(path, _)| path);

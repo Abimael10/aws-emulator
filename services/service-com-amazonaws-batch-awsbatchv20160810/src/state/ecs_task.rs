@@ -138,6 +138,9 @@ pub struct TaskPlacement {
     pub family: String,
     /// The container the job actually runs ([`effective_container`]).
     pub container: ContainerDetail,
+    /// The variables AWS Batch itself SETS in that container, over the ones the container
+    /// declares ([`super::job_variables`]).
+    pub reserved_environment: Vec<(String, String)>,
     /// The subnets the task's elastic network interface may be created in
     /// (`ComputeResource$subnets`).
     pub subnets: Vec<String>,
@@ -323,6 +326,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             } else {
                 Vec::new()
             },
+            // What AWS Batch sets in the container of the job it runs, read off this job's own
+            // record at the instant the task is configured ([`super::job_variables`]).
+            reserved_environment: self.reserved_job_variables(id),
             container,
         })
     }
@@ -962,6 +968,17 @@ async fn run_task(
             ecs::KeyValuePair::builder()
                 .set_name(pair.name.clone())
                 .set_value(pair.value.clone())
+                .build(),
+        );
+    }
+    // The variables AWS Batch sets itself, AFTER the declared ones: the prefix they carry is
+    // the service's, so a definition that wrote one of those names does not decide what its
+    // container reads for it ([`super::job_variables`]).
+    for (name, value) in &placement.reserved_environment {
+        definition = definition.environment(
+            ecs::KeyValuePair::builder()
+                .name(name)
+                .value(value)
                 .build(),
         );
     }

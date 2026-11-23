@@ -142,7 +142,8 @@ impl ::std::fmt::Debug for TaskRoleCredential {
 pub struct ContainerAwsCli {
     /// The in-process callback every call is dispatched through.
     callback: ::smithy_server_runtime::EmbeddedEmulator,
-    /// The Region the calls are made in, which is the Region the task was placed in.
+    /// The Region the calls are made in for a command line naming none, which is the Region
+    /// the task was placed in; a line that names one addresses that Region instead.
     region: String,
     /// What every call presents ([`super::task_role_credentials`]).
     credential: TaskRoleCredential,
@@ -211,9 +212,16 @@ impl ContainerAwsCli {
             return Some(self.performed_publish(&call).await);
         }
         let requested = cli::requested(arguments)?;
+        // The Region the transfer's calls go to is the one the command line names, and the
+        // Region the task was placed in for a line naming none — the CLI's own reading of that
+        // option, which selects where the call goes and nothing about the transfer.
+        let region = cli::requested_region(arguments).unwrap_or_else(|| self.region.clone());
         let word = requested.reported_word();
         let shown = requested.shown();
-        match self.carried(&requested, standard_input, files).await {
+        match self
+            .carried(&requested, &region, standard_input, files)
+            .await
+        {
             Err(detail) => Some(CliOutcome {
                 status: TRANSFER_FAILED,
                 output: String::new(),
@@ -381,12 +389,13 @@ impl ContainerAwsCli {
     async fn carried(
         &self,
         requested: &Requested,
+        region: &str,
         standard_input: Option<&str>,
         files: &mut (dyn ShellFiles + Send),
     ) -> Result<Option<String>, String> {
         let (from, to, taking_source_away) = match requested {
             Requested::Remove { target } => {
-                self.made(cli::delete_object(&self.client(&self.region)?, target))
+                self.made(cli::delete_object(&self.client(region)?, target))
                     .await?;
                 return Ok(None);
             }
@@ -396,13 +405,13 @@ impl ContainerAwsCli {
                 taking_source_away,
             } => (from, to, *taking_source_away),
         };
-        let streamed = self.copied(from, to, standard_input, files).await?;
+        let streamed = self.copied(from, to, region, standard_input, files).await?;
         // `mv` takes the source away once the destination holds it, so a move that could not be
         // completed leaves the file where it was.
         if taking_source_away {
             match from {
                 Location::Object(object) => {
-                    self.made(cli::delete_object(&self.client(&self.region)?, object))
+                    self.made(cli::delete_object(&self.client(region)?, object))
                         .await?;
                 }
                 Location::Local(path) => {
@@ -420,13 +429,14 @@ impl ContainerAwsCli {
         &self,
         from: &Location,
         to: &Location,
+        region: &str,
         standard_input: Option<&str>,
         files: &mut (dyn ShellFiles + Send),
     ) -> Result<Option<String>, String> {
         match (from, to) {
             (Location::Object(source), Location::Object(destination)) => {
                 self.made(cli::copy_object(
-                    &self.client(&self.region)?,
+                    &self.client(region)?,
                     source,
                     destination,
                 ))
@@ -437,11 +447,11 @@ impl ContainerAwsCli {
                 let contents = files
                     .read(path)
                     .map_err(|_| format!("The user-provided path {path} does not exist."))?;
-                self.put(destination, &contents).await?;
+                self.put(destination, &contents, region).await?;
                 Ok(None)
             }
             (Location::Object(source), Location::Local(path)) => {
-                let contents = self.get(source).await?;
+                let contents = self.get(source, region).await?;
                 files.write(path, &contents, false).map_err(|refusal| {
                     format!("The file {path} was not written: {}.", refusal.message())
                 })?;
@@ -453,12 +463,14 @@ impl ContainerAwsCli {
             (Location::Stream, Location::Object(destination)) => {
                 let contents = standard_input
                     .ok_or_else(|| "The command was given no standard input to upload.".to_string())?;
-                self.put(destination, contents).await?;
+                self.put(destination, contents, region).await?;
                 Ok(None)
             }
             // A download TO it answers the object's own text, which the caller writes onto that
             // stream.
-            (Location::Object(source), Location::Stream) => self.get(source).await.map(Some),
+            (Location::Object(source), Location::Stream) => {
+                self.get(source, region).await.map(Some)
+            }
             // Filtered out by the shared parse: a transfer with no end in the object store is
             // not one this program performs.
             (Location::Local(_) | Location::Stream, Location::Local(_) | Location::Stream) => {
@@ -471,10 +483,10 @@ impl ContainerAwsCli {
     ///
     /// The bytes it really carried back are counted into the container's run as RECEIVED over
     /// the network ([`super::container_consumption`]).
-    async fn get(&self, address: &ObjectAddress) -> Result<String, String> {
+    async fn get(&self, address: &ObjectAddress, region: &str) -> Result<String, String> {
         let fetched = self
             .made(cli::get_object_text(
-                &self.client(&self.region)?,
+                &self.client(region)?,
                 address,
                 MAX_TRANSFERRED_BYTES,
             ))
@@ -487,9 +499,14 @@ impl ContainerAwsCli {
     ///
     /// The bytes it really carried are counted into the container's run as SENT over the
     /// network, under [`Self::get`]'s rule.
-    async fn put(&self, address: &ObjectAddress, contents: &str) -> Result<(), String> {
+    async fn put(
+        &self,
+        address: &ObjectAddress,
+        contents: &str,
+        region: &str,
+    ) -> Result<(), String> {
         self.made(cli::put_object_text(
-            &self.client(&self.region)?,
+            &self.client(region)?,
             address,
             contents,
             MAX_TRANSFERRED_BYTES,

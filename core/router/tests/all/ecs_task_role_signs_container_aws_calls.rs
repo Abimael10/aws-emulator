@@ -44,8 +44,11 @@ const CLUSTER: &str = "taskrolecalls";
 const CONTAINER: &str = "writer";
 
 /// The image the containers start from. Nothing is fetched from it: what runs is the `command`
-/// the revision states.
-const IMAGE: &str = "public.ecr.aws/aws-cli/aws-cli:latest";
+/// the revision states, so the reference names a repository this emulator knows no program of
+/// — an image whose own entry point IS a program would be exec'd with that command as its
+/// arguments instead
+/// (`batch_job_container_runs_its_images_entry_point.rs` covers that rule).
+const IMAGE: &str = "registry.example.com/simparity/task-role-probe:1";
 
 /// The log group every container delivers its output to, created through CloudWatch Logs' own
 /// API before any task is launched.

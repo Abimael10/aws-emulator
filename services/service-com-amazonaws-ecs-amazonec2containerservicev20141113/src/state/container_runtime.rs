@@ -418,8 +418,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                             .and_then(super::container_servers::image_declared_command)
                     })
                     .flatten();
+                // The other half of that default: a container whose revision overrides no
+                // ENTRY POINT is exec'd as the entry point its IMAGE declares, with the
+                // command above as that program's arguments
+                // ([`super::container_image_entry_points`]) — which is how a container of an
+                // image whose own program takes arguments (the AWS CLI's) declares a command
+                // naming no program at all. An image whose entry point this emulator knows
+                // none of adds nothing, so such a container's program is its own vector.
+                let declared_entry_point = stored
+                    .entry_point
+                    .is_none()
+                    .then(|| {
+                        stored.image.as_deref().and_then(
+                            super::container_image_entry_points::image_declared_entry_point,
+                        )
+                    })
+                    .flatten();
                 let program = ContainerProgram::resolve(
-                    stored.entry_point.as_deref(),
+                    stored
+                        .entry_point
+                        .as_deref()
+                        .or(declared_entry_point.as_deref()),
                     command.or(declared.as_deref()),
                 );
                 // The address the task's own interface holds, which is both where a server

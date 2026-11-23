@@ -399,6 +399,11 @@ pub use container_process::*;
 mod container_servers;
 pub use container_servers::*;
 
+/// The ENTRY POINT an image declares, which is the program a container whose definition
+/// declares none runs.
+mod container_image_entry_points;
+pub use container_image_entry_points::*;
+
 /// The `awslogs` log driver: where the output of a container that runs is delivered.
 mod container_logs;
 pub use container_logs::*;
