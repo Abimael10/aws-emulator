@@ -75,8 +75,7 @@
 //! identity — but a handler there that ever needs its own model's shape id must take it
 //! from its own crate rather than from `ctx`.
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use aws_smithy_types::body::SdkBody;
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 use std::sync::Arc;
@@ -90,11 +89,6 @@ pub const CLASSIC_API_VERSION: &str = "2012-06-01";
 /// `version: 2015-12-01`. An envelope naming it is served out of that model through
 /// [`V2FrontDoor`].
 pub const V2_API_VERSION: &str = elbv2::service::shared_endpoint::API_VERSION;
-
-/// The awsQuery error code AWS answers an action/version pair it cannot resolve with.
-/// Reserved for exactly that: an action the service does not have at the version asked
-/// for, never a well-formed request to an action it does.
-const INVALID_ACTION: &str = "InvalidAction";
 
 /// Which of the two Elastic Load Balancing models serves a request on this shared
 /// endpoint, decided by the API version its awsQuery envelope names.
@@ -255,10 +249,11 @@ impl ErasedOperation for UnsupportedApiVersionOperation {
 /// — because that is the only thing a caller can act on; the status and the code are
 /// AWS's for this refusal. `served_as` is the version named when the envelope carries
 /// none: a request that states no version is served as the model's own API version (see
-/// [`serving_model`]), so that is the version it was not found for. The envelope itself is
-/// the framework's own `awsQuery` error document
-/// (`aws_smithy_schema_server::query_error_body`) with the `<RequestId>` that envelope
-/// carries added by the one writer every error of this endpoint passes through
+/// [`serving_model`]), so that is the version it was not found for. The status, the code
+/// and the sentence are the tree's one statement of this refusal
+/// ([`::service_common::query_unresolved_action`]), built on the framework's own `awsQuery`
+/// error document, with the `<RequestId>` that envelope carries added by the one writer
+/// every error of this endpoint passes through
 /// (`service_common::query_error_envelope`), so a routing refusal raised here and one
 /// raised by either generated definition cannot answer in different shapes.
 pub fn unresolved_pair_response(req: &RtRequest, served_as: &str) -> RtResponse {
@@ -268,15 +263,7 @@ pub fn unresolved_pair_response(req: &RtRequest, served_as: &str) -> RtResponse 
         .and_then(aws_smithy_schema_server::extract_action)
         .unwrap_or_default();
     let version = requested_version(req).unwrap_or_else(|| served_as.to_string());
-    let body = aws_smithy_schema_server::query_error_body(
-        false,
-        INVALID_ACTION,
-        &format!("Could not find operation {action} for version {version}"),
-    );
-    let mut resp = RtResponse::new(
-        StatusCode::try_from(400).expect("400 is a valid status"),
-        SdkBody::from(body),
-    );
-    resp.headers_mut().insert("content-type", "text/xml");
-    service_common::query_error_envelope::with_request_id(resp)
+    service_common::query_error_envelope::with_request_id(
+        ::service_common::query_unresolved_action::unresolved_pair_response(&action, &version),
+    )
 }

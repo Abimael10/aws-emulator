@@ -29,9 +29,11 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. A call naming an `Action` this model has no
+//!   operation for is refused with AWS's own unresolvable-pair sentence, read from
+//!   wherever the request carries its call (see [`unresolved_action`]); anything
+//!   else keeps the entry's protocol-correct default (query -> 400 InvalidAction,
+//!   awsJson -> 404, …).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -61,6 +63,7 @@
 pub mod management_events;
 pub mod message_text;
 pub mod sensitive_members;
+pub mod unresolved_action;
 
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
@@ -665,10 +668,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // An `awsQuery` call naming an action this model has no operation for is refused
+        // with the sentence AWS words for an action/version pair it cannot resolve,
+        // naming the action it could not find and the version it looked for it in — read
+        // from wherever the request carries its CALL, which the framework's default
+        // renderer cannot do: it re-reads the routing key off the BODY alone, so a `GET`
+        // carrying its call in the query string is answered that it is missing the
+        // `Action` field it plainly sent. A request that names no action anywhere keeps
+        // the framework's own diagnostic (see [`unresolved_action`]).
+        unresolved_action::unresolved_action_response(req)
     }
 
     fn override_framework_error(

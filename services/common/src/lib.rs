@@ -756,6 +756,10 @@ pub mod quoted_refusals;
 /// An `@httpQuery`-bound timestamp read in every form the wire names an instant in, which
 /// the generated schema narrows to one and the framework therefore refuses.
 pub mod query_timestamps;
+/// The ONE refusal every AWS Query front door answers an `Action`/`Version` pair it cannot
+/// resolve with: `400` `InvalidAction`, naming the action it could not find and the API
+/// version it looked for it in.
+pub mod query_unresolved_action;
 /// The IMAGE a service serves at an address it published for a record whose own image bytes
 /// it does not hold, derived from that record's identifier — one renderer for every service
 /// that publishes such an address.

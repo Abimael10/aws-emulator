@@ -21,8 +21,7 @@
 //! definition, and every served request goes to the operation the model's routing table
 //! names.
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use aws_smithy_types::body::SdkBody;
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
 /// The one API version this service's model declares, and so the only value a request's
@@ -82,13 +81,13 @@ impl ErasedOperation for UnsupportedApiVersionOperation {
 ///
 /// The message is built from the request — the action and the version its envelope named
 /// — because that is the only thing a caller can act on; the status and the code are what
-/// a client branches on, and they are AWS's for this refusal. The envelope itself is the
-/// framework's own `awsQuery` error document
-/// (`aws_smithy_schema_server::query_error_body`), so a routing refusal raised here and
-/// one raised by the generated definition cannot answer in different shapes — including
-/// the `<RequestId>` element that envelope carries, which
-/// [`crate::service::query_error_envelope::with_request_id`] adds to every error response
-/// this service emits, wherever it was raised.
+/// a client branches on, and they are AWS's for this refusal. The status, the code and the
+/// sentence are the tree's one statement of that refusal
+/// ([`::service_common::query_unresolved_action`]), so an action this service does not have
+/// and an action asked for at a version it does not serve are worded alike wherever either
+/// is raised; the `<RequestId>` that envelope carries is added by the one writer every
+/// error response of this service passes through
+/// ([`crate::service::query_error_envelope::with_request_id`]).
 fn unsupported_version_response(req: &RtRequest) -> RtResponse {
     let action = req
         .body()
@@ -96,15 +95,7 @@ fn unsupported_version_response(req: &RtRequest) -> RtResponse {
         .and_then(aws_smithy_schema_server::extract_action)
         .unwrap_or_default();
     let version = requested_version(req).unwrap_or_default();
-    let body = aws_smithy_schema_server::query_error_body(
-        false,
-        "InvalidAction",
-        &format!("Could not find operation {action} for version {version}"),
-    );
-    let mut resp = RtResponse::new(
-        StatusCode::try_from(400).expect("400 is a valid status"),
-        SdkBody::from(body),
-    );
-    resp.headers_mut().insert("content-type", "text/xml");
-    super::query_error_envelope::with_request_id(resp)
+    super::query_error_envelope::with_request_id(
+        ::service_common::query_unresolved_action::unresolved_pair_response(&action, &version),
+    )
 }
