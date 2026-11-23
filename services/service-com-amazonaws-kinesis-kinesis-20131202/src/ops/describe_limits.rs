@@ -2,10 +2,11 @@
 
 //! @op DescribeLimits
 //!
-//! Reports the shard and on-demand stream QUOTAS this emulator authorizes for the account
-//! and region the request was signed for, beside the usage the store actually holds
-//! against them: the open shards of every stream the region holds, and how many of those
-//! streams carry the on-demand capacity mode. A reporting operation, so it writes nothing.
+//! Reports the shard, on-demand stream and channel QUOTAS this emulator authorizes for the
+//! account and region the request was signed for, beside the usage the store actually holds
+//! against them: the open shards of every stream the region holds, how many of those
+//! streams carry the on-demand capacity mode, and how many channels the region holds. A
+//! reporting operation, so it writes nothing.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -168,13 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read reports what the store holds AT this instant and leaves it exactly as it
         // was: a stream whose removal has already fallen due is held by nobody, so it
         // counts towards neither figure without this call pruning anything.
-        let (shard_limit, open_shard_count, on_demand_stream_count) = {
+        let (shard_limit, open_shard_count, on_demand_stream_count, channel_count) = {
             let store = state.lock();
             let (shard_limit, open_shard_count) = store.shard_quota_in(now, &region);
             (
                 shard_limit,
                 open_shard_count,
                 store.on_demand_streams_held_in(now, &region),
+                store.channels_held_in(&region),
             )
         };
 
@@ -195,12 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_ON_DEMAND_STREAMS_PER_REGION,
             )
             .unwrap_or(i32::MAX),
-            // The channel members are the only optional ones, and this emulator holds no
-            // channels at all: nothing creates one, so there is no count and no ceiling to
-            // report — a zero beside a limit would claim this service already serves that
-            // resource kind. Both stay absent until the channel operations exist.
-            channel_count: None,
-            channel_count_limit: None,
+            // "The number of channels in the account" — the channels the store really holds
+            // for this account and region, counted the same way the shard and on-demand
+            // figures above are, so an account that holds none is still told its usage.
+            channel_count: Some(i32::try_from(channel_count).unwrap_or(i32::MAX)),
+            // "The maximum number of channels allowed in the account" — the ceiling
+            // `CreateChannel` is refused past for one region, read from the ONE place that
+            // refusal is taken, so the reported ceiling is the enforced ceiling. (A second,
+            // whole-emulator ceiling sits above it, which no single region can reach.)
+            channel_count_limit: Some(
+                i32::try_from(crate::state::MAX_CHANNELS_PER_REGION).unwrap_or(i32::MAX),
+            ),
         })
     }
 }

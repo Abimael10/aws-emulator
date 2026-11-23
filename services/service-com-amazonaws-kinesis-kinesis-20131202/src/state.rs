@@ -31,13 +31,15 @@
 //! of a channel's source records to its general purpose bucket destination
 //! ([`channel_delivery`]), the layout an expiry refusal spells the instant it names in
 //! ([`expiry_instant`]), and the `AWS/Kinesis` series a stream's data plane publishes about
-//! itself ([`stream_metrics`]).
+//! itself ([`stream_metrics`]), and the resolution every instant it reports and every
+//! instant a request hands it are taken at ([`reported_instants`]).
 
 pub mod channel_delivery;
 mod channel_key_access;
 mod channels;
 mod expiry_instant;
 mod kms_key;
+mod reported_instants;
 mod reserved_tag_keys;
 mod service_execution_role;
 mod shard_reading;
@@ -49,6 +51,7 @@ pub use channel_key_access::*;
 pub use channels::*;
 pub use expiry_instant::*;
 pub use kms_key::*;
+pub use reported_instants::*;
 pub use reserved_tag_keys::*;
 pub use service_execution_role::*;
 pub use shard_reading::*;
@@ -3713,14 +3716,6 @@ pub fn unassign_tags<'keys>(
 ) {
     for key in keys {
         tags.remove(key);
-    }
-}
-
-/// The modelled timestamp for a stored instant.
-pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    match at.duration_since(UNIX_EPOCH) {
-        Ok(since) => ::aws_smithy_types::DateTime::from_secs_f64(since.as_secs_f64()),
-        Err(_) => ::aws_smithy_types::DateTime::from_secs(0),
     }
 }
 

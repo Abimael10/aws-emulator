@@ -521,8 +521,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or(input.stream_arn.as_deref())
             .unwrap_or(&stream.name);
         if let Some(asked) = input.stream_creation_timestamp {
+            // Both sides at the millisecond this service keeps an instant at
+            // (`crate::state::requested_millis`): an instant the wire carried as an
+            // epoch-seconds number arrives a few nanoseconds either side of it.
             let created = crate::state::timestamp(stream.created_at);
-            if asked.to_millis().ok() != created.to_millis().ok() {
+            if crate::state::requested_millis(asked) != crate::state::requested_millis(created) {
                 return Err(ListShardsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::stream_creation_time_not_found_message(

@@ -8,16 +8,21 @@
 //! for, the quotas the service enforces beside the usage the store holds against them —
 //! `OpenShardCount` is the number of OPEN shards summed over every stream that region
 //! holds, `OnDemandStreamCount` is how many of those streams carry the on-demand capacity
-//! mode, and `ShardLimit` / `OnDemandStreamCountLimit` are the ceilings past which a call
-//! that would open another shard or give another stream that mode is refused with
-//! `LimitExceededException`. It reports and never writes, so two calls with nothing between
-//! them report the same usage, and a refused call leaves the usage exactly as it was.
+//! mode, `ChannelCount` is how many channels that region holds, and `ShardLimit` /
+//! `OnDemandStreamCountLimit` / `ChannelCountLimit` are the ceilings past which a call that
+//! would open another shard, give another stream that mode or create another channel is
+//! refused with `LimitExceededException`. Every member of the report is computed from what
+//! the store holds, so each quota and each usage figure is reported for an account that
+//! holds none of that resource kind too. It reports and never writes, so two calls with
+//! nothing between them report the same usage, and a refused call leaves the usage exactly
+//! as it was.
 //!
 //! The recorded flows this was derived from call `describe_limits()` on an account holding
 //! streams, which is one row of the tables below. The rows differ along what the rule
-//! generalises over: how many streams the region holds, the shard count each was created
+//! generalises over: the resource kind the figure counts (shards, on-demand streams,
+//! channels), how many of them the region holds, the shard count each stream was created
 //! with, the capacity mode each carries, whether a shard is open or was closed by a
-//! re-tiling, the lifecycle status the stream is in, the region the stream lives in, and
+//! re-tiling, the lifecycle status the stream is in, the region the resource lives in, and
 //! which side of the ceiling the call sits on.
 //!
 //! Every case drives the real awsJson1_1 request path (`POST /` with `X-Amz-Target:
@@ -28,12 +33,17 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    DELETION_DELAY, ON_DEMAND_INITIAL_SHARDS, STREAM_DELETING, STREAM_MODE_ON_DEMAND,
-    STREAM_MODE_PROVISIONED,
+    channel_arn, DELETION_DELAY, MAX_CHANNELS_PER_REGION, ON_DEMAND_INITIAL_SHARDS,
+    STREAM_DELETING, STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
 };
 
+use crate::channel_lifecycle::{
+    on_demand_stream_in, role_arn, storage_configuration, stream_configuration,
+};
 use crate::shard_scaling::{hash_key_range, is_open, shard_id, shard_map, summary};
-use crate::stream_tags::{error_code, past_activation, stream_arn, Emulator, REGION};
+use crate::stream_tags::{
+    error_code, past_activation, poll_until_active, stream_arn, Emulator, REGION,
+};
 
 /// A second region, so a case can show that the usage reported is the usage of the region
 /// the request was signed for and no other.
@@ -52,7 +62,8 @@ struct Limits {
     open_shard_count: i64,
     on_demand_stream_count: i64,
     on_demand_stream_count_limit: i64,
-    channel_count: Option<i64>,
+    channel_count: i64,
+    channel_count_limit: i64,
 }
 
 impl Limits {
@@ -72,7 +83,11 @@ impl Limits {
             open_shard_count: required("OpenShardCount"),
             on_demand_stream_count: required("OnDemandStreamCount"),
             on_demand_stream_count_limit: required("OnDemandStreamCountLimit"),
-            channel_count: response.get("ChannelCount").and_then(Value::as_i64),
+            // The channel members are the two the model leaves optional, and this service
+            // holds channels, so a report that omits either tells a client nothing about
+            // the channel usage or the channel ceiling it has to plan against.
+            channel_count: required("ChannelCount"),
+            channel_count_limit: required("ChannelCountLimit"),
         }
     }
 }
@@ -82,14 +97,7 @@ async fn limits_in(emulator: &Emulator, case: &str, region: &str) -> Limits {
     let response = emulator
         .ok_in(case, region, "DescribeLimits", &json!({}))
         .await;
-    let limits = Limits::of(case, &response);
-    // Nothing creates a channel in this emulator, so a channel count it reported could only
-    // be zero.
-    assert!(
-        limits.channel_count.is_none_or(|count| count == 0),
-        "case {case}: expected no channels to be counted, got {response}"
-    );
-    limits
+    Limits::of(case, &response)
 }
 
 /// [`limits_in`] in the default test region.
@@ -160,7 +168,9 @@ async fn reported_usage_is_the_usage_the_streams_of_the_region_report() {
          {empty:?}"
     );
     assert!(
-        empty.shard_limit > 0 && empty.on_demand_stream_count_limit > 0,
+        empty.shard_limit > 0
+            && empty.on_demand_stream_count_limit > 0
+            && empty.channel_count_limit > 0,
         "case limits-empty: expected the quotas to be reported for an empty account, got \
          {empty:?}"
     );
@@ -206,7 +216,11 @@ async fn reported_usage_is_the_usage_the_streams_of_the_region_report() {
         );
     }
 
-    tokio::time::sleep(past_activation()).await;
+    // Look again until every create's transition has fallen due — the condition the
+    // assertions below depend on — rather than waiting a fixed span for it.
+    for name in &held {
+        poll_until_active(&emulator, "limits-settled", name).await;
+    }
     let expected_open = open_shards_of(&emulator, "limits-settled", &held).await;
     let settled = limits(&emulator, "limits-settled").await;
     assert_eq!(
@@ -528,5 +542,162 @@ async fn the_reported_on_demand_stream_limit_is_the_ceiling_a_change_is_refused_
     assert_eq!(
         after, full,
         "case {case}: expected the refused calls to leave the usage as it was, got {after:?}"
+    );
+}
+
+/// The `CreateChannel` body a channel case uses: the modelled required members and one
+/// general purpose bucket destination, which is the cheapest destination to provision.
+fn channel_body(name: &str, source: &str, bucket: &str) -> Value {
+    json!({
+        "ChannelName": name,
+        "ServiceExecutionRoleARN": role_arn("limits-channel-delivery"),
+        "StreamConfigurationList": [stream_configuration(source, "JSON", None)],
+        "S3DestinationConfiguration": {
+            "StorageConfiguration": storage_configuration(bucket),
+        },
+    })
+}
+
+/// The channel usage reported is the channels the request's region really holds, and the
+/// channel ceiling reported is the one a create in that region is refused past — for an
+/// account that holds no channel too.
+#[tokio::test]
+async fn reported_channel_usage_is_the_channels_the_region_holds() {
+    let emulator = Emulator::new();
+    let case = "limits-channels";
+    let home_source = on_demand_stream_in(&emulator, REGION, "limits-channel-source").await;
+    let away_source =
+        on_demand_stream_in(&emulator, OTHER_REGION, "limits-channel-source-away").await;
+    let ceiling = i64::try_from(MAX_CHANNELS_PER_REGION).unwrap_or(i64::MAX);
+
+    // An account holding no channel is still told its channel usage and its channel
+    // ceiling: a missing member tells a capacity planner nothing at all.
+    let empty = limits(&emulator, "limits-channels-empty").await;
+    assert_eq!(
+        (empty.channel_count, empty.channel_count_limit),
+        (0, ceiling),
+        "case limits-channels-empty: expected no channels held beside the enforced ceiling \
+         of {ceiling}, got {empty:?}"
+    );
+
+    // The rows differ along how many channels the region holds, which is what the figure
+    // counts; each row asserts the figure after one more create.
+    for held in 1..=3i64 {
+        let name = format!("{case}-{held}");
+        emulator
+            .ok(
+                &name,
+                "CreateChannel",
+                &channel_body(&name, &home_source, "limits-channel-bucket"),
+            )
+            .await;
+        let reported = limits(&emulator, &name).await;
+        assert_eq!(
+            (reported.channel_count, reported.channel_count_limit),
+            (held, ceiling),
+            "case {name}: expected the {held} channels the region holds beside an unchanged \
+             ceiling, got {reported:?}"
+        );
+        // The call reports and writes nothing, so repeating it reports the same usage.
+        let again = limits(&emulator, &name).await;
+        assert_eq!(
+            again, reported,
+            "case {name}: expected a second read to report the same limits, got {again:?}"
+        );
+    }
+
+    // A channel of another region counts against that region, exactly as a stream does.
+    let away_name = format!("{case}-away");
+    emulator
+        .ok_in(
+            &away_name,
+            OTHER_REGION,
+            "CreateChannel",
+            &channel_body(&away_name, &away_source, "limits-channel-bucket-away"),
+        )
+        .await;
+    let home = limits_in(&emulator, &away_name, REGION).await;
+    let away = limits_in(&emulator, &away_name, OTHER_REGION).await;
+    assert_eq!(
+        (home.channel_count, away.channel_count),
+        (3, 1),
+        "case {away_name}: expected each region to be told only its own channels, got \
+         {home:?} beside {away:?}"
+    );
+    assert_eq!(
+        away.channel_count_limit, home.channel_count_limit,
+        "case {away_name}: expected the same ceiling in both regions, got {away:?} beside \
+         {home:?}"
+    );
+
+    // A channel the account no longer holds counts towards nothing.
+    emulator
+        .ok(
+            case,
+            "DeleteChannel",
+            &json!({ "ChannelARN": channel_arn(REGION, &format!("{case}-1")) }),
+        )
+        .await;
+    let after_delete = limits(&emulator, case).await;
+    assert_eq!(
+        after_delete.channel_count, 2,
+        "case {case}: expected the removed channel to count towards nothing, got \
+         {after_delete:?}"
+    );
+}
+
+/// The `ChannelCountLimit` reported is the ceiling the service enforces: a create that
+/// would take the region past it is refused, and changes nothing.
+#[tokio::test]
+async fn the_reported_channel_limit_is_the_ceiling_a_create_is_refused_past() {
+    let emulator = Emulator::new();
+    let case = "limits-channel-ceiling";
+    let source = on_demand_stream_in(&emulator, REGION, "limits-channel-ceiling-source").await;
+    let ceiling = limits(&emulator, case).await.channel_count_limit;
+    assert!(
+        ceiling > 0,
+        "case {case}: expected a positive ChannelCountLimit, got {ceiling}"
+    );
+
+    for held in 0..ceiling {
+        let name = format!("{case}-{held}");
+        emulator
+            .ok(
+                &name,
+                "CreateChannel",
+                &channel_body(&name, &source, "limits-channel-ceiling-bucket"),
+            )
+            .await;
+    }
+
+    let full = limits(&emulator, case).await;
+    assert_eq!(
+        full.channel_count, ceiling,
+        "case {case}: expected the region to sit at its ceiling of {ceiling} channels, got \
+         {full:?}"
+    );
+
+    let over = format!("{case}-over");
+    let (status, response) = emulator
+        .call(
+            "CreateChannel",
+            &channel_body(&over, &source, "limits-channel-ceiling-bucket"),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case}: expected a create past the reported ceiling to be refused, got \
+         {status} with body {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "LimitExceededException",
+        "case {case}: expected LimitExceededException, got {response}"
+    );
+
+    let after = limits(&emulator, case).await;
+    assert_eq!(
+        after, full,
+        "case {case}: expected the refused create to leave the usage as it was, got {after:?}"
     );
 }

@@ -26,8 +26,8 @@
 use ::std::time::SystemTime;
 
 use super::{
-    epoch_millis, sequence_number_le, sequence_number_of_shard, DataRecord, ShardPosition,
-    ShardRecord, SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
+    epoch_millis, requested_millis, sequence_number_le, sequence_number_of_shard, DataRecord,
+    ShardPosition, ShardRecord, SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
     SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER, SHARD_ITERATOR_TYPE_AT_TIMESTAMP,
     SHARD_ITERATOR_TYPE_LATEST, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
     TIMESTAMP_NOT_AN_EPOCH_DATE_MESSAGE,
@@ -173,7 +173,7 @@ pub fn requested_shard_position(
                 members.timestamp
             ));
         };
-        let Ok(millis) = at.to_millis() else {
+        let Some(millis) = requested_millis(at) else {
             return Err(TIMESTAMP_NOT_AN_EPOCH_DATE_MESSAGE.to_string());
         };
         let millis = u128::try_from(millis).unwrap_or_default();

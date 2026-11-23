@@ -312,8 +312,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a timestamp that is not this stream's names another stream, which this account and
         // region do not hold.
         if let Some(asked) = input.stream_creation_timestamp {
+            // Both sides at the millisecond this service keeps an instant at
+            // (`crate::state::requested_millis`): an instant the wire carried as an
+            // epoch-seconds number arrives a few nanoseconds either side of it.
             let created = crate::state::timestamp(stream.created_at);
-            if asked.to_millis().ok() != created.to_millis().ok() {
+            if crate::state::requested_millis(asked) != crate::state::requested_millis(created) {
                 return Err(not_found(&input.stream_arn));
             }
         }

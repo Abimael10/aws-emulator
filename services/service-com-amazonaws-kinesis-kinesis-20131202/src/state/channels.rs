@@ -140,7 +140,9 @@ impl Channel {
     /// An ARN a delete released and a later create took again names another stream, so a
     /// caller that pins the creation instant is answered about THAT incarnation only; one
     /// that pins none is answered about whichever stream the ARN holds. Instants are compared
-    /// at the millisecond precision this service's stored instants carry.
+    /// at the millisecond this service keeps one at ([`requested_millis`]), because an
+    /// instant the wire carried as an epoch-seconds number arrives a few nanoseconds either
+    /// side of it.
     pub fn sources_stream(
         &self,
         stream_arn: &str,
@@ -149,7 +151,7 @@ impl Channel {
         self.streams.iter().any(|stream| {
             stream.stream_arn == stream_arn
                 && created_at.is_none_or(|pinned| {
-                    pinned.to_millis().ok() == stream.stream_creation_timestamp.to_millis().ok()
+                    requested_millis(pinned) == requested_millis(stream.stream_creation_timestamp)
                 })
         })
     }
