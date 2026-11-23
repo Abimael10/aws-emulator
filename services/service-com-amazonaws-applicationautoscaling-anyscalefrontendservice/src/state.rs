@@ -228,8 +228,13 @@ pub struct ScalingPolicyRecord {
     /// so a breach that does not let up moves the target once and not once per evaluation (see
     /// [`policy_execution`]).
     pub executed_transitions: BTreeMap<String, f64>,
-    /// When this policy last moved the capacity of the resource it scales, which is the
-    /// instant its `Cooldown` is measured from.
+    /// When the movement this policy's `Cooldown` is a wait on was made, which is the instant
+    /// that wait is measured from.
+    ///
+    /// The instant of the movement that STARTED the wait: a movement performed inside it
+    /// delivers the remainder of that same one ([`InFlightMovement`]), so it leaves this
+    /// instant where it is and the wait closes a cooldown after the activity it is a wait on
+    /// (see [`policy_execution`]).
     pub last_executed: Option<SystemTime>,
     /// What the movement [`ScalingPolicyRecord::last_executed`] stands for DID, which is what
     /// an action raised while the wait for it is still running is netted against. It is

@@ -12,14 +12,16 @@
 //! service gives it ([`super::ACTIVITY_FULFILMENT`]) and reaches `Successful` once the capacity
 //! it set is the capacity the owning service holds for the scaled property.
 //!
-//! What it does NOT wait for is the owning service finishing the work that capacity gives it:
-//! the scaled property is the capacity the resource is DRIVEN to — `ecs:service:DesiredCount`
-//! is "the task count of an ECS service", and `Service$desiredCount` is "the desired number of
-//! instantiations of the task definition to keep running on the service" — so the change this
-//! service made is applied the moment that count is the one it asked for, whatever the owning
-//! service's own scheduler then manages to do with it. An estate with nowhere to run the tasks
-//! is reported by the owning service, on the resource's own status and event stream, and not
-//! by this service's scaling history.
+//! Setting the count is NOT the fulfilment of it. The count this service writes is what the
+//! owning service is asked FOR — `ecs:service:DesiredCount` is "the task count of an ECS
+//! service", and `Service$desiredCount` is "the desired number of instantiations of the task
+//! definition to keep running on the service", a number the request leaves behind the instant
+//! it is made — while the change being fulfilled is that service RUNNING the count:
+//! `Service$runningCount` is "the number of tasks in the cluster that are in the RUNNING
+//! state". So the movement waits for the owning service to catch its own desired count up, and
+//! an estate with nowhere to place the tasks — no capacity registered to the cluster, no
+//! address, no quota — is one where that never happens and the activity stays non-terminal,
+//! which is the whole of what the waiting message tells a client that is polling it.
 //!
 //! Which capacity the owning service holds is a fact only that service has, so it is READ
 //! there, once per pass ([`settle_activity_fulfilments`]), for the movements whose own span has
@@ -39,8 +41,8 @@ use super::{
     service_state, ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState, TargetKey,
 };
 
-/// The `ecs` namespace, whose owning service holds the capacity `ecs:service:DesiredCount`
-/// scales as `Service$desiredCount`.
+/// The `ecs` namespace, whose owning service runs the capacity `ecs:service:DesiredCount`
+/// scales as the tasks behind `Service$runningCount`.
 const ECS_NAMESPACE: &str = "ecs";
 
 /// Whether a movement of a target in this namespace has its fulfilment CONFIRMED in the
@@ -68,7 +70,8 @@ struct Awaiting {
     /// The activity, by the id it is reported under.
     activity_id: String,
     target: TargetKey,
-    /// The capacity the movement set, which is the capacity the owning service has to hold.
+    /// The capacity the movement set, which is the capacity the owning service has to have in
+    /// effect.
     capacity: i32,
 }
 
@@ -92,6 +95,11 @@ pub fn settle_activity_fulfilments<Eng: Send + Sync + 'static>(engine: &Eng, reg
     if awaiting.is_empty() {
         return;
     }
+    // The owning services' OWN clocks first, once for the whole pass: what each of them owes
+    // the resources this pass asks about fell due at an instant of that service's own, so a
+    // reading taken without materialising it would report a capacity already in effect as
+    // outstanding.
+    settle_owner_clocks(engine, &awaiting);
     let confirmed: BTreeSet<String> = awaiting
         .into_iter()
         .filter(|movement| owner_has_fulfilled(engine, &movement.target, movement.capacity))
@@ -101,6 +109,22 @@ pub fn settle_activity_fulfilments<Eng: Send + Sync + 'static>(engine: &Eng, reg
         return;
     }
     confirm_fulfilled(&mut state.lock(), &confirmed, SystemTime::now().max(now));
+}
+
+/// Materialise what the clock owes in each service that owns a resource this pass asks about,
+/// one pass per owning service rather than one per movement.
+///
+/// Taken with NO store lock held, this service's or the owning service's: each pass takes the
+/// locks it needs itself.
+fn settle_owner_clocks<Eng: Send + Sync + 'static>(engine: &Eng, awaiting: &[Awaiting]) {
+    use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+
+    let asks_ecs = awaiting
+        .iter()
+        .any(|movement| movement.target.service_namespace == ECS_NAMESPACE);
+    if asks_ecs && ecs::state::service_state(engine).is_some() {
+        ecs::state::advance_task_clock(engine, SystemTime::now());
+    }
 }
 
 /// The movements of `region` whose fulfilment the owning service has still to confirm, and
@@ -160,18 +184,26 @@ fn owner_has_fulfilled<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Whether the ECS service an `ecs` `ResourceId` names holds the task count a movement set on
-/// it: `Service$desiredCount`, "the desired number of instantiations of the task definition to
-/// keep running on the service", which is what `ecs:service:DesiredCount` scales.
+/// Whether the ECS service an `ecs` `ResourceId` names is RUNNING the task count a movement
+/// set on it, which is what `ecs:service:DesiredCount` scales: a count the service has taken
+/// on as `Service$desiredCount` ("the desired number of instantiations of the task definition
+/// to keep running on the service") and reached as `Service$runningCount` ("the number of
+/// tasks in the cluster that are in the RUNNING state").
 ///
-/// A count that is NOT the one this movement set is a change that has not been applied: the
-/// movement is queued for the owning service and delivered with this service's lock released
-/// (`super::policy_execution::deliver_pending_capacity`), so the first passes after the
-/// activity was recorded can read the count the service held before — and a delivery that
-/// never lands is a movement whose capacity the resource never took, which is not a fulfilled
-/// one. A LATER movement of the same target, which leaves the service holding ITS capacity
-/// instead, resolves this activity as overridden rather than fulfilled
+/// A count the service is not RUNNING yet is a change still being fulfilled: the movement is
+/// queued for the owning service and delivered with this service's lock released
+/// (`super::policy_execution::deliver_pending_capacity`), its scheduler then has to place or
+/// stop the tasks the new count asks for, and an estate with nowhere to place them is one
+/// where the count is never reached at all — which is a movement whose capacity never took
+/// effect, not a fulfilled one. A LATER movement of the same target, which leaves the service
+/// driving towards ITS capacity instead, resolves this activity as overridden rather than
+/// fulfilled
 /// (`super::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::override_unfulfilled_activities`).
+///
+/// The placements and stops the ECS clock has already made due are materialised by the pass
+/// before the counts are read ([`settle_owner_clocks`]): they were owed at an instant of that
+/// service's own, whether or not anybody called it, so reading without taking them would
+/// report a count that was already reached as outstanding.
 ///
 /// There is nothing to wait on — so the movement is as fulfilled as it will get — where that
 /// count says nothing about this movement at all: a resource id that names no ECS service, an
@@ -198,5 +230,8 @@ fn ecs_has_fulfilled<Eng: Send + Sync + 'static>(
     else {
         return true;
     };
-    desired_count == capacity
+    if desired_count != capacity {
+        return false;
+    }
+    store.service_tally(cluster, service_name).running == capacity
 }

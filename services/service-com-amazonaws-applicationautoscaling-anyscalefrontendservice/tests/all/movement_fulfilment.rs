@@ -10,23 +10,24 @@
 //! says it is still waiting for ("Successfully set desired count to 3. Waiting for change to be
 //! fulfilled by ecs."). So a movement reports `InProgress` when it is made, and `Successful` —
 //! with an `EndTime` and the settled message ("Change successfully fulfilled by ecs.") — once
-//! the capacity it set is the capacity the owning service holds for the scaled property.
+//! the owning service has that capacity in effect on the scaled property.
 //!
-//! What it does NOT wait for is the owning service finishing the work that capacity gives it.
-//! The scaled property is the capacity the resource is DRIVEN to, so a cluster with nowhere to
-//! run the tasks is an estate whose `runningCount` never catches up — which Amazon ECS reports
-//! on the service it owns, and this service's scaling history still settles the change it made.
-//! Those two facts are asserted together on the rows whose cluster has no container instance.
+//! Setting the count is not fulfilling it. The count this service writes is what the owning
+//! service is asked FOR; the change is fulfilled once that service is RUNNING it. So a cluster
+//! with nowhere to run the tasks is an estate whose `runningCount` never catches the new
+//! `desiredCount` up, and the movement stays `InProgress` with no `EndTime` for as long as that
+//! is true — which is exactly what its waiting message tells a client that is polling it. Those
+//! two facts are asserted together on the rows whose cluster has no container instance.
 //!
 //! The docs the rows are read off:
 //!
 //! * `RegisterScalableTarget$ScalableDimension`: "ecs:service:DesiredCount - The task count of
 //!   an ECS service", and `Service$desiredCount`: "The desired number of instantiations of the
 //!   task definition to keep running on the service" — the capacity an
-//!   `ecs:service:DesiredCount` movement sets, and the one its fulfilment is read off.
+//!   `ecs:service:DesiredCount` movement asks the owning service for.
 //! * `Service$runningCount`: "The number of tasks in the cluster that are in the RUNNING
-//!   state" — the count the owning service's own scheduler owes, which is not what the
-//!   activity waits on.
+//!   state" — the count that capacity being in effect is read off, and the one a cluster with
+//!   nowhere to place a task never reaches.
 //! * `ScalingActivity$StatusCode` / `$StatusMessage` / `$EndTime`: "Indicates the status of the
 //!   scaling activity", "A simple message about the current status of the scaling activity" and
 //!   "The Unix timestamp for when the scaling activity ended"
@@ -49,16 +50,24 @@ use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state:
 
 use crate::emulator::{resource_id_for, Emulator};
 
-/// The status a movement carries until the owning service holds the capacity it set.
+/// The status a movement carries until the owning service has the capacity it set in effect.
 const IN_PROGRESS: &str = "InProgress";
 /// The status it reaches once that service does. See [`IN_PROGRESS`].
 const SUCCESSFUL: &str = "Successful";
 
 /// How long a case waits before a movement the owning service has taken on must have settled:
-/// the span this service gives a movement, plus room for the requests that read it. Nothing in
-/// the emulator sleeps for it.
+/// the span this service gives a movement, plus generous room for the owning service to place
+/// or stop the tasks the new count asks for and for the requests that read it. Nothing in the
+/// emulator sleeps for it.
 fn settling_wait() -> Duration {
-    ACTIVITY_FULFILMENT + Duration::from_secs(3)
+    ACTIVITY_FULFILMENT + Duration::from_secs(20)
+}
+
+/// How long a case WATCHES a movement the owning service can never fulfil: several times the
+/// span this service gives a movement, so a movement that settled on that span alone — or on
+/// the count merely having been written — is caught holding the wrong status.
+fn unfulfilled_watch() -> Duration {
+    ACTIVITY_FULFILMENT * 3
 }
 
 /// How long a bounded poll sleeps between looks.
@@ -99,6 +108,26 @@ async fn newest(emulator: &Emulator, target: &Value, case: &str) -> Value {
 /// A member of an activity as text.
 fn field(activity: &Value, member: &str) -> String {
     activity[member].as_str().unwrap_or_default().to_string()
+}
+
+/// The newest activity of one target for the whole of `within`, answered as it was last read —
+/// returning as soon as it LEAVES `wanted`, which is what a case that expects a status to hold
+/// fails on.
+async fn watched_status(
+    emulator: &Emulator,
+    target: &Value,
+    wanted: &str,
+    within: Duration,
+    case: &str,
+) -> Value {
+    let deadline = Instant::now() + within;
+    loop {
+        let last = newest(emulator, target, case).await;
+        if field(&last, "StatusCode") != wanted || Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// The newest activity of one target once it carries `wanted`, or once the deadline is up — so
@@ -197,9 +226,9 @@ struct MovementRow {
     /// The `ScalableDimension` the row scales, which names the namespace too.
     dimension: &'static str,
     /// Whether the estate the resource lives on can RUN what the capacity asks for — for
-    /// `ecs`, whether its cluster has a container instance to place tasks on. It is not what
-    /// the movement waits on: a row whose cluster has none settles just the same, and its
-    /// `runningCount` is asserted to stay at nothing.
+    /// `ecs`, whether its cluster has a container instance to place tasks on. It is what the
+    /// movement waits on: a row whose cluster has none never reaches the count, so its
+    /// `runningCount` is asserted to stay at nothing and its activity to stay non-terminal.
     runs_tasks: bool,
     /// The capacity the resource is created at, inside the first registered window.
     starting: i64,
@@ -237,10 +266,10 @@ const MOVEMENT_CATALOG: &[MovementRow] = &[
         noun: ECS_NOUN,
     },
     // The estate of the recorded scenario: a cluster with no container instance, where the
-    // EC2 launch type has nowhere to run a task. Amazon ECS still holds the count this service
-    // set, so the change was applied and the movement settles.
+    // EC2 launch type has nowhere to run a task. Amazon ECS can never run the count this
+    // service set, so the change is never fulfilled and the movement stays in progress.
     MovementRow {
-        case: "a scale in an ECS cluster with no container instance can still apply",
+        case: "a scale in an ECS cluster with no container instance never fulfils",
         dimension: ECS_DIMENSION,
         runs_tasks: false,
         starting: 6,
@@ -250,7 +279,7 @@ const MOVEMENT_CATALOG: &[MovementRow] = &[
     },
     // The same estate scaling out, by a larger magnitude.
     MovementRow {
-        case: "a scale out an ECS cluster with no container instance can still apply",
+        case: "a scale out an ECS cluster with no container instance never fulfils",
         dimension: ECS_DIMENSION,
         runs_tasks: false,
         starting: 2,
@@ -260,7 +289,7 @@ const MOVEMENT_CATALOG: &[MovementRow] = &[
     },
     // And by a single task, which is the smallest change there is.
     MovementRow {
-        case: "a single-task scale in an ECS cluster with no container instance can still apply",
+        case: "a single-task scale in an ECS cluster with no container instance never fulfils",
         dimension: ECS_DIMENSION,
         runs_tasks: false,
         starting: 4,
@@ -338,7 +367,7 @@ async fn given_resource(emulator: &Emulator, row: &MovementRow) -> String {
 }
 
 #[tokio::test]
-async fn a_movement_settles_once_the_owning_service_holds_the_capacity_it_set() {
+async fn a_movement_settles_once_the_owning_service_runs_the_capacity_it_set() {
     for row in MOVEMENT_CATALOG {
         let case = row.case;
         let namespace = namespace_of(row.dimension);
@@ -384,20 +413,34 @@ async fn a_movement_settles_once_the_owning_service_holds_the_capacity_it_set() 
             );
         }
 
-        // The owning service holds the capacity this movement set, so the change was applied
-        // and the activity settles — the same activity, not a second one.
-        let settled = awaited_status(&emulator, &target, SUCCESSFUL, settling_wait(), case).await;
-        assert_fulfilled(&settled, row.noun, row.capacity, namespace, case);
-        assert_eq!(
-            settled["ActivityId"], started["ActivityId"],
-            "case {case:?}: expected the same activity to settle, not a second one, \
-             got {settled:?}"
-        );
+        if row.runs_tasks {
+            // The owning service runs the capacity this movement set, so the change took
+            // effect and the activity settles — the same activity, not a second one.
+            let settled =
+                awaited_status(&emulator, &target, SUCCESSFUL, settling_wait(), case).await;
+            assert_fulfilled(&settled, row.noun, row.capacity, namespace, case);
+            assert_eq!(
+                settled["ActivityId"], started["ActivityId"],
+                "case {case:?}: expected the same activity to settle, not a second one, \
+                 got {settled:?}"
+            );
+        } else {
+            // The estate the tasks cannot run on: the owning service never reaches the count,
+            // so the movement is still being waited on however long the log is read — the same
+            // activity, in the same non-terminal status, still reporting what it waits for.
+            let held =
+                watched_status(&emulator, &target, IN_PROGRESS, unfulfilled_watch(), case).await;
+            assert_awaiting(&held, row.noun, row.capacity, namespace, case);
+            assert_eq!(
+                held["ActivityId"], started["ActivityId"],
+                "case {case:?}: expected the same activity to be waiting, not a second one, \
+                 got {held:?}"
+            );
+        }
         if namespace == "ecs" {
-            // What the owning service's own scheduler then did with that count is ITS
-            // business, and the two counts are read back where each of them lives: a cluster
-            // with somewhere to run the tasks reaches the count, and one with nowhere to run
-            // them runs none of them — neither of which is what the activity waited on.
+            // And the count the activity waits on is read back where it lives: a cluster with
+            // somewhere to run the tasks reaches the count, which is what fulfilled the
+            // movement, and one with nowhere to run them runs none of them at all.
             let running = emulator.ecs_running_count(CLUSTER, SERVICE).await;
             let expected = if row.runs_tasks { row.capacity } else { 0 };
             assert_eq!(
@@ -486,7 +529,7 @@ async fn await_desired_count(emulator: &Emulator, expected: i64, within: Duratio
 }
 
 #[tokio::test]
-async fn an_alarm_driven_step_scaling_movement_settles_on_the_ecs_service_it_scales() {
+async fn an_alarm_driven_step_scaling_movement_waits_on_the_ecs_service_it_scales() {
     for row in BREACH_CATALOG {
         let case = row.case;
         let emulator = Emulator::empty();
@@ -599,19 +642,33 @@ async fn an_alarm_driven_step_scaling_movement_settles_on_the_ecs_service_it_sca
              {POLICY_NAME:?}, got {cause:?}"
         );
 
-        // The owning service holds the count the breach set, so the change was applied and the
-        // activity settles — on the estate that can run the tasks and on the one that cannot.
-        let settled = awaited_status(&emulator, &target, SUCCESSFUL, settling_wait(), case).await;
-        assert_fulfilled(&settled, ECS_NOUN, row.capacity, "ecs", case);
-        assert_eq!(
-            settled["ActivityId"], activity["ActivityId"],
-            "case {case:?}: expected the same activity to settle, not a second one, \
-             got {settled:?}"
-        );
+        if row.runs_tasks {
+            // The owning service runs the count the breach set, so the change took effect and
+            // the activity settles — the same activity, not a second one.
+            let settled =
+                awaited_status(&emulator, &target, SUCCESSFUL, settling_wait(), case).await;
+            assert_fulfilled(&settled, ECS_NOUN, row.capacity, "ecs", case);
+            assert_eq!(
+                settled["ActivityId"], activity["ActivityId"],
+                "case {case:?}: expected the same activity to settle, not a second one, \
+                 got {settled:?}"
+            );
+        } else {
+            // The recorded estate: the cluster has nowhere to place the tasks, so the count is
+            // never reached and the breach's movement is still being waited on — the status a
+            // client polling the history to find out whether the action took effect reads.
+            let held =
+                watched_status(&emulator, &target, IN_PROGRESS, unfulfilled_watch(), case).await;
+            assert_awaiting(&held, ECS_NOUN, row.capacity, "ecs", case);
+            assert_eq!(
+                held["ActivityId"], activity["ActivityId"],
+                "case {case:?}: expected the same activity to be waiting, not a second one, \
+                 got {held:?}"
+            );
+        }
 
-        // What the owning service's scheduler then did with that count is ITS business: a
-        // cluster with no container instance runs none of the tasks, which the activity did not
-        // wait on and does not report.
+        // And the count the activity waits on, read back where it lives: a cluster with no
+        // container instance runs none of the tasks the new count asks for.
         let running = emulator.ecs_running_count(CLUSTER, SERVICE).await;
         let expected = if row.runs_tasks { row.capacity } else { 0 };
         assert_eq!(

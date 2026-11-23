@@ -79,6 +79,15 @@
 //! alarm transitioned rather than the instant a pass reads it, so a pass that comes late
 //! performs exactly what the transition it reads was owed.
 //!
+//! The wait is a wait on ONE previous scaling activity, so delivering that remainder does not
+//! restart it: the span runs from the movement that started the wait, and a movement netted
+//! against it continues the same wait rather than arming another one of its own
+//! ([`Movement::continues_wait_from`]). That is what lets the window close: once the span the
+//! initiating activity was given is up, the next breach is decided against the capacity the
+//! target then holds and the adjustment its step names is applied in FULL — so a load that
+//! keeps rising past a larger step's bound goes on escalating instead of freezing at whatever
+//! the netted action left behind.
+//!
 //! A breach a WITHHELD STATE of the target rather than a wait keeps from being performed is
 //! left unconsumed — the alarm is still breaching, so the first pass that may perform it does:
 //! the target's `SuspendedState` suspends the direction the movement would be in ("while a
@@ -1162,6 +1171,17 @@ struct Movement {
     /// compared against — this policy's own wait for a previous scaling activity to take
     /// effect ([`cooldown_of`]).
     settled_for: Duration,
+    /// The instant the wait this movement belongs to STARTED, for a movement that delivers the
+    /// remainder of a movement that wait is still running for, and `None` for one that starts a
+    /// wait of its own.
+    ///
+    /// "The amount of time, in seconds, to wait for a previous scaling activity to take effect"
+    /// is a wait on the activity that STARTED it: a movement decided inside that wait is the
+    /// same decision delivering what it had not delivered yet ([`super::InFlightMovement`]), so
+    /// it continues that wait rather than starting another one — which is what lets the wait
+    /// close and the next breach apply its adjustment in full to the capacity the target then
+    /// holds.
+    continues_wait_from: Option<SystemTime>,
 }
 
 /// What this pass would do with one breach, from the store as it stands.
@@ -1345,12 +1365,18 @@ fn plan_breach(
         capacity,
         base,
         settled_for: cooldown_of(record, tracked_kind),
+        // A movement decided inside the wait for one of this policy's own continues THAT
+        // wait: it is the remainder of the same decision, so the span runs from the movement
+        // that started it and the wait closes when that span is up rather than being pushed
+        // out by every action netted against it.
+        continues_wait_from: in_flight.and(record.last_executed),
     })
 }
 
 /// Perform one movement: consume the transition, set the capacity, record the activity — which
 /// is what queues the capacity the resource is owed — record the scaling decision it settles for
-/// the target's policies, and start this policy's cooldown.
+/// the target's policies, and start this policy's cooldown, or CONTINUE the one this movement
+/// delivers the remainder of ([`Movement::continues_wait_from`]).
 fn perform_movement(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     policy: &FiringPolicy,
@@ -1362,6 +1388,7 @@ fn perform_movement(
         capacity,
         base,
         settled_for,
+        continues_wait_from,
     } = movement;
     // This transition has now been performed, so no later pass performs it again.
     remember_invocation(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
@@ -1373,6 +1400,13 @@ fn perform_movement(
     // instant the pass read, so the order the pass performs movements in is the order
     // their instants are in.
     let moved_at = SystemTime::now().max(now);
+    // The instant the wait for a previous scaling activity to take effect is measured from:
+    // the movement that STARTED it, which for a movement delivering the remainder of one
+    // still in flight is that earlier movement and not this one. So the wait closes the span
+    // after the activity it is a wait on, however many actions are netted against it in the
+    // meantime, and the first breach after it is decided against the capacity the target then
+    // holds rather than against a movement nothing is waiting for any more.
+    let wait_from = continues_wait_from.unwrap_or(moved_at).min(moved_at);
     store.record_capacity_change(&policy.key.target, capacity, cause, moved_at);
     if let Some(target) = store.targets.get_mut(&policy.key.target) {
         target.current_capacity = capacity;
@@ -1380,7 +1414,8 @@ fn perform_movement(
         // movement, which clears the decision an earlier capacity was settled against, and
         // carrying the capacity that decision was taken FROM — so a policy of this target
         // whose trigger is read later is compared against this one instead of adding to it.
-        target.settled_arbitration = moved_at
+        // It stands for the same wait, so it closes with it.
+        target.settled_arbitration = wait_from
             .checked_add(settled_for)
             .map(|open_until| super::SettledArbitration {
                 base_capacity: base,
@@ -1390,7 +1425,7 @@ fn perform_movement(
             });
     }
     if let Some(record) = store.policies.get_mut(&policy.key) {
-        record.last_executed = Some(moved_at);
+        record.last_executed = Some(wait_from);
         // What this movement did, which is what an action raised while the wait for
         // it is still running is netted against: the capacity it was computed from and the
         // capacity it moved the target to.

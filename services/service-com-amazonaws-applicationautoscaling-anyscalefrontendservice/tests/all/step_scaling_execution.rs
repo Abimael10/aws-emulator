@@ -48,6 +48,13 @@
 //! ([`a_policy_triggered_inside_another_policys_wait_adds_one_adjustment_and_no_more`],
 //! [`a_policy_triggered_inside_another_policys_wait_is_bounded_by_the_window_in_force`]).
 //!
+//! And the wait itself CLOSES. It is a wait on one previous scaling activity, so the span runs
+//! from the movement that started it and delivering the remainder of that movement arms no new
+//! wait: the first action after the span applies the whole adjustment of the step its breach
+//! falls in to the capacity the target then holds, which is how a multi-step policy escalates
+//! ([`a_change_in_capacity_step_is_applied_in_full_once_the_wait_has_closed`],
+//! [`a_percent_change_step_is_applied_in_full_once_the_wait_has_closed`]).
+//!
 //! And what bounds a SUCCESSION of actions on one policy is the same rule applied at each of
 //! them: one action applies the one adjustment whose interval the breach falls in, to the
 //! capacity the target holds when the action is raised, clamped into the registered window — so
@@ -2922,4 +2929,354 @@ async fn each_alarm_action_applies_exactly_one_step_adjustment() {
     for row in PER_ACTION_CATALOG {
         drive_per_action(row).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The first action AFTER the wait has closed
+// ---------------------------------------------------------------------------
+//
+// A cooldown is a wait on ONE previous scaling activity — "the amount of time, in seconds, to
+// wait for a previous scaling activity to take effect"
+// (`StepScalingPolicyConfiguration$Cooldown`) — so the span runs from the activity that started
+// it. An action raised while that wait is still running delivers only the remainder the
+// in-flight movement has not delivered, and performing that remainder is the SAME decision
+// finishing rather than a new one: it arms no wait of its own. So the span runs out, and the
+// first action after it is decided against the capacity the target then holds, with the whole
+// `ScalingAdjustment` of the step its breach falls in applied to that capacity and a new
+// activity recorded for the movement.
+//
+// That is what makes a multi-step policy ESCALATE: a load that keeps rising past a larger step's
+// bound keeps being answered, instead of freezing at whatever the netted action left behind.
+//
+// Each row drives three legs on one policy, through two alarms of it — a policy is the action of
+// as many alarms as a client wires it to, and a series of its own keeps each leg's breach a
+// measurement of its own:
+//
+// 1. a breach inside the SMALLER step's interval, which moves the capacity by that step and
+//    starts the wait;
+// 2. an action raised inside that wait, breaching inside the LARGER step's interval, which adds
+//    only the difference between the two;
+// 3. the same breach once the wait has closed, which adds that larger step in full.
+
+/// The metric the alarm that raises the second and third legs watches, inside
+/// [`METRIC_NAMESPACE`]: its own series, so the value that alarm grades is the one those legs
+/// published rather than a blend with the first leg's.
+const ESCALATION_METRIC_NAME: &str = "LoadAfterTheWait";
+
+/// How far past the threshold the first leg's datapoints are: inside the smaller step's
+/// interval.
+const SMALL_BREACH: f64 = 5.0;
+
+/// How far past the threshold the second and third legs' datapoints are: inside the larger
+/// step's interval. See [`SMALL_BREACH`].
+const BIG_BREACH: f64 = 25.0;
+
+/// Where the two steps of an escalation row meet, as a difference from the threshold.
+const ESCALATION_STEP_BOUNDARY: f64 = 10.0;
+
+/// How long one fresh transition of the third leg is given before another is raised: an action
+/// that lands inside the wait adds nothing, so the leg raises the next one rather than waiting
+/// on that one for ever.
+const ESCALATION_SETTLE: Duration = Duration::from_secs(4);
+
+/// One escalation to pin: the window the target is registered with, the capacity the ECS service
+/// starts at, the two steps of the policy, the wait it asks for, and the capacity the target
+/// holds after each of the three legs.
+struct EscalationRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with, which the first leg's adjustment is
+    /// computed from.
+    starting: i64,
+    min: i64,
+    max: i64,
+    adjustment_type: &'static str,
+    /// The `ScalingAdjustment` of the step the first leg's breach falls in.
+    small_adjustment: i64,
+    /// The `ScalingAdjustment` of the step the second and third legs' breaches fall in.
+    big_adjustment: i64,
+    /// The policy's `Cooldown`, in seconds: the wait the second leg lands inside and the third
+    /// leg waits out.
+    cooldown_secs: i64,
+    /// The capacity the first leg lands the target on.
+    after_first: i64,
+    /// The capacity the second leg lands it on: the larger step computed from the capacity the
+    /// in-flight movement started at, which nets out what that movement already delivered.
+    after_netted: i64,
+    /// The capacity the third leg lands it on: the larger step's whole adjustment applied to
+    /// the capacity the target holds once the wait has closed.
+    after_window: i64,
+}
+
+/// The rows differ in the `AdjustmentType` the steps are interpreted by, in the magnitude of
+/// both steps, in the capacity the climb starts from, in the registered window it happens
+/// inside, and in the length of the wait that is waited out.
+const ESCALATION_CATALOG: &[EscalationRow] = &[
+    // Two tasks, then the six-task step netted to four more, then the whole six-task step once
+    // the wait has closed.
+    EscalationRow {
+        case: "a +6 step applied in full after a +2 step's wait has closed",
+        starting: 1,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        small_adjustment: 2,
+        big_adjustment: 6,
+        cooldown_secs: 20,
+        after_first: 3,
+        after_netted: 7,
+        after_window: 13,
+    },
+    // A percentage is a percentage of the capacity the adjustment is computed from: 25% of the
+    // four tasks the target starts at, then 100% of those same four netted to three more, then
+    // 100% of the eight it holds once the wait has closed.
+    EscalationRow {
+        case: "a 100% step applied in full after a 25% step's wait has closed",
+        starting: 4,
+        min: 1,
+        max: 40,
+        adjustment_type: "PercentChangeInCapacity",
+        small_adjustment: 25,
+        big_adjustment: 100,
+        cooldown_secs: 25,
+        after_first: 5,
+        after_netted: 8,
+        after_window: 16,
+    },
+];
+
+/// How long the third leg of a row keeps raising fresh transitions for: the wait it is waiting
+/// OUT, and on top of it the same generous span every other leg of the suite is given.
+fn escalation_wait(cooldown_secs: i64) -> Duration {
+    Duration::from_secs(cooldown_secs.unsigned_abs()) + CONTINUING_WAIT
+}
+
+/// What one leg of an escalation row drives: the alarm whose transition raises the action, the
+/// series the datapoints that decide it are published to, how far past the threshold they are,
+/// and the capacity the leg must land the target on.
+struct EscalationLeg<'a> {
+    alarm_name: &'a str,
+    metric_name: &'a str,
+    breach: f64,
+    expected: i64,
+    case: &'a str,
+}
+
+/// Keep a leg's breach alive on its own series and wait for the ECS service's `desiredCount` to
+/// reach the capacity that leg expects, answering what it last read.
+async fn await_while_breaching_on(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    leg: &EscalationLeg<'_>,
+    wait: Duration,
+) -> i64 {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        publish_breach_on(emulator, leg.metric_name, leg.breach, leg.case).await;
+        let last = emulator.ecs_desired_count(cluster, service).await;
+        if last == leg.expected || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Let a leg's breach UP and drive it back, so its alarm transitions into `ALARM` afresh — the
+/// state change that raises its policy's actions again.
+async fn given_fresh_transition_on(emulator: &Emulator, leg: &EscalationLeg<'_>) {
+    let case = leg.case;
+    emulator.set_alarm_state(leg.alarm_name, "OK").await;
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach_on(emulator, leg.metric_name, leg.breach, case).await;
+        if alarm_state(emulator, leg.alarm_name, case).await == "ALARM" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the still-breaching datapoints to put {:?} back in ALARM",
+            leg.alarm_name
+        );
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Raise fresh transitions of a leg's alarm until the ECS service's `desiredCount` reaches the
+/// capacity that leg expects, answering what it last read.
+///
+/// An action raised while the policy's wait is still running is netted against the movement in
+/// flight and adds nothing, so a leg that is waiting the wait OUT keeps raising actions: the
+/// first one after the wait has closed is the one that moves the capacity.
+async fn await_through_transitions_on(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    leg: &EscalationLeg<'_>,
+    wait: Duration,
+) -> i64 {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        given_fresh_transition_on(emulator, leg).await;
+        let last =
+            await_while_breaching_on(emulator, cluster, service, leg, ESCALATION_SETTLE).await;
+        if last == leg.expected || std::time::Instant::now() >= deadline {
+            return last;
+        }
+    }
+}
+
+/// The `StartTime` of each activity of one target, oldest first.
+async fn movement_start_times(emulator: &Emulator, resource_id: &str, case: &str) -> Vec<f64> {
+    let mut listed = activities(emulator, resource_id, case).await;
+    listed.reverse();
+    listed
+        .iter()
+        .map(|activity| activity["StartTime"].as_f64().unwrap_or_default())
+        .collect()
+}
+
+/// Drive one escalation row's three legs and hold its assertions at each of them.
+async fn drive_escalation(row: &EscalationRow) {
+    let case = row.case;
+    let emulator = Emulator::empty();
+    let cluster = "escalating";
+    let service = "web";
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, row.starting)
+        .await;
+    register(&emulator, &resource_id, row.min, row.max, case).await;
+    let policy_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        "step-policy",
+        json!({
+            "AdjustmentType": row.adjustment_type,
+            "StepAdjustments": step_adjustments(&[
+                Step {
+                    lower: Some(0.0),
+                    upper: Some(ESCALATION_STEP_BOUNDARY),
+                    adjustment: row.small_adjustment,
+                },
+                Step {
+                    lower: Some(ESCALATION_STEP_BOUNDARY),
+                    upper: None,
+                    adjustment: row.big_adjustment,
+                },
+            ]),
+            "Cooldown": row.cooldown_secs,
+        }),
+        case,
+    )
+    .await;
+    // Two alarms of the one policy, each on a series of its own: the first leg's breach is
+    // graded by one and the later legs' by the other.
+    let first_alarm = "escalation-first-alarm";
+    let later_alarm = "escalation-later-alarm";
+    given_breaching_alarm_on(
+        &emulator,
+        first_alarm,
+        METRIC_NAME,
+        &policy_arn,
+        "GreaterThanThreshold",
+        case,
+    )
+    .await;
+    given_breaching_alarm_on(
+        &emulator,
+        later_alarm,
+        ESCALATION_METRIC_NAME,
+        &policy_arn,
+        "GreaterThanThreshold",
+        case,
+    )
+    .await;
+
+    // LEG ONE: the smaller step, which is the movement the policy's wait is then a wait for.
+    let first_leg = EscalationLeg {
+        alarm_name: first_alarm,
+        metric_name: METRIC_NAME,
+        breach: SMALL_BREACH,
+        expected: row.after_first,
+        case,
+    };
+    let first =
+        await_while_breaching_on(&emulator, cluster, service, &first_leg, CONTINUING_WAIT).await;
+    assert_eq!(
+        first, row.after_first,
+        "case {case:?}: expected the first breach to move the ECS desiredCount to {}, got \
+         {first:?}",
+        row.after_first
+    );
+
+    // LEG TWO: an action raised INSIDE that wait, breaching a step further up. What the
+    // in-flight movement has already delivered is netted out, so only the remainder is applied.
+    let netted_leg = EscalationLeg {
+        alarm_name: later_alarm,
+        metric_name: ESCALATION_METRIC_NAME,
+        breach: BIG_BREACH,
+        expected: row.after_netted,
+        case,
+    };
+    let netted =
+        await_while_breaching_on(&emulator, cluster, service, &netted_leg, CONTINUING_WAIT).await;
+    assert_eq!(
+        netted, row.after_netted,
+        "case {case:?}: expected the action inside the wait to add only the remainder and land \
+         the ECS desiredCount on {}, got {netted:?}",
+        row.after_netted
+    );
+
+    // LEG THREE: the same breach once the wait has CLOSED. Delivering that remainder armed no
+    // new wait, so the span runs out and the first action after it applies the larger step's
+    // whole adjustment to the capacity the target now holds.
+    let escalating_leg = EscalationLeg {
+        expected: row.after_window,
+        ..netted_leg
+    };
+    let escalated = await_through_transitions_on(
+        &emulator,
+        cluster,
+        service,
+        &escalating_leg,
+        escalation_wait(row.cooldown_secs),
+    )
+    .await;
+    assert_eq!(
+        escalated, row.after_window,
+        "case {case:?}: expected the action after the wait closed to add the whole adjustment \
+         and land the ECS desiredCount on {}, got {escalated:?}",
+        row.after_window
+    );
+
+    // And the log says what the capacity did: one activity per movement, in the order they
+    // happened, the last of them started no sooner than the whole wait after the movement that
+    // wait was a wait for.
+    let expected_log: Vec<String> = [row.after_first, row.after_netted, row.after_window]
+        .iter()
+        .map(|capacity| format!("Setting desired count to {capacity}."))
+        .collect();
+    let moved = movement_descriptions(&emulator, &resource_id, case).await;
+    assert_eq!(
+        moved, expected_log,
+        "case {case:?}: expected one activity per movement, got {moved:?}"
+    );
+    let started = movement_start_times(&emulator, &resource_id, case).await;
+    let span = started.last().copied().unwrap_or_default()
+        - started.first().copied().unwrap_or_default();
+    assert!(
+        span >= row.cooldown_secs as f64,
+        "case {case:?}: expected the escalating activity to start at least {} seconds after the \
+         movement its policy's wait was a wait for, got {span} from {started:?}",
+        row.cooldown_secs
+    );
+}
+
+#[tokio::test]
+async fn a_change_in_capacity_step_is_applied_in_full_once_the_wait_has_closed() {
+    drive_escalation(&ESCALATION_CATALOG[0]).await;
+}
+
+#[tokio::test]
+async fn a_percent_change_step_is_applied_in_full_once_the_wait_has_closed() {
+    drive_escalation(&ESCALATION_CATALOG[1]).await;
 }
