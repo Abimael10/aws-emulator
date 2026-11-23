@@ -44,6 +44,10 @@
 //! `StartAttachmentUpload` and `GetAttachment` publish name no modelled operation, so they
 //! are claimed by `can_handle` (their path is inside this service's own modelled path
 //! space) and served by [`Service::override_routing_error`]. See [`attachment_plane`].
+//!
+//! A sixth seam is taken as well: `override_protocol`, for the ONE thing about this
+//! service's wire the generic renderer cannot express — the body member a modelled failure
+//! reports its explanatory text in. See [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +56,7 @@ use std::sync::Arc;
 
 mod attachment_plane;
 mod connection_type_refusal;
+mod wire;
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -105,6 +110,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `self.engine` of its own; it must read and write the one store the operations use,
     /// not a second copy.
     engine: Arc<Eng>,
+    /// This service's wire protocol: the model's own `restJson1`, with the error document
+    /// of [`wire`]. Built once here because [`Service::override_protocol`] hands back a
+    /// borrow and must never build one per request.
+    protocol: wire::ParticipantRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -115,6 +124,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
+            protocol: wire::ParticipantRestJson::new(),
         }
     }
 }
@@ -211,5 +221,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the one difference the generic renderer
+        // cannot express: a modelled failure's explanatory text is reported under the
+        // lowercase wire key this service's error documents carry it in, not under the
+        // member name the model spells (see [`wire`]). Borrowed from the field built in
+        // `new`, never constructed per request.
+        //
+        // This seam drives the MODELLED sequence only. A refusal the framework renders
+        // before a handler runs is built from a synthetic shape that already spells that
+        // member lowercase, so both layers of this service answer one logical failure in
+        // one member.
+        Some(&self.protocol)
     }
 }

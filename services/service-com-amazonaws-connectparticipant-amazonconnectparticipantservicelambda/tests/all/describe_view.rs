@@ -433,8 +433,12 @@ async fn a_token_that_names_no_view_of_the_calling_participant_is_access_denied(
             "AccessDeniedException",
             "case {label:?}: got {body:?}"
         );
+        // `message`, the key this service's error documents report a failure's text
+        // under, whatever member name the model declares it as (`src/service/wire.rs`'s
+        // rule, pinned across this service's operations and error classes by
+        // `chat_participant_slice::every_modelled_refusal_reports_its_text_under_the_wire_message_key`).
         assert_eq!(
-            body["Message"].as_str(),
+            body["message"].as_str(),
             Some("Access denied"),
             "case {label:?}: got {body:?}"
         );

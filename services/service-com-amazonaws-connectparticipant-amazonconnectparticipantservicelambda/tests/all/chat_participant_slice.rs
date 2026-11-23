@@ -135,12 +135,14 @@ fn error_type(body: &Value) -> String {
         .to_string()
 }
 
-/// The `Message` of a restJson1 error body.
+/// The explanatory text of an error body, read out of the ONE member this service's error
+/// documents report it in: the lowercase `message`, whatever member name the model declares
+/// the text under (`src/service/wire.rs`). Read intolerantly on purpose — a reader that
+/// accepts either spelling cannot tell the two apart, which is the defect that rule fixes.
 fn error_message(body: &Value) -> String {
-    body.get("Message")
-        .or_else(|| body.get("message"))
+    body.get("message")
         .and_then(Value::as_str)
-        .unwrap_or("<no Message>")
+        .unwrap_or("<no message>")
         .to_string()
 }
 
@@ -2586,8 +2588,11 @@ async fn an_authentication_call_with_a_token_that_authenticates_nobody_is_access
                 "AccessDeniedException",
                 "case {case:?}: got {body:?}"
             );
+            // `message`, the key every error document of this service reports a
+            // failure's text under (see `error_message` and
+            // `every_modelled_refusal_reports_its_text_under_the_wire_message_key`).
             assert_eq!(
-                body["Message"].as_str(),
+                body["message"].as_str(),
                 Some("Access denied"),
                 "case {case:?}: got {body:?}"
             );
@@ -3023,6 +3028,234 @@ async fn an_authentication_refusal_reveals_neither_the_request_nor_the_store() {
             .is_some_and(|session| !session.cancelled),
         "case the session's own chat: the refusals must leave the stored session open"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The member every error document of this service reports its explanatory text in.
+// ---------------------------------------------------------------------------------------
+
+/// What the text of one refused call has to be.
+#[derive(Debug)]
+enum Text {
+    /// The class words one fixed sentence, or words it from the request: the exact text.
+    Exact(String),
+    /// The layer that refused the request worded the sentence: a non-empty one is all this
+    /// rule says about it.
+    Sentence,
+}
+
+/// One refused call, and the error document it must be answered with.
+#[derive(Debug)]
+struct RefusalRow {
+    /// What the assertions name this row.
+    case: &'static str,
+    /// The operation's path.
+    path: &'static str,
+    /// The `X-Amz-Bearer` credential the call carries.
+    bearer: String,
+    /// The request body.
+    body: Value,
+    /// The status the class renders under.
+    status: u16,
+    /// The error shape the answer names.
+    class: &'static str,
+    /// The text the document reports.
+    text: Text,
+}
+
+/// RULE: every error document this service answers with reports the text of the failure
+/// under the lowercase wire key `message` — and under that one key only — whatever member
+/// name the model declares that text under (each error shape of this model spells it
+/// `Message`: `smithy_query(query="shape",shape="AccessDeniedException")`).
+///
+/// The rows differ along what the rule generalises over: which operation answered, which
+/// error class and status it was refused with (403 `AccessDeniedException`, 400
+/// `ValidationException`, 409 `ConflictException`), whether the text is one fixed sentence
+/// or one worded from the request, and — the last row — whether the refusal was rendered by
+/// a handler returning a modelled error or by the framework's own pre-handler boundary,
+/// whose synthetic shape spells that member lowercase already. `DescribeView`, the
+/// remaining `GET`-bound operation, is covered the same way in the `describe_view` suite.
+#[tokio::test]
+async fn every_modelled_refusal_reports_its_text_under_the_wire_message_key() {
+    let harness = router();
+    let live = connect(&harness, "participant-token-wire-key").await;
+
+    // An attachment whose upload is already confirmed, so a second confirmation of it
+    // conflicts with the state it is in.
+    let (status, started) = post(
+        &harness,
+        "/participant/start-attachment-upload",
+        Some(&live),
+        &json!({
+            "ContentType": "text/plain",
+            "AttachmentSizeInBytes": 11,
+            "AttachmentName": "notes.txt",
+            "ClientToken": "wire-key-start",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "StartAttachmentUpload: got {started:?}");
+    let confirmed_id = started["AttachmentId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("StartAttachmentUpload reported no AttachmentId: {started:?}"))
+        .to_string();
+    let (status, confirmation) = post(
+        &harness,
+        "/participant/complete-attachment-upload",
+        Some(&live),
+        &json!({"AttachmentIds": [confirmed_id.clone()], "ClientToken": "wire-key-confirm"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CompleteAttachmentUpload: got {confirmation:?}"
+    );
+
+    // A size one byte past the maximum an attachment of this emulator may declare, and an
+    // attachment id of the form this service mints that names no attachment of this chat.
+    let oversize = participant::state::MAX_ATTACHMENT_BYTES + 1;
+    let missing_attachment = "00000000-0000-4000-8000-000000000000";
+    // A `SessionId` is modelled `len 36..36`, so this one passes the boundary and names no
+    // current authentication session of this chat.
+    let unknown_session = "11111111-2222-4333-8444-555555555555";
+
+    let rows = vec![
+        RefusalRow {
+            case: "SendMessage with a connection token that authenticates nobody",
+            path: "/participant/message",
+            bearer: "bogus-connection-token".to_string(),
+            body: json!({"ContentType": "text/plain", "Content": "hello"}),
+            status: 403,
+            class: "AccessDeniedException",
+            text: Text::Exact("Access denied".to_string()),
+        },
+        RefusalRow {
+            case: "GetTranscript with a connection token that authenticates nobody",
+            path: "/participant/transcript",
+            bearer: "bogus-connection-token".to_string(),
+            body: json!({}),
+            status: 403,
+            class: "AccessDeniedException",
+            text: Text::Exact("Access denied".to_string()),
+        },
+        RefusalRow {
+            case: "CreateParticipantConnection with a participant token no chat registered",
+            path: "/participant/connection",
+            bearer: "participant-token-no-chat".to_string(),
+            body: json!({"Type": ["CONNECTION_CREDENTIALS"]}),
+            status: 403,
+            class: "AccessDeniedException",
+            text: Text::Exact(
+                "User is not authorized to access this resource with an explicit deny in an \
+                 identity-based policy"
+                    .to_string(),
+            ),
+        },
+        RefusalRow {
+            case: "GetAuthenticationUrl naming no current authentication session",
+            path: "/participant/authentication-url",
+            bearer: live.clone(),
+            body: json!({"SessionId": unknown_session, "RedirectUri": "https://example.com/cb"}),
+            status: 400,
+            class: "ValidationException",
+            text: Text::Exact("Specified request parameter(s) are invalid.".to_string()),
+        },
+        RefusalRow {
+            case: "StartAttachmentUpload one byte past the maximum attachment size",
+            path: "/participant/start-attachment-upload",
+            bearer: live.clone(),
+            body: json!({
+                "ContentType": "text/plain",
+                "AttachmentSizeInBytes": oversize,
+                "AttachmentName": "too-big.txt",
+                "ClientToken": "wire-key-oversize",
+            }),
+            status: 400,
+            class: "ValidationException",
+            text: Text::Exact(format!(
+                "AttachmentSizeInBytes {oversize} exceeds the maximum attachment size of {} bytes",
+                participant::state::MAX_ATTACHMENT_BYTES
+            )),
+        },
+        RefusalRow {
+            case: "CompleteAttachmentUpload naming no attachment of this chat",
+            path: "/participant/complete-attachment-upload",
+            bearer: live.clone(),
+            body: json!({
+                "AttachmentIds": [missing_attachment],
+                "ClientToken": "wire-key-missing",
+            }),
+            status: 400,
+            class: "ValidationException",
+            text: Text::Exact(format!(
+                "Attachment with id {missing_attachment} does not exist for this contact"
+            )),
+        },
+        RefusalRow {
+            case: "CompleteAttachmentUpload confirming an upload a second time",
+            path: "/participant/complete-attachment-upload",
+            bearer: live.clone(),
+            body: json!({
+                "AttachmentIds": [confirmed_id.clone()],
+                "ClientToken": "wire-key-again",
+            }),
+            status: 409,
+            class: "ConflictException",
+            text: Text::Exact(format!(
+                "The attachment with id {confirmed_id} has already been uploaded."
+            )),
+        },
+        RefusalRow {
+            case: "SendMessage with Content below the length the model declares",
+            path: "/participant/message",
+            bearer: live.clone(),
+            body: json!({"ContentType": "text/plain", "Content": ""}),
+            status: 400,
+            class: "ValidationException",
+            text: Text::Sentence,
+        },
+    ];
+
+    for row in rows {
+        let RefusalRow {
+            case,
+            path,
+            bearer,
+            body,
+            status,
+            class,
+            text,
+        } = row;
+        let (answered, document) = post(&harness, path, Some(&bearer), &body).await;
+        assert_eq!(
+            answered, status,
+            "case {case:?}: expected status {status}, got {answered} and {document:?}"
+        );
+        assert_eq!(
+            error_type(&document),
+            class,
+            "case {case:?}: expected the class {class:?}, got {document:?}"
+        );
+        let reported = document.get("message").and_then(Value::as_str);
+        match &text {
+            Text::Exact(expected) => assert_eq!(
+                reported,
+                Some(expected.as_str()),
+                "case {case:?}: expected the member \"message\" to be {expected:?}, got \
+                 {document:?}"
+            ),
+            Text::Sentence => assert!(
+                reported.is_some_and(|sentence| !sentence.is_empty()),
+                "case {case:?}: expected a non-empty \"message\", got {document:?}"
+            ),
+        }
+        // ONE key carries that text: a document reporting it under the member name the
+        // model spells reaches an SDK as an exception with no message at all.
+        assert!(
+            document.get("Message").is_none(),
+            "case {case:?}: the text travels under \"message\" alone, got {document:?}"
+        );
+    }
 }
 
 /// Append an item of `item_type` to the transcript of the chat `participant_token` names,
