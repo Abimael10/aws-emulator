@@ -215,7 +215,9 @@ async fn listed_provider_names(router: &MultiServiceRouter, user_pool_id: &str) 
 
 /// One app client of a row: the name to create it under, the
 /// `SupportedIdentityProviders` it is created with (`None` sends no member at
-/// all) and the list it must hold once the row's provider is deleted.
+/// all) and the list it must hold once the row's provider is deleted — where a
+/// client left listing no provider at all configures none, so the member is
+/// absent from a read of it rather than reported as an empty list.
 struct ClientCase {
     client_name: &'static str,
     supported: Option<Vec<String>>,
@@ -478,6 +480,7 @@ async fn a_deleted_identity_provider_is_gone_and_every_app_client_reference_is_s
             let expected = client
                 .expected_after_delete
                 .as_ref()
+                .filter(|names| !names.is_empty())
                 .map(|names| json!(names));
             assert_eq!(
                 after.get("SupportedIdentityProviders").cloned(),

@@ -317,11 +317,18 @@ async fn an_oauth_flow_combination_no_app_client_can_hold_is_refused_by_create_a
                 .unwrap_or_else(|| panic!("case {case:?}: a minted client id: {payload}"))
                 .to_string();
             // The STORED client carries the flows as submitted, repeats
-            // included: the answer is what a later read renders.
+            // included: the answer is what a later read renders. A row that asks
+            // for NO flow configures none, and a configuration list holding no
+            // entry is ABSENT from a read rather than reported as an empty one.
             let read = described_client(&router, &user_pool_id, &client_id).await;
+            let expected = if flows.is_empty() {
+                Value::Null
+            } else {
+                json!(flows)
+            };
             assert_eq!(
                 read["AllowedOAuthFlows"],
-                json!(flows),
+                expected,
                 "case {case:?}: the stored client must carry the flows the create set, got {read}"
             );
             assert_eq!(
@@ -527,13 +534,19 @@ async fn a_scope_the_pool_has_no_definition_of_is_refused_by_create_and_update()
                 .unwrap_or_else(|| panic!("case {case:?}: a minted client id: {payload}"))
                 .to_string();
             let read = described_client(&router, &user_pool_id, &client_id).await;
+            // An app client's permitted scopes are a SET of scope text, so the read
+            // states the order the pool holds that set in — the text's own order —
+            // rather than the sequence the create carried
+            // (`scope_collection_order.rs`); a request permitting NO scope configures
+            // none, and a configuration list holding no entry is ABSENT from a read.
+            let expected = if scopes.is_empty() {
+                Value::Null
+            } else {
+                super::scope_collection_order::sorted_scopes_json(&scopes)
+            };
             assert_eq!(
                 read["AllowedOAuthScopes"],
-                // An app client's permitted scopes are a SET of scope text, so the
-                // read states the order the pool holds that set in — the text's own
-                // order — rather than the sequence the create carried
-                // (`scope_collection_order.rs`).
-                super::scope_collection_order::sorted_scopes_json(&scopes),
+                expected,
                 "case {case:?}: the stored client must carry the scopes the create set, got {read}"
             );
             assert_eq!(

@@ -758,7 +758,14 @@ pub struct RefreshTokenRotationType {
     pub retry_grace_period_seconds: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentityprovider#UserPoolClientType")]
+/// The configuration of one app client, as every operation that answers with one reports
+/// it: the `UserPoolClientType` members the model declares, in the model's own member
+/// order, and the `ClientType` the service reports on every app client appended last.
+///
+/// Member set and order from `smithy_query(query="shape", shape="UserPoolClientType")`,
+/// plus `ClientType` — a member the real service carries on every app client it answers
+/// with and the on-disk model omits, which is why the schema and the codec come from
+/// `types/recorded_member_wire.rs` rather than from the derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct UserPoolClientType {
     pub user_pool_id: Option<String>,
@@ -787,7 +794,205 @@ pub struct UserPoolClientType {
     pub enable_propagate_additional_user_context_data: Option<bool>,
     pub auth_session_validity: Option<i32>,
     pub refresh_token_rotation: Option<RefreshTokenRotationType>,
+    /// What kind of app client this is ([`crate::state::UserPoolClient::client_type`]).
+    pub client_type: String,
 }
+
+cip_schema_and_codec!(
+    UserPoolClientType,
+    USER_POOL_CLIENT_TYPE_SCHEMA,
+    "com.amazonaws.cognitoidentityprovider#UserPoolClientType",
+    "com.amazonaws.cognitoidentityprovider",
+    "UserPoolClientType",
+    (M_USER_POOL_ID, user_pool_id, "UserPoolId", 0, opt, string),
+    (M_CLIENT_NAME, client_name, "ClientName", 1, opt, string),
+    (M_CLIENT_ID, client_id, "ClientId", 2, opt, string),
+    (M_CLIENT_SECRET, client_secret, "ClientSecret", 3, opt, string),
+    (
+        M_LAST_MODIFIED_DATE,
+        last_modified_date,
+        "LastModifiedDate",
+        4,
+        opt,
+        timestamp
+    ),
+    (
+        M_CREATION_DATE,
+        creation_date,
+        "CreationDate",
+        5,
+        opt,
+        timestamp
+    ),
+    (
+        M_REFRESH_TOKEN_VALIDITY,
+        refresh_token_validity,
+        "RefreshTokenValidity",
+        6,
+        req,
+        integer
+    ),
+    (
+        M_ACCESS_TOKEN_VALIDITY,
+        access_token_validity,
+        "AccessTokenValidity",
+        7,
+        opt,
+        integer
+    ),
+    (
+        M_ID_TOKEN_VALIDITY,
+        id_token_validity,
+        "IdTokenValidity",
+        8,
+        opt,
+        integer
+    ),
+    (
+        M_TOKEN_VALIDITY_UNITS,
+        token_validity_units,
+        "TokenValidityUnits",
+        9,
+        opt,
+        structure(TokenValidityUnitsType)
+    ),
+    (
+        M_READ_ATTRIBUTES,
+        read_attributes,
+        "ReadAttributes",
+        10,
+        opt,
+        list(string)
+    ),
+    (
+        M_WRITE_ATTRIBUTES,
+        write_attributes,
+        "WriteAttributes",
+        11,
+        opt,
+        list(string)
+    ),
+    (
+        M_EXPLICIT_AUTH_FLOWS,
+        explicit_auth_flows,
+        "ExplicitAuthFlows",
+        12,
+        opt,
+        list(string)
+    ),
+    (
+        M_SUPPORTED_IDENTITY_PROVIDERS,
+        supported_identity_providers,
+        "SupportedIdentityProviders",
+        13,
+        opt,
+        list(string)
+    ),
+    (
+        M_CALLBACK_URLS,
+        callback_ur_ls,
+        "CallbackURLs",
+        14,
+        opt,
+        list(string)
+    ),
+    (
+        M_LOGOUT_URLS,
+        logout_ur_ls,
+        "LogoutURLs",
+        15,
+        opt,
+        list(string)
+    ),
+    (
+        M_DEFAULT_REDIRECT_URI,
+        default_redirect_uri,
+        "DefaultRedirectURI",
+        16,
+        opt,
+        string
+    ),
+    (
+        M_ALLOWED_OAUTH_FLOWS,
+        allowed_o_auth_flows,
+        "AllowedOAuthFlows",
+        17,
+        opt,
+        list(string)
+    ),
+    (
+        M_ALLOWED_OAUTH_SCOPES,
+        allowed_o_auth_scopes,
+        "AllowedOAuthScopes",
+        18,
+        opt,
+        list(string)
+    ),
+    (
+        M_ALLOWED_OAUTH_FLOWS_USER_POOL_CLIENT,
+        allowed_o_auth_flows_user_pool_client,
+        "AllowedOAuthFlowsUserPoolClient",
+        19,
+        opt,
+        boolean
+    ),
+    (
+        M_ANALYTICS_CONFIGURATION,
+        analytics_configuration,
+        "AnalyticsConfiguration",
+        20,
+        opt,
+        structure(AnalyticsConfigurationType)
+    ),
+    (
+        M_PREVENT_USER_EXISTENCE_ERRORS,
+        prevent_user_existence_errors,
+        "PreventUserExistenceErrors",
+        21,
+        opt,
+        string
+    ),
+    (
+        M_ENABLE_TOKEN_REVOCATION,
+        enable_token_revocation,
+        "EnableTokenRevocation",
+        22,
+        opt,
+        boolean
+    ),
+    (
+        M_ENABLE_PROPAGATE_ADDITIONAL_USER_CONTEXT_DATA,
+        enable_propagate_additional_user_context_data,
+        "EnablePropagateAdditionalUserContextData",
+        23,
+        opt,
+        boolean
+    ),
+    (
+        M_AUTH_SESSION_VALIDITY,
+        auth_session_validity,
+        "AuthSessionValidity",
+        24,
+        opt,
+        integer
+    ),
+    (
+        M_REFRESH_TOKEN_ROTATION,
+        refresh_token_rotation,
+        "RefreshTokenRotation",
+        25,
+        opt,
+        structure(RefreshTokenRotationType)
+    ),
+    (
+        M_CLIENT_TYPE,
+        client_type,
+        "ClientType",
+        26,
+        req,
+        recorded("aws.emulator.recorded.cognitoidentityprovider", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentityprovider#InvalidOAuthFlowException")]
 #[derive(Debug, Clone, Default)]

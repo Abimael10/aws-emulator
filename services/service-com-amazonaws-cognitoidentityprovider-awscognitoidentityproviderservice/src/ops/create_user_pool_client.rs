@@ -556,6 +556,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default();
         let client = crate::state::UserPoolClient {
             client_id: client_id.clone(),
+            // An app client this operation mints is an ordinary app client of the
+            // pool, which is the kind it carries from here on: the type is stamped
+            // on the record so every read path reports it from the STORED client
+            // rather than deciding it again.
+            client_type: crate::state::REGULAR_CLIENT_TYPE.to_string(),
             client_secrets,
             user_pool_id: pool.id.clone(),
             client_name: input.client_name.clone(),
@@ -625,8 +630,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response is the app-client configuration the REQUEST carried, so the
         // permitted scopes come back as the sequence it was handed, while the pool
         // holds that SET in the scope text's own order and every later READ of the
-        // app client states the order it holds it in.
-        stored.allowed_o_auth_scopes = input.allowed_o_auth_scopes;
+        // app client states the order it holds it in. A request that permitted no
+        // scope at all configures none, so the member is absent either way
+        // ([`crate::state::configured_list`]).
+        stored.allowed_o_auth_scopes =
+            crate::state::configured_list(input.allowed_o_auth_scopes.as_deref());
         Ok(CreateUserPoolClientOutput {
             user_pool_client: Some(stored),
         })

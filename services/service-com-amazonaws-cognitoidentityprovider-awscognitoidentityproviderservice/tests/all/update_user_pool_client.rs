@@ -230,7 +230,8 @@ struct UpdateCase {
 /// named. `ExplicitAuthFlows` has
 /// a documented default for a CREATE — the set a NEW app client starts with —
 /// so an update that names no flows leaves the app client with NONE of them
-/// rather than putting that create-time set back.
+/// rather than putting that create-time set back, and a configuration list
+/// holding no entry is ABSENT from a read rather than reported as an empty one.
 fn reset_to_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("AccessTokenValidity", Value::Null),
@@ -252,7 +253,7 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
         ("EnablePropagateAdditionalUserContextData", json!(false)),
         ("EnableTokenRevocation", json!(true)),
         ("PreventUserExistenceErrors", json!("LEGACY")),
-        ("ExplicitAuthFlows", json!([])),
+        ("ExplicitAuthFlows", Value::Null),
         // `ClientName` has no documented default and an app client must carry a
         // name, so an update that omits it keeps the stored one.
         ("ClientName", json!(CREATED_CLIENT_NAME)),
@@ -394,11 +395,12 @@ fn update_cases() -> Vec<UpdateCase> {
             ]),
         },
         UpdateCase {
-            case: "an empty OAuth flow list: an empty list is a value, not an absent member",
+            case: "an empty OAuth flow list: it replaces what the client held and \
+                   configures nothing",
             request: json!({ "AllowedOAuthFlows": [], "CallbackURLs": [] }),
             expected: overriding(vec![
-                ("AllowedOAuthFlows", json!([])),
-                ("CallbackURLs", json!([])),
+                ("AllowedOAuthFlows", Value::Null),
+                ("CallbackURLs", Value::Null),
             ]),
         },
         UpdateCase {

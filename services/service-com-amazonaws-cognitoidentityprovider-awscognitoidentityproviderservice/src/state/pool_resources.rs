@@ -509,10 +509,23 @@ pub fn app_client_not_found_in_pool_message(client_id: &str, user_pool_id: &str)
     format!("User pool client {client_id} does not exist in user pool {user_pool_id}.")
 }
 
+/// The `ClientType` an app client minted through `CreateUserPoolClient` carries: an
+/// ordinary app client of a user pool, the kind an API create produces, as against the
+/// other client kinds a caller may have to tell apart.
+///
+/// Recorded behavior: this copy of the model declares no `ClientType` member at all,
+/// while the service reports one on every app client it answers with, and the value it
+/// reports for an app client created through this API is a fixed token.
+pub const REGULAR_CLIENT_TYPE: &str = "REGULAR";
+
 /// One stored app client of a user pool.
 #[derive(Debug, Clone)]
 pub struct UserPoolClient {
     pub client_id: String,
+    /// What kind of app client this is, stamped when the client was minted
+    /// ([`REGULAR_CLIENT_TYPE`]) and reported by every read path from HERE, so one
+    /// stored client answers one type however it is read.
+    pub client_type: String,
     /// This app client's active client secrets, oldest first. A confidential app
     /// client is created holding one, and `AddUserPoolClientSecret` "supports up
     /// to 2 active secrets per app client for zero-downtime credential rotation
@@ -874,15 +887,17 @@ impl UserPoolClient {
             access_token_validity: self.access_token_validity,
             id_token_validity: self.id_token_validity,
             token_validity_units: Some(self.token_validity_units.clone()),
-            read_attributes: self.read_attributes.clone(),
-            write_attributes: self.write_attributes.clone(),
-            explicit_auth_flows: Some(self.explicit_auth_flows.clone()),
-            supported_identity_providers: self.supported_identity_providers.clone(),
-            callback_ur_ls: self.callback_urls.clone(),
-            logout_ur_ls: self.logout_urls.clone(),
+            read_attributes: configured_list(self.read_attributes.as_deref()),
+            write_attributes: configured_list(self.write_attributes.as_deref()),
+            explicit_auth_flows: non_empty(&self.explicit_auth_flows),
+            supported_identity_providers: configured_list(
+                self.supported_identity_providers.as_deref(),
+            ),
+            callback_ur_ls: configured_list(self.callback_urls.as_deref()),
+            logout_ur_ls: configured_list(self.logout_urls.as_deref()),
             default_redirect_uri: self.default_redirect_uri.clone(),
-            allowed_o_auth_flows: self.allowed_oauth_flows.clone(),
-            allowed_o_auth_scopes: self.allowed_oauth_scopes.clone(),
+            allowed_o_auth_flows: configured_list(self.allowed_oauth_flows.as_deref()),
+            allowed_o_auth_scopes: configured_list(self.allowed_oauth_scopes.as_deref()),
             allowed_o_auth_flows_user_pool_client: Some(self.allowed_oauth_flows_user_pool_client),
             analytics_configuration: self.analytics_configuration.clone(),
             prevent_user_existence_errors: Some(self.prevent_user_existence_errors.clone()),
@@ -892,8 +907,23 @@ impl UserPoolClient {
             ),
             auth_session_validity: Some(self.auth_session_validity),
             refresh_token_rotation: self.refresh_token_rotation.clone(),
+            client_type: self.client_type.clone(),
         }
     }
+}
+
+/// The value a configuration list member of an app client is REPORTED as: the entries it
+/// holds, or nothing at all when it holds none.
+///
+/// Every list member of an app client's configuration is optional with no modelled
+/// default, and a list with no entries configures nothing: "Amazon Cognito only populates
+/// `ReadAttributes` in the API response if you have specified your own custom set of read
+/// attributes" (`UserPoolClientType.ReadAttributes` in this service's model, and
+/// `WriteAttributes` in the same words), so a member holding no entry is ABSENT from a
+/// read rather than reported as an empty collection — the projection [`non_empty`] gives
+/// every other collection this service reports.
+pub fn configured_list(held: Option<&[String]>) -> Option<Vec<String>> {
+    held.and_then(non_empty)
 }
 
 /// Whether the attribute `name` is among the ones `permitted` grants, where an

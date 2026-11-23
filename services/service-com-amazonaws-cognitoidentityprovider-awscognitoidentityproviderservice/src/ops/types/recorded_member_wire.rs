@@ -41,18 +41,31 @@ macro_rules! cip_shape_type {
     (timestamp) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
+    (boolean) => {
+        ::aws_smithy_schema::ShapeType::Boolean
+    };
+    (integer) => {
+        ::aws_smithy_schema::ShapeType::Integer
+    };
+    (list(string)) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (structure($ty:ty)) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
 }
 
 /// One member's schema, as the vendored codegen emits it: the member's shape id, its shape
 /// type, its wire name and its index in the member list.
 ///
-/// `$kind` is the member's shape kind — `string` or `timestamp` — or
-/// `recorded("<namespace>", <kind>)` for a member the model does not declare at all, whose
-/// shape id then sits in the namespace given there rather than in the service's own.
+/// `$kind` is the member's shape kind — `string`, `timestamp`, `boolean`, `integer`,
+/// `list(string)` or `structure(<Type>)` — or `recorded("<namespace>", <kind>)` for a member
+/// the model does not declare at all, whose shape id then sits in the namespace given there
+/// rather than in the service's own.
 macro_rules! cip_member_schema {
     (
         $ns:literal, $local:literal, $wire:literal, $idx:literal,
-        recorded($rns:literal, $kind:tt)
+        recorded($rns:literal, $($kind:tt)+)
     ) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
@@ -60,19 +73,19 @@ macro_rules! cip_member_schema {
                 $rns,
                 $wire,
             ),
-            cip_shape_type!($kind),
+            cip_shape_type!($($kind)+),
             $wire,
             $idx,
         )
     };
-    ($ns:literal, $local:literal, $wire:literal, $idx:literal, $kind:tt) => {
+    ($ns:literal, $local:literal, $wire:literal, $idx:literal, $($kind:tt)+) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
                 concat!($ns, "#", $local, "$", $wire),
                 $ns,
                 $wire,
             ),
-            cip_shape_type!($kind),
+            cip_shape_type!($($kind)+),
             $wire,
             $idx,
         )
@@ -92,6 +105,27 @@ macro_rules! cip_write_member {
     ($s:ident, $m:expr, $v:expr, timestamp) => {
         $s.write_timestamp($m, $v)?;
     };
+    ($s:ident, $m:expr, $v:expr, boolean) => {
+        $s.write_boolean($m, *$v)?;
+    };
+    ($s:ident, $m:expr, $v:expr, integer) => {
+        $s.write_integer($m, *$v)?;
+    };
+    // A list of strings writes its elements against the member's own schema, the
+    // way the vendored codegen writes a scalar list.
+    ($s:ident, $m:expr, $v:expr, list(string)) => {
+        $s.write_list($m, &|__sl| {
+            for __item in $v.iter() {
+                __sl.write_string($m, __item.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
+    // A structure member writes through its own `SerializableStruct`, which is
+    // what carries the nested shape's member schemas.
+    ($s:ident, $m:expr, $v:expr, structure($ty:ty)) => {
+        $s.write_struct($m, $v)?;
+    };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
@@ -104,6 +138,23 @@ macro_rules! cip_read_member {
     };
     ($d:ident, $m:expr, timestamp) => {
         $d.read_timestamp($m)?
+    };
+    ($d:ident, $m:expr, boolean) => {
+        $d.read_boolean($m)?
+    };
+    ($d:ident, $m:expr, integer) => {
+        $d.read_integer($m)?
+    };
+    ($d:ident, $m:expr, list(string)) => {{
+        let mut __items: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __items.push(__dl.read_string($m)?);
+            Ok(())
+        })?;
+        __items
+    }};
+    ($d:ident, $m:expr, structure($ty:ty)) => {
+        <$ty as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
     };
 }
 
