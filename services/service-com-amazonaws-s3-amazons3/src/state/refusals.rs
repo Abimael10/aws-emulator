@@ -1338,6 +1338,25 @@ pub fn refused_timestamp_text(date: &::aws_smithy_types::DateTime) -> String {
     }
 }
 
+/// A TIMESTAMP the service rejected, as the `<ArgumentValue>` of an
+/// [`INVALID_ARGUMENT_CODE`] envelope renders it where that document writes the instant as a
+/// CALENDAR date: the UTC form with whole seconds, which is the `date-time` grammar the
+/// member itself is carried in on the wire (`ObjectLockRetainUntilDate` is a timestamp whose
+/// `timestampFormat` is `date-time`) with the sub-second part dropped — so the rendering comes
+/// from the same formatter the wire does rather than from a second spelling of it.
+///
+/// Beside [`refused_timestamp_text`] rather than instead of it: the two renderings belong to
+/// different refusals — the retain-until date that does not cover an event hold is reported
+/// in this one — so each is rendered where its refusal carries it, and neither takes anything
+/// from the spelling the request happened to use.
+pub fn refused_timestamp_utc_text(date: &::aws_smithy_types::DateTime) -> String {
+    ::aws_smithy_types::DateTime::from_secs(date.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        // An instant outside the range a calendar date can be written in has no such
+        // rendering, and nothing of this request's own spelling is put in its place.
+        .unwrap_or_default()
+}
+
 /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a
 /// `NotificationConfiguration` naming a destination it could not validate.
 ///

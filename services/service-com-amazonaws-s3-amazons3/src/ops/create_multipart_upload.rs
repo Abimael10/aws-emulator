@@ -593,34 +593,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The Object Lock this initiation asks the finished object to be stored with, read
-        // off the three members that carry it through the one rule every write in this
-        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
+        // off the members that carry it through the one rule every write in this service
+        // reads them by ([`crate::state::requested_object_lock`]). Half a retention
         // describes no period and a date outside the range this platform holds names no
         // instant: either is a parameter that is not valid for the request, which is
         // `InvalidRequest` (400) with the sentence the modelled shape states for itself —
         // this operation declares no error shapes, so it goes out through the unmodelled
         // channel, and nothing is recorded.
         let requested_lock = match crate::state::requested_object_lock(
-            input.object_lock_mode.as_deref(),
-            input.object_lock_retain_until_date.as_ref(),
-            input.object_lock_legal_hold_status.as_deref(),
+            crate::state::RequestedObjectLockMembers {
+                mode: input.object_lock_mode.as_deref(),
+                retain_until_date: input.object_lock_retain_until_date.as_ref(),
+                legal_hold_status: input.object_lock_legal_hold_status.as_deref(),
+                event_hold: input.object_lock_event_hold.as_deref(),
+                event_hold_duration_days: input.object_lock_event_hold_duration_days,
+                event_hold_duration_years: input.object_lock_event_hold_duration_years,
+            },
             ::std::time::SystemTime::now(),
         ) {
             Ok(requested) => requested,
-            // A date that is not in the FUTURE is a bad VALUE in a named field rather than a
-            // parameter that cannot be carried out, so it is refused as that field's
-            // `InvalidArgument`.
-            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
-                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+            // A date that is not in the FUTURE, and one that does not cover the event hold
+            // beside it, are bad VALUES in a named field rather than parameters that cannot
+            // be carried out, so each is refused as that field's `InvalidArgument` — through
+            // the one place every call of this service builds these refusals in
+            // ([`crate::scaffolded::Scaffolded::object_lock_rejection`]).
+            Err(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::object_lock_rejection(
+                    rejection,
+                    crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
                     input.object_lock_retain_until_date.as_ref(),
-                ))
-            }
-            Err(_) => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_REQUEST_CODE,
-                    crate::state::INVALID_REQUEST_STATUS,
-                    crate::state::INVALID_REQUEST_MESSAGE,
-                ))
+                )
+                .unwrap_or_else(|| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::INVALID_REQUEST_MESSAGE,
+                    )
+                }))
             }
         };
 
@@ -1056,15 +1065,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The feature `input` asks for that this emulator does not serve, if any — named for the
 /// 501 that refuses it, the way `HeadObject` names its own.
 fn unserved_feature(input: &CreateMultipartUploadInput) -> Option<&'static str> {
-    [
-        (
-            input.object_lock_event_hold.is_some(),
-            "ObjectLockEventHold",
-        ),
-        (input.request_payer.is_some(), "RequestPayer"),
-    ]
-    .into_iter()
-    .find_map(|(asked, name)| asked.then_some(name))
+    [(input.request_payer.is_some(), "RequestPayer")]
+        .into_iter()
+        .find_map(|(asked, name)| asked.then_some(name))
 }
 
 /// The IAM action an initiation is authorized under — "you must be allowed to perform the

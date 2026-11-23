@@ -401,10 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         };
 
         // Members whose semantics this emulator cannot carry out faithfully — the same
-        // list `PutObject` refuses a write for, minus the destination preconditions:
-        //
-        // * the Object Lock EVENT hold members decide when a period starts running from an
-        //   event nothing here raises, so no stored version can carry one.
+        // list `PutObject` refuses a write for, minus the destination preconditions.
         //
         // The copy-source SSE-C members are NOT in this list: a SOURCE object stored under a
         // customer-provided key is READ with the key they present, which is judged below
@@ -421,29 +418,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // against what the destination key holds — and a condition that does not hold is
         // answered with the 412 S3 documents for them.
         //
-        // The Object Lock MODE, RETAIN-UNTIL DATE and LEGAL HOLD are not in this list
-        // either: they are the lock the destination version is stored with, recorded on it
-        // below exactly as `PutObject` records its own.
-        for (member, present) in [
-            (
-                "x-amz-object-lock-event-hold",
-                input.object_lock_event_hold.is_some(),
-            ),
-            (
-                "x-amz-object-lock-event-hold-duration-days",
-                input.object_lock_event_hold_duration_days.is_some(),
-            ),
-            (
-                "x-amz-object-lock-event-hold-duration-years",
-                input.object_lock_event_hold_duration_years.is_some(),
-            ),
-        ] {
-            if present {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "CopyObject with {member}"
-                )));
-            }
-        }
+        // The Object Lock MODE, RETAIN-UNTIL DATE, LEGAL HOLD and EVENT HOLD are not in this
+        // list either: they are the lock the destination version is stored with, recorded on
+        // it below exactly as `PutObject` records its own.
 
         // The CUSTOMER-PROVIDED key this copy presents for the SOURCE object, read off the
         // three `x-amz-copy-source-` members that carry it through the one rule every call of
@@ -607,25 +584,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         let excludes_annotations = input.annotation_directive.as_deref() == Some(DIRECTIVE_EXCLUDE);
 
         // The Object Lock this copy asks for the DESTINATION version to be stored with, read
-        // off the three members that carry it through the one rule every write in this
-        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
-        // describes no period and a date outside the range this platform holds names no
-        // instant: either is a parameter that is not valid for the request, which is what the
-        // modelled `InvalidRequest` reports. A date that is not in the FUTURE is a bad VALUE
-        // in a named field instead, so it is refused as that field's `InvalidArgument`.
+        // off the members that carry it through the one rule every write in this service
+        // reads them by ([`crate::state::requested_object_lock`]), and refused through the one
+        // place those refusals are built
+        // ([`crate::scaffolded::Scaffolded::object_lock_rejection`]) — so a lock this copy
+        // cannot be given is answered exactly as the one-shot write answers it.
         let requested_lock = match crate::state::requested_object_lock(
-            input.object_lock_mode.as_deref(),
-            input.object_lock_retain_until_date.as_ref(),
-            input.object_lock_legal_hold_status.as_deref(),
+            crate::state::RequestedObjectLockMembers {
+                mode: input.object_lock_mode.as_deref(),
+                retain_until_date: input.object_lock_retain_until_date.as_ref(),
+                legal_hold_status: input.object_lock_legal_hold_status.as_deref(),
+                event_hold: input.object_lock_event_hold.as_deref(),
+                event_hold_duration_days: input.object_lock_event_hold_duration_days,
+                event_hold_duration_years: input.object_lock_event_hold_duration_years,
+            },
             ::std::time::SystemTime::now(),
         ) {
             Ok(requested) => requested,
-            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
-                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+            Err(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::object_lock_rejection(
+                    rejection,
+                    crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
                     input.object_lock_retain_until_date.as_ref(),
-                ))
+                )
+                .unwrap_or_else(|| {
+                    CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()
+                }))
             }
-            Err(_) => return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()),
         };
 
         // The role the DESTINATION bucket replicates under was resolved against IAM before

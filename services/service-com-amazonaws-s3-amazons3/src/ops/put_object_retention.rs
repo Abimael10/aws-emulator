@@ -222,40 +222,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The EVENT HOLD members of the container are a hold that runs from an event rather
-        // than to a date (`ObjectLockRetention$EventHold` / `$EventHoldDuration`), so they
-        // decide something no stored retention here could then report. Nothing emulates
-        // them, and answering 200 would claim behaviour nothing performed, so the request
-        // is refused as unwritten rather than quietly stripped of its meaning — the way
-        // `PutObject` refuses the object-lock headers it cannot carry out.
-        if let Some(retention) = input.retention.as_ref() {
-            for (member, present) in [
-                ("EventHold", retention.event_hold.is_some()),
-                (
-                    "EventHoldDuration",
-                    retention.event_hold_duration.is_some(),
-                ),
-            ] {
-                if present {
-                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                        "PutObjectRetention with Retention.{member}"
-                    )));
-                }
-            }
-        }
+        // The EVENT HOLD this call asks for, read off the two members of the container that
+        // carry it ("the event hold status for the object" and "the event hold duration for
+        // the object", `ObjectLockRetention$EventHold` / `$EventHoldDuration`) through the
+        // one rule every call that can place a hold reads them by
+        // ([`crate::state::requested_event_hold`]): an enabled hold runs for exactly one
+        // duration, and a hold that is not enabled runs for none.
+        let document = input.retention.as_ref();
+        let duration = document.and_then(|retention| retention.event_hold_duration.as_ref());
+        let requested_event_hold = match crate::state::requested_event_hold(
+            document.and_then(|retention| retention.event_hold.as_deref()),
+            duration.and_then(|duration| duration.days),
+            duration.and_then(|duration| duration.years),
+        ) {
+            Ok(hold) => hold,
+            Err(rejection) => return Err(object_lock_refusal(rejection, None)),
+        };
 
         // The retention this call asks for, or `None` for a call that asks for NONE: the
         // `Retention` container is optional and describes one period in one mode, so a
         // request that carries no container — or an empty one — is the documented way to
         // take a retention away, which is exactly what needs the governance bypass below.
+        //
+        // A container naming ONLY the event hold changes that hold on the retention already
+        // in force and keeps its mode and period: the hold is a member OF that retention, so
+        // enabling or releasing one is not a request to replace the period around it.
         let requested = match input.retention.as_ref() {
-            None => None,
+            None => RequestedRetention::Replace(None),
             Some(retention) => {
                 match (
                     retention.mode.as_deref(),
                     retention.retain_until_date.as_ref(),
                 ) {
-                    (None, None) => None,
+                    (None, None) => match requested_event_hold {
+                        // Nothing at all: the documented way to take the retention away.
+                        None => RequestedRetention::Replace(None),
+                        Some(hold) => RequestedRetention::EventHoldOnly(hold),
+                    },
                     (Some(mode), Some(date)) => {
                         // `Mode` targets the `ObjectLockRetentionMode` enum, whose values
                         // the boundary validator already refuses anything outside; checked
@@ -282,16 +285,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // it is settled here, before the store is read and before the Object
                         // Lock in force on the version is consulted at all.
                         if retain_until <= ::std::time::SystemTime::now() {
-                            return Err(crate::scaffolded::Scaffolded::invalid_argument(
-                                crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
-                                Some(&crate::state::refused_timestamp_text(date)),
-                                crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
+                            return Err(object_lock_refusal(
+                                crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture,
+                                Some(date),
                             ));
                         }
-                        Some(crate::state::ObjectRetention {
+                        // And the period has to cover the event hold it carries, judged by
+                        // the same rule every object write judges its own by.
+                        if requested_event_hold.is_some_and(|hold| {
+                            hold.bars_retain_until(retain_until, ::std::time::SystemTime::now())
+                        }) {
+                            return Err(object_lock_refusal(
+                                crate::state::ObjectLockRequestRejection::RetainUntilDateUnderEventHoldFloor,
+                                Some(date),
+                            ));
+                        }
+                        RequestedRetention::Replace(Some(crate::state::ObjectRetention {
                             mode: mode.to_string(),
                             retain_until,
-                        })
+                            event_hold: requested_event_hold,
+                        }))
                     }
                     // One member without the other describes no period: a retention runs
                     // in a mode TO a date, so AWS refuses the half of one. No error code of
@@ -365,10 +378,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below works over an owned value and the store is free to be written through.
         // A retention whose date has passed has expired and restricts nothing.
         let now = ::std::time::SystemTime::now();
-        let in_force = object
-            .retention
+        let current = object.retention.clone();
+        let in_force = current
             .clone()
             .filter(|retention| retention.in_force_at(now));
+
+        // What the version is to carry afterwards: the retention the container described, or
+        // — for a container naming only the event hold — the retention it already carries
+        // with that hold in place of its own.
+        let requested = match requested {
+            RequestedRetention::Replace(retention) => retention,
+            RequestedRetention::EventHoldOnly(hold) => {
+                // A hold is a member OF a retention, so a version carrying none has nothing
+                // for the hold to live in: the container names a hold the service cannot
+                // place, refused with the sentence every call that supplies a hold without
+                // the retention it runs in is refused with — rather than answered 200 with
+                // the hold dropped, which no later read could tell from a placed one.
+                let Some(current) = current else {
+                    return Err(object_lock_refusal(
+                        crate::state::ObjectLockRequestRejection::EventHoldWithoutMode,
+                        None,
+                    ));
+                };
+                let kept = crate::state::ObjectRetention {
+                    event_hold: Some(hold),
+                    ..current
+                };
+                // The kept period still has to cover an ENABLED hold, judged by the same rule
+                // a container stating its own period is judged by.
+                if hold.bars_retain_until(kept.retain_until, now) {
+                    return Err(object_lock_refusal(
+                        crate::state::ObjectLockRequestRejection::RetainUntilDateUnderEventHoldFloor,
+                        Some(&::aws_smithy_types::DateTime::from(kept.retain_until)),
+                    ));
+                }
+                Some(kept)
+            }
+        };
 
         if let Some(in_force) = in_force {
             // What this call would leave the version with, against what protects it now:
@@ -502,6 +548,49 @@ const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 /// `http {method: "PUT", uri: "/{Bucket}/{Key+}?retention"}`) — what a `MethodNotAllowed`
 /// document reports as the `<Method>` it refused.
 const RETENTION_WRITE_METHOD: &str = "PUT";
+
+/// What the `Retention` container of this call asks the addressed version to carry.
+///
+/// Two forms, because the container's members are not all of one kind: `Mode` and
+/// `RetainUntilDate` describe the PERIOD the version is locked for, while `EventHold` and
+/// `EventHoldDuration` describe a hold INSIDE that period
+/// (`smithy_query(query="shape",shape="ObjectLockRetention")`), so a container naming only
+/// the hold is not a request to replace the period around it.
+enum RequestedRetention {
+    /// Replace the version's retention with this one — `None` to take it away, which is what
+    /// a call carrying no container, or an empty one, asks for.
+    Replace(Option<crate::state::ObjectRetention>),
+    /// Leave the version's period as it stands and put this event hold on it.
+    EventHoldOnly(crate::state::ObjectEventHold),
+}
+
+/// The refusal this call answers a retention its members cannot describe with: built in the
+/// one place every call of this service that names an Object Lock builds these
+/// ([`crate::scaffolded::Scaffolded::object_lock_rejection`]), with the `RetainUntilDate`
+/// member of the `Retention` document as the field a refused date is reported against.
+///
+/// A rejection that place leaves to the operation's own modelled `InvalidRequest` — half a
+/// retention, an unrepresentable date, a duration naming no hold — is answered with that same
+/// code through the unmodelled channel, because this operation declares no error shapes: the
+/// `<Message>` is then the one the modelled shape states for itself rather than a sentence
+/// invented here.
+fn object_lock_refusal(
+    rejection: crate::state::ObjectLockRequestRejection,
+    date: Option<&::aws_smithy_types::DateTime>,
+) -> PutObjectRetentionError {
+    crate::scaffolded::Scaffolded::object_lock_rejection(
+        rejection,
+        crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
+        date,
+    )
+    .unwrap_or_else(|| {
+        crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            crate::state::INVALID_REQUEST_MESSAGE,
+        )
+    })
+}
 
 /// The 404 for an address whose bucket this emulator holds but whose object version it does
 /// not: the version the request NAMED is missing (`NoSuchVersion`), or the key has no

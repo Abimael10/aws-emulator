@@ -2083,22 +2083,73 @@ impl<E> Scaffolded<E> {
         })
     }
 
-    /// The refusal every WRITE that carries `x-amz-object-lock-retain-until-date` answers a
-    /// date that does not end in the future with: the `InvalidArgument` above, naming that
-    /// header and rendering the date it rejected the way the service renders a refused
-    /// timestamp ([`crate::state::refused_timestamp_text`]; the sentence,
-    /// [`crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`], is shared with the
-    /// retention write that is refused the same value in its document).
-    pub fn retain_until_date_not_in_future(date: Option<&::aws_smithy_types::DateTime>) -> Self {
-        Self::invalid_argument(
-            crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
-            Some(
-                &date
-                    .map(crate::state::refused_timestamp_text)
-                    .unwrap_or_default(),
-            ),
-            crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
-        )
+    /// The refusal a call that names an OBJECT LOCK answers a lock its members cannot
+    /// describe with ([`crate::state::ObjectLockRequestRejection`] says which), or `None`
+    /// where the caller's own modelled `InvalidRequest` is the answer: a parameter that is
+    /// not valid for the request, which that error reports with no sentence of its own.
+    ///
+    /// `date_argument` is the field the refused retain-until date arrived in — the
+    /// `x-amz-object-lock-retain-until-date` header of an object write, or the
+    /// `RetainUntilDate` member of a `Retention` document — because the
+    /// `<ArgumentName>` / `<ArgumentValue>` pair names what the caller has to change, and
+    /// `date` is the value that field carried, rendered the way the refusal carrying it
+    /// renders a timestamp.
+    ///
+    /// The ONE place these rejections become wire refusals, so every call that can lock a
+    /// version — the one-shot write, the copy, the multipart initiation and the retention
+    /// write — answers the same code, status and sentence for the same cause.
+    pub fn object_lock_rejection(
+        rejection: crate::state::ObjectLockRequestRejection,
+        date_argument: &str,
+        date: Option<&::aws_smithy_types::DateTime>,
+    ) -> Option<Self> {
+        use crate::state::ObjectLockRequestRejection as Rejection;
+
+        let invalid_request = |message: &'static str| {
+            Self::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            )
+        };
+        match rejection {
+            // Half a retention, a date outside the range this platform holds, and a duration
+            // naming no hold are each a parameter that is not valid for the request: the
+            // caller's own `InvalidRequest`, which carries no sentence of its own.
+            Rejection::IncompleteRetention
+            | Rejection::UnrepresentableRetainUntilDate
+            | Rejection::EventHoldDurationWithoutStatus => None,
+            // A date that does not end in the future is a bad VALUE in a named field, so it
+            // is that field's `InvalidArgument`, rendering the date the way the service
+            // renders a refused timestamp ([`crate::state::refused_timestamp_text`]).
+            Rejection::RetainUntilDateNotInFuture => Some(Self::invalid_argument(
+                date_argument,
+                Some(
+                    &date
+                        .map(crate::state::refused_timestamp_text)
+                        .unwrap_or_default(),
+                ),
+                crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
+            )),
+            Rejection::EventHoldWithoutMode => {
+                Some(invalid_request(crate::state::EVENT_HOLD_REQUIRES_MODE_MESSAGE))
+            }
+            Rejection::EventHoldOnWithoutOneDuration => Some(invalid_request(
+                crate::state::EVENT_HOLD_ON_REQUIRES_ONE_DURATION_MESSAGE,
+            )),
+            // And a date that does not cover the hold beside it is a bad value in the same
+            // field, carrying the date as the calendar instant it names
+            // ([`crate::state::refused_timestamp_utc_text`]).
+            Rejection::RetainUntilDateUnderEventHoldFloor => Some(Self::invalid_argument(
+                date_argument,
+                Some(
+                    &date
+                        .map(crate::state::refused_timestamp_utc_text)
+                        .unwrap_or_default(),
+                ),
+                crate::state::RETAIN_UNTIL_DATE_UNDER_EVENT_HOLD_FLOOR_MESSAGE,
+            )),
+        }
     }
 
     /// The refusal S3 answers a tag set that breaks one of the published restrictions with:

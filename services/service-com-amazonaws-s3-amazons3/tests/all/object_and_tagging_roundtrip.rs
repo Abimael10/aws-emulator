@@ -666,50 +666,15 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
         );
     }
 
-    // Members whose semantics this emulator cannot carry out keep the scaffold's 501
-    // rather than being stripped and answered as a plain success — and the request they
-    // were refused on changes nothing. Most members are NOT among them any more: the
-    // server-side-encryption pair is recorded with the object and reported back (the
-    // `object_encryption` suite covers it), `x-amz-tagging`'s tag set is parsed and
+    // Every member whose semantics this emulator once could not carry out is now served and
+    // recorded: the server-side-encryption pair is recorded with the object and reported back
+    // (the `object_encryption` suite covers it), `x-amz-tagging`'s tag set is parsed and
     // stored (`object_tagging_on_put.rs`), the conditional members are judged against
     // what the key holds (`object_conditional_writes.rs`), the Object Lock mode,
-    // retain-until date and legal hold are stored ON the version the write records
-    // (`object_lock_on_write.rs`), and a customer-provided key is recorded as the algorithm
-    // and that key's digest (`object_customer_key_encryption.rs`). The Object Lock EVENT
-    // hold stays, because its period runs from an event nothing here raises.
-    let rows: [(&str, &[(&str, &str)]); 1] = [(
-        "an object lock event hold",
-        &[("x-amz-object-lock-event-hold", "ON")][..],
-    )];
-    for (case, headers) in rows {
-        let refused = put_object(
-            &router,
-            "refusal-bucket",
-            "dags/guarded.py",
-            b"# dag",
-            headers,
-        )
-        .await;
-        assert_eq!(
-            refused.status, 501,
-            "case {case:?}: expected the scaffold's 501 for a member this emulator \
-             cannot honour, got {} with body {:?}",
-            refused.status,
-            text(&refused)
-        );
-        assert_eq!(
-            refused.error_code(),
-            "NotImplemented",
-            "case {case:?}: expected the NotImplemented code, got {:?}",
-            refused.error_code()
-        );
-        let absent = get_object(&router, "refusal-bucket", "dags/guarded.py", "", &[]).await;
-        assert_eq!(
-            absent.status, 404,
-            "case {case:?}: a refused write must store nothing, got GetObject {}",
-            absent.status
-        );
-    }
+    // retain-until date, legal hold and EVENT HOLD are stored ON the version the write
+    // records (`object_lock_on_write.rs`), and a customer-provided key is recorded as the
+    // algorithm and that key's digest (`object_customer_key_encryption.rs`) — so this write
+    // has no member left to be refused the scaffold's 501 for.
 
     // `versionId` is NOT in this table: it names one stored version of the key, which
     // this emulator does keep (see the `object_versioning` suite), so a read naming one

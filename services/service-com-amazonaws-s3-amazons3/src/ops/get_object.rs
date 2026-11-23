@@ -905,14 +905,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .map(|replication| replication.status_at(now).to_string()),
             // The OBJECT LOCK state of this version: the retention `PutObjectRetention`
-            // placed on it and the legal hold `PutObjectLegalHold` applied to it, read
-            // through the one renderer `HeadObject` reports them through
+            // placed on it — with the event hold that retention carries, reported beside the
+            // duration it runs for while it is enabled — and the legal hold
+            // `PutObjectLegalHold` applied to it, read through the one renderer `HeadObject`
+            // reports them through
             // ([`crate::state::Object::reported_object_lock`]), so a GET and a HEAD of one
-            // version cannot disagree about its lock. A version carrying neither reports
-            // none of the three headers.
+            // version cannot disagree about its lock. A version carrying none of them reports
+            // none of the headers.
             object_lock_mode: lock.mode,
             object_lock_retain_until_date: lock.retain_until.map(::aws_smithy_types::DateTime::from),
             object_lock_legal_hold_status: lock.legal_hold_status,
+            object_lock_event_hold: lock.event_hold,
+            object_lock_event_hold_duration_days: lock.event_hold_duration_days,
+            object_lock_event_hold_duration_years: lock.event_hold_duration_years,
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `DeleteMarker` needs a delete
             // marker (a delete records none, so no read can be of one), `ArchiveStatus`

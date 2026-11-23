@@ -1210,13 +1210,16 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             code: "InvalidArgument",
         },
         RefusalRow {
-            case: "an Object Lock event hold for the copy",
+            // An event hold is SERVED now (it is stored on the destination version, which
+            // `super::object_lock_on_write` holds the whole rule for), so what is refused
+            // here is a hold with no retention mode for it to run in.
+            case: "an Object Lock event hold for the copy with no mode beside it",
             destination_bucket: "copy-refusal-target",
             destination_key: "copies/event-held.csv",
             copy_source: "copy-refusal-origin/source.csv",
             headers: vec![("x-amz-object-lock-event-hold", "ON")],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidRequest",
         },
         RefusalRow {
             case: "an Object Lock retention mode without the date it runs to",

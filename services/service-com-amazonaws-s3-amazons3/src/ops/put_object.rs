@@ -434,16 +434,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // report, and answering 200 anyway would claim behaviour nothing performed, so
         // the request is refused rather than quietly stripped of its meaning:
         //
-        // * the Object Lock EVENT hold members start a period running from an event nothing
-        //   here raises, so no stored version can carry one.
-        //
         // `If-Match` and `If-None-Match` are NOT in this list: they make the write
         // conditional on what the key holds, which is judged below against the object the
         // store really holds and refused with the documented 412 when it does not hold.
         //
-        // The Object Lock MODE, RETAIN-UNTIL DATE and LEGAL HOLD are NOT in this list
-        // either: they are the lock the version this write stores is stored WITH, recorded
-        // on it below, which is what a later delete of that version is judged against.
+        // The Object Lock MODE, RETAIN-UNTIL DATE, LEGAL HOLD and EVENT HOLD are NOT in this
+        // list either: they are the lock the version this write stores is stored WITH,
+        // recorded on it below, which is what a later delete of that version is judged
+        // against and what every later read of it reports.
         //
         // `x-amz-tagging` is NOT in this list: it carries a tag set this emulator stores
         // on the object it writes (see below), exactly as `PutObjectTagging` would.
@@ -463,11 +461,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // is what this write computes the object's checksum WITH (see below), and a value
         // one of them carries is the client's own for the same bytes, which is neither
         // verified nor echoed.
-        if input.object_lock_event_hold.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "PutObject with x-amz-object-lock-event-hold",
-            ));
-        }
 
         // The CUSTOMER-PROVIDED key this write asks the object to be encrypted under. WHETHER
         // the bucket it addresses serves that encryption form at all comes first: a DIRECTORY
@@ -510,25 +503,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // The Object Lock this write asks for the version it stores to be locked under, read
-        // off the three members that carry it through the one rule every write in this
-        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
-        // describes no period and a date outside the range this platform holds names no
-        // instant: either is a parameter that is not valid for the request, which is what the
-        // modelled `InvalidRequest` reports. A date that is not in the FUTURE is a bad VALUE
-        // in a named field instead, so it is refused as that field's `InvalidArgument`.
+        // off the members that carry it through the one rule every write in this service
+        // reads them by ([`crate::state::requested_object_lock`]). Half a retention describes
+        // no period and a date outside the range this platform holds names no instant: either
+        // is a parameter that is not valid for the request, which is what the modelled
+        // `InvalidRequest` reports. A date that is not in the FUTURE, and one that does not
+        // cover the event hold beside it, are bad VALUES in a named field instead, and an
+        // event hold with no mode to run in or without exactly one duration is an
+        // `InvalidRequest` carrying the sentence S3 publishes for it — each built in the one
+        // place those refusals live
+        // ([`crate::scaffolded::Scaffolded::object_lock_rejection`]).
         let requested_lock = match crate::state::requested_object_lock(
-            input.object_lock_mode.as_deref(),
-            input.object_lock_retain_until_date.as_ref(),
-            input.object_lock_legal_hold_status.as_deref(),
+            crate::state::RequestedObjectLockMembers {
+                mode: input.object_lock_mode.as_deref(),
+                retain_until_date: input.object_lock_retain_until_date.as_ref(),
+                legal_hold_status: input.object_lock_legal_hold_status.as_deref(),
+                event_hold: input.object_lock_event_hold.as_deref(),
+                event_hold_duration_days: input.object_lock_event_hold_duration_days,
+                event_hold_duration_years: input.object_lock_event_hold_duration_years,
+            },
             ::std::time::SystemTime::now(),
         ) {
             Ok(requested) => requested,
-            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
-                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+            Err(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::object_lock_rejection(
+                    rejection,
+                    crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
                     input.object_lock_retain_until_date.as_ref(),
-                ))
+                )
+                .unwrap_or_else(|| {
+                    PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()
+                }))
             }
-            Err(_) => return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()),
         };
 
         // The integrity values this write DECLARED, judged before anything is stored:
@@ -1160,8 +1166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             encryption: encryption.clone(),
             // The Object Lock this write asked the version it stores to be locked under:
             // "the Object Lock mode that you want to apply to this object"
-            // (`PutObjectRequest$ObjectLockMode`) with the date it runs to, and "whether a
-            // legal hold will be applied to this object"
+            // (`PutObjectRequest$ObjectLockMode`) with the date it runs to, "the event hold
+            // status to apply to this object" (`$ObjectLockEventHold`) with the duration that
+            // hold runs for, and "whether a legal hold will be applied to this object"
             // (`$ObjectLockLegalHoldStatus`) — which is what a later delete of this version
             // is judged against. A write naming no retention leaves the store to apply the
             // bucket's own default retention, when its Object Lock configuration names one,

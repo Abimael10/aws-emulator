@@ -810,14 +810,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|replication| replication.status_at(now).to_string()),
             // The OBJECT LOCK state of this version: "the Object Lock mode, if any, that's
             // in effect for this object" and the date it runs to
-            // (`HeadObjectOutput$ObjectLockMode` / `$ObjectLockRetainUntilDate`), plus the
-            // legal hold status, which "is not returned if the specified version of this
-            // object has never had a legal hold applied". Read through the one renderer
-            // `GetObject` reports them through, so a HEAD and a GET of one version cannot
-            // disagree about its lock.
+            // (`HeadObjectOutput$ObjectLockMode` / `$ObjectLockRetainUntilDate`), the legal
+            // hold status, which "is not returned if the specified version of this object has
+            // never had a legal hold applied", and "the event hold status for this object"
+            // with the duration it runs for, which is "only returned when the event hold is
+            // enabled". Read through the one renderer `GetObject` reports them through, so a
+            // HEAD and a GET of one version cannot disagree about its lock.
             object_lock_mode: lock.mode,
             object_lock_retain_until_date: lock.retain_until.map(::aws_smithy_types::DateTime::from),
             object_lock_legal_hold_status: lock.legal_hold_status,
+            object_lock_event_hold: lock.event_hold,
+            object_lock_event_hold_duration_days: lock.event_hold_duration_days,
+            object_lock_event_hold_duration_years: lock.event_hold_duration_years,
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), it is in an

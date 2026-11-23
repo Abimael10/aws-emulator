@@ -449,6 +449,16 @@ pub struct ObjectRetention {
     /// When the retention period runs to: `ObjectLockRetention$RetainUntilDate`, "the date
     /// on which this Object Lock Retention will expire".
     pub retain_until: SystemTime,
+    /// The EVENT HOLD this retention carries — see [`ObjectEventHold`] — or `None` when no
+    /// call has named one for the version, which is the state a write naming only a mode and
+    /// a date leaves it in.
+    ///
+    /// Part of the retention rather than a record beside it, because that is where the API
+    /// puts it: `EventHold` and `EventHoldDuration` are members of `ObjectLockRetention`
+    /// (`smithy_query(query="shape",shape="ObjectLockRetention")`), so the one call that
+    /// replaces a retention replaces the hold with it and the one reader of a retention
+    /// reports both.
+    pub event_hold: Option<ObjectEventHold>,
 }
 
 impl ObjectRetention {
@@ -501,6 +511,139 @@ pub const RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE: &str =
 /// (`smithy_query(query="operation",operation="PutObject")` reports
 /// `ObjectLockRetainUntilDate: {httpHeader: "x-amz-object-lock-retain-until-date"}`).
 pub const OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER: &str = "x-amz-object-lock-retain-until-date";
+
+/// The `ObjectLockEventHold` value that means an event hold IS enabled on an object version
+/// — "set to `ON` to enable an event hold or `OFF` to disable it"
+/// (`ObjectLockRetention$EventHold`), one of the two values that enum publishes
+/// (`smithy_query(query="shape",shape="ObjectLockEventHold")`, which
+/// [`crate::ops::types::OBJECT_LOCK_EVENT_HOLD_VALUES`] carries).
+pub const EVENT_HOLD_ON_STATUS: &str = "ON";
+
+/// The other `ObjectLockEventHold` value: the hold is disabled on the version.
+pub const EVENT_HOLD_OFF_STATUS: &str = "OFF";
+
+/// The PERIOD an Object Lock event hold runs for: "the number of days" or "the number of
+/// years for the event hold duration" (`EventHoldDuration$Days` / `$Years`), one of the two
+/// and never both — "you cannot specify a duration in both days and years"
+/// (`PutObjectRequest$ObjectLockEventHoldDurationDays`).
+///
+/// The same shape, the same units and the same published bounds as the period a bucket's
+/// default retention runs for — a day count up to [`MAX_DEFAULT_RETENTION_DAYS`] or a year
+/// count up to [`MAX_DEFAULT_RETENTION_YEARS`], which is what `EventHoldDuration$Days` ("the
+/// minimum value is 1 and the maximum value is 36,500") and `$Years` ("the minimum value is
+/// 1 and the maximum value is 100") publish — so the two share ONE type and one arithmetic
+/// rather than a second copy of it.
+pub type EventHoldPeriod = DefaultRetentionPeriod;
+
+/// The Object Lock EVENT HOLD recorded on one stored object version, inside the retention
+/// that carries it ([`ObjectRetention::event_hold`]).
+///
+/// The members are the two the API puts on a retention: `EventHold`, "the event hold status
+/// for the object", and `EventHoldDuration`, "the event hold duration for the object"
+/// (`ObjectLockRetention$EventHold` / `$EventHoldDuration`). A hold that is enabled runs for
+/// a duration, which is why the two travel together here: the duration is what the retention
+/// date has to cover ([`Self::bars_retain_until`]) and what a read of the version reports
+/// beside the status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectEventHold {
+    /// Whether the hold is enabled: `true` for [`EVENT_HOLD_ON_STATUS`] and `false` for
+    /// [`EVENT_HOLD_OFF_STATUS`].
+    pub held: bool,
+    /// How long the hold runs for, for a hold that is enabled — `None` for one that is not,
+    /// because a disabled hold protects nothing for any span.
+    pub duration: Option<EventHoldPeriod>,
+}
+
+impl ObjectEventHold {
+    /// The `ObjectLockEventHold` value a read of the version reports for this hold.
+    pub fn status(self) -> &'static str {
+        if self.held {
+            EVENT_HOLD_ON_STATUS
+        } else {
+            EVENT_HOLD_OFF_STATUS
+        }
+    }
+
+    /// The hold's duration in DAYS, for a reader to report — `None` for a hold whose duration
+    /// is stated in years, and for one that is not enabled: the duration is "only returned
+    /// when the event hold is enabled"
+    /// (`GetObjectOutput$ObjectLockEventHoldDurationDays`).
+    pub fn reported_days(self) -> Option<i32> {
+        match self.duration.filter(|_| self.held) {
+            Some(EventHoldPeriod::Days(days)) => Some(days),
+            _ => None,
+        }
+    }
+
+    /// The hold's duration in YEARS, for a reader to report — the other half of
+    /// [`Self::reported_days`], under the same condition.
+    pub fn reported_years(self) -> Option<i32> {
+        match self.duration.filter(|_| self.held) {
+            Some(EventHoldPeriod::Years(years)) => Some(years),
+            _ => None,
+        }
+    }
+
+    /// Whether this hold bars a retention running to `retain_until`, judged at `at`: an
+    /// enabled hold runs for its duration from the moment it is placed, so the retention
+    /// around it has to reach at least that far — see
+    /// [`RETAIN_UNTIL_DATE_UNDER_EVENT_HOLD_FLOOR_MESSAGE`], the sentence this refuses with.
+    ///
+    /// A hold that is not enabled, and one naming no duration, puts no floor under the date.
+    pub fn bars_retain_until(self, retain_until: SystemTime, at: SystemTime) -> bool {
+        if !self.held {
+            return false;
+        }
+        let Some(period) = self.duration else {
+            return false;
+        };
+        let Some(seconds) = period.seconds() else {
+            // A duration whose span cannot be measured at all puts its floor past every
+            // instant this platform can hold, which no date reaches.
+            return true;
+        };
+        let Ok(seconds) = u64::try_from(seconds) else {
+            // A count of zero or fewer names no span forward of `at`, so the floor is `at`
+            // itself, which a date in the future already clears.
+            return false;
+        };
+        match at.checked_add(std::time::Duration::from_secs(seconds)) {
+            Some(floor) => retain_until < floor,
+            None => true,
+        }
+    }
+}
+
+/// The `<Message>` S3 refuses an object write that supplies an event hold WITHOUT the
+/// retention mode it belongs to with — fixed text, with no variable part.
+///
+/// An event hold is a member of the version's RETENTION
+/// (`smithy_query(query="shape",shape="ObjectLockRetention")`), so a write asking for one
+/// names the mode that retention runs in: the request cannot be carried out as given, which
+/// is the [`INVALID_REQUEST_CODE`] every write that declares these members refuses it with.
+pub const EVENT_HOLD_REQUIRES_MODE_MESSAGE: &str =
+    "x-amz-object-lock-mode is required when x-amz-object-lock-event-hold is supplied.";
+
+/// The `<Message>` S3 refuses an event hold of [`EVENT_HOLD_ON_STATUS`] that does not name
+/// exactly ONE duration with — fixed text, with no variable part.
+///
+/// An enabled hold runs for a span, stated in one unit: "you cannot specify a duration in
+/// both days and years" (`PutObjectRequest$ObjectLockEventHoldDurationDays`), and a hold with
+/// no duration at all names no span, so neither describes a hold the service can place.
+pub const EVENT_HOLD_ON_REQUIRES_ONE_DURATION_MESSAGE: &str =
+    "x-amz-object-lock-event-hold:ON must be supplied with exactly one event hold duration \
+     (days or years).";
+
+/// The `<Message>` S3 refuses a retention date that does not cover the event hold beside it
+/// with — fixed text; the date the request carried travels in the `<ArgumentValue>` of the
+/// [`INVALID_ARGUMENT_CODE`] envelope instead.
+///
+/// The hold runs for its duration from the moment it is placed, and the retention "will
+/// expire" at the date it names (`ObjectLockRetention$RetainUntilDate`), so a date before now
+/// plus that duration describes a period the hold would outlive.
+pub const RETAIN_UNTIL_DATE_UNDER_EVENT_HOLD_FLOOR_MESSAGE: &str =
+    "The retain until date must be equal to or later than the current time plus the event \
+     hold duration.";
 
 
 /// The IAM action that LIFTING a governance-mode retention is authorized under: "to
@@ -565,7 +708,7 @@ pub fn account_wide_authorization_denial(principal: &str, action: &str, reason: 
     format!("User: {principal} is not authorized to perform: {action} {reason}")
 }
 
-/// The Object Lock state a read of one stored object version REPORTS: the three
+/// The Object Lock state a read of one stored object version REPORTS: the
 /// `x-amz-object-lock-*` headers `GetObject` and `HeadObject` both declare, as
 /// [`Object::reported_object_lock`] renders them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -578,6 +721,17 @@ pub struct ReportedObjectLock {
     /// `ObjectLockLegalHoldStatus` — [`LEGAL_HOLD_ON_STATUS`] or [`LEGAL_HOLD_OFF_STATUS`]
     /// for a version a legal hold has been applied to, and nothing for one that never has.
     pub legal_hold_status: Option<String>,
+    /// `ObjectLockEventHold` — "the event hold status for this object"
+    /// (`GetObjectOutput$ObjectLockEventHold`), for a version a call has named an event hold
+    /// for, and nothing for one that never has.
+    pub event_hold: Option<String>,
+    /// `ObjectLockEventHoldDurationDays` — "only returned when the event hold is enabled"
+    /// (`GetObjectOutput$ObjectLockEventHoldDurationDays`), and only for a hold whose
+    /// duration is stated in days.
+    pub event_hold_duration_days: Option<i32>,
+    /// `ObjectLockEventHoldDurationYears` — the other unit a duration is stated in, under
+    /// the same condition.
+    pub event_hold_duration_years: Option<i32>,
 }
 
 /// The Object Lock a WRITE asked for, as [`requested_object_lock`] read it off the three
@@ -613,10 +767,50 @@ pub enum ObjectLockRequestRejection {
     /// A `x-amz-object-lock-retain-until-date` that is not in the FUTURE, which describes a
     /// period that protects nothing — see [`RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`].
     RetainUntilDateNotInFuture,
+    /// An `x-amz-object-lock-event-hold` with no `x-amz-object-lock-mode` beside it: the hold
+    /// is a member of the version's retention, which runs in a mode — see
+    /// [`EVENT_HOLD_REQUIRES_MODE_MESSAGE`].
+    EventHoldWithoutMode,
+    /// An `x-amz-object-lock-event-hold` of [`EVENT_HOLD_ON_STATUS`] with no duration, or
+    /// with one in each unit at once — see [`EVENT_HOLD_ON_REQUIRES_ONE_DURATION_MESSAGE`].
+    EventHoldOnWithoutOneDuration,
+    /// An `x-amz-object-lock-event-hold-duration-days` or `-years` with no
+    /// `x-amz-object-lock-event-hold` beside it: a duration is the span the hold it belongs to
+    /// runs for, so one naming no hold describes nothing the service can place — a parameter
+    /// that is not valid for the request, which the caller's own `InvalidRequest` reports.
+    EventHoldDurationWithoutStatus,
+    /// A `x-amz-object-lock-retain-until-date` that does not reach the end of the event hold
+    /// beside it — see [`RETAIN_UNTIL_DATE_UNDER_EVENT_HOLD_FLOOR_MESSAGE`].
+    RetainUntilDateUnderEventHoldFloor,
 }
 
-/// The Object Lock an object write asked for, read off the three members that carry it, or
-/// why it cannot be recorded.
+/// The Object Lock members ONE object write carried, as they arrived on it — what
+/// [`requested_object_lock`] reads a lock out of.
+///
+/// Every write that can lock the version it stores declares the same six
+/// (`smithy_query(query="operation",operation="PutObject")` reports `ObjectLockMode`,
+/// `ObjectLockRetainUntilDate`, `ObjectLockLegalHoldStatus`, `ObjectLockEventHold`,
+/// `ObjectLockEventHoldDurationDays` and `ObjectLockEventHoldDurationYears`, and the copy and
+/// the multipart initiation declare them too), so they travel together rather than as a
+/// handful of positional arguments each caller could pass in a different order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestedObjectLockMembers<'a> {
+    /// `x-amz-object-lock-mode` — the mode the retention runs in.
+    pub mode: Option<&'a str>,
+    /// `x-amz-object-lock-retain-until-date` — the date that retention runs to.
+    pub retain_until_date: Option<&'a ::aws_smithy_types::DateTime>,
+    /// `x-amz-object-lock-legal-hold` — whether a legal hold is applied to the version.
+    pub legal_hold_status: Option<&'a str>,
+    /// `x-amz-object-lock-event-hold` — the event hold status asked for.
+    pub event_hold: Option<&'a str>,
+    /// `x-amz-object-lock-event-hold-duration-days` — that hold's duration, in days.
+    pub event_hold_duration_days: Option<i32>,
+    /// `x-amz-object-lock-event-hold-duration-years` — that hold's duration, in years.
+    pub event_hold_duration_years: Option<i32>,
+}
+
+/// The Object Lock an object write asked for, read off the members that carry it, or why it
+/// cannot be recorded.
 ///
 /// "The Object Lock mode that you want to apply to this object" with "the date and time when
 /// you want this object's Object Lock to expire" beside it
@@ -627,20 +821,37 @@ pub enum ObjectLockRequestRejection {
 /// ([`Bucket::object_lock_delete_refusal`]), and `PutObjectRetention` /
 /// `PutObjectLegalHold` are what change them afterwards.
 ///
+/// The EVENT HOLD members are read the same way, into the retention they are members of
+/// ([`ObjectEventHold`]): "specifies the event hold status to apply to this object"
+/// (`PutObjectRequest$ObjectLockEventHold`) with the duration it runs for, in one unit. The
+/// pieces have to agree for the service to place a hold at all, so a hold with no mode to run
+/// in, an enabled hold that does not name exactly one duration, and a retention date that
+/// does not reach the end of the hold are each refused rather than recorded.
+///
 /// ONE place for the rule, so every write that declares these members — the one-shot write,
 /// the copy and the multipart initiation whose settings the completed object carries —
 /// records the same lock from the same values.
 /// `now` is the instant the period is judged against: a retention "will expire" at the date
 /// it names, so one that does not end after `now` protects nothing and is refused rather
 /// than recorded ([`RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`] is the sentence, the same rule
-/// `PutObjectRetention` judges its own `RetainUntilDate` by).
+/// `PutObjectRetention` judges its own `RetainUntilDate` by), and it is the instant the event
+/// hold's own floor is measured from.
 pub fn requested_object_lock(
-    mode: Option<&str>,
-    retain_until_date: Option<&::aws_smithy_types::DateTime>,
-    legal_hold_status: Option<&str>,
+    members: RequestedObjectLockMembers<'_>,
     now: SystemTime,
 ) -> Result<RequestedObjectLock, ObjectLockRequestRejection> {
-    let retention = match (mode, retain_until_date) {
+    // The event hold first: a hold is a member of the version's RETENTION, which runs in a
+    // mode, so a write supplying a hold without one is refused before the retention pair is
+    // read — the half-retention it leaves would otherwise report the other refusal.
+    if members.event_hold.is_some() && members.mode.is_none() {
+        return Err(ObjectLockRequestRejection::EventHoldWithoutMode);
+    }
+    let event_hold = requested_event_hold(
+        members.event_hold,
+        members.event_hold_duration_days,
+        members.event_hold_duration_years,
+    )?;
+    let retention = match (members.mode, members.retain_until_date) {
         (None, None) => None,
         (Some(mode), Some(date)) => {
             let Some(retain_until) = instant_of(date) else {
@@ -649,9 +860,16 @@ pub fn requested_object_lock(
             if retain_until <= now {
                 return Err(ObjectLockRequestRejection::RetainUntilDateNotInFuture);
             }
+            // The period has to cover the hold that runs inside it: a hold placed now runs
+            // for its duration, and the retention around it lapses at its own date, so a date
+            // under that floor describes a period the hold would outlive.
+            if event_hold.is_some_and(|hold| hold.bars_retain_until(retain_until, now)) {
+                return Err(ObjectLockRequestRejection::RetainUntilDateUnderEventHoldFloor);
+            }
             Some(ObjectRetention {
                 mode: mode.to_string(),
                 retain_until,
+                event_hold,
             })
         }
         _ => return Err(ObjectLockRequestRejection::IncompleteRetention),
@@ -661,8 +879,61 @@ pub fn requested_object_lock(
         // "ON" is a hold in place and "OFF" is one that is not; a write naming no status
         // leaves the version with none ever applied, which is a third state a reader reports
         // apart from `OFF` (see [`Object::legal_hold`]).
-        legal_hold: legal_hold_status.map(|status| status == LEGAL_HOLD_ON_STATUS),
+        legal_hold: members
+            .legal_hold_status
+            .map(|status| status == LEGAL_HOLD_ON_STATUS),
     })
+}
+
+/// The EVENT HOLD a call asked for, read off the status and the two duration members that
+/// carry it — or why it cannot be placed.
+///
+/// An enabled hold runs for exactly one duration, in one of the two units the API states a
+/// duration in — "you cannot specify a duration in both days and years"
+/// (`PutObjectRequest$ObjectLockEventHoldDurationDays`) — and a hold that is not enabled runs
+/// for none at all: a disabled hold protects nothing for any span, so no duration is kept for
+/// it and a reader of one reports none (`GetObjectOutput$ObjectLockEventHoldDurationDays` is
+/// "only returned when the event hold is enabled"). A duration supplied beside a DISABLED
+/// hold describes a span nothing runs for; it is taken rather than refused, because no
+/// wording S3 answers that pair with is recorded and a refusal would have to be invented. The
+/// COUNT of an enabled hold is kept as the caller stated it, in the unit they stated it in,
+/// because that is what a read of the version reports back.
+///
+/// `None` for a request that named NO piece of a hold at all: an object write stores no hold,
+/// and a retention write leaves the hold the version carries alone. A duration with no status
+/// beside it is not that case — it is a span for a hold nobody asked for, so it is refused
+/// rather than dropped.
+///
+/// ONE place for the rule, so the object writes that carry a hold in HEADERS and the retention
+/// write that carries it in its `Retention` document read it alike.
+pub fn requested_event_hold(
+    status: Option<&str>,
+    duration_days: Option<i32>,
+    duration_years: Option<i32>,
+) -> Result<Option<ObjectEventHold>, ObjectLockRequestRejection> {
+    let Some(status) = status else {
+        if duration_days.is_some() || duration_years.is_some() {
+            return Err(ObjectLockRequestRejection::EventHoldDurationWithoutStatus);
+        }
+        return Ok(None);
+    };
+    if status != EVENT_HOLD_ON_STATUS {
+        return Ok(Some(ObjectEventHold {
+            held: false,
+            duration: None,
+        }));
+    }
+    let duration = match (duration_days, duration_years) {
+        (Some(days), None) => EventHoldPeriod::Days(days),
+        (None, Some(years)) => EventHoldPeriod::Years(years),
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(ObjectLockRequestRejection::EventHoldOnWithoutOneDuration)
+        }
+    };
+    Ok(Some(ObjectEventHold {
+        held: true,
+        duration: Some(duration),
+    }))
 }
 
 /// The one value the `ObjectLockEnabled` enum publishes
@@ -748,9 +1019,10 @@ impl DefaultRetentionPeriod {
 /// new object placed in the bucket is locked under.
 ///
 /// The members are `DefaultRetention`'s own
-/// (`smithy_query(query="shape",shape="DefaultRetention")`) less its event hold, which
-/// nothing in this emulator carries out: the `Mode` new objects are locked in and the period
-/// that lock runs for. "The DefaultRetention settings require both a mode and a period"
+/// (`smithy_query(query="shape",shape="DefaultRetention")`) less its `DefaultEventHold`,
+/// which is the bucket configuration's own member rather than part of the period: the `Mode`
+/// new objects are locked in and the period that lock runs for. "The DefaultRetention
+/// settings require both a mode and a period"
 /// (`PutObjectLockConfiguration`'s own documentation), so the pair is ONE value here rather
 /// than two members that could disagree, and a bucket either carries a default retention or
 /// carries none — which is why this lives behind an `Option` on [`Bucket`].
@@ -781,6 +1053,10 @@ impl BucketDefaultRetention {
         Some(ObjectRetention {
             mode: self.mode.clone(),
             retain_until: written_at.checked_add(std::time::Duration::from_secs(seconds))?,
+            // The rule states a mode and a period and nothing else, so the version it locks
+            // carries no event hold: a hold is named by the call that writes or retains the
+            // version ([`requested_event_hold`]).
+            event_hold: None,
         })
     }
 }
@@ -1165,6 +1441,10 @@ impl Object {
     ///
     /// ONE place, so `GetObject` and `HeadObject` report one version's lock identically.
     pub fn reported_object_lock(&self) -> ReportedObjectLock {
+        let event_hold = self
+            .retention
+            .as_ref()
+            .and_then(|retention| retention.event_hold);
         ReportedObjectLock {
             mode: self
                 .retention
@@ -1178,6 +1458,13 @@ impl Object {
                     LEGAL_HOLD_OFF_STATUS.to_string()
                 }
             }),
+            // The event hold of that same retention, with the duration it runs for — reported
+            // only while the hold is enabled
+            // (`GetObjectOutput$ObjectLockEventHoldDurationDays`), in the one unit it was
+            // stated in.
+            event_hold: event_hold.map(|hold| hold.status().to_string()),
+            event_hold_duration_days: event_hold.and_then(ObjectEventHold::reported_days),
+            event_hold_duration_years: event_hold.and_then(ObjectEventHold::reported_years),
         }
     }
 

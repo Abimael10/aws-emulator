@@ -260,11 +260,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retain_until_date: Some(::aws_smithy_types::DateTime::from(
                     retention.retain_until,
                 )),
-                // The event-hold members are a hold that runs from an event rather than to
-                // a date; `PutObjectRetention` refuses a request carrying one, so no stored
-                // retention here has either, and none is reported.
-                event_hold: None,
-                event_hold_duration: None,
+                // The EVENT HOLD this same retention carries — "the event hold status for the
+                // object" with "the event hold duration for the object"
+                // (`ObjectLockRetention$EventHold` / `$EventHoldDuration`) — reported from
+                // the one record the object's own readers report it from
+                // ([`crate::state::ObjectEventHold`]), so this subresource and
+                // `GetObject`/`HeadObject` cannot disagree about the hold. A retention nobody
+                // has named a hold for reports neither member.
+                event_hold: retention.event_hold.map(|hold| hold.status().to_string()),
+                event_hold_duration: retention.event_hold.and_then(|hold| {
+                    let (days, years) = (hold.reported_days(), hold.reported_years());
+                    (days.is_some() || years.is_some())
+                        .then_some(EventHoldDuration { days, years })
+                }),
             }),
         })
     }

@@ -182,6 +182,9 @@ pub(crate) fn given_lapsed_retention(
         Some(ObjectRetention {
             mode: mode.to_string(),
             retain_until,
+            // A lapsed PERIOD is all this seeds: an event hold is named by the call that
+            // writes or retains the version, and no row here needs one.
+            event_hold: None,
         }),
     );
     assert_eq!(
