@@ -307,6 +307,42 @@ fn sign_in_name_shape_message(username_attributes: &[String]) -> Option<String> 
     }
 }
 
+/// The alias attribute whose values are NAMES a user signs in with rather than
+/// addresses: `preferred_username`, the third value of `AliasAttributeType`
+/// (`smithy_query(query="shape",shape="AliasAttributeType")`), beside the `email`
+/// and `phone_number` whose values have a format of their own
+/// ([`alias_format_wording`]).
+pub const PREFERRED_USERNAME_ATTRIBUTE: &str = "preferred_username";
+
+/// The sentence a request whose submitted `Username` has the FORM of a value of
+/// one of the pool's alias attributes is refused with, for the alias attribute
+/// `attribute`, or `None` for an attribute whose values have no form of their own.
+///
+/// Amazon Cognito states the format the name has and the alias the pool is
+/// configured for, both named by the attribute the pool configures: the whole
+/// sentence is built from the POOL's configuration, so it echoes nothing the
+/// caller sent.
+fn alias_format_username_message(attribute: &str) -> Option<String> {
+    let format = alias_format_wording(attribute)?;
+    Some(format!(
+        "Username cannot be of {format} format, since user pool is configured for {format} alias."
+    ))
+}
+
+/// The FORMAT `name`'s values have, as the refusal of a username of that format
+/// names it: `email` values are of email format and `phone_number` values of
+/// phone number format — the two `AliasAttributeType` values whose values carry a
+/// form of their own (`smithy_query(query="shape",shape="AliasAttributeType")`,
+/// whose third value `preferred_username` holds a name like any other) — and
+/// nothing for an attribute that is neither.
+fn alias_format_wording(name: &str) -> Option<&'static str> {
+    match name {
+        "email" => Some("email"),
+        "phone_number" => Some("phone number"),
+        _ => None,
+    }
+}
+
 /// The DNS zone this service's endpoints and token issuers are published in.
 const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
 
@@ -738,7 +774,16 @@ impl UserPool {
     /// attribute's values take ([`crate::state::attribute_value_defect`]): the
     /// submitted value is stored under the attribute, so it is judged as a value
     /// of it.
+    ///
+    /// And whatever the pool signs its users in with, a name that has the form of
+    /// one of its ALIAS attributes' values is no username of it at all
+    /// ([`UserPool::alias_format_username_defect`]).
     pub fn username_defect(&self, submitted: &str) -> Option<String> {
+        // The alias namespace is judged for every pool: a name of an aliased
+        // attribute's format is no username of this pool.
+        if let Some(defect) = self.alias_format_username_defect(submitted) {
+            return Some(defect);
+        }
         if self.username_attributes.is_empty() {
             return None;
         }
@@ -746,6 +791,43 @@ impl UserPool {
             Some(attribute) => attribute_value_defect(attribute, submitted).map(str::to_string),
             None => sign_in_name_shape_message(&self.username_attributes),
         }
+    }
+
+    /// Why `submitted` is no USERNAME of this pool because it has the format of a
+    /// value of one of the pool's ALIAS attributes, or `None` when it has no such
+    /// format or the pool aliases no attribute of that format.
+    ///
+    /// `AliasAttributes` are "attributes supported as an alias for this user
+    /// pool" (this service's model) and an alias value names ONE user of the pool
+    /// ([`UserPool::sign_in_name_holder_key`]), so in such a pool a value of that
+    /// attribute's format belongs to the ALIAS namespace: a name of the same
+    /// format would shadow the alias of whichever user holds that value. Amazon
+    /// Cognito therefore refuses such a value wherever a request submits a NAME a
+    /// user is to answer to — the `Username` a registration stores a user under,
+    /// and the `preferred_username` an attribute write stores for one
+    /// ([`PREFERRED_USERNAME_ATTRIBUTE`], itself an alias attribute, so its value
+    /// is a sign-in name too). A name that merely ADDRESSES a stored user is
+    /// unaffected: a `Username` "can be any of their alias attributes"
+    /// (`AdminGetUser.Username`), which is how an alias value resolves its holder.
+    ///
+    /// Only an alias attribute whose values have a format of their own can be
+    /// shadowed ([`alias_format_wording`]), and the format of a submitted value is
+    /// read the one way this service reads one
+    /// ([`crate::state::attribute_shape_of`]).
+    pub fn alias_format_username_defect(&self, submitted: &str) -> Option<String> {
+        let shape = attribute_shape_of(submitted)?;
+        // The pool's ALIAS attributes alone: a pool whose `UsernameAttributes`
+        // name the attribute signs its users in BY that value, so there the
+        // submitted name is the attribute's own value rather than a name
+        // shadowing it.
+        if !self
+            .alias_attributes
+            .iter()
+            .any(|attribute| attribute == shape)
+        {
+            return None;
+        }
+        alias_format_username_message(shape)
     }
 
     /// Whether this pool resolves a username it does not hold through its

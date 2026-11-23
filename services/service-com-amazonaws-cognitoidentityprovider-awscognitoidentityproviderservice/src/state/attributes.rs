@@ -16,17 +16,27 @@ use super::*;
 /// * An attribute the pool's schema does not declare cannot hold a value, and
 ///   one it declares immutable cannot change (`SchemaAttributeType.Mutable`),
 ///   so neither is an update to make — nor is blanking an attribute the schema
-///   marks required, which has to keep a value.
+///   marks required, which has to keep a value, each reported as the schema
+///   finding it is ([`schema_validation_report`]). A verified flag is immutable to
+///   the user it vouches for, whatever the schema says
+///   ([`VerifiedFlagAuthority::NotTheirs`]).
 /// * One value per attribute: `AttributeType` is "the name and value of a user
 ///   attribute", so a list naming the same attribute twice asks for two values
 ///   of one attribute, and a list naming more attributes than the schema
 ///   declares asks for more than any user of the pool can hold.
+/// * A value longer than an attribute value's own maximum
+///   ([`MAX_ATTRIBUTE_VALUE_LENGTH`]) is no value an attribute can hold, so it is
+///   refused ahead of every bound the pool's schema declares, with that ceiling
+///   stated per attribute ([`attribute_value_too_long_message`]).
 /// * "To delete an attribute from your user, submit the attribute in your API
 ///   request with a blank value", so a blank value REMOVES the stored
 ///   attribute rather than storing an empty one.
 /// * A value whose attribute has a FORM of its own has to have that form
 ///   ([`attribute_value_defect`]), so a `phone_number` that is not a phone
-///   number in E.164 form is refused rather than stored.
+///   number in E.164 form and an `email` that is not an email address are
+///   refused rather than stored — and a `preferred_username`, being a NAME its
+///   holder answers to, has to lie outside the namespace of every attribute the
+///   pool aliases ([`UserPool::alias_format_username_defect`]).
 /// * A value has to satisfy the constraints the pool's schema declares for its
 ///   attribute ([`schema_constraint_refusal`]), so a number outside the declared
 ///   `MinValue`/`MaxValue`, a string outside the declared
@@ -35,7 +45,10 @@ use super::*;
 ///   UPDATE of a stored user, with that stage's wording.
 /// * A new `email` or `phone_number` is no longer the value its verified flag
 ///   vouched for ([`verified_flag`]), so the flag goes unconfirmed unless the
-///   request sets it itself, and a deleted one takes its flag with it.
+///   request sets it itself, and a deleted one takes its flag with it — and a
+///   flag set for an attribute that would hold no value at all vouches for
+///   nothing, so it is refused
+///   ([`verified_flag_needs_a_value_message`]).
 /// * A pool that verifies the attribute itself (`AutoVerifiedAttributes`) or
 ///   requires verification before the update
 ///   (`AttributesRequireVerificationBeforeUpdate`) sends a verification
@@ -66,6 +79,26 @@ pub fn plan_attribute_update(
             "Invalid attributes given, at most {} attributes of this user pool can be updated in one request",
             pool.schema.len()
         )));
+    }
+    // Every value this request submits has to be one an attribute value may
+    // hold at all ([`MAX_ATTRIBUTE_VALUE_LENGTH`]), whatever attribute carries
+    // it and whatever the pool's schema declares for that attribute: the
+    // ceiling is the model's own, so it is judged ahead of every bound the
+    // pool's operator declared, and this stage states it in its own
+    // per-attribute sentence. Asked of the submitted list in the order it
+    // arrived, so the attribute reported is the first value past the ceiling.
+    if let Some(too_long) = requested.iter().find(|attribute| {
+        attribute
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            > MAX_ATTRIBUTE_VALUE_LENGTH
+    }) {
+        return Err(AttributeUpdateRefusal::Invalid(
+            attribute_value_too_long_message(&too_long.name, MAX_ATTRIBUTE_VALUE_LENGTH),
+        ));
     }
     // Every attribute written has to be one the pool's schema declares. Asked
     // of the submitted list as it arrived, so an undeclared attribute is
@@ -105,6 +138,22 @@ pub fn plan_attribute_update(
     let mut updates = Vec::new();
     let mut verifications = Vec::new();
     let mut demotions: Vec<(String, &'static str)> = Vec::new();
+    // A verified flag records THIS SERVICE's confirmation of the value beside
+    // it, so it is not an attribute its own holder may write
+    // ([`VerifiedFlagAuthority::NotTheirs`]): a caller with no authority over
+    // the flag cannot modify it whatever the pool's schema says about it, and
+    // Amazon Cognito reports that as the non-mutable attribute it is. Reported
+    // for the first flag the request names, in request order.
+    if authority == VerifiedFlagAuthority::NotTheirs {
+        if let Some(flag) = requested
+            .iter()
+            .find(|attribute| verified_attribute_of(&attribute.name).is_some())
+        {
+            return Err(AttributeUpdateRefusal::Invalid(
+                non_mutable_attribute_message(&flag.name),
+            ));
+        }
+    }
     // `SchemaAttributeType.Mutable` is what says a stored value may change, so an
     // attribute the schema freezes cannot be updated at all — and EVERY one the
     // request names is reported, a line each, exactly as the undeclared ones above
@@ -123,6 +172,26 @@ pub fn plan_attribute_update(
                 .map(|name| (name, SchemaValidationFinding::NotUpdatable)),
         )));
     }
+    // An attribute the pool's schema marks required has to keep a value, so a
+    // blank value is not one it may be given — "to delete an attribute from
+    // your user, submit the attribute in your API request with a blank value"
+    // (this service's model), and a required attribute is not one to delete.
+    // That is a finding of the same schema validation as the two above, so it
+    // is reported the same way: a line per attribute the request would blank,
+    // in request order.
+    let undeletable: Vec<&str> = requested
+        .iter()
+        .filter(|attribute| attribute.value.as_deref().unwrap_or_default().is_empty())
+        .map(|attribute| attribute.name.as_str())
+        .filter(|name| pool.attribute_required(name))
+        .collect();
+    if !undeletable.is_empty() {
+        return Err(AttributeUpdateRefusal::Invalid(schema_validation_report(
+            undeletable
+                .into_iter()
+                .map(|name| (name, SchemaValidationFinding::RequiredNotDeletable)),
+        )));
+    }
     // Every value written has to satisfy the constraints the pool's schema
     // declares for its attribute ([`schema_constraint_refusal`]). Judged in the
     // order the request submitted the attributes, and decided before any attribute
@@ -139,6 +208,40 @@ pub fn plan_attribute_update(
     ) {
         return Err(AttributeUpdateRefusal::Invalid(refusal));
     }
+    // A submitted NAME has to lie in a namespace this pool admits, whichever
+    // operation submits it ([`submitted_name_defect`]).
+    if let Some(defect) = submitted_name_defect(
+        pool,
+        submitted.iter().map(|(name, value)| (*name, *value)),
+    ) {
+        return Err(AttributeUpdateRefusal::Invalid(defect));
+    }
+    // A verified flag vouches for the VALUE of its own attribute
+    // ([`verified_flag`]), so there has to be one for it to vouch for: the
+    // value this request stores for that attribute, or the one the user already
+    // holds where the request says nothing about it. A flag set for an
+    // attribute that would hold nothing — because the user holds nothing and
+    // the request stores nothing, or because the request DELETES it — vouches
+    // for no value at all. Judged in request order, over the two attributes
+    // this API verifies, so the work is bounded by the flags the request names.
+    for attribute in requested {
+        let Some(described) = verified_attribute_of(&attribute.name) else {
+            continue;
+        };
+        let vouched_for = match submitted.get(described) {
+            Some(submitted_value) => *submitted_value,
+            None => user
+                .attributes
+                .get(described)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        };
+        if vouched_for.is_empty() {
+            if let Some(message) = verified_flag_needs_a_value_message(described) {
+                return Err(AttributeUpdateRefusal::Invalid(message));
+            }
+        }
+    }
     for (name, value) in &submitted {
         let name = (*name).to_string();
         // A verified flag whose attribute this same request DELETES has
@@ -154,13 +257,6 @@ pub fn plan_attribute_update(
             return Err(AttributeUpdateRefusal::Invalid(defect.to_string()));
         }
         if value.is_empty() {
-            // An attribute the schema marks required must hold a value, so it
-            // is not one a blank value may delete.
-            if pool.attribute_required(&name) {
-                return Err(AttributeUpdateRefusal::Invalid(format!(
-                    "Attribute {name} cannot be deleted: this user pool's schema declares it required"
-                )));
-            }
             // A deleted email address or phone number leaves its verified flag
             // vouching for a value the user no longer holds, so the flag goes
             // with it.
@@ -291,7 +387,9 @@ pub struct AttributeDeletionPlan {
 ///   is not one a user can be asked to give up.
 /// * An attribute the schema declares immutable (`SchemaAttributeType.Mutable`)
 ///   cannot change, and taking its value away changes it; one the schema marks
-///   required has to keep a value, so neither is one this operation may remove.
+///   required has to keep a value, so neither is one this operation may remove —
+///   the required one reported as the schema finding a blank value submitted for
+///   it earns ([`schema_validation_report`]).
 /// * A deleted `email` or `phone_number` leaves its verified flag
 ///   ([`verified_flag`]) vouching for a value the user no longer holds, so the
 ///   flag goes with it.
@@ -329,9 +427,13 @@ pub fn plan_attribute_deletion(
             return Err(non_mutable_attribute_message(&name));
         }
         if pool.attribute_required(&name) {
-            return Err(format!(
-                "Attribute {name} cannot be deleted: this user pool's schema declares it required"
-            ));
+            // An attribute the schema marks required keeps a value, and taking it
+            // away is the same finding a blank value submitted for it earns, so
+            // it is reported the same way ([`SchemaValidationFinding::RequiredNotDeletable`]).
+            return Err(schema_validation_report([(
+                name.as_str(),
+                SchemaValidationFinding::RequiredNotDeletable,
+            )]));
         }
         // Exactly as a blank value submitted to an attribute update takes it.
         if let Some(flag) = verified_flag(&name) {
@@ -352,14 +454,94 @@ pub fn plan_attribute_deletion(
 /// names neither the attribute nor the value the request submitted.
 pub const INVALID_PHONE_NUMBER_MESSAGE: &str = "Invalid phone number format.";
 
+/// The message `InvalidParameterException` carries for an `email` value that is
+/// not an email address: the fixed sentence Amazon Cognito answers, worded about
+/// the form the value does not have and naming neither the attribute nor the
+/// value the request submitted — the counterpart of
+/// [`INVALID_PHONE_NUMBER_MESSAGE`] for the other addressing attribute.
+pub const INVALID_EMAIL_MESSAGE: &str = "Invalid email address format.";
+
 /// The ATTRIBUTE whose value is a phone number, and so has a form of its own to
 /// satisfy ([`attribute_value_defect`]).
 const PHONE_NUMBER_ATTRIBUTE: &str = "phone_number";
+
+/// The ATTRIBUTE whose value is an email address, and so has a form of its own
+/// to satisfy ([`attribute_value_defect`]).
+const EMAIL_ATTRIBUTE: &str = "email";
 
 /// The most digits a phone number in E.164 form carries, country calling code
 /// included (the form `AdminCreateUser.UserAttributes` requires: "a phone number
 /// must be in E.164 format", this service's model).
 const E164_MAX_DIGITS: usize = 15;
+
+/// The most characters one user attribute's value may carry, whichever attribute
+/// holds it: `AttributeType.Value` targets `AttributeValueType`, which is
+/// `@length(max: 2048)`
+/// (`smithy_query(query="shape",shape="AttributeType,AttributeValueType")`).
+///
+/// A MODEL constant rather than a pool's own bound: the constraints a pool's
+/// schema declares for an attribute ([`schema_constraint_refusal`]) sit inside
+/// this one, and an attribute whose schema entry declares no maximum is bounded
+/// by this alone.
+pub const MAX_ATTRIBUTE_VALUE_LENGTH: usize = 2048;
+
+/// The message an UPDATE of a stored user's attributes is refused with when the
+/// value submitted for `name` is longer than `maximum` characters.
+///
+/// Amazon Cognito states that ceiling per ATTRIBUTE: the sentence's variable
+/// parts are the attribute the request named and the maximum its value may have
+/// ([`MAX_ATTRIBUTE_VALUE_LENGTH`]), and the rejected value is not quoted back —
+/// a value past a maximum is longer than the maximum, so quoting it would answer
+/// a request with the request.
+pub fn attribute_value_too_long_message(name: &str, maximum: usize) -> String {
+    format!(
+        "The value of the attribute {name} must have a length less than or equal to {maximum} \
+         characters"
+    )
+}
+
+/// Why one of the `submitted` `(attribute, value)` pairs stores a NAME no user of
+/// `pool` may answer to, or `None` when every one of them does.
+///
+/// `preferred_username` is "the user's preferred name" and an alias attribute of
+/// its own ([`PREFERRED_USERNAME_ATTRIBUTE`]), so a value submitted for it is a
+/// NAME its holder answers to rather than an address — and is held to the same
+/// namespace rule as a username: a value of the format of an attribute the pool
+/// ALIASES belongs to that alias's namespace
+/// ([`UserPool::alias_format_username_defect`]). The ONE statement of that rule
+/// for every writer of a user attribute — the two attribute updates and the two
+/// registrations — so a name one of them refuses is not stored by another.
+///
+/// Bounded by the submitted list, with no allocation for a list that names no
+/// such attribute.
+pub fn submitted_name_defect<'submitted>(
+    pool: &UserPool,
+    submitted: impl IntoIterator<Item = (&'submitted str, &'submitted str)>,
+) -> Option<String> {
+    submitted
+        .into_iter()
+        .filter(|(name, _)| *name == PREFERRED_USERNAME_ATTRIBUTE)
+        .find_map(|(_, value)| pool.alias_format_username_defect(value))
+}
+
+/// The message `InvalidParameterException` carries for a verified flag a request
+/// sets where the attribute it vouches for would hold no value, or `None` for an
+/// attribute that carries no such flag.
+///
+/// A verified flag records whether the value of its own attribute was confirmed
+/// ([`verified_flag`]), so confirming or unconfirming one needs that value to
+/// exist. Amazon Cognito states it as the value the flag needs and what the flag
+/// does, naming the attribute and nothing the request carried.
+fn verified_flag_needs_a_value_message(attribute: &str) -> Option<String> {
+    let (needed, vouched_for) = match attribute {
+        EMAIL_ATTRIBUTE => ("Email", "an email"),
+        PHONE_NUMBER_ATTRIBUTE => ("Phone number", "a phone number"),
+        _ => return None,
+    };
+    Some(format!(
+        "{needed} is required to verify/un-verify {vouched_for}"
+    ))
+}
 
 /// Why `value` is not a value the attribute `name` can hold, or `None` when the
 /// value has the form that attribute's values take.
@@ -367,19 +549,35 @@ const E164_MAX_DIGITS: usize = 15;
 /// A user attribute whose values have a FORM is checked against that form before
 /// it is stored, whichever operation submitted it: "a phone number must be in
 /// E.164 format" (`AdminCreateUser.UserAttributes` in this service's model),
-/// which is a `+` followed by the number's digits, so a `phone_number` that is
-/// not one is a bad parameter rather than a value a user may hold. Every other
-/// attribute's values are judged by the pool's schema alone, so none is refused
-/// here.
+/// which is a `+` followed by the number's digits, and an `email` holds an email
+/// ADDRESS — the value a verification message to that attribute is addressed to
+/// (`VerifiedAttributeType`, `DeliveryMediumType.EMAIL`) — so a value of either
+/// attribute that is not one is a bad parameter rather than a value a user may
+/// hold. Every other attribute's values are judged by the pool's schema alone, so
+/// none is refused here.
+///
+/// Whether a value is an address at all is the workspace's one reading of that
+/// form ([`is_email_address`]), so no two services disagree about it.
 ///
 /// A BLANK value is no value at all — "to delete an attribute from your user,
 /// submit the attribute in your API request with a blank value" (this service's
 /// model) — so it is not refused for the form it does not have.
 pub fn attribute_value_defect(name: &str, value: &str) -> Option<&'static str> {
-    if name != PHONE_NUMBER_ATTRIBUTE || value.is_empty() || is_e164(value) {
+    if value.is_empty() {
         return None;
     }
-    Some(INVALID_PHONE_NUMBER_MESSAGE)
+    match name {
+        PHONE_NUMBER_ATTRIBUTE if !is_e164(value) => Some(INVALID_PHONE_NUMBER_MESSAGE),
+        EMAIL_ATTRIBUTE if !is_email_address(value) => Some(INVALID_EMAIL_MESSAGE),
+        _ => None,
+    }
+}
+
+/// Whether `value` is an email address: the workspace's one reading of that form
+/// (`service_common::email_address`), so this service cannot disagree with another
+/// about what an address is.
+fn is_email_address(value: &str) -> bool {
+    ::service_common::email_address::is_email_address(value)
 }
 
 /// Whether `value` is a phone number in E.164 form: a `+`, then between one and
@@ -444,7 +642,15 @@ impl SchemaValidationStage {
     /// states a member's pattern constraint in, naming the value's position by the
     /// attribute's schema path; the registration stage states its own prefix ahead
     /// of it, as it does for every finding of its schema validation.
+    ///
+    /// An attribute whose values are POINTS IN TIME is reported in its own
+    /// sentence instead ([`timestamp_form_message`]), which both stages state the
+    /// same way: what refused the value is the attribute's own meaning rather than
+    /// the schema the pool's operator declared.
     fn number_form_message(self, name: &str) -> String {
+        if let Some(message) = timestamp_form_message(name) {
+            return message;
+        }
         let envelope = format!(
             "1 validation error detected: Value at '{}' failed to satisfy constraint: Member must \
              satisfy regular expression pattern: {NUMBER_VALUE_PATTERN}",
@@ -455,6 +661,48 @@ impl SchemaValidationStage {
             Self::Update => envelope,
         }
     }
+
+    /// How this stage states that the value submitted for the `Boolean` attribute
+    /// `name` is not a boolean.
+    ///
+    /// A `Boolean` attribute's values are the two a boolean has, so a value that is
+    /// neither is not a value of that attribute at all — reported as the schema
+    /// finding it is: the update stage states its own report line, and the
+    /// registration stage the same sentence under its envelope, naming the
+    /// attribute by its schema path as every finding of that stage does.
+    fn boolean_form_message(self, name: &str) -> String {
+        match self {
+            Self::Registration => format!(
+                "{SCHEMA_VALIDATION_PREFIX}{}: {}",
+                schema_path(name),
+                SchemaValidationFinding::NotABoolean.sentence()
+            ),
+            Self::Update => {
+                schema_validation_report([(name, SchemaValidationFinding::NotABoolean)])
+            }
+        }
+    }
+}
+
+/// The standard attributes whose values are POINTS IN TIME rather than plain
+/// numbers: `updated_at` is the OpenID Connect standard claim for the "time the
+/// user's information was last updated", counted in seconds since the epoch,
+/// which the standard schema declares as a `Number` (this service's own standard
+/// schema entry for it). A value of such an
+/// attribute is a unix timestamp, so one that is no number at all is reported for
+/// the timestamp it is not rather than as a bad number.
+const TIMESTAMP_ATTRIBUTES: [&str; 1] = ["updated_at"];
+
+/// The message a value submitted for a TIMESTAMP attribute that is no timestamp
+/// is refused with, or `None` for an attribute whose values are not points in
+/// time ([`TIMESTAMP_ATTRIBUTES`]).
+///
+/// Amazon Cognito names the attribute the request submitted and the form its
+/// values take, and quotes the rejected value nowhere.
+fn timestamp_form_message(name: &str) -> Option<String> {
+    TIMESTAMP_ATTRIBUTES.contains(&name).then(|| {
+        format!("Invalid {name} timestamp format. It should be a unix timestamp.")
+    })
 }
 
 /// The sentence every refusal of the REGISTRATION stage's schema validation opens
@@ -559,7 +807,20 @@ enum SchemaConstraint<'schema> {
     /// ([`NUMBER_VALUE_PATTERN`]), which a value that is not a number at all
     /// does not have.
     NumberForm,
+    /// The form a `Boolean` attribute's values take ([`BOOLEAN_VALUES`]), which a
+    /// value that is not a boolean does not have.
+    BooleanForm,
 }
+
+/// The values a `Boolean` schema attribute can hold, carried as the strings every
+/// attribute value is carried as: the two a boolean has, which are the two this
+/// service itself stores for a verified flag ([`FLAG_CONFIRMED`],
+/// [`FLAG_UNCONFIRMED`]).
+const BOOLEAN_VALUES: [&str; 2] = [FLAG_CONFIRMED, FLAG_UNCONFIRMED];
+
+/// The `AttributeDataType` whose values are booleans
+/// ([`crate::ops::types::ATTRIBUTE_DATA_TYPE_VALUES`]).
+const BOOLEAN_ATTRIBUTE_DATA_TYPE: &str = "Boolean";
 
 /// The path `pool`'s schema holds the attribute `name` under: a custom attribute
 /// under [`CUSTOM_SCHEMA_PATH`], carrying the name it was declared with rather
@@ -618,9 +879,15 @@ pub fn schema_constraint_refusal<'submitted>(
     {
         return Some(stage.number_form_message(name));
     }
+    if let Some((name, _)) = findings
+        .iter()
+        .find(|(_, missed)| matches!(missed, SchemaConstraint::BooleanForm))
+    {
+        return Some(stage.boolean_form_message(name));
+    }
     let mut bounds = findings.iter().filter_map(|(name, missed)| match missed {
         SchemaConstraint::Bound(bound) => Some((*name, *bound)),
-        SchemaConstraint::NumberForm => None,
+        SchemaConstraint::NumberForm | SchemaConstraint::BooleanForm => None,
     });
     match stage {
         SchemaValidationStage::Registration => bounds
@@ -651,8 +918,9 @@ pub fn satisfies_schema_constraints(pool: &UserPool, name: &str, value: &str) ->
 ///
 /// Which constraints apply is the attribute's `AttributeDataType` — a `Number`
 /// attribute's values have the form of a number and are bounded by value, a
-/// `String` attribute's are bounded by length, and an attribute of any other type
-/// (a boolean) carries neither structure, so nothing constrains its values. An
+/// `String` attribute's are bounded by length, a `Boolean` attribute's are the two
+/// values a boolean has ([`BOOLEAN_VALUES`]), and an attribute of any other type
+/// carries no structure, so nothing constrains its values. An
 /// entry naming no data type is a `String` one, the type an attribute defaults to
 /// ([`DEFAULT_ATTRIBUTE_DATA_TYPE`]). An attribute the schema does not declare has
 /// no entry to read and is refused as undeclared instead
@@ -688,6 +956,9 @@ fn schema_constraint_missed<'pool>(
                 }
             }
             None
+        }
+        BOOLEAN_ATTRIBUTE_DATA_TYPE => {
+            (!BOOLEAN_VALUES.contains(&value)).then_some(SchemaConstraint::BooleanForm)
         }
         STRING_ATTRIBUTE_DATA_TYPE => {
             let constraints = entry.string_attribute_constraints.as_ref()?;

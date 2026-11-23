@@ -17,7 +17,9 @@
 //! * An attribute the pool's schema does not declare cannot hold a value, and
 //!   one it declares immutable cannot change, so both are refused with
 //!   `InvalidParameterException` — as is blanking an attribute the schema marks
-//!   required, which must keep a value.
+//!   required, which must keep a value, and naming a verified flag, which
+//!   records this service's own confirmation and so is non-mutable to the user
+//!   it vouches for ([`crate::state::VerifiedFlagAuthority::NotTheirs`]).
 //! * One value per attribute: `AttributeType` is "the name and value of a user
 //!   attribute" (this service's model), so a list naming the same attribute
 //!   twice asks for two values of one attribute, and a list naming more
@@ -29,8 +31,8 @@
 //!   request with a blank value" (this operation's own documentation), so a
 //!   blank value REMOVES the stored attribute rather than storing an empty one.
 //! * A new `email` or `phone_number` is no longer the value that was confirmed,
-//!   so its verified flag ([`crate::state::verified_flag`]) goes false unless
-//!   the request sets that flag itself — and a DELETED one takes its flag with
+//!   so its verified flag ([`crate::state::verified_flag`]) goes false — and a
+//!   DELETED one takes its flag with
 //!   it, there being no value left to vouch for — and a pool that verifies the attribute
 //!   or requires verification before the update gets a
 //!   `CodeDeliveryDetails` entry naming the masked destination and the medium.
@@ -301,10 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     pool,
                     user,
                     &input.user_attributes,
-                    // The caller IS the user whose values these are, so a verified
-                    // flag it submits is stored as the value of a `Boolean`
-                    // attribute and asserts nothing about the value beside it.
-                    crate::state::VerifiedFlagAuthority::Records,
+                    // The caller IS the user whose values these are, so a
+                    // verified flag is not its to write at all: a request that
+                    // names one is refused as a write of a non-mutable
+                    // attribute.
+                    crate::state::VerifiedFlagAuthority::NotTheirs,
                 )
                 .map_err(refused)?
             };

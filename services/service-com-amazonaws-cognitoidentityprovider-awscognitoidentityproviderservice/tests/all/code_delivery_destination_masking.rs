@@ -260,8 +260,8 @@ struct EmailCase {
 }
 
 /// The rows differ along the local part's length and leading character, the
-/// domain's label count, the length of its suffix and whether it has one at all,
-/// and the case of the characters that stay readable — so what a row asserts is
+/// domain's label count, the length of its suffix, and the case of the
+/// characters that stay readable — so what a row asserts is
 /// the masking RULE rather than one rendering of it. None of these addresses is
 /// the one the issue cited.
 const EMAIL_CASES: &[EmailCase] = &[
@@ -281,8 +281,13 @@ const EMAIL_CASES: &[EmailCase] = &[
         masked: "x***@q***",
     },
     EmailCase {
-        case: "a domain carrying no suffix at all",
-        email: "root@localhost",
+        // The address a user signs up with is one this service reads as an
+        // address, and that form is `UserName@[SubDomain.]Domain.TopLevelDomain`
+        // (`service_common::email_address`), so the shortest domain a row can
+        // carry is two labels; what this row varies is the one-label HOST in
+        // front of the suffix.
+        case: "a domain whose host label is a single word",
+        email: "root@localhost.example",
         masked: "r***@l***",
     },
     EmailCase {

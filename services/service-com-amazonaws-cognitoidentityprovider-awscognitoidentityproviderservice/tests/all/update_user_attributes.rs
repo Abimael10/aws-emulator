@@ -10,15 +10,16 @@
 //! and a blank value deletes the attribute — so a later read of that user
 //! renders exactly what was written. A new value of an attribute the pool
 //! verifies (`email`, `phone_number`) is no longer the value its verified flag
-//! vouched for, so the flag goes false unless the request sets it itself, and
+//! vouched for, so the flag goes false, and
 //! the reply reports one `CodeDeliveryDetails` per attribute a verification
 //! message goes to; a pool that requires verification BEFORE the update holds
 //! the new value pending and keeps the confirmed one. An attribute the schema
-//! does not declare, one it declares immutable and blanking one it marks
-//! required are all refused with 400 `InvalidParameterException`, a value
-//! another user already holds as an alias no verified flag can take away from it
-//! with 400 `AliasExistsException` — while one a verified flag CAN moves to the
-//! taker and demotes the previous holder — and a token that names no signed-in
+//! does not declare, one it declares immutable, blanking one it marks
+//! required and naming a verified flag — which records the service's own
+//! confirmation and so is not the user's to write — are all refused with 400
+//! `InvalidParameterException`, a value
+//! another user already holds as an alias with 400 `AliasExistsException`, and
+//! a token that names no signed-in
 //! user with 400 `NotAuthorizedException` — and a refused request writes
 //! nothing.
 //!
@@ -536,20 +537,6 @@ const UPDATE_CASES: &[UpdateCase] = &[
         deliveries: &[],
     },
     UpdateCase {
-        case: "deleting an email takes its verified flag with it, even one the request sets",
-        config: PoolConfig {
-            auto_verified: &["email"],
-            verify_before_update: &[],
-            alias: &[],
-            custom_schema: &[],
-            required: &[],
-        },
-        stored: &[("email", "ada@old.example"), ("email_verified", "true")],
-        submitted: &[("email", ""), ("email_verified", "true")],
-        expected: &[("email", None), ("email_verified", None)],
-        deliveries: &[],
-    },
-    UpdateCase {
         case: "a new email in a pool that verifies it applies at once, unverified, with a mailed code",
         config: PoolConfig {
             auto_verified: &["email"],
@@ -653,23 +640,6 @@ const UPDATE_CASES: &[UpdateCase] = &[
             ("email_verified", Some("true")),
         ],
         deliveries: &[],
-    },
-    UpdateCase {
-        case: "a request that sets the verified flag itself keeps the submitted flag",
-        config: PoolConfig {
-            auto_verified: &["email"],
-            verify_before_update: &[],
-            alias: &[],
-            custom_schema: &[],
-            required: &[],
-        },
-        stored: &[],
-        submitted: &[("email", "ada@new.example"), ("email_verified", "true")],
-        expected: &[
-            ("email", Some("ada@new.example")),
-            ("email_verified", Some("true")),
-        ],
-        deliveries: &[("email", "EMAIL", "a***@n***")],
     },
     UpdateCase {
         case: "an email and a phone number in one call each report their own delivery",
@@ -779,9 +749,55 @@ struct RefusalCase {
 }
 
 /// The rows differ along WHICH rule the request breaks: an attribute no schema
-/// declares, one the schema freezes, a required one a blank value would
-/// delete, an attribute named twice, and a list longer than the pool's schema.
+/// declares, one the schema freezes, a verified flag the caller has no
+/// authority over, a required one a blank value would delete, an attribute
+/// named twice, and a list longer than the pool's schema.
 const REFUSAL_CASES: &[RefusalCase] = &[
+    RefusalCase {
+        // A verified flag records the SERVICE's confirmation of the value beside
+        // it, so it is not an attribute its own holder may write: this caller is
+        // the user the flag vouches for.
+        case: "the verified flag of the caller's own address",
+        config: PoolConfig {
+            auto_verified: &["email"],
+            verify_before_update: &[],
+            alias: &[],
+            custom_schema: &[],
+            required: &[],
+        },
+        stored: &[("email", "ada@old.example")],
+        submitted: &[("email_verified", "true")],
+        status: 400,
+        code: "InvalidParameterException",
+    },
+    RefusalCase {
+        case: "a verified flag beside the deletion of the value it vouches for",
+        config: PoolConfig {
+            auto_verified: &["email"],
+            verify_before_update: &[],
+            alias: &[],
+            custom_schema: &[],
+            required: &[],
+        },
+        stored: &[("email", "ada@old.example"), ("email_verified", "true")],
+        submitted: &[("email", ""), ("email_verified", "true")],
+        status: 400,
+        code: "InvalidParameterException",
+    },
+    RefusalCase {
+        case: "a verified flag of false, which the caller may not write either",
+        config: PoolConfig {
+            auto_verified: &["phone_number"],
+            verify_before_update: &[],
+            alias: &[],
+            custom_schema: &[],
+            required: &[],
+        },
+        stored: &[("phone_number", "+15550100")],
+        submitted: &[("phone_number_verified", "false")],
+        status: 400,
+        code: "InvalidParameterException",
+    },
     RefusalCase {
         case: "an attribute the pool's schema does not declare",
         config: PoolConfig {
@@ -1058,9 +1074,9 @@ async fn an_alias_value_another_user_holds_moves_to_the_taker_or_is_refused() {
         "an email another user holds verified, taken unverified"
     );
 
-    // Asking for that same address AS VERIFIED takes the alias: an alias names
-    // ONE user of the pool, so the write is accepted and the previous holder's
-    // copy is demoted out of verified status.
+    // Asking for that same address AS VERIFIED is not this caller's to ask: the
+    // verified flag records the service's own confirmation of the value, so the
+    // user it would vouch for cannot write it, and the alias stays where it is.
     let (status, payload) = update(
         &router,
         &other,
@@ -1068,15 +1084,16 @@ async fn an_alias_value_another_user_holds_moves_to_the_taker_or_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case {:?}: taking a verified alias must succeed, got {status} with {payload}",
+        (status, error_code(&payload)),
+        (400, "InvalidParameterException"),
+        "case {:?}: a user may not vouch for its own address, got {status} with {payload}",
         "an email another user holds verified, taken verified"
     );
     let taker = stored_attributes(&router, &holder.user_pool_id, "grace").await;
     assert_eq!(
         taker.get("email_verified").map(String::as_str),
-        Some("true"),
-        "case {:?}: the taker holds the alias verified, got {taker:?}",
+        Some("false"),
+        "case {:?}: the refused write leaves the address unverified, got {taker:?}",
         "an email another user holds verified, taken verified"
     );
     let demoted = stored_attributes(&router, &holder.user_pool_id, "ada").await;
@@ -1085,8 +1102,8 @@ async fn an_alias_value_another_user_holds_moves_to_the_taker_or_is_refused() {
             demoted.get("email").map(String::as_str),
             demoted.get("email_verified").map(String::as_str),
         ),
-        (Some("ada@alias.example"), Some("false")),
-        "case {:?}: the previous holder keeps the value but loses the verified flag, got {demoted:?}",
+        (Some("ada@alias.example"), Some("true")),
+        "case {:?}: the holder keeps the alias the refused write did not take, got {demoted:?}",
         "an email another user holds verified, taken verified"
     );
 }

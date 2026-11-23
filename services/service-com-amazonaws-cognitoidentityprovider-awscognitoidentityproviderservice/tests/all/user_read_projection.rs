@@ -569,12 +569,15 @@ async fn admin_create_user_refuses_every_name_the_pool_already_resolves() {
             Some("UsernameExistsException"),
         ),
         (
+            // A value of an aliased attribute's FORM is no username of such a pool
+            // at all, so the create is refused for the name it submitted rather
+            // than for the user that name resolves to.
             "an alias value that names the stored user",
             alias_pool.clone(),
             shared.to_string(),
             vec![],
             400,
-            Some("UsernameExistsException"),
+            Some("InvalidParameterException"),
         ),
         (
             "a fresh name carrying an alias value another user holds",
@@ -667,10 +670,20 @@ async fn admin_create_user_refuses_every_name_the_pool_already_resolves() {
                     *code,
                     "case {case:?}: expected error code {code}, got {payload}"
                 );
+                // The sentence each class of refusal carries: a name the pool already
+                // resolves to a user earns the duplicate-account one, while a name of an
+                // aliased attribute's form earns the username-namespace one, which names
+                // the format and the alias the pool is configured for.
+                let expected_message = if *code == "InvalidParameterException" {
+                    "Username cannot be of email format, since user pool is configured for \
+                     email alias."
+                } else {
+                    "User account already exists"
+                };
                 assert_eq!(
                     error_message(&payload),
-                    "User account already exists",
-                    "case {case:?}: expected the duplicate-account sentence, got {payload}"
+                    expected_message,
+                    "case {case:?}: expected {expected_message:?}, got {payload}"
                 );
             }
             None => assert!(

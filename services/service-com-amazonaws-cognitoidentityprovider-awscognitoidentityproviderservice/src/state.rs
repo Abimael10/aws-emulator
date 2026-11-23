@@ -3835,16 +3835,19 @@ pub enum AttributeUpdateRefusal {
 /// Cognito then "doesn't send a verification message to your user" (this
 /// service's model), while the self-service `UpdateUserAttributes` documents no
 /// such clause: the caller of that one is the user whose value would be
-/// verified, so the flag it submits is not an assertion that it was.
+/// verified, so it has no authority over the flag at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifiedFlagAuthority {
     /// A submitted flag of [`FLAG_CONFIRMED`] asserts the value beside it is
     /// verified: that value is stored at once and no message is sent for it.
     Asserts,
-    /// A submitted flag is stored as the value of a `Boolean` attribute and
-    /// asserts nothing: the pool's own settings alone decide whether a new
-    /// value waits for a confirmation.
-    Records,
+    /// The flag is not the caller's to write: a verified flag records this
+    /// service's own confirmation of the value beside it, so the user it vouches
+    /// for cannot assert it — a request of such a caller that names one is
+    /// refused as a write of a non-mutable attribute
+    /// ([`non_mutable_attribute_message`]), whatever the pool's schema declares
+    /// about the flag.
+    NotTheirs,
 }
 
 /// The message a request refused because it would change an attribute the
@@ -3858,9 +3861,12 @@ pub enum VerifiedFlagAuthority {
 /// names neither the pool nor the user: the schema, not this user's state, is
 /// what refused it.
 ///
-/// This is the sentence a DELETION of such an attribute carries. A write that
-/// submits a VALUE for it is validated against the schema value by value, so it
-/// is refused with that report's own line for the finding
+/// This is the sentence a DELETION of such an attribute carries, and the one a
+/// write of a verified flag by the user it vouches for carries
+/// ([`VerifiedFlagAuthority::NotTheirs`]), neither of which is a value judged
+/// against the schema. A write that submits a VALUE for an attribute the schema
+/// itself freezes is validated against the schema value by value, so it is
+/// refused with that report's own line for the finding
 /// ([`schema_validation_report`]) rather than with this sentence.
 pub fn non_mutable_attribute_message(attribute_name: &str) -> String {
     format!("Cannot modify the non-mutable attribute {attribute_name}")
@@ -3891,15 +3897,25 @@ pub enum SchemaValidationFinding {
     /// bound it missed and the bound as the schema declares it
     /// ([`schema_constraint_refusal`]).
     OutsideDeclaredBound(String),
+    /// The pool's schema declares the attribute `Boolean`
+    /// (`SchemaAttributeType.AttributeDataType`) and the submitted value is not
+    /// one of the two values a boolean has, so it is no value of that attribute.
+    NotABoolean,
+    /// The pool's schema marks the attribute required
+    /// (`SchemaAttributeType.Required`), so it has to keep a value: the blank
+    /// value the request submitted for it would delete it.
+    RequiredNotDeletable,
 }
 
 impl SchemaValidationFinding {
     /// The sentence this finding is reported with.
-    fn sentence(&self) -> &str {
+    pub(crate) fn sentence(&self) -> &str {
         match self {
             Self::NotInSchema => "Attribute does not exist in the schema.",
             Self::NotUpdatable => "Attribute cannot be updated.",
             Self::OutsideDeclaredBound(sentence) => sentence.as_str(),
+            Self::NotABoolean => "The attribute is not a valid boolean.",
+            Self::RequiredNotDeletable => "Required attribute cannot be deleted.",
         }
     }
 }

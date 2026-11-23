@@ -209,6 +209,28 @@ const USER_POOL_ID_MEMBER_PATH: &str = "userPoolId";
 /// path it is cased from, and checked against the model by this file's own test.
 const USER_POOL_ID_MEMBER: &str = "UserPoolId";
 
+/// The operations that UPDATE the attributes of a user the pool already holds, as against
+/// the registrations that submit a new account's attributes: the administrative write and
+/// the self-service one
+/// (`smithy_query(query="operation",operation="AdminUpdateUserAttributes,UpdateUserAttributes")`,
+/// both carrying `UserAttributes` as an `AttributeListType`). Amazon Cognito states the
+/// ceiling on an attribute VALUE in its own per-attribute sentence at that stage, which the
+/// handler builds from the attribute the request named
+/// ([`crate::state::attribute_value_too_long_message`]), so a value past the modelled
+/// maximum is served through to the handler rather than refused by the constraint walk (see
+/// [`served_despite`]).
+const ATTRIBUTE_UPDATE_OPERATIONS: [&str; 2] =
+    ["AdminUpdateUserAttributes", "UpdateUserAttributes"];
+
+/// The validation path of the `UserAttributes` member those operations submit the
+/// name/value pairs in, as the framework spells a member path.
+const USER_ATTRIBUTES_MEMBER_PATH: &str = "userAttributes";
+
+/// The validation path segment of the `Value` member of one `AttributeType` entry of that
+/// list (`smithy_query(query="shape",shape="AttributeType")`: `Value` targets
+/// `AttributeValueType`, `@length` max 2048), as the framework spells a member path.
+const ATTRIBUTE_VALUE_MEMBER_PATH: &str = "value";
+
 /// The `com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -706,6 +728,17 @@ fn absent_user_pool_id_sentence<'v>(
 /// the items a page of that size holds. Only the floor is served: a page size over the
 /// declared maximum asks for more than the listing serves at once, which is not a page it
 /// has, and keeps the framework's refusal.
+///
+/// A fourth is the VALUE of one submitted user attribute, past the maximum an attribute
+/// value may have, on an operation that updates a stored user's attributes
+/// ([`ATTRIBUTE_UPDATE_OPERATIONS`]): Amazon Cognito refuses that request too, but states
+/// the ceiling per ATTRIBUTE — the attribute the request named and the maximum its value
+/// may have — where the constraint walk can only state the member position and quote the
+/// rejected value back. The attribute's NAME is a sibling of the refused value, which no
+/// violation carries, so the request is served through to the handler and refused there
+/// (`crate::state::plan_attribute_update`), which has the submitted pairs and the pool's
+/// schema. Only that one member of those operations: every other value past a declared
+/// maximum keeps the constraint report.
 fn served_despite(operation: &str, violation: &Violation) -> bool {
     let presented_value = !matches!(violation.kind, ViolationKind::MissingRequiredMember);
     (operation == DESCRIBE_USER_POOL_DOMAIN
@@ -717,6 +750,21 @@ fn served_despite(operation: &str, violation: &Violation) -> bool {
         || (operation == LIST_USER_POOL_CLIENTS
             && violation.path == MAX_RESULTS_MEMBER_PATH
             && matches!(violation.kind, ViolationKind::MinValue(_)))
+        || (ATTRIBUTE_UPDATE_OPERATIONS.contains(&operation)
+            && matches!(violation.kind, ViolationKind::MaxLength(_))
+            && states_a_submitted_attribute_value(&violation.path))
+}
+
+/// Whether `path` is the position of the VALUE of one entry of a submitted user-attribute
+/// list, whatever position in the list that entry sat at.
+///
+/// Read off the path's two ends — the member the list arrived in and the member of the
+/// entry the value sat in — so the element's own 1-based position and the collection step
+/// between them belong to the framework's spelling rather than to this rule.
+fn states_a_submitted_attribute_value(path: &str) -> bool {
+    let mut segments = path.split('.');
+    segments.next() == Some(USER_ATTRIBUTES_MEMBER_PATH)
+        && segments.next_back() == Some(ATTRIBUTE_VALUE_MEMBER_PATH)
 }
 
 impl<O> WithSubmittedValues<O>

@@ -29,7 +29,10 @@
 //!
 //! A value that is not of its data type's form is reported by both stages in the
 //! constraint envelope naming the pattern it failed, the registration stage
-//! stating its own prefix ahead of it. A refused write stores nothing, so the
+//! stating its own prefix ahead of it — except for an attribute whose values are
+//! points in time (`updated_at`), which both stages report in the sentence that
+//! names the attribute and the unix timestamp its values are. A refused write
+//! stores nothing, so the
 //! user keeps every value it held (and a refused create leaves no user at all).
 //! Both bounds are INCLUSIVE, an undeclared bound bounds nothing, and a length is
 //! counted in characters.
@@ -68,6 +71,10 @@ enum Missed {
     /// The form a `Number` attribute's values take, which both stages report in
     /// the constraint envelope.
     NumberForm,
+    /// The form a TIMESTAMP attribute's values take: a value that is no unix
+    /// timestamp is reported in the sentence Amazon Cognito states that attribute's
+    /// own form in, which both stages state the same way.
+    TimestampForm,
 }
 
 /// A bound missed, as both stages name it.
@@ -123,6 +130,16 @@ impl Row {
         Self::refused(case, attribute, value, Missed::NumberForm)
     }
 
+    /// A row whose value is no unix timestamp for an attribute whose values are
+    /// points in time.
+    fn not_a_timestamp(
+        case: &'static str,
+        attribute: &'static str,
+        value: impl Into<String>,
+    ) -> Self {
+        Self::refused(case, attribute, value, Missed::TimestampForm)
+    }
+
     /// The message a REGISTRATION refuses this row's value with.
     fn registration_refusal(&self) -> Option<String> {
         self.missed.as_ref().map(|missed| match missed {
@@ -130,6 +147,7 @@ impl Row {
             Missed::NumberForm => {
                 format!("{SCHEMA_ENVELOPE}{}", constraint_envelope(self.attribute))
             }
+            Missed::TimestampForm => timestamp_form(self.attribute),
         })
     }
 
@@ -138,8 +156,17 @@ impl Row {
         self.missed.as_ref().map(|missed| match missed {
             Missed::Bound { sentence, .. } => report_line(self.attribute, sentence),
             Missed::NumberForm => constraint_envelope(self.attribute),
+            Missed::TimestampForm => timestamp_form(self.attribute),
         })
     }
+}
+
+/// The sentence a value that is no unix timestamp is refused with, which names
+/// the attribute the request submitted and the form its values take. Recorded
+/// for `updated_at`, the standard schema's one attribute whose values are points
+/// in time.
+fn timestamp_form(attribute: &str) -> String {
+    format!("Invalid {attribute} timestamp format. It should be a unix timestamp.")
 }
 
 /// The envelope every refusal of the REGISTRATION stage opens with.
@@ -415,8 +442,8 @@ fn rows() -> Vec<Row> {
             "-1",
             bound(MIN_VALUE, "Number must be greater than 0"),
         ),
-        Row::not_a_number(
-            "a standard number that is no number at all",
+        Row::not_a_timestamp(
+            "a standard number that is no number at all, whose values are timestamps",
             "updated_at",
             "yesterday",
         ),

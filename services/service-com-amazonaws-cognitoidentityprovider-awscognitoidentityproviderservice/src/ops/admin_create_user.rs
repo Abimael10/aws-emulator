@@ -477,6 +477,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         }) {
             return Err(invalid_parameter(defect.to_string()));
         }
+        // A submitted `preferred_username` is a NAME its holder answers to rather
+        // than an address, so it is held to the pool's own username namespace,
+        // the same rule the attribute writes apply
+        // ([`crate::state::submitted_name_defect`]).
+        if let Some(defect) = crate::state::submitted_name_defect(
+            pool,
+            requested_attributes.iter().map(|attribute| {
+                (
+                    attribute.name.as_str(),
+                    attribute.value.as_deref().unwrap_or_default(),
+                )
+            }),
+        ) {
+            return Err(invalid_parameter(defect));
+        }
         // A submitted value also has to satisfy the constraints the pool's schema
         // declares for its attribute, the same rule every other writer of a user
         // attribute applies ([`crate::state::schema_constraint_refusal`]) — this
