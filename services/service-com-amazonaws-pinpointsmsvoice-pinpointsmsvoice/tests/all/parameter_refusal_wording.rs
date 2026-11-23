@@ -198,10 +198,10 @@ const INVALID_CONTENT: &str = "Message is invalid. The message must have either 
 const EXISTING_SET: &str = "refusal-wording-set";
 
 /// Every row refuses one request for one parameter. They span three bindings (a URI path
-/// label, a query parameter, a body member), five operations and six forms of unusable
-/// value — and, for a URI-bound parameter, both layers: a label that bound NO value is the
-/// request-binding layer's sentence, one that bound a BLANK value is this service's
-/// validation's.
+/// label, a query parameter, a body member), five operations and seven forms of unusable
+/// value — and, for a parameter that is PRESENT either way, both layers: a value that bound
+/// NO value at all is the request-binding layer's sentence, one that bound a BLANK value is
+/// this service's validation's, whether it travels as a label or as a query parameter.
 const CASES: &[Case] = &[
     // ---- a @required URI parameter with no value -------------------------------------
     Case {
@@ -284,6 +284,32 @@ const CASES: &[Case] = &[
         name: "ListConfigurationSets with a fractional PageSize",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=2.5",
+        body: None,
+        message: None,
+    },
+    // ---- a query parameter that bound a BLANK value ----------------------------------
+    // The query-parameter half of the label rows above: a value that is present binds,
+    // blank or not, so it reaches this service's own validation and is refused in the
+    // class that parameter belongs to — named for `NextToken`, sentence-less for
+    // `PageSize`.
+    Case {
+        name: "ListConfigurationSets with a BLANK NextToken",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=%20",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Case {
+        name: "ListConfigurationSets with a NextToken of several whitespace bytes",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=%20%09%0A",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Case {
+        name: "ListConfigurationSets with a BLANK PageSize",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?PageSize=%20",
         body: None,
         message: None,
     },
@@ -907,20 +933,31 @@ const SEVERAL_UNUSABLE_CASES: &[Several] = &[
         body: None,
         message: Some(INVALID_NEXT_TOKEN),
     },
-    // ---- only the sentence-less class is unusable, so no sentence is worded -------------
-    // A BLANK `NextToken` names no position this service needs one for, so it is read as
-    // absent rather than unusable: the `PageSize` beside it is the only parameter refused.
+    // ---- a BLANK query parameter: present, so it reached validation unusable ------------
+    // A blank value BOUND, so it is a value this service cannot use rather than a request
+    // that named none: the `NextToken` here is refused beside the `PageSize`, and since it
+    // is the class this service names, its sentence is the one worded.
     Several {
         name: "ListConfigurationSets with a blank NextToken and a PageSize of zero",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?NextToken=%20&PageSize=0",
         body: None,
-        message: None,
+        message: Some(INVALID_NEXT_TOKEN),
     },
     Several {
         name: "ListConfigurationSets with a blank NextToken and a PageSize in exponent form",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?NextToken=%20%09&PageSize=1e3",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    // ---- only the sentence-less class is unusable, so no sentence is worded -------------
+    // The `NextToken` beside each of these bound NOTHING (it is absent, or present and
+    // empty), so the `PageSize` is the only parameter refused.
+    Several {
+        name: "ListConfigurationSets with an EMPTY NextToken and a PageSize of zero",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=&PageSize=0",
         body: None,
         message: None,
     },

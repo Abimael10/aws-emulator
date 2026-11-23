@@ -69,6 +69,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::types::refusal_wording::{optional_parameter, OptionalValue, Unusable};
+
 /// The page bound applied when the caller sends no `PageSize`.
 ///
 /// An unbounded default would let one `GET` with no parameters amplify into a response
@@ -175,47 +177,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `smithy_query(query="operation",operation="ListConfigurationSets",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
         // so the ONE refusal reports every parameter this layer cannot use rather than
         // whichever was looked at first. `refusal_wording` words it.
-        let mut unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = Vec::new();
+        let mut unusable: Vec<(&str, Unusable)> = Vec::new();
 
         // `NextToken` is opaque to the caller but it is OURS: one this service did not
         // mint cannot name a position in the listing, so it is a parameter this
         // service's validation cannot use — and one it names in the refusal, because the
         // caller can only have got a usable token from this service.
-        let resume_after = match input.next_token.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(raw) => match decode_token(raw) {
-                Some(after) => Some(after),
-                None => {
-                    unusable.push((
-                        "NextToken",
-                        super::types::refusal_wording::Unusable::Unreadable,
-                    ));
-                    None
-                }
-            },
+        //
+        // A value that bound NOTHING (absent, or present and empty) names no position to
+        // resume from, so the listing starts at the beginning; a value that is present but
+        // BLANK did bind and is no token this service ever minted, so it is refused like
+        // any other unminted one rather than read as naming no position at all. That split
+        // is `refusal_wording::optional_parameter`'s, stated once for this service.
+        let asked_token = optional_parameter(input.next_token.as_deref());
+        let resume_after = match asked_token {
+            OptionalValue::Nothing => None,
+            // A blank value is no token this service ever minted, so the two unusable
+            // forms resolve the same way: no position to resume from, and a finding
+            // below.
+            OptionalValue::Blank => None,
+            OptionalValue::Present(raw) => decode_token(raw),
         };
+        if resume_after.is_none() && asked_token != OptionalValue::Nothing {
+            unusable.push(("NextToken", Unusable::Unreadable));
+        }
 
         // `PageSize` is modelled as a string, so a value that is not a positive
-        // decimal count is a client error, not a count to clamp. Absent, the server's
-        // own `DEFAULT_PAGE_SIZE` applies; present, it is clamped to `MAX_PAGE_SIZE`.
+        // decimal count is a client error, not a count to clamp. Bound to NOTHING, the
+        // server's own `DEFAULT_PAGE_SIZE` applies; present, it is read as a count and
+        // clamped to `MAX_PAGE_SIZE` — and a present but BLANK value is no count, so it is
+        // refused rather than taking that default.
         // It is this service's one refusal that carries NO sentence, so it contributes no
         // name to one — see [`parse_page_size`].
-        let page_size = match input.page_size.as_deref().map(str::trim) {
-            None | Some("") => DEFAULT_PAGE_SIZE,
-            Some(raw) => match parse_page_size(raw) {
-                Some(size) => size,
-                None => {
-                    unusable.push((
-                        "PageSize",
-                        super::types::refusal_wording::Unusable::Unworded,
-                    ));
-                    // Never served: the finding above refuses the request.
-                    DEFAULT_PAGE_SIZE
-                }
-            },
+        let asked_page_size = match optional_parameter(input.page_size.as_deref()) {
+            OptionalValue::Nothing => Some(DEFAULT_PAGE_SIZE),
+            // A blank value is no count either, so it is refused like every other value
+            // that is not one rather than taking the server's default.
+            OptionalValue::Blank => None,
+            OptionalValue::Present(raw) => parse_page_size(raw),
         };
+        if asked_page_size.is_none() {
+            unusable.push(("PageSize", Unusable::Unworded));
+        }
+        // The fallback is never served: the finding above refuses the request.
+        let page_size = asked_page_size.unwrap_or(DEFAULT_PAGE_SIZE);
 
-        if let Some(refusal) = super::types::refusal_wording::unusable_parameters(&unusable) {
+        if let Some(refusal) = refusal_wording::unusable_parameters(&unusable) {
             return Err(
                 ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
                     message: refusal.message,

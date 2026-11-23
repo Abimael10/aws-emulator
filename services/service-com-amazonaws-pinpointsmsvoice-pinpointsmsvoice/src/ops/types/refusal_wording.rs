@@ -27,6 +27,12 @@
 //! [`unusable_required_labels`] is that same rule for a request whose only own-validation
 //! parameters are its `@required` URI labels.
 //!
+//! WHICH values are unusable is the same question for a parameter this service merely has a
+//! default for, so it is answered here too: [`optional_parameter`] tells a value that bound
+//! NOTHING (so the default applies) from one that bound a BLANK value (so this service's
+//! validation was reached and cannot use it). An optional parameter is not a reason to read
+//! an unusable value as an absent one.
+//!
 //! A parameter this service refuses with NO sentence at all ([`Unusable::Unworded`])
 //! contributes no name, so it can never silence a sentence another parameter of the same
 //! request earned: the refusal carries none only when every unusable parameter is of that
@@ -149,6 +155,47 @@ pub fn unusable_label(value: &str) -> Option<Unusable> {
         Some(Unusable::Unreadable)
     } else {
         None
+    }
+}
+
+/// What a request bound to one OPTIONAL parameter, as the parameter's reader must read it.
+///
+/// The same EMPTY/BLANK split [`unusable_label`] states, for a parameter whose absence is
+/// SERVED (by this service's own default) instead of refused: a value that bound nothing is
+/// no choice at all, while a BLANK value did bind and so reached this service's validation,
+/// which cannot use it. Folding the blank case onto the absent one would answer a request
+/// that named an unusable value as though it had named none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalValue<'a> {
+    /// Nothing bound at all — the parameter is absent, or present carrying an empty value
+    /// — so the request named no choice and this service's own default applies.
+    Nothing,
+    /// A value bound, and it is BLANK: it reached this service's own validation, which
+    /// cannot use it, so the request is refused for it like any other unusable value.
+    Blank,
+    /// A value bound that carries content, with any surrounding padding removed — what the
+    /// parameter's own reader then reads.
+    Present(&'a str),
+}
+
+/// Classify the `value` a request bound to one optional parameter, or `None` where the
+/// parameter was absent.
+///
+/// This is [`unusable_label`]'s split stated for the optional parameters, so the line
+/// between "named no choice" and "named a value this service cannot use" is drawn in ONE
+/// place for every parameter of this service, whether it travels as a URI label, a query
+/// parameter or a body member.
+pub fn optional_parameter(value: Option<&str>) -> OptionalValue<'_> {
+    match value {
+        None => OptionalValue::Nothing,
+        Some(raw) => match unusable_label(raw) {
+            // Empty: nothing bound, exactly as an absent parameter.
+            Some(Unusable::Unbound) => OptionalValue::Nothing,
+            // Present but blank: bound, and unusable.
+            Some(_) => OptionalValue::Blank,
+            // Content: the padding around it is not part of the value.
+            None => OptionalValue::Present(raw.trim()),
+        },
     }
 }
 
@@ -315,6 +362,37 @@ mod tests {
             ),
         ] {
             let answer = unusable_parameters(findings).map(|refusal| refusal.message);
+            assert_eq!(
+                answer, expected,
+                "case {case:?}: expected {expected:?}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: an optional parameter's value bound NOTHING only when it is absent or empty; a
+    /// value that is present but blank DID bind and is unusable, and a value with content is
+    /// read with its surrounding padding removed.
+    ///
+    /// The rows differ along what the rule generalises over: whether a value bound at all,
+    /// the FORM of a blank value (space, tab, newline, several of them), and whether a value
+    /// with content carries padding, on which side, and of which whitespace.
+    #[test]
+    fn an_optional_value_is_nothing_only_when_it_bound_nothing() {
+        for (case, value, expected) in [
+            ("absent", None, OptionalValue::Nothing),
+            ("present but empty", Some(""), OptionalValue::Nothing),
+            ("one space", Some(" "), OptionalValue::Blank),
+            ("one tab", Some("\t"), OptionalValue::Blank),
+            ("a newline", Some("\n"), OptionalValue::Blank),
+            ("several kinds of whitespace", Some(" \t\r\n "), OptionalValue::Blank),
+            ("content alone", Some("value"), OptionalValue::Present("value")),
+            ("content padded on the left", Some("  value"), OptionalValue::Present("value")),
+            ("content padded on the right", Some("value\t"), OptionalValue::Present("value")),
+            ("content padded on both sides", Some(" value "), OptionalValue::Present("value")),
+            // Whitespace INSIDE a value is part of it: only the padding is removed.
+            ("content with whitespace inside it", Some(" a b "), OptionalValue::Present("a b")),
+        ] {
+            let answer = optional_parameter(value);
             assert_eq!(
                 answer, expected,
                 "case {case:?}: expected {expected:?}, got {answer:?}"
