@@ -12,9 +12,10 @@
 //! Each test below is a table spanning the class the rule generalises over rather than
 //! the one request that exposed it: every client-error class this service's operations
 //! can reach (its shape declaring 400, 402, 404 and 409 in turn), every identifier form
-//! `KeyArnOrKeyAliasType` admits, and several operations per class — the status is a
-//! property of the service's error channel, so it cannot be right for one operation and
-//! wrong for the next.
+//! `KeyArnOrKeyAliasType` admits, every alias operation the model declares crossed with
+//! the classes each of them refuses with, and several operations per class — the status
+//! is a property of the service's error channel, so it cannot be right for one
+//! operation and wrong for the next.
 //!
 //! Every call goes through the real `MultiServiceRouter` (`POST /` with
 //! `X-Amz-Target: PaymentCryptographyControlPlane.<Op>`, awsJson1_0) and the
@@ -343,6 +344,153 @@ async fn a_constraint_refusal_answers_the_same_client_error_status() {
             status, CLIENT_ERROR_STATUS,
             "case MaxResults {max_results}: outside the modelled 1..100 range, expected \
              HTTP {CLIENT_ERROR_STATUS}, got {status} {parsed}"
+        );
+    }
+}
+
+/// The key ARN of [`absent_identifiers`] that names no key in this account — a
+/// well-formed `KeyArn`, so it reaches a handler's own existence check rather than the
+/// constraint walk.
+///
+/// Taken from that catalog rather than spelled a second time, so the ARN form this
+/// suite drives lives in one place.
+fn absent_key_arn() -> String {
+    absent_identifiers()
+        .into_iter()
+        .find(|(form, _)| *form == "a key ARN")
+        .map(|(_, identifier)| identifier)
+        .expect("absent_identifiers catalogs a key ARN naming no key")
+}
+
+/// Alias name pairs spanning the class the modelled `AliasName` admits: both bounds of
+/// its length, a nested name, and a name using every punctuation character its pattern
+/// allows. In each pair the first name is created and the second is never created.
+///
+/// Source: `smithy_query(query="operation",operation="CreateAlias,GetAlias,UpdateAlias,
+/// DeleteAlias")` — on all four operations `AliasName` is `@required` with
+/// `length 7..256` and `pattern ^alias/[a-zA-Z0-9/_-]+$`. None of these names is the
+/// one the issue cited; the rule is the same for each.
+fn alias_name_pairs() -> Vec<(&'static str, String, String)> {
+    vec![
+        (
+            "the shortest name the length admits",
+            "alias/b".to_string(),
+            "alias/c".to_string(),
+        ),
+        (
+            "a nested name",
+            "alias/eu/pin/verify-1".to_string(),
+            "alias/eu/pin/verify-2".to_string(),
+        ),
+        (
+            "every punctuation character the pattern admits",
+            "alias/Mixed_Case-and/slashes/9".to_string(),
+            "alias/Other_Case-and/slashes/8".to_string(),
+        ),
+        (
+            "the longest name the length admits",
+            format!("alias/{}", "t".repeat(250)),
+            format!("alias/{}", "f".repeat(250)),
+        ),
+    ]
+}
+
+/// RULE: the status line of a refusal belongs to this service's `awsJson1_0` envelope
+/// and not to the refused shape's `@httpError`, so every refusal the ALIAS surface
+/// raises — whichever operation raised it and whichever class it names — is answered
+/// with the one client-error status, with the class carried in the body's `__type`.
+///
+/// The table is every alias operation the model declares (`CreateAlias`, `GetAlias`,
+/// `UpdateAlias`, `DeleteAlias`) crossed with the refusal classes each of them can
+/// reach — shapes declaring `@httpError` 400, 404 and 409 — over alias names spanning
+/// the modelled `AliasName` class. Two of those declared statuses differ from the
+/// status the service writes, which [`assert_client_refusal`] asserts separately: a
+/// shape's `@httpError` classifies the error here, it is not the status line.
+#[tokio::test]
+async fn every_alias_refusal_answers_the_client_error_status_whatever_class_it_names() {
+    let router = router();
+    let absent_key = absent_key_arn();
+    for (form, taken, free) in alias_name_pairs() {
+        let bound_key = fresh_key_arn(&router).await;
+        let other_key = fresh_key_arn(&router).await;
+        ok_call(
+            &router,
+            "CreateAlias",
+            &json!({"AliasName": taken, "KeyArn": bound_key}),
+        )
+        .await;
+
+        // (what the request asks for, the operation, its body, the class it must name)
+        let rows: Vec<(&str, &str, Value, &str)> = vec![
+            (
+                "binds a name the registry already holds",
+                "CreateAlias",
+                json!({"AliasName": taken, "KeyArn": other_key}),
+                "ConflictException",
+            ),
+            (
+                "binds a free name to no key at all",
+                "CreateAlias",
+                json!({"AliasName": free}),
+                "ValidationException",
+            ),
+            (
+                "binds a free name to a key never minted",
+                "CreateAlias",
+                json!({"AliasName": free, "KeyArn": absent_key}),
+                "ResourceNotFoundException",
+            ),
+            (
+                "reads a name the registry never held",
+                "GetAlias",
+                json!({"AliasName": free}),
+                "ResourceNotFoundException",
+            ),
+            (
+                "repoints a name the registry never held",
+                "UpdateAlias",
+                json!({"AliasName": free, "KeyArn": bound_key}),
+                "ResourceNotFoundException",
+            ),
+            (
+                "repoints a bound name onto a key never minted",
+                "UpdateAlias",
+                json!({"AliasName": taken, "KeyArn": absent_key}),
+                "ResourceNotFoundException",
+            ),
+            (
+                "deletes a name the registry never held",
+                "DeleteAlias",
+                json!({"AliasName": free}),
+                "ResourceNotFoundException",
+            ),
+        ];
+
+        for (asked, operation, body, class) in rows {
+            let case = format!("{operation} {asked}, {form}");
+            let (status, parsed) = call(&router, operation, &body).await;
+            assert_client_refusal(&case, status, &parsed, class);
+        }
+
+        // None of those refusals wrote anything: the created name still resolves to the
+        // key it was bound to, and the name that was never created still resolves to
+        // nothing — under the same status.
+        let read = ok_call(&router, "GetAlias", &json!({"AliasName": taken})).await;
+        assert_eq!(
+            string(
+                read.get("Alias")
+                    .unwrap_or_else(|| panic!("case {form}: GetAlias answered no Alias: {read}")),
+                "KeyArn"
+            ),
+            bound_key,
+            "case {form}: the refused calls must leave the stored binding alone, got {read}"
+        );
+        let (status, parsed) = call(&router, "GetAlias", &json!({"AliasName": free})).await;
+        assert_client_refusal(
+            &format!("GetAlias after the refusals, {form}"),
+            status,
+            &parsed,
+            "ResourceNotFoundException",
         );
     }
 }
