@@ -48,7 +48,10 @@ const CATALOG_CODE: &str = "EntityNotFoundException";
 /// The catalog's own sentence for a TABLE READ that resolved to nothing: the Data Catalog
 /// answers one wording for every such miss, and it names no entity of the request (Glue's
 /// own `GetTable` refusal, `state::messages::TABLE_ENTITY_NOT_FOUND`).
-const TABLE_MISS: &str = "Entity Not Found";
+///
+/// `pub(crate)` because `tests/all` is ONE crate: the suite over a drop and a recreate of
+/// the same table asserts this same sentence rather than keeping a second copy of it.
+pub(crate) const TABLE_MISS: &str = "Entity Not Found";
 
 /// The catalog's own sentence for a DATABASE the catalog holds none of, whose one variable
 /// part is the database as the catalog KEYS it (Glue's own
@@ -97,7 +100,11 @@ async fn seed(router: &MultiServiceRouter) {
 
 /// Register one `GLUE` data catalog naming THIS account's catalog id, which addresses the
 /// same Data Catalog under a second name, and answer with that name.
-async fn register_second_name(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`TABLE_MISS`] is: the sibling suite over a drop and a
+/// recreate reads through a second name too, and one registration path keeps the two from
+/// drifting.
+pub(crate) async fn register_second_name(router: &MultiServiceRouter, name: &str) -> String {
     athena_ok(
         router,
         "CreateDataCatalog",
@@ -117,7 +124,10 @@ async fn register_second_name(router: &MultiServiceRouter, name: &str) -> String
 /// Every token of the clause is fixed text but the request id, which belongs to the relayed
 /// CALL — so it is checked for the FORM the emulator's request ids carry rather than
 /// compared to a value.
-fn relayed_request_id(case: &str, refusal: &str, expected_reason: &str) -> String {
+///
+/// `pub(crate)` for the reason [`TABLE_MISS`] is: the sibling suite over a drop and a
+/// recreate checks the same clause, and one rendering of it keeps the two from drifting.
+pub(crate) fn relayed_request_id(case: &str, refusal: &str, expected_reason: &str) -> String {
     let head = format!(
         "{expected_reason} (Service: {CATALOG_SERVICE}; Status Code: {CATALOG_STATUS}; Error \
          Code: {CATALOG_CODE}; Request ID: "

@@ -203,7 +203,10 @@ fn without_create_time(case: &str, entry: &Value, from: f64, until: f64) -> Valu
 }
 
 /// The `Name`s of a `TableMetadataList`, in the order the service returned them.
-fn reported_names(page: &Value) -> Vec<String> {
+///
+/// `pub(crate)` because `tests/all` is ONE crate: a sibling suite that reads the same
+/// listing uses this one extractor rather than a copy of it.
+pub(crate) fn reported_names(page: &Value) -> Vec<String> {
     page["TableMetadataList"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a TableMetadataList, got {page}"))
