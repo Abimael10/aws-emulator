@@ -196,6 +196,16 @@ pub fn parse_policy_target(target: &str) -> Result<PolicyTarget, PolicyTargetRef
     Err(unreadable_target())
 }
 
+/// Whether `target` is WRITTEN as an ARN, whatever resource it names.
+///
+/// Two of the three forms a policy target takes are ARNs and the third is not
+/// ([`parse_policy_target`]), so an operation that has to tell "an address I read" from
+/// "no address at all" — which is what classifying an unreadable principal as a Cognito
+/// identity needs — asks this rather than re-reading the ARN fields of its own.
+pub fn names_an_arn(target: &str) -> bool {
+    arn_service_and_resource(target).is_some()
+}
+
 /// The service and resource fields of `target` when it is an ARN at all, else `None`.
 fn arn_service_and_resource(target: &str) -> Option<(&str, &str)> {
     // 6 fields: arn:<partition>:<service>:<region>:<account-id>:<resource>. The

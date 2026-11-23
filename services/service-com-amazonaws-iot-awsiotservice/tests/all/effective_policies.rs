@@ -13,10 +13,11 @@
 //! with the registry's own `policyName`/`policyArn` and the document of the version in
 //! effect; a thing group's union adds the groups ABOVE it; the read changes nothing, so
 //! the answer tracks the relation as later attaches and detaches move it. An identity of
-//! no supported form, two conflicting identities and no identity at all are refused
-//! `InvalidRequestException` (400); a well-formed identity naming a resource this account
-//! does not hold is refused `ResourceNotFoundException` (404) — never an empty list
-//! standing in for "no such principal".
+//! no supported form, an ARN principal with a pool id beside it, a Cognito identity
+//! principal without one and no identity at all are refused `InvalidRequestException`
+//! (400); a well-formed identity naming a resource this account does not hold is refused
+//! `ResourceNotFoundException` (404) — never an empty list standing in for "no such
+//! principal".
 //!
 //! The tables span the class the rule generalises over rather than one recorded request:
 //! each of the three principal forms the modelled member documents (a certificate ARN, a
@@ -344,6 +345,9 @@ struct PrincipalCase {
     label: &'static str,
     /// The identity the read asks about.
     principal: String,
+    /// The pool the request names beside the principal: present exactly for the Cognito
+    /// identity form, which the operation answers only with the pool that names it.
+    pool_id: Option<String>,
     /// `(policyName, action)` of every policy attached to it — none, one or several.
     policies: Vec<(&'static str, &'static str)>,
 }
@@ -366,11 +370,13 @@ async fn effective_policies_are_the_policies_attached_to_the_identity() {
         PrincipalCase {
             label: "one policy on an ACTIVE certificate",
             principal: active_certificate.clone(),
+            pool_id: None,
             policies: vec![("connect", "iot:Connect")],
         },
         PrincipalCase {
             label: "three policies on an INACTIVE certificate",
             principal: inactive_certificate.clone(),
+            pool_id: None,
             policies: vec![
                 ("publish", "iot:Publish"),
                 ("subscribe", "iot:Subscribe"),
@@ -380,16 +386,19 @@ async fn effective_policies_are_the_policies_attached_to_the_identity() {
         PrincipalCase {
             label: "a thing group principal",
             principal: group.clone(),
+            pool_id: None,
             policies: vec![("floor+policy=1", "iot:Connect")],
         },
         PrincipalCase {
-            label: "a Cognito identity principal",
+            label: "a Cognito identity principal beside its pool",
             principal: format!("{REGION}:11112222-3333-4444-5555-666677778888"),
+            pool_id: Some(format!("{REGION}:aaaabbbb-cccc-dddd-eeee-ffff00002222")),
             policies: vec![("cognito-connect", "iot:Connect"), ("cognito-publish", "iot:Publish")],
         },
         PrincipalCase {
             label: "a certificate with no attachment at all",
             principal: bare_certificate.clone(),
+            pool_id: None,
             policies: Vec::new(),
         },
     ];
@@ -403,7 +412,7 @@ async fn effective_policies_are_the_policies_attached_to_the_identity() {
 
     for case in &cases {
         let answer = emulator
-            .get_effective_policies(Some(&case.principal), None, None)
+            .get_effective_policies(Some(&case.principal), case.pool_id.as_deref(), None)
             .await;
         assert_eq!(
             answer.status, 200,
@@ -678,19 +687,20 @@ async fn effective_policies_resolve_the_thing_the_question_is_about() {
         with_thing.body
     );
 
-    // A registered thing on its own is a question this operation answers: the device
-    // exists, so the answer is the list of what governs it.
+    // A registered thing on its own names NO identity, so it is not a question this
+    // operation answers however well the device resolves.
     let thing_only = emulator
         .get_effective_policies(None, None, Some("sensor-7"))
         .await;
     assert_eq!(
-        thing_only.status, 200,
-        "case thingName alone: GetEffectivePolicies must answer 200, got {} {:?}",
+        thing_only.status, 400,
+        "case thingName alone: GetEffectivePolicies must refuse with HTTP 400, got {} {:?}",
         thing_only.status, thing_only.body
     );
-    assert!(
-        thing_only.has_effective_policies(),
-        "case thingName alone: effectivePolicies must be present, got {:?}",
+    assert_eq!(
+        thing_only.message(),
+        "Both principal and CognitoIdentityPoolId can not be null.",
+        "case thingName alone: unexpected refusal message, got {:?}",
         thing_only.body
     );
 }
@@ -749,18 +759,29 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             thing_name: None,
             status: 400,
             error_code: QUALIFIED_INVALID_REQUEST,
-            message: "Principal, CognitoIdentityPoolId or thingName must be provided."
-                .to_string(),
+            message: "Both principal and CognitoIdentityPoolId can not be null.".to_string(),
         },
         RefusalCase {
-            label: "a principal of no supported form",
+            label: "a device named with no identity beside it",
+            principal: None,
+            cognito_identity_pool_id: None,
+            thing_name: Some("ghost-thing"),
+            status: 400,
+            error_code: QUALIFIED_INVALID_REQUEST,
+            message: "Both principal and CognitoIdentityPoolId can not be null.".to_string(),
+        },
+        RefusalCase {
+            label: "a principal that is no ARN, with no pool beside it",
             principal: Some("not-a-principal".to_string()),
             cognito_identity_pool_id: None,
             thing_name: None,
             status: 400,
             error_code: QUALIFIED_INVALID_REQUEST,
-            // No address was read out of the value, so the refusal names nothing.
-            message: "Invalid Target".to_string(),
+            // No ARN was read out of the value, so it is the Cognito identity form, which
+            // the pool that names it has to come with.
+            message: "CognitoIdentityPoolId must be provided if your principal is \
+                      CognitoIdentityId."
+                .to_string(),
         },
         RefusalCase {
             label: "a principal naming an IoT resource of another type",
@@ -809,7 +830,7 @@ async fn effective_policies_refuse_a_request_that_names_no_resolvable_device() {
             thing_name: Some("ghost-thing"),
             status: 404,
             error_code: "ResourceNotFoundException",
-            message: format!("Thing {ACCOUNT_ID}:ghost-thing not found."),
+            message: "ghost-thing thing doesn't exists".to_string(),
         },
     ];
 

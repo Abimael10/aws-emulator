@@ -19,7 +19,7 @@
 //!   [`crate::state::ComAmazonawsIotAwsiotserviceState::policy_attachment_scope`] walks).
 //! * `cognitoIdentityPoolId` — the `<region>:<id>` form a Cognito identity pool is named
 //!   by, resolved no further than its form, because identity pools live in another
-//!   service. It is MUTUALLY EXCLUSIVE with `principal`. A pool and an identity are named
+//!   service. A pool and an identity are named
 //!   in the SAME form, so both share one key space in the relation: a policy attached to
 //!   `<region>:<id>` governs whoever is named by that string, which is what
 //!   `AttachPolicy` records.
@@ -29,6 +29,16 @@
 //!   service records either relation yet (`AddThingToThingGroup`,
 //!   `UpdateThingGroupsForThing` and `AttachThingPrincipal` are still scaffolds), so a
 //!   thing adds no policy of its own until one of them does.
+//!
+//! ONE of the two identity members has to be supplied — `thingName` is context about the
+//! device and not an identity, so it satisfies nothing — and the requirement is read
+//! before any of the three is resolved. Which FORM the principal takes then decides
+//! whether the pool id belongs beside it: a principal that is no ARN is the Cognito
+//! identity form, which is named by the pool it belongs to, so the request has to carry
+//! that pool id; an ARN names its resource by itself, so a pool id beside it states a
+//! second identity for one question. Each of the three refusals is this operation's own
+//! fixed sentence ([`MISSING_IDENTITY_MESSAGE`], [`COGNITO_IDENTITY_POOL_REQUIRED_MESSAGE`],
+//! [`CONFLICTING_IDENTITY_MESSAGE`]).
 //!
 //! Each reported policy carries the registry's own `policyName` and `policyArn` and the
 //! document of the version in effect, which is the document `GetPolicy` reports — one
@@ -160,22 +170,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The two identities name the SAME thing two ways — who is connecting — so a
-        // request that supplies both states two answers to one question and is refused
-        // with the modelled `InvalidRequestException` (HTTP 400) rather than one of them
-        // being picked silently.
-        if input.principal.is_some() && input.cognito_identity_pool_id.is_some() {
-            return Err(invalid_request(CONFLICTING_IDENTITY_MESSAGE.to_string()));
+        // An IDENTITY is what this operation answers about, so one of the two identity
+        // members is required and the requirement is read FIRST — before the principal is
+        // resolved and before the `thingName` is looked up, because a thing name is
+        // context about the device rather than an identity and satisfies nothing. A
+        // request that names neither identity is the modelled `InvalidRequestException`
+        // (HTTP 400) whatever else it carries: never a device's policy list, and never a
+        // miss of the thing it happened to name.
+        if input.principal.is_none() && input.cognito_identity_pool_id.is_none() {
+            return Err(invalid_request(MISSING_IDENTITY_MESSAGE.to_string()));
         }
 
-        // A request that names no identity at all asks about no device: there is nothing
-        // to compute an authorization scope from, which is a bad request and not an empty
-        // answer.
-        if input.principal.is_none()
-            && input.cognito_identity_pool_id.is_none()
-            && input.thing_name.is_none()
-        {
-            return Err(invalid_request(MISSING_IDENTITY_MESSAGE.to_string()));
+        // Which FORM the principal takes decides whether the pool id belongs beside it.
+        // The member documents three forms — a certificate ARN, a thing group ARN and a
+        // Cognito identity — and a value that is no ARN at all is the Cognito identity
+        // one: an identity is named by the POOL it belongs to, which this service holds no
+        // record of, so such a principal is answerable only with its
+        // `cognitoIdentityPoolId` beside it. An ARN names its resource by itself, so a
+        // pool id beside one states two identities for one question and is refused rather
+        // than one of them being picked silently. Both refusals are the modelled
+        // `InvalidRequestException` (HTTP 400).
+        if let Some(principal) = input.principal.as_deref() {
+            if crate::state::names_an_arn(principal) {
+                if input.cognito_identity_pool_id.is_some() {
+                    return Err(invalid_request(CONFLICTING_IDENTITY_MESSAGE.to_string()));
+                }
+            } else if input.cognito_identity_pool_id.is_none() {
+                return Err(invalid_request(
+                    COGNITO_IDENTITY_POOL_REQUIRED_MESSAGE.to_string(),
+                ));
+            }
         }
 
         let store = state.lock();
@@ -225,10 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(thing_name) = input.thing_name.as_deref() {
             // The device the question is about: a name no thing is registered under is
-            // the modelled `ResourceNotFoundException` (HTTP 404), worded the way every
-            // reader of one thing words the miss.
+            // the modelled `ResourceNotFoundException` (HTTP 404), stated in this
+            // operation's own wording ([`thing_miss_message`]).
             if !store.things.contains_key(thing_name) {
-                return Err(not_found(crate::state::missing_thing_message(thing_name)));
+                return Err(not_found(thing_miss_message(thing_name)));
             }
         }
 
@@ -263,19 +287,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How this operation states that `principal` and `cognitoIdentityPoolId` were both
-/// supplied.
+/// How this operation states that an ARN `principal` was supplied with a
+/// `cognitoIdentityPoolId` beside it.
 ///
 /// FIXED text with no variable part: the refusal is about the PAIR of members and names
 /// them, so neither caller-supplied value is echoed back.
 const CONFLICTING_IDENTITY_MESSAGE: &str =
     "Principal must be null if CognitoIdentityPoolId is provided.";
 
-/// How this operation states that the request named no identity and no device, so there
-/// is nothing whose authorization could be computed. It names the members one of which
-/// has to be supplied, for the same reason the sentence above names both of its.
-const MISSING_IDENTITY_MESSAGE: &str =
-    "Principal, CognitoIdentityPoolId or thingName must be provided.";
+/// How this operation states that NEITHER identity member was supplied, so there is
+/// nothing whose authorization could be computed. It names the two members, for the same
+/// reason the sentence above names both of its, and a `thingName` the request may also
+/// carry is not among them because a thing name is not an identity.
+const MISSING_IDENTITY_MESSAGE: &str = "Both principal and CognitoIdentityPoolId can not be null.";
+
+/// How this operation states that the `principal` is the Cognito identity form — a value
+/// that is no ARN — and the pool that names it was not supplied.
+///
+/// FIXED text naming the member that is missing and the form that requires it; the
+/// offending principal is NOT echoed, for the same reason the two sentences above echo
+/// nothing.
+const COGNITO_IDENTITY_POOL_REQUIRED_MESSAGE: &str =
+    "CognitoIdentityPoolId must be provided if your principal is CognitoIdentityId.";
+
+/// How this operation states that `thingName` names no thing this account holds.
+///
+/// The device is addressed by the NAME the request sent, so that name is the sentence's
+/// one variable part and nothing else of the request or of this account's state — no
+/// account id, no prefix — is part of it. Every other reader of one thing words its own
+/// miss ([`crate::state::missing_thing_message`]); this is the wording of the operation
+/// that resolves a thing as context for an authorization question.
+fn thing_miss_message(thing_name: &str) -> String {
+    format!("{thing_name} thing doesn't exists")
+}
 
 /// The modelled `InvalidRequestException` (HTTP 400), lifted into this operation's error
 /// channel.
