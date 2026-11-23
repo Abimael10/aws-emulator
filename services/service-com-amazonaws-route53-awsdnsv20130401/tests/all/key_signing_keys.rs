@@ -222,9 +222,17 @@ fn create_ksk_body(
     )
 }
 
-/// Create one key-signing key and return the reply.
-pub(crate) async fn create_ksk(
+/// Create one key-signing key under a caller reference of the caller's choosing,
+/// and return the reply.
+///
+/// `CreateKeySigningKeyRequest$CallerReference` is `len 1..128`
+/// (`smithy_query(query="operation",operation="CreateKeySigningKey")`), which the
+/// reference [`create_ksk`] composes outgrows once the key's `Name` approaches
+/// its own 128-character bound — so a test over that bound names the reference
+/// itself rather than letting the request be refused for the wrong member.
+pub(crate) async fn create_ksk_with_reference(
     router: &MultiServiceRouter,
+    caller_reference: &str,
     hosted_zone_id: &str,
     name: &str,
     status: &str,
@@ -234,13 +242,26 @@ pub(crate) async fn create_ksk(
         router,
         "POST",
         "/2013-04-01/keysigningkey",
-        &create_ksk_body(
-            &format!("ksk-{hosted_zone_id}-{name}"),
-            hosted_zone_id,
-            kms_arn,
-            name,
-            status,
-        ),
+        &create_ksk_body(caller_reference, hosted_zone_id, kms_arn, name, status),
+    )
+    .await
+}
+
+/// Create one key-signing key and return the reply.
+pub(crate) async fn create_ksk(
+    router: &MultiServiceRouter,
+    hosted_zone_id: &str,
+    name: &str,
+    status: &str,
+    kms_arn: &str,
+) -> Reply {
+    create_ksk_with_reference(
+        router,
+        &format!("ksk-{hosted_zone_id}-{name}"),
+        hosted_zone_id,
+        name,
+        status,
+        kms_arn,
     )
     .await
 }

@@ -27,6 +27,12 @@
 //! the activation of a second key clears just as disabling signing does. A
 //! refusal moves nothing.
 //!
+//! The ADDRESS is the pair, so the zone half is what tells two keys of the same
+//! name apart: a name is "unique for each key-signing key in the same hosted
+//! zone" (`smithy_query(query="doc",shape="KeySigningKey",member="Name")`) and no
+//! wider, so a call resolves the key of the zone it names and the identically
+//! named key of every other zone is left exactly as it was.
+//!
 //! The rows below therefore span what a status call can differ along: the status
 //! the addressed key stands in when it arrives — every value of
 //! `KeySigningKey$Status`, including the two a failed request leaves behind,
@@ -57,8 +63,9 @@ use crate::key_signing_key_deletion::{
     activate_ksk, deactivate_ksk, in_use_message, reported_status, unusable_key_message,
 };
 use crate::key_signing_keys::{
-    assert_polls_a_change, create_ksk_ok, create_signing_kms_key, emulator, emulator_with_store,
-    member, schedule_kms_key_deletion, set_kms_key_enabled, PERSISTED_MEMBERS, REPORTED_KEY,
+    assert_polls_a_change, create_ksk_ok, create_ksk_with_reference, create_signing_kms_key,
+    emulator, emulator_with_store, member, schedule_kms_key_deletion, set_kms_key_enabled,
+    PERSISTED_MEMBERS, REPORTED_KEY,
 };
 use crate::refusal_message_rules::message_of;
 
@@ -897,4 +904,174 @@ async fn activating_a_second_key_frees_the_one_a_signing_zone_was_holding() {
          with body {}",
         last.status, last.body
     );
+}
+
+/// One row of the two-zone addressing table: a name BOTH zones hold a key under.
+struct SharedNameRow {
+    case: &'static str,
+    /// The name both zones' keys are created with.
+    name: String,
+    /// Whether the activation spells the addressed zone's id with the
+    /// `/hostedzone/` prefix a response hands back (URI-encoded) rather than
+    /// bare.
+    prefixed: bool,
+    /// Whether the two keys stand on ONE customer managed key — which a create
+    /// allows across zones — rather than on one each.
+    shared_kms: bool,
+}
+
+/// How long a `SigningKeyName` may be: `len 3..128`
+/// (`smithy_query(query="shape",shape="SigningKeyName")`). The rows are checked
+/// against this where they are used, so a row whose name left the member's range
+/// fails as itself rather than as a request the boundary refused.
+const NAME_LENGTHS: std::ops::RangeInclusive<usize> = 3..=128;
+
+/// The rows span what the NAME half of the address can differ along — both
+/// bounds of [`NAME_LENGTHS`] and the characters `KeySigningKey$Name` allows in
+/// between — crossed with the two spellings of the zone id a request addresses
+/// and whether the two keys publish one customer managed key or one each.
+fn shared_name_rows() -> Vec<SharedNameRow> {
+    vec![
+        SharedNameRow {
+            case: "the shortest name the member allows",
+            name: "abc".to_string(),
+            prefixed: false,
+            shared_kms: false,
+        },
+        SharedNameRow {
+            case: "a name over letters, digits and underscores",
+            name: "K9_signer_2024".to_string(),
+            prefixed: true,
+            shared_kms: true,
+        },
+        SharedNameRow {
+            case: "the longest name the member allows",
+            // Built rather than written out, so the length is the member's bound
+            // by construction.
+            name: format!("ksk{}", "_".repeat(*NAME_LENGTHS.end() - 3)),
+            prefixed: true,
+            shared_kms: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_activation_moves_only_the_addressed_zone_s_key_of_that_name() {
+    for row in shared_name_rows() {
+        let case = row.case;
+        let length = row.name.chars().count();
+        assert!(
+            NAME_LENGTHS.contains(&length),
+            "case {case:?}: the row's name must be one SigningKeyName allows \
+             ({NAME_LENGTHS:?}), got {length} character(s)"
+        );
+        let router = emulator();
+        // Two zones, each holding a key of the SAME name and in the same status:
+        // the zone half of the address is the only thing that tells them apart.
+        let shared_arn = if row.shared_kms {
+            Some(create_signing_kms_key(&router, case).await)
+        } else {
+            None
+        };
+        let mut zone_ids = Vec::new();
+        for (index, apex) in ["example.com", "other.example.net"]
+            .into_iter()
+            .enumerate()
+        {
+            let zone_id =
+                create_zone_ok(&router, apex, &format!("ref-shared-name-{length}-{index}")).await;
+            let arn = match &shared_arn {
+                Some(arn) => arn.clone(),
+                None => create_signing_kms_key(&router, case).await,
+            };
+            // The caller reference is named here rather than composed from the
+            // name: the longest name a key may carry leaves no room for one
+            // built around it.
+            let created = create_ksk_with_reference(
+                &router,
+                &format!("ref-ksk-{zone_id}"),
+                &zone_id,
+                &row.name,
+                "INACTIVE",
+                &arn,
+            )
+            .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?}: the key of zone {index} must be created, got {} with body {}",
+                created.status, created.body
+            );
+            zone_ids.push(zone_id);
+        }
+        let addressed = &zone_ids[0];
+        let other = &zone_ids[1];
+        let requested = if row.prefixed {
+            format!("%2Fhostedzone%2F{addressed}")
+        } else {
+            addressed.clone()
+        };
+        let other_before = published_keys(&router, case, other).await;
+
+        let activated = activate_ksk(&router, &requested, &row.name).await;
+
+        assert_eq!(
+            activated.status, 200,
+            "case {case:?}: expected 200 (501 = still scaffolded), got {} with body {}",
+            activated.status, activated.body
+        );
+        assert_polls_a_change(case, &activated);
+
+        let addressed_keys = published_keys(&router, case, addressed).await;
+        assert_eq!(
+            addressed_keys.keys().collect::<Vec<_>>(),
+            vec![&row.name],
+            "case {case:?}: the addressed zone must report exactly its one key of that name, got \
+             {:?}",
+            addressed_keys.keys().collect::<Vec<_>>()
+        );
+        let status = published_member(case, &addressed_keys, &row.name, "Status");
+        assert_eq!(
+            status, "ACTIVE",
+            "case {case:?}: the addressed zone's key must end ACTIVE, got {status:?}"
+        );
+
+        // The other zone's key of the same name was not reached: every member it
+        // publishes, its status and the instant it was last moved at included, is
+        // what it was before the call.
+        let other_after = published_keys(&router, case, other).await;
+        assert_eq!(
+            other_after, other_before,
+            "case {case:?}: the identically named key of the other zone must be untouched, got \
+             {other_after:?} after {other_before:?}"
+        );
+        let other_status = published_member(case, &other_after, &row.name, "Status");
+        assert_eq!(
+            other_status, "INACTIVE",
+            "case {case:?}: the other zone's key stays in the status it was created in, got \
+             {other_status:?}"
+        );
+
+        // And that key is reached through its OWN zone's address, which moves it
+        // and leaves the first zone's key exactly as the first call left it.
+        let second = activate_ksk(&router, other, &row.name).await;
+        assert_eq!(
+            second.status, 200,
+            "case {case:?}: the other zone's key of the same name is addressable, got {} with \
+             body {}",
+            second.status, second.body
+        );
+        assert_polls_a_change(case, &second);
+        let other_moved = published_keys(&router, case, other).await;
+        let moved_status = published_member(case, &other_moved, &row.name, "Status");
+        assert_eq!(
+            moved_status, "ACTIVE",
+            "case {case:?}: the other zone's key must end ACTIVE too, got {moved_status:?}"
+        );
+        let addressed_again = published_keys(&router, case, addressed).await;
+        assert_eq!(
+            addressed_again, addressed_keys,
+            "case {case:?}: an activation addressed at another zone changes nothing a client \
+             reads of this zone's key, got {addressed_again:?} after {addressed_keys:?}"
+        );
+    }
 }
