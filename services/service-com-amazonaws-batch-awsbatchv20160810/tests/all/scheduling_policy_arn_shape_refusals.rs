@@ -8,12 +8,12 @@
 //! * an identifier whose SHAPE names no scheduling policy of this endpoint is refused with
 //!   the modelled `ClientException` (HTTP 400) inside Batch's input-validation envelope —
 //!   `Error executing request, Exception : <detail>, RequestId: <this call's id>` — whose
-//!   detail is the pattern rule followed by the identifier the request submitted, verbatim;
+//!   detail is the pattern rule ALONE, carrying no value of the request;
 //! * the response names the call it answers in the header AWS reports a request id in, and
 //!   reports the very id its own message states, so one call is correlatable by one id;
 //! * where the identifier arrives as one entry of a LIST (`DescribeSchedulingPolicies$arns`),
-//!   the refusal names the offending ENTRY — the first one that breaks the rule — and not
-//!   whichever entry came first;
+//!   the refusal is that same one sentence, whichever entry of the list broke the rule and
+//!   whatever its position;
 //! * a refused request writes nothing: the policies beside it stay exactly as they were.
 
 use serde_json::{json, Value};
@@ -106,20 +106,16 @@ fn malformed_identifiers() -> Vec<(String, String)> {
     ]
 }
 
-/// The detail this class's envelope carries: the pattern rule, then the identifier the
-/// request submitted.
+/// The detail this class's envelope carries: the pattern rule, and nothing from the request.
 ///
 /// The rule sentence is spelled out here rather than read from the crate's constant, so a
 /// reworded message is a failing test and not a silently updated expectation.
-fn expected_detail(identifier: &str) -> String {
-    format!(
-        "Scheduling policy arn should match a valid Scheduling policy arn pattern: {identifier}"
-    )
-}
+const EXPECTED_DETAIL: &str =
+    "Scheduling policy arn should match a valid Scheduling policy arn pattern";
 
-/// Assert the answer to `uri` with `body` is the enveloped, identifier-naming refusal of
-/// `identifier`, and that the id the response reports in the header is the one its own
-/// message states.
+/// Assert the answer to `uri` with `body` is the enveloped refusal of `identifier` that
+/// states the pattern rule and carries no part of that identifier, and that the id the
+/// response reports in the header is the one its own message states.
 async fn assert_refused(batch: &Batch, case: &str, uri: &str, body: Value, identifier: &str) {
     let (status, headers, refused) = batch.send_reported("POST", uri, Some(body)).await;
     assert_eq!(
@@ -134,10 +130,12 @@ async fn assert_refused(batch: &Batch, case: &str, uri: &str, body: Value, ident
     let message = error_message(&refused);
     let (detail, request_id) = enveloped(case, &message);
     assert_eq!(
-        detail,
-        expected_detail(identifier),
-        "case {case:?}: expected the pattern sentence naming the submitted identifier, got \
-         {message:?}"
+        detail, EXPECTED_DETAIL,
+        "case {case:?}: expected the pattern rule alone inside the envelope, got {message:?}"
+    );
+    assert!(
+        EXPECTED_DETAIL.contains(identifier) || !message.contains(identifier),
+        "case {case:?}: expected the refusal to carry no value of the request, got {message:?}"
     );
     let reported = headers
         .get(REQUEST_ID_HEADER)
@@ -153,7 +151,7 @@ async fn assert_refused(batch: &Batch, case: &str, uri: &str, body: Value, ident
 
 /// RULE: an identifier whose shape names no scheduling policy of this endpoint is refused
 /// 400 / `ClientException` inside Batch's input-validation envelope, whose detail is the
-/// pattern sentence followed by the identifier the request submitted.
+/// pattern rule alone — the same sentence for every such identifier.
 #[tokio::test]
 async fn a_malformed_scheduling_policy_identifier_is_refused_naming_it() {
     let batch = Batch::new();
@@ -174,8 +172,8 @@ async fn a_malformed_scheduling_policy_identifier_is_refused_naming_it() {
 }
 
 /// RULE: `DescribeSchedulingPolicies$arns` is "a list of … Amazon Resource Name (ARN)
-/// entries", so a BARE NAME — the form the writers resolve — is refused there too, and the
-/// refusal names the name that was submitted.
+/// entries", so a BARE NAME — the form the writers resolve — is refused there too, with the
+/// pattern rule and none of the name that was submitted.
 #[tokio::test]
 async fn a_bare_name_is_refused_by_the_reader_and_resolved_by_the_writers() {
     let batch = Batch::new();
@@ -235,11 +233,11 @@ async fn a_bare_name_is_refused_by_the_reader_and_resolved_by_the_writers() {
     }
 }
 
-/// RULE: the refusal names the ENTRY of `arns` that broke the rule — the first one that
-/// does — whatever its position beside entries that are valid, and the refused call writes
-/// nothing.
+/// RULE: the refusal is ONE sentence — the rule the entry broke — whichever entry of `arns`
+/// breaks it and whatever its position beside entries that are valid, and the refused call
+/// writes nothing.
 #[tokio::test]
-async fn the_refusal_names_the_offending_entry_of_the_list() {
+async fn the_refusal_states_the_rule_whichever_entry_of_the_list_breaks_it() {
     let batch = Batch::new();
 
     let created = batch
@@ -250,9 +248,9 @@ async fn the_refusal_names_the_offending_entry_of_the_list() {
     let first_bad = "sp entry one".to_string();
     let second_bad = arn("job-queue/jq-entry");
 
-    // Each row is the list as submitted and the entry the refusal must name: the bad entry
+    // Each row is the list as submitted and the entry that breaks the rule: the bad entry
     // alone, after a valid one, after one that is valid but names nothing, and two bad
-    // entries, where the FIRST of them is the one named.
+    // entries — every row reads the one sentence.
     let rows: Vec<(&str, Vec<String>, String)> = vec![
         (
             "a bad entry alone",

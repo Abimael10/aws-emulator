@@ -282,12 +282,25 @@ pub const QUOTA_SHARE_ARN_NOT_VALID: &str =
 pub const SCHEDULING_POLICY_ARN_NOT_VALID: &str =
     "Scheduling policy arn should match a valid Scheduling policy arn pattern";
 
-/// That refusal as a scheduling-policy operation answers it: the rule above, then the
-/// identifier the request submitted, verbatim, inside Batch's input-validation envelope.
+/// That refusal as a scheduling-policy operation answers it: the rule above and NOTHING
+/// from the request, inside Batch's input-validation envelope.
 ///
-/// The offending value is what makes the refusal actionable — `DescribeSchedulingPolicies`
-/// takes a LIST of identifiers, so a refusal that states the rule alone leaves the caller
-/// unable to tell which entry broke it — and it is the inner sentence's only variable part.
+/// A refusal this frontend raises by checking a request value against a published rule
+/// states the RULE and carries no value of the request — the form every such sentence of
+/// this service is recorded in: the pattern rule of the quota-share identifier
+/// ([`QUOTA_SHARE_ARN_NOT_VALID`]) states its rule without the ARN it refused, the `arns`
+/// count bound ([`scheduling_policy_arns_bound_message`]) and the page-size bound
+/// ([`max_results_bound_message`]) state the range without the number the request carried,
+/// and the published range of a scheduling-policy member
+/// ([`scheduling_policy_range_message`]) states the bounds without the value. So two
+/// callers that broke one rule with different identifiers read ONE sentence, and a client
+/// classifies the whole class with one matcher. Which entry of a list broke it is the
+/// caller's own request to re-read, not something the service dictates back.
+///
+/// A refusal of a NAME that is outside the name pattern is a DIFFERENT class and is
+/// recorded echoing the name and spelling the pattern out
+/// ([`unsupported_name_message`]), so each class keeps the wording it is
+/// recorded with rather than one being derived from the other.
 ///
 /// Answered ENVELOPED ([`client_exception_enveloped`]): this is a refusal Batch's frontend
 /// raises by checking a value the REQUEST carries against a pattern, before any lookup, and
@@ -298,13 +311,8 @@ pub const SCHEDULING_POLICY_ARN_NOT_VALID: &str =
 /// identifier rule [`QUOTA_SHARE_ARN_NOT_VALID`], the name patterns of the creates). A
 /// refusal derived from STATE instead — not found ([`does_not_exist_sentence`]), already
 /// exists, still in use — stays bare.
-///
-/// The EVIDENCED parts are the envelope and that the value refused comes from the request;
-/// the `": "` joining the rule to the value is this crate's choice, because the recorded
-/// refusal of this class asserts the inner sentence by shape rather than by value. A later
-/// recording that pins the exact inner form changes this one expression and nothing else.
-pub fn scheduling_policy_arn_not_valid(reference: &str) -> ClientException {
-    client_exception_enveloped(format!("{SCHEDULING_POLICY_ARN_NOT_VALID}: {reference}"))
+pub fn scheduling_policy_arn_not_valid() -> ClientException {
+    client_exception_enveloped(SCHEDULING_POLICY_ARN_NOT_VALID)
 }
 
 /// What `DescribeSchedulingPolicies` answers for a request whose `arns` names nothing.

@@ -11,7 +11,7 @@
 //! A policy is identified HERE by its ARN alone — `arns` is "a list of up to 100 scheduling
 //! policy Amazon Resource Name (ARN) entries" — so an entry of any other shape (a bare
 //! name, an ARN of another region, account, partition or resource kind) is refused with the
-//! modelled `ClientException` naming that entry
+//! modelled `ClientException` stating that pattern rule and nothing from the request
 //! ([`crate::state::scheduling_policy_arn_not_valid`]), and so is an
 //! `arns` list that names nothing at all
 //! ([`crate::state::SCHEDULING_POLICY_ARNS_REQUIRED`]), which is REQUIRED, or one naming
@@ -20,7 +20,8 @@
 //! names no stored policy is reported as absent instead.
 //!
 //! All three refusals are things the frontend decides from the REQUEST's own values, so all
-//! three are worded inside Batch's input-validation envelope
+//! three state the rule that was broken and carry no value of the request, and all three
+//! are worded inside Batch's input-validation envelope
 //! ([`crate::state::client_exception_enveloped`]) — `Error executing request, Exception :
 //! <detail>, RequestId: <this call's id>` — and a client can classify any of them with one
 //! matcher.
@@ -196,17 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every entry is an ARN of this endpoint's own: a bare name, or an ARN of another
         // region, account, partition or resource kind, names no scheduling policy here, so
-        // it is refused rather than reported as absent. The refusal names the entry it
-        // refused — the first one that breaks the rule — so a caller that submitted several
-        // can tell which one to repair, and it is worded in the frontend envelope every
+        // it is refused rather than reported as absent. The refusal states the PATTERN RULE
+        // the entry broke and echoes no entry — the one sentence this service words for the
+        // class, whichever entry of the list broke it — inside the frontend envelope every
         // refusal this operation decides from the request's own values carries.
-        if let Some(refused) = input
+        if input
             .arns
             .iter()
-            .find(|reference| !batch::is_scheduling_policy_arn(&region, reference))
+            .any(|reference| !batch::is_scheduling_policy_arn(&region, reference))
         {
             return Err(DescribeSchedulingPoliciesErrorModeled::ClientException(
-                batch::scheduling_policy_arn_not_valid(refused),
+                batch::scheduling_policy_arn_not_valid(),
             )
             .into());
         }

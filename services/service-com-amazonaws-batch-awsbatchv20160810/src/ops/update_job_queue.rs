@@ -365,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // for.
                 if !batch::is_scheduling_policy_reference(&region, requested) {
                     return Err(UpdateJobQueueErrorModeled::ClientException(
-                        batch::scheduling_policy_arn_not_valid(requested),
+                        batch::scheduling_policy_arn_not_valid(),
                     )
                     .into());
                 }

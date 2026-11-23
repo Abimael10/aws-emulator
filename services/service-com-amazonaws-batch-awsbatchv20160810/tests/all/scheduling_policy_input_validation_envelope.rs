@@ -46,8 +46,8 @@ struct Refusal {
     /// The `DescribeSchedulingPolicies` request that provokes it.
     body: Value,
     /// The detail the envelope must carry, where its wording is settled: the entry-shape
-    /// class states the rule and then the entry the request submitted, and the arity class
-    /// states the range the member admits. `None` for the row whose inner sentence is
+    /// class states the pattern rule and carries nothing from the request, and the arity
+    /// class states the range the member admits. `None` for the row whose inner sentence is
     /// owned by its own open issue — the envelope is the rule here, and the detail is only
     /// required to be a non-empty sentence that is not itself wrapped a second time.
     detail: Option<String>,
@@ -82,14 +82,14 @@ fn refusals(stored_arn: &str) -> Vec<Refusal> {
         rows.push(Refusal {
             label: format!("{label} alone"),
             body: json!({"arns": [&entry]}),
-            detail: Some(format!("{PATTERN_RULE}: {entry}")),
+            detail: Some(PATTERN_RULE.to_string()),
         });
         // The same entry travelling behind one that resolves: the refusal is the entry's,
         // whatever its position.
         rows.push(Refusal {
             label: format!("{label} after a stored ARN"),
             body: json!({"arns": [stored_arn, &entry]}),
-            detail: Some(format!("{PATTERN_RULE}: {entry}")),
+            detail: Some(PATTERN_RULE.to_string()),
         });
     }
 
