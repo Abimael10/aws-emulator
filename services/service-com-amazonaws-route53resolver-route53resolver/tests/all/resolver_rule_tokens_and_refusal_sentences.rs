@@ -32,7 +32,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    call, emulator, error_type, ok, string_member, traced_message, Emulator, ACCOUNT,
+    call, call_tracing, emulator, error_type, ok, string_member, traced_message, tracing_chain,
+    Emulator, ACCOUNT,
 };
 use super::resolver_query_log_config_associations::{association, config_id};
 use super::resolver_rule_deletion::{associate, forward_rule, outbound_endpoint};
@@ -474,6 +475,12 @@ async fn a_non_ascii_domain_or_delegation_record_is_refused_and_nothing_is_creat
 /// and the association's where it resolves the association the (configuration,
 /// VPC) pair was made from.
 ///
+/// The CLASS that sentence travels as is each path's own, as its recorded
+/// refusal states it: the associate reports the id it could not resolve as a bad
+/// INPUT (`InvalidParameterException`, naming the member in `FieldName`), while
+/// the operations that ADDRESS a resource by it report a missing resource
+/// (`ResourceNotFoundException`, naming the type in `ResourceType`).
+///
 /// The table spans the forms a `ResourceId` (length 1..64) takes: the form this
 /// service mints, an association's form, no Resolver form at all, and both
 /// published bounds of the length.
@@ -499,12 +506,14 @@ async fn an_unknown_query_log_config_is_refused_with_the_coded_sentence() {
         ("the shortest ResourceId (length 1)", "c".to_string()),
         ("the longest ResourceId (length 64)", "c".repeat(64)),
     ] {
-        for (operation, body, sentence, resource_type) in [
+        for (operation, body, sentence, shape, member, named) in [
             (
                 "AssociateResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown, "ResourceId": vpc }),
                 CONFIG_GONE_SENTENCE,
-                "ResolverQueryLogConfig",
+                "InvalidParameterException",
+                "FieldName",
+                "ResolverQueryLogConfigId",
             ),
             (
                 // The disassociate resolves the ASSOCIATION the (configuration,
@@ -514,28 +523,25 @@ async fn an_unknown_query_log_config_is_refused_with_the_coded_sentence() {
                 "DisassociateResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown, "ResourceId": vpc }),
                 ASSOCIATION_GONE_SENTENCE,
+                "ResourceNotFoundException",
+                "ResourceType",
                 "ResolverQueryLogConfigAssociation",
             ),
             (
                 "GetResolverQueryLogConfig",
                 json!({ "ResolverQueryLogConfigId": unknown }),
                 CONFIG_GONE_SENTENCE,
+                "ResourceNotFoundException",
+                "ResourceType",
                 "ResolverQueryLogConfig",
             ),
         ] {
             let (status, parsed) = call(&router, operation, body).await;
-            assert_traced_refusal(
-                case,
-                operation,
-                status,
-                &parsed,
-                "ResourceNotFoundException",
-                sentence,
-            );
+            assert_traced_refusal(case, operation, status, &parsed, shape, sentence);
             assert_eq!(
-                string_member(&parsed, "ResourceType"),
-                resource_type,
-                "case {case:?}/{operation}: the refusal must name the missing resource, got \
+                string_member(&parsed, member),
+                named,
+                "case {case:?}/{operation}: the refusal must name {named} in {member}, got \
                  {parsed}"
             );
         }
@@ -883,4 +889,199 @@ async fn an_unknown_filter_key_is_refused_with_the_coded_sentence() {
         )
         .await;
     }
+}
+
+/// The smallest page `ListFirewallConfigs` may be asked for, from the range the
+/// model puts on its `MaxResults`
+/// (`smithy_query(query="operation",operation="ListFirewallConfigs")`: 5..10).
+const FIREWALL_CONFIG_SMALLEST_PAGE: i32 = 5;
+
+/// The id of a DNS Firewall resource this suite creates, from the create's
+/// answer.
+async fn created_id(router: &Emulator, operation: &str, request: Value, member: &str) -> String {
+    let created = ok(router, operation, request).await;
+    let resource = created
+        .get(member)
+        .unwrap_or_else(|| panic!("{operation} answers a {member}, got {created}"));
+    string_member(resource, "Id")
+}
+
+/// A cursor this service really minted for `operation`'s collection, which is
+/// another listing's cursor and so not one THEY accept.
+async fn minted_cursor(router: &Emulator, operation: &str, request: Value) -> String {
+    let page = ok(router, operation, request).await;
+    page.get("NextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{operation} leaves items over at that page size, got {page}"))
+        .to_string()
+}
+
+/// A `NextToken` no page of this service ever issued is refused in the words of
+/// the component that OWNS the collection being paged, and never read as "start
+/// from the beginning".
+///
+/// A listing over this service's OWN records states Resolver's coded
+/// `[RSLVR-00302]` sentence, quoting the token that was sent; the per-VPC
+/// firewall configuration listing pages the account's Amazon EC2 VPC inventory,
+/// whose cursors that service mints and validates, so it states EC2's
+/// `InvalidParameterValue` sentence inside the clause the relaying SDK layer puts
+/// around a caught service exception — naming who refused, with what status,
+/// under which error code, and the id of that call, which is minted per call.
+/// Both close with the trace clause of the request, and both travel as the
+/// `ValidationException` these listings model, none of them declaring
+/// `InvalidNextTokenException`.
+///
+/// The table spans what the rule generalises over: the listing (the ones that
+/// page this service's own records, including one scoped to a rule group and one
+/// to a domain list, and the one that pages the VPC inventory) and the form of
+/// the token (text that is no cursor at all, an empty token, hex that decodes to
+/// nothing, and a cursor this service really did mint for ANOTHER query).
+#[tokio::test]
+async fn an_unissued_next_token_is_refused_in_the_words_of_the_collections_owner() {
+    let router = emulator();
+    // Enough VPCs for the configuration listing to leave items over at its
+    // smallest page, so one of its own cursors can be minted below.
+    router.hold_vpcs([
+        "vpc-00000000000000071",
+        "vpc-00000000000000072",
+        "vpc-00000000000000073",
+        "vpc-00000000000000074",
+        "vpc-00000000000000075",
+        "vpc-00000000000000076",
+        "vpc-00000000000000077",
+    ]);
+    let group = created_id(
+        &router,
+        "CreateFirewallRuleGroup",
+        json!({ "CreatorRequestId": "group-next-token", "Name": "group-next-token" }),
+        "FirewallRuleGroup",
+    )
+    .await;
+    let domain_list = created_id(
+        &router,
+        "CreateFirewallDomainList",
+        json!({ "CreatorRequestId": "list-next-token", "Name": "list-next-token" }),
+        "FirewallDomainList",
+    )
+    .await;
+
+    // Two cursors this service really minted, each for a different collection:
+    // a cursor of one collection is not a cursor another accepts, so each row
+    // is handed the one that is not its own.
+    let domain_lists_cursor =
+        minted_cursor(&router, "ListFirewallDomainLists", json!({ "MaxResults": 1 })).await;
+    let configs_cursor = minted_cursor(
+        &router,
+        "ListFirewallConfigs",
+        json!({ "MaxResults": FIREWALL_CONFIG_SMALLEST_PAGE }),
+    )
+    .await;
+
+    // Every listing of this service that models `ValidationException` alone,
+    // with the request that reaches its pagination, and whether the collection
+    // it pages is this service's own records or the account's VPC inventory.
+    let listings: Vec<(&str, Value, bool)> = vec![
+        ("ListFirewallDomainLists", json!({}), true),
+        ("ListFirewallRuleGroups", json!({}), true),
+        ("ListFirewallRuleGroupAssociations", json!({}), true),
+        (
+            "ListFirewallRules",
+            json!({ "FirewallRuleGroupId": group.clone() }),
+            true,
+        ),
+        (
+            "ListFirewallDomains",
+            json!({ "FirewallDomainListId": domain_list.clone() }),
+            true,
+        ),
+        ("ListOutpostResolvers", json!({}), true),
+        ("ListFirewallConfigs", json!({}), false),
+    ];
+
+    // Every request id the relayed envelope reported, so two relayed refusals
+    // never report one id.
+    let mut relayed_ids: Vec<String> = Vec::new();
+    for (index, (operation, base, own_records)) in listings.iter().enumerate() {
+        let foreign = if *operation == "ListFirewallDomainLists" {
+            configs_cursor.clone()
+        } else {
+            domain_lists_cursor.clone()
+        };
+        let tokens: Vec<(&str, String)> = vec![
+            ("text that is no cursor at all", "not-a-real-pagination-token".to_string()),
+            ("an empty token", String::new()),
+            ("hex that decodes to no cursor", "deadbeef".to_string()),
+            ("a cursor minted for another query", foreign),
+        ];
+        for (row, (case, token)) in tokens.iter().enumerate() {
+            let (header, root) = tracing_chain(
+                700 + u32::try_from(index * tokens.len() + row).expect("a small index"),
+            );
+            let mut body = base.clone();
+            body.as_object_mut()
+                .expect("the request is an object")
+                .insert("NextToken".to_string(), json!(token));
+            let (status, parsed) =
+                call_tracing(&router, operation, body, Some(header.as_str())).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}/{operation}: a cursor this query never issued must be refused, got \
+                 {status}: {parsed}"
+            );
+            assert!(
+                error_type(&parsed).contains("ValidationException"),
+                "case {case:?}/{operation}: the refusal must name ValidationException, got {parsed}"
+            );
+            let message = string_member(&parsed, "Message");
+            let (stated, trace) = traced_message(&message).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}/{operation}: the refusal must close with the trace clause of \
+                     the request, got {message:?}"
+                )
+            });
+            assert_eq!(
+                trace, root,
+                "case {case:?}/{operation}: the clause must carry the Root the request named, got \
+                 {message:?}"
+            );
+            if *own_records {
+                let expected = format!(
+                    r#"[{CODE_INVALID_NEXT_TOKEN}] Invalid next token: "{token}", invalid version."#
+                );
+                assert_eq!(
+                    stated, expected,
+                    "case {case:?}/{operation}: the refusal must state this service's coded \
+                     sentence, got {message:?}"
+                );
+            } else {
+                let head = format!(
+                    "Value ( {token} ) for parameter NextToken is invalid. The token is invalid. \
+                     (Service: AmazonEC2; Status Code: 400; Error Code: InvalidParameterValue; \
+                     Request ID: "
+                );
+                let tail = "; Proxy: null)";
+                let request_id = stated
+                    .strip_prefix(&head)
+                    .and_then(|rest| rest.strip_suffix(tail));
+                assert!(
+                    request_id.is_some_and(service_common::query_error_envelope::is_request_id),
+                    "case {case:?}/{operation}: the refusal must relay EC2's sentence as \
+                     {head:?}<request id>{tail:?}, got {message:?}"
+                );
+                relayed_ids.push(request_id.unwrap_or_default().to_string());
+            }
+        }
+
+        // The refusal is about the token: the same query without one is served.
+        ok(&router, operation, base.clone()).await;
+    }
+
+    // The id in the relayed envelope belongs to the relayed CALL, so no two
+    // refusals report the same one.
+    let distinct: std::collections::BTreeSet<&String> = relayed_ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        relayed_ids.len(),
+        "each relayed refusal must report its own request id, got {relayed_ids:?}"
+    );
 }

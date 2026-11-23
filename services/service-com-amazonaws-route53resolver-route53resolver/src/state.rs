@@ -53,11 +53,13 @@ pub mod dns_firewall;
 mod domain_imports;
 mod firewall_associations;
 mod firewall_rules;
+mod page_token_refusals;
 mod query_log;
 /// What a Resolver query logging configuration associated with a VPC delivers for a query
 /// asked inside that VPC, and where.
 mod query_log_delivery;
 mod query_log_destinations;
+mod relayed_ec2;
 mod resolver_rules;
 mod tags;
 mod vpc_configs;
@@ -73,8 +75,10 @@ pub use dns_firewall::*;
 pub use domain_imports::*;
 pub use firewall_associations::*;
 pub use firewall_rules::*;
+pub use page_token_refusals::*;
 pub use query_log::*;
 pub use query_log_destinations::*;
+pub use relayed_ec2::*;
 pub use resolver_rules::*;
 pub use tags::*;
 pub use vpc_configs::*;
@@ -1928,17 +1932,13 @@ pub fn invalid_domain_or_delegation_record() -> InvalidParameterException {
 /// `NextToken` this service did not mint for that query.
 ///
 /// Built here so every listing that models `InvalidNextTokenException` reports
-/// the one body: the sentence the service words this fault with, behind the
-/// service error code for it ([`RSLVR_CODE_INVALID_NEXT_TOKEN`]), with the
-/// token the request sent double-quoted inside it as its one variable part. A
-/// listing whose recorded refusal of an unissued token is the PARAMETER fault
-/// instead reports [`invalid_next_token_parameter`].
+/// the one body: the sentence the service words this fault with
+/// ([`coded_next_token_message`], shared with the listings whose model carries no
+/// such shape). A listing whose recorded refusal of an unissued token is the
+/// PARAMETER fault instead reports [`invalid_next_token_parameter`].
 pub fn invalid_next_token(next_token: &str) -> InvalidNextTokenException {
     InvalidNextTokenException {
-        message: Some(rslvr_message(
-            RSLVR_CODE_INVALID_NEXT_TOKEN,
-            &format!(r#"Invalid next token: "{next_token}", invalid version"#),
-        )),
+        message: Some(coded_next_token_message(next_token)),
     }
 }
 
@@ -4786,9 +4786,7 @@ pub const RESOLVER_CONFIG_LIST_SCOPE: &str = "ListResolverConfigs/all/v1";
 /// [`subnet_not_found`].
 pub fn invalid_next_token_parameter(next_token: &str) -> InvalidParameterException {
     InvalidParameterException {
-        message: format!(
-            "Value ( {next_token} ) for parameter NextToken is invalid. The token is invalid."
-        ),
+        message: unissued_next_token_sentence(next_token),
         field_name: None,
     }
 }

@@ -114,8 +114,14 @@ struct Refusal {
     operation: &'static str,
     body: fn(&str) -> Value,
     sentence: &'static str,
-    /// The modelled resource name the refusal reports beside the message.
-    resource_type: &'static str,
+    /// The modelled error shape this path reports the fault as: a missing
+    /// resource where the call ADDRESSES one by that id, and an invalid
+    /// parameter where the path's recorded refusal reports the id as bad input.
+    shape: &'static str,
+    /// The body member naming what the refusal is about, and the value it
+    /// carries: the resource type of a missing resource, and the member at fault
+    /// of an invalid parameter.
+    named: (&'static str, &'static str),
 }
 
 /// Every query-logging path that refuses a resource it cannot address: each
@@ -133,21 +139,27 @@ const REFUSALS: &[Refusal] = &[
         operation: "GetResolverQueryLogConfig",
         body: |_| json!({ "ResolverQueryLogConfigId": UNKNOWN_CONFIG }),
         sentence: CONFIG_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfig",
+        shape: "ResourceNotFoundException",
+        named: ("ResourceType", "ResolverQueryLogConfig"),
     },
     Refusal {
         case: "a delete of a configuration the store holds nothing under",
         operation: "DeleteResolverQueryLogConfig",
         body: |_| json!({ "ResolverQueryLogConfigId": UNKNOWN_CONFIG }),
         sentence: CONFIG_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfig",
+        shape: "ResourceNotFoundException",
+        named: ("ResourceType", "ResolverQueryLogConfig"),
     },
     Refusal {
         case: "an associate naming a configuration the store holds nothing under",
         operation: "AssociateResolverQueryLogConfig",
         body: |_| json!({ "ResolverQueryLogConfigId": UNKNOWN_CONFIG, "ResourceId": HELD_VPC }),
         sentence: CONFIG_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfig",
+        // The associate reports the id it could not resolve as bad INPUT, the
+        // class its own recorded refusal carries, and names the member it was
+        // asked for rather than a resource type.
+        shape: "InvalidParameterException",
+        named: ("FieldName", "ResolverQueryLogConfigId"),
     },
     Refusal {
         case: "a disassociate naming a configuration the store holds nothing under",
@@ -157,14 +169,16 @@ const REFUSALS: &[Refusal] = &[
         // VPC) pair was made from, so a configuration the store holds nothing
         // under holds no association either and is reported for that.
         sentence: ASSOCIATION_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfigAssociation",
+        shape: "ResourceNotFoundException",
+        named: ("ResourceType", "ResolverQueryLogConfigAssociation"),
     },
     Refusal {
         case: "a read of an association the store holds nothing under",
         operation: "GetResolverQueryLogConfigAssociation",
         body: |_| json!({ "ResolverQueryLogConfigAssociationId": UNKNOWN_ASSOCIATION }),
         sentence: ASSOCIATION_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfigAssociation",
+        shape: "ResourceNotFoundException",
+        named: ("ResourceType", "ResolverQueryLogConfigAssociation"),
     },
     Refusal {
         case: "a disassociate of a pair the configuration holds no association for",
@@ -173,7 +187,8 @@ const REFUSALS: &[Refusal] = &[
             json!({ "ResolverQueryLogConfigId": stored, "ResourceId": UNASSOCIATED_VPC })
         },
         sentence: ASSOCIATION_GONE_SENTENCE,
-        resource_type: "ResolverQueryLogConfigAssociation",
+        shape: "ResourceNotFoundException",
+        named: ("ResourceType", "ResolverQueryLogConfigAssociation"),
     },
 ];
 
@@ -208,13 +223,15 @@ async fn every_query_log_refusal_closes_with_the_trace_clause_of_the_request() {
                 refusal.operation
             );
             assert!(
-                error_type(&body).contains("ResourceNotFoundException"),
-                "case {case:?}: the refusal must name ResourceNotFoundException, got {body}"
+                error_type(&body).contains(refusal.shape),
+                "case {case:?}: the refusal must name {}, got {body}",
+                refusal.shape
             );
+            let (member, named) = refusal.named;
             assert_eq!(
-                string_member(&body, "ResourceType"),
-                refusal.resource_type,
-                "case {case:?}: the refusal must name the resource that is missing, got {body}"
+                string_member(&body, member),
+                named,
+                "case {case:?}: the refusal must name {named} in {member}, got {body}"
             );
 
             let message = string_member(&body, "Message");

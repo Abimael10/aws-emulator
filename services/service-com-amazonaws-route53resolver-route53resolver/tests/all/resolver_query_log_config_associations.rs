@@ -397,8 +397,9 @@ async fn an_association_settles_from_creating_to_active() {
 }
 
 /// A `ResolverQueryLogConfigId` the store holds no configuration under is
-/// refused with the `ResourceNotFoundException` the operation models, and
-/// nothing is associated for it.
+/// refused with the `InvalidParameterException` the operation models — this path
+/// reports the id it could not resolve as a bad input, which is the class its
+/// recorded refusal carries — and nothing is associated for it.
 ///
 /// The rows walk what the rule generalises over: an id of the right shape that
 /// nothing minted, an id of another of this service's resources, the shortest
@@ -427,7 +428,7 @@ async fn an_unknown_configuration_id_is_refused() {
                 "ResourceId": "vpc-0123456789abcdef0",
             }),
             case,
-            "ResourceNotFoundException",
+            "InvalidParameterException",
         )
         .await;
     }

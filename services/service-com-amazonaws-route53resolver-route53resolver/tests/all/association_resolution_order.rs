@@ -5,13 +5,16 @@
 //!
 //! Two rules are pinned here.
 //!
-//! 1. A call that ASSOCIATES a Resolver resource with a VPC resolves the VPC the
-//!    association would be made IN before the resource it would be made FOR, so
-//!    a request naming neither is refused for the VPC; and the DNS Firewall
-//!    slice reports a VPC the account holds nothing under with the one body it
-//!    answers for every resource a caller cannot address — the coded can't-find
-//!    sentence naming the id the request sent, closed with the trace clause of
-//!    the request — rather than with a parameter-validation sentence of its own.
+//! 1. A call that ASSOCIATES a Resolver resource with a VPC resolves, FIRST, the
+//!    resource its own recorded refusal names: the rule associate and the DNS
+//!    Firewall associate report the VPC the association would be made IN, so a
+//!    request naming neither is refused for the VPC, while the query-logging
+//!    associate reports the CONFIGURATION it would be made FOR, as an invalid
+//!    parameter. The DNS Firewall slice reports a VPC the account holds nothing
+//!    under with the one body it answers for every resource a caller cannot
+//!    address — the coded can't-find sentence naming the id the request sent,
+//!    closed with the trace clause of the request — rather than with a
+//!    parameter-validation sentence of its own.
 //! 2. A call that addresses an association by the (configuration, VPC) PAIR it
 //!    was made from resolves the ASSOCIATION and nothing else, so every pair the
 //!    service holds no association for — including one whose configuration it
@@ -195,29 +198,32 @@ async fn a_firewall_associate_reports_an_unresolvable_vpc_with_the_coded_sentenc
     );
 }
 
-/// The VPC is resolved before the resource the association is made FOR: a
-/// request naming a VPC the account does not hold AND a resource this service
-/// holds nothing under is refused for the VPC, by all three association writes,
-/// and writes nothing.
+/// Each associate resolves, FIRST, the resource its own recorded refusal names:
+/// a request naming a VPC the account does not hold AND a resource this service
+/// holds nothing under is refused for the VPC by the rule and DNS Firewall
+/// associates, and for the CONFIGURATION by the query-logging associate.
 ///
 /// The three writes are `AssociateResolverRule`'s `VPCId`,
 /// `AssociateResolverQueryLogConfig`'s `ResourceId` and
 /// `AssociateFirewallRuleGroup`'s `VpcId`. The first two model
-/// `InvalidParameterException` and report the sentence Amazon EC2 words for an
-/// id its inventory does not hold; the third models no
-/// `InvalidParameterException` at all and reports the DNS Firewall slice's coded
-/// can't-find sentence.
+/// `InvalidParameterException`: the rule associate reports the sentence Amazon
+/// EC2 words for an id its inventory does not hold, the query-logging associate
+/// the coded sentence of the configuration that cannot be addressed. The third
+/// models no `InvalidParameterException` at all and reports the DNS Firewall
+/// slice's coded can't-find sentence.
 #[tokio::test]
-async fn the_vpc_is_resolved_before_the_resource_the_association_is_made_for() {
+async fn each_associate_is_refused_for_the_resource_it_resolves_first() {
     // An id of each kind that this service holds no resource under, in the form
-    // it mints one, and the member of that request which names the VPC.
-    let writes: [(&str, &str, Value, &str, &str); 3] = [
+    // it mints one, the member of that request which names the VPC, the refusal
+    // it is answered with and which resource that refusal is about.
+    let writes: [(&str, &str, Value, &str, &str, Subject); 3] = [
         (
             "a Resolver rule",
             "AssociateResolverRule",
             json!({ "ResolverRuleId": "rslvr-rr-0000000000000000" }),
             "VPCId",
             "InvalidParameterException",
+            Subject::VpcOfTheInventory,
         ),
         (
             "a query logging configuration",
@@ -225,6 +231,7 @@ async fn the_vpc_is_resolved_before_the_resource_the_association_is_made_for() {
             json!({ "ResolverQueryLogConfigId": "rqlc-0000000000000000" }),
             "ResourceId",
             "InvalidParameterException",
+            Subject::QueryLogConfig,
         ),
         (
             "a DNS Firewall rule group",
@@ -232,10 +239,11 @@ async fn the_vpc_is_resolved_before_the_resource_the_association_is_made_for() {
             associate_firewall_request("ordering", "rslvr-frg-0000000000000000", ""),
             "VpcId",
             "ResourceNotFoundException",
+            Subject::VpcThatCantBeFound,
         ),
     ];
 
-    for (case, operation, template, vpc_member, refusal) in writes {
+    for (case, operation, template, vpc_member, refusal, subject) in writes {
         for (id_case, unknown) in unresolvable_vpc_ids() {
             let router = emulator();
             router.hold_vpcs([HELD_VPC]);
@@ -250,25 +258,42 @@ async fn the_vpc_is_resolved_before_the_resource_the_association_is_made_for() {
             );
             assert!(
                 error_type(&parsed).contains(refusal),
-                "case {case:?}/{id_case:?}: {operation} must answer {refusal} for the VPC that \
-                 resolved to nothing, got {parsed}"
+                "case {case:?}/{id_case:?}: {operation} must answer {refusal} for the resource it \
+                 resolves first, got {parsed}"
             );
             let message = string_member(&parsed, "Message");
-            let expected = if refusal == "ResourceNotFoundException" {
-                cant_find_sentence(&unknown)
-            } else {
-                format!("The vpc ID '{unknown}' does not exist")
+            let expected = match subject {
+                Subject::VpcOfTheInventory => format!("The vpc ID '{unknown}' does not exist"),
+                Subject::VpcThatCantBeFound => cant_find_sentence(&unknown),
+                Subject::QueryLogConfig => CONFIG_GONE_SENTENCE.to_string(),
             };
             let stated =
                 traced_message(&message).map_or(message.clone(), |(stated, _)| stated.to_string());
             assert_eq!(
                 stated, expected,
-                "case {case:?}/{id_case:?}: {operation} must name the VPC that resolved to \
-                 nothing, got {message:?}"
+                "case {case:?}/{id_case:?}: {operation} must name the resource it resolves first, \
+                 got {message:?}"
             );
         }
     }
 }
+
+/// Which resource an associate's refusal is ABOUT, and in whose words.
+#[derive(Debug, Clone, Copy)]
+enum Subject {
+    /// The VPC, in the sentence Amazon EC2 words for an id its inventory does
+    /// not hold.
+    VpcOfTheInventory,
+    /// The VPC, in the DNS Firewall slice's coded can't-find sentence.
+    VpcThatCantBeFound,
+    /// The query logging configuration, in its own coded sentence.
+    QueryLogConfig,
+}
+
+/// The sentence a query logging configuration the service holds nothing under is
+/// refused with, whichever class the path that could not resolve it reports.
+const CONFIG_GONE_SENTENCE: &str =
+    "[RSLVR-01601] The specified query logging configuration doesn't exist.";
 
 /// Every pair a disassociate names that the service holds no association for is
 /// refused with the one coded sentence for a missing association — a

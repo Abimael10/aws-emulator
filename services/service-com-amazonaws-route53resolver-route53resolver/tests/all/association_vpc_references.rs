@@ -22,7 +22,10 @@
 //! The matching `Disassociate*` operations also take a VPC id, but there it
 //! SELECTS an association the service already holds rather than creating one, so
 //! it is not part of this rule (`tests/all/resolver_rule_disassociation.rs` owns
-//! that half).
+//! that half). Which resource a request naming NEITHER a held VPC nor a stored
+//! owner is refused for is each path's own, as its recorded refusal states it:
+//! the rule and DNS Firewall associates report the VPC, the query-logging
+//! associate the configuration it would be made FOR.
 //!
 //! The rows differ along what the rule generalises over: which operation makes
 //! the association, the form of the id (both of Amazon EC2's published forms and
@@ -119,6 +122,23 @@ impl Association {
                 })
                 .0
                 .to_string(),
+        }
+    }
+
+    /// The sentence a request naming BOTH an unresolvable VPC and a resource
+    /// this service holds nothing under is refused with.
+    ///
+    /// Which of the two the refusal is about is each path's own, as its recorded
+    /// refusal states it: the rule associate and the DNS Firewall associate
+    /// report the VPC, so the sentence is [`Self::refusal_message`]'s, while the
+    /// query-logging associate resolves the CONFIGURATION first and reports its
+    /// coded sentence instead.
+    fn missing_owner_sentence(self, unknown_vpc: &str) -> String {
+        match self {
+            Self::ResolverRule | Self::FirewallRuleGroup => self.refusal_message(unknown_vpc),
+            Self::QueryLogConfig => {
+                "[RSLVR-01601] The specified query logging configuration doesn't exist.".to_string()
+            }
         }
     }
 
@@ -492,11 +512,13 @@ async fn a_vpc_taken_out_of_the_account_stops_resolving() {
     }
 }
 
-/// The VPC the association would be made IN is resolved before the resource it
-/// would be made FOR: a request naming a VPC the account does not hold is
-/// answered for THAT, even when the resource it names does not exist either.
+/// Each associate is refused for the resource it resolves FIRST: a request
+/// naming a VPC the account does not hold is answered for THAT by the rule and
+/// DNS Firewall writes, even when the resource it names does not exist either,
+/// while the query-logging write resolves its configuration first and is
+/// answered for that one.
 #[tokio::test]
-async fn the_vpc_is_resolved_before_the_associated_resource() {
+async fn a_request_naming_neither_resource_is_refused_for_the_one_resolved_first() {
     // The id of each kind that this service holds no resource under, in the form
     // it mints: a Resolver rule, a query logging configuration and a DNS
     // Firewall rule group.
@@ -520,13 +542,16 @@ async fn the_vpc_is_resolved_before_the_associated_resource() {
         );
         assert!(
             error_type(&parsed).contains(association.refusal()),
-            "{}: the VPC that resolved to nothing is what the request is refused for, got {parsed}",
+            "{}: the resource resolved first is what the request is refused for, got {parsed}",
             association.operation()
         );
+        let message = string_member(&parsed, "Message");
+        let stated = super::harness::traced_message(&message)
+            .map_or(message.clone(), |(stated, _)| stated.to_string());
         assert_eq!(
-            association.stated_sentence(&string_member(&parsed, "Message")),
-            association.refusal_message(LONG_FORM_ID),
-            "{}: the refusal must name the VPC that resolved to nothing, got {parsed}",
+            stated,
+            association.missing_owner_sentence(LONG_FORM_ID),
+            "{}: the refusal must name the resource resolved first, got {parsed}",
             association.operation()
         );
     }

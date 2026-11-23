@@ -175,14 +175,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::Instant::now();
 
+        // `ResolverQueryLogConfigId` is "the ID of the query logging
+        // configuration that you want to associate a VPC with": the
+        // configuration the association would be made FOR is resolved BEFORE
+        // the VPC it would be made IN, so a request naming neither is refused
+        // for the configuration, and an id this service holds no configuration
+        // under is reported as an invalid PARAMETER
+        // (`crate::state::invalid_resolver_query_log_config_id`), which is the
+        // class this path's recorded refusal carries. The lock is released again
+        // so the write path below repeats this lookup under the lock it writes
+        // through.
+        {
+            let store = state.lock();
+            if !store
+                .resolver_query_log_configs
+                .contains_key(&input.resolver_query_log_config_id)
+            {
+                return Err(
+                    AssociateResolverQueryLogConfigErrorModeled::InvalidParameterException(
+                        crate::state::invalid_resolver_query_log_config_id(&trace_root),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // `ResourceId` is "the ID of an Amazon VPC that you want this query
         // logging configuration to log queries for" — a VPC of the caller's own
         // account, so the id is resolved against that account's Amazon EC2
         // inventory, the same resolution the endpoint write path makes for a
-        // `SubnetId`. The VPC the association would be made IN is resolved
-        // BEFORE the configuration it would be made FOR, so a request naming
-        // neither is refused for the VPC. Resolved with no lock of this
-        // service's store held, and before anything is written.
+        // `SubnetId`. Resolved with no lock of this service's store held, and
+        // before anything is written.
         if let Some(unknown) =
             crate::state::unresolvable_vpc_id(&*self.engine, [input.resource_id.as_str()])
         {
@@ -194,40 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `ResolverQueryLogConfigId` is "the ID of the query logging
-        // configuration that you want to associate a VPC with": the
-        // configuration has to exist for the association to mean anything. The
-        // lock is released again so the write path below repeats this lookup
-        // under the lock it writes through.
-        {
-            let store = state.lock();
-            if !store
-                .resolver_query_log_configs
-                .contains_key(&input.resolver_query_log_config_id)
-            {
-                return Err(
-                    AssociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                        crate::state::resolver_query_log_config_not_found(&trace_root),
-                    )
-                    .into(),
-                );
-            }
-        }
-
         let mut store = state.lock();
 
-        // `ResolverQueryLogConfigId` is "the ID of the query logging
-        // configuration that you want to associate a VPC with": the
-        // configuration has to exist for the association to mean anything. The
-        // store was unlocked for the VPC resolution above, so this lookup is
+        // The configuration has to exist for the association to mean anything.
+        // The store was unlocked for the VPC resolution above, so the lookup is
         // repeated under the lock this call writes through rather than asserted.
         let Some(config) = store
             .resolver_query_log_configs
             .get(&input.resolver_query_log_config_id)
         else {
             return Err(
-                AssociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_not_found(&trace_root),
+                AssociateResolverQueryLogConfigErrorModeled::InvalidParameterException(
+                    crate::state::invalid_resolver_query_log_config_id(&trace_root),
                 )
                 .into(),
             );

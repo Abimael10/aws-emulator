@@ -338,6 +338,38 @@ pub fn query_log_config_vpc_already_associated(trace_root: &str) -> InvalidReque
     }
 }
 
+/// The `InvalidParameterException` `AssociateResolverQueryLogConfig` answers for
+/// a `ResolverQueryLogConfigId` it holds no configuration under.
+///
+/// The fault is the same one [`resolver_query_log_config_not_found`] states — the
+/// caller cannot address the configuration it named — so the body states the same
+/// sentence, behind the same service error code
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND`]), naming nothing of the request and
+/// closed with the same trace clause ([`traced_message`]). What is this path's
+/// own, as its recorded refusal states it, is the CLASS: the associate reports
+/// the id it could not resolve as a bad INPUT ("one or more parameters in this
+/// request are not valid") rather than as a missing resource, so a client that
+/// maps a refusal back to the member it sent catches it there — and the member is
+/// named beside the sentence in `FieldName`, "the name of the parameter that's
+/// invalid", because the sentence itself names nothing of the request.
+pub fn invalid_resolver_query_log_config_id(trace_root: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: traced_message(
+            rslvr_message(
+                RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND,
+                "The specified query logging configuration doesn't exist",
+            ),
+            trace_root,
+        ),
+        field_name: Some(RESOLVER_QUERY_LOG_CONFIG_ID_MEMBER.to_string()),
+    }
+}
+
+/// The modelled member an associate names its query logging configuration by, as
+/// the model spells it
+/// (`smithy_query(query="operation",operation="AssociateResolverQueryLogConfig")`).
+const RESOLVER_QUERY_LOG_CONFIG_ID_MEMBER: &str = "ResolverQueryLogConfigId";
+
 /// The `InvalidRequestException` `AssociateResolverQueryLogConfig` answers for a
 /// VPC whose queries another configuration already sends to the SAME kind of
 /// destination.

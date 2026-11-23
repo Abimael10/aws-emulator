@@ -153,7 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // What this pure read takes from `ctx` is the request's tracing header,
+        // which the cursor refusal below closes with.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListOutpostResolversErrorModeled::InternalServiceErrorException(
@@ -199,17 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(page) = page else {
-            // This operation models no `InvalidNextTokenException`, so a cursor
-            // this service did not mint for this query is refused with the
-            // `ValidationException` it does model, rather than being read as
-            // "start from the beginning" and silently repeating page one.
+            // The collection is this service's own records, so a cursor it never
+            // minted for this query is refused with this service's coded
+            // sentence for that fault
+            // (`crate::state::coded_next_token_validation`), rather than being
+            // read as "start from the beginning" and silently repeating page
+            // one. This operation models no `InvalidNextTokenException`, so the
+            // refusal travels as the `ValidationException` it does model.
             return Err(ListOutpostResolversErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "The NextToken you provided was not issued by this service for this query"
-                            .to_string(),
-                    ),
-                },
+                crate::state::coded_next_token_validation(
+                    input.next_token.as_deref().unwrap_or_default(),
+                    &crate::state::request_trace_root(&ctx.parts().headers),
+                ),
             )
             .into());
         };
