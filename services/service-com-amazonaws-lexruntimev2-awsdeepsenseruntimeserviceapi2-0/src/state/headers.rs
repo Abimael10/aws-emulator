@@ -22,9 +22,17 @@
 //! and the model's schemas, or the raw UTF-8 text where the member is text —
 //! compressed with gzip and then base64 encoded. The functions below are that
 //! rule; nothing else in this crate encodes or decodes a header payload.
+//!
+//! The per-member step is here too, not in the operations: a header payload is
+//! written from a member of an operation's own input or output, so its schema is
+//! read off that schema, and a member holding a COLLECTION that is empty reports
+//! no header at all, because each of those members is an optional
+//! `NonEmptyString`. Both operations that answer with these headers write them
+//! through the same three functions, so they cannot report the same stored
+//! session differently.
 
 use aws_smithy_schema::codec::FinishSerializer;
-use aws_smithy_schema::serde::SerdeError;
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::json::{JsonShapeDeserializer, JsonShapeSerializer};
 use aws_smithy_schema_server::DeserializableStruct;
@@ -199,6 +207,95 @@ pub fn member_schema<'a>(schema: &'a Schema, member: &str) -> Option<&'a Schema>
         .iter()
         .copied()
         .find(|candidate| candidate.member_name() == Some(member))
+}
+
+/// [`member_schema`], as the failure the three encoders below report: a member a
+/// header payload is written from that the model does not declare is a mismatch
+/// between this crate and the model, which the operation reports rather than
+/// papers over with another schema.
+fn declared_member<'a>(schema: &'a Schema, member: &str) -> Result<&'a Schema, String> {
+    member_schema(schema, member).ok_or_else(|| format!("the model declares no {member} member"))
+}
+
+/// Encode the header payload of a STRUCTURE member of `schema`.
+///
+/// The payload is the member's own JSON under the module's encoding, written
+/// with the member's own schema read off `schema` rather than one re-declared
+/// here — so what a client decoding the header reads back is the member exactly
+/// as the model names it.
+pub fn encode_struct_member(
+    schema: &Schema,
+    member: &str,
+    value: &dyn SerializableStruct,
+) -> Result<String, String> {
+    let member_schema = declared_member(schema, member)?;
+    encode_json(|serializer| serializer.write_struct(member_schema, value))
+}
+
+/// Encode the header payload of a LIST member of `schema`, or report that there
+/// is none.
+///
+/// Every structured collection this service reports travels on an optional
+/// header, so an EMPTY collection has nothing to report and the header is absent
+/// rather than carrying an encoded empty list.
+pub fn encode_list_member<T: SerializableStruct>(
+    schema: &Schema,
+    member: &str,
+    elements: &[T],
+) -> Result<Option<String>, String> {
+    if elements.is_empty() {
+        return Ok(None);
+    }
+    let list_schema = declared_member(schema, member)?;
+    // A list element is written with the list's own member schema
+    // (`Schema::member()`), so whatever the model says about the element is
+    // applied to it.
+    let element_schema = list_schema
+        .member()
+        .ok_or_else(|| format!("the model declares no {member} element member"))?;
+    encode_json(|serializer| {
+        serializer.write_list(list_schema, &|element| {
+            for value in elements {
+                element.write_struct(element_schema, value)?;
+            }
+            Ok(())
+        })
+    })
+    .map(Some)
+}
+
+/// Encode the header payload of a `map<string, string>` member of `schema`, or
+/// report that there is none — the same absent-when-empty rule
+/// [`encode_list_member`] applies.
+pub fn encode_map_member(
+    schema: &Schema,
+    member: &str,
+    entries: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let map_schema = declared_member(schema, member)?;
+    // A map entry is written with its own key and value member schemas:
+    // `Schema::key()` is the map's key member and `Schema::member()` its value
+    // member, so whatever the model says about either (a name, a constraint) is
+    // applied to the right one.
+    let key_schema = map_schema
+        .key()
+        .ok_or_else(|| format!("the model declares no {member} key member"))?;
+    let value_schema = map_schema
+        .member()
+        .ok_or_else(|| format!("the model declares no {member} value member"))?;
+    encode_json(|serializer| {
+        serializer.write_map(map_schema, &|entry| {
+            for (name, value) in entries {
+                entry.write_string(key_schema, name)?;
+                entry.write_string(value_schema, value)?;
+            }
+            Ok(())
+        })
+    })
+    .map(Some)
 }
 
 #[cfg(test)]

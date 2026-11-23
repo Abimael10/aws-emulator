@@ -167,13 +167,13 @@
 use super::types::*;
 use crate::state::bot_model::{built_locale, AddressRefused, BotLocaleModel, LocaleUnavailable};
 use crate::state::headers::{
-    decode_string_map, decode_struct, encode_json, encode_text, member_schema, HeaderRejected,
+    decode_string_map, decode_struct, encode_list_member, encode_map_member, encode_struct_member,
+    encode_text, HeaderRejected,
 };
 use crate::state::{
     asks_for_speech, AttributesRefused, SessionKey, SessionStoreFull, TurnRefused, AUDIO_PREFIX,
     MAX_UTTERANCE_CHARS, TEXT_CONTENT_TYPE,
 };
-use aws_smithy_schema::serde::ShapeSerializer;
 use std::time::SystemTime;
 
 /// The prefix a `requestContentType` carries when the input stream is text
@@ -507,88 +507,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let turn_schema = super::types::RECOGNIZE_TEXT_OUTPUT_SCHEMA;
         // The structured payloads are the SAME shapes the sibling operations
-        // carry in a body, so their schemas are read off the model rather than
-        // declared here: `RecognizeText`'s output binds each of them by name,
-        // while this operation's own output declares them as the strings they
-        // travel as.
-        let state_schema = member_schema(turn_schema, "sessionState")
-            .ok_or_else(|| internal("the model declares no sessionState member"))?;
-        let messages_schema = member_schema(turn_schema, "messages")
-            .ok_or_else(|| internal("the model declares no messages member"))?;
-        let interpretations_schema = member_schema(turn_schema, "interpretations")
-            .ok_or_else(|| internal("the model declares no interpretations member"))?;
-        let attributes_schema = member_schema(turn_schema, "requestAttributes")
-            .ok_or_else(|| internal("the model declares no requestAttributes member"))?;
-
-        let session_state = encode_json(|serializer| {
-            serializer.write_struct(state_schema, &turn.session_state)
-        })
-        .map_err(internal)?;
-
-        // Every other structured header is an optional `NonEmptyString`: with
-        // nothing stored there is nothing to report, so the header is absent
-        // rather than an encoded empty collection.
-        let messages = if turn.messages.is_empty() {
-            None
-        } else {
-            let element_schema = messages_schema
-                .member()
-                .ok_or_else(|| internal("the model declares no messages element member"))?;
-            Some(
-                encode_json(|serializer| {
-                    serializer.write_list(messages_schema, &|element| {
-                        for message in &turn.messages {
-                            element.write_struct(element_schema, message)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .map_err(internal)?,
-            )
-        };
-        let interpretations = if turn.interpretations.is_empty() {
-            None
-        } else {
-            let element_schema = interpretations_schema
-                .member()
-                .ok_or_else(|| internal("the model declares no interpretations element member"))?;
-            Some(
-                encode_json(|serializer| {
-                    serializer.write_list(interpretations_schema, &|element| {
-                        for interpretation in &turn.interpretations {
-                            element.write_struct(element_schema, interpretation)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .map_err(internal)?,
-            )
-        };
-        let request_attributes = if turn.request_attributes.is_empty() {
-            None
-        } else {
-            // A map entry is written with its own key and value member schemas:
-            // `Schema::key()` is the map's key member and `Schema::member()` its
-            // value member.
-            let key_schema = attributes_schema
-                .key()
-                .ok_or_else(|| internal("the model declares no requestAttributes key member"))?;
-            let value_schema = attributes_schema
-                .member()
-                .ok_or_else(|| internal("the model declares no requestAttributes value member"))?;
-            Some(
-                encode_json(|serializer| {
-                    serializer.write_map(attributes_schema, &|entry| {
-                        for (name, value) in &turn.request_attributes {
-                            entry.write_string(key_schema, name)?;
-                            entry.write_string(value_schema, value)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .map_err(internal)?,
-            )
-        };
+        // carry in a body, so each is written from that member of the model
+        // rather than from a schema declared here: `RecognizeText`'s output binds
+        // each of them by name, while this operation's own output declares them
+        // as the strings they travel as. The encoding, and the rule that an
+        // optional header reports nothing for an empty collection, are
+        // `crate::state::headers`' — the same ones the sibling `PutSession`
+        // answers with.
+        let session_state =
+            encode_struct_member(turn_schema, "sessionState", &turn.session_state)
+                .map_err(internal)?;
+        let messages =
+            encode_list_member(turn_schema, "messages", &turn.messages).map_err(internal)?;
+        let interpretations =
+            encode_list_member(turn_schema, "interpretations", &turn.interpretations)
+                .map_err(internal)?;
+        let request_attributes =
+            encode_map_member(turn_schema, "requestAttributes", &turn.request_attributes)
+                .map_err(internal)?;
 
         Ok(RecognizeUtteranceOutput {
             // The input was text, so that is the mode this turn ran in.

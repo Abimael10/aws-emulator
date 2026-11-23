@@ -107,7 +107,7 @@
 use super::types::*;
 use crate::state::bot_definition::SeedRefused;
 use crate::state::bot_model::{built_locale, AddressRefused, LocaleUnavailable};
-use crate::state::headers::{encode_json, member_schema};
+use crate::state::headers::{encode_list_member, encode_map_member, encode_struct_member};
 // `asks_for_speech` and `TEXT_CONTENT_TYPE` are `crate::state`'s, because the
 // two operations that take a `responseContentType` must answer the same way for
 // the same value.
@@ -115,31 +115,16 @@ use crate::state::{
     asks_for_speech, check_attribute_bytes, check_request_attributes, AttributesRefused,
     SessionKey, SessionStoreFull, TEXT_CONTENT_TYPE,
 };
-use aws_smithy_schema::serde::ShapeSerializer;
-use aws_smithy_schema_server::json::JsonShapeSerializer;
 use std::time::SystemTime;
-
-/// Encode one modelled value for a response header, in this operation's own
-/// error channel.
-///
-/// The encoding is the service-wide one in [`crate::state::headers`]: the
-/// value's JSON, gzip-compressed and then base64 encoded, which is what each of
-/// this operation's header members documents ("the `sessionState` field is
-/// compressed with gzip and then base64 encoded"). A failure to write it is the
-/// emulator's own, never the caller's, so it is reported as the modelled server
-/// error.
-///
-/// The header payloads below are the input's own `sessionState`, `messages` and
-/// `requestAttributes` shapes, so their schemas are read off the generated input
-/// schema with [`member_schema`] rather than re-declared here.
-fn header_value(
-    write: impl FnOnce(&mut JsonShapeSerializer) -> Result<(), aws_smithy_schema::serde::SerdeError>,
-) -> Result<String, PutSessionError> {
-    encode_json(write).map_err(internal)
-}
 
 /// A server fault this operation declares, for a failure that is the emulator's
 /// own and not the caller's.
+///
+/// The response headers below are written by [`crate::state::headers`], whose
+/// encoding is what each of this operation's header members documents ("the
+/// `sessionState` field is compressed with gzip and then base64 encoded"); a
+/// failure to write one is the emulator's own, never the caller's, so it is
+/// reported through here.
 fn internal(message: impl Into<String>) -> PutSessionError {
     PutSessionErrorModeled::InternalServerException(InternalServerException {
         message: message.into(),
@@ -377,62 +362,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // The header payloads are the input's own `sessionState`, `messages` and
+        // `requestAttributes` shapes, so each is written from that member of the
+        // generated input schema, under the one encoding
+        // `crate::state::headers` owns. `messages` and `requestAttributes` are
+        // optional `NonEmptyString` headers, so with nothing stored for one
+        // there is nothing to report and the header is absent rather than an
+        // encoded empty collection.
         let input_schema = Self::INPUT_SCHEMA;
-        let state_schema = member_schema(input_schema, "sessionState")
-            .ok_or_else(|| internal("the model declares no sessionState member"))?;
-        let messages_schema = member_schema(input_schema, "messages")
-            .ok_or_else(|| internal("the model declares no messages member"))?;
-        let attributes_schema = member_schema(input_schema, "requestAttributes")
-            .ok_or_else(|| internal("the model declares no requestAttributes member"))?;
-
-        let session_state =
-            header_value(|serializer| serializer.write_struct(state_schema, &stored_state))?;
-        // Both of these are optional `NonEmptyString` headers: with nothing
-        // stored there is nothing to report, so the header is absent rather than
-        // an encoded empty collection.
-        let messages = if stored_messages.is_empty() {
-            None
-        } else {
-            // A list element is written with the list's own member schema
-            // (`Schema::member()`), so whatever the model says about the element
-            // is applied to it.
-            let element_schema = messages_schema
-                .member()
-                .ok_or_else(|| internal("the model declares no messages element member"))?;
-            Some(header_value(|serializer| {
-                serializer.write_list(messages_schema, &|element| {
-                    for message in &stored_messages {
-                        element.write_struct(element_schema, message)?;
-                    }
-                    Ok(())
-                })
-            })?)
-        };
-        let request_attributes = if stored_attributes.is_empty() {
-            None
-        } else {
-            // A map entry is written with its own key and value member schemas:
-            // `Schema::key()` is the map's key member and `Schema::member()` its
-            // value member, so whatever the model says about either (a name, a
-            // constraint) is applied to the right one. A model that declares
-            // neither is a mismatch this operation reports rather than papers
-            // over with the map's own schema.
-            let key_schema = attributes_schema
-                .key()
-                .ok_or_else(|| internal("the model declares no requestAttributes key member"))?;
-            let value_schema = attributes_schema
-                .member()
-                .ok_or_else(|| internal("the model declares no requestAttributes value member"))?;
-            Some(header_value(|serializer| {
-                serializer.write_map(attributes_schema, &|entry| {
-                    for (name, value) in &stored_attributes {
-                        entry.write_string(key_schema, name)?;
-                        entry.write_string(value_schema, value)?;
-                    }
-                    Ok(())
-                })
-            })?)
-        };
+        let session_state = encode_struct_member(input_schema, "sessionState", &stored_state)
+            .map_err(internal)?;
+        let messages =
+            encode_list_member(input_schema, "messages", &stored_messages).map_err(internal)?;
+        let request_attributes =
+            encode_map_member(input_schema, "requestAttributes", &stored_attributes)
+                .map_err(internal)?;
 
         Ok(PutSessionOutput {
             content_type: Some(content_type),
