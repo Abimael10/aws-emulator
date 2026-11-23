@@ -3297,6 +3297,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // A job resting in `RUNNABLE` owes nothing unless its queue's compute
                     // capacity placed it, which is what this due instant says happened.
                     JOB_RUNNABLE => {
+                        // The tags a propagating job carries travel ONTO the task, and "tags
+                        // can only be propagated to the tasks during task creation": so the
+                        // documented ceiling on the combined set is decided here, where that
+                        // creation is about to happen, and a job over it is "moved to the
+                        // FAILED state" with no task made and no attempt started for it
+                        // ([`MAX_PROPAGATED_TASK_TAGS`]).
+                        if self.propagation_exceeds_task_tag_limit(id) {
+                            let reason = propagated_tags_over_limit_reason();
+                            self.finish_job(id, JOB_FAILED, Some(&reason), due);
+                            return Some(Advanced::Terminal);
+                        }
                         // WHETHER it can be placed is the capacity its queue offers AND the
                         // consumable resources its own requirements claim: a quantity is a
                         // concurrency bound, so a job whose claim does not fit waits here

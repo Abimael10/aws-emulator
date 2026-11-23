@@ -253,6 +253,28 @@ const STOP_CODE_ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 /// middle segment of the log stream its output goes to ([`job_log_stream_name`]).
 const TASK_CONTAINER_NAME: &str = LOG_STREAM_CONTAINER_NAME;
 
+/// How many tags a propagating job may put on the Amazon ECS task it runs as.
+///
+/// `SubmitJob$propagateTags`: "if the total number of combined tags from the job and job
+/// definition is over 50, the job is moved to the FAILED state" — the ceiling is on the
+/// COMBINED set, which is the set the propagation would carry
+/// ([`ComAmazonawsBatchAwsbatchv20160810State::propagated_task_tags`]), and it is the
+/// propagation's own: a job that propagates nothing is held to no such number.
+pub const MAX_PROPAGATED_TASK_TAGS: usize = 50;
+
+/// `statusReason` of a job whose propagation would carry more than
+/// [`MAX_PROPAGATED_TASK_TAGS`] tags.
+///
+/// The condition the documented sentence names, in that sentence's own words and with the
+/// number read off the ceiling itself, because the member states the rule and the state the
+/// job is moved to without publishing a second wording for it.
+pub fn propagated_tags_over_limit_reason() -> String {
+    format!(
+        "The total number of combined tags from the job and job definition is over \
+         {MAX_PROPAGATED_TASK_TAGS}"
+    )
+}
+
 impl ComAmazonawsBatchAwsbatchv20160810State {
     /// Where the job `id` would RUN as an Amazon ECS task, or `None` when the capacity its
     /// queue offers cannot take one.
@@ -326,6 +348,26 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .collect();
         merged.extend(job.tags.clone().unwrap_or_default());
         merged.into_iter().collect()
+    }
+
+    /// Whether the propagation `id` asked for would put MORE tags on the task it runs as than
+    /// the propagation allows ([`MAX_PROPAGATED_TASK_TAGS`]).
+    ///
+    /// Read off the same merged set the propagation would carry
+    /// ([`Self::propagated_task_tags`]), so what decides the job's end is exactly what would
+    /// have travelled — one entry per key, the tie-break already applied. A job that asked for
+    /// no propagation puts no tags on any task, so no ceiling applies to it.
+    ///
+    /// Costs the one merge of the two tag sets, each of which the model's own `TagrisTagsMap`
+    /// bounds.
+    pub(super) fn propagation_exceeds_task_tag_limit(&self, id: &str) -> bool {
+        let Some(job) = self.jobs.get(id) else {
+            return false;
+        };
+        if !job.propagate_tags.unwrap_or(false) {
+            return false;
+        }
+        self.propagated_task_tags(job).len() > MAX_PROPAGATED_TASK_TAGS
     }
 
     /// Owe Amazon ECS the task `id`'s container runs as, and take the job out of the clock's
