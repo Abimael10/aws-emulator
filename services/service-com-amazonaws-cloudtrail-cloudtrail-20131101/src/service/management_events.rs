@@ -158,11 +158,22 @@ impl<Eng: Send + Sync + 'static> AuditedService for CloudTrailAudit<Eng> {
 /// `EventDataStore` on the Lake store lifecycle, `Channel` on the channel operations and
 /// `DashboardId` on the dashboard ones. The member alone decides the kind, so it holds for
 /// every operation that carries a member of that name.
+///
+/// An operation that reads or writes through a resource it names by a member of its own
+/// addresses that resource exactly as the four above do, so each such member is here too:
+/// `InsightSource` is "the Amazon Resource Name(ARN) of the trail for which you want to
+/// retrieve Insights events" (`ListInsightsDataRequest$InsightSource`), `InsightsDestination`
+/// "the ARN (or ID suffix of the ARN) of the destination event data store that logs Insights
+/// events" (`PutInsightSelectorsRequest$InsightsDestination`) and `Destination` "the ARN of
+/// the destination event data store" (`ListImportsRequest$Destination`).
 const IDENTIFIER_MEMBERS: &[(&str, ResourceKind)] = &[
     ("TrailName", ResourceKind::Trail),
     ("EventDataStore", ResourceKind::EventDataStore),
     ("Channel", ResourceKind::Channel),
     ("DashboardId", ResourceKind::Dashboard),
+    ("InsightSource", ResourceKind::Trail),
+    ("InsightsDestination", ResourceKind::EventDataStore),
+    ("Destination", ResourceKind::EventDataStore),
 ];
 
 /// The operations whose `Name` member names a TRAIL: the trail lifecycle and the two
@@ -206,6 +217,15 @@ const IDENTIFIER_LIST_MEMBERS: &[(&str, Option<ResourceKind>)] = &[
     ("trailNameList", Some(ResourceKind::Trail)),
     // Every entry is an ARN, which names its own kind.
     ("ResourceIdList", None),
+    // Each entry is an event data store's ARN or the ID suffix of one: the destination an
+    // import writes to (`StartImportRequest$Destinations`) and the store a generated query
+    // is to run against (`GenerateQueryRequest$EventDataStores`). A channel's own
+    // `Destinations` is a list of STRUCTURES rather than of identifiers
+    // (`CreateChannelRequest$Destinations` -> `Destination`), and a structure is not a text
+    // this reading takes, so the one member name covers both shapes without the channel
+    // operations addressing a store they only reference.
+    ("Destinations", Some(ResourceKind::EventDataStore)),
+    ("EventDataStores", Some(ResourceKind::EventDataStore)),
 ];
 
 /// The resources the call `operation` served addressed, from the identifiers its request

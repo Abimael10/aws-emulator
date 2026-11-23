@@ -24,6 +24,13 @@
 //! to (every resource, the trail the request names, another trail of the same account), and
 //! the kind of caller (an IAM user's long-term key and the account's own published
 //! credential).
+//!
+//! WHICH resource the sentence names is its own table
+//! ([`a_refusal_names_the_resource_the_requests_own_identifier_member_addresses`]): every
+//! member of a request that carries the identifier of a CloudTrail resource addresses that
+//! resource, whatever the member is called, so the refusal's "on resource" clause names the
+//! ARN the decision was taken against — and only a request carrying no such member is judged
+//! against every resource of the service and worded without the clause.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -65,6 +72,14 @@ fn user_arn() -> String {
 fn trail_arn(name: &str) -> String {
     format!(
         "arn:aws:cloudtrail:{HOME_REGION}:{}:trail/{name}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The ARN of the event data store `id`, as this service mints one in [`HOME_REGION`].
+fn event_data_store_arn(id: &str) -> String {
+    format!(
+        "arn:aws:cloudtrail:{HOME_REGION}:{}:eventdatastore/{id}",
         engine::emulator_account_id()
     )
 }
@@ -294,10 +309,8 @@ async fn a_call_is_served_only_when_an_identity_policy_allows_its_action() {
             refused_because: None,
         },
         Row {
-            // The Insights read, which addresses no single CloudTrail resource of its own
-            // (`ListInsightsDataRequest` carries no identifier member naming one), so it
-            // is judged against every resource of this service and the sentence states no
-            // resource clause.
+            // The Insights read addresses the trail its own `InsightSource` names, so the
+            // sentence carries that trail's ARN in its resource clause.
             case: "no policy at all, on the Insights data read",
             document: None,
             operation: "ListInsightsData",
@@ -305,7 +318,7 @@ async fn a_call_is_served_only_when_an_identity_policy_allows_its_action() {
                 "InsightSource": trail_arn("authz-read"),
                 "DataType": INSIGHTS_EVENTS_DATA_TYPE,
             }),
-            resource: None,
+            resource: Some(trail_arn("authz-read")),
             refused_because: Some(no_policy_allows("cloudtrail:ListInsightsData")),
         },
         Row {
@@ -322,7 +335,7 @@ async fn a_call_is_served_only_when_an_identity_policy_allows_its_action() {
                 "InsightSource": trail_arn("authz-read"),
                 "DataType": INSIGHTS_EVENTS_DATA_TYPE,
             }),
-            resource: None,
+            resource: Some(trail_arn("authz-read")),
             refused_because: Some(EXPLICIT_DENY.to_string()),
         },
     ];
@@ -657,4 +670,166 @@ async fn a_refused_call_is_recorded_without_the_parameters_it_never_carried() {
         .call("GetTrailStatus", &json!({"Name": "authz-recorded"}))
         .await
         .expect_ok("the trail a refused delete left alone");
+}
+
+/// One row of the resource-clause table: a call whose request names a CloudTrail resource
+/// through a member of its own, and the ARN the refusal of that call has to name.
+struct Addressed {
+    case: &'static str,
+    /// The document in force on the IAM user while the row runs, or `None` for a user
+    /// carrying none (IAM's default deny).
+    document: Option<Value>,
+    operation: &'static str,
+    request: Value,
+    /// The ARN the sentence's resource clause names, or `None` for a request that names no
+    /// CloudTrail resource at all — judged against every resource, so worded without the
+    /// clause.
+    resource: Option<String>,
+    /// The clause naming which of IAM's rules refused the call, where it is not IAM's
+    /// default deny on the row's own action.
+    reason: Option<&'static str>,
+}
+
+/// RULE: the resource a call is judged on — and the one its refusal names in IAM's "on
+/// resource" clause — is the CloudTrail resource the request's own identifier member
+/// addresses, whichever member carries it and whether it was written as an ARN or as a bare
+/// name; only a request carrying no such member is judged against every resource of the
+/// service and refused without the clause.
+///
+/// The rows span the members this service's requests address a resource through — the
+/// Insights source, an Insights destination, an import destination, a store named in a
+/// list — the two FORMS an identifier takes (the ARN, and the bare name completed in the
+/// calling Region), both resource KINDS a member names, and both wordings the clause sits
+/// in (IAM's default deny and an explicit deny). The member tables these rows stand for
+/// are `IDENTIFIER_MEMBERS` and `IDENTIFIER_LIST_MEMBERS` in
+/// `src/service/management_events.rs`, read off this service's own input shapes
+/// (`smithy_query(query="shape", shape="ListInsightsDataRequest,PutInsightSelectorsRequest,\
+/// ListImportsRequest,GenerateQueryRequest,StartImportRequest")`).
+#[tokio::test]
+async fn a_refusal_names_the_resource_the_requests_own_identifier_member_addresses() {
+    let emulator = Emulator::new();
+    given_user(emulator.engine());
+
+    // Two event data store ids, in the 36-character form this service mints one in.
+    let source_store = event_data_store_arn("11111111-2222-4333-8444-555555555555");
+    let destination_store = event_data_store_arn("66666666-7777-4888-8999-aaaaaaaaaaaa");
+    // A grant over the SOURCE store only, so a call naming both stores is refused on the
+    // other one — which is how the row for a second identifier member pins which ARN the
+    // clause carries.
+    let source_only = policy("Allow", json!("cloudtrail:*"), json!(source_store.clone()));
+
+    let rows = vec![
+        Addressed {
+            case: "the Insights read, addressing its source trail by ARN",
+            document: None,
+            operation: "ListInsightsData",
+            request: json!({
+                "InsightSource": trail_arn("authz-insights"),
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+            resource: Some(trail_arn("authz-insights")),
+            reason: None,
+        },
+        Addressed {
+            case: "the Insights read, addressing its source trail by bare name",
+            document: None,
+            operation: "ListInsightsData",
+            request: json!({
+                "InsightSource": "authz-insights",
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+            resource: Some(trail_arn("authz-insights")),
+            reason: None,
+        },
+        Addressed {
+            case: "the Insights read, denied outright rather than ungranted",
+            document: Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "cloudtrail:ListInsightsData", "Resource": "*"},
+                ],
+            })),
+            operation: "ListInsightsData",
+            request: json!({
+                "InsightSource": trail_arn("authz-insights"),
+                "DataType": INSIGHTS_EVENTS_DATA_TYPE,
+            }),
+            resource: Some(trail_arn("authz-insights")),
+            reason: Some(EXPLICIT_DENY),
+        },
+        Addressed {
+            case: "the import listing, addressing its destination store",
+            document: None,
+            operation: "ListImports",
+            request: json!({"Destination": destination_store.clone()}),
+            resource: Some(destination_store.clone()),
+            reason: None,
+        },
+        Addressed {
+            case: "a generated query, addressing the store its list names",
+            document: None,
+            operation: "GenerateQuery",
+            request: json!({
+                "EventDataStores": [destination_store.clone()],
+                "Prompt": "how many calls were refused",
+            }),
+            resource: Some(destination_store.clone()),
+            reason: None,
+        },
+        Addressed {
+            case: "an import start, addressing the store its destinations name",
+            document: None,
+            operation: "StartImport",
+            request: json!({"Destinations": [destination_store.clone()]}),
+            resource: Some(destination_store.clone()),
+            reason: None,
+        },
+        Addressed {
+            case: "an Insights write, addressing the destination store the source is \
+                   granted",
+            document: Some(source_only),
+            operation: "PutInsightSelectors",
+            request: json!({
+                "EventDataStore": source_store.clone(),
+                "InsightsDestination": destination_store.clone(),
+                "InsightSelectors": [{"InsightType": "ApiCallRateInsight"}],
+            }),
+            resource: Some(destination_store.clone()),
+            reason: None,
+        },
+        Addressed {
+            case: "a collection, which addresses no resource of its own",
+            document: None,
+            operation: "ListTrails",
+            request: json!({}),
+            resource: None,
+            reason: None,
+        },
+    ];
+
+    for Addressed {
+        case,
+        document,
+        operation,
+        request,
+        resource,
+        reason,
+    } in rows
+    {
+        given_user_policy(emulator.engine(), document.as_ref());
+        let reply = emulator
+            .call_in_as(operation, USER_KEY_ID, HOME_REGION, &request)
+            .await;
+        reply.expect_error(case, ACCESS_DENIED.0, ACCESS_DENIED.1);
+        let action = format!("cloudtrail:{operation}");
+        let reason = reason.map_or_else(|| no_policy_allows(&action), str::to_string);
+        let expected = denial(&user_arn(), &action, resource.as_deref(), &reason);
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected IAM's sentence {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
 }

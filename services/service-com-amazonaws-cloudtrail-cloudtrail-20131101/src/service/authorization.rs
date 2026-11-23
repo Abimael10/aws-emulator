@@ -675,6 +675,55 @@ mod tests {
                 json!({"resourceId": "arn:aws:s3:::a-bucket"}),
                 vec![EVERY_RESOURCE.to_string()],
             ),
+            (
+                "the Insights source a read names, by the trail's ARN",
+                "ListInsightsData",
+                json!({"insightSource": ResourceKind::Trail.resource_arn(region, "audited")}),
+                vec![ResourceKind::Trail.resource_arn(region, "audited")],
+            ),
+            (
+                "the Insights source a read names, by the trail's bare name",
+                "ListInsightsData",
+                json!({"insightSource": "audited"}),
+                vec![ResourceKind::Trail.resource_arn(region, "audited")],
+            ),
+            (
+                "the store an import listing names as its destination",
+                "ListImports",
+                json!({"destination": store_arn.clone()}),
+                vec![store_arn.clone()],
+            ),
+            (
+                "the store a generated query names in its list",
+                "GenerateQuery",
+                json!({"eventDataStores": [store_arn.clone()], "prompt": "which calls"}),
+                vec![store_arn.clone()],
+            ),
+            (
+                "a channel create, whose destinations are structures and not identifiers",
+                "CreateChannel",
+                json!({
+                    "name": "partner-feed",
+                    "destinations": [
+                        {"type": "EVENT_DATA_STORE", "location": store_arn.clone()},
+                    ],
+                }),
+                vec![ResourceKind::Channel.resource_arn(region, "partner-feed")],
+            ),
+            (
+                "both stores an Insights write names, each judged",
+                "PutInsightSelectors",
+                json!({
+                    "eventDataStore": store_arn.clone(),
+                    "insightsDestination": ResourceKind::EventDataStore
+                        .resource_arn(region, "a1a2a3a4-2222-4333-8444-555566667777"),
+                }),
+                vec![
+                    store_arn.clone(),
+                    ResourceKind::EventDataStore
+                        .resource_arn(region, "a1a2a3a4-2222-4333-8444-555566667777"),
+                ],
+            ),
         ];
         for (case, operation, parameters, expected) in rows {
             let judged = judged_resources(operation, &parameters, region);
