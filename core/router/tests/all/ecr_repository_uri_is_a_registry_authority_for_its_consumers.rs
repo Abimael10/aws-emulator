@@ -66,8 +66,8 @@ const POLL_ATTEMPTS: usize = 120;
 
 /// The emulator with the three services a row exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them, SERVED at `served_base` — which is the address
-/// `OperationContext::endpoint` reports, and so the zone and the port every address these
-/// services announce is anchored on. Request authentication is off, as in every other suite
+/// `OperationContext::endpoint` reports, and so the authority every address these
+/// services announce carries. Request authentication is off, as in every other suite
 /// here; the in-process callback CloudFormation makes signs its request either way (the
 /// credential scope is what routes it).
 fn build_router(served_base: &str) -> MultiServiceRouter {
