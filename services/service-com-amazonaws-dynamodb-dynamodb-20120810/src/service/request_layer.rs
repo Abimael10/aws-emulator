@@ -42,7 +42,11 @@
 //! `services/service-com-amazonaws-xray-awsxray` and
 //! `services/service-com-amazonaws-kinesis-kinesis-20131202` do for their own services.
 //!
-//! # What an explicit `null` states
+//! # What a member with NO VALUE states
+//!
+//! A body states no value for a member in two spellings, and they are the same statement: the
+//! member carried as an explicit `null`, and the member left out of a structure the body does
+//! carry.
 //!
 //! ABSENCE: a member a body carries as `null` is a member that body does not state, so the
 //! request is served exactly as the same request without it — which is what lets a client
@@ -52,10 +56,17 @@
 //! A member the input REQUIRES is the one such member a request cannot be served without, and
 //! stating it `null` is the same as leaving it out: either way the body states no value for a
 //! member the model requires, which is a violation of the model's OWN `@required` rule. So
-//! that is how it is refused — the CONSTRAINT report, counted in the same envelope and worded
-//! by the same renderer as every other bound the same body breaks, over every one of them
-//! rather than over the first member the read stopped at ([`BodyReading::Invalid`],
-//! [`StatedAbsences::violations`]). The ONE exception is the surface observed to answer such a
+//! that is how it is refused, in this layer and in the same words for both spellings — the
+//! CONSTRAINT report, counted in the same envelope and worded by the same renderer as every
+//! other bound the same body breaks, over EVERY member with no value rather than over the
+//! first member the read stopped at ([`BodyReading::Invalid`],
+//! [`StatedAbsences::violations`]). The reader finds those members one per read and stops at
+//! the first, so the report over all of them is built by filling each member it names and
+//! asking it again ([`StatedAbsences::unstated_members`] asks the question for a body that
+//! states no `null` of its own, which is what a left-out member needs); that asking is one
+//! read of the body per round and is held to [`MOST_JSON_READ_FOR_ABSENCES`], past which the
+//! body is served as it arrived and the framework's own refusal of the first such member is
+//! what answers it. The ONE exception is the surface observed to answer such a
 //! `null` with the reader's own diagnosis of the body instead — the body-level failure, naming
 //! the position in the request the read stopped at ([`READER_DIAGNOSIS_OPERATIONS`],
 //! [`Prose`]).
@@ -82,9 +93,9 @@
 //! question, because the codec read it. A value so read is then held to the model's own
 //! constraints like any other, which is where a page size read as zero earns the range clause.
 //!
-//! It is read BEFORE the absences above, because what a body states is a fact of the body as
-//! the protocol READS it: what a member with no value earns is settled over the body whose
-//! values have already been read in the form the protocol reads them in.
+//! It is read BEFORE the members with no value above, because what a body states is a fact of
+//! the body as the protocol READS it: what a member with no value earns is settled over the
+//! body whose values have already been read in the form the protocol reads them in.
 //!
 //! # What is left to another layer, deliberately
 //!
@@ -92,8 +103,8 @@
 //!   dropping it would renumber the elements beside it, so the codec answers it as it stands;
 //! * a read that failed for a reason that is neither a value's JSON class nor a base64 text's
 //!   length — text that is not a timestamp, base64 of a legal length that still does not
-//!   decode, an absent `@required` member the body never carried at all — which the
-//!   framework and this service's own constraint wording answer, unchanged;
+//!   decode — which the framework and this service's own constraint wording answer,
+//!   unchanged;
 //! * a target type this layer states no name for ([`named_type`]) or no expectation for
 //!   ([`Expected::of`] — a structure, a union, a timestamp or a blob, none of which is read
 //!   into one value the reader has an expectation for): the sentence's two halves are the
@@ -535,14 +546,14 @@ fn null_target<Eng: Send + Sync + 'static>(
     for_served_input!(null_read_target, key, protocol, req)
 }
 
-/// The top-level members of the input of the operation `key` names, each as the generated
-/// input SCHEMA declares it — which is where codegen states a member's Smithy name, the name
-/// this protocol carries it under, and the modelled type it is read as.
+/// How many top-level members the input of the operation `key` names declares, as the
+/// generated input SCHEMA states them — the count that bounds the rounds a body with members
+/// to fill may take ([`StatedAbsences::violations`]).
 fn declared_input_members<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<Vec<DeclaredMember>> {
+) -> Option<usize> {
     for_served_input!(input_members, key, protocol, req)
 }
 
@@ -577,39 +588,20 @@ fn walked_violations<O: Operation>(
     ))
 }
 
-/// One member of an operation's input, as its schema declares it.
-#[derive(Debug, Clone, Copy)]
-struct DeclaredMember {
-    /// The member's Smithy name, which is what the deserializer spells its absence from
-    /// ([`path::member`]).
-    name: &'static str,
-    /// The name this protocol carries the member under — its `@jsonName` where the model
-    /// gives one, else its Smithy name, which is the lookup the JSON codec performs.
-    wire: &'static str,
-    /// The modelled type the member is read as.
-    target: ShapeType,
-}
-
-/// Read `O`'s input schema. The protocol and the request are not read: a member list is a
-/// fact of the model, fixed per operation, and nothing about it is per-request — the two
-/// parameters are the shape of the one dispatcher every reader of a body goes through
+/// Count `O`'s input schema's members. The protocol and the request are not read: a member
+/// list is a fact of the model, fixed per operation, and nothing about it is per-request — the
+/// two parameters are the shape of the one dispatcher every reader of a body goes through
 /// ([`for_served_input`]).
 fn input_members<O: Operation>(
     _protocol: &dyn ServerHttpProtocol,
     _req: &RtRequest,
-) -> Option<Vec<DeclaredMember>> {
+) -> Option<usize> {
     Some(
         O::INPUT_SCHEMA
             .members()
             .iter()
-            .filter_map(|member| {
-                Some(DeclaredMember {
-                    name: member.member_name()?,
-                    wire: wire_name(member),
-                    target: member.shape_type(),
-                })
-            })
-            .collect(),
+            .filter(|member| member.member_name().is_some())
+            .count(),
     )
 }
 
@@ -813,7 +805,7 @@ fn nests_too_deep(stated: &::serde_json::Error) -> bool {
     stated.to_string().contains("recursion limit exceeded")
 }
 
-/// How much JSON this layer may read to ASK what a body's stated absences earn.
+/// How much JSON this layer may read to ASK what the members a body states no value for earn.
 ///
 /// Two costs, and only one of them is a caller's to grow. APPLYING the absences is one pass
 /// over the body ([`StatedAbsences::rewritten`]), whatever their number, so it needs no bound
@@ -821,9 +813,11 @@ fn nests_too_deep(stated: &::serde_json::Error) -> bool {
 /// a probe for the modelled type its member is read as, and then up to one round per member of
 /// the input to isolate that member from any other the body does not carry, and EACH of those
 /// is a read of the whole body. So the bound is on the product of all three factors — the
-/// number of `null`s, the rounds one of them may take, and the body's own size — rather than
-/// on any one of them ([`StatedAbsences::of`]). It is applied BEFORE anything per-absence is
-/// built, so neither a path nor a probe is materialised past it.
+/// number of members with no value, the rounds one of them may take, and the body's own size —
+/// rather than on any one of them ([`StatedAbsences::of`]). It is applied BEFORE anything
+/// per-absence is built, so neither a path nor a probe is materialised past it. A body that
+/// states no absence of its own is counted as one, because asking whether it leaves a required
+/// member out costs the same rounds ([`StatedAbsences::unstated_members`]).
 ///
 /// Past the cap the absences are still applied; what is skipped is the asking, which leaves
 /// such a request the framework's own refusal of an absent required member.
@@ -850,8 +844,14 @@ enum Applied {
     StoodIn(Value),
 }
 
-/// One body, the members its explicit `null`s state the absence of, and the modelled type
-/// each of those members is read as.
+/// One body, the members it states NO VALUE for — a member carried as an explicit `null`, and
+/// a member left out of a structure the body carries — and the modelled type each of the ones
+/// the body does carry as `null` is read as.
+///
+/// Both spellings earn the same report, so both are answered here (this module's "What a member
+/// with NO VALUE states"): what the `null`s state is read off the document up front, and the
+/// members the body leaves out are the ones the reader names as the report is built
+/// ([`Self::violations`]).
 struct StatedAbsences<'r> {
     /// The routing key of the operation the body is being read for.
     key: &'r str,
@@ -873,10 +873,15 @@ struct StatedAbsences<'r> {
     /// The modelled type the codec reads each of those members as, and `None` for a member
     /// whose read stopped at something else first.
     targets: Vec<Option<ShapeType>>,
-    /// The input's own members, read off its schema once: how many there are bounds the rounds
-    /// one absence may take to isolate ([`Self::required`]), which is a factor of the bound
-    /// above, and each round reads the list rather than the schema again.
-    declared: Vec<DeclaredMember>,
+    /// How many members the input declares: the rounds a body may take to fill the members it
+    /// states no value for are bounded by that count ([`Self::violations`],
+    /// [`Self::required_path`]), which is a factor of the bound above.
+    declared: usize,
+    /// Whether the members with no value may be ASKED about at all, or the body is past
+    /// [`MOST_JSON_READ_FOR_ABSENCES`] and is only applied — read by
+    /// [`Self::unstated_members`], where there is no recorded path to read it off because the
+    /// body states no absence of its own.
+    asking: bool,
 }
 
 impl<'r> StatedAbsences<'r> {
@@ -897,14 +902,15 @@ impl<'r> StatedAbsences<'r> {
         let stated = absences_stated(&document);
         let declared = declared_input_members::<Eng>(key, protocol, req).unwrap_or_default();
         // The reads one absence costs: one for the type its member is read as, one more for
-        // that same question asked beside the absences next to it, one per round that
-        // isolates it, and up to three per round that completes the walk over the body
-        // ([`Self::violations`]).
-        let each = declared
-            .len()
-            .saturating_mul(4)
-            .saturating_add(3);
+        // that same question asked beside the absences next to it, up to two per round that
+        // isolates it ([`Self::required_path`]), and up to three per round that completes the
+        // walk over the body ([`Self::violations`]).
+        let each = declared.saturating_mul(5).saturating_add(3);
+        // Counted over at least ONE absence, because a body that states none of its own can
+        // still leave a member the input requires out of a structure it carries, and asking
+        // about that costs the same rounds ([`Self::unstated_members`]).
         let asking = stated
+            .max(1)
             .saturating_mul(each)
             .saturating_mul(body.len())
             <= MOST_JSON_READ_FOR_ABSENCES;
@@ -923,6 +929,7 @@ impl<'r> StatedAbsences<'r> {
             at,
             targets: Vec::new(),
             declared,
+            asking,
         };
         held.targets = (0..held.at.len())
             .map(|which| held.target::<Eng>(which))
@@ -944,7 +951,10 @@ impl<'r> StatedAbsences<'r> {
     /// What the body states.
     fn reading<Eng: Send + Sync + 'static>(&self) -> BodyReading {
         if self.stated == 0 {
-            return BodyReading::AsSent;
+            // A body stating no absence of its own can still leave a member the input
+            // REQUIRES out of a structure it carries, which is the same defect
+            // ([`Self::unstated_members`]).
+            return self.unstated_members::<Eng>();
         }
         // The `null`s standing for a member the input REQUIRES, each beside the member path
         // the reader names it by, in the order the BODY carries them — which is the order
@@ -979,6 +989,38 @@ impl<'r> StatedAbsences<'r> {
             // A request that cannot be rebuilt is served exactly as it arrived, which is the
             // framework's own answer to the `null` it then reads.
             None => BodyReading::AsSent,
+        }
+    }
+
+    /// What a body that states no absence of its OWN states: `AsSent` for one that carries a
+    /// value for every member the input requires, and the CONSTRAINT report over every member
+    /// with no value for one that leaves such a member out.
+    ///
+    /// A member left out of a structure the body carries and the same member carried as `null`
+    /// are the same absence, so they earn the same answer: one clause per member with no value,
+    /// counted in one envelope, beside every other bound the same body breaks. The reader is
+    /// what finds them, one per read, and it stops at the FIRST — so the report over all of
+    /// them is built by the same completion the stated absences go through
+    /// ([`Self::violations`]), which fills each member the reader names and asks again.
+    ///
+    /// Asked only of a body the reader cannot build an input from at all: a body that reads is
+    /// served as it arrived, so a well-formed request pays one read for the question and
+    /// nothing more.
+    fn unstated_members<Eng: Send + Sync + 'static>(&self) -> BodyReading {
+        if !self.asking {
+            return BodyReading::AsSent;
+        }
+        let Some(probe) = rebuilt(self.req, &self.document) else {
+            return BodyReading::AsSent;
+        };
+        if absent_member::<Eng>(self.key, self.protocol, &probe).is_none() {
+            return BodyReading::AsSent;
+        }
+        // Nothing the CALLER stated is absent, so the report is the completion's alone; a
+        // completion that reaches no member leaves the request the framework's own answer.
+        match self.violations::<Eng>(&[]) {
+            found if found.is_empty() => BodyReading::AsSent,
+            found => BodyReading::Invalid(found),
         }
     }
 
@@ -1022,9 +1064,10 @@ impl<'r> StatedAbsences<'r> {
     ) -> Vec<Violation> {
         // The caller's own absences, in the order the body carries them.
         let mut absences: Vec<String> = required.iter().map(|(_, path)| path.clone()).collect();
-        // Every position this layer put a value at, which is every absence above plus each
-        // member filled in a round below.
-        let mut invented: Vec<String> = absences.clone();
+        // Every position this layer put a value at, which is every absence it could stand a
+        // value in plus each member filled in a round below. A stated absence whose modelled
+        // type the reader never named stands nothing, so it is left to the rounds below to
+        // fill exactly as a member the body leaves out is.
         let stands = |which: usize| {
             self.targets
                 .get(which)
@@ -1032,9 +1075,11 @@ impl<'r> StatedAbsences<'r> {
                 .flatten()
                 .and_then(stands_in)
         };
-        if !required.iter().all(|(which, _)| stands(*which).is_some()) {
-            return as_absences(&absences);
-        }
+        let mut invented: Vec<String> = required
+            .iter()
+            .filter(|(which, _)| stands(*which).is_some())
+            .map(|(_, path)| path.clone())
+            .collect();
         let mut document = self.rewritten(&|held| {
             match required
                 .iter()
@@ -1049,8 +1094,12 @@ impl<'r> StatedAbsences<'r> {
         // Bounded by the input's own member count: each round fills one member the round
         // before reported absent, and a filled member is never reported absent again. That
         // count is a factor of the bound on how much JSON one request may have read here
-        // ([`MOST_JSON_READ_FOR_ABSENCES`]).
-        for _ in 0..=self.declared.len() {
+        // ([`MOST_JSON_READ_FOR_ABSENCES`]), which is why the rounds are bounded by a fact of
+        // the MODEL rather than by one of the body: a member with no value stands wherever a
+        // structure does, so the body itself offers no bound a caller cannot grow. A body with
+        // more such members than the input has members is reported over the ones these rounds
+        // reached — a shorter report, never a clause about a member that has a value.
+        for _ in 0..=self.declared {
             let Some(probe) = rebuilt(self.req, &document) else {
                 return as_absences(&absences);
             };
@@ -1068,8 +1117,9 @@ impl<'r> StatedAbsences<'r> {
                 return as_absences(&absences);
             }
             // A member absent from a value this layer stood in is absent from THAT value
-            // rather than from the body, so it is filled and not reported.
-            if !invented.iter().any(|at| inside(&unstated, at)) {
+            // rather than from the body, so it is filled and not reported; one the report
+            // already names is not named twice.
+            if !invented.iter().any(|at| inside(&unstated, at)) && !absences.contains(&unstated) {
                 absences.push(unstated.clone());
             }
             let filled = self
@@ -1081,6 +1131,8 @@ impl<'r> StatedAbsences<'r> {
             }
             invented.push(unstated);
         }
+        // Out of rounds: the report is the members these rounds reached, which is the half this
+        // layer is sure of (see the bound above).
         as_absences(&absences)
     }
 
@@ -1140,26 +1192,30 @@ impl<'r> StatedAbsences<'r> {
     /// member the input requires stops the read before any member's absence is noticed at all.
     /// So a member reported absent that this `null` does not stand for is filled in turn and
     /// the reader asked again, until it reports this one or reports one that cannot be filled.
+    /// Such a member is filled WHEREVER it stands — a member of the input itself, or one
+    /// nested in a structure, a list or a map the body carries — because that is where a body
+    /// can leave one out ([`Self::target_at`], the same filling the report over a whole body
+    /// goes through).
     fn required_path<Eng: Send + Sync + 'static>(&self, which: usize) -> Option<String> {
         let mut document = self.filled(which);
-        // Bounded by the input's own member count: each round fills a member the round before
-        // reported absent, and a filled member is never reported absent again. That count is
-        // also a factor of the bound on how much JSON one request may have read here
-        // ([`MOST_JSON_READ_FOR_ABSENCES`]).
-        for _ in 0..=self.declared.len() {
+        // Bounded by the input's own member count, for the reason the same bound carries in
+        // [`Self::violations`]: the rounds are bounded by a fact of the MODEL because a member
+        // with no value stands wherever a structure does. Out of rounds, this `null` is not
+        // reported as the absence of a required member at all, which leaves the body the
+        // framework's own answer.
+        for _ in 0..=self.declared {
             let probe = rebuilt(self.req, &document)?;
             let absent = absent_member::<Eng>(self.key, self.protocol, &probe)?;
             if names(&self.at[which], &absent) {
                 return Some(absent);
             }
             let filled = self
-                .declared
-                .iter()
-                .find(|member| path::member(member.name) == absent)
-                .and_then(|member| stands_in(member.target).map(|value| (member.wire, value)));
-            let (wire, value) = filled?;
-            let members = document.as_object_mut()?;
-            members.insert(wire.to_string(), value);
+                .target_at::<Eng>(&document, &absent)
+                .and_then(stands_in)
+                .is_some_and(|value| put_at(&mut document, &absent, value));
+            if !filled {
+                return None;
+            }
         }
         None
     }

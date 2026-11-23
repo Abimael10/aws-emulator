@@ -899,3 +899,25 @@ pub fn error_code(body: &Value) -> String {
         .unwrap_or("<no __type>")
         .to_string()
 }
+
+/// The clause one member with NO VALUE earns, as the framework words it: the path the
+/// validating walk reports the member under, and the requirement that it not be null.
+///
+/// Here rather than in one suite because several of them read that clause back — a member
+/// stated `null` and the same member left out are the same absence, so the wording is one.
+pub fn absent_clause(path: &str) -> String {
+    format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
+}
+
+/// The whole message a constraint refusal reporting `clauses` carries: the envelope counts
+/// them, and they are joined in the order the refusal states them.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [clause] => format!("1 validation error detected: {clause}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}

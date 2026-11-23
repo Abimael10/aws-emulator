@@ -35,7 +35,7 @@
 
 use serde_json::{json, Value};
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{absent_clause, call, emulator, error_code, message, ok, validation_envelope};
 use crate::table_items::create_active_table;
 
 /// The table the rows address when they address a real one.
@@ -47,12 +47,6 @@ fn table_arn() -> String {
         "arn:aws:dynamodb:{}:000000000000:table/{TABLE}",
         crate::emulator::REGION
     )
-}
-
-/// The clause one member with no value earns, as the framework words it: the path the
-/// validating walk reports the member under, and the requirement that it not be null.
-fn absent_clause(path: &str) -> String {
-    format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
 }
 
 /// The clause a string outside its `@length` minimum earns.
@@ -70,18 +64,6 @@ fn pattern_clause(value: &str, path: &str) -> String {
         "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy regular \
          expression pattern: [a-zA-Z0-9_.-]+"
     )
-}
-
-/// The whole message a refusal reporting `clauses` carries.
-fn envelope(clauses: &[String]) -> String {
-    match clauses {
-        [clause] => format!("1 validation error detected: {clause}"),
-        many => format!(
-            "{} validation errors detected: {}",
-            many.len(),
-            many.join("; ")
-        ),
-    }
 }
 
 /// One row of the report table: the request, and the clauses its refusal must state in the
@@ -291,7 +273,7 @@ async fn a_member_with_no_value_is_reported_as_the_constraint_violation_it_is() 
              {refused}",
             row.operation
         );
-        let expected = envelope(&(row.clauses)());
+        let expected = validation_envelope(&(row.clauses)());
         let stated = message(&refused);
         assert_eq!(
             stated, expected,
