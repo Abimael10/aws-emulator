@@ -19,7 +19,7 @@ use super::*;
 use crate::ops::types::{
     ClusteringConfig, CreateOnlineEvaluationConfigInput, CreateOnlineEvaluationConfigOutput,
     DataSourceConfig, EvaluatorReference, GetOnlineEvaluationConfigOutput, Insight, OutputConfig,
-    Rule,
+    Rule, UpdateOnlineEvaluationConfigInput, UpdateOnlineEvaluationConfigOutput,
 };
 
 /// The ARN resource type an online evaluation configuration carries:
@@ -43,6 +43,7 @@ pub fn online_evaluation_config_arn(region: &str, online_evaluation_config_id: &
 /// to a provisioning or an evaluation that failed, which nothing here makes happen.
 pub const ONLINE_EVALUATION_CONFIG_STATUS_CREATING: &str = "CREATING";
 pub const ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE: &str = "ACTIVE";
+pub const ONLINE_EVALUATION_CONFIG_STATUS_UPDATING: &str = "UPDATING";
 
 /// `OnlineEvaluationExecutionStatus`'s two values — whether the evaluation this
 /// configuration describes is running (`smithy_query shape=OnlineEvaluationExecutionStatus`).
@@ -103,6 +104,27 @@ pub fn online_evaluation_config_not_found(
         message: Some(format!(
             "{ONLINE_EVALUATION_CONFIG_LABEL} with ID {online_evaluation_config_id} does not \
              exist"
+        )),
+    }
+}
+
+/// The modelled conflict for a change asked of an online evaluation configuration whose own
+/// asynchronous work is still under way: the configuration is not `ACTIVE`, so the request
+/// collides with the operation already running on it, exactly as a change asked of a busy
+/// sibling of this control plane does ([`super::policy_engine_concurrent_modification`]).
+///
+/// The text is fixed and tells the caller what to wait for; its variable parts are the
+/// identifier the request carried and the status the configuration is in right now, as
+/// `OnlineEvaluationConfigStatus` spells it — the same token every response reports it in.
+pub fn online_evaluation_config_status_conflict(
+    online_evaluation_config_id: &str,
+    status: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "{ONLINE_EVALUATION_CONFIG_LABEL} with ID {online_evaluation_config_id} is in \
+             {status} status and cannot be modified. Retry the request once its status is \
+             {ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE}."
         )),
     }
 }
@@ -217,6 +239,84 @@ impl OnlineEvaluationConfigRecord {
             online_evaluation_config_id: self.online_evaluation_config_id.clone(),
             created_at: timestamp(self.created_at),
             output_config: self.output_config.clone(),
+            status: self.status_at(now).to_string(),
+            execution_status: self.execution_status.clone(),
+            failure_reason: None,
+        }
+    }
+
+    /// Apply what an update asked of this configuration: every member the request carried
+    /// replaces the stored one, every member it omitted is left as it was, and the
+    /// configuration reports `UPDATING` until the clock owes it `ACTIVE` again.
+    ///
+    /// The update models no configuration member as `@required` while a read reports `rule`,
+    /// `dataSourceConfig` and `evaluationExecutionRoleArn`
+    /// (`smithy_query operation=UpdateOnlineEvaluationConfig,GetOnlineEvaluationConfig`), so a
+    /// request that omits one cannot be asking for it to be cleared: this is a patch of the
+    /// configuration and not its whole replacement.
+    pub fn apply_update(&mut self, requested: UpdateOnlineEvaluationConfigInput, now: SystemTime) {
+        let UpdateOnlineEvaluationConfigInput {
+            client_token: _,
+            online_evaluation_config_id: _,
+            description,
+            rule,
+            data_source_config,
+            evaluators,
+            insights,
+            clustering_config,
+            output_config,
+            evaluation_execution_role_arn,
+            execution_status,
+        } = requested;
+        if let Some(description) = description {
+            self.description = Some(description);
+        }
+        if let Some(rule) = rule {
+            self.rule = rule;
+        }
+        if let Some(data_source_config) = data_source_config {
+            self.data_source_config = data_source_config;
+        }
+        if let Some(evaluators) = evaluators {
+            self.evaluators = evaluators;
+        }
+        if let Some(insights) = insights {
+            self.insights = Some(insights);
+        }
+        if let Some(clustering_config) = clustering_config {
+            self.clustering_config = Some(clustering_config);
+        }
+        if let Some(output_config) = output_config {
+            self.output_config = Some(output_config);
+        }
+        if let Some(role_arn) = evaluation_execution_role_arn {
+            self.evaluation_execution_role_arn = role_arn;
+        }
+        if let Some(execution_status) = execution_status {
+            self.execution_status = execution_status;
+        }
+        self.updated_at = now;
+        // An updated configuration is not active again at once: the update is accepted with
+        // HTTP 202 and reports a transient status
+        // (`smithy_query operation=UpdateOnlineEvaluationConfig`), so the transition back to
+        // `ACTIVE` is owed by the clock rather than by this call.
+        self.transient_status = ONLINE_EVALUATION_CONFIG_STATUS_UPDATING.to_string();
+        self.settled_status = ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE.to_string();
+        self.settles_at = now + ONLINE_EVALUATION_CONFIG_SETTLE_DELAY;
+    }
+
+    /// This configuration as `UpdateOnlineEvaluationConfig`'s response envelope: every member
+    /// `UpdateOnlineEvaluationConfigResponse` declares, read off the record just written.
+    ///
+    /// `failureReason` is the reason for failure if the update or the execution failed
+    /// (`smithy_query doc shape=UpdateOnlineEvaluationConfigResponse member=failureReason`),
+    /// and a configuration this emulator updated is on its way back to `ACTIVE` with nothing
+    /// failed, so there is no reason to report.
+    pub fn update_output(&self, now: SystemTime) -> UpdateOnlineEvaluationConfigOutput {
+        UpdateOnlineEvaluationConfigOutput {
+            online_evaluation_config_arn: self.online_evaluation_config_arn.clone(),
+            online_evaluation_config_id: self.online_evaluation_config_id.clone(),
+            updated_at: timestamp(self.updated_at),
             status: self.status_at(now).to_string(),
             execution_status: self.execution_status.clone(),
             failure_reason: None,

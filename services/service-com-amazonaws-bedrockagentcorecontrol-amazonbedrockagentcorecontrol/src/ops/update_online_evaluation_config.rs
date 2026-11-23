@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOnlineEvaluationConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOnlineEvaluationConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOnlineEvaluationConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +188,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOnlineEvaluationConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOnlineEvaluationConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOnlineEvaluationConfig"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateOnlineEvaluationConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the online evaluation config store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whether this request replays one this token already applied to the configuration the
+        // path names: "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error." A token remembered for another configuration
+        // is not a replay of this request, so it is applied rather than answered for.
+        let replays_this_config = store
+            .replayed_online_evaluation_config_result(Self::NAME, input.client_token.as_deref())
+            .is_some_and(|remembered| remembered == input.online_evaluation_config_id);
+
+        // The store is keyed by the `onlineEvaluationConfigId` the create minted; an id naming
+        // no stored configuration is the modelled 404, and nothing is written for it.
+        let record = store
+            .online_evaluation_configs
+            .get_mut(&input.online_evaluation_config_id)
+            .ok_or_else(|| {
+                UpdateOnlineEvaluationConfigErrorModeled::ResourceNotFoundException(
+                    crate::state::online_evaluation_config_not_found(
+                        &input.online_evaluation_config_id,
+                    ),
+                )
+            })?;
+
+        // The replay is answered with the configuration that token first updated, before the
+        // status the first update left behind could refuse it.
+        if replays_this_config {
+            return Ok(record.update_output(now));
+        }
+
+        // A configuration whose own asynchronous create or last update is still under way
+        // cannot take another change: the request collides with the operation already running
+        // on it, so it is refused the modelled 409 and the stored configuration is left
+        // exactly as it was.
+        let status = record.status_at(now).to_string();
+        if status != crate::state::ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE {
+            return Err(
+                UpdateOnlineEvaluationConfigErrorModeled::ConflictException(
+                    crate::state::online_evaluation_config_status_conflict(
+                        &input.online_evaluation_config_id,
+                        &status,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Accepted: every member the request carried replaces the stored one, every member it
+        // omitted is left as it was, and the configuration reports `UPDATING` until the clock
+        // owes it `ACTIVE` again.
+        let config_id = input.online_evaluation_config_id.clone();
+        let client_token = input.client_token.clone();
+        record.apply_update(input, now);
+        let output = record.update_output(now);
+
+        store.remember_online_evaluation_config_client_token(Self::NAME, client_token, &config_id);
+
+        Ok(output)
     }
 }
