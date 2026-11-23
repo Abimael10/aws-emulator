@@ -2,27 +2,26 @@
 
 //! @op DeleteDirectory
 //!
-//! IMPLEMENTED: starts the teardown of one directory of this account. The directory is NOT
-//! taken away while the caller waits: the delete moves it out of the stage it was serving
-//! in and into `Deleting`, and the clock finishes the teardown — the stage settles on
-//! `Deleted` one span later and the record leaves the store one span after that
-//! (`crate::state::directory_deletion`).
+//! IMPLEMENTED: deletes one directory of this account. The teardown is COMPLETE when this
+//! operation answers: everything the directory was given is released inside the call, in
+//! the services that own it, and the directory's own record goes with it
+//! (`crate::state::directory_deletion`), so nothing of the directory is left for a later
+//! call to finish and nothing is owed to the clock.
 //!
-//! What a client does with that: `DescribeDirectories` keeps reporting the directory while
-//! the teardown runs, in the teardown stage rather than the one it served in, which is
-//! the progress every delete-and-wait client polls for, and only once the record is gone do
-//! the reads answer for a directory this account no longer has — an id it HAD, which is
-//! what makes a later filtered read an empty page rather than a refusal.
+//! What a client does with that: the FIRST read after the delete already answers for a
+//! directory this account no longer has — an id it HAD, which is what makes a later
+//! reporting call filtered by that id an empty page rather than a refusal, while every call
+//! that must resolve the id to a live directory is refused with the modelled "specified
+//! entity could not be found".
 //!
-//! A repeated delete of a directory already being torn down answers the same id and moves
-//! the teardown no further: the chain keeps the instant the first delete started it from.
+//! A repeated delete therefore finds nothing to delete, and is refused the way a delete of
+//! an id that was never there is.
 //!
-//! The teardown also releases what the create provisioned for the directory in ANOTHER
+//! The teardown releases what the create provisioned for the directory in ANOTHER
 //! service: the network interfaces the directory's servers answered on and the domain
 //! controller security group are Amazon EC2's resources, created there by the create, so they
 //! are deleted THERE over the same in-process callback — the interfaces first, since EC2
-//! refuses to delete a group an interface still holds — and the directory stops naming a
-//! group the owner of security groups no longer holds while the caller's own subnets stop
+//! refuses to delete a group an interface still holds — so the caller's own subnets stop
 //! being held by the interfaces of a directory that is gone.
 //!
 //! "After an alias has been created, it cannot be deleted or reused", so deleting the
@@ -150,52 +149,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         // The directory's own record, and the network its servers sat on, under ONE
-        // short-lived lock: the hop into the owner of security groups below holds no guard.
-        let (directory_id, provisioned_group, provisioned_interfaces) = {
+        // short-lived lock: the hops into the owner of network interfaces and security
+        // groups below hold no guard.
+        let teardown = {
             let mut store = state.lock();
             store.advance_clock(now);
 
-            // The delete does not take the directory away while the caller waits: it moves
-            // it into the teardown stage and the clock finishes the job (see
-            // `crate::state::directory_deletion`), so the next `DescribeDirectories` still
-            // reports the directory — in `Deleting` rather than the stage it was serving in,
-            // which is the progress a delete-and-wait client polls for. An id no directory
-            // is stored under is the modelled "specified entity could not be found".
-            let directory_id = store
-                .begin_directory_deletion(&input.directory_id, now)
+            // The delete TAKES THE DIRECTORY AWAY: this call releases everything it was
+            // given (below) and its record goes with them, so there is nothing left for the
+            // clock to finish (see `crate::state::directory_deletion`). An id no directory is
+            // stored under — one this account never had, and one a delete already took — is
+            // the modelled "specified entity could not be found".
+            let teardown = store
+                .tear_down_directory(&input.directory_id)
                 .ok_or_else(|| {
                     DeleteDirectoryErrorModeled::EntityDoesNotExistException(
                         crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
                     )
                 })?;
-            // The group the create was given for this directory's servers, read off the
-            // record before the teardown takes it: a repeated delete finds it already
-            // released and asks for nothing.
-            let provisioned_group = store
-                .directories
-                .get(&directory_id)
-                .and_then(|directory| directory.provisioned_security_group_id())
-                .map(str::to_string);
-            // ...and the network interfaces those servers answered on, read off the same
-            // record for the same reason.
-            let provisioned_interfaces = store
-                .directories
-                .get(&directory_id)
-                .map(crate::state::Directory::provisioned_network_interface_ids)
-                .unwrap_or_default();
 
-            // The directory stops serving its OBJECTS the moment the teardown starts: a
-            // directory being decommissioned answers no data-plane call, so the shared
-            // inventory that plane reads must not keep claiming the account holds it. The
-            // record goes whole — the directory's domain name, its data-access switch and
-            // its accounts describe nothing any more — while this service's own record
-            // stays until the clock takes it, so the control plane can still report the
-            // teardown.
+            // The directory stops serving its OBJECTS with the same call: a directory that is
+            // gone answers no data-plane call, so the shared inventory that plane reads must
+            // not keep claiming the account holds it. The record goes whole — the directory's
+            // domain name, its data-access switch and its accounts describe nothing any more.
             if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
-                inventory.lock().forget(&directory_id);
+                inventory.lock().forget(&teardown.directory_id);
             }
 
-            (directory_id, provisioned_group, provisioned_interfaces)
+            teardown
         };
 
         // The teardown releases what the create placed for the directory's servers in ANOTHER
@@ -205,14 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone, and the caller's own subnets and VPC stop being held by interfaces of a
         // directory that no longer exists. Before the group, because EC2 refuses to delete a
         // security group an interface still holds.
-        if !provisioned_interfaces.is_empty() {
-            let released =
-                crate::state::release_server_interfaces(ctx, &region, &provisioned_interfaces)
-                    .await;
-            let mut store = state.lock();
-            if let Some(directory) = store.directories.get_mut(&directory_id) {
-                directory.forget_network_interfaces(&released);
-            }
+        if !teardown.network_interface_ids.is_empty() {
+            crate::state::release_server_interfaces(
+                ctx,
+                &region,
+                &teardown.network_interface_ids,
+            )
+            .await;
         }
 
         // The teardown also releases the network the create provisioned for the directory's
@@ -220,19 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there by the create, so it is DELETED THERE — a group of servers that no longer
         // exist is not one the owner of security groups should go on holding, and a client
         // that reconciles the directory's network against EC2 after the delete finds it
-        // gone. The directory then stops naming it, so no reported `SecurityGroupId` ever
-        // names a group EC2 does not hold; a group EC2 still holds is still reported.
-        if let Some(group_id) = provisioned_group {
-            if crate::state::release_controllers_group(ctx, &region, &group_id).await {
-                let mut store = state.lock();
-                if let Some(directory) = store.directories.get_mut(&directory_id) {
-                    directory.forget_security_group();
-                }
-            }
+        // gone. Nothing of this service names it any more either: the record that did is
+        // gone, so no reported `SecurityGroupId` can name a group EC2 does not hold.
+        if let Some(group_id) = &teardown.security_group_id {
+            crate::state::release_controllers_group(ctx, &region, group_id).await;
         }
 
         Ok(DeleteDirectoryOutput {
-            directory_id: Some(directory_id),
+            directory_id: Some(teardown.directory_id),
         })
     }
 }

@@ -88,8 +88,8 @@ pub mod ca_enrollment_policy;
 /// two modelled absences that resolution reports. Re-exported below, so both operations
 /// reach one decision as `crate::state::<name>`.
 mod certificate_lookup;
-/// The teardown `DeleteDirectory` starts, and the clock that finishes it. Re-exported
-/// below, so its stages are reached as `crate::state::<name>` like every other stage.
+/// The teardown `DeleteDirectory` performs, which is complete when the delete answers.
+/// Re-exported below, so what it hands back is reached as `crate::state::<name>`.
 mod directory_deletion;
 pub mod directory_network;
 pub mod directory_servers;
@@ -119,7 +119,7 @@ pub use ca_enrollment_policy::{
 };
 pub use certificate_lookup::CertificateAbsence;
 pub use diagnostics::*;
-pub use directory_deletion::{STAGE_DELETED, STAGE_DELETING};
+pub use directory_deletion::DirectoryTeardown;
 pub use directory_updates::UpdateActivityRecord;
 
 pub use directory_network::{address_after, server_address, SubnetNetwork};
@@ -2670,22 +2670,6 @@ impl Directory {
         }
     }
 
-    /// Stop naming the security group this directory's servers sat behind, because the owner
-    /// of security groups no longer holds it
-    /// ([`ec2_security_groups::release_controllers_group`]).
-    ///
-    /// A `SecurityGroupId` is a claim that EC2 holds that group, so the one place the claim
-    /// is withdrawn is the one place the group is really gone — nothing else clears it, and a
-    /// directory whose group is still there goes on naming it.
-    pub fn forget_security_group(&mut self) {
-        if let Some(settings) = self.vpc_settings.as_mut() {
-            settings.security_group_id = None;
-        }
-        if let Some(settings) = self.connect_settings.as_mut() {
-            settings.security_group_id = None;
-        }
-    }
-
     /// The subnets this directory's servers are placed across: the `SubnetIds` the create
     /// named, in the order it named them, read from whichever settings block this
     /// directory's type reports its placement as ([`Self::vpc_id`]).
@@ -3913,8 +3897,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// `EnableCAEnrollmentPolicy` or `DisableCAEnrollmentPolicy` ran, a directory
     /// setting's status when
     /// `UpdateSettings` ran, a domain controller's status when the placement or the
-    /// retirement of it ran,
-    /// a directory's teardown when `DeleteDirectory` ran.
+    /// retirement of it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             // The stage a create owes is a CHAIN — `Requested`, then `Creating` for the
@@ -4058,12 +4041,6 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     || controller.status_due_at.is_some_and(|due| now < due)
             });
         }
-        // The chain a DELETE owes: the transient `Deleting` a delete records settles on the
-        // terminal `Deleted`, after which the directory's record leaves the store — a
-        // directory this service no longer holds is not one `DescribeDirectories` reports.
-        // It runs after the stage chain a create owes, so one pass can carry a directory
-        // whose delete ran long enough ago all the way out.
-        self.materialise_directory_deletions(now);
         for snapshot in self.snapshots.values_mut() {
             let Some(due) = snapshot.status_due_at else {
                 continue;
@@ -4239,10 +4216,9 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// The DNS domains this service itself serves: the fully qualified domain name of
     /// every directory it stores, folded by [`domain_key`] so a lookup agrees with DNS.
     ///
-    /// A directory whose teardown has started ([`STAGE_DELETING`], [`STAGE_DELETED`]) is
-    /// NOT one of them: its servers are being decommissioned, so nothing answers DNS at the
-    /// addresses `DirectoryDescription$DnsIpAddrs` reports for it any more, even while the
-    /// control plane still describes the directory through that teardown.
+    /// A directory this service no longer stores is NOT one of them: a delete releases the
+    /// servers that answered DNS at the addresses `DirectoryDescription$DnsIpAddrs` reported
+    /// for it and takes the record with them ([`directory_deletion`]).
     ///
     /// A trust's remote domain is resolved against this set
     /// ([`remote_domain_has_a_peer`]): a directory this service holds IS a peer at its own
@@ -4251,9 +4227,6 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     pub fn domains_served(&self) -> BTreeSet<String> {
         self.directories
             .values()
-            .filter(|directory| {
-                !directory_deletion::DIRECTORY_TEARDOWN_STAGES.contains(&directory.stage.as_str())
-            })
             .map(|directory| domain_key(&directory.name))
             .collect()
     }

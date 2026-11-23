@@ -158,8 +158,7 @@ pub async fn provision_server_interfaces(
 }
 
 /// Release the network interfaces this service placed for a directory's servers: delete them
-/// in the service that OWNS network interfaces, and report the ones that owner no longer
-/// holds.
+/// in the service that OWNS network interfaces.
 ///
 /// Each interface exists FOR one of the directory's servers — nothing else of the account was
 /// ever given it — so the teardown that takes those servers away takes their interfaces with
@@ -168,10 +167,10 @@ pub async fn provision_server_interfaces(
 /// are the ones the create recorded off EC2's own answers, so this deletes the interfaces EC2
 /// minted and never an identifier of this service's own.
 ///
-/// An identifier missing from the answer is one the owner still holds — it could not be asked,
-/// or it refused the delete because something of the account still has the interface attached
-/// — and the directory then goes on naming it, because a record withdrawn while the interface
-/// remained would be the same defect in the other direction.
+/// An interface the owner still holds — it could not be asked, or it refused the delete
+/// because something of the account still has the interface attached — is logged rather than
+/// reported back: the directory those servers belonged to is gone by now, so there is no
+/// record left to name it and nothing for a caller to reconcile against.
 ///
 /// Called with this service's store RELEASED, so no guard is held across the hops, and BEFORE
 /// the group those interfaces carry is released: EC2 refuses to delete a security group an
@@ -180,39 +179,34 @@ pub async fn release_server_interfaces(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     interface_ids: &[String],
-) -> Vec<String> {
-    let mut released: Vec<String> = Vec::new();
+) {
     if interface_ids.is_empty() {
-        return released;
+        return;
     }
     let Some(client) = ec2(ctx, region) else {
         ::tracing::warn!(
             "the request names no Region label, so the network interfaces of the directory's \
              servers cannot be released"
         );
-        return released;
+        return;
     };
     for interface_id in interface_ids {
-        match client
+        if let Err(error) = client
             .delete_network_interface()
             .network_interface_id(interface_id)
             .send()
             .await
         {
-            Ok(_) => released.push(interface_id.clone()),
-            Err(error) => {
-                // At `warn`: a directory torn down with an interface left behind in the
-                // caller's subnet is worth seeing, and this IS why.
-                ::tracing::warn!(
-                    %region,
-                    %interface_id,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "a network interface of a directory's server could not be deleted in EC2"
-                );
-            }
+            // At `warn`: a directory torn down with an interface left behind in the
+            // caller's subnet is worth seeing, and this IS why.
+            ::tracing::warn!(
+                %region,
+                %interface_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a network interface of a directory's server could not be deleted in EC2"
+            );
         }
     }
-    released
 }
 
 impl super::Directory {
@@ -235,18 +229,5 @@ impl super::Directory {
             .get(subnet_id)?
             .private_ip
             .as_deref()
-    }
-
-    /// Stop recording the network interfaces `released` names, because the owner of network
-    /// interfaces no longer holds them ([`release_server_interfaces`]).
-    ///
-    /// A recorded interface is a claim that EC2 holds it, so the one place the claim is
-    /// dropped is the one place the interface is really gone — nothing else clears it, and an
-    /// interface that is still there stays recorded.
-    pub fn forget_network_interfaces(&mut self, released: &[String]) {
-        let released: ::std::collections::BTreeSet<&str> =
-            released.iter().map(String::as_str).collect();
-        self.provisioned_network_interfaces
-            .retain(|_, interface| !released.contains(interface.interface_id.as_str()));
     }
 }

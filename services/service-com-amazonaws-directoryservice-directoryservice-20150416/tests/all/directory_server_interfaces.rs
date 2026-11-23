@@ -553,8 +553,19 @@ async fn deleting_a_directory_releases_the_interfaces_ec2_held_for_its_servers()
             );
         }
 
-        // A repeated delete releases nothing twice and is still served.
-        delete(router, directory_id, case).await;
+        // A repeated delete releases nothing twice: the directory is gone, so there is
+        // nothing to delete and the call is refused.
+        let (status, parsed) = crate::directory_lifecycle::call(
+            router,
+            "DeleteDirectory",
+            json!({ "DirectoryId": directory_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a repeated delete of {directory_id} to be refused, got \
+             {status} with {parsed}"
+        );
     }
 
     // Nothing of the account's own network was taken by any of those teardowns.

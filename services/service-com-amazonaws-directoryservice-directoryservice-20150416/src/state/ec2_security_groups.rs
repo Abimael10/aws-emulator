@@ -219,8 +219,7 @@ pub fn controllers_group_description(directory_id: &str) -> String {
 }
 
 /// Release the security group this service provisioned for a directory's servers: delete it
-/// in the service that OWNS security groups, and report whether that owner no longer holds
-/// it.
+/// in the service that OWNS security groups.
 ///
 /// The group exists FOR the directory's servers — nothing else of the account was ever given
 /// it — so the teardown that takes those servers away takes the group with them: a group left
@@ -229,10 +228,10 @@ pub fn controllers_group_description(directory_id: &str) -> String {
 /// create recorded off EC2's own answer, so this deletes the group EC2 minted and never an id
 /// of this service's own.
 ///
-/// `false` when the owner still holds it — it could not be asked, or it refused the delete
-/// because something of the account still references the group — and the directory then goes
-/// on naming the group that is still there, because a report this service withdrew while the
-/// group remained would be the same defect in the other direction.
+/// An owner that still holds it — it could not be asked, or it refused the delete because
+/// something of the account still references the group — is logged rather than reported back:
+/// the directory the group was for is gone by now, so there is no record left to name it and
+/// nothing for a caller to reconcile against.
 ///
 /// Called with this service's store RELEASED, so no guard is held across the hop. ONE call,
 /// with no caller-sized value in it.
@@ -240,32 +239,28 @@ pub async fn release_controllers_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     group_id: &str,
-) -> bool {
+) {
     let Some(client) = ec2(ctx, region) else {
         ::tracing::warn!(
             "the request names no Region label, so the security group of the directory's \
              servers cannot be released"
         );
-        return false;
+        return;
     };
-    match client
+    if let Err(error) = client
         .delete_security_group()
         .group_id(group_id)
         .send()
         .await
     {
-        Ok(_) => true,
-        Err(error) => {
-            // At `warn` for the same reason the create's hop logs one: a directory torn down
-            // with its security group left behind in EC2 is worth seeing, and this IS why.
-            ::tracing::warn!(
-                %region,
-                %group_id,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the security group of a directory's servers could not be deleted in EC2"
-            );
-            false
-        }
+        // At `warn` for the same reason the create's hop logs one: a directory torn down
+        // with its security group left behind in EC2 is worth seeing, and this IS why.
+        ::tracing::warn!(
+            %region,
+            %group_id,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the security group of a directory's servers could not be deleted in EC2"
+        );
     }
 }
 

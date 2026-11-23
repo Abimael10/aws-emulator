@@ -1,113 +1,71 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! DIRECTORY TEARDOWN: the stages a deleted directory passes through, and the clock that
-//! takes its record away once they have run out.
+//! DIRECTORY TEARDOWN: what `DeleteDirectory` takes away, and the one fact the account keeps
+//! about an id it HAD.
 //!
-//! `DeleteDirectory` does not take the directory away while the caller waits. The modelled
-//! `DirectoryStage` enum declares [`STAGE_DELETING`] and [`STAGE_DELETED`] for exactly this
-//! window, and `DescribeDirectories` keeps DESCRIBING the directory in them: a directory
-//! being torn down still has servers to decommission, so what the delete does is move the
-//! directory OUT of the stage it was serving in and into the teardown — which is the
-//! progress every delete-and-wait client polls for, and what lets such a client tell a
-//! delete it started from an id that never existed.
+//! The teardown is COMPLETE when the delete answers. By the time the operation
+//! ([`crate::ops::delete_directory`]) hands its caller the id, this service has released
+//! everything the directory was given: the network interfaces its servers answered on and the
+//! domain controller security group they sat behind are deleted in the service that OWNS them,
+//! and the entry the Directory Service DATA plane reads is dropped from the shared inventory.
+//! Nothing of the directory is left for a later call to finish.
 //!
-//! So the teardown is a CHAIN the clock owes, built the same way every other transient
-//! state of this service is (see [`TRANSITION_SPAN`]):
+//! So nothing is owed to the clock here. A transition is owed to the clock only while this
+//! service still has work to do after it answered — the servers a create has to bring up,
+//! which is what a create's stage chain reports ([`TRANSITION_SPAN`],
+//! [`DIRECTORY_BUILD_SPAN`]) — and a teardown that ran inside the call has none: a record kept
+//! past it would describe a directory whose servers, addresses, group and data plane are
+//! already gone.
 //!
-//! 1. the delete records [`STAGE_DELETING`], with the next step owed one span later;
-//! 2. that step settles the stage on [`STAGE_DELETED`], the terminal value of the enum, and
-//!    holds the record one more span so a caller can read the settled stage;
-//! 3. the record then leaves the store, taking with it everything that describes nothing
-//!    without it — the directory's snapshots, the trusts it is one party to and the shares
-//!    consumer accounts hold on it — and the id is remembered as one this account HAD, which
-//!    is what makes a later reporting call filtered by it an empty page rather than a
-//!    refusal.
+//! What the delete leaves behind is a single FACT: that this account HAD the id
+//! ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::remember_deleted_directory`]).
+//! That is what makes a later reporting call FILTERED by the id an empty page rather than a
+//! refusal, while an id this account was never issued stays refused — the distinction a
+//! delete-and-wait client reads its own deletion off.
 //!
-//! Nothing here sleeps: each step stores the instant the next one falls due, and
-//! [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`] materialises
-//! whatever is already owed, so the chain runs on the delete's own clock however long ago it
-//! ran and whether or not anybody calls again.
+//! Everything that describes nothing without the directory goes with its record: the snapshots
+//! taken of it, the trusts it is one party to and the shares consumer accounts hold on it.
 
 use super::*;
 
-/// The stage a directory is in while `DeleteDirectory`'s teardown runs: the `Deleting`
-/// value of the modelled `DirectoryStage` enum
-/// (`smithy_query(query="shape",shape="DirectoryStage")`).
+/// What a directory's teardown has to release in the services that OWN the resources its
+/// create was given, read off the record before it left the store.
 ///
-/// A directory in this stage is still one `DescribeDirectories` reports, and no longer one
-/// any stage-gated operation serves.
-pub const STAGE_DELETING: &str = "Deleting";
-
-/// The stage a deleted directory settles on before its record leaves the store: the
-/// `Deleted` value of the same modelled enum, the terminal end of the teardown.
-pub const STAGE_DELETED: &str = "Deleted";
+/// Why it is answered rather than left on the record: the hops into the owner of network
+/// interfaces and security groups hold no lock on this store, so the delete takes the record
+/// away under its own short-lived guard and carries these identifiers out with it.
+#[derive(Debug)]
+pub struct DirectoryTeardown {
+    /// The directory the delete applied to, as this service stored the id.
+    pub directory_id: String,
+    /// The domain controller security group the create was given, or `None` for a directory
+    /// that was given none.
+    pub security_group_id: Option<String>,
+    /// The network interfaces the directory's servers answered on, in subnet order.
+    pub network_interface_ids: Vec<String>,
+}
 
 impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
-    /// Start the teardown of the directory `directory_id`, as of `now`, answering the id of
-    /// the directory the delete applies to — or `None` when no directory is stored under it,
-    /// which is the caller's cue to refuse the request.
+    /// Take the directory `directory_id` out of the store and answer what the caller must now
+    /// release in the services that own it — or `None` when no directory is stored under that
+    /// id, which is the caller's cue to refuse the request.
     ///
-    /// THE one place a delete is recorded: it moves the directory into [`STAGE_DELETING`]
-    /// and owes the rest of the chain to the clock ([`materialise_directory_deletions`],
-    /// reached through `advance_clock`), so the record is still there for the next
-    /// `DescribeDirectories` to report and the id is not yet free.
-    ///
-    /// A directory already being torn down is moved no further: the teardown it is in keeps
-    /// the instant IT was started from, so a repeated delete neither restarts the chain nor
-    /// pushes the removal further out.
-    pub fn begin_directory_deletion(
-        &mut self,
-        directory_id: &str,
-        now: SystemTime,
-    ) -> Option<String> {
-        let directory = self.directories.get_mut(directory_id)?;
-        if !DIRECTORY_TEARDOWN_STAGES.contains(&directory.stage.as_str()) {
-            directory.stage = STAGE_DELETING.to_string();
-            directory.stage_last_updated = now;
-            directory.stage_due_at = Some(now + TRANSITION_SPAN);
-        }
-        Some(directory.directory_id.clone())
-    }
-
-    /// Materialise every step of a directory teardown the clock has already made due at
-    /// `now`: the move to [`STAGE_DELETED`], and then the record leaving the store.
-    ///
-    /// Called from `advance_clock` alone, after the stage chain a CREATE owes, so one pass
-    /// carries a directory whose delete ran long enough ago all the way out.
-    pub(super) fn materialise_directory_deletions(&mut self, now: SystemTime) {
-        for directory in self.directories.values_mut() {
-            let Some(due) = directory.stage_due_at else {
-                continue;
-            };
-            if now >= due && directory.stage == STAGE_DELETING {
-                directory.stage = STAGE_DELETED.to_string();
-                directory.stage_last_updated = due;
-                // The settled stage is held for one more span, so the terminal value of
-                // the teardown is one a caller polling the delete can actually read before
-                // the record goes.
-                directory.stage_due_at = Some(due + TRANSITION_SPAN);
-            }
-        }
-        // Nothing is allocated unless a record really is owed removal, which is the common
-        // case on every other call: the predicate is asked first, and only then is the set
-        // of ids collected — BEFORE any of them is taken out, so the cascade below borrows
-        // the store on its own.
-        let owed = |directory: &&Directory| {
-            directory.stage == STAGE_DELETED
-                && directory.stage_due_at.is_some_and(|due| now >= due)
+    /// THE one place a delete is recorded. The record goes whole, with everything that
+    /// describes nothing without it ([`Self::forget_directory`]), and the id is remembered as
+    /// one this account HAD, so a repeated delete finds nothing to delete and is refused the
+    /// way a delete of an id that was never there is.
+    pub fn tear_down_directory(&mut self, directory_id: &str) -> Option<DirectoryTeardown> {
+        let directory = self.directories.get(directory_id)?;
+        let teardown = DirectoryTeardown {
+            directory_id: directory.directory_id.clone(),
+            security_group_id: directory
+                .provisioned_security_group_id()
+                .map(str::to_string),
+            network_interface_ids: directory.provisioned_network_interface_ids(),
         };
-        if !self.directories.values().any(|directory| owed(&directory)) {
-            return;
-        }
-        let removed: Vec<(String, u64)> = self
-            .directories
-            .values()
-            .filter(owed)
-            .map(|directory| (directory.directory_id.clone(), directory.seq))
-            .collect();
-        for (directory_id, seq) in removed {
-            self.forget_directory(&directory_id, seq);
-        }
+        let seq = directory.seq;
+        self.forget_directory(&teardown.directory_id, seq);
+        Some(teardown)
     }
 
     /// Take the record of the directory `directory_id`, created at rank `seq`, out of the
@@ -141,12 +99,3 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             .retain(|_, share| share.owner_directory_id != directory_id);
     }
 }
-
-/// The stages a directory whose teardown has already started is in.
-///
-/// What they decide: no further delete restarts the chain from one of them, and a directory
-/// in one of them is no longer in service — so it is not a directory this service serves a
-/// DNS domain for
-/// ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::domains_served`]), even
-/// while the control plane still describes it.
-pub(super) const DIRECTORY_TEARDOWN_STAGES: [&str; 2] = [STAGE_DELETING, STAGE_DELETED];

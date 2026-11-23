@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The teardown `DeleteDirectory` starts, driven end to end over HTTP.
+//! The teardown `DeleteDirectory` performs, driven end to end over HTTP.
 //!
 //! Every case goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: DirectoryService_20150416.<Operation>` and an `awsJson1_1` body,
@@ -9,40 +9,36 @@
 //! struct, so an answer that is not computed from persisted state cannot pass.
 //!
 //! The rule under test, asserted over a TABLE of directories rather than one recorded call:
-//! a delete does not take the directory away while the caller waits. It moves the directory
-//! OUT of the stage it was serving in and into the teardown the modelled `DirectoryStage`
-//! enum declares — `Deleting`, then `Deleted` — and `DescribeDirectories` keeps describing
-//! it, from the same persisted record, until the removal the clock owes falls due. Only
-//! then is the directory one the account no longer holds: a reporting call that takes the
-//! id as a FILTER narrows to an empty page, and every other call naming it is refused.
+//! a delete takes the directory away INSIDE the call. Everything the directory was given is
+//! released by the time the delete answers — the interfaces its servers answered on and the
+//! group they sat behind, in the service that owns them (`crate::directory_server_interfaces`
+//! and `crate::directory_network_release` assert that half), and the entry the data plane
+//! reads — so the record that describes them goes with them and nothing is left for a later
+//! call to finish. The FIRST read after the delete therefore answers for a directory this
+//! account no longer holds: a reporting call that takes the id as a FILTER narrows to an
+//! empty page, the unfiltered inventory does not name it, and every call that has to resolve
+//! the id to a live directory is refused — while an id this account was NEVER issued is
+//! refused with the other sentence, which is what lets a client tell its own completed
+//! deletion from an id that was never there.
 //!
-//! The rows differ along what the two creates persist — create operation, directory type,
-//! size, edition and network type — and every pass keeps a control directory in the same
-//! store, so a teardown is shown to be per-directory rather than per-store.
-
-use std::time::Duration;
+//! No case waits for anything here: that there is nothing to wait for is the rule. The rows
+//! differ along what the two creates persist — create operation, directory type, size,
+//! edition and network type — and every pass keeps a control directory in the same store, so
+//! a teardown is shown to be per-directory rather than per-store.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
-    STAGE_DELETED, STAGE_DELETING, TRANSITION_SPAN,
-};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
-    call, create_directory, descriptions, minimal_create, ok, service, string, PASSWORD,
-    PAST_ONE_SPAN, STAGE_ACTIVE,
+    await_in_service, call, create_directory, describe_all, descriptions, minimal_create, ok,
+    service, string, PASSWORD, STAGE_ACTIVE,
 };
-use crate::harness::PAST_THE_TEARDOWN;
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
-/// Comfortably past the FIRST step of the teardown — the move onto the stage it settles on
-/// — and comfortably short of the second, so a case that waits this long observes the
-/// settled stage while the record is still there.
-///
-/// DERIVED from the span the service publishes rather than restated: each step of the
-/// teardown is one [`TRANSITION_SPAN`], so this sits between them with margin on each side.
-const INSIDE_THE_SETTLED_STAGE: Duration =
-    TRANSITION_SPAN.saturating_add(Duration::from_millis(200));
+/// Well-formed `DirectoryId`s (`^d-[0-9a-f]{10}$`) this account is never issued, so each one
+/// reaches a read as a value the account has NEVER held — neither stored nor deleted. Varied
+/// along their digits, so no case can pass by matching one value.
+const NEVER_ISSUED: [&str; 3] = ["d-0000000000", "d-ffffffffff", "d-1234abcdef"];
 
 /// One row of the directory table: how the directory is created.
 struct Row {
@@ -144,8 +140,114 @@ async fn delete(router: &MultiServiceRouter, directory_id: &str, case: &str) {
     );
 }
 
+/// This service's refusal envelope: the diagnostic, then the call's OWN request id — which is
+/// the one the body reports, never a value written into a case.
+fn with_request_id(diagnostic: &str, request_id: &str) -> String {
+    format!("{diagnostic} : RequestId: {request_id}")
+}
+
+/// Assert that `operation` with `body` is refused HTTP 400 / `EntityDoesNotExistException`
+/// with `diagnostic` followed by the request id the refusal itself reports.
+async fn refused_with(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    diagnostic: &str,
+    case: &str,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to be refused, got {status} with {parsed}"
+    );
+    assert_eq!(
+        parsed["__type"],
+        json!("EntityDoesNotExistException"),
+        "case {case:?}: expected the modelled not-found refusal from {operation}, got {parsed}"
+    );
+    let request_id = string(&parsed, "RequestId", case);
+    assert_eq!(
+        string(&parsed, "Message", case),
+        with_request_id(diagnostic, &request_id),
+        "case {case:?}: expected {operation} to state the not-found sentence for the id the \
+         request named, got {parsed}"
+    );
+}
+
+/// The sentence a call whose subject has to be a directory this account holds is refused
+/// with, for the id the REQUEST named (`state::no_such_directory`).
+fn does_not_exist(directory_id: &str) -> String {
+    format!("Directory: '{directory_id}' does not exist.")
+}
+
+/// The sentence a reporting call FILTERED by ids the account has never held is refused with,
+/// naming those ids (`state::invalid_directory_ids`).
+fn invalid_directory_ids(directory_ids: &[&str]) -> String {
+    format!("Invalid directory ID(s): {}.", directory_ids.join(","))
+}
+
+/// Every call of this slice whose subject has to be a directory the account holds, named by
+/// `DirectoryId`, for the id `directory_id`: each of them must refuse an id whose directory
+/// is gone, with the sentence for an id that resolves to no directory
+/// (`state::no_such_directory`).
+fn calls_needing_a_live_directory(directory_id: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("DeleteDirectory", json!({ "DirectoryId": directory_id })),
+        ("GetSnapshotLimits", json!({ "DirectoryId": directory_id })),
+        (
+            "CreateSnapshot",
+            json!({ "DirectoryId": directory_id, "Name": "after-the-delete" }),
+        ),
+        (
+            "CreateAlias",
+            json!({ "DirectoryId": directory_id, "Alias": "revived" }),
+        ),
+    ]
+}
+
+/// The calls of the TAG family for the same id, which take it as a `ResourceId`: they are
+/// refused too, with that family's own sentence for an identifier that resolves to no
+/// resource (`state::invalid_resource_id`, whose wording `crate::error_envelopes` pins), so
+/// what is asserted here is that the directory is gone for them as well.
+fn tag_calls(directory_id: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        ("ListTagsForResource", json!({ "ResourceId": directory_id })),
+        (
+            "AddTagsToResource",
+            json!({
+                "ResourceId": directory_id,
+                "Tags": [{ "Key": "env", "Value": "dev" }],
+            }),
+        ),
+        (
+            "RemoveTagsFromResource",
+            json!({ "ResourceId": directory_id, "TagKeys": ["owner"] }),
+        ),
+    ]
+}
+
+/// Assert that `operation` with `body` is refused HTTP 400 / `EntityDoesNotExistException`,
+/// whatever the family's diagnostic says.
+async fn refused_as_absent(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to be refused, got {status} with {parsed}"
+    );
+    assert_eq!(
+        parsed["__type"],
+        json!("EntityDoesNotExistException"),
+        "case {case:?}: expected the modelled not-found refusal from {operation}, got {parsed}"
+    );
+}
+
 #[tokio::test]
-async fn a_deleted_directory_is_described_through_its_teardown_and_then_is_gone() {
+async fn a_delete_takes_the_directory_away_in_the_call() {
     let router = service();
     let rows = rows();
 
@@ -161,20 +263,21 @@ async fn a_deleted_directory_is_described_through_its_teardown_and_then_is_gone(
     for row in &rows {
         ids.push((row, create(&router, row).await));
     }
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    for (row, id) in &ids {
+        await_in_service(&router, id, row.case).await;
+    }
 
     for (row, id) in &ids {
         let case = row.case;
-        // The directory is in service before the delete, so the stage the delete moves it
-        // out of is a stage it really was in.
+        // The directory is in service before the delete, so the directory the delete takes
+        // away is one that really was being served.
         assert_eq!(
             reported_stage(&router, id, case).await.as_deref(),
             Some(STAGE_ACTIVE),
             "case {case:?}: expected the directory to be in service before the delete"
         );
-        // A tag, so the record the teardown keeps describing is one with content of its
-        // own: nothing of the description is invented while the directory is being torn
-        // down.
+        // A tag, so the record the delete takes away is one with content of its own: what
+        // hangs off a directory goes when the directory does.
         ok(
             &router,
             "AddTagsToResource",
@@ -182,80 +285,37 @@ async fn a_deleted_directory_is_described_through_its_teardown_and_then_is_gone(
             case,
         )
         .await;
-        let before = page_for(&router, id, case).await;
 
         delete(&router, id, case).await;
 
-        // The delete answered, and the directory is STILL described — out of `Active` and
-        // into the first stage of the teardown, with everything else the record holds
-        // reported exactly as it was.
-        let during = page_for(&router, id, case).await;
+        // The FIRST read after the delete, with nothing waited for: the account no longer
+        // holds the directory. The id FILTERS the reporting call to an empty page, which is
+        // what a delete-and-wait client reads its own deletion off.
         assert_eq!(
-            during.len(),
-            1,
-            "case {case:?}: expected the deleted directory to still be described, got \
-             {during:?}"
+            page_for(&router, id, case).await,
+            Vec::<Value>::new(),
+            "case {case:?}: expected the deleted id to narrow the page to nothing"
         );
-        let described = &during[0];
-        assert_eq!(
-            described["Stage"],
-            json!(STAGE_DELETING),
-            "case {case:?}: expected the teardown's first stage, got {described}"
+        // ...and the unfiltered inventory does not name it either.
+        let inventory: Vec<String> = describe_all(&router, case)
+            .await
+            .iter()
+            .map(|described| string(described, "DirectoryId", case))
+            .collect();
+        assert!(
+            !inventory.contains(id),
+            "case {case:?}: expected {id} to be absent from the account's inventory, got \
+             {inventory:?}"
         );
-        for member in ["DirectoryId", "Name", "Type", "LaunchTime"] {
-            assert_eq!(
-                described[member], before[0][member],
-                "case {case:?}: expected {member} to be reported from the same record, got {}",
-                described[member]
-            );
+        // Every call whose subject has to be a live directory is refused, with the sentence
+        // for an id that resolves to no directory and the refusal's own request id.
+        for (operation, body) in calls_needing_a_live_directory(id) {
+            refused_with(&router, operation, body, &does_not_exist(id), case).await;
         }
-        // The tags are still the resource's own while it is being torn down: the record is
-        // there, so what hangs off it is reported from there.
-        let tags = ok(
-            &router,
-            "ListTagsForResource",
-            json!({ "ResourceId": id }),
-            case,
-        )
-        .await;
-        assert_eq!(
-            tags["Tags"],
-            json!([{ "Key": "owner", "Value": "platform" }]),
-            "case {case:?}: expected the directory's own tags during the teardown, got {tags}"
-        );
-
-        // One span on, the teardown has settled on the stage the modelled enum ends at,
-        // and the record is still there to report it.
-        tokio::time::sleep(INSIDE_THE_SETTLED_STAGE).await;
-        assert_eq!(
-            reported_stage(&router, id, case).await.as_deref(),
-            Some(STAGE_DELETED),
-            "case {case:?}: expected the teardown to settle on the enum's terminal stage"
-        );
-
-        // And once the removal the delete owes falls due the account no longer holds the
-        // directory: the id FILTERS the reporting call to an empty page, and every call
-        // whose subject is the directory is refused.
-        tokio::time::sleep(PAST_THE_TEARDOWN).await;
-        assert_eq!(
-            reported_stage(&router, id, case).await,
-            None,
-            "case {case:?}: expected the record to have left the store"
-        );
-        for (operation, body) in [
-            ("ListTagsForResource", json!({ "ResourceId": id })),
-            ("CreateAlias", json!({ "DirectoryId": id, "Alias": "revived" })),
-            (
-                "AddTagsToResource",
-                json!({ "ResourceId": id, "Tags": [{ "Key": "env", "Value": "dev" }] }),
-            ),
-        ] {
-            let (status, parsed) = call(&router, operation, body).await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected {operation} on a removed directory to be refused, \
-                 got {status} with {parsed}"
-            );
+        // ...and the tag calls, which name the same id as a RESOURCE, are refused too: the
+        // tags that hung off the directory went with it.
+        for (operation, body) in tag_calls(id) {
+            refused_as_absent(&router, operation, body, case).await;
         }
     }
 
@@ -271,43 +331,78 @@ async fn a_deleted_directory_is_described_through_its_teardown_and_then_is_gone(
 }
 
 #[tokio::test]
-async fn a_repeated_delete_answers_the_same_id_and_does_not_restart_the_teardown() {
+async fn a_deleted_id_is_told_apart_from_one_the_account_was_never_issued() {
     let router = service();
-    let id = create_directory(&router, minimal_create("twice.example.com"), "repeated").await;
-    let kept = create_directory(&router, minimal_create("kept.example.com"), "repeated").await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    let case = "the two absences";
+    let deleted = create_directory(&router, minimal_create("told-apart.example.com"), case).await;
+    let kept = create_directory(&router, minimal_create("kept.example.com"), case).await;
+    await_in_service(&router, &deleted, case).await;
 
-    delete(&router, &id, "repeated: the first delete").await;
-    // The second delete asks for the state the directory is already heading for: it answers
-    // the same id, and the teardown keeps the instant the FIRST delete started it from — so
-    // the record still leaves the store within one teardown of that first call rather than
-    // of this one.
-    delete(&router, &id, "repeated: the second delete").await;
+    delete(&router, &deleted, case).await;
+
+    // An id this account HAD: the reporting call filtered by it is SERVED, with an empty
+    // page, and a live id beside it is still reported.
+    let mixed = ok(
+        &router,
+        "DescribeDirectories",
+        json!({ "DirectoryIds": [&deleted, &kept] }),
+        case,
+    )
+    .await;
+    let reported: Vec<String> = descriptions(&mixed, case)
+        .iter()
+        .map(|described| string(described, "DirectoryId", case))
+        .collect();
     assert_eq!(
-        reported_stage(&router, &id, "repeated").await.as_deref(),
-        Some(STAGE_DELETING),
-        "case \"repeated\": expected the repeated delete to leave the teardown where it was"
+        reported,
+        vec![kept.clone()],
+        "case {case:?}: expected the deleted id to narrow away and the live one to remain"
     );
 
-    tokio::time::sleep(PAST_THE_TEARDOWN).await;
+    // An id the account was never issued is a value the listing cannot be narrowed by, so it
+    // is refused instead — naming exactly the ids that were never held, in filter order.
+    for never in NEVER_ISSUED {
+        refused_with(
+            &router,
+            "DescribeDirectories",
+            json!({ "DirectoryIds": [never] }),
+            &invalid_directory_ids(&[never]),
+            case,
+        )
+        .await;
+        refused_with(
+            &router,
+            "DescribeDirectories",
+            json!({ "DirectoryIds": [&deleted, never, &kept] }),
+            &invalid_directory_ids(&[never]),
+            case,
+        )
+        .await;
+    }
+    refused_with(
+        &router,
+        "DescribeDirectories",
+        json!({ "DirectoryIds": [NEVER_ISSUED[2], &deleted, NEVER_ISSUED[0]] }),
+        &invalid_directory_ids(&[NEVER_ISSUED[2], NEVER_ISSUED[0]]),
+        case,
+    )
+    .await;
+
+    // ...and for the calls that must resolve the id to a live directory, the two absences are
+    // one and the same answer: there is no directory to act on either way.
+    for subject in [deleted.as_str(), NEVER_ISSUED[1]] {
+        for (operation, body) in calls_needing_a_live_directory(subject) {
+            refused_with(&router, operation, body, &does_not_exist(subject), case).await;
+        }
+        for (operation, body) in tag_calls(subject) {
+            refused_as_absent(&router, operation, body, case).await;
+        }
+    }
+
     assert_eq!(
-        reported_stage(&router, &id, "repeated").await,
-        None,
-        "case \"repeated\": expected the record to leave the store on the first delete's \
-         own clock"
-    );
-    // A delete of an id the account no longer holds is refused, which is how a client tells
-    // a delete it started from an id that was never there.
-    let (status, parsed) = call(&router, "DeleteDirectory", json!({ "DirectoryId": &id })).await;
-    assert_eq!(
-        status, 400,
-        "case \"repeated\": expected a delete of the removed id to be refused, got {status} \
-         with {parsed}"
-    );
-    assert_eq!(
-        reported_stage(&router, &kept, "repeated").await.as_deref(),
+        reported_stage(&router, &kept, case).await.as_deref(),
         Some(STAGE_ACTIVE),
-        "case \"repeated\": expected the other directory to be untouched"
+        "case {case:?}: expected the other directory to be untouched"
     );
 }
 
@@ -315,9 +410,12 @@ async fn a_repeated_delete_answers_the_same_id_and_does_not_restart_the_teardown
 async fn what_describes_nothing_without_the_directory_goes_with_its_record() {
     let router = service();
     let case = "the cascade";
-    let doomed = create_microsoft_ad(&router, minimal_microsoft_ad("doomed.example.com"), case).await;
+    let doomed =
+        create_microsoft_ad(&router, minimal_microsoft_ad("doomed.example.com"), case).await;
     let kept = create_microsoft_ad(&router, minimal_microsoft_ad("kept.example.com"), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    for id in [&doomed, &kept] {
+        await_in_service(&router, id, case).await;
+    }
 
     // A snapshot OF each directory, so the one taken of the doomed directory is a record
     // that describes nothing once its directory's record is gone.
@@ -335,29 +433,8 @@ async fn what_describes_nothing_without_the_directory_goes_with_its_record() {
 
     delete(&router, &doomed, case).await;
 
-    // While the directory is being torn down its record is still there, so the snapshot
-    // taken of it is still described: the cascade follows the RECORD leaving the store, not
-    // the delete being accepted.
-    let during = ok(
-        &router,
-        "DescribeSnapshots",
-        json!({ "SnapshotIds": [&snapshots[0]] }),
-        case,
-    )
-    .await;
-    assert_eq!(
-        during["Snapshots"]
-            .as_array()
-            .map(|infos| infos.len())
-            .unwrap_or_default(),
-        1,
-        "case {case:?}: expected the snapshot to be described during the teardown, got \
-         {during}"
-    );
-
-    tokio::time::sleep(PAST_THE_TEARDOWN).await;
-    // The record is gone, and with it the snapshot taken of that directory — while the
-    // other directory's snapshot is untouched.
+    // The record is gone, and with it the snapshot taken of that directory — the cascade
+    // follows the record, and the record goes with the delete.
     let (status, parsed) = call(
         &router,
         "DescribeSnapshots",
@@ -366,9 +443,10 @@ async fn what_describes_nothing_without_the_directory_goes_with_its_record() {
     .await;
     assert_eq!(
         status, 400,
-        "case {case:?}: expected a snapshot of the removed directory to resolve to nothing, \
+        "case {case:?}: expected a snapshot of the deleted directory to resolve to nothing, \
          got {status} with {parsed}"
     );
+    // ...while the other directory's snapshot is untouched.
     let surviving = ok(
         &router,
         "DescribeSnapshots",
