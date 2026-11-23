@@ -30,7 +30,10 @@ use crate::snapshot_copy_configuration::available_cluster;
 ///
 /// Source: `smithy_query(query="shape", shape="AquaConfigurationStatus")` — the
 /// enum admits `auto`, `disabled` and `enabled`.
-const REQUESTED_STATUSES: [Option<&str>; 4] =
+///
+/// `pub(crate)` so a sibling suite about the SAME operation drives the same class
+/// through this one table rather than keeping a second copy of it.
+pub(crate) const REQUESTED_STATUSES: [Option<&str>; 4] =
     [Some("enabled"), Some("disabled"), Some("auto"), None];
 
 /// The AQUA configuration every cluster carries, as the wire reports it: AQUA is
@@ -39,7 +42,10 @@ const AUTOMATIC_CONFIGURATION: (&str, &str) = ("disabled", "auto");
 
 /// `ModifyAquaConfiguration` for one cluster, asking for `status` when the row
 /// carries one.
-async fn modify_aqua(emulator: &Emulator, cluster: &str, status: Option<&str>) -> Answer {
+///
+/// `pub(crate)` for the same reason as the table above: a sibling suite makes the
+/// same request through this one builder.
+pub(crate) async fn modify_aqua(emulator: &Emulator, cluster: &str, status: Option<&str>) -> Answer {
     let mut params: Vec<(&str, &str)> = vec![("ClusterIdentifier", cluster)];
     if let Some(status) = status {
         params.push(("AquaConfigurationStatus", status));
