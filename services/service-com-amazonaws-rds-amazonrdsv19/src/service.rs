@@ -46,7 +46,10 @@
 //! own rules refused with — a value outside a declared constraint, and a `@required`
 //! member the request did not carry; see [`invalid_parameter_value`]. Neither of the
 //! framework's two codes for those classes is one this service's Query API publishes, and
-//! the code is what a client branches on.
+//! the code is what a client branches on. It also words the second of those two: a
+//! parameter the request never carried is refused by naming the parameter it has to supply
+//! ([`missing_parameter`]), which is a different statement from the constraint clause a
+//! value that WAS carried is reported with.
 //!
 //! `override_operation` refuses a request whose Query envelope asks for an API version
 //! this service does not serve — see [`api_version`]. The framework's `awsQuery` routing
@@ -84,6 +87,7 @@
 pub mod api_version;
 pub mod authorization;
 pub mod management_events;
+pub mod missing_parameter;
 pub mod query_error_envelope;
 pub mod unresolved_reference;
 
@@ -116,27 +120,35 @@ const XML_NAMESPACE: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 /// service publishes, so a client branching on the documented one never fires.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
-/// A refusal produced by the rules the MODEL declares, restated under the error code this
-/// service's Query API publishes for it, or `None` when there was nothing to state.
+/// A refusal produced by the rules the MODEL declares, restated the way this service's
+/// Query API states it, or `None` when there was nothing to state.
 ///
-/// Only the CODE changes. The message is the framework's, built from the member path and
-/// the requirement each violation carries (`1 validation error detected: Value '<value>' at
-/// '<member>' failed to satisfy constraint: <requirement>`), which is the text AWS answers
-/// such a refusal with — so there is nothing to reword and the two cannot drift.
+/// The CODE is this service's for the whole class. The class is every rule a member can
+/// declare — a numeric range, a length, a pattern, an enumerated value set, uniqueness, and
+/// the `@required` trait a request did not satisfy — because one code covers them all: each
+/// is a parameter whose value the request did not supply acceptably. That makes one refusal
+/// of one class whichever layer finds it: the operations whose page size is a modelled
+/// `@range` are refused exactly as the ones that carry the same bound in prose and check it
+/// in the handler, and a `@required` member the codec found absent while reading the body is
+/// refused as a parameter rather than as a body this front door could not read — which is
+/// what the other query code names, and is a different claim about the request.
 ///
-/// The class is every rule a member can declare — a numeric range, a length, a pattern, an
-/// enumerated value set, uniqueness, and the `@required` trait a request did not satisfy —
-/// because one code covers them all: each is a parameter whose value the request did not
-/// supply acceptably. That makes one refusal of one class whichever layer finds it: the
-/// operations whose page size is a modelled `@range` are refused exactly as the ones that
-/// carry the same bound in prose and check it in the handler, and a `@required` member the
-/// codec found absent while reading the body is refused as a parameter rather than as a body
-/// this front door could not read — which is what the other query code names, and is a
-/// different claim about the request.
+/// The SENTENCE follows what the request DID. A parameter it did not carry is refused by
+/// naming the parameter it has to supply ([`missing_parameter`]): there is no value to report
+/// and no value broke a constraint, so the service states which parameter is needed and
+/// nothing else. A value it DID carry is reported as the constraint that value broke, in the
+/// framework's own clause built from the member path and the requirement (`1 validation error
+/// detected: Value '<value>' at '<member>' failed to satisfy constraint: <requirement>`),
+/// which is the text AWS answers that class with — so there is nothing to reword there and
+/// the two cannot drift.
 fn invalid_parameter_value(violations: &[Violation]) -> Option<Refused> {
+    let message = match missing_parameter::message(violations) {
+        Some(absent) => absent,
+        None => envelope(violations)?,
+    };
     Some(Refused {
         code: INVALID_PARAMETER_VALUE.to_string(),
-        message: envelope(violations)?,
+        message,
     })
 }
 
@@ -261,8 +273,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it the way this service states it. The one class reworded here is a request the
         // model's own rules refused — a value outside a declared constraint, or a
         // `@required` member it did not carry — which carries this service's own
-        // `InvalidParameterValue` code and the framework's message unchanged (see
-        // [`invalid_parameter_value`]); every other refusal keeps the framework's wording.
+        // `InvalidParameterValue` code, and its own sentence for a parameter the request
+        // left out (see [`invalid_parameter_value`]); every other refusal keeps the
+        // framework's wording.
         match refusal {
             Refusal::Invalid(violations) => invalid_parameter_value(violations),
             _ => None,

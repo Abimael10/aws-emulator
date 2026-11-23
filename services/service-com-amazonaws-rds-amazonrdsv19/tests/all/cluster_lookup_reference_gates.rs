@@ -16,8 +16,9 @@
 //!   lookup, so one cluster is reported by one name whichever form the request used.
 //! * A request the model's own rules refused — a value outside a declared constraint, and a
 //!   `@required` member the request did not carry — is answered with the Query API code this
-//!   front door publishes for a parameter it was not given acceptably, keeping the
-//!   validation sentence the refusal already carries.
+//!   front door publishes for a parameter it was not given acceptably, and a parameter the
+//!   request never carried is refused by naming the parameter it has to supply (the sentence
+//!   the sibling table in `missing_parameter_refusal_sentences.rs` holds this door to).
 //!
 //! Each table spans what its rule generalises over: which operation the reference reached and
 //! which clause of the grammar the value broke; the forms a reference can take (identifier,
@@ -340,8 +341,8 @@ struct AbsentMemberCase {
     case: &'static str,
     action: &'static str,
     params: &'static [(&'static str, &'static str)],
-    /// The member path the refusal names — the model's member name with its first character
-    /// lowered, which is the casing the validation envelope uses.
+    /// The parameter the refusal names — the model's member name with its first character
+    /// lowered, which is the casing a refusal of this front door spells a member in.
     member_path: &'static str,
 }
 
@@ -401,8 +402,7 @@ async fn an_absent_required_member_is_refused_as_a_parameter_value() {
         );
         let message = text(&body, "Message");
         let expected = format!(
-            "1 validation error detected: Value null at '{}' failed to satisfy constraint: \
-             Member must not be null",
+            "Please specify a value for parameter '{}'.",
             row.member_path
         );
         assert_eq!(
