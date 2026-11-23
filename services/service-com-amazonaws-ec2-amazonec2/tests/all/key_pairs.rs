@@ -354,10 +354,15 @@ async fn create_key_pair_generates_the_asked_for_key_and_stores_its_public_half(
                 );
                 // "For ED25519 key pairs, the key fingerprint is the base64-encoded SHA-256
                 // digest, which is the default for OpenSSH" — so the reported fingerprint is
-                // the one OpenSSH itself computes over this very public key.
-                let expected = parsed_public
-                    .fingerprint(::ssh_key::HashAlg::Sha256)
-                    .to_string();
+                // the digest OpenSSH itself computes over this very public key, base64
+                // encoded with its padding and carrying no algorithm name (the `SHA256:`
+                // `ssh-keygen -l` prints names the hash it used; the model's sentence is
+                // about the digest).
+                let expected = ::base64::engine::general_purpose::STANDARD.encode(
+                    parsed_public
+                        .fingerprint(::ssh_key::HashAlg::Sha256)
+                        .as_bytes(),
+                );
                 assert_eq!(
                     fingerprint, expected,
                     "case {case:?}: expected the fingerprint of the stored public key \

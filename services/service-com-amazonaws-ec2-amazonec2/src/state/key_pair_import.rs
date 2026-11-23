@@ -30,7 +30,10 @@
 
 use ::md5::Digest as _;
 
-use super::{colon_separated_hex, openssh_public_key_line, KEY_TYPE_ED25519, KEY_TYPE_RSA};
+use super::{
+    base64_sha256_fingerprint, colon_separated_hex, openssh_public_key_line, KEY_TYPE_ED25519,
+    KEY_TYPE_RSA,
+};
 
 /// The RSA key lengths an import admits, in bits: "supported lengths: 1024, 2048, and 4096"
 /// (Amazon EC2 User Guide, "Create a key pair and import the public key to Amazon EC2" —
@@ -133,10 +136,10 @@ pub fn read_public_key_material(material: &[u8]) -> Option<ImportedPublicKey> {
 ///   fingerprint in. That is the value `openssl rsa -in key -pubout -outform DER | openssl
 ///   md5 -c` prints, which is how the User Guide has a caller verify an imported RSA pair's
 ///   fingerprint.
-/// * ED25519 — "the base64-encoded SHA-256 digest, which is the default for OpenSSH": the
-///   `SHA256:<base64>` form `ssh-keygen -l` prints, which is what that default IS, and the
-///   same rendering a generated Ed25519 key pair's fingerprint takes
-///   ([`super::key_pair_material`]) — one sentence of the model, one rendering.
+/// * ED25519 — "the base64-encoded SHA-256 digest, which is the default for OpenSSH": that
+///   digest, base64-encoded ([`base64_sha256_fingerprint`]), which is also the rendering a
+///   generated Ed25519 key pair's fingerprint takes ([`super::key_pair_material`]) — one
+///   sentence of the model, one rendering.
 ///
 /// Both are computed from the key material ALONE, so one key always fingerprints to one
 /// string and every later read of the pair answers that one value.
@@ -145,7 +148,7 @@ fn imported_key_fingerprint(key: &::ssh_key::PublicKey) -> Option<String> {
         ::ssh_key::public::KeyData::Rsa(rsa) => Some(colon_separated_hex(&::md5::Md5::digest(
             rsa_subject_public_key_info(rsa)?,
         ))),
-        _ => Some(key.fingerprint(::ssh_key::HashAlg::Sha256).to_string()),
+        _ => Some(base64_sha256_fingerprint(key)),
     }
 }
 

@@ -7,9 +7,11 @@
 //! (`DescribeKeyPairs`) — narrowed by `KeyNames`, `KeyPairIds` and the filters the operation
 //! publishes, in `KeyPairId` order.
 //!
-//! A name or an id the account holds no key pair under is `InvalidKeyPair.NotFound` rather
-//! than an absent row, a filter name the operation does not publish is
-//! `InvalidParameterValue`, and `DryRun` reports whether the request WOULD have succeeded.
+//! A value given as a key pair id that is no key pair id at all is `InvalidParameterValue`,
+//! read BEFORE anything is looked up; a name or a WELL-FORMED id the account holds no key
+//! pair under is `InvalidKeyPair.NotFound` rather than an absent row, a filter name the
+//! operation does not publish is `InvalidParameterValue`, and `DryRun` reports whether the
+//! request WOULD have succeeded.
 //! "The public key material" is reported only when `IncludePublicKey` asks for it
 //! ([`crate::state::KeyPairRecord::view`]); the private half is not stored at all, so no
 //! read can ever answer one.
@@ -235,6 +237,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "KeyNames carries {} names, above the maximum of {MAX_RESOURCE_IDS}",
                 requested_names.len()
             )));
+        }
+
+        // What each selector IS is settled from the request alone, BEFORE the store is
+        // consulted: a value given as a key pair id that is not one names no key pair of any
+        // account, so it is a complaint about the REQUEST rather than a key pair reported
+        // absent from this one — the ordering and the wording every other operation taking a
+        // key pair id keeps ([`crate::state::key_pair_selector`], which
+        // `crate::state::invalid_key_pair_id_value` is shared with), so one unreadable id
+        // earns one refusal wherever it is named. That is also what leaves
+        // `InvalidKeyPair.NotFound` to mean a WELL-FORMED id the account holds no key pair
+        // under, so a caller can tell a value that is no key pair id from a key pair that is
+        // gone or another account's.
+        if let Some(malformed) = requested_ids
+            .iter()
+            .find(|id| !crate::state::key_pair_id_is_well_formed(id))
+        {
+            return Err(crate::state::invalid_key_pair_id_value(malformed));
+        }
+        // The same reading for a NAME: the bounds EC2 publishes on a key pair name whichever
+        // call supplies it are read through the one helper that states them
+        // ([`crate::state::validate_key_pair_name`]), so a name no key pair could ever carry
+        // is refused here rather than reported absent. An empty entry names nothing of its
+        // own — ec2Query carries an omitted member and an empty one identically — so it is
+        // left to the lookup below rather than read as a request missing the member.
+        for key_name in requested_names.iter().filter(|name| !name.is_empty()) {
+            crate::state::validate_key_pair_name(key_name)?;
         }
 
         let store = state.lock();

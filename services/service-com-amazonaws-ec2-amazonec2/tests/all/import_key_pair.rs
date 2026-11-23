@@ -226,14 +226,13 @@ fn expected_rsa_fingerprint(bits: usize, seed: u8) -> String {
 }
 
 /// The `KeyFingerprint` an imported ED25519 key pair reports: "the base64-encoded SHA-256
-/// digest, which is the default for OpenSSH" — the `SHA256:<base64>` form `ssh-keygen -l`
-/// prints, which is what that default is, over the key's own blob. The same rendering a
-/// generated Ed25519 key pair's fingerprint takes, which [`super::key_pairs`] asserts.
+/// digest, which is the default for OpenSSH" — the SHA-256 digest of the key's own blob,
+/// base64-encoded with its padding and carrying no algorithm name (`ssh-keygen -l` prints
+/// that digest inside a `SHA256:` rendering of its own, which names the hash rather than
+/// being part of the value). The same rendering a generated Ed25519 key pair's fingerprint
+/// takes, which [`super::key_pairs`] asserts.
 fn expected_ed25519_fingerprint(blob: &[u8]) -> String {
-    format!(
-        "SHA256:{}",
-        ::base64::engine::general_purpose::STANDARD_NO_PAD.encode(::sha2::Sha256::digest(blob))
-    )
+    ::base64::engine::general_purpose::STANDARD.encode(::sha2::Sha256::digest(blob))
 }
 
 // ===========================================================================

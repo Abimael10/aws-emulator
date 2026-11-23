@@ -182,9 +182,9 @@ fn generate_ed25519_key_pair(key_format: &str, comment: &str) -> Option<Generate
     let private_key = ::ssh_key::PrivateKey::from(keypair);
     let public_key = private_key.public_key().clone();
     // "For ED25519 key pairs, the key fingerprint is the base64-encoded SHA-256 digest,
-    // which is the default for OpenSSH" (`KeyPair$KeyFingerprint`) — the `SHA256:<base64>`
-    // form `ssh-keygen -l` prints, which is what that default IS.
-    let key_fingerprint = public_key.fingerprint(::ssh_key::HashAlg::Sha256).to_string();
+    // which is the default for OpenSSH" (`KeyPair$KeyFingerprint`), rendered by the ONE
+    // reading of that sentence this crate has ([`base64_sha256_fingerprint`]).
+    let key_fingerprint = base64_sha256_fingerprint(&public_key);
     let key_material = match key_format {
         KEY_FORMAT_PPK => putty_private_key(
             &public_key,
@@ -341,4 +341,23 @@ pub fn colon_separated_hex(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<String>>()
         .join(":")
+}
+
+/// "The base64-encoded SHA-256 digest" (`KeyPair$KeyFingerprint`,
+/// `KeyPairInfo$KeyFingerprint`) of `public_key` — the fingerprint EC2 publishes for an
+/// ED25519 key pair, whether it generated the pair or imported it.
+///
+/// The value is the DIGEST, base64-encoded: standard base64 with its padding, carrying no
+/// algorithm name. `ssh-keygen -l` prints that same digest inside a `SHA256:<base64>`
+/// rendering with the padding stripped, which names the hash it used — the model's sentence
+/// is about the digest, so the prefix is not part of the value.
+///
+/// The ONE reading of that sentence, shared with [`super::key_pair_import`]: a generated and
+/// an imported ED25519 key pair carry the identical sentence in the model, so one key
+/// fingerprints to one string however the account came by it.
+pub fn base64_sha256_fingerprint(public_key: &::ssh_key::PublicKey) -> String {
+    use ::base64::Engine as _;
+
+    ::base64::engine::general_purpose::STANDARD
+        .encode(public_key.fingerprint(::ssh_key::HashAlg::Sha256).as_bytes())
 }
