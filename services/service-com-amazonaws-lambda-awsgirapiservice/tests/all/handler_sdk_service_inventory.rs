@@ -59,7 +59,10 @@ const KEY: &str = "orders/one.txt";
 /// — the `*_MODEL` includes in `src/state/execution/aws_api.rs`, one per
 /// `services/service-com-amazonaws-<service>-*` crate — each named here by the token the AWS
 /// SDK for Python builds a client for it with. A service whose model is embedded and whose
-/// protocol is bound, but whose token the inventory omits, is one no handler can call at all.
+/// protocol is bound, but whose token the inventory omits, is one no handler can call at all —
+/// which goes for the token service as much as for the ones a handler calls to do its work: a
+/// handler that cannot build a client for it can neither read back which identity it runs as nor
+/// assume another role.
 const MUST_REACH: &[&str] = &[
     "apigateway",
     "apigatewaymanagementapi",
@@ -81,6 +84,7 @@ const MUST_REACH: &[&str] = &[
     "sns",
     "sqs",
     "ssm",
+    "sts",
     "xray",
 ];
 
