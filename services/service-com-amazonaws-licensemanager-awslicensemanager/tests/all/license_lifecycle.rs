@@ -13,9 +13,13 @@
 //! * the minted identity is a license ARN in the Region the request named as the
 //!   license's home, the license is `AVAILABLE` at once, and its version is the
 //!   first one.
-//! * `Issuer.KeyFingerprint` is on the READ shape only, so the service derives it
-//!   from the issuer identity and every read of every license of one issuer reports
-//!   the same value, while any other issuer identity reports another.
+//! * `Issuer.KeyFingerprint` is on the READ shape only, so the service derives it:
+//!   it is the colon-delimited text `aws:<account>:<issuer name>:issuer-fingerprint`,
+//!   which a client can construct for itself, so every read of every license of one
+//!   issuer name reports that same value and another issuer name reports another;
+//! * every instant this service renders from the clock — `License.CreateTime` here —
+//!   is a Z-suffixed ISO8601-UTC instant at millisecond precision or none: three
+//!   fractional digits at most, never the microseconds a host clock also offers.
 //! * `ClientToken` is an idempotency key: the repeat of an accepted create reports
 //!   the license that create minted and mints nothing new.
 //! * a license body this store will not hold is refused with a modelled 400 and
@@ -27,6 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -44,6 +49,24 @@ const SIGNING_REGION: &str = "us-east-1";
 /// The canonical account id every emulated ARN carries
 /// (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
+
+/// The last segment of the issuer key fingerprint License Manager reports, as the
+/// recorded `GetLicense` body renders it: fixed text, not a per-issuer or per-run
+/// value, so the whole fingerprint is spelled out by the account and the issuer name.
+const ISSUER_FINGERPRINT_SUFFIX: &str = "issuer-fingerprint";
+
+/// The longest `ISO8601DateTime` the model admits: its `@length` maximum
+/// (`smithy_query(query="shape",shape="ISO8601DateTime")`).
+const ISO8601_MAX_LEN: usize = 50;
+
+/// The most fractional-second digits an instant License Manager reports carries: a
+/// millisecond. The modelled pattern admits any number of them, so the precision is
+/// the service's, and the recorded license body renders three digits or none.
+const MAX_SUBSECOND_DIGITS: usize = 3;
+
+/// How many licenses the create-time sweep mints: enough consecutive clock reads
+/// that the sub-second part differs from row to row, and few enough to stay fast.
+const PRECISION_SWEEP_LICENSES: usize = 32;
 
 /// Every value the modelled `EntitlementUnit` enum admits, in model order
 /// (`smithy_query(query="shape",shape="EntitlementUnit")`, which the crate also
@@ -251,7 +274,11 @@ fn assert_round_trip(case: &str, stored: &Value, body: &Value, arn: &str) {
         body["Issuer"].get("SignKey"),
         "case {case:?}: GetLicense reported another Issuer.SignKey: {stored}"
     );
-    assert_derived_key_fingerprint(case, stored);
+    assert_derived_key_fingerprint(
+        case,
+        stored,
+        body["Issuer"]["Name"].as_str().unwrap_or_default(),
+    );
     let create_time = stored["CreateTime"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the stored license carries no CreateTime: {stored}"));
@@ -259,34 +286,55 @@ fn assert_round_trip(case: &str, stored: &Value, body: &Value, arn: &str) {
         DateTime::from_str(create_time, Format::DateTime).is_ok(),
         "case {case:?}: CreateTime {create_time:?} is not an ISO8601-UTC instant"
     );
+    assert_rendered_instant(case, "License.CreateTime", create_time);
 }
 
-/// Assert that the license `stored` carries a DERIVED issuer key fingerprint — a
-/// non-empty value scoped to this emulator's account whose last segment is a
-/// digest, so it is computed from the issuer identity and not echoed from one member
-/// of the request — and return it.
-fn assert_derived_key_fingerprint(case: &str, stored: &Value) -> String {
+/// Assert that `value` is an instant in the form License Manager reports one in:
+/// Z-suffixed UTC, inside the modelled length of `ISO8601DateTime`, and carrying at
+/// most [`MAX_SUBSECOND_DIGITS`] fractional digits — the precision a client parsing
+/// or string-matching the value expects.
+///
+/// Shared with the sibling suites, which drive the other operations that report an
+/// instant this service reads off the clock.
+pub(crate) fn assert_rendered_instant(case: &str, member: &str, value: &str) {
+    assert!(
+        value.len() <= ISO8601_MAX_LEN,
+        "case {case:?}: {member} is {} characters, past the modelled {ISO8601_MAX_LEN}: {value:?}",
+        value.len()
+    );
+    let civil = value.strip_suffix('Z').unwrap_or_else(|| {
+        panic!("case {case:?}: expected {member} to be a Z-suffixed UTC instant, got {value:?}")
+    });
+    let fraction = civil.split_once('.').map_or("", |(_, fraction)| fraction);
+    assert!(
+        (fraction.is_empty() || fraction.len() == MAX_SUBSECOND_DIGITS)
+            && fraction.bytes().all(|byte| byte.is_ascii_digit()),
+        "case {case:?}: expected {member} to carry {MAX_SUBSECOND_DIGITS} fractional digits or \
+         none, got {value:?}"
+    );
+}
+
+/// The issuer key fingerprint a license whose create named the issuer `issuer_name`
+/// is reported with, as a CLIENT constructs it: the account the license belongs to,
+/// that name, and the fixed final segment.
+fn expected_key_fingerprint(issuer_name: &str) -> String {
+    format!("aws:{ACCOUNT_ID}:{issuer_name}:{ISSUER_FINGERPRINT_SUFFIX}")
+}
+
+/// Assert that the license `stored` carries the DERIVED issuer key fingerprint of
+/// the issuer name its create carried — a value no member of the request supplies —
+/// and return it.
+fn assert_derived_key_fingerprint(case: &str, stored: &Value, issuer_name: &str) -> String {
     let fingerprint = stored["Issuer"]["KeyFingerprint"]
         .as_str()
         .unwrap_or_else(|| {
             panic!("case {case:?}: GetLicense reported an Issuer with no KeyFingerprint: {stored}")
         })
         .to_string();
-    assert!(
-        !fingerprint.is_empty(),
-        "case {case:?}: GetLicense reported an empty KeyFingerprint: {stored}"
-    );
-    assert!(
-        fingerprint.starts_with(&format!("aws:{ACCOUNT_ID}:")),
-        "case {case:?}: expected a KeyFingerprint scoped to account {ACCOUNT_ID}, got {fingerprint:?}"
-    );
-    let digest = fingerprint.split(':').next_back().unwrap_or_default();
-    assert!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        "case {case:?}: expected the KeyFingerprint to end in a SHA-256 digest, got {fingerprint:?}"
+    let expected = expected_key_fingerprint(issuer_name);
+    assert_eq!(
+        fingerprint, expected,
+        "case {case:?}: expected the KeyFingerprint {expected:?}, got {fingerprint:?}"
     );
     fingerprint
 }
@@ -538,9 +586,10 @@ fn next(state: &mut u64) -> u64 {
 }
 
 /// Every issuer identity a create can carry, one per row: the rows differ in the
-/// name's value, its length and its character set, in whether a `SignKey` names a
-/// key at all, and in the key's value — and the last two re-spell the same
-/// characters across the name/key boundary, which is still a different identity.
+/// name's value, its length, its character set and whether it carries the delimiter
+/// the fingerprint itself is spelled with, in whether a `SignKey` names a key at
+/// all, and in the key's value — and three rows name ONE issuer name under
+/// different sign keys, which the reported fingerprint does not distinguish.
 ///
 /// `Issuer` carries exactly `Name` (required) and `SignKey`
 /// (`smithy_query(query="shape",shape="Issuer")`), so these rows span the whole
@@ -577,6 +626,11 @@ fn issuer_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "a name carrying the fingerprint's own delimiter",
+            json!({"Name": "corp:eu:platform"}),
+        ),
+        ("a digits-only name", json!({"Name": "123456789"})),
+        (
             "a two-character name and a one-character key",
             json!({"Name": "ab", "SignKey": "c"}),
         ),
@@ -588,13 +642,17 @@ fn issuer_rows() -> Vec<(&'static str, Value)> {
 }
 
 #[tokio::test]
-async fn an_issuer_key_fingerprint_is_derived_from_the_issuer_identity_alone() {
+async fn an_issuer_key_fingerprint_is_the_account_and_the_issuer_name() {
     let router = emulator();
-    // Each fingerprint the service derived, against the rows that produced it, so a
-    // collision names both rows.
-    let mut by_fingerprint: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    // Each fingerprint the service derived, against the issuer names that produced
+    // it, so a value shared by two DIFFERENT names names both of them.
+    let mut names_by_fingerprint: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for (n, (case, issuer)) in issuer_rows().into_iter().enumerate() {
+        let issuer_name = issuer["Name"]
+            .as_str()
+            .expect("every row states an issuer name")
+            .to_string();
         // Two licenses of ONE issuer, alike in nothing else: different license name,
         // SKU, home Region, entitlements and metadata. The fingerprint belongs to
         // the issuer, so both licenses must report the same one.
@@ -615,7 +673,7 @@ async fn an_issuer_key_fingerprint_is_derived_from_the_issuer_identity_alone() {
         let second_arn = create_ok(&router, case, &second).await;
 
         let stored = get_ok(&router, case, &first_arn).await;
-        let fingerprint = assert_derived_key_fingerprint(case, &stored);
+        let fingerprint = assert_derived_key_fingerprint(case, &stored, &issuer_name);
 
         // The read is a report: reading the license again reports the same value.
         let again = get_ok(&router, case, &first_arn).await;
@@ -632,18 +690,131 @@ async fn an_issuer_key_fingerprint_is_derived_from_the_issuer_identity_alone() {
             "case {case:?}: two licenses of one issuer must carry one fingerprint, got {second_stored}"
         );
 
-        by_fingerprint.entry(fingerprint).or_default().push(case);
+        names_by_fingerprint
+            .entry(fingerprint)
+            .or_default()
+            .insert(issuer_name);
     }
 
-    // Every row states a DIFFERENT issuer identity, so every row has a fingerprint
-    // of its own — that is what lets (ProductSKU, KeyFingerprint) discriminate one
-    // issuer's license from another's.
-    for (fingerprint, rows) in &by_fingerprint {
+    // The fingerprint names the issuer: no two issuer NAMES are reported under one
+    // fingerprint — that is what lets (ProductSKU, KeyFingerprint) discriminate one
+    // issuer's license from another's — while rows that name one issuer share it
+    // whatever sign key they named.
+    for (fingerprint, names) in &names_by_fingerprint {
         assert_eq!(
-            rows.len(),
+            names.len(),
             1,
-            "cases {rows:?}: different issuers must not share the fingerprint {fingerprint:?}"
+            "issuer names {names:?}: different issuers must not share the fingerprint \
+             {fingerprint:?}"
         );
+    }
+}
+
+/// The rule for the instants this service reads off the clock: `CreateTime` is
+/// reported at the precision License Manager reports an instant at — millisecond or
+/// none — whatever instant the clock was at, and a read reports the stored value
+/// rather than a fresh one.
+#[tokio::test]
+async fn a_license_create_time_is_reported_at_millisecond_precision() {
+    let router = emulator();
+    let mut previous: Option<(String, f64)> = None;
+
+    for index in 0..PRECISION_SWEEP_LICENSES {
+        let case = format!("license {index} of the create-time sweep");
+        let mut body = base_body(&format!("token-precision-{index}"));
+        body["LicenseName"] = json!(format!("precision-{index}"));
+        body["ProductSKU"] = json!(format!("sku-precision-{index}"));
+
+        let arn = create_ok(&router, &case, &body).await;
+        let stored = get_ok(&router, &case, &arn).await;
+        let create_time = stored["CreateTime"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the license carries no CreateTime: {stored}"))
+            .to_string();
+        assert_rendered_instant(&case, "License.CreateTime", &create_time);
+
+        // The read is a report: a second read reports the instant the create stored,
+        // not the instant of the read.
+        let again = get_ok(&router, &case, &arn).await;
+        assert_eq!(
+            again["CreateTime"].as_str(),
+            Some(create_time.as_str()),
+            "case {case:?}: a second read reported another CreateTime: {again}"
+        );
+
+        // Truncating the clock keeps its order: a license minted later is never
+        // reported as created before one minted earlier.
+        let secs = DateTime::from_str(&create_time, Format::DateTime)
+            .unwrap_or_else(|e| panic!("case {case:?}: CreateTime {create_time:?} ({e})"))
+            .as_secs_f64();
+        if let Some((earlier_case, earlier_secs)) = &previous {
+            assert!(
+                secs >= *earlier_secs,
+                "case {case:?}: CreateTime {secs} is before the one of case \
+                 {earlier_case:?} ({earlier_secs})"
+            );
+        }
+        previous = Some((case, secs));
+    }
+}
+
+/// The same rule at the one place every instant this service reports is rendered,
+/// driven over sub-second parts a host clock cannot be asked for: the rows differ in
+/// the sub-second remainder — none at all, a remainder below one millisecond, each
+/// end of the millisecond range, a millisecond field with a trailing zero that must
+/// not be trimmed, and the last nanosecond below a whole second, which rounding
+/// would carry into the next second.
+#[test]
+fn an_instant_is_rendered_to_the_millisecond_or_to_the_whole_second() {
+    // 2026-01-01T00:00:00Z, so every row's expectation reads as the rendering plus
+    // its sub-second field.
+    const EPOCH_SECS: u64 = 1_767_225_600;
+
+    // (case, the sub-second NANOseconds of the instant, the instant as reported)
+    let rows: [(&str, u32, &str); 9] = [
+        ("a whole second", 0, "2026-01-01T00:00:00Z"),
+        (
+            "a remainder below one millisecond",
+            999_999,
+            "2026-01-01T00:00:00Z",
+        ),
+        ("the first millisecond", 1_000_000, "2026-01-01T00:00:00.001Z"),
+        (
+            "a millisecond and a remainder below the next",
+            1_999_999,
+            "2026-01-01T00:00:00.001Z",
+        ),
+        (
+            "a millisecond field with a trailing zero",
+            10_000_000,
+            "2026-01-01T00:00:00.010Z",
+        ),
+        ("half a second", 500_000_000, "2026-01-01T00:00:00.500Z"),
+        (
+            "a hundred milliseconds, two trailing zeros",
+            100_000_000,
+            "2026-01-01T00:00:00.100Z",
+        ),
+        (
+            "the last whole millisecond",
+            999_000_000,
+            "2026-01-01T00:00:00.999Z",
+        ),
+        (
+            "the last nanosecond below the next second",
+            999_999_999,
+            "2026-01-01T00:00:00.999Z",
+        ),
+    ];
+
+    for (case, nanos, expected) in rows {
+        let at = UNIX_EPOCH + Duration::new(EPOCH_SECS, nanos);
+        let rendered = service_com_amazonaws_licensemanager_awslicensemanager::state::iso8601(at);
+        assert_eq!(
+            rendered, expected,
+            "case {case:?}: expected {expected:?}, got {rendered:?}"
+        );
+        assert_rendered_instant(case, "the rendered instant", &rendered);
     }
 }
 
@@ -659,7 +830,11 @@ async fn a_caller_cannot_choose_an_issuer_key_fingerprint() {
     let mut plain = base_body("token-fingerprint-derived");
     plain["Issuer"] = issuer.clone();
     let plain_arn = create_ok(&router, case, &plain).await;
-    let derived = assert_derived_key_fingerprint(case, &get_ok(&router, case, &plain_arn).await);
+    let derived = assert_derived_key_fingerprint(
+        case,
+        &get_ok(&router, case, &plain_arn).await,
+        "chosen-issuer",
+    );
 
     // `KeyFingerprint` is not a member of the `Issuer` a create carries, so a request
     // that smuggles one is either refused or answered with the fingerprint the

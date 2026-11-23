@@ -109,8 +109,8 @@ pub const ENTITLEMENT_UNIT_NONE: &str = "None";
 pub const SIGNED_TOKEN_MIN_LEN: usize = 4096;
 
 /// The domain tag mixed into the key a grant's signed token is MAC'd under, and
-/// into the filler that token carries, so neither can be confused with the issuer
-/// fingerprint digest [`issuer_key_fingerprint`] derives.
+/// into the filler that token carries, so neither can be confused with any other
+/// digest this service derives.
 const SIGNED_TOKEN_DOMAIN: &str = "license-manager:signed-token:v1";
 
 /// The version `CreateLicense` gives a license it mints. License versions are
@@ -161,10 +161,10 @@ pub const MAX_COLLECTION_ENTRIES: usize = 50;
 /// license or a tag.
 pub const MAX_TEXT_LEN: usize = 2048;
 
-/// The domain tag mixed into the preimage of an issuer key fingerprint, so a digest
-/// this service derives for an issuer identity cannot be confused with a digest it
-/// derives for anything else.
-const ISSUER_FINGERPRINT_DOMAIN: &str = "license-manager:issuer:v1";
+/// The last segment of every issuer key fingerprint this service reports: fixed
+/// text, not a per-issuer value, so the whole fingerprint is spelled out by the
+/// account the license belongs to and the issuer name its create named.
+const ISSUER_FINGERPRINT_SUFFIX: &str = "issuer-fingerprint";
 
 /// The issuer key fingerprint a license of this issuer carries.
 ///
@@ -172,32 +172,22 @@ const ISSUER_FINGERPRINT_DOMAIN: &str = "license-manager:issuer:v1";
 /// `IssuerDetails`, which `License.Issuer` targets, carries `Name`, `SignKey` and
 /// `KeyFingerprint`, while `Issuer` — the shape a create carries — has only `Name`
 /// and `SignKey`
-/// (`smithy_query(query="shape",shape="Issuer,IssuerDetails")`). No caller can
-/// supply a fingerprint, so the service derives it, and it derives it from the
-/// ISSUER IDENTITY alone — the name and the signing key the create named — so one
-/// issuer always fingerprints the same way however many licenses it issues, two
-/// different issuers never share a fingerprint, and every read of a license reports
-/// one stable value that `CheckoutLicense` can resolve against as the second half of
-/// its (`ProductSKU`, `KeyFingerprint`) key.
+/// (`smithy_query(query="shape",shape="Issuer,IssuerDetails")`), and the model
+/// publishes no pattern for it. No caller can supply a fingerprint, so the service
+/// derives it, and it derives it as the colon-delimited text License Manager reports
+/// for a license issuer: `aws:`, the account the license belongs to, the issuer
+/// NAME exactly as the create stated it, and [`ISSUER_FINGERPRINT_SUFFIX`].
 ///
-/// The form mirrors the colon-delimited fingerprint License Manager reports for a
-/// license issuer, `aws:<account>:<issuer name>:<fingerprint>`, with the last
-/// segment the SHA-256 digest of the length-prefixed issuer identity — length
-/// prefixes so no name/key boundary can be shifted to spell another issuer's
-/// preimage. An absent `SignKey` names no key and so hashes as an empty one. No key
-/// material is held or signed here: the digest IDENTIFIES the issuer, it does not
-/// certify it.
-pub fn issuer_key_fingerprint(name: &str, sign_key: Option<&str>) -> String {
-    let mut digest = Sha256::new();
-    digest.update(ISSUER_FINGERPRINT_DOMAIN.as_bytes());
-    for part in [name, sign_key.unwrap_or_default()] {
-        digest.update(format!(":{}:", part.len()).as_bytes());
-        digest.update(part.as_bytes());
-    }
+/// Only the account and the name vary, so the value is CONSTRUCTIBLE by a client
+/// that knows the issuer it created a license with — which is what makes it usable
+/// as the second half of the (`ProductSKU`, `KeyFingerprint`) key `CheckoutLicense`
+/// resolves a license by — and it is stable per issuer name: every read of every
+/// license of one issuer reports the same text. No key material is held or signed
+/// here: the fingerprint IDENTIFIES the issuer, it does not certify it.
+pub fn issuer_key_fingerprint(name: &str) -> String {
     format!(
-        "aws:{}:{name}:{}",
-        ::engine::emulator_account_id(),
-        ::hex::encode(digest.finalize())
+        "aws:{}:{name}:{ISSUER_FINGERPRINT_SUFFIX}",
+        ::engine::emulator_account_id()
     )
 }
 
@@ -209,10 +199,7 @@ pub fn issuer_key_fingerprint(name: &str, sign_key: Option<&str>) -> String {
 /// fingerprints the same way whichever operation minted the license.
 pub fn issuer_details(issuer: Issuer) -> IssuerDetails {
     IssuerDetails {
-        key_fingerprint: Some(issuer_key_fingerprint(
-            &issuer.name,
-            issuer.sign_key.as_deref(),
-        )),
+        key_fingerprint: Some(issuer_key_fingerprint(&issuer.name)),
         name: Some(issuer.name),
         sign_key: issuer.sign_key,
     }
@@ -508,9 +495,11 @@ fn base64url(bytes: &[u8]) -> String {
 }
 
 /// The key a grant on `license` has its signed token MAC'd under: the digest of
-/// this service's token domain and the license issuer's fingerprint. The
-/// fingerprint is a public identifier, so no key material is held here — the MAC
-/// makes a token self-consistent against this store, it does not certify it.
+/// this service's token domain and the license issuer's fingerprint. That
+/// fingerprint is a public identifier a client can spell out for itself
+/// ([`issuer_key_fingerprint`]), so no key material is held or protected here — the
+/// MAC makes a token self-consistent against this store, and nothing in this service
+/// verifies a token or grants anything on one: it does not certify it.
 fn signed_token_key(license: &StoredLicense) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(SIGNED_TOKEN_DOMAIN.as_bytes());
@@ -1991,16 +1980,53 @@ pub fn license_arn(region: &str, id: &str) -> String {
     )
 }
 
-/// Now, as the ISO8601-UTC instant `License.CreateTime` carries.
-///
-/// `Format::DateTime` renders RFC 3339 in UTC, `YYYY-MM-DDThh:mm:ss[.fff]Z`, which
-/// is what the member's modelled pattern admits.
+/// The fractional-second digits an instant this service reports carries when it
+/// carries any: three, a millisecond. The modelled pattern of `ISO8601DateTime`
+/// admits any number of them, so the precision is the service's to choose, and
+/// License Manager reports an instant to the millisecond — never to the microseconds
+/// or nanoseconds a host clock can also offer, and never to one or two digits.
+const RENDERED_SUBSECOND_DIGITS: usize = 3;
+
+/// Nanoseconds per millisecond: what the sub-second part of a clock reading is
+/// truncated by before it is rendered.
+const NANOS_PER_MILLI: u32 = 1_000_000;
+
+/// Now, as the ISO8601-UTC instant `License.CreateTime` and every other instant this
+/// service reports carries.
 pub fn now_iso8601() -> String {
-    ::aws_smithy_types::DateTime::from(SystemTime::now())
+    iso8601(SystemTime::now())
+}
+
+/// `at` as the ISO8601-UTC instant this service reports: `YYYY-MM-DDThh:mm:ss.sssZ`,
+/// or `YYYY-MM-DDThh:mm:ssZ` for an instant that falls on a whole second — the two
+/// forms License Manager reports an instant in, both admitted by the member's
+/// modelled pattern.
+///
+/// `Format::DateTime` renders RFC 3339 in UTC, but at whatever sub-second precision
+/// the instant handed to it holds — for a host clock, microseconds or finer — and
+/// with trailing zeros dropped, which would leave one or two digits. So the whole
+/// second is rendered through it and the millisecond field is written here. The
+/// millisecond is TRUNCATED, not rounded, so the instant reported is at or before the
+/// one the clock read and never names a moment that has not happened yet.
+pub fn iso8601(at: SystemTime) -> String {
+    let instant = ::aws_smithy_types::DateTime::from(at);
+    let millis = instant.subsec_nanos() / NANOS_PER_MILLI;
+    let whole_second = ::aws_smithy_types::DateTime::from_secs(instant.secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         // That format renders every instant this type can hold; the epoch is the
         // bounded fallback, so no handler has to carry a formatting failure.
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    match whole_second.strip_suffix('Z') {
+        // An instant on a whole second carries no fractional field at all.
+        Some(_) if millis == 0 => whole_second,
+        Some(civil) => format!(
+            "{civil}.{millis:0width$}Z",
+            width = RENDERED_SUBSECOND_DIGITS
+        ),
+        // Unreachable for a UTC rendering, which that format always suffixes with
+        // `Z`; an instant with no `Z` to replace is reported as rendered.
+        None => whole_second,
+    }
 }
 
 /// Whether `region` is an AWS Region token: the only text this service lets into a

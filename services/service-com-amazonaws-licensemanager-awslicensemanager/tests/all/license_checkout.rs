@@ -28,7 +28,12 @@
 //!   again;
 //! * `ExtendLicenseConsumption` moves a held grant to the bound a checkout of its
 //!   type taken now would carry, persisting it unless the request is a dry run, and
-//!   refuses a token that names no held grant.
+//!   refuses a token that names no held grant;
+//! * the issuer `KeyFingerprint` a checkout resolves a license by is the value a
+//!   CLIENT constructs from the account and the issuer name it created the license
+//!   with, `aws:<account>:<issuer name>:issuer-fingerprint`;
+//! * every instant a checkout and an extension report from the clock is a Z-suffixed
+//!   ISO8601-UTC instant at millisecond precision or none.
 //!
 //! Each table row differs in what those rules generalise over: the entitlement's
 //! unit, whether it caps a count and allows overage, how many units are requested,
@@ -74,6 +79,15 @@ const INVALID_CONSUMPTION_TOKEN: &str = "Invalid value of consumptionToken.";
 /// The most grants this emulator's store holds at once: the bound
 /// `insert_consumption` enforces, as `state::MAX_LICENSE_CONSUMPTIONS` sets it.
 const MAX_HELD_GRANTS: usize = 500;
+
+/// The canonical account id every emulated ARN and every issuer key fingerprint
+/// carries (`engine::EMULATOR_ACCOUNT_ID`).
+const ACCOUNT_ID: &str = "000000000000";
+
+/// The last segment of the issuer key fingerprint License Manager reports, as the
+/// recorded `GetLicense` body renders it: fixed text, so a client can construct the
+/// whole value from the account and the issuer name.
+const ISSUER_FINGERPRINT_SUFFIX: &str = "issuer-fingerprint";
 
 /// One emulator: a single shared engine behind the router, exactly as `core/router`
 /// assembles it, plus the handle on that engine a case reads a stored grant through
@@ -1513,6 +1527,195 @@ async fn an_expiration_the_clock_has_passed_releases_the_grant_without_a_write()
             INVALID_CONSUMPTION_TOKEN,
             "case {case:?}: expected {operation} to answer the refusal AWS words for that error \
              class, got {response}"
+        );
+    }
+}
+
+/// The issuer key fingerprint a license whose create named `issuer_name` is reported
+/// with, as a CLIENT constructs it without reading any response: the account, that
+/// name, and the fixed final segment.
+fn constructed_key_fingerprint(issuer_name: &str) -> String {
+    format!("aws:{ACCOUNT_ID}:{issuer_name}:{ISSUER_FINGERPRINT_SUFFIX}")
+}
+
+/// Every issuer name a create can state, one per row: the rows differ in the name's
+/// value, its length, its character set and whether it carries the delimiter the
+/// fingerprint itself is spelled with — so resolution cannot rely on the value's
+/// segment count.
+///
+/// Only `Issuer.Name` reaches the fingerprint
+/// (`smithy_query(query="shape",shape="Issuer,IssuerDetails")`).
+fn constructible_issuer_rows() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("a plain name", "checkout-issuer"),
+        ("another plain name", "second-issuer"),
+        ("a name that is a prefix of another row's", "second"),
+        ("an empty name", ""),
+        ("a digits-only name", "123456789"),
+        ("a non-ASCII name", "Ünïcödé Issuer ✓"),
+        (
+            "a name carrying the fingerprint's own delimiter",
+            "corp:eu:platform",
+        ),
+    ]
+}
+
+/// The rule that makes the reported fingerprint more than decorative: a checkout
+/// presenting the fingerprint a client CONSTRUCTS from the issuer it created the
+/// license with — never one read back out of a response — resolves that license and
+/// is granted its entitlement.
+#[tokio::test]
+async fn a_checkout_resolves_a_license_by_the_fingerprint_a_client_constructs() {
+    let (router, _engine) = emulator();
+
+    for (index, (case, issuer_name)) in constructible_issuer_rows().into_iter().enumerate() {
+        let sku = format!("sku-constructed-{index}");
+        let declared = json!([entitlement("seats", "Count", &[("MaxCount", json!(10))])]);
+        let (status, created) =
+            call(&router, "CreateLicense", &license_body(&sku, issuer_name, declared)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateLicense to answer 200, got {status} {created}"
+        );
+        let arn = created["LicenseArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: CreateLicense answered no LicenseArn: {created}")
+            })
+            .to_string();
+
+        let (status, response) = call(
+            &router,
+            "CheckoutLicense",
+            &checkout_body(
+                &sku,
+                &constructed_key_fingerprint(issuer_name),
+                "PROVISIONAL",
+                &format!("checkout-constructed-{index}"),
+                json!([requested("seats", "Count", Some("2"))]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the checkout presenting the constructed fingerprint to \
+             answer 200, got {status} {response}"
+        );
+        assert_eq!(
+            response["LicenseArn"].as_str(),
+            Some(arn.as_str()),
+            "case {case:?}: expected the checkout to resolve the license {arn:?}, got {response}"
+        );
+        assert!(
+            response["LicenseConsumptionToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "case {case:?}: the checkout granted no consumption token: {response}"
+        );
+
+        // The grant is real, not a shallow 200: the usage reports the units it took.
+        let consumed = consumed_units(&router, case, &arn, "seats").await;
+        assert_eq!(
+            consumed, 2,
+            "case {case:?}: expected the grant to consume 2 seats, got {consumed}"
+        );
+    }
+}
+
+/// The rule for every instant this service reads off the clock, here on the checkout
+/// path: `IssuedAt`, and the `Expiration` a checkout and an extension compute from
+/// it, carry millisecond precision or none.
+#[tokio::test]
+async fn a_checkout_reports_its_instants_at_millisecond_precision() {
+    let (router, _engine) = emulator();
+
+    // The rows differ in the checkout type, which is what decides whether the
+    // expiration is computed from the clock (`PROVISIONAL`, bounded by the
+    // provisional time to live) or echoed from the license's validity
+    // (`PERPETUAL`).
+    for (index, (case, checkout_type)) in [
+        ("a provisional checkout", "PROVISIONAL"),
+        ("a perpetual checkout", "PERPETUAL"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sku = format!("sku-instants-{index}");
+        let (_, fingerprint) = create_license(
+            &router,
+            case,
+            &sku,
+            json!([entitlement("seats", "Count", &[("MaxCount", json!(10))])]),
+        )
+        .await;
+
+        let (status, checkout) = call(
+            &router,
+            "CheckoutLicense",
+            &checkout_body(
+                &sku,
+                &fingerprint,
+                checkout_type,
+                &format!("checkout-instants-{index}"),
+                json!([requested("seats", "Count", Some("1"))]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the checkout to answer 200, got {status} {checkout}"
+        );
+
+        let issued_at = checkout["IssuedAt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the checkout answered no IssuedAt"));
+        crate::license_lifecycle::assert_rendered_instant(
+            case,
+            "CheckoutLicense.IssuedAt",
+            issued_at,
+        );
+        let expiration = checkout["Expiration"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the checkout answered no Expiration"));
+        crate::license_lifecycle::assert_rendered_instant(
+            case,
+            "CheckoutLicense.Expiration",
+            expiration,
+        );
+        if checkout_type == "PERPETUAL" {
+            // Nothing in the clock bounds a perpetual checkout, so its bound is the
+            // license's own validity end, reported exactly as the create stated it.
+            assert_eq!(
+                expiration, VALIDITY_END,
+                "case {case:?}: expected the validity end {VALIDITY_END:?}, got {expiration:?}"
+            );
+        }
+
+        let token = checkout["LicenseConsumptionToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the checkout answered no LicenseConsumptionToken")
+            })
+            .to_string();
+        let (status, extended) = call(
+            &router,
+            "ExtendLicenseConsumption",
+            &json!({"LicenseConsumptionToken": token, "DryRun": false}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the extension to answer 200, got {status} {extended}"
+        );
+        let moved_to = extended["Expiration"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: the extension answered no Expiration"));
+        crate::license_lifecycle::assert_rendered_instant(
+            case,
+            "ExtendLicenseConsumption.Expiration",
+            moved_to,
         );
     }
 }

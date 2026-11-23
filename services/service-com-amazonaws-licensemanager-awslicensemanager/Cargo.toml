@@ -25,9 +25,9 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `NextToken` ListLicenseConfigurations hands out, and
-# renders the digest of a derived issuer key fingerprint.
+# renders the digests the signed token a checkout answers with is built from.
 hex = { workspace = true }
-# SHA-256, the digest an issuer key fingerprint is derived with.
+# SHA-256, the digest that token's key and its filler are derived with.
 sha2 = { workspace = true }
 # HMAC-SHA256, the keyed digest the signed token a checkout answers with carries.
 hmac = "0.12"
