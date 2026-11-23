@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let restored_at = ::aws_smithy_types::DateTime::from(now);
+        let restored_at = crate::state::recorded_instant(now);
 
         let mut store = state.lock();
         // A transition the clock already made due is materialised before the

@@ -294,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The snapshot exists from this instant — nothing here outlives its own call —
         // so the profile owes the clock no transition and the new version is readable
         // immediately.
-        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let now = crate::state::recorded_instant(::std::time::SystemTime::now());
         profile.published.insert(
             version,
             crate::state::ProfileVersionRecord {

@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // becomes exactly what this call carried, so a file the new content omits is
         // no longer in the DRAFT. Only the DRAFT moves — a published version is an
         // immutable snapshot of the DRAFT as it stood when it was published.
-        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let now = crate::state::recorded_instant(::std::time::SystemTime::now());
         profile.draft.mapping = mapping;
         // `ChangeDescription` describes "what changed in this update", so it belongs to
         // the change this call made: an update that carries none leaves the DRAFT with

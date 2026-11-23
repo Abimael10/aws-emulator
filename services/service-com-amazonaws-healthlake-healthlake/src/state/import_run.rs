@@ -67,7 +67,7 @@ use crate::ops::types::{InputDataConfig, JobProgressReport, OutputDataConfig, S3
 use crate::service::fhir_rest::{is_logical_id, is_resource_type_name, stored_content};
 
 use super::{
-    ComAmazonawsHealthlakeHealthlakeState, FhirResource, FhirResourceVersion,
+    recorded_instant, ComAmazonawsHealthlakeHealthlakeState, FhirResource, FhirResourceVersion,
     FhirRetentionCeiling, JobStatus, MAX_FHIR_RESOURCES_PER_DATASTORE, MAX_FHIR_RESOURCE_BYTES,
     MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE, MAX_FHIR_RESOURCE_BYTES_TOTAL,
 };
@@ -367,7 +367,7 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         run: ImportRun,
         now: SystemTime,
     ) -> ImportOutcome {
-        let stamp = ::aws_smithy_types::DateTime::from(now);
+        let stamp = recorded_instant(now);
         let Ok(last_updated) = stamp.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
             return ImportOutcome {
                 status: JobStatus::Failed,

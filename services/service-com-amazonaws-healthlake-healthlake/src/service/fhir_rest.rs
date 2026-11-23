@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::non_rpc::{bounded, request_path};
-use crate::state::FhirEndpointPath;
+use crate::state::{recorded_instant, FhirEndpointPath};
 
 /// The media type a FHIR JSON representation travels as, which is what a FHIR client
 /// sends and expects back (FHIR R4 §2.2 "Content Types").
@@ -259,7 +259,7 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
         }
 
         let now = SystemTime::now();
-        let stamp = ::aws_smithy_types::DateTime::from(now);
+        let stamp = recorded_instant(now);
         let Ok(last_updated) = stamp.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
             return outcome(
                 500,
@@ -437,7 +437,7 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
             .map(|resource| resource.version);
 
         let now = SystemTime::now();
-        let stamp = ::aws_smithy_types::DateTime::from(now);
+        let stamp = recorded_instant(now);
         let Ok(last_updated) = stamp.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
             return outcome(
                 500,

@@ -337,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 owed.0,
                 owed.1,
             )),
-            submitted_at: ::aws_smithy_types::DateTime::from(now),
+            submitted_at: crate::state::recorded_instant(now),
             ended_at: None,
             output_data_config: input.output_data_config,
             data_access_role_arn: Some(input.data_access_role_arn),

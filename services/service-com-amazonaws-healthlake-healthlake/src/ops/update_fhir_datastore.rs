@@ -227,11 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(configuration) = input.backup_configuration {
             // Through the record's own setter, so the reported `BackupEnabledAt`
             // is the instant backup became enabled rather than the instant this
-            // call ran or the data store was created.
-            datastore.set_backup_configuration(
-                configuration,
-                ::aws_smithy_types::DateTime::from(now),
-            );
+            // call ran or the data store was created. The setter's contract
+            // holds this stamp at the clock's own reading, because it bounds the
+            // restore window a `RestorePointTime` is compared against.
+            datastore
+                .set_backup_configuration(configuration, ::aws_smithy_types::DateTime::from(now));
         }
 
         // Applying a configuration change to a data store is ASYNCHRONOUS work:

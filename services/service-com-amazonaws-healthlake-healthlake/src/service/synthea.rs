@@ -46,7 +46,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
-use crate::state::{ComAmazonawsHealthlakeHealthlakeState, FhirResource};
+use crate::state::{recorded_instant, ComAmazonawsHealthlakeHealthlakeState, FhirResource};
 
 /// The LOINC code system URI, as FHIR R4 names it for observation codes.
 const LOINC: &str = "http://loinc.org";
@@ -282,7 +282,7 @@ pub(crate) fn preloaded_resources(
     store: &mut ComAmazonawsHealthlakeHealthlakeState,
     created_at: SystemTime,
 ) -> Option<PreloadedResources> {
-    let stamp = ::aws_smithy_types::DateTime::from(created_at);
+    let stamp = recorded_instant(created_at);
     let last_updated = stamp
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()?;
@@ -372,7 +372,7 @@ fn mint(
 /// An instant as a FHIR `dateTime`, in the same rendering
 /// [`super::fhir_rest::stored_content`] writes `meta.lastUpdated` with.
 fn instant(at: SystemTime) -> Option<String> {
-    ::aws_smithy_types::DateTime::from(at)
+    recorded_instant(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
 }

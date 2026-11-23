@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let created_at = ::aws_smithy_types::DateTime::from(now);
+        let created_at = crate::state::recorded_instant(now);
         let id = store.next_datastore_id(now);
         // `PreloadDataConfig` is "an optional parameter to preload (import) open
         // source Synthea FHIR data upon creation of the data store", so a data
@@ -391,9 +391,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Written through the record's own setter, so the reported
         // `BackupEnabledAt` is the instant backup became enabled rather than a
-        // second copy of the creation time.
+        // second copy of the creation time. It is stamped from the clock's own
+        // reading, not from the record's `CreatedAt`: the setter's contract is
+        // that this stamp is a restore-window bound.
         if let Some(configuration) = input.backup_configuration {
-            datastore.set_backup_configuration(configuration, created_at);
+            datastore.set_backup_configuration(
+                configuration,
+                ::aws_smithy_types::DateTime::from(now),
+            );
         }
 
         let output = CreateFHIRDatastoreOutput {

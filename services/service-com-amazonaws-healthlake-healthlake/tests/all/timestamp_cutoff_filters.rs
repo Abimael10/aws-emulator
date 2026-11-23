@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How every listing of this service reads the pair of timestamp cutoff members
-//! its request carries.
+//! How this service reads the timestamp cutoff members a listing's request
+//! carries, and at what RESOLUTION it reports an instant it recorded itself.
 //!
-//! The rule under test: a listing applies a timestamp cutoff member exactly as
+//! The second rule is pinned by
+//! [`every_recorded_instant_is_reported_at_millisecond_resolution`]: an instant
+//! this service records on a record and reports through a modelled timestamp
+//! member is kept to whole MILLISECONDS, so the epoch-seconds number a reader
+//! gets back carries no finer fraction however precise the host clock that
+//! stamped it. Both timestamp shapes this service reports through
+//! (`HealthLakeTimestamp` and `DateTime`) carry no `@timestampFormat` trait, so
+//! under awsJson1_0 every one of those members is an epoch-seconds JSON number
+//! whose fractional part IS the precision of the instant behind it. The bounds
+//! of a restore window are not such instants and are pinned by
+//! `tests/all/datastore_backup_restore_window.rs` instead.
+//!
+//! The first rule under test: a listing applies a timestamp cutoff member exactly as
 //! that member's own documentation words it — a member that selects records
 //! "before" / "after" the instant it names is a STRICT bound, so a record at
 //! exactly that instant is reported by neither, while a member that selects
@@ -33,6 +45,8 @@
 //! deserialization and the modelled constraints are all exercised, not
 //! bypassed.
 
+use std::time::{Duration, Instant};
+
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::ops::types::{
@@ -44,7 +58,7 @@ use service_com_amazonaws_healthlake_healthlake::state::{
     TransformationJobStatus,
 };
 
-use crate::fhir_datastore_lifecycle::HealthLake;
+use crate::fhir_datastore_lifecycle::{string_at, HealthLake, SETTLING_DEADLINE};
 
 /// The epoch second every placed instant below is measured from. A fixed
 /// instant, so a cutoff can be exactly the instant a record carries rather than
@@ -613,6 +627,523 @@ async fn a_placed_record_holds_the_instant_it_was_placed_at() {
             (at.secs(), at.subsec_nanos()),
             "case {id:?}: the placed record must hold {at:?}, got {:?}",
             job.submitted_at
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The RESOLUTION a recorded instant is reported at.
+// ---------------------------------------------------------------------------
+
+/// Every member this service reports a RECORDED instant through, as the model
+/// names it, read with `smithy_query(query="shape", shape="<reported shape>")`:
+/// `CreatedAt` on `DatastoreProperties`; `SubmitTime` and `EndTime` on
+/// `ImportJobProperties`, `ExportJobProperties`, `TransformationJobProperties`
+/// and `TransformationJobSummary`; `LastUpdatedAt` on the data transformation
+/// profile shapes; and `DeletionTime` on
+/// `DeleteDataTransformationProfileResponse`.
+///
+/// `DatastoreBackupStatus`'s own members (`BackupEnabledAt`,
+/// `EarliestRestorePoint`, `LatestRestorePoint`) are NOT here: they are the
+/// bounds of the restore window a caller's `RestorePointTime` is admitted or
+/// refused against rather than instants recorded on a record, and
+/// `tests/all/datastore_backup_restore_window.rs` pins them to the instants the
+/// clock read.
+const RECORDED_INSTANT_MEMBERS: [&str; 5] = [
+    "CreatedAt",
+    "DeletionTime",
+    "EndTime",
+    "LastUpdatedAt",
+    "SubmitTime",
+];
+
+/// How far past a whole millisecond a reported epoch-seconds number may sit.
+///
+/// A millisecond-resolution instant near the present needs more significant
+/// digits than a JSON number's double carries exactly, so reading one back and
+/// scaling it to milliseconds lands a few ten-thousandths of a millisecond off a
+/// whole one. That representation noise is what this admits — a thousandth of a
+/// millisecond, several times the noise and a thousand times under the
+/// resolution being asserted, so an instant carrying any real sub-millisecond
+/// fraction is still caught.
+const PRECISION_SLACK_MILLIS: f64 = 1e-3;
+
+/// How long a poll waits between two reads of a job whose run the clock still
+/// owes. Short next to the run span, so a settled job is seen promptly, and the
+/// wait itself is bounded by [`SETTLING_DEADLINE`] rather than by this.
+const JOB_POLL_PAUSE: Duration = Duration::from_millis(20);
+
+/// Each terminal value the two modelled job-status enums declare (`JobStatus`
+/// and `TransformationJobStatus`): a job in one of these has ended, so its
+/// `EndTime` is recorded.
+const TERMINAL_JOB_STATUSES: [&str; 5] = [
+    "COMPLETED",
+    "COMPLETED_WITH_ERRORS",
+    "FAILED",
+    "CANCEL_COMPLETED",
+    "CANCEL_FAILED",
+];
+
+/// The `DataAccessRoleArn` every start below carries.
+const PRECISION_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthLakePrecision";
+
+/// One read a case asserts: the operation that answered it, the body, and the
+/// recorded-instant members that body MUST carry — so a case cannot pass by
+/// reporting no timestamp at all.
+struct Reported {
+    read: &'static str,
+    body: Value,
+    required: &'static [&'static str],
+}
+
+/// Which operation of this service RECORDS the instants a row then reads back.
+///
+/// The rows span the class the rule generalises over: every record kind this
+/// service stamps (a data store, a data store whose continuous backup is
+/// enabled, all three job records, and a data transformation profile), reported
+/// through both a single-record read and a listing, and reached through every
+/// operation that writes one of those instants — a create, a start, an update, a
+/// publish and a delete.
+#[derive(Clone, Copy, Debug)]
+enum Recorder {
+    Datastore,
+    ImportJob,
+    ExportJob,
+    TransformationJob,
+    Profile,
+}
+
+impl Recorder {
+    const ALL: [Recorder; 5] = [
+        Recorder::Datastore,
+        Recorder::ImportJob,
+        Recorder::ExportJob,
+        Recorder::TransformationJob,
+        Recorder::Profile,
+    ];
+
+    fn case(self) -> &'static str {
+        match self {
+            Recorder::Datastore => "a created data store, preloaded",
+            Recorder::ImportJob => "a started FHIR import job",
+            Recorder::ExportJob => "a started FHIR export job",
+            Recorder::TransformationJob => "a started data transformation job",
+            Recorder::Profile => "a data transformation profile, through its whole lifecycle",
+        }
+    }
+
+    /// Record this row's instants through the operations that write them, and
+    /// answer every read that reports them back.
+    async fn drive(self, service: &HealthLake) -> Vec<Reported> {
+        match self {
+            Recorder::Datastore => {
+                // Preloaded, so the create also stamps the FHIR resources it
+                // generates — the instants the store sweep below reads off the
+                // records themselves.
+                let (id, _) = service
+                    .create(&json!({
+                        "DatastoreTypeVersion": "R4",
+                        "DatastoreName": "precision.store",
+                        "PreloadDataConfig": { "PreloadDataType": "SYNTHEA" },
+                    }))
+                    .await;
+                vec![
+                    Reported {
+                        read: "DescribeFHIRDatastore",
+                        body: service.poll_until_status(&id, "ACTIVE").await,
+                        required: &["CreatedAt"],
+                    },
+                    Reported {
+                        read: "ListFHIRDatastores",
+                        body: service.ok("ListFHIRDatastores", &json!({})).await,
+                        required: &["CreatedAt"],
+                    },
+                ]
+            }
+            Recorder::ImportJob => {
+                let datastore_id = active_datastore(service, "precision.import.store").await;
+                let started = service
+                    .ok(
+                        "StartFHIRImportJob",
+                        &json!({
+                            "DatastoreId": &datastore_id,
+                            "DataAccessRoleArn": PRECISION_ROLE_ARN,
+                            "InputDataConfig": { "S3Uri": "s3://precision-import-bucket/incoming" },
+                            "JobOutputDataConfig": { "S3Configuration": {
+                                "S3Uri": "s3://precision-import-bucket/output",
+                                "KmsKeyId": KMS_KEY_ID,
+                            } },
+                        }),
+                    )
+                    .await;
+                let job_id = string_at(&started, "JobId");
+                vec![
+                    Reported {
+                        read: "DescribeFHIRImportJob",
+                        body: poll_until_ended(
+                            service,
+                            "DescribeFHIRImportJob",
+                            &json!({ "DatastoreId": &datastore_id, "JobId": &job_id }),
+                            "ImportJobProperties",
+                        )
+                        .await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                    Reported {
+                        read: "ListFHIRImportJobs",
+                        body: service
+                            .ok(
+                                "ListFHIRImportJobs",
+                                &json!({ "DatastoreId": &datastore_id }),
+                            )
+                            .await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                ]
+            }
+            Recorder::ExportJob => {
+                let datastore_id = active_datastore(service, "precision.export.store").await;
+                let started = service
+                    .ok(
+                        "StartFHIRExportJob",
+                        &json!({
+                            "DatastoreId": &datastore_id,
+                            "DataAccessRoleArn": PRECISION_ROLE_ARN,
+                            "OutputDataConfig": { "S3Configuration": {
+                                "S3Uri": "s3://precision-export-bucket/outgoing",
+                                "KmsKeyId": KMS_KEY_ID,
+                            } },
+                        }),
+                    )
+                    .await;
+                let job_id = string_at(&started, "JobId");
+                vec![
+                    Reported {
+                        read: "DescribeFHIRExportJob",
+                        body: poll_until_ended(
+                            service,
+                            "DescribeFHIRExportJob",
+                            &json!({ "DatastoreId": &datastore_id, "JobId": &job_id }),
+                            "ExportJobProperties",
+                        )
+                        .await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                    Reported {
+                        read: "ListFHIRExportJobs",
+                        body: service
+                            .ok(
+                                "ListFHIRExportJobs",
+                                &json!({ "DatastoreId": &datastore_id }),
+                            )
+                            .await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                ]
+            }
+            Recorder::TransformationJob => {
+                let (profile_id, _) =
+                    crate::start_data_transformation_job::profile(service, "precision-transform")
+                        .await;
+                let started = service
+                    .ok(
+                        "StartDataTransformationJob",
+                        &json!({
+                            "ClientToken": "precision-transformation-job",
+                            "ProfileId": &profile_id,
+                            "DataAccessRoleArn": PRECISION_ROLE_ARN,
+                            "InputDataConfig": { "S3Uri": "s3://precision-transform-in/ccda" },
+                            "OutputDataConfig": { "S3Configuration": {
+                                "S3Uri": "s3://precision-transform-out/r4",
+                                "KmsKeyId": KMS_KEY_ID,
+                            } },
+                        }),
+                    )
+                    .await;
+                let job_id = string_at(&started, "JobId");
+                vec![
+                    Reported {
+                        read: "DescribeDataTransformationJob",
+                        body: poll_until_ended(
+                            service,
+                            "DescribeDataTransformationJob",
+                            &json!({ "JobId": &job_id }),
+                            "TransformationJobProperties",
+                        )
+                        .await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                    Reported {
+                        read: "ListDataTransformationJobs",
+                        body: service.ok("ListDataTransformationJobs", &json!({})).await,
+                        required: &["SubmitTime", "EndTime"],
+                    },
+                ]
+            }
+            Recorder::Profile => {
+                let created = service
+                    .ok(
+                        "CreateDataTransformationProfile",
+                        &json!({
+                            "ProfileName": "precision-profile",
+                            "SourceFormat": "CCDA",
+                            "Source": { "ProfileMapping": { "ProfileMapping": {
+                                "sections/allergies.map": "AllergyIntolerance <- allergy",
+                            } } },
+                        }),
+                    )
+                    .await;
+                let profile_id = string_at(&created, "ProfileId");
+                let read = service
+                    .ok(
+                        "GetDataTransformationProfile",
+                        &json!({ "ProfileId": &profile_id }),
+                    )
+                    .await;
+                let updated = service
+                    .ok(
+                        "UpdateDataTransformationProfile",
+                        &json!({
+                            "ProfileId": &profile_id,
+                            "ProfileMapping": { "sections/vitals.map": "Observation <- vitals" },
+                        }),
+                    )
+                    .await;
+                let published = service
+                    .ok(
+                        "PublishDataTransformationProfile",
+                        &json!({ "ProfileId": &profile_id, "SourceFormat": "CCDA" }),
+                    )
+                    .await;
+                let listed = service
+                    .ok(
+                        "ListDataTransformationProfiles",
+                        &json!({ "SourceFormat": "CCDA" }),
+                    )
+                    .await;
+                let versions = service
+                    .ok(
+                        "ListDataTransformationProfileVersions",
+                        &json!({ "ProfileId": &profile_id }),
+                    )
+                    .await;
+                let deleted = service
+                    .ok(
+                        "DeleteDataTransformationProfile",
+                        &json!({ "ProfileId": &profile_id }),
+                    )
+                    .await;
+                vec![
+                    Reported {
+                        read: "CreateDataTransformationProfile",
+                        body: created,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "GetDataTransformationProfile",
+                        body: read,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "UpdateDataTransformationProfile",
+                        body: updated,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "PublishDataTransformationProfile",
+                        body: published,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "ListDataTransformationProfiles",
+                        body: listed,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "ListDataTransformationProfileVersions",
+                        body: versions,
+                        required: &["LastUpdatedAt"],
+                    },
+                    Reported {
+                        read: "DeleteDataTransformationProfile",
+                        body: deleted,
+                        required: &["DeletionTime"],
+                    },
+                ]
+            }
+        }
+    }
+}
+
+/// Create a data store and look until it reports the settled `ACTIVE` status a
+/// job may be started against, answering its `DatastoreId`.
+async fn active_datastore(service: &HealthLake, name: &str) -> String {
+    let (id, _) = service
+        .create(&json!({ "DatastoreTypeVersion": "R4", "DatastoreName": name }))
+        .await;
+    service.poll_until_status(&id, "ACTIVE").await;
+    id
+}
+
+/// Look at `operation` until the job it reports has reached a status it never
+/// leaves, and answer that whole response.
+///
+/// The transition a started job owes is materialised by whichever call reads the
+/// record next, so waiting for one means LOOKING again until it has fallen due —
+/// never sleeping for the span, which would tie the outcome to how fast the host
+/// runs.
+async fn poll_until_ended(
+    service: &HealthLake,
+    operation: &str,
+    request: &Value,
+    properties: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    loop {
+        let read = service.ok(operation, request).await;
+        let status = read[properties]["JobStatus"].as_str().unwrap_or_default();
+        if TERMINAL_JOB_STATUSES.contains(&status) {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{operation} did not report an ended job within {SETTLING_DEADLINE:?}, \
+             last read {read}"
+        );
+        tokio::time::sleep(JOB_POLL_PAUSE).await;
+    }
+}
+
+/// Every recorded instant `body` reports, as `(member, epoch seconds)` pairs,
+/// found wherever it carries one: a single reported record, a listing's entries
+/// and a nested structure alike.
+fn reported_instants(body: &Value, found: &mut Vec<(String, f64)>) {
+    match body {
+        Value::Object(members) => {
+            for (member, value) in members {
+                if RECORDED_INSTANT_MEMBERS.contains(&member.as_str()) {
+                    if let Some(seconds) = value.as_f64() {
+                        found.push((member.clone(), seconds));
+                    }
+                }
+                reported_instants(value, found);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                reported_instants(entry, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// How far `seconds` sits past a whole millisecond, in milliseconds.
+fn sub_millisecond_residue(seconds: f64) -> f64 {
+    let millis = seconds * 1_000.0;
+    (millis - millis.round()).abs()
+}
+
+/// Every instant the STORE holds, read off the records themselves: the same rule
+/// checked exactly, free of the rounding a JSON number brings.
+fn stored_instants(service: &HealthLake) -> Vec<(String, DateTime)> {
+    let state = service
+        .engine
+        .state::<ComAmazonawsHealthlakeHealthlakeState>();
+    let store = state.lock();
+    let mut held: Vec<(String, DateTime)> = Vec::new();
+    for (id, datastore) in &store.datastores {
+        held.push((format!("data store {id} created"), datastore.created_at));
+        // `backup_enabled_at` is deliberately absent: it bounds the restore
+        // window rather than recording a change to the record, and is held at
+        // the resolution that bound is compared at.
+        for ((resource_type, resource_id), resource) in &datastore.fhir_resources {
+            held.push((
+                format!("data store {id} {resource_type}/{resource_id} last updated"),
+                resource.last_updated,
+            ));
+        }
+    }
+    for (id, job) in &store.import_jobs {
+        held.push((format!("import job {id} submitted"), job.submitted_at));
+        if let Some(at) = job.ended_at {
+            held.push((format!("import job {id} ended"), at));
+        }
+    }
+    for (id, job) in &store.export_jobs {
+        held.push((format!("export job {id} submitted"), job.submitted_at));
+        if let Some(at) = job.ended_at {
+            held.push((format!("export job {id} ended"), at));
+        }
+    }
+    for (id, job) in &store.transformation_jobs {
+        held.push((format!("transformation job {id} submitted"), job.submitted_at));
+        if let Some(at) = job.ended_at {
+            held.push((format!("transformation job {id} ended"), at));
+        }
+    }
+    for (id, profile) in &store.profiles {
+        held.push((format!("profile {id} created"), profile.created_at));
+        held.push((
+            format!("profile {id} draft last updated"),
+            profile.draft.last_updated_at,
+        ));
+        for (version, record) in &profile.published {
+            held.push((
+                format!("profile {id} version {version} last updated"),
+                record.last_updated_at,
+            ));
+        }
+    }
+    held
+}
+
+#[tokio::test]
+async fn every_recorded_instant_is_reported_at_millisecond_resolution() {
+    // One service for every row, so the store sweep at the end sees every
+    // record each row wrote.
+    let service = HealthLake::new();
+
+    for recorder in Recorder::ALL {
+        let case = recorder.case();
+        for reported in recorder.drive(&service).await {
+            let read = reported.read;
+            let mut found: Vec<(String, f64)> = Vec::new();
+            reported_instants(&reported.body, &mut found);
+
+            for member in reported.required {
+                assert!(
+                    found.iter().any(|(name, _)| name == member),
+                    "case {case:?}: {read} must report a {member}, got {:?} in {}",
+                    found,
+                    reported.body
+                );
+            }
+
+            for (member, seconds) in &found {
+                let residue = sub_millisecond_residue(*seconds);
+                assert!(
+                    residue <= PRECISION_SLACK_MILLIS,
+                    "case {case:?}: {read} must report {member} at millisecond resolution, \
+                     got {seconds} ({residue} ms past a whole millisecond)"
+                );
+            }
+        }
+    }
+
+    // And the exact form of the same rule, off the records rather than off a
+    // response: nothing this service recorded holds a sub-millisecond fraction
+    // at all, so no later read of it can report one.
+    let held = stored_instants(&service);
+    assert!(
+        held.len() > Recorder::ALL.len(),
+        "the rows must leave the records they stamped in the store, got {held:?}"
+    );
+    for (record, at) in &held {
+        assert_eq!(
+            at.subsec_nanos() % 1_000_000,
+            0,
+            "the instant recorded for the {record} must hold whole milliseconds, got {at:?}"
         );
     }
 }

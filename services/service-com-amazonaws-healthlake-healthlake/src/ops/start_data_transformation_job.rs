@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TransformationJobStatus::Failed,
                 Some(crate::state::TRANSFORMATION_NOT_PERFORMED_MESSAGE.to_string()),
             )),
-            submitted_at: ::aws_smithy_types::DateTime::from(now),
+            submitted_at: crate::state::recorded_instant(now),
             ended_at: None,
             input_data_config: input.input_data_config,
             output_data_config: input.output_data_config,

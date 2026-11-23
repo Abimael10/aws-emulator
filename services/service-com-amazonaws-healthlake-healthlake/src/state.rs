@@ -1030,6 +1030,12 @@ impl Datastore {
     /// on the data store", so it is stamped when the configuration becomes
     /// enabled, left alone while it stays enabled (a later configuration change
     /// does not re-enable anything), and cleared when it is not enabled.
+    ///
+    /// `at` is the instant the clock read, NOT one at [`recorded_precision`]:
+    /// this stamp is the START BOUND of the restore window
+    /// ([`Datastore::restore_window`]), which a caller's `RestorePointTime` is
+    /// admitted or refused against, so it is held at the resolution that
+    /// comparison is made at.
     pub fn set_backup_configuration(
         &mut self,
         configuration: BackupConfiguration,
@@ -1056,6 +1062,11 @@ impl Datastore {
     /// Derived on every call rather than stored: the latest restorable point
     /// advances with the clock, so there is nothing here to keep up to date and
     /// reading it writes nothing.
+    ///
+    /// Both bounds are at the resolution the clock reads them rather than at
+    /// [`recorded_precision`]: they are not instants recorded ON a record but
+    /// the BOUNDARIES a caller's `RestorePointTime` is admitted or refused
+    /// against, and a bound moved to a whole millisecond is a boundary moved.
     pub fn restore_window(&self, now: SystemTime) -> Option<RestoreWindow> {
         let enabled_at = self.backup_enabled_at?;
         let retention_floor = self
@@ -1369,7 +1380,7 @@ impl ExportJob {
         // never leaves, and is stamped with the instant that step fell DUE —
         // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
+            self.ended_at = Some(recorded_instant(due_at));
         }
     }
 }
@@ -1479,7 +1490,7 @@ impl ImportJob {
         // never leaves, and is stamped with the instant that step fell DUE —
         // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
+            self.ended_at = Some(recorded_instant(due_at));
         }
     }
 }
@@ -1652,7 +1663,7 @@ impl TransformationJob {
         // never leaves, and is stamped with the instant that step fell DUE —
         // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
+            self.ended_at = Some(recorded_instant(due_at));
         }
     }
 }
@@ -3137,6 +3148,46 @@ fn healthlake_arn_resource(arn: &str) -> Option<&str> {
         return None;
     }
     Some(resource)
+}
+
+/// The precision every instant this service RECORDS on a record is kept to:
+/// whole MILLISECONDS, with the host clock's finer remainder dropped.
+///
+/// Both timestamp shapes this service reports through (`HealthLakeTimestamp` and
+/// `DateTime`) carry no `@timestampFormat`, so under its `awsJson1_0` protocol
+/// every timestamp member is serialized as an epoch-seconds JSON number whose
+/// fractional part is exactly the precision of the instant behind it. The
+/// service records an instant to the millisecond, so a value it reports never
+/// carries a finer fraction than that — truncating once where the clock is read
+/// is what makes that so for every member read off the record afterwards,
+/// rather than leaving each reader to round the same stored value its own way.
+///
+/// Truncation and not rounding: the instant a recorded value names never moves
+/// forward past the instant the work actually happened.
+pub const RECORDED_PRECISION_NANOS: u32 = 1_000_000;
+
+/// `at` as this service records an instant: a modelled timestamp at
+/// [`RECORDED_PRECISION_NANOS`].
+///
+/// The ONE place the host clock becomes a recorded instant, so every stamp this
+/// service writes onto a record — a data store's create instant, a job's submit
+/// and end instants, a profile's created, last-updated and deletion instants, a
+/// FHIR resource's last-updated instant — is held, compared and reported at the
+/// same precision.
+///
+/// What this is NOT for: the bounds of a restore window
+/// ([`Datastore::restore_window`] and the `BackupEnabledAt` that starts it),
+/// which are not instants recorded on a record but the boundaries a caller's
+/// `RestorePointTime` is admitted or refused against.
+pub fn recorded_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    recorded_precision(::aws_smithy_types::DateTime::from(at))
+}
+
+/// `at` truncated to [`RECORDED_PRECISION_NANOS`], for an instant that is
+/// already a modelled timestamp rather than a reading of the host clock.
+pub fn recorded_precision(at: ::aws_smithy_types::DateTime) -> ::aws_smithy_types::DateTime {
+    let nanos = at.subsec_nanos() / RECORDED_PRECISION_NANOS * RECORDED_PRECISION_NANOS;
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(at.secs(), nanos)
 }
 
 /// Epoch nanoseconds for a modelled timestamp, so two `HealthLakeTimestamp`

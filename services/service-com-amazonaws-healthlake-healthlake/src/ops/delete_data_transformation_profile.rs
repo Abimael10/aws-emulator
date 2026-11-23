@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteDataTransformationProfileOutput {
             profile_id: profile.id,
             profile_name: Some(profile.name),
-            deletion_time: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            deletion_time: crate::state::recorded_instant(::std::time::SystemTime::now()),
         })
     }
 }

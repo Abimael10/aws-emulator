@@ -293,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 outcome.status,
                 outcome.message,
             )),
-            submitted_at: ::aws_smithy_types::DateTime::from(now),
+            submitted_at: crate::state::recorded_instant(now),
             ended_at: None,
             input_data_config: input.input_data_config,
             output_data_config: Some(output_data_config),

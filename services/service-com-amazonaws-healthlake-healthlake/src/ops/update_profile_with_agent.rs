@@ -338,7 +338,7 @@ impl<Eng: Send + Sync + 'static> UpdateProfileWithAgent<Eng> {
             // account of the change and the instant it was recorded, which the
             // modelled readers report.
             profile.draft.change_description = Some(agent_change_description(&conversation_id));
-            profile.draft.last_updated_at = ::aws_smithy_types::DateTime::from(now);
+            profile.draft.last_updated_at = crate::state::recorded_instant(now);
         }
 
         // The answer, read off the profile as it stands AFTER the turn's write.

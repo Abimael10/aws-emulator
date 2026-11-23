@@ -301,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let created_at = ::aws_smithy_types::DateTime::from(now);
+        let created_at = crate::state::recorded_instant(now);
         let id = store.next_profile_id(now);
         let profile = crate::state::DataTransformationProfile {
             arn: crate::state::profile_arn(&region, &id),
