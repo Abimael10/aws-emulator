@@ -23,6 +23,19 @@
 //!   writes that have to seal a value (`PutSecretValue`, `UpdateSecret`, `CreateSecret`);
 //! * the member the value travels in, since the envelope is the same for both.
 //!
+//! The other half of the same rule, asserted by the last test here: only the secret's
+//! VALUE is sealed under that key — "Retrieves the details of a secret. It does not
+//! include the encrypted secret value" (`DescribeSecret`, this service's Smithy model),
+//! whose required permission is `secretsmanager:DescribeSecret` alone — so every
+//! operation that reports or changes METADATA keeps answering, and keeps enumerating the
+//! secret, while the authority on the key no longer reaches the cryptographic operation a
+//! value needs. Its rows add the third way that authority is withdrawn: a key policy
+//! clause that admits a cryptographic use only when it arrives through one service's path
+//! to the key (`kms:ViaService`), which confines the key rather than revoking it — so the
+//! envelope this service makes on the caller's behalf is served through the clause that
+//! names THIS service while the caller's own direct use of the key is refused, and
+//! refused through the clause that names another.
+//!
 //! KMS is mounted beside Secrets Manager on ONE engine, as `core/router/src/lib.rs`
 //! mounts them, so every key, policy and grant below is minted through KMS's own
 //! operations. The harness is [`crate::secret_kms_key_state`]'s, which is the suite that
@@ -30,7 +43,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::secret_kms_key_state::{create_body, key_policy, version_count, Emulator};
+use crate::secret_kms_key_state::{create_body, key_policy, version_count, Emulator, REGION};
 use crate::secret_lifecycle::ValueCase;
 
 /// The whole `Message` of the `AccessDeniedException` Secrets Manager refuses an
@@ -499,4 +512,451 @@ async fn grant(
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: CreateGrant reported no GrantId in {created}"))
         .to_string()
+}
+
+/// The regional endpoint name of an AWS service, which is the value `kms:ViaService` carries
+/// for a cryptographic request that service makes on a caller's behalf and the value a key
+/// policy confining a key to one service's path to it compares against.
+fn endpoint(vendor: &str) -> String {
+    format!("{vendor}.{REGION}.amazonaws.com")
+}
+
+/// The endpoint prefix of THIS service, which is what a key policy confining a key to the
+/// secret store's use of it names.
+const THIS_SERVICE: &str = "secretsmanager";
+
+/// Another service's endpoint prefix, which names a path to the key that no call below
+/// arrives through.
+const ANOTHER_SERVICE: &str = "s3";
+
+/// The actions a statement confining a key to one service's path to it is written over: the
+/// cryptographic uses of a key, two of them as action PATTERNS rather than names, which is
+/// how such a statement is written.
+fn cryptographic_actions() -> Value {
+    json!([
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
+    ])
+}
+
+/// How the use of the secret's key is taken out of the caller's hands for a row of the
+/// metadata table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    /// The key policy is replaced with one naming no cryptographic action at all, which is
+    /// [`Removal::KeyPolicyStatement`] read at its limit.
+    KeyPolicyWithoutTheActions,
+    /// The cryptographic actions reached the caller through a GRANT, and that grant is
+    /// revoked ([`Removal::Grant`]).
+    GrantRevoked,
+    /// The key is CONFINED rather than revoked: every cryptographic use that does not arrive
+    /// through the named service's path to the key is denied. The envelope arrives through
+    /// this service, so the clause naming this service admits it and the clause naming
+    /// another refuses it — and the caller's own direct use, which presents no value for the
+    /// condition key, is refused either way.
+    ConfinedTo(&'static str),
+}
+
+impl Withdrawal {
+    fn label(self) -> String {
+        match self {
+            Self::KeyPolicyWithoutTheActions => {
+                "the key policy names no cryptographic action".to_string()
+            }
+            Self::GrantRevoked => "the grant that carried the actions is revoked".to_string(),
+            Self::ConfinedTo(vendor) => {
+                format!("the key is confined to {}'s path to it", endpoint(vendor))
+            }
+        }
+    }
+
+    /// Whether the secret's VALUE is still served while this withdrawal is in force, which
+    /// only the clause naming THIS service's path leaves open.
+    fn value_served(self) -> bool {
+        self == Self::ConfinedTo(THIS_SERVICE)
+    }
+}
+
+/// The key policy that confines the key to `vendor`'s path to it: this caller may administer
+/// and use the key, and NO principal may perform a cryptographic operation on it except
+/// through that service.
+fn confining_policy(vendor: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Id": "key-confined-to-one-service",
+        "Statement": [
+            {
+                "Sid": "AdministerAndUseTheKey",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": service_com_amazonaws_kms_trentservice::state::caller_identity_arn(),
+                },
+                "Action": "kms:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "OnlyThroughTheNamedService",
+                "Effect": "Deny",
+                "Principal": {"AWS": "*"},
+                "Action": cryptographic_actions(),
+                "Resource": "*",
+                "Condition": {"StringNotEquals": {"kms:ViaService": [endpoint(vendor)]}},
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// What a metadata answer has to say about the secret it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reports {
+    /// The secret's own details: the key it is under and the version it holds.
+    Details,
+    /// An enumeration the secret appears in, with the key it is under.
+    Enumerated,
+    /// The secret's versions, which hold the one its value lives in.
+    Versions,
+    /// The secret's resource-policy slot, which names the secret whether or not a document
+    /// is attached.
+    PolicySlot,
+}
+
+/// One operation that reports metadata, and what its answer must say.
+struct MetadataCall {
+    case: &'static str,
+    operation: &'static str,
+    body: fn(&Target<'_>) -> Value,
+    reports: Reports,
+}
+
+/// The metadata-reporting operations under test: the secret's own details, both the
+/// unfiltered and the filtered enumeration it must appear in, its versions, and its
+/// resource-policy slot. None of them "include the encrypted secret value"
+/// (`DescribeSecret`), and each states `secretsmanager:<operation>` as its only required
+/// permission (this service's Smithy model).
+const METADATA_CALLS: &[MetadataCall] = &[
+    MetadataCall {
+        case: "DescribeSecret",
+        operation: "DescribeSecret",
+        body: |target| json!({"SecretId": target.name}),
+        reports: Reports::Details,
+    },
+    MetadataCall {
+        case: "ListSecrets with no filter",
+        operation: "ListSecrets",
+        body: |_| json!({}),
+        reports: Reports::Enumerated,
+    },
+    MetadataCall {
+        case: "ListSecrets filtered by the secret's name",
+        operation: "ListSecrets",
+        body: |target| json!({"Filters": [{"Key": "name", "Values": [target.name]}]}),
+        reports: Reports::Enumerated,
+    },
+    MetadataCall {
+        case: "ListSecretVersionIds",
+        operation: "ListSecretVersionIds",
+        body: |target| json!({"SecretId": target.name, "IncludeDeprecated": true}),
+        reports: Reports::Versions,
+    },
+    MetadataCall {
+        case: "GetResourcePolicy",
+        operation: "GetResourcePolicy",
+        body: |target| json!({"SecretId": target.name}),
+        reports: Reports::PolicySlot,
+    },
+];
+
+/// The tag a metadata WRITE attaches while the key withholds the value: "Tags are part of
+/// the secret's metadata" (`TagResource`, this service's Smithy model).
+const TAG_KEY: &str = "environment";
+const TAG_VALUE: &str = "attached-while-the-key-withheld-the-value";
+
+/// Assert `answered` says about the secret what this kind of metadata answer reports.
+fn assert_reports(answered: &Value, reports: Reports, target: &Target<'_>, case: &str) {
+    match reports {
+        Reports::Details => {
+            assert_eq!(
+                answered["Name"].as_str(),
+                Some(target.name),
+                "case {case:?}: expected the details to name the secret, got {answered}"
+            );
+            assert_eq!(
+                answered["KmsKeyId"].as_str(),
+                Some(target.key_arn),
+                "case {case:?}: expected the details to report the key the secret is under, \
+                 got {answered}"
+            );
+            assert!(
+                answered["VersionIdsToStages"]
+                    .get(target.version_id)
+                    .is_some(),
+                "case {case:?}: expected the details to report the version {:?} the secret \
+                 holds, got {answered}",
+                target.version_id
+            );
+        }
+        Reports::Enumerated => {
+            let listed = answered["SecretList"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: no SecretList in {answered}"));
+            let entry = listed
+                .iter()
+                .find(|entry| entry["Name"].as_str() == Some(target.name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the enumeration to hold the secret {:?}, got \
+                         {answered}",
+                        target.name
+                    )
+                });
+            assert_eq!(
+                entry["KmsKeyId"].as_str(),
+                Some(target.key_arn),
+                "case {case:?}: expected the entry to report the key the secret is under, got \
+                 {entry}"
+            );
+        }
+        Reports::Versions => {
+            let versions = answered["Versions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: no Versions in {answered}"));
+            assert!(
+                versions
+                    .iter()
+                    .any(|version| version["VersionId"].as_str() == Some(target.version_id)),
+                "case {case:?}: expected the versions to hold {:?}, got {answered}",
+                target.version_id
+            );
+        }
+        Reports::PolicySlot => {
+            assert_eq!(
+                answered["Name"].as_str(),
+                Some(target.name),
+                "case {case:?}: expected the resource-policy slot to name the secret, got \
+                 {answered}"
+            );
+            assert!(
+                answered["ARN"]
+                    .as_str()
+                    .is_some_and(|arn| arn.contains(target.name)),
+                "case {case:?}: expected the resource-policy slot to report the secret's ARN, \
+                 got {answered}"
+            );
+        }
+    }
+}
+
+/// Assert the caller's OWN direct cryptographic call on the key is refused: such a request
+/// presents no value for `kms:ViaService`, so a clause comparing that key fires on it
+/// whichever service's path the clause admits.
+async fn assert_direct_use_refused(emulator: &Emulator, key_arn: &str, case: &str) {
+    let (status, answered) = emulator
+        .kms(
+            "GenerateDataKey",
+            &json!({"KeyId": key_arn, "KeySpec": "AES_256"}),
+        )
+        .await;
+    let raw = answered
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        (status, raw.split('#').next_back().unwrap_or(raw)),
+        (400, ACCESS_DENIED_CODE),
+        "case {case:?}: expected the caller's own direct kms:GenerateDataKey to be refused \
+         HTTP 400 {ACCESS_DENIED_CODE}, got {status} with {answered}"
+    );
+}
+
+/// RULE: only a secret's VALUE is sealed under its customer managed key — the metadata is
+/// not — so the operations that report or change metadata keep answering, and keep
+/// enumerating the secret, however the authority in force on that key stops reaching the
+/// cryptographic operation a value needs; and a clause that admits a cryptographic use only
+/// through THIS service's path to the key serves the envelope this service makes on the
+/// caller's behalf while refusing the caller's own direct use of the key.
+#[tokio::test]
+async fn the_metadata_of_a_secret_answers_while_its_key_withholds_the_value() {
+    for (index, withdrawal) in [
+        Withdrawal::KeyPolicyWithoutTheActions,
+        Withdrawal::GrantRevoked,
+        Withdrawal::ConfinedTo(ANOTHER_SERVICE),
+        Withdrawal::ConfinedTo(THIS_SERVICE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = withdrawal.label();
+        let emulator = Emulator::new();
+        let (key_arn, _) = emulator.create_key(&case).await;
+        let name = format!("kms-denied-metadata-{index}");
+        let value = ValueCase::string("a string value", "s3cr3t-behind-a-withheld-key");
+
+        // The secret is created while the key still permits the caller everything, so what
+        // the rows assert below is the withdrawal and nothing else.
+        let created = emulator
+            .sm_ok(
+                "CreateSecret",
+                &create_body(&name, Some(&key_arn), &value),
+                &case,
+            )
+            .await;
+        let version_id = created["VersionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateSecret reported no VersionId"))
+            .to_string();
+
+        // For the grant row the key policy names no cryptographic action first, so the grant
+        // it issues is the only authority that reaches them.
+        let grant_id = match withdrawal {
+            Withdrawal::GrantRevoked => {
+                put_policy(&emulator, &key_arn, &[], &case).await;
+                Some(grant(&emulator, &key_arn, &KeyAction::BOTH, &case).await)
+            }
+            _ => None,
+        };
+
+        // The POSITIVE CONTROL: the value is served while the authority is in force.
+        let read = emulator
+            .sm_ok("GetSecretValue", &json!({"SecretId": &name}), &case)
+            .await;
+        value.assert_round_trip(&read, &case);
+
+        // The withdrawal itself.
+        match (withdrawal, grant_id) {
+            (Withdrawal::KeyPolicyWithoutTheActions, _) => {
+                put_policy(&emulator, &key_arn, &[], &case).await;
+            }
+            (Withdrawal::GrantRevoked, Some(grant_id)) => {
+                emulator
+                    .kms_ok(
+                        "RevokeGrant",
+                        &json!({"KeyId": &key_arn, "GrantId": grant_id}),
+                        &case,
+                    )
+                    .await;
+            }
+            (Withdrawal::GrantRevoked, None) => {
+                panic!("case {case:?}: the grant row minted no grant")
+            }
+            (Withdrawal::ConfinedTo(vendor), _) => {
+                emulator
+                    .kms_ok(
+                        "PutKeyPolicy",
+                        &json!({
+                            "KeyId": &key_arn,
+                            "Policy": confining_policy(vendor),
+                            // The document is the one statement under test, so it leaves no
+                            // path to a later PutKeyPolicy the lockout check would accept.
+                            "BypassPolicyLockoutSafetyCheck": true,
+                        }),
+                        &case,
+                    )
+                    .await;
+            }
+        }
+
+        // The VALUE plane, which is what the key decides: refused with this service's own
+        // sentence wherever the withdrawal reaches the envelope's own call, and served
+        // through the clause that admits this service's path to the key — where a write
+        // through the envelope stores a new version and both versions read back.
+        let before = version_count(&emulator, &name, &case).await;
+        if withdrawal.value_served() {
+            let served = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": &name}), &case)
+                .await;
+            value.assert_round_trip(&served, &case);
+            let replacement = ValueCase::string("a replacement", "written-through-this-service");
+            let mut write = Map::new();
+            write.insert("SecretId".to_string(), json!(&name));
+            if let Value::Object(members) = replacement.wire_members() {
+                write.extend(members);
+            }
+            let written = emulator
+                .sm_ok("PutSecretValue", &Value::Object(write), &case)
+                .await;
+            assert_ne!(
+                written["VersionId"].as_str(),
+                Some(version_id.as_str()),
+                "case {case:?}: expected the write through this service's path to store a new \
+                 version, got {written}"
+            );
+            assert_eq!(
+                version_count(&emulator, &name, &case).await,
+                before + 1,
+                "case {case:?}: expected the served write to store one version"
+            );
+            let baseline = emulator
+                .sm_ok(
+                    "GetSecretValue",
+                    &json!({"SecretId": &name, "VersionId": &version_id}),
+                    &case,
+                )
+                .await;
+            value.assert_round_trip(&baseline, &case);
+        } else {
+            let (code, message) = emulator
+                .sm_err("GetSecretValue", &json!({"SecretId": &name}), &case)
+                .await;
+            assert_eq!(
+                code, ACCESS_DENIED_CODE,
+                "case {case:?}: expected {ACCESS_DENIED_CODE}, got {code} with {message:?}"
+            );
+            assert_eq!(
+                message, KMS_ACCESS_DENIED_MESSAGE,
+                "case {case:?}: expected the message {KMS_ACCESS_DENIED_MESSAGE:?}, got \
+                 {message:?}"
+            );
+        }
+
+        // A confining clause compares HOW the request arrived, so the caller's own direct use
+        // of the key is refused whichever service's path that clause admits — which is what
+        // shows the clause is in force for the row the envelope is served on.
+        if matches!(withdrawal, Withdrawal::ConfinedTo(_)) {
+            assert_direct_use_refused(&emulator, &key_arn, &case).await;
+        }
+
+        // The METADATA plane, in the same window: every reporting operation answers and says
+        // what it says about the secret, the key it is under included.
+        let target = Target {
+            name: &name,
+            version_id: &version_id,
+            key_arn: &key_arn,
+            fresh: &name,
+        };
+        for call in METADATA_CALLS {
+            let case = format!("{case}, {}", call.case);
+            let answered = emulator
+                .sm_ok(call.operation, &(call.body)(&target), &case)
+                .await;
+            assert_reports(&answered, call.reports, &target, &case);
+        }
+
+        // And a metadata WRITE is applied, because no value is sealed to apply it: the tag
+        // attaches and the details report it.
+        let tag_case = format!("{case}, TagResource");
+        emulator
+            .sm_ok(
+                "TagResource",
+                &json!({"SecretId": &name, "Tags": [{"Key": TAG_KEY, "Value": TAG_VALUE}]}),
+                &tag_case,
+            )
+            .await;
+        let described = emulator
+            .sm_ok("DescribeSecret", &json!({"SecretId": &name}), &tag_case)
+            .await;
+        let tags = described["Tags"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {tag_case:?}: no Tags in {described}"));
+        assert!(
+            tags.iter().any(|tag| {
+                tag["Key"].as_str() == Some(TAG_KEY) && tag["Value"].as_str() == Some(TAG_VALUE)
+            }),
+            "case {tag_case:?}: expected the tag attached while the key withheld the value, \
+             got {described}"
+        );
+    }
 }

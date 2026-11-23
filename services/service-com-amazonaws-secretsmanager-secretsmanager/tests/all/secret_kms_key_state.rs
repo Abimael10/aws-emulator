@@ -43,7 +43,11 @@ use crate::secret_lifecycle::ValueCase;
 /// The region every request in this suite signs for: a KMS key is regional, and
 /// Secrets Manager calls the key in the region the request was addressed to, so the
 /// keys and the secrets below live in the same one.
-const REGION: &str = "us-west-2";
+///
+/// A suite built on this harness that writes a key policy comparing a REGIONAL value —
+/// the service endpoint name `kms:ViaService` carries, say — reads the region from here,
+/// so the document it writes names the region its requests are signed for.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// How a read refusal introduces the KMS refusal it relays: Secrets Manager states
 /// what it could not do and then relays the wrapped failure, which is how the
@@ -180,11 +184,16 @@ impl Emulator {
         )
     }
 
+    /// One KMS operation the CALLER makes itself, with whatever status it answered: a
+    /// refusal of the caller's own direct use of a key is half of what a key policy
+    /// confining that key to one service's path to it does.
+    pub(crate) async fn kms(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call("kms", "TrentService", operation, body).await
+    }
+
     /// One KMS operation that must succeed.
     pub(crate) async fn kms_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
-        let (status, parsed) = self
-            .call("kms", "TrentService", operation, body)
-            .await;
+        let (status, parsed) = self.kms(operation, body).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200 from KMS {operation}, got {status} with body {parsed}"
