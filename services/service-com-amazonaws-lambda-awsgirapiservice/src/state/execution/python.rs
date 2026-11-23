@@ -1154,11 +1154,12 @@ fn prepare(
         .as_object()
         .set_attr("builtin_module_names", vm.ctx.new_tuple(names), vm)?;
     clamp_recursion(vm, recursion_limit)?;
-    // WHICH RELEASE of the language this execution environment is, which the function's own
-    // `Runtime` names ([`super::python_release`]). Installed LAST, so every module the host
-    // itself imported on the way up was imported by the interpreter as it was built, and the
-    // release the run reports is read by the guest's own imports and by nothing else.
-    super::python_release::install(vm, environment)?;
+    // WHICH RELEASE of the language this execution environment is and WHICH IMPLEMENTATION of
+    // it, both of which the function's own `Runtime` names ([`super::python_release`]).
+    // Installed LAST, so every module the host itself imported on the way up was imported by
+    // the interpreter as it was built, and the identity the run reports is read by the guest's
+    // own imports and by nothing else.
+    super::python_release::install(vm, environment, architecture)?;
     Ok(environ)
 }
 
@@ -2294,26 +2295,36 @@ fn signing_as_client(access: AwsAccess, credentials: Option<&str>) -> Result<Aws
 /// to reach. Nothing here is a stub that pretends to have done the work.
 ///
 /// The names that would end THIS PROCESS are refused here too (`_exit`, `abort`), beside the
-/// ones that would start or signal another (`fork`, `execv`, `kill`): the module this list
-/// narrows carries no such call today, and a refusal installed under the name is what keeps
-/// that true of an interpreter release that adds one — a guest call that ended the process
-/// would take every other invocation's run and every tenant's state with it, past every bound
-/// a run is held to. What a run may do to its own ENVIRONMENT is not on this list and is not
+/// ones that would start or signal another (`fork`, `execv`, `posix_spawn`, `kill`) and the ones
+/// that would change what this process RUNS AS or what it can see of the host (`setuid`,
+/// `setresuid`, `initgroups`, `chroot`): the module this list narrows carries no such call
+/// today, and a refusal installed under the name is what keeps that true of an interpreter
+/// release that adds one — a guest call that started a host process or ended this one would
+/// take every other invocation's run and every tenant's state with it, past every bound a run is
+/// held to. Every POSIX spelling of each is named, because a name absent from this list is a
+/// name whose call would be whatever the module carries under it: the spawn pair beside the
+/// `exec` and `fork` families, `fexecve` beside `execve`, `pipe2` beside `pipe` and `dup3`
+/// beside `dup2`. What a run may do to its own ENVIRONMENT is not on this list and is not
 /// host-reaching: the environment mapping, the working directory it reports and the random
-/// bytes it reads are answered from the environment's own memory ([`super::host_posix`]).
+/// bytes it reads are answered from the environment's own memory ([`super::host_posix`]), which
+/// is also where the fork registration a library makes is answered.
 const REFUSED_POSIX_CALLS: &[&str] = &[
     "_exit", "abort",
-    "access", "chdir", "chmod", "chown", "close", "closerange", "confstr", "cpu_count",
-    "device_encoding", "dup", "dup2",
-    "execv", "execve", "fchdir", "fchmod", "fchown", "fdatasync", "fdopen", "fork", "forkpty",
+    "access", "chdir", "chmod", "chown", "chroot", "close", "closerange", "confstr", "cpu_count",
+    "device_encoding", "dup", "dup2", "dup3",
+    "execv", "execve", "fchdir", "fchmod", "fchown", "fdatasync", "fdopen", "fexecve", "fork",
+    "forkpty",
     "fstat", "fstatvfs", "fsync", "ftruncate", "get_blocking", "get_inheritable",
     "get_terminal_size", "getegid", "geteuid", "getgid", "getgrouplist", "getgroups", "getlogin",
-    "getppid", "getpriority", "getsid", "getuid", "isatty", "kill", "killpg", "lchown", "link",
+    "getppid", "getpriority", "getresgid", "getresuid", "getsid", "getuid", "initgroups",
+    "isatty", "kill", "killpg", "lchown", "link",
     "listdir", "lseek", "lstat", "major", "makedev", "minor", "mkdir", "mkfifo", "mknod", "nice",
-    "open", "openpty", "pipe", "popen", "pread", "putenv_host", "pwrite", "read", "readlink",
+    "open", "openpty", "pipe", "pipe2", "popen", "posix_spawn", "posix_spawnp", "pread",
+    "putenv_host", "pwrite", "read", "readlink",
     "readv", "remove", "rename", "replace", "rmdir", "scandir", "sched_yield", "sendfile",
     "set_blocking", "set_inheritable", "setegid", "seteuid", "setgid", "setgroups", "setpgid",
-    "setpgrp", "setpriority", "setregid", "setreuid", "setsid", "setuid", "spawnv", "spawnve",
+    "setpgrp", "setpriority", "setregid", "setresgid", "setresuid", "setreuid", "setsid",
+    "setuid", "spawnv", "spawnve",
     "pathconf", "fpathconf", "process_cpu_count", "sched_getaffinity", "sched_setaffinity",
     "sysconf", "waitstatus_to_exitcode", "lockf", "getrandom",
     "stat", "statvfs", "symlink", "sync", "system", "tcgetpgrp", "tcsetpgrp", "times", "truncate",
@@ -3055,6 +3066,160 @@ mod tests {
             assert_eq!(
                 actual, wanted,
                 "case {case}: expected {wanted}, got {actual} (log {:?})",
+                finished.log
+            );
+        }
+    }
+
+    /// RULE: the IDENTITY of the interpreter a run happens on is the identity of the managed
+    /// runtime its function is configured with — the implementation that runtime is and the
+    /// release it names — however the interpreter this emulator embeds identifies itself.
+    ///
+    /// The rows are `python` members of the model's own `Runtime` enum
+    /// (`smithy_query(query="shape", shape="Runtime")`), including releases the issue behind
+    /// this test never cited, and each is read through every reading of the identity a Python
+    /// program has: the implementation record, the version text the standard library's
+    /// `platform` module derives the running implementation from, and the release beside them.
+    #[test]
+    fn a_run_reports_the_implementation_its_runtime_is() {
+        let source = "import platform, sys\n\
+                      def handler(event, context):\n    \
+                          return {\n        \
+                              'platform_implementation': platform.python_implementation(),\n        \
+                              'name': sys.implementation.name,\n        \
+                              'cache_tag': sys.implementation.cache_tag,\n        \
+                              'implementation_release': list(sys.implementation.version[:2]),\n        \
+                              'same_hexversion': sys.implementation.hexversion == sys.hexversion,\n        \
+                              'release': list(sys.version_info[:2]),\n        \
+                              'version_names_another': 'rustpython' in sys.version.lower(),\n    \
+                          }\n";
+        // The runtime the function is configured with, and the release it names.
+        let cases: &[(&str, u64, u64)] = &[
+            ("python3.9", 3, 9),
+            ("python3.12", 3, 12),
+            ("python3.13", 3, 13),
+        ];
+        for (runtime, major, minor) in cases {
+            let mut environment = BTreeMap::new();
+            environment.insert(
+                super::super::EXECUTION_ENV_VARIABLE.to_string(),
+                format!("{}{runtime}", super::super::EXECUTION_ENV_PREFIX),
+            );
+            let finished = ran_with(
+                source,
+                "lambda_function.handler",
+                None,
+                &environment,
+                budget(),
+            );
+            let actual = returned(&finished, runtime);
+            let expected = ::serde_json::json!({
+                "platform_implementation": "CPython",
+                "name": "cpython",
+                "cache_tag": format!("cpython-{major}{minor}"),
+                "implementation_release": [major, minor],
+                "same_hexversion": true,
+                "release": [major, minor],
+                "version_names_another": false,
+            });
+            assert_eq!(
+                actual, expected,
+                "case {runtime}: expected the identity of that managed runtime, got {actual} \
+                 (log {:?})",
+                finished.log
+            );
+        }
+    }
+
+    /// RULE: no name a run can reach on the module its operating system is served by starts a
+    /// host process, ends this one, or changes what this process runs as — every one of them
+    /// raises, and the names the environment answers from its own memory still answer.
+    ///
+    /// Source of the names: the POSIX process, signal and privilege calls Python's `os` exposes
+    /// on the module it is built on — each family in both of its spellings, so a name added
+    /// beside one already refused (`posix_spawn` beside `spawnv`, `fexecve` beside `execve`,
+    /// `pipe2` beside `pipe`, `dup3` beside `dup2`, `setresuid` beside `setuid`) is read here
+    /// too. The containment is the module this emulator supplies and the refusals installed on
+    /// it ([`REFUSED_POSIX_CALLS`]), and this is the reading of it from GUEST code.
+    #[test]
+    fn no_posix_name_a_run_reaches_starts_or_ends_a_process() {
+        let names = [
+            "_exit",
+            "abort",
+            "chroot",
+            "dup",
+            "dup2",
+            "dup3",
+            "execv",
+            "execve",
+            "fexecve",
+            "fork",
+            "forkpty",
+            "initgroups",
+            "kill",
+            "killpg",
+            "open",
+            "pipe",
+            "pipe2",
+            "popen",
+            "posix_spawn",
+            "posix_spawnp",
+            "setgid",
+            "setresgid",
+            "setresuid",
+            "setsid",
+            "setuid",
+            "spawnv",
+            "spawnve",
+            "system",
+            "wait",
+            "waitpid",
+        ];
+        let source = "import posix\n\
+                      def handler(event, context):\n    \
+                          outcome = {}\n    \
+                          for name in event['names']:\n        \
+                              held = getattr(posix, name, None)\n        \
+                              if held is None:\n            \
+                                  outcome[name] = 'absent'\n            \
+                                  continue\n        \
+                              try:\n            \
+                                  held()\n            \
+                                  outcome[name] = 'returned'\n        \
+                              except OSError:\n            \
+                                  outcome[name] = 'refused'\n        \
+                              except BaseException as error:\n            \
+                                  outcome[name] = type(error).__name__\n    \
+                          return {\n        \
+                              'outcome': outcome,\n        \
+                              'cwd': posix.getcwd(),\n        \
+                              'pid': posix.getpid() > 0,\n    \
+                          }\n";
+        let event = ::serde_json::json!({ "names": names }).to_string();
+        let finished = ran(source, "lambda_function.handler", Some(&event));
+        let answered = returned(&finished, "the posix surface a run reaches");
+        for name in names {
+            let actual = answered
+                .get("outcome")
+                .and_then(|outcome| outcome.get(name))
+                .and_then(::serde_json::Value::as_str);
+            assert_eq!(
+                actual,
+                Some("refused"),
+                "case posix.{name}: expected the call to raise, got {actual:?} (log {:?})",
+                finished.log
+            );
+        }
+        // And the module still answers what a run reads from its own memory, so the refusals
+        // above are refusals of the host-reaching calls and not of the module as a whole.
+        for (member, expected) in [
+            ("cwd", ::serde_json::json!("/var/task")),
+            ("pid", ::serde_json::json!(true)),
+        ] {
+            let actual = answered.get(member).cloned().unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "case posix.{member}: expected {expected}, got {actual} (log {:?})",
                 finished.log
             );
         }

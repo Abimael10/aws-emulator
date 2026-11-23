@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CPython RELEASE the runtime a function is configured with names, as the interpreter
-//! one invocation runs in reports it.
+//! The IDENTITY of the interpreter the runtime a function is configured with names — which
+//! implementation of Python it is and which RELEASE of it — as the interpreter one invocation
+//! runs in reports it.
 //!
 //! A managed `python3.x` runtime IS a release of the language: the identifier names the
 //! interpreter's own minor version, so a handler of a function created with one identifier
@@ -21,9 +22,18 @@
 //! invocation — names no runtime, so nothing is installed for it and the interpreter reports
 //! its own build.
 //!
+//! WHICH IMPLEMENTATION of the language a managed runtime is is the same kind of statement: a
+//! `python3.x` runtime is a CPython release ([`IMPLEMENTATION_NAME`]), so that is the
+//! implementation a handler of such a function observes — through `sys.implementation`, and
+//! through the version TEXT the standard library's `platform` module derives the running
+//! implementation from. WHICH interpreter this emulator embeds to run the handler is this
+//! emulator's own affair and no statement of the function's runtime, so no reading of the
+//! runtime's identity reports it: where the interpreter states its own implementation, the
+//! implementation the runtime IS is stated instead.
+//!
 //! The installation is the HOST's, before a line of guest code is read, and it is READ BACK
-//! afterwards: an installation that did not take would leave a run reporting a release its
-//! function was not created with, and no later reading would say so.
+//! afterwards: an installation that did not take would leave a run reporting a release or an
+//! implementation its function was not created with, and no later reading would say so.
 
 use std::collections::BTreeMap;
 
@@ -63,6 +73,30 @@ const LANGUAGE_MAJOR: u8 = 3;
 /// `serial`).
 const FIELD_NAMES: &[&str] = &["major", "minor", "micro", "releaselevel", "serial"];
 
+/// The IMPLEMENTATION of Python a managed `python3.x` runtime is, as a Python program reads an
+/// implementation's own name (`sys.implementation.name`, which is lower case).
+///
+/// A managed runtime is one implementation of the language, and the `python3.x` runtimes are
+/// CPython releases — so that is the implementation a handler of such a function observes,
+/// exactly as the RELEASE it observes is the one its `Runtime` identifier names and the machine
+/// it observes is the one its `Architectures` names
+/// ([`super::host_posix::install_environment_identity`]).
+const IMPLEMENTATION_NAME: &str = "cpython";
+
+/// The same implementation as the version TEXT names one.
+///
+/// The text is the one reading the standard library's `platform` module derives the running
+/// implementation from (`platform.python_implementation()`), and an implementation is named
+/// there the way it is written rather than the way it is keyed.
+const IMPLEMENTATION_TITLE: &str = "CPython";
+
+/// Where an implementation states the machine it is built for, as `sys.implementation` carries
+/// that statement on the systems that have one.
+const MULTIARCH: &str = "_multiarch";
+
+/// What that statement separates the machine from the rest of itself by.
+const MULTIARCH_SEPARATOR: char = '-';
+
 /// The release `runtime` names: the major and minor version of the interpreter a function
 /// configured with that identifier runs on, or `None` for an identifier that names no release
 /// of this language at all ([`LANGUAGE_MAJOR`]).
@@ -100,22 +134,28 @@ fn runtime_of(environment: &BTreeMap<String, String>) -> Option<&str> {
 /// Install the release the run's own runtime names on `vm`, where a Python program reads the
 /// version of the interpreter it is running on.
 ///
-/// Three readings carry it, and all three are installed together so no two of them disagree:
-/// the version `sys.version_info` reports field by field, the version TEXT `sys.version`
-/// carries (which is what the standard library's `platform` module reads the running version
-/// out of), and the single number `sys.hexversion` packs it into. Only the version itself is
-/// restated in the text: what the interpreter says about its own build beside the version
-/// stays as it is, because that is this build's and not the release's.
+/// Three readings carry the release, and all three are installed together so no two of them
+/// disagree: the version `sys.version_info` reports field by field, the version TEXT
+/// `sys.version` carries (which is what the standard library's `platform` module reads the
+/// running version out of), and the single number `sys.hexversion` packs it into. Only the
+/// version and the IMPLEMENTATION are restated in the text: what the interpreter says about
+/// its own build beside those stays as it is, because that is this build's and not the
+/// runtime's.
+///
+/// The implementation the runtime is goes in beside them ([`install_implementation`]), read
+/// from the same runtime identifier, so the implementation `sys.implementation` reports and the
+/// one the text names are one statement.
 pub(super) fn install(
     vm: &VirtualMachine,
     environment: &BTreeMap<String, String>,
+    architecture: &str,
 ) -> PyResult<()> {
     let Some((major, minor)) = runtime_of(environment).and_then(named_by) else {
         return Ok(());
     };
     let system = vm.sys_module.as_object();
     let release = release_object(vm, major, minor)?;
-    system.set_attr("version_info", release, vm)?;
+    system.set_attr("version_info", release.clone(), vm)?;
     // Read back by the HOST: the run reports the release its function was created with, or it
     // is not served at all.
     let installed = system.get_attr("version_info", vm)?;
@@ -125,14 +165,103 @@ pub(super) fn install(
              release its runtime names, so no function is run in it"
         )));
     }
+    // WHAT the interpreter states its own implementation to be, read before anything restates
+    // it: it is the name the version text identifies the engine by, and that text is the one
+    // reading `platform` derives the running implementation from. Read with the rest: an
+    // interpreter whose own implementation cannot be read is one whose statement of itself
+    // cannot be restated either, so no function is run in it rather than one being run in an
+    // environment reporting an implementation its runtime is not.
+    let identity = system.get_attr("implementation", vm)?;
+    let engine: String = identity.get_attr("name", vm)?.try_into_value(vm)?;
     let built: String = system.get_attr("version", vm)?.try_into_value(vm)?;
     system.set_attr(
         "version",
-        vm.ctx.new_str(version_text(&built, major, minor)),
+        vm.ctx.new_str(version_text(&built, &engine, major, minor)),
         vm,
     )?;
+    // Read back by the HOST, as the release is: the text a run reports names the implementation
+    // the runtime is and no other, because that text is where `platform` reads the running
+    // implementation from.
+    let stated: String = system.get_attr("version", vm)?.try_into_value(vm)?;
+    if names_implementation(&stated, &engine) && !engine.eq_ignore_ascii_case(IMPLEMENTATION_TITLE)
+    {
+        return Err(vm.new_runtime_error(format!(
+            "the version this execution environment reports still names the {engine} \
+             implementation rather than the {IMPLEMENTATION_NAME} its runtime is, so no function \
+             is run in it"
+        )));
+    }
     system.set_attr("hexversion", vm.ctx.new_int(hexversion(major, minor)), vm)?;
+    install_implementation(vm, &identity, &release, (major, minor), architecture)
+}
+
+/// Install the IMPLEMENTATION this execution environment runs, where a Python program reads the
+/// implementation it is running on (`sys.implementation`): the implementation a managed runtime
+/// is ([`IMPLEMENTATION_NAME`]), the release that runtime names — the same object
+/// `sys.version_info` is, so the two readings cannot disagree — the single number that release
+/// packs into, the cache tag the implementation and the release make together, and the machine
+/// the function's own architecture names.
+///
+/// The object the identity is stated on is put back on `sys` and READ BACK from there, for the
+/// same reason the release is: an installation that did not take would leave a run reporting an
+/// implementation its function's runtime is not, and no later reading would say so.
+fn install_implementation(
+    vm: &VirtualMachine,
+    identity: &PyObjectRef,
+    release: &PyObjectRef,
+    (major, minor): (u8, u8),
+    architecture: &str,
+) -> PyResult<()> {
+    identity.set_attr("name", vm.ctx.new_str(IMPLEMENTATION_NAME), vm)?;
+    identity.set_attr("version", release.clone(), vm)?;
+    identity.set_attr("hexversion", vm.ctx.new_int(hexversion(major, minor)), vm)?;
+    identity.set_attr("cache_tag", vm.ctx.new_str(cache_tag(major, minor)), vm)?;
+    // The machine the identity names, where it names one at all: the function's own
+    // architecture, which is the machine every other reading of this environment reports
+    // ([`super::host_posix::install_environment_identity`]) rather than the one this process
+    // happens to be on.
+    if let Some(held) = identity
+        .get_attr(MULTIARCH, vm)
+        .ok()
+        .and_then(|held| held.try_into_value::<String>(vm).ok())
+    {
+        identity.set_attr(
+            MULTIARCH,
+            vm.ctx.new_str(multiarch_of(&held, architecture)),
+            vm,
+        )?;
+    }
+    let system = vm.sys_module.as_object();
+    system.set_attr("implementation", identity.clone(), vm)?;
+    let installed: String = system
+        .get_attr("implementation", vm)?
+        .get_attr("name", vm)?
+        .try_into_value(vm)?;
+    if installed != IMPLEMENTATION_NAME {
+        return Err(vm.new_runtime_error(format!(
+            "the interpreter of this execution environment does not report the \
+             {IMPLEMENTATION_NAME} implementation its runtime is, so no function is run in it"
+        )));
+    }
     Ok(())
+}
+
+/// What an implementation and a release are keyed together by, as `sys.implementation.cache_tag`
+/// carries that key: the implementation's own name and the release's major and minor version
+/// written after it.
+fn cache_tag(major: u8, minor: u8) -> String {
+    format!("{IMPLEMENTATION_NAME}-{major}{minor}")
+}
+
+/// The machine statement of an implementation running a function on `architecture`: the machine
+/// that architecture names ([`super::host_posix::machine_of`]), followed by whatever `held`
+/// states about the environment the implementation is built for.
+fn multiarch_of(held: &str, architecture: &str) -> String {
+    let machine = super::host_posix::machine_of(architecture);
+    match held.split_once(MULTIARCH_SEPARATOR) {
+        Some((_, rest)) => format!("{machine}{MULTIARCH_SEPARATOR}{rest}"),
+        None => machine.to_string(),
+    }
 }
 
 /// The version a Python program reads field by field, as the object `sys.version_info` is.
@@ -197,18 +326,74 @@ fn read_release(vm: &VirtualMachine, held: &PyObjectRef) -> Option<(i64, i64)> {
     Some(read)
 }
 
-/// The version TEXT a run carries: the release its runtime names, followed by whatever the
-/// interpreter states about its own build.
+/// The version TEXT a run carries: the release its runtime names, the implementation that
+/// runtime is, and whatever the interpreter states about its own build beside the two.
 ///
-/// The text is what `platform.python_version()` reads the running version out of, and it
-/// begins with the version itself, so that is the one part restated — the build information
-/// after it is this interpreter's own and is left exactly as it is.
-fn version_text(built: &str, major: u8, minor: u8) -> String {
+/// The text is what `platform.python_version()` reads the running version out of and what
+/// `platform.python_implementation()` reads the running implementation from, so both of those
+/// are the runtime's: the version it begins with is the release, and a statement of `engine` —
+/// the implementation the interpreter states ITSELF to be — is restated as the implementation
+/// the runtime is ([`restated`]). Everything else is this build's own and is left exactly as it
+/// is.
+fn version_text(built: &str, engine: &str, major: u8, minor: u8) -> String {
     let release = format!("{major}.{minor}.{MICRO}");
-    match built.split_once(char::is_whitespace) {
+    let stated = match built.split_once(char::is_whitespace) {
         Some((_, rest)) => format!("{release} {rest}"),
-        None => release,
+        None => release.clone(),
+    };
+    restated(&stated, engine, &release)
+}
+
+/// `text` with every statement of the implementation named `engine` restated as the
+/// implementation and release this runtime is: the name itself, and the version written right
+/// after it, which is that implementation's own.
+///
+/// The name is matched however it is written, because an implementation names itself one way in
+/// the text it builds and another in the key it is read by. A text that states no
+/// implementation, and an interpreter that names none for itself, are left as they are.
+fn restated(text: &str, engine: &str, release: &str) -> String {
+    if engine.is_empty() {
+        return text.to_string();
     }
+    // Lowered ONCE, for the whole scan: lowering an ASCII letter leaves every byte position
+    // where it was, so a position found in this copy is a position in `text` itself.
+    let lowered = text.to_ascii_lowercase();
+    let wanted = engine.to_ascii_lowercase();
+    let mut rendered = String::new();
+    let mut at = 0_usize;
+    while let Some(found) = lowered[at..].find(wanted.as_str()) {
+        let stands = at + found;
+        rendered.push_str(&text[at..stands]);
+        rendered.push_str(IMPLEMENTATION_TITLE);
+        at = stands + wanted.len();
+        // The version written right after the name is the version OF that implementation, so
+        // the release this runtime names takes its place; anything else after the name is a
+        // statement of something other than the implementation and stays.
+        let rest = &text[at..];
+        let spaces = rest.len() - rest.trim_start_matches(' ').len();
+        let stated: String = rest[spaces..].chars().take_while(in_version).collect();
+        if stated.starts_with(|character: char| character.is_ascii_digit()) {
+            rendered.push_str(&rest[..spaces]);
+            rendered.push_str(release);
+            at += spaces + stated.len();
+        }
+    }
+    rendered.push_str(&text[at..]);
+    rendered
+}
+
+/// Whether `character` can stand in the VERSION a text states of an implementation, which is
+/// read the way the standard library's `platform` module reads one: word characters, the dots
+/// between a version's own parts, and the plus a local version carries.
+fn in_version(character: &char) -> bool {
+    character.is_alphanumeric() || matches!(character, '.' | '+' | '_')
+}
+
+/// Whether `text` states the implementation `named`, however either of them is written: the
+/// reading `platform` makes of a version text to decide which implementation is running, and
+/// the one the host reads the installed text back by.
+fn names_implementation(text: &str, named: &str) -> bool {
+    !named.is_empty() && text.to_ascii_lowercase().contains(&named.to_ascii_lowercase())
 }
 
 /// The release packed into the single number `sys.hexversion` carries: one byte each for the
@@ -303,29 +488,150 @@ mod tests {
     /// states about its own build, whatever shape that statement has.
     #[test]
     fn the_version_text_restates_the_release_and_nothing_else() {
-        // The text the interpreter carries, the release the runtime names, and the text a run
-        // of it reports.
-        let cases: &[(&str, (u8, u8), &str)] = &[
+        // The text the interpreter carries, the implementation it states itself to be, the
+        // release the runtime names, and the text a run of it reports. None of these texts
+        // names the interpreter's own implementation, so nothing but the version is restated.
+        let cases: &[(&str, &str, (u8, u8), &str)] = &[
             (
                 "3.14.0 (heads/main:0000000, Jan 1 2026, 00:00:00) [rustc 1.90.0]",
+                "someengine",
                 (3, 11),
                 "3.11.0 (heads/main:0000000, Jan 1 2026, 00:00:00) [rustc 1.90.0]",
             ),
             (
                 "3.14.0 (default) [cc]",
+                "someengine",
                 (3, 12),
                 "3.12.0 (default) [cc]",
             ),
             // A statement of nothing but a version is restated whole.
-            ("3.14.0", (3, 13), "3.13.0"),
+            ("3.14.0", "someengine", (3, 13), "3.13.0"),
             // And an interpreter that states no version at all is given the release's own.
-            ("", (3, 14), "3.14.0"),
+            ("", "someengine", (3, 14), "3.14.0"),
+            // An interpreter that names no implementation for itself has none restated.
+            (
+                "3.14.0 (main) [cc 1.0]",
+                "",
+                (3, 12),
+                "3.12.0 (main) [cc 1.0]",
+            ),
         ];
-        for (built, (major, minor), expected) in cases {
-            let actual = version_text(built, *major, *minor);
+        for (built, engine, (major, minor), expected) in cases {
+            let actual = version_text(built, engine, *major, *minor);
             assert_eq!(
                 &actual, expected,
                 "case {built:?}: expected the text {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the version text names the implementation the function's runtime IS, so the
+    /// implementation the interpreter states about itself — and the version it states of that
+    /// implementation — is never what a run reports.
+    ///
+    /// The rows differ along how an interpreter states itself in that text: where in the text
+    /// it stands, how its name is cased, whether a version of its own follows the name, and how
+    /// many times it is stated.
+    #[test]
+    fn the_version_text_names_the_implementation_the_runtime_is() {
+        // The text the interpreter carries, the name it keys its own implementation by, the
+        // release the runtime names, and the text a run of it reports.
+        let cases: &[(&str, &str, (u8, u8), &str)] = &[
+            // The statement an embedded interpreter makes in the field the text keeps for the
+            // compiler: its own name, its own version, then the compiler itself.
+            (
+                "3.14.0 (heads/main:0000000, Jan 1 2026, 00:00:00)\n\
+                 [RustPython 0.6.0 with rustc 1.90.0 (0000000 2026-01-01)]",
+                "rustpython",
+                (3, 12),
+                "3.12.0 (heads/main:0000000, Jan 1 2026, 00:00:00)\n\
+                 [CPython 3.12.0 with rustc 1.90.0 (0000000 2026-01-01)]",
+            ),
+            // The same statement in the build field instead, and twice over.
+            (
+                "3.14.0 (RustPython 0.6.0, Jan 1 2026, 00:00:00) [RustPython 0.6.0]",
+                "rustpython",
+                (3, 13),
+                "3.13.0 (CPython 3.13.0, Jan 1 2026, 00:00:00) [CPython 3.13.0]",
+            ),
+            // A name stated with no version of its own after it: only the name is restated.
+            (
+                "3.14.0 (main) [rustpython]",
+                "RustPython",
+                (3, 9),
+                "3.9.0 (main) [CPython]",
+            ),
+            // An interpreter whose own name is the implementation's: the release it states of
+            // it is still the runtime's.
+            (
+                "3.14.0 (main) [CPython 3.14.0 with cc]",
+                "cpython",
+                (3, 11),
+                "3.11.0 (main) [CPython 3.11.0 with cc]",
+            ),
+        ];
+        for (built, engine, (major, minor), expected) in cases {
+            let actual = version_text(built, engine, *major, *minor);
+            assert_eq!(
+                &actual, expected,
+                "case {built:?}: expected the text {expected:?}, got {actual:?}"
+            );
+            assert!(
+                !names_implementation(&actual, engine)
+                    || engine.eq_ignore_ascii_case(IMPLEMENTATION_TITLE),
+                "case {built:?}: the text names no implementation but the runtime's, got \
+                 {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the implementation and the release are keyed together the way a Python program
+    /// reads that key, for every release a `python3.x` runtime names.
+    ///
+    /// Source of the form: `sys.implementation.cache_tag`, which CPython writes as its own
+    /// implementation name and the major and minor version after it.
+    #[test]
+    fn the_cache_tag_keys_the_implementation_and_the_release() {
+        let cases: &[((u8, u8), &str)] = &[
+            ((3, 9), "cpython-39"),
+            ((3, 11), "cpython-311"),
+            ((3, 12), "cpython-312"),
+            ((3, 13), "cpython-313"),
+            ((3, 15), "cpython-315"),
+        ];
+        for ((major, minor), expected) in cases {
+            let actual = cache_tag(*major, *minor);
+            assert_eq!(
+                &actual, expected,
+                "case {major}.{minor}: expected the tag {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the machine the implementation states it is built for is the one the function's
+    /// architecture names, and never the machine this process happens to be on.
+    ///
+    /// Source of the architectures: the model's own `Architecture` enum
+    /// (`smithy_query(query="shape", shape="Architecture")`), both of whose values are read
+    /// here, each against a statement naming the other.
+    #[test]
+    fn the_machine_the_implementation_names_is_the_function_s() {
+        // What the interpreter's own build states, the architecture the function carries, and
+        // what a run of it reports.
+        let cases: &[(&str, &str, &str)] = &[
+            ("aarch64-linux-gnu", "x86_64", "x86_64-linux-gnu"),
+            ("x86_64-linux-gnu", "arm64", "aarch64-linux-gnu"),
+            ("x86_64-linux-gnu", "x86_64", "x86_64-linux-gnu"),
+            ("aarch64-linux-gnu", "arm64", "aarch64-linux-gnu"),
+            // A statement of nothing but a machine carries nothing else to keep.
+            ("aarch64", "x86_64", "x86_64"),
+            ("", "arm64", "aarch64"),
+        ];
+        for (held, architecture, expected) in cases {
+            let actual = multiarch_of(held, architecture);
+            assert_eq!(
+                &actual, expected,
+                "case {held:?} on {architecture}: expected {expected:?}, got {actual:?}"
             );
         }
     }
