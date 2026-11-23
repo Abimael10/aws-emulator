@@ -62,7 +62,13 @@ use crate::provisioning_loop::{action, call, first_text, members, p};
 
 /// The one function every row registers: it answers what the destination the check requested
 /// names, so one package serves every class of answer the rule generalises over.
-const FUNCTION: &str = "elbv2-hc-verdict-target";
+///
+/// `pub(crate)` with the three items below ([`HANDLER_SOURCE`], [`package`], [`emulator`] and
+/// [`create_function`]): every suite of this crate whose rows turn on what a health check's
+/// invocation ANSWERS needs exactly this function and exactly this mounting
+/// (`all/lambda_target_health_state_sequence.rs` among them), so they share one of each rather
+/// than drifting on what is mounted or on what the handler answers.
+pub(crate) const FUNCTION: &str = "elbv2-hc-verdict-target";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern. No IAM is mounted
 /// here, so nothing is known about the role and nothing the function does needs one.
@@ -104,7 +110,7 @@ const FAILED_HEALTH_CHECKS_DESCRIPTION: &str = "Health checks failed";
 /// The handler every row runs. It answers what the LAST SEGMENT of the destination the check
 /// requested names: a run that raises for `raise`, an object naming no status for `nostatus`, a
 /// payload that is no object for `notanobject`, else the status that segment spells.
-const HANDLER_SOURCE: &str = r#"
+pub(crate) const HANDLER_SOURCE: &str = r#"
 def lambda_handler(event, context):
     choice = (event.get("path") or "/").rsplit("/", 1)[-1]
     if choice == "raise":
@@ -122,7 +128,7 @@ def lambda_handler(event, context):
 
 /// A .zip deployment package holding [`HANDLER_SOURCE`] as `lambda_function.py`, written in
 /// memory the way a caller uploads one.
-fn package() -> Vec<u8> {
+pub(crate) fn package() -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -141,7 +147,7 @@ fn package() -> Vec<u8> {
 /// This service and Lambda over ONE shared engine, as `core/router/src/lib.rs` mounts them: the
 /// function a health check invokes is RUN by that Lambda, so what each row's verdict is decided
 /// from is a real run rather than a record this suite wrote.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -157,7 +163,10 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Create the one function through Lambda's own API and answer its ARN.
-async fn create_function(router: &MultiServiceRouter, engine: &Arc<engine::InMemoryEngine>) -> String {
+pub(crate) async fn create_function(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+) -> String {
     let (status, created) = lambda(
         router,
         "POST",

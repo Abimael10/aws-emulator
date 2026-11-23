@@ -251,10 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound is on what is stored rather than on what was stored when this one started.
         check_quota(group, &requested)?;
 
-        // The cadence this group's health checks run at, which is what times the first
-        // check of every registration this call makes
-        // ([`crate::state::health_check_interval`]).
-        let interval = crate::state::health_check_interval(group);
         for ((target, (id, port)), zone) in input.targets.iter().zip(requested).zip(zones) {
             group.targets.insert(
                 (id.clone(), port),
@@ -272,9 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // target that was draining returns it to service: it is checked from
                     // now rather than removed when the drain it was in runs out.
                     draining_until: None,
-                    // The first check of it is one health-check interval away, as every
-                    // later one is one interval after the last.
-                    checks_due_at: now + interval,
+                    // The first check of it is owed at once — a load balancer begins sending
+                    // a registration checks as soon as it is registered, which is the
+                    // `initial` it reports while it is still determining its health — and
+                    // every later one comes one health-check interval after the last.
+                    checks_due_at: now,
                     // No check has observed this registration yet, so it starts with the
                     // verdict the clock owes it ([`crate::state::target_health`]).
                     probe: crate::state::TargetProbe::default(),

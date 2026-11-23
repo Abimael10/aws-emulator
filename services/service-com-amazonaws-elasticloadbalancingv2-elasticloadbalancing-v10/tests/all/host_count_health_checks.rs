@@ -483,10 +483,13 @@ struct CadenceRow {
 }
 
 impl CadenceRow {
-    /// The shortest span this row's schedule can reach its verdict in: one check per
-    /// interval, and the threshold of them before the verdict moves.
+    /// The shortest span this row's schedule can reach its verdict in: the FIRST check is
+    /// owed when health checking on the registration begins and every later one is one
+    /// interval after the last, so the threshold of consecutive checks spans one interval
+    /// fewer than that threshold.
     fn soonest_verdict(&self) -> Duration {
-        Duration::from_secs(self.interval_seconds).saturating_mul(self.unhealthy_threshold)
+        Duration::from_secs(self.interval_seconds)
+            .saturating_mul(self.unhealthy_threshold.saturating_sub(1))
     }
 }
 
@@ -679,7 +682,7 @@ async fn a_verdict_takes_its_threshold_of_checks_at_the_configured_interval() {
                     row.case
                 );
                 // The span the schedule takes: a verdict cannot be in before the threshold of
-                // checks is, and the checks are one interval apart.
+                // checks is, and the checks are one interval apart from the first one on.
                 assert!(
                     settled.after >= row.soonest_verdict(),
                     "case {:?}: a verdict takes {:?} at this cadence, got it after {:?}",
