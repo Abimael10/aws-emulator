@@ -211,8 +211,10 @@ impl DataPlane<'_> {
     /// The routing controls to report, in ARN order: every one the control plane holds,
     /// or just those hosted in `control_panel_arn` when a filter is given.
     ///
-    /// The order is total and stable, which is what lets `ListRoutingControls`' pages
-    /// walk the set without repeats or omissions.
+    /// The order is total, stable and ASCENDING, which is what lets
+    /// `ListRoutingControls`' pages walk the set without repeats or omissions: a cursor
+    /// naming one control's ARN is a position in this order, so a page resumes from it
+    /// whether or not that control is still here.
     pub fn routing_controls_in(&self, control_panel_arn: Option<&str>) -> Vec<RoutingControl> {
         self.registry
             .routing_controls

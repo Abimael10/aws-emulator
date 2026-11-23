@@ -9,10 +9,14 @@
 //! Paging honours `MaxResults` and `NextToken`: the token is an opaque, versioned
 //! encoding of the filter it was issued for plus the routing control the next page
 //! starts at, so issuing a page writes no state and the pages walk the whole set
-//! without repeats or omissions. A `ControlPanelArn` no control panel was minted for is
-//! a `ResourceNotFoundException`; a token this service did not issue is a
-//! `ValidationException` (400). The status a refusal is stated at is this API's
-//! ([`crate::service::error_status`]).
+//! without repeats or omissions. The cursor names a POSITION in that order, so a page
+//! resumes at the first routing control whose ARN is not below the one the cursor names —
+//! which keeps the walk going even when the control plane deleted that control between
+//! two pages. A `ControlPanelArn` no control panel was minted for is a
+//! `ResourceNotFoundException`; a token this service did not issue — one it cannot
+//! decode, one in a form this build does not know, or one issued for another
+//! `ControlPanelArn` — is a `ValidationException` (400). The status a refusal is stated
+//! at is this API's ([`crate::service::error_status`]).
 //!
 //! WHETHER the filter names a control panel at all is settled before that lookup, by
 //! [`crate::service::resource_arn`]: a `ControlPanelArn` that is not a well-formed ARN of a
@@ -133,7 +137,8 @@ const CURSOR_VERSION: &str = "v1";
 /// The cursor names the next ITEM rather than an offset into the listing, because the
 /// set it walks is the control plane's registry: a routing control created or deleted
 /// between two pages would shift every offset after it, but it cannot shift the ARN this
-/// page is to resume at.
+/// page is to resume at. Reading it back ([`resume_offset`]) therefore treats that ARN as
+/// a position in the order rather than as an entry that has to still be there.
 fn encode_cursor(control_panel_arn: Option<&str>, resume_at: &str) -> String {
     hex::encode(format!(
         "{CURSOR_VERSION}|{}|{resume_at}",
@@ -158,6 +163,20 @@ fn decode_cursor(token: &str, control_panel_arn: Option<&str>) -> Option<String>
         return None;
     }
     Some(resume_at.to_string())
+}
+
+/// Where in `controls` the page a cursor naming `resume_at` starts.
+///
+/// `controls` is the listing in ascending ARN order and the cursor names a POSITION in
+/// that order, so the page starts at the first control whose ARN is not below
+/// `resume_at`: that control itself while the registry still holds it, and the next one
+/// still listed once the control plane has deleted it. Either way every control before
+/// the resume point has already been reported and none from it on has been, so the pages
+/// keep walking the whole set without repeats or omissions — which is the reason the
+/// cursor names an item at all ([`encode_cursor`]). A cursor that sorts past every
+/// remaining control resumes at the end of the listing, which is an empty final page.
+fn resume_offset(controls: &[crate::state::RoutingControl], resume_at: &str) -> usize {
+    controls.partition_point(|control| control.routing_control_arn.as_str() < resume_at)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -288,13 +307,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let offset = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => decode_cursor(token, filter)
-                .and_then(|resume_at| {
-                    controls
-                        .iter()
-                        .position(|control| control.routing_control_arn == resume_at)
-                })
-                .ok_or_else(|| {
+            // Only a token this operation did not issue for this filter is refused. One
+            // it decodes carries a position in the listing, and every listing has a
+            // resume point for a position — the control the cursor names while it is
+            // still registered, the next one still listed once it is gone.
+            Some(token) => {
+                let resume_at = decode_cursor(token, filter).ok_or_else(|| {
                     ListRoutingControlsError::from(
                         ListRoutingControlsErrorModeled::ValidationException(ValidationException {
                             message: "NextToken is not a token this call issued for the \
@@ -309,7 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }]),
                         }),
                     )
-                })?,
+                })?;
+                resume_offset(&controls, &resume_at)
+            }
         };
 
         // `MaxResults` is modelled with `@range(min: 1)`, so a value below it is a

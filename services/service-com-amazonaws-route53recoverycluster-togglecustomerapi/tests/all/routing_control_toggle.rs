@@ -22,10 +22,10 @@ use service_com_amazonaws_route53recoverycluster_togglecustomerapi::ops::types::
 use service_com_amazonaws_route53recoverycluster_togglecustomerapi::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES;
 
 use super::common::{
-    call, emulator, error_code, fleet, get_state, list_all_pages, listed_arns, unknown_arn_like,
-    RESOURCE_NOT_FOUND_STATUS,
-    Fleet,
+    call, delete_routing_control, emulator, error_code, fleet, get_state, list_all_pages,
+    listed_arns, unknown_arn_like, RESOURCE_NOT_FOUND_STATUS, Fleet,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
 /// A cursor in the encoding `ListRoutingControls` issues (an unfiltered listing
 /// resuming at `arn`), so a token naming a routing control that is not in the set can be
@@ -381,7 +381,13 @@ async fn max_results_outside_the_modelled_range_is_refused() {
 
 /// RULE: a `NextToken` is only valid for the call that issued it — it carries the
 /// filter it was issued for and the routing control it resumes at, and a token this
-/// service did not issue is refused with HTTP 400 `ValidationException`.
+/// service did not issue (one it cannot decode, or one bound to another
+/// `ControlPanelArn`) is refused with HTTP 400 `ValidationException`.
+///
+/// A token this service CAN decode names a position in the listing instead, and is
+/// served from it whether or not the registry still holds that routing control —
+/// `a_page_resumes_at_the_position_a_decodable_token_names` and
+/// `a_deleted_resume_control_does_not_end_the_pagination_walk` are the rows for that.
 #[tokio::test]
 async fn a_next_token_is_only_valid_for_the_call_that_issued_it() {
     let router = emulator();
@@ -396,7 +402,7 @@ async fn a_next_token_is_only_valid_for_the_call_that_issued_it() {
         .to_string();
 
     // Rows: the unfiltered token replayed under a filter, under another filter,
-    // and tokens this service never issued at all.
+    // and a token this service never issued at all.
     let cases: Vec<(String, Value)> = vec![
         (
             "a token issued unfiltered, replayed with a filter".to_string(),
@@ -413,8 +419,12 @@ async fn a_next_token_is_only_valid_for_the_call_that_issued_it() {
             json!({ "NextToken": "not-a-token" }),
         ),
         (
-            "a token naming a routing control that is not in the set".to_string(),
-            json!({ "NextToken": cursor_for(&unknown_arn_like(&fleet.arns()[0])) }),
+            "a token in a version this build does not know".to_string(),
+            json!({ "NextToken": hex::encode(format!("v0||{}", fleet.arns()[0])) }),
+        ),
+        (
+            "a token carrying more fields than the encoding has".to_string(),
+            json!({ "NextToken": hex::encode(format!("v1||{}|extra", fleet.arns()[0])) }),
         ),
     ];
 
@@ -429,6 +439,267 @@ async fn a_next_token_is_only_valid_for_the_call_that_issued_it() {
             "ValidationException",
             "case {case}: expected ValidationException, got {body}"
         );
+    }
+}
+
+/// Follow the rest of a `ListRoutingControls` walk from `token`, under the same filter
+/// and page size, and answer the `RoutingControlArn` of every control the remaining
+/// pages report.
+///
+/// `bound` is one more page than the remaining set can need, so a cursor that never
+/// terminates fails the test instead of hanging.
+async fn follow_from_token(
+    router: &MultiServiceRouter,
+    control_panel_arn: Option<&str>,
+    max_results: Option<u32>,
+    token: &str,
+    bound: usize,
+    case: &str,
+) -> Vec<String> {
+    let mut collected: Vec<String> = Vec::new();
+    let mut next_token = token.to_string();
+    for _ in 0..(bound + 2) {
+        let mut request = serde_json::Map::new();
+        if let Some(panel) = control_panel_arn {
+            request.insert("ControlPanelArn".to_string(), json!(panel));
+        }
+        if let Some(size) = max_results {
+            request.insert("MaxResults".to_string(), json!(size));
+        }
+        request.insert("NextToken".to_string(), json!(next_token));
+        let (status, body) = call(router, "ListRoutingControls", &Value::Object(request)).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: a token this call issued must be served, got {status} with {body}"
+        );
+        let page = body
+            .get("RoutingControls")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case}: RoutingControls is required, got {body}"))
+            .clone();
+        if let Some(size) = max_results {
+            assert!(
+                page.len() <= size as usize,
+                "case {case}: a page must not exceed MaxResults, got {} entries",
+                page.len()
+            );
+        }
+        collected.extend(listed_arns(&page));
+        match body.get("NextToken").and_then(Value::as_str) {
+            None => return collected,
+            Some(issued) => next_token = issued.to_string(),
+        }
+    }
+    panic!("case {case}: ListRoutingControls kept issuing a NextToken past the end of the set");
+}
+
+/// RULE: a `NextToken` names a POSITION in the listing's order, so the next page resumes
+/// at the first routing control whose ARN is not below the one the token names — a
+/// routing control the control plane deletes between two pages is left out of the
+/// listing, it does not end the walk, which still reports every control that is still
+/// registered and was not reported before.
+///
+/// The rows differ along the page size, how many controls are deleted at the resume
+/// point (one, two, every one the walk had left), and whether the listing carries a
+/// `ControlPanelArn` filter.
+#[tokio::test]
+async fn a_deleted_resume_control_does_not_end_the_pagination_walk() {
+    // (case, page size, the control panel of the fleet the listing is filtered by, how
+    // many controls to delete from the resume point on)
+    let rows: Vec<(&str, u32, Option<usize>, usize)> = vec![
+        (
+            "page size 1, the control the next page resumes at deleted",
+            1,
+            None,
+            1,
+        ),
+        (
+            "page size 1, the resume control and the one after it deleted",
+            1,
+            None,
+            2,
+        ),
+        (
+            "page size 2, the control the next page resumes at deleted",
+            2,
+            None,
+            1,
+        ),
+        (
+            "page size 1, every control the walk had left deleted",
+            1,
+            None,
+            4,
+        ),
+        (
+            "page size 1 filtered by a control panel, the resume control deleted",
+            1,
+            Some(0),
+            1,
+        ),
+        (
+            "page size 2 filtered by a control panel, its last control deleted",
+            2,
+            Some(0),
+            1,
+        ),
+    ];
+
+    for (case, max_results, panel, deletions) in rows {
+        let router = emulator();
+        let fleet = fleet(&router).await;
+        let filter = panel.map(|index| fleet.panels[index].arn.clone());
+        let scope: Vec<String> = match &filter {
+            None => fleet.arns(),
+            Some(panel_arn) => fleet
+                .controls()
+                .into_iter()
+                .filter(|control| &control.panel_arn == panel_arn)
+                .map(|control| control.arn)
+                .collect(),
+        };
+        let first = max_results as usize;
+        assert!(
+            scope.len() > first,
+            "case {case}: the row needs a set larger than one page, got {} control(s)",
+            scope.len()
+        );
+
+        // The first page, and the token it issues for the controls past it.
+        let mut request = serde_json::Map::new();
+        if let Some(panel_arn) = &filter {
+            request.insert("ControlPanelArn".to_string(), json!(panel_arn));
+        }
+        request.insert("MaxResults".to_string(), json!(max_results));
+        let (status, first_page) =
+            call(&router, "ListRoutingControls", &Value::Object(request)).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the first page must succeed, got {status} with {first_page}"
+        );
+        let reported_first = listed_arns(
+            first_page
+                .get("RoutingControls")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!("case {case}: RoutingControls is required, got {first_page}")
+                }),
+        );
+        assert_eq!(
+            reported_first,
+            scope[..first].to_vec(),
+            "case {case}: the first page must report the start of the set, got {reported_first:?}"
+        );
+        let token = first_page
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case}: a set larger than one page issues a NextToken, got {first_page}")
+            })
+            .to_string();
+
+        // Delete the control the next page is to resume at, and the ones after it this
+        // row names, through the control plane that owns them.
+        let deleted: Vec<String> = scope[first..(first + deletions).min(scope.len())].to_vec();
+        for arn in &deleted {
+            delete_routing_control(&router, arn).await;
+        }
+
+        let rest = follow_from_token(
+            &router,
+            filter.as_deref(),
+            Some(max_results),
+            &token,
+            scope.len(),
+            case,
+        )
+        .await;
+        let expected: Vec<String> = scope[first..]
+            .iter()
+            .filter(|arn| !deleted.contains(arn))
+            .cloned()
+            .collect();
+        assert_eq!(
+            rest, expected,
+            "case {case}: the walk must continue over the controls still registered, got {rest:?}"
+        );
+
+        // And the walk as a whole reported every still-registered control exactly once.
+        let walked: Vec<String> = reported_first.into_iter().chain(rest).collect();
+        let still_registered: Vec<String> = scope
+            .iter()
+            .filter(|arn| !deleted.contains(arn))
+            .cloned()
+            .collect();
+        assert_eq!(
+            walked, still_registered,
+            "case {case}: the pages must walk the whole remaining set without repeats or \
+             omissions, got {walked:?}"
+        );
+    }
+}
+
+/// RULE: a token this call can decode names a position in the listing's ARN order and is
+/// served from it — the page starts at the first routing control whose ARN is not below
+/// that position, and a position past every control is an empty final page carrying no
+/// `NextToken`.
+///
+/// The rows are a position before every control, the position of a control that IS
+/// registered, a position between two controls that no control is registered at, and a
+/// position past every control; each is run unpaged and at two page sizes. Every cursor
+/// is built out of the fleet's own ARNs, so it stays inside the modelled `Arn` pattern
+/// `^[A-Za-z0-9:.\/_-]*$` (`smithy_query(query="shape",shape="Arn")`): `arn` is a prefix
+/// of every one of them, and an ARN with one more character sorts straight after the ARN
+/// it extends, which — ARNs of one resource type having equal length — is before the
+/// next one.
+#[tokio::test]
+async fn a_page_resumes_at_the_position_a_decodable_token_names() {
+    let router = emulator();
+    let fleet = fleet(&router).await;
+    let arns = fleet.arns();
+    let last = arns.last().expect("the fleet has routing controls").clone();
+
+    // (case, the position the cursor names, the controls the walk from it must report)
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "a position before every routing control",
+            "arn".to_string(),
+            arns.clone(),
+        ),
+        (
+            "the position of a routing control that is registered",
+            arns[1].clone(),
+            arns[1..].to_vec(),
+        ),
+        (
+            "a position between two routing controls that none is registered at",
+            format!("{}0", arns[0]),
+            arns[1..].to_vec(),
+        ),
+        (
+            "a position past every routing control",
+            format!("{last}0"),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, position, expected) in rows {
+        for max_results in [None, Some(1), Some(2)] {
+            let case = format!("{case} (MaxResults={max_results:?})");
+            let reported = follow_from_token(
+                &router,
+                None,
+                max_results,
+                &cursor_for(&position),
+                arns.len(),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                reported, expected,
+                "case {case}: the page must resume at the named position, got {reported:?}"
+            );
+        }
     }
 }
 
