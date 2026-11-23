@@ -48,6 +48,13 @@
 //! ([`a_policy_triggered_inside_another_policys_wait_adds_one_adjustment_and_no_more`],
 //! [`a_policy_triggered_inside_another_policys_wait_is_bounded_by_the_window_in_force`]).
 //!
+//! And what bounds a SUCCESSION of actions on one policy is the same rule applied at each of
+//! them: one action applies the one adjustment whose interval the breach falls in, to the
+//! capacity the target holds when the action is raised, clamped into the registered window — so
+//! after `n` actions the capacity is `n` single adjustments from where it started and never more,
+//! whichever `AdjustmentType` states them and however many steps the configuration carries
+//! ([`each_alarm_action_applies_exactly_one_step_adjustment`]).
+//!
 //! Every case goes through the same front door a client uses — the policy, the alarm, the
 //! breach and the read-back of the ECS service are all requests — so nothing reaches into a
 //! state struct and a capacity that is not computed from persisted state cannot pass.
@@ -2626,5 +2633,293 @@ async fn a_policy_triggered_inside_another_policys_wait_adds_one_adjustment_and_
 async fn a_policy_triggered_inside_another_policys_wait_is_bounded_by_the_window_in_force() {
     for row in TWIN_BOUNDED_CATALOG {
         drive_twin(row).await;
+    }
+}
+
+/// How many actions a row of [`PER_ACTION_CATALOG`] raises on its one policy: the alarm leaves
+/// `ALARM` and returns that many times, so the policy is handed that many actions to perform.
+///
+/// More than two, because what this pins is an INEQUALITY that has to hold at every action
+/// rather than at the first one: a pass that applied a step twice, or that replayed an earlier
+/// action beside the current one, would land the capacity past the single step the action states
+/// at whichever action it happened on.
+const ACTIONS_PER_ROW: usize = 3;
+
+/// One SUCCESSION of alarm actions on one step scaling policy, each raised outside any wait of
+/// that policy's own, and the capacity the target holds after each of them.
+///
+/// The rows differ along what the rule generalises over: the `AdjustmentType` the step is
+/// interpreted by, the direction it moves in, the floor on a percentage's magnitude, how many
+/// steps the configuration carries, and whether the registered ceiling is what the action lands
+/// against.
+struct PerActionRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with, which is the capacity the FIRST
+    /// action's adjustment is computed from.
+    starting: i64,
+    min: i64,
+    max: i64,
+    adjustment_type: &'static str,
+    min_adjustment_magnitude: Option<i64>,
+    steps: &'static [Step],
+    /// The alarm's `ComparisonOperator`, which names the side of the threshold the breach is on.
+    comparison_operator: &'static str,
+    /// The capacity the target must hold after each successive action, in order: the ONE
+    /// adjustment whose interval that action's breach falls in, applied to the capacity the
+    /// target held when the action was raised and clamped into the registered window.
+    after_each_action: &'static [i64; ACTIONS_PER_ROW],
+    /// Capacities the resource must never be reported at: what a step applied more than once per
+    /// action, or the step the breach does NOT fall in, would reach.
+    never: &'static [i64],
+}
+
+/// The successions to pin. Every row's policy names `Cooldown` 0, so no action of it is inside a
+/// wait of its own and each one is decided from the capacity the target holds — which is what
+/// makes the capacity after `n` actions the sum of `n` single adjustments and never of more.
+const PER_ACTION_CATALOG: &[PerActionRow] = &[
+    // The shape a client that sizes a step to bound how fast a service grows gets: two tasks per
+    // action and never four, however many actions follow.
+    PerActionRow {
+        case: "a +2 ChangeInCapacity policy adds two tasks per action",
+        starting: 1,
+        min: 1,
+        max: 12,
+        adjustment_type: "ChangeInCapacity",
+        min_adjustment_magnitude: None,
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+        comparison_operator: "GreaterThanThreshold",
+        after_each_action: &[3, 5, 7],
+        // 9 and 11 are a fourth and a fifth application of the same step.
+        never: &[9, 11],
+    },
+    // The mirror of it, in the direction a breach BELOW the threshold names: one task removed per
+    // action, and never two.
+    PerActionRow {
+        case: "a -1 ChangeInCapacity policy removes one task per action",
+        starting: 5,
+        min: 1,
+        max: 10,
+        adjustment_type: "ChangeInCapacity",
+        min_adjustment_magnitude: None,
+        steps: &[Step { lower: None, upper: Some(0.0), adjustment: -1 }],
+        comparison_operator: "LessThanThreshold",
+        after_each_action: &[4, 3, 2],
+        // 1 is a fourth removal, which is also the registered floor: the three actions of this
+        // row may not reach it.
+        never: &[1],
+    },
+    // A percentage, with the documented floor on the units it comes to
+    // (`StepScalingPolicyConfiguration$MinAdjustmentMagnitude`): 50% of 3 is 1.5 units, taken
+    // toward zero to 1 and raised to the floor of 2; of 5 it is 2.5, taken to 2, already at the
+    // floor; of 7 it is 3.5, taken to 3.
+    PerActionRow {
+        case: "a PercentChangeInCapacity policy applies its magnitude once per action",
+        starting: 3,
+        min: 1,
+        max: 20,
+        adjustment_type: "PercentChangeInCapacity",
+        min_adjustment_magnitude: Some(2),
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 50 }],
+        comparison_operator: "GreaterThanThreshold",
+        after_each_action: &[5, 7, 10],
+        // 12 and 15 are a second application of the same percentage inside one action.
+        never: &[12, 15],
+    },
+    // Several steps: the action applies the ONE whose interval the breach falls in. A forced
+    // alarm state carries no datapoint, so the breach is the smallest one in its direction — the
+    // threshold itself — and the step at the threshold is the one every action of this row
+    // performs, never the one a breach ten past it would fall in.
+    PerActionRow {
+        case: "a two-step policy applies only the step the breach falls in",
+        starting: 1,
+        min: 1,
+        max: 30,
+        adjustment_type: "ChangeInCapacity",
+        min_adjustment_magnitude: None,
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(10.0), adjustment: 2 },
+            Step { lower: Some(10.0), upper: None, adjustment: 9 },
+        ],
+        comparison_operator: "GreaterThanThreshold",
+        after_each_action: &[3, 5, 7],
+        // 10, 12 and 14 are what the other step would reach, and 16 is both steps together.
+        never: &[10, 12, 14, 16],
+    },
+    // The registered ceiling is what bounds the succession: the second action's step overshoots
+    // it and is performed AT it, and the third asks past a bound the target already sits at, so
+    // nothing moves at all.
+    PerActionRow {
+        case: "a +5 policy is performed at the ceiling and then holds there",
+        starting: 2,
+        min: 1,
+        max: 8,
+        adjustment_type: "ChangeInCapacity",
+        min_adjustment_magnitude: None,
+        steps: &[Step { lower: Some(0.0), upper: None, adjustment: 5 }],
+        comparison_operator: "GreaterThanThreshold",
+        after_each_action: &[7, 8, 8],
+        // 12 and 13 are the unclamped sums, and 9 is anything past the registered ceiling.
+        never: &[9, 12, 13],
+    },
+];
+
+/// Every DISTINCT `desiredCount` the ECS service was reported at on its way to `expected`, in the
+/// order they were read, stopping as soon as it is reported there.
+///
+/// The poll is the TEST waiting for the clock that executes a breach, so a row whose capacity
+/// overshoots the step it was owed fails on the readings it collected rather than on how fast the
+/// host ran.
+async fn readings_until(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    expected: i64,
+) -> Vec<i64> {
+    let deadline = std::time::Instant::now() + CLOCK_WAIT;
+    let mut readings: Vec<i64> = Vec::new();
+    loop {
+        let count = emulator.ecs_desired_count(cluster, service).await;
+        if readings.last() != Some(&count) {
+            readings.push(count);
+        }
+        if count == expected || std::time::Instant::now() >= deadline {
+            return readings;
+        }
+        tokio::time::sleep(CLOCK_POLL).await;
+    }
+}
+
+/// Every distinct `desiredCount` the service was reported at over the WHOLE wait: what an action
+/// that must move no capacity is held to, since a movement it was not owed would arrive on one of
+/// the clock's wake-ups inside it.
+async fn readings_while_held(emulator: &Emulator, cluster: &str, service: &str) -> Vec<i64> {
+    let deadline = std::time::Instant::now() + CLOCK_WAIT;
+    let mut readings: Vec<i64> = Vec::new();
+    loop {
+        let count = emulator.ecs_desired_count(cluster, service).await;
+        if readings.last() != Some(&count) {
+            readings.push(count);
+        }
+        if std::time::Instant::now() >= deadline {
+            return readings;
+        }
+        tokio::time::sleep(CLOCK_POLL).await;
+    }
+}
+
+/// Raise ONE alarm action: the alarm LEAVES `ALARM` and returns to it, which is the state change
+/// that executes the actions it names — "The actions to execute when this alarm transitions to
+/// the ALARM state from any other state" (`PutMetricAlarmInput$AlarmActions`).
+///
+/// The first action of a row is the alarm's first entry into `ALARM`, so there is nothing to
+/// leave yet.
+async fn raise_action(emulator: &Emulator, alarm_name: &str, index: usize) {
+    if index > 0 {
+        emulator.set_alarm_state(alarm_name, "OK").await;
+    }
+    emulator.set_alarm_state(alarm_name, "ALARM").await;
+}
+
+/// Drive one succession end to end: the target, the policy, the alarm, and then one action after
+/// another — holding, at EVERY action, that the capacity moved by the single adjustment that
+/// action's breach falls in and by no more.
+async fn drive_per_action(row: &PerActionRow) {
+    let case = row.case;
+    let emulator = Emulator::empty();
+    let cluster = "per-action";
+    let service = "web";
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, row.starting)
+        .await;
+    register(&emulator, &resource_id, row.min, row.max, case).await;
+    let mut configuration = json!({
+        "AdjustmentType": row.adjustment_type,
+        "StepAdjustments": step_adjustments(row.steps),
+        // No wait of this policy's own, so every action of it is decided from the capacity the
+        // target holds rather than netted against a movement still in flight: what bounds the
+        // succession is the one adjustment each action states.
+        "Cooldown": 0,
+    });
+    if let Some(magnitude) = row.min_adjustment_magnitude {
+        configuration["MinAdjustmentMagnitude"] = json!(magnitude);
+    }
+    let policy_arn =
+        put_step_policy(&emulator, &resource_id, "step-policy", configuration, case).await;
+    let alarm_name = "per-action-alarm";
+    emulator
+        .given_policy_alarm(&PolicyAlarm {
+            name: alarm_name,
+            policy_arn: &policy_arn,
+            metric_namespace: METRIC_NAMESPACE,
+            metric_name: METRIC_NAME,
+            threshold: THRESHOLD,
+            comparison_operator: row.comparison_operator,
+        })
+        .await;
+
+    let mut held = row.starting;
+    let mut movements: Vec<i64> = Vec::new();
+    for (index, expected) in row.after_each_action.iter().copied().enumerate() {
+        raise_action(&emulator, alarm_name, index).await;
+        // An action that asks for the capacity the target already holds — or past a bound it
+        // already sits at — is watched for the whole wait instead, because what it must do is
+        // nothing.
+        let readings = if expected == held {
+            readings_while_held(&emulator, cluster, service).await
+        } else {
+            readings_until(&emulator, cluster, service, expected).await
+        };
+        let reached = readings.last().copied().unwrap_or(held);
+        assert_eq!(
+            reached, expected,
+            "case {case:?}: expected action {} of {ACTIONS_PER_ROW} to leave the ECS \
+             desiredCount at {expected}, got {reached:?} after reading {readings:?}",
+            index + 1
+        );
+        // Nothing on the way past the single adjustment this action states: every capacity the
+        // resource was reported at lies between the one it held when the action was raised and
+        // the one that adjustment asks for.
+        let (low, high) = (held.min(expected), held.max(expected));
+        let outside: Vec<i64> = readings
+            .iter()
+            .copied()
+            .filter(|count| *count < low || *count > high)
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "case {case:?}: expected action {} of {ACTIONS_PER_ROW} to move the desiredCount no \
+             further than {high} from {held}, got {outside:?} among {readings:?}",
+            index + 1
+        );
+        let forbidden = forbidden_readings(&readings, row.never);
+        assert!(
+            forbidden.is_empty(),
+            "case {case:?}: expected the desiredCount never to be reported at any of {:?}, got \
+             {forbidden:?} among {readings:?}",
+            row.never
+        );
+        if expected != held {
+            movements.push(expected);
+        }
+        held = expected;
+    }
+
+    // And the activity log says exactly what the capacity did: one movement per action that moved
+    // capacity, in the order they happened, and none for the action that was owed nothing.
+    let expected_log: Vec<String> = movements
+        .iter()
+        .map(|capacity| format!("Setting desired count to {capacity}."))
+        .collect();
+    let moved = movement_descriptions(&emulator, &resource_id, case).await;
+    assert_eq!(
+        moved, expected_log,
+        "case {case:?}: expected one activity per action that moved capacity, got {moved:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_alarm_action_applies_exactly_one_step_adjustment() {
+    for row in PER_ACTION_CATALOG {
+        drive_per_action(row).await;
     }
 }
