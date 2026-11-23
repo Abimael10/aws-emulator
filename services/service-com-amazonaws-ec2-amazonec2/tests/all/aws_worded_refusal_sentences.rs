@@ -111,7 +111,23 @@ async fn every_byoip_range_operation_words_an_unreadable_cidr_the_same_way() {
     // holds.
     let operations: [(&str, &[(&str, &str)]); 5] = [
         ("AdvertiseByoipCidr", &[]),
-        ("ProvisionByoipCidr", &[]),
+        // The authorization document is a parameter the provision REQUIRES
+        // (`ProvisionByoipCidrRequest$CidrAuthorizationContext`), and a parameter the request
+        // did not carry is reported before the value of another is judged, so the row carries
+        // one: its contents are a credential this emulator cannot check.
+        (
+            "ProvisionByoipCidr",
+            &[
+                (
+                    "CidrAuthorizationContext.Message",
+                    "1|aws|000000000000|81.2.69.0/24|20991231|SHA256|RSAPSS",
+                ),
+                (
+                    "CidrAuthorizationContext.Signature",
+                    "signed-authorization-message",
+                ),
+            ],
+        ),
         ("WithdrawByoipCidr", &[]),
         ("DeprovisionByoipCidr", &[]),
         // The ASN member is read before the range, so it carries a well-formed value from

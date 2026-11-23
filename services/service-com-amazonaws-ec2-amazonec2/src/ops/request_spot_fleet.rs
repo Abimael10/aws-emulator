@@ -112,6 +112,29 @@ impl From<RequestSpotFleetErrorModeled> for RequestSpotFleetError {
     }
 }
 
+/// The service principal a Spot Fleet's `IamFleetRole` is assumed by: the Spot Fleet service
+/// itself, which is the principal that "requests, launches, terminates and tags instances on
+/// your behalf" under that role (`SpotFleetRequestConfigData$IamFleetRole`).
+pub const SPOT_FLEET_SERVICE_PRINCIPAL: &str = "spotfleet.amazonaws.com";
+
+/// EC2's error code for a `SpotFleetRequestConfig` whose contents the service cannot act on.
+pub const INVALID_SPOT_FLEET_REQUEST_CONFIG: &str = "InvalidSpotFleetRequestConfig";
+
+/// Refuse a Spot Fleet request whose configuration carries a member the service cannot act
+/// on: HTTP 400 [`INVALID_SPOT_FLEET_REQUEST_CONFIG`], with the sentence this surface words
+/// such a refusal with — the fixed `Parameter: SpotFleetRequestConfig.`, the MEMBER at fault
+/// as the configuration shape names it, and the fixed ` is invalid.`
+///
+/// The member is named and its value is NOT quoted back: the caller sent the value, and the
+/// class says which member of the configuration the service could not use.
+fn invalid_spot_fleet_request_config<E>(member: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_FLEET_REQUEST_CONFIG,
+        400,
+        format!("Parameter: SpotFleetRequestConfig.{member} is invalid."),
+    )
+}
+
 /// The `RequestSpotFleet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,12 +205,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The request must contain the parameter spotFleetRequestConfig.iamFleetRole",
             ));
         }
+        // A value that is not the ARN of an IAM role names no role the fleet could be granted
+        // anything under, so the configuration carries an unusable `IamFleetRole` — which is
+        // the ONE class this surface refuses a member of the configuration with, naming the
+        // member rather than quoting the value.
         if !iam_role_arn_is_well_formed(&config.iam_fleet_role) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for iamFleetRole. \
-                 It must be the Amazon Resource Name of an IAM role",
-                config.iam_fleet_role
-            )));
+            return Err(invalid_spot_fleet_request_config("IamFleetRole"));
+        }
+        // The fleet acts UNDER that role, so a role this account does not hold — or one whose
+        // trust policy does not let the Spot Fleet service assume it — is a role the fleet
+        // could never act under, and the configuration naming it is refused in the same
+        // class. Asked through the crate-wide reading of that question, which refuses only on
+        // what IAM ANSWERED and stays silent on a role of another account or an IAM it could
+        // not reach. Asked BEFORE the launch specifications are resolved: the fleet's own
+        // permission to launch anything at all is settled before what it would launch.
+        if ::service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &config.iam_fleet_role,
+            SPOT_FLEET_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(invalid_spot_fleet_request_config("IamFleetRole"));
         }
 
         // "The type of request … Default: `maintain`. `instant` is listed but is not used by

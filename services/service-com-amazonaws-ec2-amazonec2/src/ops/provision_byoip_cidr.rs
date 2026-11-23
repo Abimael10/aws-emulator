@@ -2,7 +2,8 @@
 
 //! @op ProvisionByoipCidr
 //!
-//! Brings one public address range to this account: validates the range against what
+//! Brings one public address range to this account: requires the authorization document the
+//! service takes a range on (`CidrAuthorizationContext`), validates the range against what
 //! `ProvisionByoipCidrRequest$Cidr` publishes for one — public space, no more specific
 //! than the family's most specific prefix, overlapping no range already brought — mints
 //! the address pool the provision creates, and stores the range in [`crate::state`] in
@@ -172,6 +173,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `CidrAuthorizationContext` is "a signed document that proves that you are authorized
+        // to bring the specified IP address range to Amazon using BYOIP"
+        // (`ProvisionByoipCidrRequest$CidrAuthorizationContext`): the proof of authorization
+        // the service takes a range on, which it requires of every provision — so a request
+        // that carries none is answered as the MISSING PARAMETER it is, before the value of
+        // any other member is judged. A request that is wrong in two ways is told about the
+        // parameter it left out rather than about the range it did send.
+        let Some(authorization) = input.cidr_authorization_context.as_ref() else {
+            return Err(state::missing_parameter(
+                "You must provide a CidrAuthorizationContext parameter.",
+            ));
+        };
+        // Both members of that document are modelled `@required` and `clientOptional`, so one
+        // the request left out reaches this handler as an empty string: an authorization
+        // document missing either half is as absent as no document at all, and is reported
+        // with the member it left out.
+        for (parameter, value) in [
+            ("message", authorization.message.as_str()),
+            ("signature", authorization.signature.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter \
+                     cidrAuthorizationContext.{parameter}"
+                )));
+            }
+        }
+
         // "(IPv6 only) Indicate whether the address range will be publicly advertised to
         // the internet. Default: true"
         // (`ProvisionByoipCidrRequest$PubliclyAdvertisable`). It decides both the most
@@ -287,12 +316,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // `CidrAuthorizationContext` is "a signed document that proves that you are
-        // authorized to bring the specified IP address range to Amazon using BYOIP" —
-        // proof AWS checks against the range's RPKI ROA, which no emulator can reach.
-        // Every caller of this emulator is permitted, so the document is neither required
-        // nor verified, and nothing from it is stored or reported. `MultiRegion` the model
-        // documents as "Reserved.", so it carries nothing to act on either.
+        // The authorization document the request had to carry (read above) is proof AWS checks
+        // against the range's RPKI ROA, which no emulator can reach: every caller of this
+        // emulator is permitted, so the document is required but not VERIFIED, and nothing
+        // from it is stored or reported. `MultiRegion` the model documents as "Reserved.", so
+        // it carries nothing to act on either.
         // The store refuses a record whose caller-chosen bytes would cross the emulator's
         // one byte budget, and a range it did not store is not a range to report.
         let Some(byoip_cidr) = store.provision_byoip_cidr(spec) else {

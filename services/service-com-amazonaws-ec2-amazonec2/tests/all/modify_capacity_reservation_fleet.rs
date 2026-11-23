@@ -208,10 +208,15 @@ const INSTANCE_TYPES: [&str; 3] = ["m5.large", "c5.xlarge", "r5.2xlarge"];
 impl Start {
     /// This Fleet as `CreateCapacityReservationFleet` form fields.
     fn params(&self, zone: &str) -> Vec<Param> {
-        let mut params = vec![param(
-            "TotalTargetCapacity",
-            &self.total_target_capacity.to_string(),
-        )];
+        let mut params = vec![
+            param(
+                "TotalTargetCapacity",
+                &self.total_target_capacity.to_string(),
+            ),
+            // The instance matching criteria the create takes as a parameter of its own
+            // (`$InstanceMatchCriteria`), in the one value that member publishes.
+            param("InstanceMatchCriteria", "open"),
+        ];
         for (index, weight) in self.weights.iter().enumerate() {
             let mut fields: Vec<(&str, String)> = vec![
                 ("InstanceType", INSTANCE_TYPES[index].to_string()),

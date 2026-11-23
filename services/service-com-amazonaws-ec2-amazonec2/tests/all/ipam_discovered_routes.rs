@@ -619,7 +619,21 @@ async fn a_provisioned_range_is_discovered_as_a_route_of_its_border_groups_regio
 
     let mut provisioned: Vec<(&str, &str, String)> = Vec::new();
     for (row, cidr, group, expected_group) in rows {
-        let mut params = vec![p("Cidr", cidr)];
+        let mut params = vec![
+            p("Cidr", cidr),
+            // The authorization document every provision has to carry
+            // (`ProvisionByoipCidrRequest$CidrAuthorizationContext`): a credential whose
+            // contents AWS checks against the range's RPKI ROA, which this emulator cannot
+            // reach, so any document serves.
+            p(
+                "CidrAuthorizationContext.Message",
+                "1|aws|000000000000|81.2.69.0/24|20991231|SHA256|RSAPSS",
+            ),
+            p(
+                "CidrAuthorizationContext.Signature",
+                "signed-authorization-message",
+            ),
+        ];
         if let Some(group) = group {
             params.push(p("NetworkBorderGroup", group));
         }

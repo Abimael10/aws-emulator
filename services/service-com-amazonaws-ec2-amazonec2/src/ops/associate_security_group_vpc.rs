@@ -148,13 +148,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A value that is not a security group id names no group in ANY account, so the
+        // GROUP ID's own form is read BEFORE any id of this request is resolved against the
+        // store: "not an id of this kind" is a fault of the request, which the service
+        // answers before it reports any resource as absent, so a request that is wrong in
+        // both ways is told about its unreadable id rather than about the VPC that id was
+        // never going to be associated with. A value outside the PRINTED id form is refused
+        // by the request boundary, in the boundary's own words
+        // ([`crate::state::invalid_group_id_malformed`]).
+        if !state::security_group_id_is_well_formed(&input.group_id) {
+            return Err(state::invalid_group_id_malformed(&input.group_id));
+        }
+
         let service_state = state::require_service_state(&*self.engine)?;
         let mut store = service_state.lock();
 
-        // "A VPC ID" (`$VpcId`): the VPC the group is being made usable in is what this
-        // operation is asked about, so it is resolved FIRST, and an id the account holds no
-        // VPC for is refused with the code every operation of this crate refuses an unknown
-        // VPC id with rather than associating with a VPC that does not exist.
+        // The long id form carries an OBFUSCATED identifier rather than free text, so a
+        // long-form value above everything the mint has issued decodes to nothing and is no
+        // security group id either — the `0123456789abcdef0` shape documentation examples and
+        // hand-written probes reach for
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::long_form_id_was_never_issued`]).
+        // That is the SERVICE's own reading of the id rather than the boundary's, so it is
+        // worded the way this surface words an id it cannot decode
+        // ([`malformed_security_group_id`]), and it is still asked before any id is resolved:
+        // an id that decodes to nothing names no group that could ever have existed, while a
+        // short-form id carries no identifier to decode and so is reported absent below.
+        if store.long_form_id_was_never_issued(&input.group_id) {
+            return Err(malformed_security_group_id(&input.group_id));
+        }
+
+        // "A VPC ID" (`$VpcId`): with every id of the request readable, the VPC the group is
+        // being made usable in is resolved first — it is the resource this operation acts
+        // inside — and an id the account holds no VPC for is refused with the code every
+        // operation of this crate refuses an unknown VPC id with rather than associating with
+        // a VPC that does not exist.
         let Some(vpc) = store.vpcs.get(input.vpc_id.as_str()) else {
             return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
         };
@@ -174,10 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A value that is not a security group id names no group in ANY account, so it is
         // refused as malformed before the store is asked about it — the same order every
-        // other operation of this crate reads a `GroupId` in.
-        if !state::security_group_id_is_well_formed(&input.group_id) {
-            return Err(state::invalid_group_id_malformed(&input.group_id));
-        }
+        // other operation of this crate reads a `GroupId` in. The FORM is read above, before
+        // the VPC is resolved.
         // "You must own the security group" (`AssociateSecurityGroupVpc`): a group id this
         // account holds no group for is nothing this account can associate.
         let Some(group) = store.security_groups.get(input.group_id.as_str()) else {
@@ -255,4 +280,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: association.state,
         })
     }
+}
+
+/// Refuse a `GroupId` in the printed id form that this service never ISSUED, so it decodes to
+/// no security group: HTTP 400 [`crate::state::INVALID_GROUP_ID_MALFORMED`], worded the way
+/// this surface words an id it cannot decode — the fixed `The `, ` ID '`, `' is malformed`
+/// around this resource's own type name ([`crate::state::RESOURCE_TYPE_SECURITY_GROUP`]) and
+/// the value the REQUEST sent, bounded the way every refusal of this crate bounds a value the
+/// caller chose the length of.
+///
+/// The code is the one [`crate::state::invalid_group_id_malformed`] answers, and only the
+/// SENTENCE differs: that one is the REQUEST BOUNDARY's wording, for a value the boundary
+/// cannot read as an id at all (`Invalid id: "<value>"`), while this is the SERVICE's, for a
+/// value it read and could not decode. Both are recorded for this code, which is why the two
+/// readings are worded apart rather than collapsed.
+fn malformed_security_group_id<E>(group_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_GROUP_ID_MALFORMED,
+        400,
+        format!(
+            "The {kind} ID '{value}' is malformed",
+            kind = crate::state::RESOURCE_TYPE_SECURITY_GROUP,
+            value = crate::state::echoed_resource_id(group_id),
+        ),
+    )
 }

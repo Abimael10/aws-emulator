@@ -145,6 +145,9 @@ async fn seed_fleets(router: &MultiServiceRouter) -> Vec<String> {
     for (index, tags) in SEEDED_TAGS.iter().enumerate() {
         let mut params = vec![
             p("TotalTargetCapacity", "2"),
+            // The instance matching criteria the create takes as a parameter of its own
+            // (`CreateCapacityReservationFleetRequest$InstanceMatchCriteria`).
+            p("InstanceMatchCriteria", "open"),
             p("InstanceTypeSpecification.1.InstanceType", "m5.large"),
             p("InstanceTypeSpecification.1.InstancePlatform", "Linux/UNIX"),
             p("InstanceTypeSpecification.1.AvailabilityZone", &zone),

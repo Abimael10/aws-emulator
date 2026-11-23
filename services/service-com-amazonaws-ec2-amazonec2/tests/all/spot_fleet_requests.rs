@@ -759,7 +759,9 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 params[0] = c("IamFleetRole", "aws-ec2-spot-fleet-tagging-role");
                 params
             },
-            expected_code: "InvalidParameterValue",
+            // A member of the configuration the service cannot act on is refused in the
+            // configuration's own class, naming the member rather than quoting the value.
+            expected_code: "InvalidSpotFleetRequestConfig",
         },
         RefusalCase {
             case: "a fleet role ARN naming another service",
@@ -771,7 +773,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 );
                 params
             },
-            expected_code: "InvalidParameterValue",
+            expected_code: "InvalidSpotFleetRequestConfig",
         },
         RefusalCase {
             case: "the fleet type that is listed but not used by Spot Fleet",

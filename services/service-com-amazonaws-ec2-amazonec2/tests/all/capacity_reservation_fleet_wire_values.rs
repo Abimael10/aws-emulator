@@ -40,6 +40,10 @@ const REGION: &str = "us-west-2";
 const INSTANCE_TYPE: &str = "m5.large";
 const INSTANCE_PLATFORM: &str = "Linux/UNIX";
 
+/// The instance matching criteria every Capacity Reservation Fleet here is created with: the
+/// one value `CreateCapacityReservationFleetRequest$InstanceMatchCriteria` publishes.
+const FLEET_MATCH_CRITERIA: &str = "open";
+
 /// The ARN of the IAM role a Spot Fleet request grants the fleet; its account is the
 /// caller's rather than this emulator's.
 const FLEET_ROLE: &str = "arn:aws:iam::111122223333:role/aws-ec2-spot-fleet-tagging-role";
@@ -77,6 +81,10 @@ fn create_params(
 ) -> Vec<Param> {
     let mut params = vec![
         param("TotalTargetCapacity", &target.to_string()),
+        // The instance matching criteria every Capacity Reservation in the Fleet inherits is
+        // a parameter of the create (`$InstanceMatchCriteria`), so every call carries the one
+        // value that member publishes.
+        param("InstanceMatchCriteria", FLEET_MATCH_CRITERIA),
         param("InstanceTypeSpecification.1.InstanceType", INSTANCE_TYPE),
         param(
             "InstanceTypeSpecification.1.InstancePlatform",
@@ -420,7 +428,10 @@ async fn a_defaulted_priority_is_ordered_behind_an_assigned_one() {
     let zone = first_zone(&router).await;
 
     let case = "one specification prioritized, one not";
-    let mut params = vec![param("TotalTargetCapacity", "2")];
+    let mut params = vec![
+        param("TotalTargetCapacity", "2"),
+        param("InstanceMatchCriteria", FLEET_MATCH_CRITERIA),
+    ];
     for (index, priority) in [None, Some(7)].into_iter().enumerate() {
         let position = index + 1;
         params.push(param(

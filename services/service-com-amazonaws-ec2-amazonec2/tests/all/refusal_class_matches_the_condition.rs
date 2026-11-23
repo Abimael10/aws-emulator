@@ -142,7 +142,9 @@ fn fleet_params(criteria: Option<&str>) -> Vec<Param> {
 /// The rows differ along the VALUE: the criteria another Capacity Reservation surface does
 /// publish, the published word in the wrong case, and a word no EC2 surface publishes at all.
 /// The expected sentence comes from the crate's own wording helper and the GENERATED catalog,
-/// so the table writes out neither.
+/// so the table writes out neither. The two closing rows separate the two classes: the
+/// published word is served, while a request that carries no criteria at all is refused for
+/// the PARAMETER it left out rather than for a value.
 #[tokio::test]
 async fn a_fleet_criteria_outside_the_published_catalog_is_a_parameter_value_refusal() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -161,23 +163,34 @@ async fn a_fleet_criteria_outside_the_published_catalog_is_a_parameter_value_ref
         .await;
     }
 
-    // The one word the catalog publishes, and a request that names none at all: both are
-    // served, so the rows above are refused for the value they carry and not for the member.
-    for criteria in [Some(catalog[0]), None] {
-        let case = format!("a Fleet asked for {criteria:?}");
-        let body = ok(
-            &case,
-            &router,
-            "CreateCapacityReservationFleet",
-            &fleet_params(criteria),
-        )
-        .await;
-        assert_eq!(
-            element(&body, "instanceMatchCriteria").as_deref(),
-            Some(catalog[0]),
-            "case {case:?}: expected the Fleet to report the published criteria, got {body}"
-        );
-    }
+    // The one word the catalog publishes is served, so the rows above are refused for the
+    // value they carry and not for the member; a request that names NO criteria is refused for
+    // the parameter it left out instead, which is the other class and the other rule
+    // (`refusal_class_before_resource_lookup`).
+    let case = format!("a Fleet asked for {:?}", Some(catalog[0]));
+    let body = ok(
+        &case,
+        &router,
+        "CreateCapacityReservationFleet",
+        &fleet_params(Some(catalog[0])),
+    )
+    .await;
+    assert_eq!(
+        element(&body, "instanceMatchCriteria").as_deref(),
+        Some(catalog[0]),
+        "case {case:?}: expected the Fleet to report the published criteria, got {body}"
+    );
+    assert_refusal(
+        "a Fleet asked for no criteria at all",
+        &router,
+        "CreateCapacityReservationFleet",
+        &fleet_params(None),
+        (
+            ec2::state::MISSING_PARAMETER,
+            "The following parameter is missing: instanceMatchCriteria",
+        ),
+    )
+    .await;
 }
 
 /// The form fields of a managed prefix list create of family `family` carrying the one entry

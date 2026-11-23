@@ -122,6 +122,47 @@ pub fn parameter_pattern_violation_message(path: &str, value: &str, pattern: &st
     )
 }
 
+/// The sentence that layer refuses a member whose value is outside the LENGTH BOUNDS the
+/// parameter's own validator holds it to: the same envelope and the same `Value '<value>' at
+/// '<path>'` opening as [`parameter_format_violation_message`], closed by the fixed
+/// `failed to satisfy constraint: Member must satisfy constraint: ` and the two bounds, the
+/// upper one first, each in that layer's own `Member must have length …` clause.
+///
+/// The clause AWS words when a member is checked against the length range its validator
+/// publishes rather than merely read for its form, so the caller is told both bounds the value
+/// has to sit between. `min` and `max` are the bounds that validator publishes, named by the
+/// member's own module beside the reader that enforces them; `value` is what the request sent,
+/// rendered the way the layer prints that parameter's value (a list through
+/// [`rendered_parameter_list`], a plain member as itself).
+pub fn parameter_length_violation_message(
+    path: &str,
+    value: &str,
+    min: usize,
+    max: usize,
+) -> String {
+    format!(
+        "{ONE_PARAMETER_VALIDATION_ERROR}Value '{value}' at '{path}' failed to satisfy \
+         constraint: Member must satisfy constraint: [Member must have length less than or \
+         equal to {max}, Member must have length greater than or equal to {min}]"
+    )
+}
+
+/// Refuse a member whose value is outside the length bounds that layer holds it to: HTTP 400
+/// [`INVALID_REQUEST`], with the one clause [`parameter_length_violation_message`] words for
+/// it.
+///
+/// The CODE is the layer's own rather than a member-specific one: the fault is that the
+/// request does not satisfy a constraint the service publishes on the member, which no
+/// resource-specific code of the operation covers ([`INVALID_REQUEST`]).
+pub fn invalid_parameter_length<E>(
+    path: &str,
+    value: &str,
+    min: usize,
+    max: usize,
+) -> Scaffolded<E> {
+    invalid_request(parameter_length_violation_message(path, value, min, max))
+}
+
 /// Is `allowed` one of the value sets the VPC flow-log surface's parameters take?
 ///
 /// The flow-log operations are the ones whose members this service has recorded the parameter

@@ -95,9 +95,21 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
     call(router, REGION, "DescribeIpv6Pools", params).await
 }
 
-/// One `ProvisionByoipCidr` call carrying `params`.
+/// One `ProvisionByoipCidr` call carrying `params`, plus the authorization document every
+/// provision has to carry (`ProvisionByoipCidrRequest$CidrAuthorizationContext`) — a
+/// credential whose contents AWS checks against the range's RPKI ROA, which this emulator
+/// cannot reach, so one fixed document serves every call here.
 async fn provision(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
-    call(router, REGION, "ProvisionByoipCidr", params).await
+    let mut params = params.to_vec();
+    params.push(p(
+        "CidrAuthorizationContext.Message",
+        "1|aws|000000000000|2001:4860::/48|20991231|SHA256|RSAPSS",
+    ));
+    params.push(p(
+        "CidrAuthorizationContext.Signature",
+        "signed-authorization-message",
+    ));
+    call(router, REGION, "ProvisionByoipCidr", &params).await
 }
 
 /// One `DeprovisionByoipCidr` call for `cidr`.

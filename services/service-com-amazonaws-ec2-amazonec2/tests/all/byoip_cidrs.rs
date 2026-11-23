@@ -48,6 +48,16 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
 }
 
+/// The plain-text half of the authorization document a provision carries
+/// ("the plain-text authorization message for the prefix and account" —
+/// `CidrAuthorizationContext$Message`). Its CONTENTS are proof AWS checks against the range's
+/// RPKI ROA, which this emulator cannot reach, so any non-empty document serves here.
+const AUTHORIZATION_MESSAGE: &str = "1|aws|000000000000|203.0.113.0/24|20991231|SHA256|RSAPSS";
+
+/// The signed half of that document ("the signed authorization message for the prefix and
+/// account" — `CidrAuthorizationContext$Signature`).
+const AUTHORIZATION_SIGNATURE: &str = "signed-authorization-message";
+
 /// One request's form parameters, as the ec2Query harness takes them.
 type Params = Vec<(String, String)>;
 
@@ -64,12 +74,20 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
 }
 
 /// The parameters that bring `cidr`, with whatever extra ones the case needs.
+///
+/// Every provision carries the authorization document the service takes a range on
+/// (`ProvisionByoipCidrRequest$CidrAuthorizationContext`), so one builder puts it on every
+/// call here and no case is refused for leaving it out.
 fn provision_params(
     cidr: &str,
     publicly_advertisable: Option<bool>,
     extra: Params,
 ) -> Params {
-    let mut params = vec![p("Cidr", cidr)];
+    let mut params = vec![
+        p("Cidr", cidr),
+        p("CidrAuthorizationContext.Message", AUTHORIZATION_MESSAGE),
+        p("CidrAuthorizationContext.Signature", AUTHORIZATION_SIGNATURE),
+    ];
     if let Some(advertisable) = publicly_advertisable {
         params.push(p("PubliclyAdvertisable", advertisable.to_string()));
     }
@@ -445,23 +463,21 @@ async fn a_cidr_outside_the_published_rules_is_refused_and_stores_nothing() {
 }
 
 /// A `CidrAuthorizationContext` is "a signed document that proves that you are authorized
-/// to bring the specified IP address range to Amazon using BYOIP" — proof against the
-/// range's RPKI ROA, which no emulator can reach. So a request that carries one is
-/// accepted on the same terms as one that does not, and NOTHING from the document reaches
-/// the stored range or the report: it is a credential, not data about the range.
+/// to bring the specified IP address range to Amazon using BYOIP" — the proof the service
+/// takes a range on, so every provision carries it, while its CONTENTS are checked against
+/// the range's RPKI ROA, which no emulator can reach. So the document is required and
+/// NOTHING from it reaches the stored range or the report: it is a credential, not data
+/// about the range.
 #[tokio::test]
 async fn a_cidr_authorization_context_is_accepted_and_never_reported() {
     let router = emulator();
     let message = "1|aws|123456789012|81.2.69.0/24|20260101|SHA256|RSAPSS";
     let signature = "ZXhhbXBsZS1zaWduYXR1cmU=";
-    let params = provision_params(
-        "81.2.69.0/24",
-        None,
-        vec![
-            p("CidrAuthorizationContext.Message", message),
-            p("CidrAuthorizationContext.Signature", signature),
-        ],
-    );
+    let params = vec![
+        p("Cidr", "81.2.69.0/24"),
+        p("CidrAuthorizationContext.Message", message),
+        p("CidrAuthorizationContext.Signature", signature),
+    ];
     let (status, body) = provision(&router, &params).await;
     assert_eq!(
         status, 200,
@@ -481,7 +497,7 @@ async fn a_cidr_authorization_context_is_accepted_and_never_reported() {
             "81.2.69.0/24".to_string(),
             BYOIP_CIDR_STATE_PENDING_PROVISION.to_string()
         )],
-        "the range is brought exactly as it is without the document, got {page:?}"
+        "the range is brought with nothing of the document on it, got {page:?}"
     );
 }
 

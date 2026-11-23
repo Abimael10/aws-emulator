@@ -162,6 +162,9 @@ async fn poll_until_state(
 fn fleet_params(total_target_capacity: i32, weight: f64, chosen_priority: i32) -> Vec<Param> {
     vec![
         param("TotalTargetCapacity", &total_target_capacity.to_string()),
+        // The instance matching criteria the create takes as a parameter of its own
+        // (`$InstanceMatchCriteria`), in the one value that member publishes.
+        param("InstanceMatchCriteria", "open"),
         param("InstanceTypeSpecification.1.InstanceType", "c5.large"),
         param("InstanceTypeSpecification.1.InstancePlatform", "Linux/UNIX"),
         param("InstanceTypeSpecification.1.AvailabilityZone", "us-west-2a"),

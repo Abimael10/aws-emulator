@@ -96,6 +96,23 @@ impl From<RegisterInstanceEventNotificationAttributesErrorModeled> for RegisterI
     }
 }
 
+/// The path the request-validation layer names this operation's tag-key list by, as the
+/// recorded clause of that layer spells it: the layer reads the request against the service's
+/// OWN member names for the registration — a registered key is a RESOURCE tag key there — so
+/// the path is not the wire name the request sends the list under
+/// (`InstanceTagAttribute.InstanceTagKey.N`) and cannot be derived from it with
+/// [`crate::state::parameter_path`].
+pub const REGISTERED_TAG_KEYS_PARAMETER_PATH: &str = "resourceTagAttribute.resourceTagKeys";
+
+/// The lengths that layer admits for ONE registered tag key, as the bounds its recorded clause
+/// publishes for this member.
+///
+/// Wider than the key length EC2's own tagging rules hold a key to
+/// ([`crate::state::MAX_TAG_KEY_CHARS`]), which is asked AFTER this one: a key inside this
+/// range reaches the operation and is then held to the service's own bound, while one outside
+/// it never reaches the operation at all.
+pub const REGISTERED_TAG_KEY_LENGTHS: ::std::ops::RangeInclusive<usize> = 1..=256;
+
 /// The `RegisterInstanceEventNotificationAttributes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,12 +183,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // single request could store caller-chosen megabytes per Region. This request
         // carries keys alone, so it checks exactly the key rule, through the same entry
         // point the deregister of the same registration checks its keys with.
+        //
+        // The request-validation layer's own bounds on this member come FIRST, before the
+        // service's: a key outside the length range that layer publishes never reaches the
+        // operation, so it is answered with that layer's clause (the member's path, the value
+        // as the layer prints a list, and both bounds) rather than with a sentence this
+        // operation words. The service's own, narrower key bound is asked after, below.
+        if requested_keys
+            .iter()
+            .any(|key| !REGISTERED_TAG_KEY_LENGTHS.contains(&key.chars().count()))
+        {
+            return Err(crate::state::invalid_parameter_length(
+                REGISTERED_TAG_KEYS_PARAMETER_PATH,
+                &crate::state::rendered_parameter_list(requested_keys),
+                *REGISTERED_TAG_KEY_LENGTHS.start(),
+                *REGISTERED_TAG_KEY_LENGTHS.end(),
+            ));
+        }
         for key in requested_keys {
-            if key.is_empty() {
-                return Err(Scaffolded::invalid_parameter_value(
-                    "A tag key cannot be empty",
-                ));
-            }
             validate_tag_key(key)?;
         }
 

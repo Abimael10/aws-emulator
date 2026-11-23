@@ -426,10 +426,19 @@ const CREATE_CASES: &[CreateCase] = &[
 impl CreateCase {
     /// This row as `CreateCapacityReservationFleet` form fields.
     fn params(&self, zones: &[(String, String)]) -> Vec<Param> {
-        let mut params = vec![param(
-            "TotalTargetCapacity",
-            &self.total_target_capacity.to_string(),
-        )];
+        let mut params = vec![
+            param(
+                "TotalTargetCapacity",
+                &self.total_target_capacity.to_string(),
+            ),
+            // The create takes the instance matching criteria every Capacity Reservation in
+            // the Fleet inherits (`$InstanceMatchCriteria`) as a parameter of its own, so
+            // every row carries the one value that member publishes.
+            param(
+                "InstanceMatchCriteria",
+                FLEET_INSTANCE_MATCH_CRITERIA_VALUES[0],
+            ),
+        ];
         for (index, instance_type) in self.instance_types.iter().enumerate() {
             let (zone_name, zone_id) = &zones[0];
             let mut fields: Vec<(&str, String)> = vec![
@@ -1246,6 +1255,18 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
     ];
 
     for (case, params, expected_code) in rows {
+        // Every row is a request that is well formed APART from the fault it tests, so each
+        // carries the matching criteria the create takes as a parameter of its own: a
+        // parameter the request leaves out is reported before any value is judged, which
+        // would answer every row alike.
+        let params = [
+            params,
+            vec![param(
+                "InstanceMatchCriteria",
+                FLEET_INSTANCE_MATCH_CRITERIA_VALUES[0],
+            )],
+        ]
+        .concat();
         let (status, body) = api(&router, "CreateCapacityReservationFleet", &params).await;
         assert_eq!(
             status, 400,

@@ -86,6 +86,9 @@ async fn create_fleet(
         "CreateCapacityReservationFleet",
         &[
             param("TotalTargetCapacity", &target.to_string()),
+            // The instance matching criteria the create takes as a parameter of its own
+            // (`$InstanceMatchCriteria`), in the one value that member publishes.
+            param("InstanceMatchCriteria", "open"),
             param("InstanceTypeSpecification.1.InstanceType", INSTANCE_TYPE),
             param(
                 "InstanceTypeSpecification.1.InstancePlatform",

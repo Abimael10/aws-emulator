@@ -619,7 +619,7 @@ async fn an_associate_the_service_cannot_satisfy_is_refused_and_writes_nothing()
     past_the_transition().await;
     let before = reported_pairs("before the refusals", &router).await;
 
-    let rows: [RefusalRow<'_>; 12] = [
+    let rows: [RefusalRow<'_>; 13] = [
         (
             "no GroupId at all",
             String::new(),
@@ -677,11 +677,24 @@ async fn an_associate_the_service_cannot_satisfy_is_refused_and_writes_nothing()
             "Invalid id: \"vpc-0a1b2c3d4e5f60718\"".to_string(),
         ),
         (
-            "a well-formed group id no group has",
+            // The long id form carries an identifier the service DECODES, so a long-form
+            // value above everything its mint has issued decodes to no group at all: it is
+            // malformed rather than absent, and the service words that reading itself.
+            "a long group id the service never issued",
             "sg-0a1b2c3d4e5f60718".to_string(),
             other.clone(),
+            "InvalidGroupId.Malformed",
+            "The security-group ID 'sg-0a1b2c3d4e5f60718' is malformed".to_string(),
+        ),
+        (
+            // The SHORT form carries no identifier to decode, so one that names nothing is
+            // reported absent — which is what keeps the not-found half of the pair
+            // reachable.
+            "a well-formed group id no group has",
+            "sg-9f8e7d6c".to_string(),
+            other.clone(),
             "InvalidGroup.NotFound",
-            "The security group 'sg-0a1b2c3d4e5f60718' does not exist".to_string(),
+            "The security group 'sg-9f8e7d6c' does not exist".to_string(),
         ),
         (
             "the Region's default VPC as the target",

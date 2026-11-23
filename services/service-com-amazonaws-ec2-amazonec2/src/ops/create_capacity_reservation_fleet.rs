@@ -150,6 +150,11 @@ impl From<CreateCapacityReservationFleetErrorModeled> for CreateCapacityReservat
     }
 }
 
+/// The parameter this create reports missing, as the service's own clause names it: the
+/// request's `InstanceMatchCriteria` with the lower-case initial every parameter clause of EC2
+/// spells a member with ([`crate::state::parameter_path`]).
+pub const MISSING_INSTANCE_MATCH_CRITERIA: &str = "instanceMatchCriteria";
+
 /// The `CreateCapacityReservationFleet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -202,6 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specification names is resolved against that Region's zones. It is also the Region
         // the Fleet's ARN names.
         let region = request_region(ctx.parts());
+
+        // A parameter the request did not CARRY is reported missing before the VALUE of any
+        // other parameter is judged: the first thing the service has to say about a request
+        // is what the request left out, so one that is wrong in both ways is told which
+        // parameter to add rather than which value to correct. `InstanceMatchCriteria` is
+        // modelled as a plain enum member, but this Fleet is created with the instance
+        // matching criteria every Capacity Reservation in it inherits
+        // (`$InstanceMatchCriteria`), so the service takes it as a parameter of the create
+        // rather than defaulting it.
+        if input.instance_match_criteria.is_none() {
+            return Err(Scaffolded::missing_parameter(format!(
+                "The following parameter is missing: {MISSING_INSTANCE_MATCH_CRITERIA}"
+            )));
+        }
 
         // "Currently, only the `prioritized` allocation strategy is supported […] Valid
         // values: `prioritized`" (`$AllocationStrategy`) — a plain `String` in the model, so

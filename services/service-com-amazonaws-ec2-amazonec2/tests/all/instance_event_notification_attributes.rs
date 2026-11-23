@@ -875,11 +875,14 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
             ec2::state::MISSING_PARAMETER,
         ),
         (
+            // A key with no characters is outside the length range the request-validation
+            // layer holds this member to, so it is that layer's refusal
+            // ([`ec2::state::INVALID_REQUEST`]) rather than one this operation words.
             "a key with no characters",
             REGISTER,
             register_keys(&[""]),
             400,
-            ec2::state::INVALID_PARAMETER_VALUE,
+            ec2::state::INVALID_REQUEST,
         ),
         (
             "a dry run of a register that would have succeeded",
