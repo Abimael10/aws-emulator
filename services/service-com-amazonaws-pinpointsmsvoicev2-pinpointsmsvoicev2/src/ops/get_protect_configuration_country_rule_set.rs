@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProtectConfigurationCountryRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProtectConfigurationCountryRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProtectConfigurationCountryRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a READ of the country rule set the named protect configuration holds for
+//! one `NumberCapability`. Every country this service recognizes is reported with the
+//! status stored for it under that capability, and with the documented default status for
+//! every country no `UpdateProtectConfigurationCountryRuleSet` has written. It writes
+//! nothing, so repeating the call answers the same rule set.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProtectConfigurationCountryRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProtectConfigurationCountryRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProtectConfigurationCountryRuleSet"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetProtectConfigurationCountryRuleSetErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the protect-configuration store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        // A read: the guard is taken for reading only and nothing below writes through it,
+        // so reading a rule set cannot change what a later caller sees.
+        let state = store.lock();
+
+        // `ProtectConfigurationId` is an `…IdOrArn`, so either form names the resource;
+        // the store is keyed by the bare id.
+        let protect_configuration_id =
+            crate::state::name_from_name_or_arn(&input.protect_configuration_id);
+        let Some(record) = state.protect_configurations.get(protect_configuration_id) else {
+            return Err(
+                GetProtectConfigurationCountryRuleSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "protect-configuration",
+                            protect_configuration_id,
+                        )),
+                        resource_type: Some("protect-configuration".to_string()),
+                        resource_id: Some(protect_configuration_id.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole rule set for the requested capability, read out of the record: the
+        // statuses it holds, and the documented default for every other country.
+        Ok(GetProtectConfigurationCountryRuleSetOutput {
+            protect_configuration_arn: record.arn.clone(),
+            protect_configuration_id: record.id.clone(),
+            number_capability: input.number_capability.clone(),
+            country_rule_set: record
+                .country_rule_set(&input.number_capability)
+                .into_iter()
+                .map(|(country, protect_status)| {
+                    (
+                        country,
+                        ProtectConfigurationCountryRuleSetInformation { protect_status },
+                    )
+                })
+                .collect(),
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProtectConfigurationCountryRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProtectConfigurationCountryRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProtectConfigurationCountryRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the `ProtectStatus` the request names for each country into the
+//! named protect configuration's rule set for ONE `NumberCapability`, leaving every
+//! country it does not name and every other capability as they were, and answers the
+//! whole resulting rule set out of the stored record — the same rule set
+//! `GetProtectConfigurationCountryRuleSet` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProtectConfigurationCountryRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProtectConfigurationCountryRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProtectConfigurationCountryRuleSet"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateProtectConfigurationCountryRuleSetErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the protect-configuration store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+
+        // The map's keys are destination countries, and the model constrains a key only to
+        // its FORM (two upper-case letters): WHICH two-letter strings name a country is a
+        // rule only this service can apply. A key that names none is a parameter value it
+        // cannot hold a rule for, and it refuses the WHOLE update, so nothing is written:
+        // a partially applied update would leave a rule set no request asked for.
+        if input
+            .country_rule_set_updates
+            .keys()
+            .any(|country| !crate::state::is_country_rule_set_country(country))
+        {
+            return Err(
+                UpdateProtectConfigurationCountryRuleSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::validation_error_message(
+                            crate::state::INVALID_PARAMETER_REASON,
+                            COUNTRY_RULE_SET_UPDATES_FIELD,
+                        )),
+                        reason: Some(crate::state::INVALID_PARAMETER_REASON.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: COUNTRY_RULE_SET_UPDATES_FIELD.to_string(),
+                            message: COUNTRY_CODE_REQUIREMENT.to_string(),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ProtectConfigurationId` is an `…IdOrArn`, so either form names the resource;
+        // the store is keyed by the bare id.
+        let protect_configuration_id =
+            crate::state::name_from_name_or_arn(&input.protect_configuration_id);
+        let Some(record) = state
+            .protect_configurations
+            .get_mut(protect_configuration_id)
+        else {
+            return Err(
+                UpdateProtectConfigurationCountryRuleSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "protect-configuration",
+                            protect_configuration_id,
+                        )),
+                        resource_type: Some("protect-configuration".to_string()),
+                        resource_id: Some(protect_configuration_id.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole point of the operation: each named country's status has to OUTLIVE
+        // this request, under the ONE capability the request names, so every later read of
+        // that capability's rule set reports it and the other capabilities are untouched.
+        for (country, information) in &input.country_rule_set_updates {
+            record.set_country_protect_status(
+                &input.number_capability,
+                country,
+                &information.protect_status,
+            );
+        }
+
+        // Read the response back out of the record that was written.
+        Ok(UpdateProtectConfigurationCountryRuleSetOutput {
+            protect_configuration_arn: record.arn.clone(),
+            protect_configuration_id: record.id.clone(),
+            number_capability: input.number_capability.clone(),
+            country_rule_set: record
+                .country_rule_set(&input.number_capability)
+                .into_iter()
+                .map(|(country, protect_status)| {
+                    (
+                        country,
+                        ProtectConfigurationCountryRuleSetInformation { protect_status },
+                    )
+                })
+                .collect(),
+        })
     }
 }
+
+/// The wire name of the member a refused country code belongs to, as this service's
+/// refusals name a member.
+const COUNTRY_RULE_SET_UPDATES_FIELD: &str = "countryRuleSetUpdates";
+
+/// The requirement a refused country code failed, worded as the requirement sentences the
+/// rest of this service's refusals carry (`Member must …`).
+const COUNTRY_CODE_REQUIREMENT: &str = "Member must be keyed by a two-letter ISO country code";

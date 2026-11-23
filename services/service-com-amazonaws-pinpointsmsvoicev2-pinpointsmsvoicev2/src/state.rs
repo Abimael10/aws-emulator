@@ -229,6 +229,75 @@ pub fn conflict_message(reason: &str, resource_type: &str, resource_id: &str) ->
 /// alone and none of `ConflictException`'s resource members.
 pub const CLIENT_TOKEN_CONFLICT_MESSAGE: &str = "Token used for different request";
 
+/// The `ProtectStatus` every country of every capability carries in a protect
+/// configuration no caller has changed.
+///
+/// `CreateProtectConfiguration` documents it: "By default all country rule sets for each
+/// capability are set to ALLOW."
+pub const DEFAULT_PROTECT_STATUS: &str = "ALLOW";
+
+/// The destination countries a protect configuration's country rule set covers: the
+/// published ISO 3166-1 alpha-2 codes, from the `rust_iso3166` crate's table rather than
+/// a list restated here.
+///
+/// `ProtectConfigurationCountryRuleSet` is keyed by `IsoCountryCode`
+/// (`smithy_query(query="shape",shape="ProtectConfigurationCountryRuleSet")`: `len 2..2`,
+/// `^[A-Z]{2}$`) and holds at most 300 entries, which the published table fits; the
+/// documentation for the map calls the key "the two-letter ISO country code".
+pub fn country_rule_set_countries() -> &'static [&'static str] {
+    ISO_COUNTRY_CODES
+}
+
+/// See [`country_rule_set_countries`]. A `static` so the slice is borrowed from the
+/// crate's own table rather than from a temporary.
+static ISO_COUNTRY_CODES: &[&str] = ::rust_iso3166::ALL_ALPHA2;
+
+/// Whether `country` is one of the two-letter country codes
+/// [`country_rule_set_countries`] lists.
+///
+/// The codes are published as two UPPERCASE letters, so the lookup is case-sensitive: a
+/// pair of letters that is not an assigned code names no country, whatever the modelled
+/// `^[A-Z]{2}$` pattern allows.
+pub fn is_country_rule_set_country(country: &str) -> bool {
+    country.chars().all(|letter| letter.is_ascii_uppercase())
+        && ::rust_iso3166::from_alpha2(country).is_some()
+}
+
+/// The `ValidationExceptionReason` a parameter this service cannot read the value of
+/// earns.
+pub const INVALID_PARAMETER_REASON: &str = "INVALID_PARAMETER";
+
+/// The `ValidationExceptionReason` a member whose value this service validated and
+/// rejected earns, whether the rule it broke is one the model declares (the boundary
+/// walk in `crate::service::validation`) or one only a handler can check.
+pub const FIELD_VALIDATION_FAILED_REASON: &str = "FIELD_VALIDATION_FAILED";
+
+/// The sentence this service refuses a request's parameters with: fixed text up to the
+/// colon, then the bracketed, single-quoted WIRE names of the members it rejected, in the
+/// order they are given.
+///
+/// Stated once for the whole service, so the boundary refusal and a handler's own refusal
+/// of a value no modelled constraint can describe word the same thing. No submitted value
+/// is echoed: the sentence names the member, never its contents.
+pub fn invalid_parameters_message(wire_names: &[&str]) -> String {
+    let named: Vec<String> = wire_names.iter().map(|name| format!("'{name}'")).collect();
+    format!(
+        "The following parameter is null, empty or invalid: [{}]",
+        named.join(", ")
+    )
+}
+
+/// The message a `ValidationException` carries when this service could not READ a
+/// parameter's value: like the conflict and not-found messages, a restatement of the
+/// exception's own structured members, here its `Reason` and the members its `Fields`
+/// name.
+///
+/// Distinct from [`invalid_parameters_message`], which states a value this service read
+/// and then could not use. `reason` is a `ValidationExceptionReason`.
+pub fn validation_error_message(reason: &str, fields: &str) -> String {
+    format!("Validation Error Occurred - Reason=\"{reason}\" Fields=\"{fields}\"")
+}
+
 /// The message a `ResourceNotFoundException` carries: like the conflict message, this
 /// service words it as a restatement of the exception's own structured members.
 ///
@@ -402,6 +471,16 @@ pub struct ProtectConfiguration {
     pub account_default: bool,
     pub deletion_protection_enabled: bool,
     pub tags: Vec<Tag>,
+    /// The `ProtectStatus` this configuration holds per destination country, keyed by
+    /// `NumberCapability` and then by ISO country code — and only for the countries a
+    /// caller has actually set, every other country carrying
+    /// [`DEFAULT_PROTECT_STATUS`]. The rule set is per capability, so a status written
+    /// for one capability leaves the others as they were.
+    ///
+    /// Bounded by the model: at most one entry per `NumberCapability` value, each holding
+    /// at most one entry per country in [`country_rule_set_countries`], since a status is
+    /// written only for a country code this service recognizes.
+    pub country_rule_sets: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ProtectConfiguration {
@@ -420,6 +499,38 @@ impl ProtectConfiguration {
             }
             _ => None,
         }
+    }
+
+    /// The whole `ProtectConfigurationCountryRuleSet` for one `NumberCapability`: every
+    /// country this service recognizes, with the status this record holds for it under
+    /// that capability and [`DEFAULT_PROTECT_STATUS`] for the ones it holds none for.
+    ///
+    /// A `BTreeMap`, so one rule set is reported in a stable country order.
+    pub fn country_rule_set(&self, number_capability: &str) -> BTreeMap<String, String> {
+        let written = self.country_rule_sets.get(number_capability);
+        country_rule_set_countries()
+            .iter()
+            .map(|country| {
+                let status = written
+                    .and_then(|statuses| statuses.get(*country))
+                    .map_or(DEFAULT_PROTECT_STATUS, String::as_str);
+                ((*country).to_string(), status.to_string())
+            })
+            .collect()
+    }
+
+    /// Hold `protect_status` for one country under one `NumberCapability`, replacing the
+    /// status that capability held for that country.
+    pub fn set_country_protect_status(
+        &mut self,
+        number_capability: &str,
+        country: &str,
+        protect_status: &str,
+    ) {
+        self.country_rule_sets
+            .entry(number_capability.to_string())
+            .or_default()
+            .insert(country.to_string(), protect_status.to_string());
     }
 }
 

@@ -67,28 +67,26 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// From `smithy_query(query="shape",shape="ValidationExceptionReason")`, whose value set
 /// also carries `CANNOT_PARSE`, `MISSING_PARAMETER`, `INVALID_PARAMETER` and `OTHER`
 /// among others: what happened here is that a field was validated and failed, which is
-/// exactly this value.
-const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+/// exactly this value. A handler that validates a value itself earns the same reason, so
+/// it is stated once, beside this service's other refusal wording.
+const FIELD_VALIDATION_FAILED: &str = crate::state::FIELD_VALIDATION_FAILED_REASON;
 
 /// The sentence this service refuses a request with, naming every member it rejected.
 ///
 /// `pub(super)` because the framework's own refusal channel states the same sentence for
 /// the few refusals that do not reach this module's renderer (see
 /// `crate::service::EmulatedService::override_refusal`), and one wording cannot be written
-/// twice.
+/// twice. The sentence itself is [`crate::state::invalid_parameters_message`], which a
+/// handler refusing a value no modelled constraint can describe words its refusal with.
 pub(super) fn parameter_list_message(violations: &[Violation]) -> String {
-    let mut named: Vec<String> = Vec::with_capacity(violations.len());
+    let mut named: Vec<&str> = Vec::with_capacity(violations.len());
     for violation in violations {
         // One member can fail two constraints; it is one rejected parameter either way.
-        let quoted = format!("'{}'", violation.path);
-        if !named.contains(&quoted) {
-            named.push(quoted);
+        if !named.contains(&violation.path.as_str()) {
+            named.push(violation.path.as_str());
         }
     }
-    format!(
-        "The following parameter is null, empty or invalid: [{}]",
-        named.join(", ")
-    )
+    crate::state::invalid_parameters_message(&named)
 }
 
 /// The requirement one violation states: the framework's own sentence for that constraint

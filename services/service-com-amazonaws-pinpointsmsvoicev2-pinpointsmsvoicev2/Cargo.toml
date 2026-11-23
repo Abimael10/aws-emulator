@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # The one claim rule for a service whose SigV4 signing name is shared with another
 # emulated service (here Pinpoint SMS Voice V1).
 service-common = { path = "../common" }
+# The published ISO 3166-1 country table: which two-letter codes are country codes, and
+# the whole set of them a protect configuration's country rule set covers.
+rust_iso3166 = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

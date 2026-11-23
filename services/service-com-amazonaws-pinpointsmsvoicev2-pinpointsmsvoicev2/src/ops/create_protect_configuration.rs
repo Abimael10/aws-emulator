@@ -257,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             account_default: false,
             deletion_protection_enabled,
             tags: input.tags.unwrap_or_default(),
+            // Every country of every capability starts at the documented default status,
+            // which is what an empty rule-set map means; only
+            // `UpdateProtectConfigurationCountryRuleSet` writes an entry here.
+            country_rule_sets: ::std::collections::BTreeMap::new(),
         };
         state.protect_configurations.insert(id.clone(), record);
         if let Some(token) = input.client_token.as_deref() {
