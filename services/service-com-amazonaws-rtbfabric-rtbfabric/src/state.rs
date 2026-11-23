@@ -152,6 +152,16 @@ pub const LINK_STATUS_FAILED: &str = "FAILED";
 /// `LinkStatus` member: terminal, the link is gone.
 pub const LINK_STATUS_DELETED: &str = "DELETED";
 
+/// Whether a link in `status` is up: carrying traffic, or carrying traffic while
+/// a configuration change it has already taken is applied. One statement of what
+/// "carrying traffic" means for every kind of link this store holds — a link
+/// between two gateways ([`Link::is_up`]) and a link with one end outside the
+/// fabric, whose record carries a status of the same `LinkStatus` enum — so
+/// nothing has to repeat the status list to answer the same question.
+pub fn link_status_is_up(status: &str) -> bool {
+    status == LINK_STATUS_ACTIVE || status == LINK_STATUS_PENDING_UPDATE
+}
+
 /// `LinkDirection` member: the link was opened by a requester gateway.
 pub const LINK_DIRECTION_REQUEST: &str = "REQUEST";
 /// `LinkDirection` member: the link was opened by a responder gateway.
@@ -390,7 +400,16 @@ impl Link {
     /// to a link in one of these statuses is applied to a live link, which is
     /// what `PENDING_UPDATE` reports, so the clock owes it `ACTIVE` again.
     pub fn is_up(&self) -> bool {
-        self.status == LINK_STATUS_ACTIVE || self.status == LINK_STATUS_PENDING_UPDATE
+        link_status_is_up(&self.status)
+    }
+
+    /// Whether an outstanding request on this link is waiting for `gateway_id`
+    /// to answer it. A link is opened from one end and answered by the OTHER:
+    /// the opener is [`Link::gateway_id`] — whichever kind of gateway it is — so
+    /// the request is outstanding AGAINST the peer end, and never against the
+    /// end that asked for it.
+    pub fn awaits_answer_from(&self, gateway_id: &str) -> bool {
+        self.request_outstanding() && self.peer_gateway_id == gateway_id
     }
 
     /// Whether this link has reached a status nothing moves it out of: the peer
@@ -454,9 +473,10 @@ pub struct IdempotentUpdate {
 pub struct LinkCounts {
     /// Every link this gateway is an end of.
     pub total: i32,
-    /// Those carrying traffic.
+    /// Those carrying traffic, as [`link_status_is_up`] defines it.
     pub active: i32,
-    /// Those whose request is still outstanding.
+    /// Those whose request is still outstanding and waiting for THIS gateway to
+    /// answer it, as [`Link::awaits_answer_from`] defines it.
     pub requested: i32,
 }
 
@@ -751,7 +771,9 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         })
     }
 
-    /// Count the stored links `gateway_id` is an end of, by status.
+    /// Count the stored links `gateway_id` is an end of, as that gateway sees
+    /// them: every one of them, those carrying traffic, and those whose request
+    /// is still waiting for THIS gateway to answer.
     ///
     /// A link with one end OUTSIDE the fabric is one of that gateway's links
     /// too — `RequesterGatewayStatus`'s reader documents `totalLinksCount` as
@@ -764,10 +786,10 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         let mut counts = LinkCounts::default();
         for link in mine {
             counts.total = counts.total.saturating_add(1);
-            if link.status == LINK_STATUS_ACTIVE {
+            if link.is_up() {
                 counts.active = counts.active.saturating_add(1);
             }
-            if link.request_outstanding() {
+            if link.awaits_answer_from(gateway_id) {
                 counts.requested = counts.requested.saturating_add(1);
             }
         }
@@ -783,7 +805,7 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .filter(|(link_gateway_id, _)| *link_gateway_id == gateway_id);
         for (_, status) in external {
             counts.total = counts.total.saturating_add(1);
-            if status == LINK_STATUS_ACTIVE {
+            if link_status_is_up(status) {
                 counts.active = counts.active.saturating_add(1);
             }
         }

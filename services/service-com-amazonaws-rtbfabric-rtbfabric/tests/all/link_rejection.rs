@@ -23,6 +23,12 @@
 //! change leaves the link in. Its table spans which of the two optional members
 //! the call states, the published bounds of the modelled timeout range, which
 //! end addresses the call, and every member of the modelled `LinkStatus` enum.
+//!
+//! The counters the two gateway readers DERIVE from those statuses are covered
+//! here too, because they are a function of exactly what this suite drives: a
+//! link counts as active for both its ends while it carries traffic, the live
+//! link under an update included, and counts as requested only for the end an
+//! outstanding request is waiting on — the end the link was not opened from.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -157,9 +163,9 @@ impl Fabric {
         owed
     }
 
-    /// A requester gateway, a responder gateway and a link opened from the
-    /// requester to the responder, all over the wire.
-    async fn linked_pair(&self, token: &str) -> Pair {
+    /// A requester gateway and a responder gateway, both over the wire, as
+    /// `(the requester's id, the responder's id)`.
+    async fn gateway_pair(&self, token: &str) -> (String, String) {
         let gateway = json!({
             "vpcId": "vpc-0123456789abcdef0",
             "subnetIds": ["subnet-0123456789abcdef0"],
@@ -184,26 +190,49 @@ impl Fabric {
             )
             .await;
         assert_eq!(status, 200, "CreateResponderGateway: {status} {responder:?}");
-        let requester_id = text(&requester, "gatewayId");
-        let responder_id = text(&responder, "gatewayId");
+        (text(&requester, "gatewayId"), text(&responder, "gatewayId"))
+    }
+
+    /// Open a link from `opener_id` to `peer_id` over the wire, and answer with
+    /// what `CreateLink` reported. Either kind of gateway can be the opener; the
+    /// service reads the link's direction from which kind that is.
+    async fn open_link(&self, opener_id: &str, peer_id: &str) -> Value {
         let (status, link) = self
             .send(
                 "POST",
-                &format!("/gateway/{requester_id}/create-link"),
+                &format!("/gateway/{opener_id}/create-link"),
                 Some(json!({
-                    "peerGatewayId": responder_id,
+                    "peerGatewayId": peer_id,
                     "logSettings": log_settings(),
                     "attributes": { "customerProvidedId": "spot-fabric" },
                 })),
             )
             .await;
         assert_eq!(status, 200, "CreateLink: {status} {link:?}");
+        link
+    }
+
+    /// A requester gateway, a responder gateway and a link opened from the
+    /// requester to the responder, all over the wire.
+    async fn linked_pair(&self, token: &str) -> Pair {
+        let (requester_id, responder_id) = self.gateway_pair(token).await;
+        let link = self.open_link(&requester_id, &responder_id).await;
         Pair {
             requester_id,
             responder_id,
             link_id: text(&link, "linkId"),
             created_at: link["createdAt"].clone(),
         }
+    }
+
+    /// Read one gateway, asserting the read itself answered.
+    async fn gateway(&self, case: &str, path: &str) -> Value {
+        let (status, body) = self.send("GET", path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the read of {path:?} to answer 200, got {status} {body:?}"
+        );
+        body
     }
 
     /// Put `status` on every stored link.
@@ -1274,5 +1303,306 @@ async fn an_update_states_a_timeout_inside_the_modelled_range() {
         json!(5000),
         "expected the last accepted timeout to be read back, got {:?}",
         read_back["timeoutInMillis"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The counters the two gateway readers DERIVE from the statuses this suite
+// drives: `GetRequesterGateway`'s `activeLinksCount`/`totalLinksCount` and
+// `GetResponderGateway`'s those two plus `linksRequestedCount`.
+//
+// Two rules, both about the stored links rather than about one request:
+//
+// * a link counts as active for each of its ends exactly while it is carrying
+//   traffic, which this service reports as `ACTIVE` and as the `PENDING_UPDATE`
+//   of a live link that has taken a configuration change — the status the
+//   update above leaves — so a link under an update is still an active link;
+// * a link counts as requested for a gateway only while its request is still
+//   outstanding AND that gateway is the end that must answer it, which is the
+//   end the link was NOT opened from. `linksRequestedCount` is modelled as "The
+//   count of requested links waiting for the responder gateway to accept or
+//   reject" (`smithy_query(query="doc", shape="GetResponderGatewayResponse",
+//   member="linksRequestedCount")`), and a responder gateway that opened a link
+//   itself is waiting for nothing.
+// ---------------------------------------------------------------------------
+
+/// The statuses in which a link is carrying traffic, which is what the active
+/// counter counts: the live link, and the live link to which a configuration
+/// change it has already taken is being applied.
+const CARRYING_TRAFFIC: &[&str] = &[LINK_STATUS_ACTIVE, LINK_STATUS_PENDING_UPDATE];
+
+/// The statuses in which a link request is still outstanding, so the end it was
+/// put to can still accept or decline it.
+const REQUEST_OUTSTANDING: &[&str] = &[LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REQUESTED];
+
+/// One counter row: which kind of gateway opened the link, which is what decides
+/// which of its two ends has to answer the request.
+struct CounterRow {
+    name: &'static str,
+    opened_by_requester: bool,
+    /// The `LinkDirection` the service reads from the opener's kind.
+    direction: &'static str,
+}
+
+const COUNTER_ROWS: &[CounterRow] = &[
+    CounterRow {
+        name: "the requester gateway opened the link",
+        opened_by_requester: true,
+        direction: "REQUEST",
+    },
+    CounterRow {
+        name: "the responder gateway opened the link",
+        opened_by_requester: false,
+        direction: "RESPONSE",
+    },
+];
+
+#[tokio::test]
+async fn the_derived_counters_follow_the_link_status_and_the_end_that_must_answer() {
+    for row in COUNTER_ROWS {
+        let fabric = Fabric::new();
+        let (requester_id, responder_id) = fabric.gateway_pair("token").await;
+        let (opener_id, peer_id) = match row.opened_by_requester {
+            true => (&requester_id, &responder_id),
+            false => (&responder_id, &requester_id),
+        };
+        let link = fabric.open_link(opener_id, peer_id).await;
+        assert_eq!(
+            text(&link, "direction"),
+            row.direction,
+            "case {:?}: expected the direction the opener's kind gives the link, got {:?}",
+            row.name,
+            link["direction"]
+        );
+
+        // The whole modelled catalog, from `LINK_STATUS_VALUES` (this service's
+        // `LinkStatus` enum), so a status no operation reaches yet is covered too.
+        for status_value in LINK_STATUS_VALUES {
+            let case = format!("{}, the link is {status_value}", row.name);
+            fabric.force_link_status(status_value);
+
+            let expected_active = i64::from(CARRYING_TRAFFIC.contains(status_value));
+            // An outstanding request is waiting for the end it was put to, which
+            // is the end that did not open the link.
+            let expected_requested =
+                i64::from(REQUEST_OUTSTANDING.contains(status_value) && row.opened_by_requester);
+
+            let responder = fabric
+                .gateway(&case, &format!("/responder-gateway/{responder_id}"))
+                .await;
+            assert_eq!(
+                responder["activeLinksCount"],
+                json!(expected_active),
+                "case {case:?}: expected the responder gateway's activeLinksCount {expected_active}, got {:?}",
+                responder["activeLinksCount"]
+            );
+            assert_eq!(
+                responder["linksRequestedCount"],
+                json!(expected_requested),
+                "case {case:?}: expected the responder gateway's linksRequestedCount {expected_requested}, got {:?}",
+                responder["linksRequestedCount"]
+            );
+            assert_eq!(
+                responder["totalLinksCount"],
+                json!(1),
+                "case {case:?}: expected the responder gateway's totalLinksCount 1, got {:?}",
+                responder["totalLinksCount"]
+            );
+
+            let requester = fabric
+                .gateway(&case, &format!("/requester-gateway/{requester_id}"))
+                .await;
+            assert_eq!(
+                requester["activeLinksCount"],
+                json!(expected_active),
+                "case {case:?}: expected the requester gateway's activeLinksCount {expected_active}, got {:?}",
+                requester["activeLinksCount"]
+            );
+            assert_eq!(
+                requester["totalLinksCount"],
+                json!(1),
+                "case {case:?}: expected the requester gateway's totalLinksCount 1, got {:?}",
+                requester["totalLinksCount"]
+            );
+            // `GetRequesterGatewayResponse` models no `linksRequestedCount`: the
+            // inbound queue belongs to the end that answers link requests.
+            assert!(
+                requester["linksRequestedCount"].is_null(),
+                "case {case:?}: expected no linksRequestedCount on the requester gateway, got {:?}",
+                requester["linksRequestedCount"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_live_link_applying_a_configuration_change_still_counts_as_active() {
+    // The update table above, so the link reaches PENDING_UPDATE through every
+    // combination of the members the call may state and either end addressing it.
+    for row in UPDATE_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair("token").await;
+        let (status, accepted) = fabric
+            .send(
+                "POST",
+                &format!("/gateway/{}/link/{}/accept", pair.responder_id, pair.link_id),
+                Some(accept_body(&UPDATE_BASELINE)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the accept to answer 200, got {status} {accepted:?}"
+        );
+        fabric
+            .poll_link_status(&pair.requester_id, &pair.link_id, LINK_STATUS_ACTIVE)
+            .await;
+
+        let addressed = if row.from_peer {
+            &pair.responder_id
+        } else {
+            &pair.requester_id
+        };
+        let (status, updated) = fabric
+            .send(
+                "PATCH",
+                &format!("/gateway/{addressed}/link/{}", pair.link_id),
+                Some(update_body(row)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UpdateLink to answer 200, got {status} {updated:?}"
+        );
+        assert_eq!(
+            text(&updated, "status"),
+            LINK_STATUS_PENDING_UPDATE,
+            "case {case:?}: expected the update of a live link to report it pending, got {:?}",
+            updated["status"]
+        );
+
+        // The link carries traffic throughout — before the change, while it is
+        // being applied, and after the clock has settled it — so both ends count
+        // it as one of their active links whenever these reads land, and neither
+        // end is waiting for a request to be answered.
+        for (kind, path) in [
+            ("requester", format!("/requester-gateway/{}", pair.requester_id)),
+            ("responder", format!("/responder-gateway/{}", pair.responder_id)),
+        ] {
+            let gateway = fabric.gateway(case, &path).await;
+            assert_eq!(
+                gateway["activeLinksCount"],
+                json!(1),
+                "case {case:?}: expected the {kind} gateway to count the updating link as active, got {:?}",
+                gateway["activeLinksCount"]
+            );
+            assert_eq!(
+                gateway["totalLinksCount"],
+                json!(1),
+                "case {case:?}: expected the {kind} gateway's totalLinksCount 1, got {:?}",
+                gateway["totalLinksCount"]
+            );
+        }
+        let responder = fabric
+            .gateway(case, &format!("/responder-gateway/{}", pair.responder_id))
+            .await;
+        assert_eq!(
+            responder["linksRequestedCount"],
+            json!(0),
+            "case {case:?}: expected no outstanding request once the link is up, got {:?}",
+            responder["linksRequestedCount"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_responder_gateway_counts_only_the_link_requests_put_to_it() {
+    let case = "one request put to the responder gateway, one the responder gateway opened";
+    let fabric = Fabric::new();
+    // Two pairs, for the three gateways this needs: the responder gateway under
+    // test, the requester gateway that asks it for a link, and a second
+    // requester gateway for the responder to ask in turn.
+    let (asking_id, responder_id) = fabric.gateway_pair("token-a").await;
+    let (asked_id, _) = fabric.gateway_pair("token-b").await;
+
+    let inbound = fabric.open_link(&asking_id, &responder_id).await;
+    let inbound_id = text(&inbound, "linkId");
+    let self_opened = fabric.open_link(&responder_id, &asked_id).await;
+    let self_opened_id = text(&self_opened, "linkId");
+
+    // Both requests are outstanding; poll them to the status the clock owes so
+    // the reading below is taken with nothing owed on either.
+    fabric
+        .poll_link_status(&asking_id, &inbound_id, LINK_STATUS_REQUESTED)
+        .await;
+    fabric
+        .poll_link_status(&responder_id, &self_opened_id, LINK_STATUS_REQUESTED)
+        .await;
+
+    let responder = fabric
+        .gateway(case, &format!("/responder-gateway/{responder_id}"))
+        .await;
+    assert_eq!(
+        responder["totalLinksCount"],
+        json!(2),
+        "case {case:?}: expected both links to count against the responder gateway, got {:?}",
+        responder["totalLinksCount"]
+    );
+    assert_eq!(
+        responder["linksRequestedCount"],
+        json!(1),
+        "case {case:?}: expected only the request put TO the responder gateway to be counted, got {:?}",
+        responder["linksRequestedCount"]
+    );
+    assert_eq!(
+        responder["activeLinksCount"],
+        json!(0),
+        "case {case:?}: expected no active link while both requests are outstanding, got {:?}",
+        responder["activeLinksCount"]
+    );
+
+    // Answering the inbound request empties the inbound queue: the link the
+    // responder gateway opened itself was never in it.
+    let (status, answered) = fabric
+        .send(
+            "POST",
+            &format!("/gateway/{responder_id}/link/{inbound_id}/accept"),
+            Some(json!({ "logSettings": log_settings() })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected AcceptLink to answer 200, got {status} {answered:?}"
+    );
+    fabric
+        .poll_link_status(&responder_id, &inbound_id, LINK_STATUS_ACTIVE)
+        .await;
+
+    let responder = fabric
+        .gateway(case, &format!("/responder-gateway/{responder_id}"))
+        .await;
+    assert_eq!(
+        responder["linksRequestedCount"],
+        json!(0),
+        "case {case:?}: expected the answered request to leave the inbound queue empty, got {:?}",
+        responder["linksRequestedCount"]
+    );
+    assert_eq!(
+        responder["activeLinksCount"],
+        json!(1),
+        "case {case:?}: expected the accepted link to count as active, got {:?}",
+        responder["activeLinksCount"]
+    );
+
+    // The gateway the responder's own request was put to counts that link,
+    // because it is the end which has to answer it.
+    let asked = fabric
+        .gateway(case, &format!("/requester-gateway/{asked_id}"))
+        .await;
+    assert_eq!(
+        asked["totalLinksCount"],
+        json!(1),
+        "case {case:?}: expected the peer of the self-opened link to count it, got {:?}",
+        asked["totalLinksCount"]
     );
 }
