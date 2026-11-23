@@ -27,7 +27,11 @@
 //! no credential, exactly as a relying party's would.
 //!
 //! `token_issuer_endpoint` holds the rest of the same member's rule: one pool announces ONE
-//! issuer however each LATER caller addresses this emulator.
+//! issuer however each LATER caller addresses this emulator, and
+//! `pool_issuer_is_reachable_when_served` the half of this one for an emulator that IS served
+//! on a port. The parts of the fixture that are not about the endpoint a request reached — the
+//! wire prefix, the credential scope, the anonymous fetch and the JOSE reading — are
+//! `pub(crate)` here and shared with that suite, so the sign-in fixture is written once.
 
 use std::sync::Arc;
 
@@ -39,27 +43,27 @@ use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderserv
 
 /// The local name of this service's Smithy shape, which is the `X-Amz-Target` prefix a
 /// client writes.
-const TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
+pub(crate) const TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
 
 /// This service's SigV4 signing name, the 4th field of a credential scope.
-const SIGNING_NAME: &str = "cognito-idp";
+pub(crate) const SIGNING_NAME: &str = "cognito-idp";
 
 /// A password satisfying a default pool's password policy, written for this suite.
-const GOOD_PASSWORD: &str = "Passw0rd!2024";
+pub(crate) const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The user every row signs in.
-const USERNAME: &str = "heron";
+pub(crate) const USERNAME: &str = "heron";
 
 /// The two members of `AuthenticationResult` that carry a SIGNED token, both of which
 /// announce the minting pool's issuer.
-const TOKEN_MEMBERS: [&str; 2] = ["IdToken", "AccessToken"];
+pub(crate) const TOKEN_MEMBERS: [&str; 2] = ["IdToken", "AccessToken"];
 
 /// The path under an issuer its OpenID Connect discovery document is published at, and the
 /// path under it its key set is: the two well-known locations every OIDC relying party
 /// reads (RFC 8414 §3, and the Amazon Cognito Developer Guide's "Verifying a JSON web
 /// token").
-const OPENID_CONFIGURATION: &str = "/.well-known/openid-configuration";
-const JWKS: &str = "/.well-known/jwks.json";
+pub(crate) const OPENID_CONFIGURATION: &str = "/.well-known/openid-configuration";
+pub(crate) const JWKS: &str = "/.well-known/jwks.json";
 
 /// One row: the endpoint the creating request is addressed at, the Region it is signed for,
 /// the issuer type it configures, and whether the pool therefore publishes its issuer on an
@@ -139,7 +143,7 @@ fn router() -> MultiServiceRouter {
 
 /// A credential scope naming this service in `region`, which is what routes a call here
 /// whatever host it addressed — and what decides the Region a created pool lives in.
-fn authorization(region: &str) -> String {
+pub(crate) fn authorization(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{SIGNING_NAME}/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=0000"
@@ -190,7 +194,7 @@ async fn ok(
 /// which is what a relying party holding a token does with the locators it reads.
 ///
 /// Answers the status and the body, which must be JSON for a document this emulator serves.
-async fn fetch(router: &MultiServiceRouter, case: &str, url: &str) -> (u16, Value) {
+pub(crate) async fn fetch(router: &MultiServiceRouter, case: &str, url: &str) -> (u16, Value) {
     let rest = url
         .strip_prefix("https://")
         .unwrap_or_else(|| panic!("case {case:?}: {url:?} must be an https URL"));
@@ -235,7 +239,7 @@ fn segment_json(case: &str, segment: &str) -> Value {
 }
 
 /// The JOSE header and the claim set of the compact JWS `token`.
-fn header_and_claims(case: &str, token: &str) -> (Value, Value) {
+pub(crate) fn header_and_claims(case: &str, token: &str) -> (Value, Value) {
     let mut segments = token.split('.');
     let header = segments
         .next()
@@ -250,7 +254,7 @@ fn header_and_claims(case: &str, token: &str) -> (Value, Value) {
 }
 
 /// The string member `name` of `document`.
-fn member(case: &str, document: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, document: &Value, name: &str) -> String {
     document[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a {name} in {document}"))
