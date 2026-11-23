@@ -200,6 +200,22 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         release_time: 1_669_593_600,
         governed_resources: &["AWS::RDS::DBInstance"],
     },
+    // The newest Security Hub control this table records: the catalog publishes it under
+    // a designator of its own and dates it with its own release instant, because the
+    // surface it governs was released long after the body of controls above.
+    PublishedSecurityHubControl {
+        designator: "SH.REDSHIFT-SERVERLESS.DT.3",
+        identifier: "1ks6hwrtiiia8t2djn1iys62x",
+        implementation_identifier: "RedshiftServerless.3",
+        name: "Redshift Serverless workgroups should prohibit public access",
+        description: "This control checks whether an Amazon Redshift Serverless \
+                      workgroup is publicly accessible. The control fails if the \
+                      workgroup is publicly accessible.",
+        severity: "HIGH",
+        parameter_requirement_summary: "NONE",
+        release_time: 1_765_929_600,
+        governed_resources: &["AWS::RedshiftServerless::Workgroup"],
+    },
     // The control whose check is on the ACCOUNT-level block public access settings, so
     // the catalog publishes every S3 resource type those settings restrict access to as
     // governed — the row that spans a governed-resource list of several types.

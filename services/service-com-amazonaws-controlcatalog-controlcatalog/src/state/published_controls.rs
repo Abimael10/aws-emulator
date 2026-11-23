@@ -212,6 +212,67 @@ const GENERALLY_AVAILABLE_REGIONS: &[&str] = &[
     "us-west-2",
 ];
 
+/// The Regions a control over Amazon Cognito user pool advanced security deploys to.
+///
+/// Source: the Region availability the implementing surface publishes — advanced security
+/// on an Amazon Cognito user pool is offered in the Regions of the partition that are
+/// enabled by default, and nowhere else, so that is where the implementing AWS Config
+/// managed rule can evaluate a user pool. `DeployableRegions` reports "the Regions in
+/// which the control is available for deployment" (`smithy_query(query="doc",
+/// shape="RegionConfiguration", member="DeployableRegions")`), so a control whose
+/// implementing surface is offered in fewer Regions than the partition publishes its own,
+/// narrower list rather than the partition-wide one ([`GENERALLY_AVAILABLE_REGIONS`]).
+/// Ordered by Region code, the order the catalog reports them in.
+const COGNITO_ADVANCED_SECURITY_REGIONS: &[&str] = &[
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// The Regions a control over an Amazon Redshift Serverless workgroup deploys to.
+///
+/// Source: the Region availability Amazon Web Services publishes for Amazon Redshift
+/// Serverless, which is where a workgroup can exist for the control to govern. Ordered by
+/// Region code, the order the catalog reports them in.
+const REDSHIFT_SERVERLESS_REGIONS: &[&str] = &[
+    "af-south-1",
+    "ap-east-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "il-central-1",
+    "me-central-1",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-2",
+];
+
 /// A control that supports no control parameter: nothing is supplied when it is
 /// enabled, so its `ParameterRequirementSummary` is `NONE`.
 const NO_PARAMETERS: &[(&str, &str)] = &[];
@@ -1313,7 +1374,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         control_tower_identifier: None,
         designators: &["CONFIG.COGNITO-IDP.DT.1"],
         scope: REGIONAL,
-        deployable_regions: GENERALLY_AVAILABLE_REGIONS,
+        // Advanced security on a user pool is offered in fewer Regions than the
+        // partition, so the catalog publishes this control's own availability rather
+        // than the partition-wide set.
+        deployable_regions: COGNITO_ADVANCED_SECURITY_REGIONS,
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::Cognito::UserPool"],
         governed_providers: AWS,
@@ -2047,6 +2111,32 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         frameworks: NO_FRAMEWORK_ITEMS,
     },
     ControlSeed {
+        slug: "securityhub-redshift-serverless-3",
+        name: "Redshift Serverless workgroups should prohibit public access",
+        // The implementing Security Hub control's own published text: what the control
+        // checks, followed by the condition under which it fails.
+        description: "This control checks whether an Amazon Redshift Serverless \
+                      workgroup is publicly accessible. The control fails if the \
+                      workgroup is publicly accessible.",
+        behavior: DETECTIVE,
+        severity: HIGH,
+        implementation_type: SECURITY_HUB_CONTROL,
+        implementation_identifier: Some("RedshiftServerless.3"),
+        control_tower_identifier: None,
+        // The catalog publishes this control under a designator of its own rather than
+        // under its Security Hub id.
+        designators: &["SH.REDSHIFT-SERVERLESS.DT.3"],
+        scope: REGIONAL,
+        // Redshift Serverless is offered in fewer Regions than the partition, so the
+        // control deploys to the Regions a workgroup can exist in.
+        deployable_regions: REDSHIFT_SERVERLESS_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::RedshiftServerless::Workgroup"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: NO_FRAMEWORK_ITEMS,
+    },
+    ControlSeed {
         slug: "securityhub-rds-3",
         name: "RDS DB instances should have encryption at-rest enabled",
         description: "This AWS control checks whether storage encryption is enabled for \
@@ -2376,6 +2466,13 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         slug: "securityhub-rds-3",
         identifier: "dsrtfqf4g9gvlguj5hqahozla",
         release_time: Some(1_669_593_600),
+    },
+    // Released well after the body above — the catalog publishes a control once the
+    // surface it governs exists — so it carries its own instant.
+    PublishedCatalogRecord {
+        slug: "securityhub-redshift-serverless-3",
+        identifier: "1ks6hwrtiiia8t2djn1iys62x",
+        release_time: Some(1_765_929_600),
     },
     // The two controls over Amazon S3 belong to that same body of governance
     // capability, so the catalog dates them with the one instant recorded above rather

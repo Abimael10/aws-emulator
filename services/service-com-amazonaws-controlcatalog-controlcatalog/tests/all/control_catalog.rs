@@ -1211,3 +1211,212 @@ async fn the_catalog_is_shared_state_rather_than_per_request_literals() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Where a published control deploys
+// ---------------------------------------------------------------------------
+
+/// The deployable-Region set the catalog publishes for one control.
+///
+/// Source: the Control Catalog's own published record for the control — the opaque
+/// identifier its ARN carries, the designator it is published under, and the Regions it
+/// reports as deployable, which are the Regions the surface implementing it is offered in.
+struct PublishedAvailability {
+    /// A designator the control is published under, which names it catalog-wide.
+    designator: &'static str,
+    /// The opaque identifier the control's published catalog ARN carries.
+    identifier: &'static str,
+    /// The Regions the catalog publishes the control as deployable in, in the order it
+    /// reports them.
+    deployable_regions: &'static [&'static str],
+}
+
+/// Controls whose published deployable-Region set the catalog records, spanning what the
+/// rule generalises over: both implementing surfaces (an AWS Config managed rule and a
+/// Security Hub control), and availability sets of different sizes — neither of them the
+/// Region inventory the emulator serves other controls with.
+const PUBLISHED_AVAILABILITY: &[PublishedAvailability] = &[
+    // A control over a feature offered only in the Regions of the partition that are
+    // enabled by default.
+    PublishedAvailability {
+        designator: "CONFIG.COGNITO-IDP.DT.1",
+        identifier: "1038h7d21e6g8i10g6v3xsssi",
+        deployable_regions: &[
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-northeast-3",
+            "ap-south-1",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ca-central-1",
+            "eu-central-1",
+            "eu-north-1",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "sa-east-1",
+            "us-east-1",
+            "us-east-2",
+            "us-west-1",
+            "us-west-2",
+        ],
+    },
+    // A control over a service offered in a different set again, including Regions that
+    // are enabled on request.
+    PublishedAvailability {
+        designator: "SH.REDSHIFT-SERVERLESS.DT.3",
+        identifier: "1ks6hwrtiiia8t2djn1iys62x",
+        deployable_regions: &[
+            "af-south-1",
+            "ap-east-1",
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-northeast-3",
+            "ap-south-1",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ca-central-1",
+            "eu-central-1",
+            "eu-central-2",
+            "eu-north-1",
+            "eu-south-1",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "il-central-1",
+            "me-central-1",
+            "sa-east-1",
+            "us-east-1",
+            "us-east-2",
+            "us-west-2",
+        ],
+    },
+];
+
+/// `DeployableRegions` is the control's OWN published availability.
+///
+/// `RegionConfiguration` "[r]eturns information about the control, including the scope of
+/// the control, if enabled, and the Regions in which the control is available for
+/// deployment" (`smithy_query(query="operation", operation="GetControl")`), so a REGIONAL
+/// control reports the Regions the catalog publishes for THAT control — a set that differs
+/// between controls because the surfaces implementing them are offered in different
+/// Regions — rather than one Region inventory served for the whole catalog. Read back in a
+/// second session over its own engine as well, because the set is published content and
+/// not a per-request or per-run projection.
+#[tokio::test]
+async fn a_regional_controls_deployable_regions_are_its_own_published_availability() {
+    let emulator = Emulator::new();
+    let elsewhere = Emulator::new();
+
+    for row in PUBLISHED_AVAILABILITY {
+        let arn = format!("arn:aws:controlcatalog:::control/{}", row.identifier);
+        let case = row.designator;
+        let body = format!(r#"{{"ControlArn":"{arn}"}}"#);
+        let control = emulator.ok("/get-control", &body).await;
+
+        assert!(
+            strings(&control, "Aliases").contains(&row.designator.to_string()),
+            "case {case}: expected the designator the catalog publishes {arn} under, got \
+             {:?}",
+            control["Aliases"]
+        );
+        assert_eq!(
+            control["RegionConfiguration"]["Scope"].as_str(),
+            Some("REGIONAL"),
+            "case {case}: a control that deploys per Region is REGIONAL, got {:?}",
+            control["RegionConfiguration"]
+        );
+        let served = strings(&control["RegionConfiguration"], "DeployableRegions");
+        assert_eq!(
+            served, row.deployable_regions,
+            "case {case}: expected the Regions the catalog publishes this control as \
+             deployable in, got {served:?}"
+        );
+        let in_the_second_session = elsewhere.ok("/get-control", &body).await;
+        assert_eq!(
+            strings(&in_the_second_session["RegionConfiguration"], "DeployableRegions"),
+            served,
+            "case {case}: a second session must publish the same availability, got {:?}",
+            in_the_second_session["RegionConfiguration"]
+        );
+    }
+
+    // The rows are not two spellings of one list: the sets differ in membership and in
+    // size, which is the difference the rule is about.
+    let sets: BTreeSet<Vec<&str>> = PUBLISHED_AVAILABILITY
+        .iter()
+        .map(|row| row.deployable_regions.to_vec())
+        .collect();
+    assert_eq!(
+        sets.len(),
+        PUBLISHED_AVAILABILITY.len(),
+        "case table: each row must record its own availability for the rule to be tested, \
+         saw {sets:?}"
+    );
+}
+
+/// No single Region list is served for the whole catalog, and every served list is a set
+/// of published Region codes.
+///
+/// The rule above, taken over EVERY control the service serves rather than the rows that
+/// record one: a REGIONAL control reports a non-empty list of distinct Region codes in the
+/// catalog's own order, a GLOBAL control reports none at all ("controls that have the value
+/// GLOBAL in the Scope field do not show the DeployableRegions field, because it does not
+/// apply"), and the catalog publishes more than one availability across its controls.
+#[tokio::test]
+async fn the_catalog_publishes_more_than_one_deployable_region_set() {
+    let emulator = Emulator::new();
+    let controls = drain(&emulator, "/list-controls", "Controls", None, "{}").await;
+    assert!(!controls.is_empty(), "the catalog must hold controls");
+
+    let mut sets: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut regional = 0usize;
+    for summary in &controls {
+        let arn = summary["Arn"].as_str().expect("a control carries its ARN");
+        let control = emulator
+            .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+            .await;
+        let configuration = &control["RegionConfiguration"];
+        if configuration["Scope"].as_str() != Some("REGIONAL") {
+            continue;
+        }
+        regional += 1;
+        let served = strings(configuration, "DeployableRegions");
+        assert!(
+            !served.is_empty(),
+            "case {arn}: a REGIONAL control reports the Regions it deploys to"
+        );
+        let distinct: BTreeSet<&String> = served.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            served.len(),
+            "case {arn}: expected each deployable Region once, got {served:?}"
+        );
+        for region in &served {
+            // A Region code is lower-case letters, digits and hyphens, as every Region
+            // segment the service's modeled ARN patterns admit (`[a-zA-Z0-9-]*`) is
+            // written in the published catalog.
+            assert!(
+                !region.is_empty()
+                    && region.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '-'
+                    }),
+                "case {arn}: expected a published Region code, got {region:?}"
+            );
+        }
+        sets.insert(served);
+    }
+
+    assert!(
+        regional >= 2,
+        "case catalog: the catalog must publish REGIONAL controls for this rule to have \
+         rows, saw {regional}"
+    );
+    assert!(
+        sets.len() >= 2,
+        "case catalog: a control's availability is its own, so the catalog must publish \
+         more than one deployable-Region set, saw {sets:?}"
+    );
+}
