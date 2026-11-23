@@ -18,7 +18,10 @@
 //!    timestamp axis for `OneMinute`/`FiveMinute`/`OneHour` (keyed by the bucket's first
 //!    epoch second), or one bucket per `Step` for `IterationNumber`.
 //! 4. Each bucket is reduced by `MetricStat` to one `MetricValues` entry, beside its
-//!    bucket key in `XAxisValues`; both lists are the same length and ascending in x.
+//!    bucket key in `XAxisValues`; both lists are the same length and ascending in x. The
+//!    reduction is the number the statistic names for every bucket this store can hold,
+//!    including one holding an unbounded value, and is never NOT A NUMBER
+//!    ([`Statistic::reduce`]).
 //!
 //! `Status` reports what happened to that one query:
 //!
@@ -106,6 +109,7 @@
 use super::types::*;
 
 use crate::state::{ComAmazonawsSagemakermetricsSagemakermetricsserviceState, MetricDatum};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -203,31 +207,116 @@ impl Statistic {
 
     /// Reduce one bucket's values, which arrive ascending by `(timestamp, step)`, to the
     /// single number this statistic names. `values` is never empty: a bucket exists only
-    /// because a point fell in it. No stored value is `NaN` (`BatchPutMetrics` stores
-    /// none), so every comparison below is total and the reduction is the number the
-    /// statistic names.
+    /// because a point fell in it.
+    ///
+    /// Every reduction here is TOTAL over the values this store holds — every finite
+    /// number plus the two unbounded ones, since an infinite `Value` is a number and is
+    /// stored as one while a `NaN` never becomes a point at all
+    /// ([`crate::state::MetricDatum::value`]). A statistic of a bucket holding an
+    /// unbounded value is the LIMIT of that statistic's own definition as the unbounded
+    /// value is replaced by a finite magnitude growing without bound, which exists for
+    /// every bucket — so the answer is always the number the statistic names, and never
+    /// the NOT A NUMBER this service neither stores nor reports.
     fn reduce(self, values: &[f64]) -> f64 {
-        let count = values.len() as f64;
-        let sum: f64 = values.iter().sum();
         match self {
             Self::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
             Self::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            Self::Avg => sum / count,
-            Self::Count => count,
-            Self::StdDev => {
-                // Population standard deviation over the bucket's own points: the
-                // bucket is the whole population being summarised, so a one-point
-                // bucket has a spread of zero rather than an undefined one.
-                let mean = sum / count;
-                let variance =
-                    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / count;
-                variance.sqrt()
-            }
+            Self::Avg => mean(values),
+            Self::Count => values.len() as f64,
+            Self::StdDev => standard_deviation(values),
             // The series is kept sorted, so the bucket's last value is its latest. The
             // fallback is unreachable (a bucket holds at least one point).
-            Self::Last => values.last().copied().unwrap_or(f64::NAN),
+            Self::Last => values.last().copied().unwrap_or_default(),
         }
     }
+}
+
+/// The arithmetic mean of one bucket's values.
+///
+/// Dividing the bucket's float SUM by its count is not that mean: an unbounded value above
+/// and one below sum to NOT A NUMBER, and so does every quotient after them, while a sum of
+/// large finite values can leave the double range the mean itself sits well inside. The
+/// mean is instead read off the limit of the same definition with each unbounded value
+/// replaced by a finite magnitude `m` growing without bound —
+/// `(finite part + (above - below) * m) / count` — which tends to the unbounded value whose
+/// count DOMINATES and, when the two counts match, to the finite part over the whole
+/// bucket's count, the unbounded values cancelling. Each finite value contributes its own
+/// SHARE of that part, `value / count`, so what is accumulated is the mean itself: no
+/// partial total is larger than the largest value in the bucket, and nothing overflows that
+/// the mean does not.
+///
+/// `0.0` for an empty bucket, which cannot happen: a bucket exists because a point fell in
+/// it.
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let count = values.len() as f64;
+    let mut finite_part = 0.0_f64;
+    let mut above = 0_usize;
+    let mut below = 0_usize;
+    for value in values.iter().copied() {
+        if value == f64::INFINITY {
+            above += 1;
+        } else if value == f64::NEG_INFINITY {
+            below += 1;
+        } else {
+            finite_part += value / count;
+        }
+    }
+    match above.cmp(&below) {
+        Ordering::Greater => f64::INFINITY,
+        Ordering::Less => f64::NEG_INFINITY,
+        Ordering::Equal => finite_part,
+    }
+}
+
+/// The POPULATION standard deviation of one bucket's values: the bucket is the whole
+/// population being summarised, so the deviations are taken about its own mean and divided by
+/// its own count.
+///
+/// Read off the same limit as [`mean`]. A population whose values are all the SAME number
+/// has no spread at all, whatever that number is — which covers the one-point bucket; past
+/// that, replacing an unbounded value by a growing magnitude pushes the deviations about
+/// the mean up with it, so a bucket that holds one and is not constant has a spread
+/// unbounded above; and a bucket of finite values is the ordinary formula.
+///
+/// That formula is evaluated on the values divided by the bucket's LARGEST magnitude, which
+/// the deviation of a scale-free population is then multiplied back by: a deviation is
+/// homogeneous, so the two agree, while every quantity in between is at most a few units and
+/// so cannot leave the double range the way a squared deviation of a large value does. The
+/// answer is therefore the spread of the bucket rather than an artefact of the arithmetic —
+/// at most that largest magnitude, which is a value the bucket itself holds.
+///
+/// `0.0` for an empty bucket, which cannot happen: a bucket exists because a point fell in
+/// it.
+fn standard_deviation(values: &[f64]) -> f64 {
+    let Some(first) = values.first().copied() else {
+        return 0.0;
+    };
+    if values.iter().all(|value| *value == first) {
+        return 0.0;
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return f64::INFINITY;
+    }
+    // Positive: a bucket whose largest magnitude is zero holds nothing but zeroes, which the
+    // constant case above already answered.
+    let scale = values
+        .iter()
+        .copied()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let count = values.len() as f64;
+    let scaled_mean = values.iter().map(|value| value / scale).sum::<f64>() / count;
+    let scaled_variance = values
+        .iter()
+        .map(|value| {
+            let deviation = value / scale - scaled_mean;
+            deviation * deviation
+        })
+        .sum::<f64>()
+        / count;
+    scale * scaled_variance.sqrt()
 }
 
 /// How a query groups points: the `Period`.

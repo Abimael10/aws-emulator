@@ -81,7 +81,9 @@ pub struct MetricDatum {
     /// `RawMetricData.Step` — `None` when the caller omitted it.
     pub step: Option<i32>,
     /// `RawMetricData.Value`. Never `NaN`: a value with no position in any ordering is
-    /// not stored, so every stored value is comparable and aggregatable.
+    /// not stored, so every stored value is comparable and aggregatable. An UNBOUNDED
+    /// value is a number and is stored as one, so aggregating a series has to be total
+    /// over those two as well (`crate::ops::batch_get_metrics`).
     pub value: f64,
 }
 

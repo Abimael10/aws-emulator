@@ -95,6 +95,31 @@ type RawPoint = (&'static str, i64, Option<i32>, f64);
 /// (`Status`, `XAxisValues`, `MetricValues`).
 type AggregationCase = (&'static str, Query, &'static str, Vec<i64>, Vec<f64>);
 
+/// `RawMetricData.Value` as this protocol carries it: a JSON number for a finite value,
+/// and the quoted text this protocol's codec reads a float from for an unbounded one (a
+/// bare non-finite literal is not JSON at all).
+fn wire_value(value: f64) -> Value {
+    if value.is_finite() {
+        json!(value)
+    } else if value > 0.0 {
+        json!("Infinity")
+    } else {
+        json!("-Infinity")
+    }
+}
+
+/// One `MetricValues` entry as the response carries it: a JSON number, or the quoted text
+/// a non-finite double travels as. `NaN` is read too, so a reduction that manufactured one
+/// is reported by the assertion that compares it rather than by a parse failure here.
+fn metric_value(entry: &Value) -> f64 {
+    entry.as_f64().unwrap_or_else(|| match entry.as_str() {
+        Some("Infinity") => f64::INFINITY,
+        Some("-Infinity") => f64::NEG_INFINITY,
+        Some("NaN") => f64::NAN,
+        _ => panic!("MetricValues entries are doubles, got {entry:?}"),
+    })
+}
+
 fn raw_metric_data(points: &[RawPoint]) -> Value {
     Value::Array(
         points
@@ -103,7 +128,7 @@ fn raw_metric_data(points: &[RawPoint]) -> Value {
                 let mut datum = serde_json::Map::new();
                 datum.insert("MetricName".to_string(), json!(name));
                 datum.insert("Timestamp".to_string(), json!(timestamp));
-                datum.insert("Value".to_string(), json!(value));
+                datum.insert("Value".to_string(), wire_value(*value));
                 if let Some(step) = step {
                     datum.insert("Step".to_string(), json!(step));
                 }
@@ -265,7 +290,7 @@ async fn get_metrics(router: &MultiServiceRouter, queries: &[Query]) -> Vec<Quer
                     .as_array()
                     .unwrap_or_else(|| panic!("MetricValues must be a list: {result:?}"))
                     .iter()
-                    .map(|v| v.as_f64().expect("MetricValues entries are doubles"))
+                    .map(metric_value)
                     .collect()
             });
             QueryResult {
@@ -312,8 +337,16 @@ fn assert_result(case: &str, got: &QueryResult, status: &str, x: &[i64], values:
         "case {case}: XAxisValues and MetricValues must be the same length, got {got:?}"
     );
     for (i, (actual, want)) in got_values.iter().zip(values).enumerate() {
+        // A computed finite aggregate is compared with a tolerance; an unbounded one is
+        // the exact value the statistic names, and NOT A NUMBER equals nothing at all, so
+        // a reduction that produced one fails here with the value it produced.
+        let answers_the_case = if want.is_finite() {
+            (actual - want).abs() < EPSILON
+        } else {
+            actual == want
+        };
         assert!(
-            (actual - want).abs() < EPSILON,
+            answers_the_case,
             "case {case}: MetricValues[{i}] expected {want}, got {actual}"
         );
     }
@@ -1059,6 +1092,203 @@ async fn a_modelled_constraint_violation_is_reported_per_item_inside_a_200() {
                     "case {case}: every point was ingested, so Errors is [], got {response:?}"
                 );
             }
+        }
+    }
+}
+
+/// One row of the aggregation table for a bucket holding values of UNBOUNDED magnitude:
+/// the case — which doubles as the metric name the row's own series is written under, a
+/// metric name being an opaque key — the bucket's values in timestamp order, the statistic
+/// that reduces them, and the one number that reduction must answer.
+type UnboundedCase = (&'static str, &'static [f64], &'static str, f64);
+
+/// RULE: every `MetricStat` reduces its bucket to the number that statistic names for
+/// every series this store can hold, a stored `Value` of unbounded magnitude included, so
+/// a `Complete` result never carries NOT A NUMBER.
+///
+/// `BatchPutMetrics` stores an unbounded `Value` as the number it is and refuses only a
+/// `NaN`, so each reduction is read off its own definition as a magnitude grows without
+/// bound: the mean follows whichever unbounded direction outnumbers the other and keeps the
+/// finite share when they cancel, a population with one value or one constant value has no
+/// spread whatever that value is, and any other bucket holding an unbounded value spreads
+/// without bound. Finite rows are in the same table because the same reduction answers
+/// them.
+#[tokio::test]
+async fn aggregating_unbounded_values_answers_a_number_for_every_statistic() {
+    // Population variance of {1.0, 2.0, 6.0} about its mean 3.0: (4 + 1 + 9) / 3.
+    let finite_spread = (14.0_f64 / 3.0).sqrt();
+    let cases: &[UnboundedCase] = &[
+        // StdDev: the spread of a population that is one value, or one value repeated.
+        ("a lone unbounded value", &[f64::INFINITY], "StdDev", 0.0),
+        (
+            "a lone unbounded value below",
+            &[f64::NEG_INFINITY],
+            "StdDev",
+            0.0,
+        ),
+        (
+            "an unbounded value repeated",
+            &[f64::INFINITY, f64::INFINITY],
+            "StdDev",
+            0.0,
+        ),
+        // StdDev: any other bucket holding an unbounded value has no finite spread.
+        (
+            "unbounded above against unbounded below",
+            &[f64::INFINITY, f64::NEG_INFINITY],
+            "StdDev",
+            f64::INFINITY,
+        ),
+        (
+            "an unbounded value beside a finite one",
+            &[f64::INFINITY, 1.0],
+            "StdDev",
+            f64::INFINITY,
+        ),
+        // Avg: the direction that outnumbers the other decides the mean.
+        ("the mean runs up", &[f64::INFINITY, 1.0], "Avg", f64::INFINITY),
+        (
+            "the mean runs down",
+            &[f64::NEG_INFINITY, 1.0],
+            "Avg",
+            f64::NEG_INFINITY,
+        ),
+        (
+            "the mean runs up on the count",
+            &[f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY],
+            "Avg",
+            f64::INFINITY,
+        ),
+        // Avg: equal counts in both directions cancel, leaving the finite share.
+        (
+            "opposed unbounded values and nothing else",
+            &[f64::INFINITY, f64::NEG_INFINITY],
+            "Avg",
+            0.0,
+        ),
+        (
+            "opposed unbounded values over a finite point",
+            &[f64::INFINITY, f64::NEG_INFINITY, 3.0],
+            "Avg",
+            1.0,
+        ),
+        // The order statistics, the count and the latest point take an unbounded value as
+        // the number it is.
+        (
+            "the smallest value is unbounded below",
+            &[f64::INFINITY, f64::NEG_INFINITY, 1.0],
+            "Min",
+            f64::NEG_INFINITY,
+        ),
+        (
+            "the largest value is unbounded above",
+            &[f64::INFINITY, f64::NEG_INFINITY, 1.0],
+            "Max",
+            f64::INFINITY,
+        ),
+        (
+            "unbounded values are counted like any other",
+            &[f64::INFINITY, f64::NEG_INFINITY],
+            "Count",
+            2.0,
+        ),
+        (
+            "the latest point of the bucket is unbounded",
+            &[1.0, f64::INFINITY],
+            "Last",
+            f64::INFINITY,
+        ),
+        // The mean of values at the top of the double range is in that range, even where
+        // their sum is not.
+        (
+            "a mean at the top of the range",
+            &[f64::MAX, f64::MAX],
+            "Avg",
+            f64::MAX,
+        ),
+        (
+            "a mean whose own sum would not fit",
+            &[f64::MAX, f64::MAX, -f64::MAX],
+            "Avg",
+            f64::MAX / 3.0,
+        ),
+        (
+            "a constant bucket at the top of the range",
+            &[f64::MAX, f64::MAX],
+            "StdDev",
+            0.0,
+        ),
+        (
+            // The spread of {M, -M} about its mean 0 is M itself, which is in the range even
+            // though the squared deviation it is read off is not.
+            "a spread at the top of the range",
+            &[f64::MAX, -f64::MAX],
+            "StdDev",
+            f64::MAX,
+        ),
+        // Finite rows, answered by the same reduction.
+        ("a finite mean", &[1.0, 2.0, 6.0], "Avg", 3.0),
+        ("a finite spread", &[1.0, 2.0, 6.0], "StdDev", finite_spread),
+    ];
+
+    // The same table under two groupings, which pins the rule in the REDUCTION rather than
+    // in how the points were bucketed: one bucket per hour over points a second apart, and
+    // one bucket per iteration over points that share a step.
+    let groupings: [(&'static str, &'static str, &'static str, &'static str, i64); 2] = [
+        (
+            "per hour",
+            "tc-unbounded-hour",
+            "OneHour",
+            "Timestamp",
+            HOUR_BUCKETS[0],
+        ),
+        (
+            "per iteration",
+            "tc-unbounded-iteration",
+            "IterationNumber",
+            "IterationNumber",
+            0,
+        ),
+    ];
+
+    for (grouping, component, period, axis, bucket) in groupings {
+        let router = emulator();
+        for (case, values, stat, want) in cases {
+            // Every point of a row lands in ONE bucket: a second apart inside the same
+            // hour, or at the same iteration, each at a coordinate of its own.
+            let points: Vec<RawPoint> = values
+                .iter()
+                .enumerate()
+                .map(|(at, value)| {
+                    let step = if axis == "IterationNumber" {
+                        0
+                    } else {
+                        i32::try_from(at).expect("a row holds a handful of points")
+                    };
+                    (
+                        *case,
+                        T0 + i64::try_from(at).expect("a row holds a handful of points"),
+                        Some(step),
+                        *value,
+                    )
+                })
+                .collect();
+            let errors = put_metrics(&router, component, &points).await;
+            assert!(
+                errors.is_empty(),
+                "case {grouping}/{case:?}: every value of the bucket is a measurement and \
+                 is stored, got {errors:?}"
+            );
+
+            let query = Query::new(case, component).aggregate(stat, period, axis);
+            let results = get_metrics(&router, &[query]).await;
+            assert_result(
+                &format!("{grouping}/{case} as {stat}"),
+                &results[0],
+                "Complete",
+                &[bucket],
+                &[*want],
+            );
         }
     }
 }
