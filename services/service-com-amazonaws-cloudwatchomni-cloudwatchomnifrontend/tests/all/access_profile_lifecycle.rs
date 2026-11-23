@@ -135,7 +135,7 @@ use super::domain_space_lifecycle::SPACE_REGIONS;
 
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
-struct Omni {
+pub(crate) struct Omni {
     engine: Arc<engine::InMemoryEngine>,
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
@@ -151,7 +151,7 @@ struct Omni {
 }
 
 impl Omni {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -190,7 +190,7 @@ impl Omni {
     ///
     /// An account holds at most ONE domain, so every space this suite creates hangs off
     /// the same one; the create carries the `clientToken` it is admitted only with.
-    async fn domain(&self, case: &str) -> String {
+    pub(crate) async fn domain(&self, case: &str) -> String {
         if let Some(held) = self
             .domain
             .lock()
@@ -222,7 +222,7 @@ impl Omni {
     /// An account holds at most ONE space per Region, so each space is created in a
     /// Region of its own ([`SPACE_REGIONS`]); the profile calls that follow address the
     /// space by its id, which no Region scopes.
-    async fn space(&self, case: &str, name: &str) -> String {
+    pub(crate) async fn space(&self, case: &str, name: &str) -> String {
         let domain_id = self.domain(case).await;
         let index = self
             .spaces_created
@@ -253,7 +253,7 @@ impl Omni {
             .space_id
     }
 
-    async fn create_access_profile(
+    pub(crate) async fn create_access_profile(
         &self,
         input: &CreateAccessProfileInput,
     ) -> Result<CreateAccessProfileOutput, CreateAccessProfileError> {
@@ -302,7 +302,7 @@ impl Omni {
     }
 
     /// Dispatch one rpcv2Cbor request over HTTP and return the status and body.
-    async fn over_the_wire<I: SerializableStruct>(
+    pub(crate) async fn over_the_wire<I: SerializableStruct>(
         &self,
         operation: &str,
         input_schema: &Schema,
