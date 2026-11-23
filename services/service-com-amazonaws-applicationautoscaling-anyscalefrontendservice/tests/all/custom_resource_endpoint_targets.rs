@@ -19,6 +19,12 @@
 //! all, and one that is no URL at all — and, for the stage that serves it, a window the
 //! capacity is inside of (which moves nothing) beside one whose floor is above it.
 //!
+//! The second suite below pins what the movement a floor owes LOOKS LIKE at the endpoint and in
+//! the history: ONE `PATCH` carrying the one member the contract names, ONE activity settling
+//! `Successful`, and a target that reads back with the registered bounds and the namespace's own
+//! service-linked role — on every addressing the endpoint's URL can take, since which address a
+//! client was handed is no part of the rule.
+//!
 //! This suite builds its OWN emulator rather than using the shared one
 //! ([`super::emulator::Emulator`]), because the endpoint is served by a service the other
 //! suites do not mount: Amazon API Gateway, through a REST API whose `GET` and `PATCH` on the
@@ -703,6 +709,287 @@ async fn a_custom_resource_target_is_registered_only_on_an_endpoint_this_service
             held,
             Some(moved_to as f64),
             "case {case:?}: expected the endpoint's own capacity to be {moved_to}, got {held:?}"
+        );
+    }
+}
+
+/// The service-linked role a `custom-resource` scalable target is scaled through.
+///
+/// Source: the `RoleARN` a scalable target reports is the role "that allows Application Auto
+/// Scaling to modify the scalable target on your behalf", and the service "uses a service-linked
+/// role, which it creates if it does not yet exist" — one per namespace, named
+/// `AWSServiceRoleForApplicationAutoScaling_<resource type>`.
+const CUSTOM_RESOURCE_ROLE_NAME: &str = "AWSServiceRoleForApplicationAutoScaling_CustomResource";
+
+/// The emulator's own endpoint, as a client that resolves no AWS host dials it: a loopback
+/// authority with a port, which names no service and so carries the api in the path.
+const EMULATOR_ENDPOINT: &str = "127.0.0.1:34991";
+
+/// How a row's resource id ADDRESSES the endpoint.
+///
+/// The three spellings of one deployed stage: the api's own invoke host, and the two the
+/// emulator publishes for a client that resolves that host nowhere — the reserved data-plane
+/// prefix followed by the api id, and the same prefix followed by the endpoint host itself.
+/// Which one a client was handed is no part of the rule, so each of them is a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressing {
+    /// `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/…`.
+    ApiEndpointHost,
+    /// `https://{host}:{port}/_aws/execute-api/{api-id}/{stage}/…`.
+    EmulatorPrefix,
+    /// `https://{host}:{port}/_aws/{api-id}.execute-api.{region}.amazonaws.com/{stage}/…`.
+    EmulatorPrefixedHost,
+}
+
+/// One registration whose floor is ABOVE the capacity the endpoint reports.
+struct FloorRow {
+    case: &'static str,
+    addressing: Addressing,
+    /// The capacity the endpoint's own item holds before the registration.
+    reported: i64,
+    /// The window the registration declares, whose floor is above [`FloorRow::reported`].
+    window: (i64, i64),
+}
+
+/// The catalogue: the floor and the capacity it is above differ in value, in distance and in
+/// how many digits the floor has, and each addressing of the endpoint is exercised.
+const FLOOR_ROWS: &[FloorRow] = &[
+    FloorRow {
+        case: "a floor one above the reported capacity, on the api's own endpoint host",
+        addressing: Addressing::ApiEndpointHost,
+        reported: 2,
+        window: (3, 6),
+    },
+    FloorRow {
+        case: "the same floor, reached on the emulator's own endpoint",
+        addressing: Addressing::EmulatorPrefix,
+        reported: 2,
+        window: (3, 6),
+    },
+    FloorRow {
+        case: "a two-digit floor nine above the reported capacity",
+        addressing: Addressing::EmulatorPrefix,
+        reported: 3,
+        window: (12, 20),
+    },
+    FloorRow {
+        case: "a floor of one above an endpoint reporting no capacity at all",
+        addressing: Addressing::EmulatorPrefixedHost,
+        reported: 0,
+        window: (1, 4),
+    },
+];
+
+/// The dimension id a floor row's endpoint item is keyed by, which is also the last segment of
+/// the resource id it registers.
+fn floor_dimension_id(index: usize) -> String {
+    format!("floor-{index}")
+}
+
+/// The resource id a floor row registers: the URL of one deployed stage's dimension document,
+/// spelled the way that row's client was handed it.
+fn floor_resource_id(row: &FloorRow, api: &str, dimension: &str) -> String {
+    let path = format!("{DEPLOYED_STAGE}/{DIMENSION_PATH}/{dimension}");
+    let endpoint_host = format!("{api}.execute-api.{REGION}.amazonaws.com");
+    match row.addressing {
+        Addressing::ApiEndpointHost => format!("https://{endpoint_host}/{path}"),
+        Addressing::EmulatorPrefix => {
+            format!("https://{EMULATOR_ENDPOINT}/_aws/execute-api/{api}/{path}")
+        }
+        Addressing::EmulatorPrefixedHost => {
+            format!("https://{EMULATOR_ENDPOINT}/_aws/{endpoint_host}/{path}")
+        }
+    }
+}
+
+/// The item the endpoint serves for one dimension, as the service that owns it reports — the
+/// capacity it holds, how many `PATCH`es it has taken, and the body of the last one.
+async fn endpoint_item(router: &MultiServiceRouter, dimension: &str) -> Value {
+    let (status, read) = dynamodb(
+        router,
+        "GetItem",
+        json!({
+            "TableName": CAPACITY_TABLE,
+            "Key": {"id": {"S": dimension}},
+            "ConsistentRead": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected GetItem to answer 200, got {status} {read:?}"
+    );
+    read["Item"].clone()
+}
+
+/// The number one of that item's members holds, which DynamoDB carries as the decimal it spells.
+fn item_number(item: &Value, member: &str) -> Option<f64> {
+    item[member]["N"]
+        .as_str()
+        .and_then(|value| value.parse::<f64>().ok())
+}
+
+/// Poll the endpoint's own item until it reports `floor`, or the budget is up — so a failing
+/// case reports the item it last saw rather than hanging.
+async fn poll_until_endpoint_moved(
+    router: &MultiServiceRouter,
+    dimension: &str,
+    floor: i64,
+) -> Value {
+    let deadline = SystemTime::now() + POLL_FOR;
+    let mut item = endpoint_item(router, dimension).await;
+    while item_number(&item, "desired") != Some(floor as f64) && SystemTime::now() < deadline {
+        tokio::time::sleep(POLL_EVERY).await;
+        item = endpoint_item(router, dimension).await;
+    }
+    item
+}
+
+/// Poll the target's activity log until every activity it holds has settled `Successful` and
+/// there is at least one, or the budget is up.
+async fn poll_until_activities_settled(
+    router: &MultiServiceRouter,
+    resource_id: &str,
+) -> Vec<Value> {
+    let settled = |listed: &[Value]| {
+        !listed.is_empty()
+            && listed
+                .iter()
+                .all(|activity| activity["StatusCode"] == json!(SUCCESSFUL))
+    };
+    let deadline = SystemTime::now() + POLL_FOR;
+    let mut listed = activities(router, resource_id).await;
+    while !settled(&listed) && SystemTime::now() < deadline {
+        tokio::time::sleep(POLL_EVERY).await;
+        listed = activities(router, resource_id).await;
+    }
+    listed
+}
+
+/// RULE: registering a `custom-resource` target whose `MinCapacity` is above the capacity the
+/// endpoint reports raises that resource to the floor as part of the registration — ONE `PATCH`
+/// carrying exactly the one member the contract names (`{"desiredCapacity": <min>}`) — and
+/// records exactly ONE scaling activity for the movement, which settles `Successful` and states
+/// the bound that caused it, the capacity it set and the namespace that fulfilled it. The target
+/// then reads back with the window it registered and the `RoleARN` of the namespace's own
+/// service-linked role.
+#[tokio::test]
+async fn a_registration_floor_patches_the_endpoint_once_and_records_one_activity() {
+    let router = router();
+    let api = given_endpoint(&router).await;
+    given_capacity_table(&router).await;
+    for (index, row) in FLOOR_ROWS.iter().enumerate() {
+        given_item(&router, &floor_dimension_id(index), row.reported).await;
+    }
+
+    for (index, row) in FLOOR_ROWS.iter().enumerate() {
+        let case = row.case;
+        let dimension = floor_dimension_id(index);
+        let resource_id = floor_resource_id(row, &api, &dimension);
+        let (min, max) = row.window;
+
+        let (status, body) = application_auto_scaling(
+            &router,
+            "RegisterScalableTarget",
+            json!({
+                "ServiceNamespace": "custom-resource",
+                "ResourceId": resource_id,
+                "ScalableDimension": DIMENSION,
+                "MinCapacity": min,
+                "MaxCapacity": max,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the registration to be accepted, got {status} {body:?}"
+        );
+        assert!(
+            body["ScalableTargetARN"].as_str().is_some(),
+            "case {case:?}: expected the registration to answer the target's ARN, got {body:?}"
+        );
+
+        // The endpoint itself moved: the item its integrations read and write holds the floor.
+        let item = poll_until_endpoint_moved(&router, &dimension, min).await;
+        assert_eq!(
+            item_number(&item, "desired"),
+            Some(min as f64),
+            "case {case:?}: expected the endpoint's own capacity to be raised to {min}, got \
+             {item:?}"
+        );
+        // ONE request moved it, and its body is the one member the contract carries.
+        assert_eq!(
+            item_number(&item, "patches"),
+            Some(1.0),
+            "case {case:?}: expected exactly one PATCH to reach the endpoint, got {item:?}"
+        );
+        let expected_body = format!("{{\"desiredCapacity\": {min}.0}}");
+        assert_eq!(
+            item["lastBody"]["S"],
+            json!(expected_body),
+            "case {case:?}: expected the endpoint to have received {expected_body:?}, got {item:?}"
+        );
+
+        // And the movement is auditable: one activity, settled, in the service's own wording.
+        let listed = poll_until_activities_settled(&router, &resource_id).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: expected exactly one activity for the movement, got {listed:?}"
+        );
+        let activity = &listed[0];
+        let expected = json!({
+            "ServiceNamespace": "custom-resource",
+            "ResourceId": resource_id,
+            "ScalableDimension": DIMENSION,
+            "Cause": format!("minimum capacity was set to {min}"),
+            "Description": format!("Setting desired capacity to {min}."),
+            "StatusCode": SUCCESSFUL,
+            "StatusMessage": format!(
+                "Successfully set desired capacity to {min}. Change successfully fulfilled by \
+                 custom-resource."
+            ),
+        });
+        for (name, want) in expected.as_object().expect("an object of members") {
+            assert_eq!(
+                &activity[name], want,
+                "case {case:?}: expected {name} {want:?}, got {activity:?}"
+            );
+        }
+
+        // Nothing moved the endpoint a second time once the movement had settled.
+        let settled_item = endpoint_item(&router, &dimension).await;
+        assert_eq!(
+            (
+                item_number(&settled_item, "desired"),
+                item_number(&settled_item, "patches")
+            ),
+            (Some(min as f64), Some(1.0)),
+            "case {case:?}: expected the settled endpoint to hold the floor after one PATCH, got \
+             {settled_item:?}"
+        );
+
+        // The registered target reads back with its window and the role it is scaled through.
+        let registered = targets(&router, &resource_id).await;
+        assert_eq!(
+            registered.len(),
+            1,
+            "case {case:?}: expected the registered target to be reported, got {registered:?}"
+        );
+        assert_eq!(
+            (
+                registered[0]["MinCapacity"].clone(),
+                registered[0]["MaxCapacity"].clone()
+            ),
+            (json!(min), json!(max)),
+            "case {case:?}: expected the registered window, got {:?}",
+            registered[0]
+        );
+        let role_arn = registered[0]["RoleARN"].as_str().unwrap_or_default();
+        assert!(
+            role_arn.ends_with(&format!("/{CUSTOM_RESOURCE_ROLE_NAME}")),
+            "case {case:?}: expected a RoleARN naming {CUSTOM_RESOURCE_ROLE_NAME:?}, got \
+             {role_arn:?}"
         );
     }
 }
