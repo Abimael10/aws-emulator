@@ -88,8 +88,16 @@
 //! answer the caller gets back depends on it: an emulator with no object store or
 //! no CloudWatch Logs mounted, a bucket or log group the account has since deleted
 //! and a write the owning service refuses lose the record and are traced, exactly
-//! as every other vended-logs delivery in this tree is. The object store's guard is
-//! taken, and the log event written, with NO guard of this service held.
+//! as every other vended-logs delivery in this tree is. The object is written, and
+//! the log event put, with NO guard of this service held.
+//!
+//! Both writes go through the ONE path this tree delivers a vended log by: the object
+//! through [`::service_common::vended_logs::delivered_object`], which frames the records
+//! and puts the object in the destination bucket through Amazon S3's own operation, and
+//! the log event through
+//! [`::service_common::cloudwatch_logs::delivered_into_held_group`]. So a delivered record
+//! is one the owning service really holds — a bucket this account has deleted, and a write
+//! that service refuses, lose it rather than being recorded as delivered.
 //!
 //! One record is bounded by the one call it is of — the bodies it carries are the
 //! request this service already bounded ([`super::context_window`]) and the answer
@@ -98,10 +106,8 @@
 //! bounds a long-running emulator's accumulated records.
 
 use ::std::cell::RefCell;
-use ::std::io::Write;
 
 use ::aws_smithy_runtime_api::http::Response as RtResponse;
-use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use crate::ops::types::{ContentBlock, Message, TokenUsage};
 
@@ -122,9 +128,6 @@ pub const LOG_FILE_SERVICE_SEGMENT: &str = "BedrockModelInvocationLogs";
 
 /// What a delivered object's name ends with: the records, gzipped.
 pub const LOG_FILE_SUFFIX: &str = ".json.gz";
-
-/// The media type of the object a delivered log file is: a gzip stream.
-const GZIP_MEDIA_TYPE: &str = "application/x-gzip";
 
 /// The input member that travels in the request URI rather than in the body, so
 /// it is not part of the body a record carries — the model is named by the
@@ -545,27 +548,11 @@ pub fn record_key(
     )
 }
 
-/// The object's bytes: the records as newline-delimited JSON, gzipped — or `None`
-/// when the framing itself failed.
+/// The records one DELIVERED object carries: its bytes read back as the delivery's own
+/// framing ([`::service_common::vended_logs::gzipped`]) wrote them, one JSON document per
+/// line — `None` for bytes that are not such an object.
 ///
-/// Writing into a `Vec` cannot fail for want of space, so a failure here would be
-/// the encoder's own; it answers `None` rather than a truncated stream, because no
-/// object at all is more honest than one a reader cannot decompress.
-fn gzipped(records: &[::serde_json::Value]) -> Option<Vec<u8>> {
-    let mut encoder =
-        ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
-    for record in records {
-        encoder.write_all(record.to_string().as_bytes()).ok()?;
-        encoder.write_all(b"\n").ok()?;
-    }
-    encoder.finish().ok()
-}
-
-/// The records one DELIVERED object carries: its bytes read back as what [`gzipped`]
-/// wrote them, one JSON document per line — `None` for bytes that are not such an
-/// object.
-///
-/// The reading counterpart of the framing above, stated here beside it for the reason
+/// The reading counterpart of that framing, stated here for the reason
 /// [`record_key_prefix`] is: a reader of a destination bucket — an audit consumer, and
 /// the suites that assert what one holds — fetches an object and decompresses it, so
 /// the form it decodes cannot drift from the form the delivery wrote.
@@ -625,7 +612,7 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
         caller_identity_arn(engine, ctx.parts()).as_deref(),
     );
     if let Some(destination) = delivery.object_destination.as_ref() {
-        deliver_object(engine, destination, invocation, &record, &request_id);
+        deliver_object(ctx, destination, invocation, &record, &request_id).await;
     }
     if let Some(destination) = delivery.log_group_destination.as_ref() {
         deliver_log_event(ctx, destination, invocation, &record).await;
@@ -637,8 +624,14 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
 
 /// Write one invocation's `record` into the object destination, as the vended-log
 /// object that destination's reader fetches ([`record_key`]).
-fn deliver_object<Eng: Send + Sync + 'static>(
-    engine: &Eng,
+///
+/// Delivered through the one vended-logs object write this tree makes
+/// ([`::service_common::vended_logs::delivered_object`]), so the object is PUT in the
+/// destination bucket through Amazon S3's own operation rather than placed in its store:
+/// a bucket the account has deleted, and a write the object store refuses, deliver nothing
+/// and are traced. Call it with no state guard held: it awaits that write.
+async fn deliver_object(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     destination: &ObjectDestination,
     invocation: &LoggedInvocation,
     record: &::serde_json::Value,
@@ -651,36 +644,17 @@ fn deliver_object<Eng: Send + Sync + 'static>(
         invocation.at_millis,
         request_id,
     );
-    let Some(body) = gzipped(::std::slice::from_ref(record)) else {
-        ::tracing::warn!(
-            bucket = ?destination.bucket,
-            key = ?key,
-            "an invocation's log record could not be framed, so no object was delivered"
-        );
-        return;
-    };
-    let Some(store) = s3::state::service_state(engine) else {
-        ::tracing::warn!(
-            bucket = ?destination.bucket,
-            "no Amazon S3 is mounted beside this service, so an invocation's log record could \
-             not be delivered"
-        );
-        return;
-    };
-    let object = s3::state::Object::stored(body, Some(GZIP_MEDIA_TYPE.to_string()));
-    let written = {
-        let mut objects = store.lock();
-        objects.put_object(&destination.bucket, &key, object)
-    };
-    match written {
-        Some(s3::state::ObjectWrite::Created | s3::state::ObjectWrite::Replaced) => {}
-        refused => ::tracing::warn!(
-            bucket = ?destination.bucket,
-            key = ?key,
-            outcome = ?refused,
-            "an invocation's log record could not be written to this emulator's Amazon S3"
-        ),
-    }
+    // The write traces its own loss, with the bucket, the key and the object store's own
+    // answer, so one lost record produces ONE trace event rather than a second, vaguer line
+    // from here.
+    let _delivered = ::service_common::vended_logs::delivered_object(
+        ctx,
+        &invocation.region,
+        &destination.bucket,
+        &key,
+        ::std::slice::from_ref(&record.to_string()),
+    )
+    .await;
 }
 
 /// Put one invocation's `record` in the log group destination, as the one log event
@@ -806,26 +780,36 @@ mod tests {
         }
     }
 
-    /// RULE: the object is a gzip stream of the records, one JSON document per line.
+    /// RULE: the object a delivery writes is a gzip stream of the records, one JSON
+    /// document per line — the form [`delivered_records`] reads back, so the write and the
+    /// read cannot drift.
     #[test]
     fn a_delivered_object_is_gzipped_newline_delimited_json() {
         for count in [0_usize, 1, 3] {
             let records: Vec<::serde_json::Value> = (0..count)
                 .map(|index| ::serde_json::json!({ "requestId": format!("r{index}") }))
                 .collect();
-            let body = gzipped(&records)
+            let record_lines: Vec<String> = records.iter().map(ToString::to_string).collect();
+            let body = ::service_common::vended_logs::gzipped(&record_lines)
                 .unwrap_or_else(|| panic!("case {count} records: the object must have a body"));
             let mut decoded = String::new();
             ::flate2::read::GzDecoder::new(body.as_slice())
                 .read_to_string(&mut decoded)
                 .unwrap_or_else(|error| panic!("case {count} records: not a gzip stream: {error}"));
-            let lines: Vec<&str> = decoded.lines().collect();
+            let read_back = delivered_records(&body).unwrap_or_else(|| {
+                panic!("case {count} records: the object must read back as its records")
+            });
             assert_eq!(
-                lines.len(),
+                read_back, records,
+                "case {count} records: expected the records back, got {decoded:?}"
+            );
+            let decoded_lines: Vec<&str> = decoded.lines().collect();
+            assert_eq!(
+                decoded_lines.len(),
                 count,
                 "case {count} records: expected one line each, got {decoded:?}"
             );
-            for (index, line) in lines.iter().enumerate() {
+            for (index, line) in decoded_lines.iter().enumerate() {
                 let document: ::serde_json::Value = ::serde_json::from_str(line)
                     .unwrap_or_else(|error| {
                         panic!("case {count} records: line {index} is not JSON: {error}")
