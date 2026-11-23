@@ -1889,8 +1889,13 @@ pub(super) const I386_INSTANCE_TYPES: [&str; 8] = [
 pub(super) const PARAVIRTUAL_ONLY_FAMILIES: [&str; 2] = ["c1", "t1"];
 
 /// The previous generation families that run both paravirtual and HVM AMIs (same page).
-pub(super) const PARAVIRTUAL_AND_HVM_FAMILIES: [&str; 12] = [
-    "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "i2", "m1", "m2", "m3",
+///
+/// The storage optimized `i2` family is NOT among them: its AMIs are HVM ones alone, the
+/// family's own page saying so, while its root device may still be an instance store — which
+/// is the other fact this list is read for, and which the catalog publishes per type
+/// ([`crate::state::PublishedInstanceTypeFacts::root_device_types`]) for the family.
+pub(super) const PARAVIRTUAL_AND_HVM_FAMILIES: [&str; 11] = [
+    "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "m1", "m2", "m3",
 ];
 
 /// The family letters whose instance storage IS the family: the storage optimized
@@ -2314,17 +2319,21 @@ pub struct InstanceStorageFacts {
     pub disk_type: &'static str,
     /// Is the store presented as NVMe devices?
     pub nvme: bool,
+    /// Is the store encrypted with a key the host holds?
+    pub encrypted: bool,
 }
 
 impl InstanceStorageFacts {
     /// This instance store as the modelled `InstanceStorageInfo` shape.
     ///
     /// "Instance store volumes on Nitro-based instances are encrypted" with a key the
-    /// host holds and the caller never sees, so encryption is `required` exactly where
-    /// the devices are NVMe, and not offered at all on the older SATA and magnetic
-    /// stores.
+    /// host holds and the caller never sees, which is why the NVMe stores are the encrypted
+    /// ones by derivation; the two members are read APART, because whether a store is
+    /// encrypted is a fact AWS publishes per type ([`crate::state::published_instance_storage`])
+    /// while whether its devices are NVMe ones is a fact of the device model, and a type can
+    /// publish an encrypted store on devices that are not NVMe.
     pub fn to_instance_storage_info(&self) -> InstanceStorageInfo {
-        let support = if self.nvme { "required" } else { "unsupported" };
+        let support = |offered: bool| if offered { "required" } else { "unsupported" };
         InstanceStorageInfo {
             total_size_in_gb: Some(self.total_size_gb),
             disks: Some(vec![DiskInfo {
@@ -2332,8 +2341,8 @@ impl InstanceStorageFacts {
                 count: Some(self.disk_count),
                 r#type: Some(self.disk_type.to_string()),
             }]),
-            nvme_support: Some(support.to_string()),
-            encryption_support: Some(support.to_string()),
+            nvme_support: Some(support(self.nvme).to_string()),
+            encryption_support: Some(support(self.encrypted).to_string()),
         }
     }
 }
@@ -2376,6 +2385,7 @@ pub(super) fn instance_storage_facts(
         disk_size_gb: i64::try_from(disk_size_gb).unwrap_or(i64::MAX),
         disk_type,
         nvme,
+        encrypted: nvme,
     })
 }
 
@@ -2822,11 +2832,12 @@ pub(super) fn supported_boot_modes(architecture: &str, nitro: bool) -> Vec<Strin
 /// the size that has the whole host's cards carries more than one — so the entries name full
 /// instance types, not families: the bare metal size of a host whose widest virtualized size
 /// carries two cards IS that whole host, so it carries the same two.
-pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 18] = [
+pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 19] = [
     ("c6in.32xlarge", 2),
     ("c6in.metal", 2),
     ("c8gb.48xlarge", 2),
     ("dl1.24xlarge", 4),
+    ("g7.48xlarge", 2),
     ("m6idn.32xlarge", 2),
     ("m6in.32xlarge", 2),
     ("m6in.metal", 2),

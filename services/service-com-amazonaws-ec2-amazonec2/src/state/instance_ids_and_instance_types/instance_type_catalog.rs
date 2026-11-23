@@ -29,6 +29,7 @@ use crate::ops::types::{
 };
 
 mod amd_epyc_rows;
+mod block_storage_optimized_graviton_memory_rows;
 mod burstable_rows;
 mod burstable_xen_rows;
 mod dense_hdd_storage_rows;
@@ -42,7 +43,9 @@ mod network_optimized_rows;
 mod neuron_accelerated_rows;
 mod newest_generation_graviton_rows;
 mod previous_generation_rows;
+mod seventh_generation_graphics_rows;
 mod storage_optimized_graviton_rows;
+mod xen_storage_optimized_rows;
 
 /// The EBS-optimized performance AWS publishes for one instance type: the two bandwidth and
 /// the two IOPS figures of its row in "Amazon EBS optimized instance types".
@@ -347,6 +350,11 @@ pub struct PublishedInstanceTypeFacts {
     /// (`Some((0, 0))`) says the type carries no instance store at all, which is a fact as
     /// much as a device count is; a row that leaves this unset keeps the derived answer.
     pub instance_store_devices: Option<(i32, i64)>,
+    /// Whether that store is encrypted (`InstanceStorageInfo$EncryptionSupport`), where the
+    /// published answer for the type is not the one its device model gives: a store AWS
+    /// encrypts with a key the host holds reports `required` whether or not the devices are
+    /// presented as NVMe ones, which `InstanceStorageInfo$NvmeSupport` answers on its own.
+    pub instance_store_encrypted: Option<bool>,
     /// "The network performance", as the published table writes it.
     pub network_performance: Option<&'static str>,
     /// The network bandwidth AWS publishes for the type, in Gbps, as (the figure it sustains,
@@ -479,6 +487,7 @@ impl PublishedInstanceTypeFacts {
             maximum_ebs_attachments: None,
             attachment_limit_type: None,
             instance_store_devices: None,
+            instance_store_encrypted: None,
             network_performance: None,
             network_bandwidth_gbps: None,
             bandwidth_weightings: None,
@@ -663,6 +672,14 @@ impl PublishedInstanceTypeFacts {
     /// The type's local instance store: `devices` devices of `gb_each` GB.
     const fn instance_store(mut self, devices: i32, gb_each: i64) -> Self {
         self.instance_store_devices = Some((devices, gb_each));
+        self
+    }
+
+    /// Whether that store is encrypted, as the published answer for the type says — a fact of
+    /// the store rather than of the device model, which is what lets a type whose devices are
+    /// not NVMe still publish an encrypted store.
+    const fn instance_store_encryption(mut self, encrypted: bool) -> Self {
+        self.instance_store_encrypted = Some(encrypted);
         self
     }
 
@@ -4759,7 +4776,9 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// NVMe devices, the families whose accelerators are Neuron devices, the compute optimized
 /// families on the newest AWS Graviton hardware, the storage optimized Graviton ones, the
 /// fourth generation families on the Xen hypervisor and the memory optimized ones with local
-/// NVMe devices. A row is reached by its instance type alone, so which table it is written in
+/// NVMe devices, the seventh generation graphics family, the block storage optimized memory
+/// one on the newest AWS Graviton hardware and the two storage optimized families on the Xen
+/// hypervisor. A row is reached by its instance type alone, so which table it is written in
 /// is nothing but where the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
@@ -4783,6 +4802,11 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(
             storage_optimized_graviton_rows::STORAGE_OPTIMIZED_GRAVITON_INSTANCE_TYPE_FACTS,
         )
+        .chain(seventh_generation_graphics_rows::SEVENTH_GENERATION_GRAPHICS_INSTANCE_TYPE_FACTS)
+        .chain(
+            block_storage_optimized_graviton_memory_rows::BLOCK_STORAGE_OPTIMIZED_GRAVITON_MEMORY_INSTANCE_TYPE_FACTS,
+        )
+        .chain(xen_storage_optimized_rows::XEN_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it
@@ -4806,19 +4830,28 @@ pub fn published_instance_types() -> impl Iterator<Item = &'static str> {
 /// the `derived` store of its name where its row publishes none.
 ///
 /// A row that publishes devices says how many there are and how big they are, which is the
-/// half of the fact no name yields; the device MODEL — magnetic or solid state, NVMe or not,
-/// and therefore its encryption — comes from the derived store of the same type where its
-/// name yields one, and from the name itself where it does not. A row that publishes NO
-/// devices says the type carries no instance store at all, which overrides the derivation
-/// rather than falling back to it: a family whose name reads as having local devices can
-/// still have a size that carries none.
+/// half of the fact no name yields; the device MODEL — magnetic or solid state, NVMe or not —
+/// comes from the derived store of the same type where its name yields one, and from the name
+/// itself where it does not. A row that publishes NO devices says the type carries no instance
+/// store at all, which overrides the derivation rather than falling back to it: a family whose
+/// name reads as having local devices can still have a size that carries none.
+///
+/// Whether the store is ENCRYPTED is a published fact of its own, so a row carries it apart
+/// from the devices and from the device model: the key the host holds is applied to the store
+/// of the types AWS publishes it for, whether or not those devices are presented as NVMe ones
+/// — and a row that publishes nothing about it keeps the derived answer, which is that the
+/// NVMe stores are the encrypted ones.
 pub(super) fn published_instance_storage(
     facts: Option<&'static PublishedInstanceTypeFacts>,
     name: &InstanceTypeName<'_>,
     derived: Option<InstanceStorageFacts>,
 ) -> Option<InstanceStorageFacts> {
+    let published_encryption = facts.and_then(|facts| facts.instance_store_encrypted);
     let Some((devices, gb_each)) = facts.and_then(|facts| facts.instance_store_devices) else {
-        return derived;
+        return derived.map(|store| InstanceStorageFacts {
+            encrypted: published_encryption.unwrap_or(store.encrypted),
+            ..store
+        });
     };
     if devices <= 0 {
         return None;
@@ -4833,5 +4866,6 @@ pub(super) fn published_instance_storage(
         disk_size_gb: gb_each,
         disk_type,
         nvme,
+        encrypted: published_encryption.unwrap_or(nvme),
     })
 }
