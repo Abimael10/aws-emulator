@@ -900,6 +900,12 @@ pub fn iso8601(at: SystemTime) -> String {
 
 /// The `RegisteredSubscriptionProvider` the model describes, built entirely from the
 /// stored record — every member is what registration persisted.
+///
+/// The ONE statement of the record -> reported-members rule: both operations that report a
+/// registration in full project through here (`ListRegisteredSubscriptionProviders` for
+/// every page element, `GetRegisteredSubscriptionProvider` for the one it resolved, whose
+/// output shape declares the same member set), so a change to how a member is derived
+/// reaches both and the two cannot answer the same stored registration differently.
 pub fn registered_subscription_provider(
     record: &SubscriptionProviderRecord,
 ) -> RegisteredSubscriptionProvider {

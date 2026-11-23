@@ -190,15 +190,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_provider(&input.subscription_provider_arn)
             .map_err(into_error)?;
 
+        // The record -> reported-members projection is stated ONCE, in
+        // [`crate::state::registered_subscription_provider`], and both operations that
+        // report a registration go through it; the two output shapes declare the same
+        // member set, so the projected members move straight across. A change to how any
+        // one member is derived from the record therefore reaches this operation and the
+        // listing together, and the two cannot answer the same stored registration
+        // differently.
+        let RegisteredSubscriptionProvider {
+            subscription_provider_arn,
+            subscription_provider_source,
+            secret_arn,
+            subscription_provider_status,
+            subscription_provider_status_message,
+            last_successful_data_retrieval_time,
+        } = crate::state::registered_subscription_provider(record);
+
         Ok(GetRegisteredSubscriptionProviderOutput {
-            subscription_provider_arn: Some(record.arn.clone()),
-            subscription_provider_source: Some(record.source.clone()),
-            secret_arn: Some(record.secret_arn.clone()),
-            subscription_provider_status: Some(record.status.clone()),
-            subscription_provider_status_message: record.status_message.clone(),
-            last_successful_data_retrieval_time: record
-                .last_successful_data_retrieval_time
-                .clone(),
+            subscription_provider_arn,
+            subscription_provider_source,
+            secret_arn,
+            subscription_provider_status,
+            subscription_provider_status_message,
+            last_successful_data_retrieval_time,
         })
     }
 }
