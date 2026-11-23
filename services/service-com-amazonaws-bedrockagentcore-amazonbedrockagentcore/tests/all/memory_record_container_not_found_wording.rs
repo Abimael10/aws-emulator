@@ -37,11 +37,21 @@
 //! * whether the optional `namespace` is present, as the query the per-record operations
 //!   bind it to or the body member the listing binds it to.
 //!
+//! The collection-level WRITE has a second set of rows of its own, because what it offers
+//! is where a container-level refusal could have been worded from the request or could have
+//! left something behind: those rows span how many records the batch offers (up to the
+//! modelled maximum), which optional members each record carries, which record expiry the
+//! request asks for, which spelling and partition the container id arrived in, and whether
+//! the batch carries a `clientToken` — and each of them then proves the refusal persisted
+//! NOTHING, by creating the container through the control plane and replaying the very same
+//! request.
+//!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so routes, status codes and `restJson1` error bodies are exercised too.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
@@ -266,14 +276,10 @@ impl Call {
     }
 }
 
-/// One `MemoryRecordCreateInput` a batch create offers.
+/// One `MemoryRecordCreateInput` a batch create offers, carrying only the members the model
+/// requires.
 fn one_record_payload(request_identifier: &str) -> Value {
-    json!({
-        "requestIdentifier": request_identifier,
-        "namespaces": [NAMESPACE],
-        "content": {"text": "the user prefers window seats"},
-        "timestamp": 1_700_000_000,
-    })
+    record_payload(request_identifier, None, None)
 }
 
 /// `POST /memories/{memoryId}/memoryRecords/batchCreate` with one entry, answering with the
@@ -628,4 +634,406 @@ async fn the_record_sentence_answers_only_inside_a_container_that_exists() {
          got {:?}",
         message(&body)
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The collection-level WRITE: `POST /memories/{memoryId}/memoryRecords/batchCreate`.
+//
+// It is the one memory-records operation whose request carries content, so it is where a
+// container-level refusal could have taken a word from the request, and the only one where
+// a refusal could leave something behind. The rows below span what it can offer.
+// ---------------------------------------------------------------------------------------
+
+/// The account the test harness signs for, which is the account every ARN spelling below
+/// names.
+const ACCOUNT: &str = "123456789012";
+
+/// One `MemoryRecordCreateInput`: `requestIdentifier`, `namespaces` (at most one entry),
+/// `content` and `timestamp` are required, `memoryStrategyId` and `metadata` optional
+/// (source: smithy_query query="shape" shape="MemoryRecordCreateInput").
+fn record_payload(
+    request_identifier: &str,
+    memory_strategy_id: Option<&str>,
+    metadata: Option<Value>,
+) -> Value {
+    let mut record = json!({
+        "requestIdentifier": request_identifier,
+        "namespaces": [NAMESPACE],
+        "content": {"text": format!("content offered by {request_identifier}")},
+        "timestamp": 1_700_000_000,
+    });
+    if let Some(strategy) = memory_strategy_id {
+        record["memoryStrategyId"] = json!(strategy);
+    }
+    if let Some(metadata) = metadata {
+        record["metadata"] = metadata;
+    }
+    record
+}
+
+/// A `MemoryRecordMetadataMap` with one entry per member of `MemoryRecordMetadataValue`, so
+/// a row offers every value form the map admits (source: smithy_query query="shape"
+/// shape="MemoryRecordMetadataValue").
+fn every_metadata_value_form() -> Value {
+    json!({
+        "topic": {"stringValue": "seating"},
+        "tags": {"stringListValue": ["window", "aisle"]},
+        "confidence": {"numberValue": 0.75},
+        "observed_at": {"dateTimeValue": 1_700_000_000},
+    })
+}
+
+/// A well-formed bare `MemoryId` of this row's own, so no row's container is another's
+/// (`MemoryId`: length 12.., pattern
+/// `^(arn:(aws|aws-cn|aws-us-gov):bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`
+/// — source: smithy_query query="shape" shape="MemoryId").
+fn row_memory_id(row: usize) -> String {
+    format!("batch-row{row}-0123456789")
+}
+
+/// The same container spelled as the memory ARN `MemoryId`'s pattern also admits, in any of
+/// the three partitions it names.
+fn memory_arn(partition: &str, region: &str, memory: &str) -> String {
+    format!("arn:{partition}:bedrock-agentcore:{region}:{ACCOUNT}:memory/{memory}")
+}
+
+/// One batch create offered to a container the account does not hold.
+#[derive(Debug)]
+struct BatchCase {
+    /// The row's own name, which every assertion names and every record tracks itself by.
+    case: &'static str,
+    /// The bare id of the row's container.
+    memory: String,
+    /// How the row SPELLS that container in the URI: the bare id, or an ARN.
+    addressed_as: String,
+    /// Whether the control plane created the container and then deleted it, rather than
+    /// never having created it at all.
+    deleted_rather_than_never_created: bool,
+    /// The `records` the row offers, in order.
+    records: Vec<Value>,
+    /// The `clientToken` the row carries, if any: an `@idempotencyToken`, so a refusal that
+    /// memoised it would answer a later retry out of what it never wrote.
+    client_token: Option<String>,
+    /// The `recordExpirySpecification` the row carries, if any.
+    expiry: Option<Value>,
+}
+
+impl BatchCase {
+    fn new(case: &'static str, row: usize, records: Vec<Value>) -> Self {
+        let memory = row_memory_id(row);
+        Self {
+            case,
+            addressed_as: memory.clone(),
+            memory,
+            deleted_rather_than_never_created: false,
+            records,
+            client_token: None,
+            expiry: None,
+        }
+    }
+
+    fn addressed_as(mut self, addressed_as: String) -> Self {
+        self.addressed_as = addressed_as;
+        self
+    }
+
+    fn deleted(mut self) -> Self {
+        self.deleted_rather_than_never_created = true;
+        self
+    }
+
+    fn with_client_token(mut self) -> Self {
+        self.client_token = Some(format!("token-{}", self.case));
+        self
+    }
+
+    fn with_expiry(mut self, expiry: Value) -> Self {
+        self.expiry = Some(expiry);
+        self
+    }
+
+    fn request_body(&self) -> Value {
+        let mut body = json!({"records": self.records});
+        if let Some(token) = &self.client_token {
+            body["clientToken"] = json!(token);
+        }
+        if let Some(expiry) = &self.expiry {
+            body["recordExpirySpecification"] = expiry.clone();
+        }
+        body
+    }
+
+    fn batch_create_path(&self) -> String {
+        format!(
+            "/memories/{}/memoryRecords/batchCreate",
+            label(&self.addressed_as)
+        )
+    }
+
+    /// The `requestIdentifier` of each record the row offers, in order.
+    fn request_identifiers(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .map(|record| {
+                record["requestIdentifier"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Every value this row spells, none of which the container sentence may carry.
+    fn named_values(&self) -> Vec<String> {
+        let mut named = vec![self.memory.clone(), self.addressed_as.clone()];
+        named.extend(self.client_token.clone());
+        named.extend(self.request_identifiers());
+        named.push(NAMESPACE.to_string());
+        named
+    }
+}
+
+/// The rows: each differs from the others in what the batch offers — how many records (one,
+/// a few, and the modelled maximum of 100), which optional members a record carries, which
+/// record expiry the request asks for, whether a `clientToken` is carried, which spelling
+/// and partition the container id arrived in, and whether the container was deleted or never
+/// created.
+fn batch_cases() -> Vec<BatchCase> {
+    let mut rows = vec![
+        BatchCase::new(
+            "one-record-and-nothing-optional",
+            1,
+            vec![record_payload("one-record-1", None, None)],
+        ),
+        BatchCase::new(
+            "two-records-under-a-client-token",
+            2,
+            vec![
+                record_payload("two-records-1", None, None),
+                record_payload("two-records-2", None, None),
+            ],
+        )
+        .with_client_token(),
+        BatchCase::new(
+            "every-metadata-value-form-and-a-strategy",
+            3,
+            vec![record_payload(
+                "metadata-1",
+                Some("semanticMemoryStrategy"),
+                Some(every_metadata_value_form()),
+            )],
+        ),
+        // `recordExpiryDurationDays` has `@range` min 31, so 31 is the shortest expiry the
+        // model admits (source: smithy_query query="shape"
+        // shape="RecordExpirySpecification").
+        BatchCase::new(
+            "an-expiry-at-the-shortest-duration-the-model-admits",
+            4,
+            vec![
+                record_payload("expiry-min-1", None, None),
+                record_payload("expiry-min-2", None, None),
+            ],
+        )
+        .with_client_token()
+        .with_expiry(json!({"recordExpiryDurationDays": 31})),
+        // `RecordExpiryAction`'s only value, which creates records that do not expire.
+        BatchCase::new(
+            "an-expiry-remove-action",
+            5,
+            vec![record_payload("expiry-remove-1", None, None)],
+        )
+        .with_expiry(json!({"action": "REMOVE"})),
+        BatchCase::new(
+            "addressed-by-the-container-arn",
+            6,
+            vec![
+                record_payload("by-arn-1", None, None),
+                record_payload("by-arn-2", None, None),
+                record_payload("by-arn-3", None, None),
+            ],
+        )
+        .addressed_as(memory_arn("aws", "us-east-1", &row_memory_id(6)))
+        .with_client_token(),
+        BatchCase::new(
+            "addressed-by-a-gov-partition-container-arn",
+            7,
+            vec![record_payload("by-gov-arn-1", None, None)],
+        )
+        .addressed_as(memory_arn("aws-us-gov", "us-gov-west-1", &row_memory_id(7))),
+        BatchCase::new(
+            "a-container-the-control-plane-deleted",
+            8,
+            vec![
+                record_payload("deleted-container-1", None, None),
+                record_payload("deleted-container-2", None, None),
+            ],
+        )
+        .deleted()
+        .with_client_token(),
+    ];
+    // `records` has `@length` max 100, so a batch of 100 is the largest one request may
+    // offer (source: smithy_query query="shape" shape="MemoryRecordsCreateInputList").
+    rows.push(BatchCase::new(
+        "the-largest-batch-the-model-admits",
+        9,
+        (1..=100)
+            .map(|n| record_payload(&format!("largest-batch-{n}"), None, None))
+            .collect(),
+    ));
+    rows
+}
+
+/// A batch create whose `memoryId` names no container the account holds is refused 404
+/// `ResourceNotFoundException` with the container sentence — whatever the batch offers —
+/// and the refusal writes NOTHING: once the control plane creates the container, the very
+/// same request (the same `clientToken` included) stores every record it offers, each of
+/// them readable one by one and listed exactly once.
+#[tokio::test]
+async fn a_batch_create_into_an_absent_container_is_refused_and_stores_nothing() {
+    let (engine, router) = emulator();
+
+    for case in batch_cases() {
+        let name = case.case;
+        let offered = case.request_identifiers();
+        let body = case.request_body();
+
+        if case.deleted_rather_than_never_created {
+            create_memory(&engine, &case.memory);
+            delete_memory(&engine, &case.memory);
+        }
+
+        let (status, refused) = send(&router, "POST", &case.batch_create_path(), Some(body.clone()))
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {name:?}: expected HTTP 404, got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            RESOURCE_NOT_FOUND,
+            "case {name:?}: expected {RESOURCE_NOT_FOUND}, got {refused:?}"
+        );
+        assert_eq!(
+            message(&refused),
+            CONTAINER_NOT_FOUND_MESSAGE,
+            "case {name:?}: expected message {CONTAINER_NOT_FOUND_MESSAGE:?}, got {:?}",
+            message(&refused)
+        );
+        for named in case.named_values() {
+            assert!(
+                !message(&refused).contains(&named),
+                "case {name:?}: the container sentence must not carry {named:?}, got {:?}",
+                message(&refused)
+            );
+        }
+
+        // The container now exists, and the SAME request is replayed: a refusal that had
+        // written records, or memoised the `clientToken` it carried, would answer out of
+        // what it never stored.
+        create_memory(&engine, &case.memory);
+        let (status, created) = send(&router, "POST", &case.batch_create_path(), Some(body)).await;
+        assert_eq!(
+            status, 201,
+            "case {name:?}: expected HTTP 201 once the container exists, got {status} with \
+             {created:?}"
+        );
+        assert_eq!(
+            created["failedRecords"].as_array().map(Vec::len),
+            Some(0),
+            "case {name:?}: expected no failed record, got {created:?}"
+        );
+        let successful = created["successfulRecords"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            successful.len(),
+            offered.len(),
+            "case {name:?}: expected {} successful record(s), got {created:?}",
+            offered.len()
+        );
+
+        let mut minted: Vec<String> = Vec::with_capacity(successful.len());
+        for (at, outcome) in successful.iter().enumerate() {
+            assert_eq!(
+                outcome["requestIdentifier"].as_str(),
+                Some(offered[at].as_str()),
+                "case {name:?}: expected outcome {at} to track {:?}, got {outcome:?}",
+                offered[at]
+            );
+            assert_eq!(
+                outcome["status"].as_str(),
+                Some("SUCCEEDED"),
+                "case {name:?}: expected outcome {at} to have SUCCEEDED, got {outcome:?}"
+            );
+            let id = outcome["memoryRecordId"].as_str().unwrap_or_default();
+            // `MemoryRecordId`: length 40..50, pattern `^mem-[a-zA-Z0-9-_]*$`.
+            assert!(
+                id.starts_with("mem-") && (40..=50).contains(&id.len()),
+                "case {name:?}: expected outcome {at} to carry a minted MemoryRecordId, got \
+                 {outcome:?}"
+            );
+            minted.push(id.to_string());
+        }
+        let distinct: BTreeSet<&String> = minted.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            minted.len(),
+            "case {name:?}: expected {} distinct record ids, got {minted:?}",
+            minted.len()
+        );
+
+        // Every stored record reads back on its own, …
+        for id in &minted {
+            let (status, read) = send(
+                &router,
+                "GET",
+                &format!(
+                    "/memories/{}/memoryRecord/{}",
+                    label(&case.addressed_as),
+                    label(id)
+                ),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: expected {id:?} to read back, got {status} with {read:?}"
+            );
+            assert_eq!(
+                read["memoryRecord"]["memoryRecordId"].as_str(),
+                Some(id.as_str()),
+                "case {name:?}: expected GetMemoryRecord to report {id:?}, got {read:?}"
+            );
+        }
+
+        // … and the container holds exactly those records: nothing the refused call left
+        // behind, and no record stored twice. `maxResults` max is 100, which is also the
+        // largest batch a row offers, so one page holds the whole container.
+        let (status, listed) = send(
+            &router,
+            "POST",
+            &format!("/memories/{}/memoryRecords", label(&case.addressed_as)),
+            Some(json!({"maxResults": 100})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the listing to answer HTTP 200, got {status} with {listed:?}"
+        );
+        let reported: BTreeSet<String> = listed["memoryRecordSummaries"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["memoryRecordId"].as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected: BTreeSet<String> = minted.iter().cloned().collect();
+        assert_eq!(
+            reported, expected,
+            "case {name:?}: expected the container to hold exactly {expected:?}, got {reported:?}"
+        );
+    }
 }
