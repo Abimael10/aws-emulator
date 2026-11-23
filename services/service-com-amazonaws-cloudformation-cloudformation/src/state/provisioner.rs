@@ -3301,7 +3301,27 @@ impl Provisioner {
     /// ([`MSK_HANDLER_REQUEST_TOKEN_LABEL`]) — the same token the event's own
     /// `(RequestToken: …)` reports, since one resource request earned both.
     pub(super) fn handler_message(self, class: &str, message: &str, token: &str) -> String {
-        let plugin_worded = matches!(self, Self::OpenSearchServiceDomain);
+        let plugin_worded = matches!(
+            self,
+            Self::OpenSearchServiceDomain
+            // The WARM POOL's provider is written against that plugin too, so an
+            // invalid-request refusal of Amazon EC2 Auto Scaling's reaches the reason as
+            // `Invalid request provided: <the service's message>` — as the recorded
+            // `ResourceStatusReason` of an `AWS::AutoScaling::WarmPool` whose declared
+            // `PoolState` is outside the set that member admits carries it (in the behavioral
+            // corpus `simparity-behavioral-aws-v1`, check
+            // `autoscaling__cloudformation.deploy-asg-warmpool-poolstate-invalid-enum-rejected`,
+            // whose reason reads `Resource handler returned message: "Invalid request provided:
+            // <the service's sentence> (Service: AutoScaling, Status Code: 400, Request ID: …)
+            // (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
+            // Every refusal of this type that falls in that class is worded this way, whichever
+            // call made it, and a refusal of any other class is reported as it came. The
+            // group's own provider is NOT one of these — its recorded reason carries the
+            // service's message alone ([`super::provisioning::sdk_diagnostics`]) — and neither
+            // is any other type of this service here, no recorded reason of one showing the
+            // plugin's wording: which of the two a type is, is its provider's.
+            | Self::AutoScalingWarmPool
+        );
         if plugin_worded && class == super::provisioning::HANDLER_ERROR_INVALID_REQUEST {
             return format!("{INVALID_REQUEST_PROVIDED}{message}");
         }
