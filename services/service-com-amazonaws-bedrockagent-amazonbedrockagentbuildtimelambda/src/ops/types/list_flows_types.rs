@@ -25,7 +25,16 @@ pub struct ListFlowsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#FlowSummary")]
+/// `FlowSummary`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt`
+/// target `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="FlowSummary")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same
+/// wire names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct FlowSummary {
     pub name: String,
@@ -37,4 +46,20 @@ pub struct FlowSummary {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub version: String,
 }
+
+bedrock_agent_schema_and_codec!(
+    FlowSummary,
+    FLOW_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagent#FlowSummary",
+    "com.amazonaws.bedrockagent",
+    "FlowSummary",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (M_ID, id, "id", 2, req, string),
+    (M_ARN, arn, "arn", 3, req, string),
+    (M_STATUS, status, "status", 4, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 5, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 6, req, date_time),
+    (M_VERSION, version, "version", 7, req, string),
+);
 

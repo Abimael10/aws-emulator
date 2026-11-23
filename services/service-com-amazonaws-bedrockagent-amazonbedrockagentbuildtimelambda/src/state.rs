@@ -167,6 +167,10 @@ mod bound_vector_index;
 /// resolution of an alias identifier and of an alias's routing target.
 mod flow_aliases;
 
+/// What `ListFlows` enumerates — the account's flows — the order it reports them
+/// in, and the page it hands out.
+mod flow_listing;
+
 /// What an ingestion job does over a data source's source, and the accounting
 /// it reports for it.
 mod ingestion;
@@ -228,6 +232,7 @@ mod published_enum_value_sets;
 pub use bound_vector_index::*;
 pub use data_source_listing::*;
 pub use flow_aliases::*;
+pub use flow_listing::*;
 pub use ingestion::*;
 pub use ingestion_job_listing::*;
 pub use ingestion_record::*;
