@@ -7,10 +7,11 @@
 //! force on the principal that signed it, and `ListBuckets` asks for `s3:ListAllMyBuckets`
 //! ("to grant IAM permission to use this operation, you must add the `s3:ListAllMyBuckets`
 //! policy action", `ListBuckets`'s own documentation). That action supports no resource types,
-//! so the only `Resource` element that can grant it is IAM's wildcard — a grant scoped to a
-//! bucket's ARN does not reach it — and a request no document allows is refused 403
-//! `AccessDenied` naming the principal, the action and IAM's reason clause, with NO `on
-//! resource:` clause, there being no resource the request addressed.
+//! so it is judged against every resource of the service that publishes it: a `Resource`
+//! element covering all of them grants it — IAM's own wildcard, and the service-wide ARN —
+//! while one scoped to a single bucket does not reach it, and a request no document allows is
+//! refused 403 `AccessDenied` naming the principal, the action and IAM's reason clause, with
+//! NO `on resource:` clause, there being no resource the request addressed.
 //!
 //! The rows differ along what the rule generalises over: which actions the caller's own
 //! document grants (none, this one, every S3 action, another action, this one scoped to a
@@ -313,5 +314,131 @@ async fn each_account_wide_listing_asks_for_its_own_action() {
                 "case {case:?}: expected the refusal {wanted:?}, got {message:?}"
             );
         }
+    }
+}
+
+/// One row of the table below: the account-wide action the caller is granted, the `Resource`
+/// element that grant is written over, and whether the listing that action authorizes is
+/// served.
+struct ResourceRow {
+    case: &'static str,
+    action: &'static str,
+    resource: &'static str,
+    served: bool,
+}
+
+/// RULE: an IAM action published with no resource types is judged against the ARN naming
+/// every resource of the service that publishes it, so a `Resource` element that covers all
+/// of them grants it — IAM's own wildcard, and the service-wide ARN AWS writes such a grant
+/// with ("`Action`": `s3:ListAllMyBuckets`, "`Resource`": `arn:aws:s3:::*`, Amazon S3 User
+/// Guide, *Controlling access to a bucket with user policies*) — while one scoped to a single
+/// resource, to the keys inside one, or to another service's namespace does not reach it.
+///
+/// The rows differ along what the rule generalises over: WHICH account-wide action is granted
+/// (the general purpose listing, whose resources name neither Region nor account, and the
+/// directory listing, whose resources name both), and HOW the `Resource` element is spelled —
+/// IAM's wildcard, the service-wide ARN, that ARN with its partition field wildcarded, one
+/// resource of the service, every key inside one, and the other namespace's service-wide ARN.
+#[tokio::test]
+async fn an_account_wide_action_is_judged_against_every_resource_of_its_service() {
+    let router = router();
+    // The account's own credential creates the bucket a served general purpose listing
+    // reports: it speaks for the account, which no identity-based policy bounds.
+    let created = create_bucket(&router, BUCKET, None, None).await;
+    assert_eq!(
+        created.status, 200,
+        "setup: the bucket must be created, got {}",
+        created.status
+    );
+
+    let rows: &[ResourceRow] = &[
+        ResourceRow {
+            case: "the general purpose listing on IAM's own wildcard",
+            action: LIST_ALL_MY_BUCKETS,
+            resource: "*",
+            served: true,
+        },
+        ResourceRow {
+            case: "the general purpose listing on every bucket of the account",
+            action: LIST_ALL_MY_BUCKETS,
+            resource: "arn:aws:s3:::*",
+            served: true,
+        },
+        ResourceRow {
+            case: "the general purpose listing on every bucket of every partition",
+            action: LIST_ALL_MY_BUCKETS,
+            resource: "arn:*:s3:::*",
+            served: true,
+        },
+        ResourceRow {
+            case: "the general purpose listing on one bucket alone",
+            action: LIST_ALL_MY_BUCKETS,
+            resource: "arn:aws:s3:::account-wide-listing",
+            served: false,
+        },
+        ResourceRow {
+            case: "the general purpose listing on every key of every bucket",
+            action: LIST_ALL_MY_BUCKETS,
+            resource: "arn:aws:s3:::*/*",
+            served: false,
+        },
+        ResourceRow {
+            case: "the directory listing on IAM's own wildcard",
+            action: LIST_ALL_MY_DIRECTORY_BUCKETS,
+            resource: "*",
+            served: true,
+        },
+        ResourceRow {
+            case: "the directory listing on every resource of its own namespace",
+            action: LIST_ALL_MY_DIRECTORY_BUCKETS,
+            resource: "arn:aws:s3express:*:*:*",
+            served: true,
+        },
+        ResourceRow {
+            case: "the directory listing on one directory bucket alone",
+            action: LIST_ALL_MY_DIRECTORY_BUCKETS,
+            resource: "arn:aws:s3express:us-east-1:*:bucket/probe--use1-az1--x-s3",
+            served: false,
+        },
+        ResourceRow {
+            case: "the directory listing on the general purpose namespace",
+            action: LIST_ALL_MY_DIRECTORY_BUCKETS,
+            resource: "arn:aws:s3:::*",
+            served: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let name = format!("listing-resource-probe-{index}");
+        let akid =
+            user_with_grant(&router, &name, &[row.action], &[row.resource.to_string()]).await;
+        let principal = user_arn(&name);
+        let answered = match row.action == LIST_ALL_MY_DIRECTORY_BUCKETS {
+            true => list_directory_buckets(&router, &akid).await,
+            false => list_buckets(&router, &akid).await,
+        };
+        let body = String::from_utf8_lossy(&answered.body).to_string();
+        let expected = if row.served { 200 } else { 403 };
+        assert_eq!(
+            answered.status, expected,
+            "case {case:?}: the listing granted on {:?} expected HTTP {expected}, got {} with \
+             {body}",
+            row.resource, answered.status
+        );
+        if row.served {
+            continue;
+        }
+        assert_eq!(
+            element(&body, "Code"),
+            ACCESS_DENIED,
+            "case {case:?}: expected the code {ACCESS_DENIED}, got {body}"
+        );
+        let wanted = no_grant_message(&principal, row.action);
+        let actual = element(&body, "Message");
+        assert_eq!(
+            actual, wanted,
+            "case {case:?}: expected the refusal {wanted:?}, got {actual:?}"
+        );
     }
 }

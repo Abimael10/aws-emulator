@@ -238,11 +238,37 @@ pub const LIST_ALL_MY_BUCKETS_ACTION: &str = "s3:ListAllMyBuckets";
 /// it.
 pub const LIST_ALL_MY_DIRECTORY_BUCKETS_ACTION: &str = "s3express:ListAllMyDirectoryBuckets";
 
-/// The resource an action that addresses no resource of its own is decided over: IAM's own
-/// wildcard, which is the only `Resource` element a statement granting such an action can
-/// carry — the account's bucket listing names no bucket, so a grant scoped to one bucket's
-/// ARN does not reach it, while `"Resource": "*"` does.
-const ACCOUNT_WIDE_RESOURCE: &str = "*";
+/// The resource an action published with NO resource types is decided over, for an action of
+/// the general purpose namespace: the ARN naming every bucket of the account, which is what
+/// such an action reaches. The account's own listing names no one bucket, so a `Resource`
+/// element that covers every one of them admits it — IAM's own wildcard `"*"`, and the
+/// service-wide ARN AWS writes such a grant with ("`Action`": `s3:ListAllMyBuckets`,
+/// "`Resource`": `arn:aws:s3:::*`, Amazon S3 User Guide, *Controlling access to a bucket with
+/// user policies*) — while one scoped to a single bucket's ARN does not reach it at all.
+///
+/// Spelled with [`state::bucket_arn`]'s own form of an all-buckets name, so the ARN this is
+/// matched against reads exactly like the ARN of each bucket a grant could name instead.
+const EVERY_BUCKET_RESOURCE: &str = "arn:aws:s3:::*";
+
+/// [`EVERY_BUCKET_RESOURCE`] for an action of the DIRECTORY-bucket namespace, whose resources
+/// carry the Region and the account ([`state::directory_bucket_arn`]) rather than leaving both
+/// fields empty: every resource of that namespace, in every Region and every account.
+const EVERY_DIRECTORY_BUCKET_RESOURCE: &str = "arn:aws:s3express:*:*:*";
+
+/// The namespace an action that addresses a DIRECTORY bucket is published under, with the
+/// separator a policy action carries — what tells the two account-wide listings apart
+/// ([`LIST_ALL_MY_DIRECTORY_BUCKETS_ACTION`] is published here and
+/// [`LIST_ALL_MY_BUCKETS_ACTION`] is not).
+const DIRECTORY_ACTION_NAMESPACE: &str = "s3express:";
+
+/// The resource `action` is decided over, when `action` addresses no resource of its own:
+/// every resource of the namespace that publishes it — see [`EVERY_BUCKET_RESOURCE`].
+fn account_wide_resource(action: &str) -> &'static str {
+    match action.starts_with(DIRECTORY_ACTION_NAMESPACE) {
+        true => EVERY_DIRECTORY_BUCKET_RESOURCE,
+        false => EVERY_BUCKET_RESOURCE,
+    }
+}
 
 /// What a refusal names as the principal of a request whose session credential has already
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
@@ -920,8 +946,8 @@ fn boundary_outcomes(
 /// The account's own bucket listing is such an action: it names no bucket, so no bucket
 /// policy is in force on it and nothing but the documents in force on the calling identity —
 /// and the scope its credential was minted with — can allow it. The decision is therefore the
-/// identity half of [`denial`]'s rule, unchanged and over the one resource such a statement
-/// can name ([`ACCOUNT_WIDE_RESOURCE`]): an explicit `Deny` refuses whatever a grant says, an
+/// identity half of [`denial`]'s rule, unchanged and over the resources such an action
+/// reaches ([`account_wide_resource`]): an explicit `Deny` refuses whatever a grant says, an
 /// `Allow` among the caller's documents permits it, a grant the scope does not also allow is
 /// refused naming the scope, and with no grant at all the request falls to IAM's implicit
 /// deny. The callers [`denial`] does not bound are not bounded here either (see the module
@@ -940,22 +966,17 @@ pub fn account_wide_denial(caller: &Caller, action: &str) -> Option<String> {
     };
     let context = caller_conditions(caller, &[]);
     let published = published_keys(caller);
-    let request = request_over(
-        action,
-        ACCOUNT_WIDE_RESOURCE,
-        &caller.principals,
-        &context,
-        &published,
-    );
+    let addressed = account_wide_resource(action);
+    let request = request_over(action, addressed, &caller.principals, &context, &published);
     let documents = iam::prepare_documents(&caller.documents);
     let said = iam::identity_outcome_prepared(&documents, &request);
     if authorization::deny_is_decided(&said, &published) {
         return refusal(IDENTITY_POLICY_DENY_REASON);
     }
-    // The CEILING in force on the identity, read over the one resource such a statement can
-    // name, exactly as in [`denial`]: an explicit deny in it refuses whatever a grant says,
+    // The CEILING in force on the identity, read over the resources such an action reaches,
+    // exactly as in [`denial`]: an explicit deny in it refuses whatever a grant says,
     // and a grant it does not also allow is withheld below.
-    let account_wide = vec![ACCOUNT_WIDE_RESOURCE.to_string()];
+    let account_wide = vec![addressed.to_string()];
     let bounded = boundary_outcomes(caller, &account_wide, action, &context, &published);
     if bounded
         .iter()
