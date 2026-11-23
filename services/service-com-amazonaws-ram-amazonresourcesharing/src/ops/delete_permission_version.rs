@@ -344,7 +344,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "The version you specify must not be attached to any resource share": a
             // share governed by this version is therefore refused rather than left
-            // without the version it is governed by under a caller's feet.
+            // without the version it is governed by under a caller's feet. The refusal
+            // is worded with the one fixed text RAM gives this class, which names
+            // neither the version nor the shares holding it.
             let attached = store.shares_attaching_permission_version(
                 &input.permission_arn,
                 input.permission_version,

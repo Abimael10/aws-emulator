@@ -1195,6 +1195,9 @@ async fn a_version_delete_a_caller_may_not_make_is_refused_and_changes_nothing()
         &[policy_template(&["imagebuilder:ListComponents"])],
     )
     .await;
+    // The share is governed by version 1 of that permission, which is what the delete of
+    // version 1 is refused for; its ARN is read so the refusal can be shown to name
+    // neither it nor the permission.
     let share_arn = arn_of(
         case,
         &create_ok(
@@ -1724,5 +1727,145 @@ async fn the_refusal_of_an_attached_permission_version_carries_one_fixed_text() 
                 "case {case:?}: the delete of the unattached version {free} is served"
             );
         }
+    }
+}
+
+/// One row of the lifted-refusal table: a permission for `resource_type` whose FIRST
+/// version `shares` live resource shares are governed by, each of which is then taken
+/// away.
+struct LiftedRefusalRow {
+    case: &'static str,
+    name: &'static str,
+    resource_type: &'static str,
+    /// One more of these actions is allowed by each successive version, so the two
+    /// versions the row writes carry different templates.
+    actions: &'static [&'static str],
+    shares: usize,
+}
+
+#[tokio::test]
+async fn the_attached_version_refusal_lifts_once_no_live_share_is_governed_by_it() {
+    // What blocks the delete is the LIVE shares governed by that version, so the rows vary
+    // along how many of them there are: while any one of them is still live the delete is
+    // refused the same way, and the call is served once the last is gone. The resource type
+    // and the actions vary with them, so the rule is not read off one type's spelling.
+    let rows = [
+        LiftedRefusalRow {
+            case: "one share governed by the version",
+            name: "LiftedByOneShare",
+            resource_type: "imagebuilder:Component",
+            actions: IMAGEBUILDER_ACTIONS,
+            shares: 1,
+        },
+        LiftedRefusalRow {
+            case: "three shares governed by the version",
+            name: "LiftedByThreeShares",
+            resource_type: "codebuild:Project",
+            actions: CODEBUILD_ACTIONS,
+            shares: 3,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (router, _engine) = emulator_with_engine();
+        // The shares are created while the first version is still the permission's
+        // default, so that is the version they are governed by; the version written after
+        // them moves the default away, leaving the attachment as the only thing the delete
+        // of the first version is refused for.
+        let arn = mint(
+            &router,
+            case,
+            row.name,
+            row.resource_type,
+            &[policy_template(&row.actions[..1])],
+        )
+        .await;
+        let mut share_arns: Vec<String> = Vec::new();
+        for index in 0..row.shares {
+            let share = create_ok(
+                &router,
+                case,
+                &json!({
+                    "name": format!("{}-share-{index}", row.name),
+                    "permissionArns": [arn],
+                }),
+            )
+            .await;
+            share_arns.push(arn_of(case, &share));
+        }
+        let (status, written) = create_permission_version(
+            &router,
+            &json!({
+                "permissionArn": arn,
+                "policyTemplate": policy_template(&row.actions[..2]),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 writing the second version, got {status} with \
+             {written:?}"
+        );
+
+        // Every share is still live, so the delete of the version they are governed by is
+        // refused in the words of that class.
+        let (status, refused) =
+            delete_permission_version(&router, &arn, FIRST_PERMISSION_VERSION, None).await;
+        assert_eq!(
+            (status, error_code(&refused), error_message(&refused)),
+            (
+                400,
+                "OperationNotPermittedException".to_string(),
+                ATTACHED_VERSION_REFUSAL_MESSAGE.to_string()
+            ),
+            "case {case:?}: expected the attached-version refusal, got {status} with {refused:?}"
+        );
+
+        // Taking the shares away one at a time: a share `DeleteResourceShare` has removed
+        // governs nothing, so the refusal holds for exactly as long as a live share is
+        // governed by the version.
+        for (index, share_arn) in share_arns.iter().enumerate() {
+            let (status, deleted) = delete(&router, share_arn, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 deleting {share_arn}, got {status} with \
+                 {deleted:?}"
+            );
+            let still_live = share_arns.len() - index - 1;
+            if still_live == 0 {
+                break;
+            }
+            let (status, refused) =
+                delete_permission_version(&router, &arn, FIRST_PERMISSION_VERSION, None).await;
+            assert_eq!(
+                (status, error_code(&refused), error_message(&refused)),
+                (
+                    400,
+                    "OperationNotPermittedException".to_string(),
+                    ATTACHED_VERSION_REFUSAL_MESSAGE.to_string()
+                ),
+                "case {case:?}: {still_live} live share(s) are still governed by the version, so \
+                 the delete is refused the same way, got {status} with {refused:?}"
+            );
+        }
+
+        // No live share is governed by it any more, so the same call is served and the
+        // version is on the delete path the operation reports.
+        assert_eq!(
+            delete_version_ok(&router, case, &arn, FIRST_PERMISSION_VERSION, None).await,
+            PERMISSION_STATUS_DELETING,
+            "case {case:?}: the delete of the version no live share is governed by is served"
+        );
+        let listed = version_statuses(&router, case, &arn).await;
+        assert_eq!(
+            listed
+                .iter()
+                .find(|(version, _)| version == &FIRST_PERMISSION_VERSION.to_string())
+                .map(|(_, status)| status.clone()),
+            Some(PERMISSION_STATUS_DELETING.to_string()),
+            "case {case:?}: the deleted version reports the stage its delete starts in, got \
+             {listed:?}"
+        );
     }
 }
