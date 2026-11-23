@@ -27,6 +27,10 @@
 //! 4. The TERMINATING family and the TOTAL it is part of, on a group whose termination
 //!    lifecycle hook holds the instance a scale-in takes: a state the group really stays in,
 //!    rather than one the clock is about to retire.
+//!
+//! The harness and the readers here are `pub(crate)`: the sibling suite over the STANDBY
+//! family creates its groups, collects their metrics and reads their series through these one
+//! copies rather than a second set of them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -76,12 +80,12 @@ const UNIT_NONE: &str = "None";
 /// How long a poll keeps looking before it gives up. Generous on purpose: every wait here is
 /// for a CONDITION — an instance reaching service, a minute falling due — that nothing inside
 /// the emulator sleeps for, so a loaded host may need many passes to reach it.
-const POLL_DEADLINE: Duration = Duration::from_secs(150);
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(150);
 
 /// How long one poll waits before looking again. Unhurried on purpose: the condition is what
 /// is waited for, so a slower look costs nothing and leaves the host to the work it is
 /// waiting on.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// How far back a read of the series looks, in seconds: well past the run-up a series opens
 /// with, so a read finds every minute it has published.
@@ -90,7 +94,7 @@ const READ_BACK_SECS: f64 = 30.0 * 60.0;
 /// One emulator with Amazon EC2 Auto Scaling, Amazon EC2 and CloudWatch on ONE engine: the
 /// instances a group launches are the account's own EC2 instances and the series it publishes
 /// are CloudWatch's own metrics, so one engine is what makes the three views one account.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     crate::support::seed_launch_templates(&engine, &[LAUNCH_TEMPLATE_NAME]);
     let mut router = MultiServiceRouter::new();
@@ -112,7 +116,7 @@ fn only_zone() -> String {
 
 /// Create one group whose mixed instances policy overrides [`INSTANCE_TYPE`], carrying
 /// `weight` when the row states one.
-async fn create_group(
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     name: &str,
     weight: Option<&str>,
@@ -150,7 +154,7 @@ async fn create_group(
 
 /// Enable metrics collection for `group`, naming `metrics` — or every metric of the catalog
 /// when the list is empty, which is what a request naming none asks for.
-async fn enable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&str]) {
+pub(crate) async fn enable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&str]) {
     let mut params = vec![
         p("AutoScalingGroupName", group),
         p("Granularity", GRANULARITY),
@@ -166,7 +170,7 @@ async fn enable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&st
 }
 
 /// Stop collecting `metrics` for `group`.
-async fn disable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&str]) {
+pub(crate) async fn disable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&str]) {
     let mut params = vec![p("AutoScalingGroupName", group)];
     for (index, metric) in metrics.iter().enumerate() {
         params.push(p(&format!("Metrics.member.{}", index + 1), *metric));
@@ -180,7 +184,7 @@ async fn disable_metrics(router: &MultiServiceRouter, group: &str, metrics: &[&s
 
 /// The metrics `DescribeAutoScalingGroups` reports the group collects, in the order it reports
 /// them.
-async fn enabled_metrics(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+pub(crate) async fn enabled_metrics(router: &MultiServiceRouter, group: &str) -> Vec<String> {
     let (status, body) = query(
         router,
         "DescribeAutoScalingGroups",
@@ -327,17 +331,21 @@ fn now_secs() -> f64 {
 
 /// One datapoint of one series, as `GetMetricStatistics` reports it.
 #[derive(Debug, Clone, PartialEq)]
-struct Point {
-    maximum: f64,
-    minimum: f64,
-    average: f64,
-    sample_count: f64,
-    unit: String,
+pub(crate) struct Point {
+    pub(crate) maximum: f64,
+    pub(crate) minimum: f64,
+    pub(crate) average: f64,
+    pub(crate) sample_count: f64,
+    pub(crate) unit: String,
 }
 
 /// The series `metric` of `group` holds, keyed by the whole minute each datapoint is
 /// aggregated at — which is what makes "these two metrics agree at ONE time stamp" readable.
-async fn series(router: &MultiServiceRouter, group: &str, metric: &str) -> BTreeMap<i64, Point> {
+pub(crate) async fn series(
+    router: &MultiServiceRouter,
+    group: &str,
+    metric: &str,
+) -> BTreeMap<i64, Point> {
     let end = now_secs();
     let answer = cloudwatch(
         router,
@@ -384,7 +392,7 @@ async fn series(router: &MultiServiceRouter, group: &str, metric: &str) -> BTree
 }
 
 /// The metric names CloudWatch indexes for `group` in this service's namespace, sorted.
-async fn indexed_metrics(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+pub(crate) async fn indexed_metrics(router: &MultiServiceRouter, group: &str) -> Vec<String> {
     let answer = cloudwatch(
         router,
         "ListMetrics",
@@ -424,7 +432,7 @@ fn same(left: f64, right: f64) -> bool {
 /// readings SHARE: that is what makes "the capacity is the weight times the instance count at
 /// a single time stamp" an assertion about one observation of the group rather than about two
 /// readings taken at different instants.
-async fn shared_minute(
+pub(crate) async fn shared_minute(
     router: &MultiServiceRouter,
     group: &str,
     case: &str,
@@ -467,7 +475,7 @@ async fn shared_minute(
 
 /// Look again until the series `metric` of `group` holds at least one datapoint, and answer
 /// how many it holds.
-async fn published_count(
+pub(crate) async fn published_count(
     router: &MultiServiceRouter,
     group: &str,
     metric: &str,
