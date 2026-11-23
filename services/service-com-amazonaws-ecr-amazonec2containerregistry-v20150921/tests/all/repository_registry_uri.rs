@@ -301,9 +301,9 @@ async fn a_client_recovers_the_registry_the_account_and_the_region_beside_the_re
 
 #[tokio::test]
 async fn one_name_in_two_registries_is_told_apart_by_the_members_that_carry_that_identity() {
-    // One name in several Regions is several repositories, and what tells them apart is the
-    // identity each reports — its own Region's ARN — while each is reached at the one address
-    // this emulator answers registry requests on, which carries no Region of its own.
+    // One name in several Regions is several repositories, and what tells them apart is both
+    // the identity each reports — its own Region's ARN — and the authority each is published
+    // at, which names that Region's registry.
     let router = emulator();
     let name = "shared-name";
     let mut arns: Vec<String> = Vec::new();
@@ -592,7 +592,7 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
         );
 
         // The second Region's registry does not hold the name, so the same create succeeds
-        // there, reporting its own registry's ARN at the same published address.
+        // there, reporting its own registry's ARN at its own registry's published authority.
         let elsewhere = ok_in_region(
             &router,
             &case,
@@ -968,7 +968,7 @@ async fn one_cached_path_in_two_regions_is_told_apart_by_its_registrys_identity(
 async fn a_cached_repository_and_a_created_one_are_reported_the_same_way() {
     // The URI is the address the repository is published at, so the path that MINTED it
     // cannot change it: a repository a client created and one the registry imported are
-    // reported on the same endpoint, differing only in the name each carries.
+    // reported at the same registry's authority, differing only in the name each carries.
     let router = emulator();
     let import = &CACHED_IMPORTS[0];
     let cached = cached_repository(import);

@@ -333,8 +333,9 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                  {created_uri:?}"
             );
 
-            // The two parts a reader splits the value into: the address it dials, and the
-            // repository path it composes a tag, a digest or a registry v2 path on.
+            // The two parts a reader splits the value into: the authority it dials and
+            // parses, and the repository path it composes a tag, a digest or a registry v2
+            // path on.
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
@@ -433,9 +434,10 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
 
 #[tokio::test]
 async fn a_repository_uri_names_the_endpoint_the_read_itself_arrived_on() {
-    // The URI is an ADDRESS, so every reader is handed the endpoint this emulator answers
-    // THAT reader at, with the repository as the path — exactly as the URL its own
-    // `docker login` is pointed at is. What no reader's endpoint moves is the stored
+    // The URI is an ADDRESS a reader also parses, so every reader is handed this registry's
+    // own labels in the zone and on the port this emulator answers THAT reader at, with the
+    // repository as the path — anchored on the same endpoint the URL its own `docker login`
+    // is pointed at is. What no reader's endpoint moves is the stored
     // record's identity: the owning account and the ARN.
     let router = emulator();
     let endpoints = endpoints();
