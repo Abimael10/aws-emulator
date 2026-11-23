@@ -48,7 +48,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{
     call, call_ecs, call_in_region, cell, create_bucket, csv_rows,
     emulator_with_analysed_services, emulator_with_analysed_services_and_engine, error_code,
-    export_destination, get_object, opt_in, seed_cloudwatch_series, REGION,
+    export_destination, get_object, opt_in, seed_cloudwatch_series, summary_of, summary_set,
+    REGION,
 };
 
 /// The account id every ARN the emulator mints carries.
@@ -1479,6 +1480,408 @@ fn scaled(reserved: f64, current: f64, recommended: f64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// The SUMMARY of these recommendations: `GetRecommendationSummaries` counts a resource type
+// whose recommendations this service COMPUTES from another service's inventory from that same
+// computation, so the `EcsService` row counts exactly the services this reader reports — the
+// reader is the oracle for every count, reason code, risk rating and saving of that row, in
+// both directions.
+// ---------------------------------------------------------------------------
+
+/// The resource type the account's Amazon ECS services are summarised under: the
+/// `RecommendationSourceType` `RecommendationSummary$recommendationResourceType` names for them.
+const SUMMARY_RESOURCE_TYPE: &str = "EcsService";
+
+/// One Amazon ECS service of the summary table: what the account creates, what is published for
+/// it, and what the analysis then has to say about it.
+#[derive(Debug)]
+struct SummaryCase {
+    name: &'static str,
+    service: &'static str,
+    /// Its Amazon ECS launch type — only a service on Fargate is one Compute Optimizer analyses.
+    launch_type: &'static str,
+    /// The task definition's task-level `cpu`/`memory`, in the form it is registered with.
+    cpu: &'static str,
+    memory: &'static str,
+    /// What those forms mean in CPU units and MiB, which is what the task's monthly cost is
+    /// computed from.
+    current_cpu: f64,
+    current_memory: f64,
+    desired_count: i64,
+    /// The `CPUUtilization` and `MemoryUtilization` observations published for it, as per cent;
+    /// empty for a service nothing was published for.
+    cpu_values: &'static [f64],
+    memory_values: &'static [f64],
+    /// The finding the analysis reaches for it, or `None` for a service the analysis has no
+    /// input for — which neither the reader nor the summary counts.
+    finding: Option<&'static str>,
+}
+
+/// The `EcsService` summary counts the services this reader reports and nothing else: an account
+/// whose Amazon ECS store holds no service is summarised with zero at every finding, and each
+/// service the account then creates moves the counts, the reason codes, the risk ratings and the
+/// saving to exactly what the reader reports for the services the store holds.
+///
+/// The rows differ along what that rule generalises over: how many services the store holds (none,
+/// then one more per row), the finding each one reaches, the task size and the form it is
+/// registered in, how many tasks a service keeps running, and whether the analysis has an input
+/// for the service at all — one row runs on EC2, which Compute Optimizer does not analyse, and
+/// one has no published utilization, so neither reader counts either of them.
+#[tokio::test]
+async fn the_ecs_service_summary_counts_the_services_this_reader_reports() {
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    opt_in(&router).await;
+    let cluster = "summaries";
+    create_cluster(&router, cluster, "setup").await;
+    let published_at = now_secs() - 3_600;
+
+    // Row: the account's Amazon ECS store holds no service at all. The reader reports none, so
+    // the summary counts none — the baseline a resident catalog row would break.
+    let empty = assert_summary_counts_the_reader(&router, "no Amazon ECS service at all").await;
+    assert!(
+        empty.is_empty(),
+        "case \"no Amazon ECS service at all\": the ECS store holds no service, so the reader \
+         reports none, got {empty:?}"
+    );
+
+    let cases = [
+        SummaryCase {
+            name: "a service both of whose dimensions can be sized down",
+            service: "summaryoverprovisioned",
+            launch_type: "FARGATE",
+            cpu: "1024",
+            memory: "2048",
+            current_cpu: 1024.0,
+            current_memory: 2048.0,
+            desired_count: 1,
+            cpu_values: &[20.0, 40.0],
+            memory_values: &[30.0, 40.0],
+            finding: Some("Overprovisioned"),
+        },
+        SummaryCase {
+            name: "a cpu peak above the target, on four tasks",
+            service: "summarycpubound",
+            launch_type: "FARGATE",
+            cpu: "1024",
+            memory: "2048",
+            current_cpu: 1024.0,
+            current_memory: 2048.0,
+            desired_count: 4,
+            cpu_values: &[60.0, 95.0],
+            memory_values: &[40.0, 50.0],
+            finding: Some("Underprovisioned"),
+        },
+        SummaryCase {
+            name: "a service already at the smallest sufficient task size",
+            service: "summaryoptimized",
+            launch_type: "FARGATE",
+            cpu: "256",
+            memory: "512",
+            current_cpu: 256.0,
+            current_memory: 512.0,
+            desired_count: 2,
+            cpu_values: &[50.0, 70.0],
+            memory_values: &[60.0, 70.0],
+            finding: Some("Optimized"),
+        },
+        SummaryCase {
+            // A second service at the same finding, whose excess is MEMORY — so the memory
+            // reason code behind that finding is counted for two of the account's services and
+            // no count below is one row restated.
+            name: "only memory is excessive, the size given as vCPU and GB",
+            service: "summarymemoryheavy",
+            launch_type: "FARGATE",
+            cpu: "1 vCPU",
+            memory: "8GB",
+            current_cpu: 1024.0,
+            current_memory: 8192.0,
+            desired_count: 3,
+            cpu_values: &[70.0, 80.0],
+            memory_values: &[5.0, 10.0],
+            finding: Some("Overprovisioned"),
+        },
+        SummaryCase {
+            // "Compute Optimizer generates recommendations for Amazon ECS services on Fargate":
+            // a service on EC2 is one the analysis does not support, so neither reader counts it.
+            name: "a service that does not run on Fargate",
+            service: "summaryoncontainerinstances",
+            launch_type: "EC2",
+            cpu: "1024",
+            memory: "2048",
+            current_cpu: 1024.0,
+            current_memory: 2048.0,
+            desired_count: 2,
+            cpu_values: &[30.0, 40.0],
+            memory_values: &[30.0, 40.0],
+            finding: None,
+        },
+        SummaryCase {
+            // A service the analysis has merely not reached: nothing was published for it, so
+            // there is no utilization to size it against and neither reader counts it.
+            name: "a service nothing was published for",
+            service: "summaryunobserved",
+            launch_type: "FARGATE",
+            cpu: "2048",
+            memory: "4096",
+            current_cpu: 2048.0,
+            current_memory: 4096.0,
+            desired_count: 5,
+            cpu_values: &[],
+            memory_values: &[],
+            finding: None,
+        },
+    ];
+
+    // What the services the analysis DOES reach cost their account per month, at the public
+    // Fargate prices: the figure the summary states its saving as a percentage of.
+    let mut analysed_monthly_cost = 0.0;
+    let mut counted = 0;
+    for test in &cases {
+        let case = test.name;
+        let family = format!("{}family", test.service);
+        register_task_definition(&router, &family, test.cpu, test.memory, case).await;
+        let arn = create_service(
+            &router,
+            cluster,
+            test.service,
+            &family,
+            test.launch_type,
+            test.desired_count,
+            case,
+        )
+        .await;
+        for (metric, values) in [
+            (CPU_METRIC, test.cpu_values),
+            (MEMORY_METRIC, test.memory_values),
+        ] {
+            if !values.is_empty() {
+                publish(&engine, cluster, test.service, metric, values, published_at);
+            }
+        }
+        if test.finding.is_some() {
+            analysed_monthly_cost +=
+                monthly_cost(test.current_cpu, test.current_memory, test.desired_count);
+            counted += 1;
+        }
+
+        // The summary agrees with the reader after EVERY service the account creates, so neither
+        // a service the reader reports nor one it does not can drift into the counts.
+        let reported = assert_summary_counts_the_reader(&router, case).await;
+        assert_eq!(
+            reported.len(),
+            counted,
+            "case {case:?}: the reader must report the {counted} analysable service(s) created so \
+             far, got {reported:?}"
+        );
+        let found = reported
+            .iter()
+            .find(|recommendation| recommendation["serviceArn"] == json!(arn));
+        match test.finding {
+            Some(finding) => {
+                let found = found.unwrap_or_else(|| {
+                    panic!("case {case:?}: {arn} must be reported, got {reported:?}")
+                });
+                assert_eq!(
+                    found["finding"],
+                    json!(finding),
+                    "case {case:?}: expected the finding {finding} for {arn}, got {found}"
+                );
+            }
+            None => assert!(
+                found.is_none(),
+                "case {case:?}: the analysis has no input for {arn}, so no recommendation is \
+                 reported for it, got {reported:?}"
+            ),
+        }
+    }
+
+    // The table spans the whole finding vocabulary of this resource type, so each per-finding
+    // count above is observed non-zero rather than all of them zero together.
+    let answer = summary_set(&router, "the whole table", json!({})).await;
+    let summary = summary_of("the whole table", &answer, SUMMARY_RESOURCE_TYPE);
+    for finding in ["Underprovisioned", "Overprovisioned", "Optimized"] {
+        assert!(
+            summary_count_at(summary, finding, "the whole table") > 0.0,
+            "the table must hold a service at {finding} for its count to be observable, got \
+             {summary}"
+        );
+    }
+
+    // And the saving the summary states is that saving "as a percentage of monthly cost", the
+    // monthly cost being what the analysed services bill at the public Fargate prices.
+    let opportunity = &summary["savingsOpportunity"];
+    let saved = summary_number(
+        &opportunity["estimatedMonthlySavings"]["value"],
+        "the whole table",
+    );
+    let expected_percentage = round2(saved / analysed_monthly_cost * 100.0);
+    let percentage = summary_number(
+        &opportunity["savingsOpportunityPercentage"],
+        "the whole table",
+    );
+    assert!(
+        (percentage - expected_percentage).abs() < 0.02,
+        "the {saved} saved is {expected_percentage}% of the {analysed_monthly_cost} the analysed \
+         services cost, got {percentage}"
+    );
+}
+
+/// Read the `EcsService` summary and the Amazon ECS service recommendations of the same moment,
+/// asserting every count the summary states is what the reader reports, and answer those
+/// recommendations.
+///
+/// Every expectation is computed from the reader's own answer, so the reader is the oracle: how
+/// many services carry each finding, how many of those name each `FindingReasonCode` the summary
+/// counts at, how many run each `CurrentPerformanceRisk`, and what adopting their recommendation
+/// options would save.
+async fn assert_summary_counts_the_reader(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    let reported = swept_recommendations(router, case).await;
+    let answer = summary_set(router, case, json!({})).await;
+    let summary = summary_of(case, &answer, SUMMARY_RESOURCE_TYPE);
+
+    let counts = summary["summaries"].as_array().cloned().unwrap_or_else(|| {
+        panic!("case {case:?}: an Amazon ECS service is counted at each finding, got {summary}")
+    });
+    let mut total = 0.0;
+    for entry in &counts {
+        let finding = entry["name"].as_str().unwrap_or_default().to_string();
+        let count = summary_number(&entry["value"], case);
+        let at_finding: Vec<&Value> = reported
+            .iter()
+            .filter(|recommendation| recommendation["finding"] == json!(finding))
+            .collect();
+        assert_eq!(
+            count,
+            at_finding.len() as f64,
+            "case {case:?}: expected the {} service(s) the reader reports at {finding}, got {count}",
+            at_finding.len()
+        );
+        total += count;
+
+        // A reason code states what the recommended task size would change, counted over the
+        // services at the finding it explains.
+        let reasons = entry["reasonCodeSummaries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: a group the service recommends a configuration for states why \
+                     a finding was reached, got {entry}"
+                )
+            });
+        for reason in &reasons {
+            let name = reason["name"].as_str().unwrap_or_default().to_string();
+            let counted = summary_number(&reason["value"], case);
+            let expected = at_finding
+                .iter()
+                .filter(|recommendation| {
+                    recommendation["findingReasonCodes"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|code| *code == json!(name))
+                })
+                .count();
+            assert_eq!(
+                counted, expected as f64,
+                "case {case:?}: expected the {expected} service(s) the reader reports {name} for \
+                 at {finding}, got {counted}"
+            );
+        }
+    }
+    assert_eq!(
+        total,
+        reported.len() as f64,
+        "case {case:?}: the summary counts exactly the {} service(s) the reader reports, got \
+         {summary}",
+        reported.len()
+    );
+
+    // Every analysed service runs exactly one performance risk: the one the reader reports for it.
+    let ratings = &summary["currentPerformanceRiskRatings"];
+    for (member, rating) in [
+        ("high", "High"),
+        ("medium", "Medium"),
+        ("low", "Low"),
+        ("veryLow", "VeryLow"),
+    ] {
+        let expected = reported
+            .iter()
+            .filter(|recommendation| recommendation["currentPerformanceRisk"] == json!(rating))
+            .count();
+        assert_eq!(
+            summary_number(&ratings[member], case),
+            expected as f64,
+            "case {case:?}: expected the {expected} service(s) the reader reports at {rating}, got \
+             {ratings}"
+        );
+    }
+
+    // What adopting the recommendations would save: the saving of the options the reader reports.
+    let expected_savings = round2(reported.iter().map(option_savings).sum());
+    let saved = summary_number(
+        &summary["savingsOpportunity"]["estimatedMonthlySavings"]["value"],
+        case,
+    );
+    assert!(
+        (saved - expected_savings).abs() < 0.01,
+        "case {case:?}: expected the {expected_savings} the reader's options save, got {saved}"
+    );
+    assert_eq!(
+        summary_number(&summary["savingsOpportunity"]["savingsOpportunityPercentage"], case) == 0.0,
+        saved == 0.0,
+        "case {case:?}: a percentage is zero exactly when the saving is, got {summary}"
+    );
+
+    reported
+}
+
+/// What one reported recommendation's option would save per month, or `0` for a recommendation
+/// whose option saves nothing.
+fn option_savings(recommendation: &Value) -> f64 {
+    recommendation["serviceRecommendationOptions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .first()
+        .and_then(|option| {
+            option["savingsOpportunity"]["estimatedMonthlySavings"]["value"].as_f64()
+        })
+        .unwrap_or_default()
+}
+
+/// Every Amazon ECS service recommendation the account holds, as the reader reports them —
+/// including none at all, which is what a store holding no service is answered with.
+async fn swept_recommendations(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    let (status, body) = call(router, "GetECSServiceRecommendations", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the Amazon ECS service recommendations must be served, got {status}: \
+         {body}"
+    );
+    list(&body, "ecsServiceRecommendations", case)
+}
+
+/// One finding count of a summary.
+fn summary_count_at(summary: &Value, finding: &str, case: &str) -> f64 {
+    summary["summaries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .find(|entry| entry["name"] == json!(finding))
+        .map(|entry| summary_number(&entry["value"], case))
+        .unwrap_or_else(|| panic!("case {case:?}: {finding} must be counted, got {summary}"))
+}
+
+/// A number a summary member carries.
+fn summary_number(value: &Value, case: &str) -> f64 {
+    value
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a number, got {value}"))
+}
+
+// ---------------------------------------------------------------------------
 // The EXPORT of these recommendations: `ExportECSServiceRecommendations` writes a file of the
 // recommendations this reader reports, so the reader is the oracle for every row and every
 // cell of it.
@@ -1508,10 +1911,9 @@ const TIMESTAMP_COLUMN: &str = "LastRefreshTimestamp";
 /// no `autoScalingConfiguration` and the column is empty in every row.
 const UNRECORDED_COLUMN: &str = "CurrentServiceConfigurationAutoScalingConfiguration";
 
-/// The Amazon ECS service of the findings catalog this crate seeds: a service of no ECS store,
-/// which `GetECSServiceRecommendations` therefore reports no recommendation for — so no row of
-/// an export file is of it either.
-fn catalog_only_service_arn() -> String {
+/// An Amazon ECS service ARN no ECS store holds a record of, which this reader therefore reports
+/// no recommendation for — so no row of an export file is of it either.
+fn unheld_service_arn() -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT}:service/payments/checkout")
 }
 
@@ -2105,8 +2507,8 @@ async fn the_export_file_holds_what_the_ecs_service_reader_reports() {
             }
         }
 
-        // The file is of the services the READER reports, so the service the findings catalog
-        // alone holds — which the reader reports no recommendation for — is in no row of it.
+        // The file is of the services the READER reports, so a service no ECS store holds —
+        // which the reader reports no recommendation for — is in no row of it.
         if header.iter().any(|column| column == "ServiceArn") {
             let exported: Vec<&str> = data
                 .iter()
@@ -2120,10 +2522,10 @@ async fn the_export_file_holds_what_the_ecs_service_reader_reports() {
                 exported, expected,
                 "case {case:?}: the exported services must be the ones the reader reports"
             );
-            let catalog_only = catalog_only_service_arn();
+            let unheld = unheld_service_arn();
             assert!(
-                !exported.contains(&catalog_only.as_str()),
-                "case {case:?}: {catalog_only} is a service no ECS store holds and the reader \
+                !exported.contains(&unheld.as_str()),
+                "case {case:?}: {unheld} is a service no ECS store holds and the reader \
                  reports nothing for, so no row is of it, got {exported:?}"
             );
         }

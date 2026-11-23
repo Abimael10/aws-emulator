@@ -154,8 +154,9 @@ pub fn ecs_candidate_preferences(
 /// inputs for, computed by [`ecs_service_recommendation`].
 ///
 /// The ONE sweep every surface that serves a SET of these recommendations reads — the reader
-/// that reports them and the export that writes them to a file — so the file an export job
-/// writes holds exactly the recommendations a read of the same moment reports.
+/// that reports them, the export that writes them to a file and the summary that counts them
+/// ([`analysed_ecs_service_resources`]) — so the file an export job writes, and the counts a
+/// summary states, hold exactly the recommendations a read of the same moment reports.
 ///
 /// The gate is the one the reader applies: an account that is not opted in holds no analysis at
 /// all. The analysis itself is computed from another service's inventory and the utilization
@@ -171,6 +172,45 @@ pub fn analysed_ecs_services<Eng: Send + Sync + 'static>(
     account_id: &str,
     now: f64,
 ) -> Vec<ECSServiceRecommendation> {
+    analysed_ecs_service_analyses(engine, store, region, account_id, now)
+        .into_iter()
+        .map(|(_, recommendation)| recommendation)
+        .collect()
+}
+
+/// The same analysed Amazon ECS services as ROWS OF THE FINDINGS CATALOG — the shape a summary
+/// aggregates a resource type's resources in ([`AnalysedResource`]) — one per recommendation
+/// [`analysed_ecs_services`] reports, projected by [`ecs_analysed_resource`].
+///
+/// A resource type whose recommendations this service computes from another service's inventory
+/// is SUMMARISED from that computation and not from the findings catalog, so the summary counts
+/// exactly the resources the reader of those recommendations reports and the two cannot disagree
+/// about how many the account has or about any one's finding, risk or cost — the rule the
+/// database, volume and function surfaces of this service are summarised by.
+pub fn analysed_ecs_service_resources<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &ComAmazonawsComputeoptimizerComputeoptimizerserviceState,
+    region: &str,
+    account_id: &str,
+    now: f64,
+) -> Vec<AnalysedResource> {
+    analysed_ecs_service_analyses(engine, store, region, account_id, now)
+        .iter()
+        .map(|(candidate, recommendation)| ecs_analysed_resource(candidate, recommendation))
+        .collect()
+}
+
+/// The sweep both surfaces above read: each analysed service's recommendation beside the
+/// candidate it was computed from, so a caller that needs the service's persisted configuration
+/// (how many tasks it keeps running) as well as the recommendation reads one sweep rather than
+/// two that could select differently.
+fn analysed_ecs_service_analyses<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &ComAmazonawsComputeoptimizerComputeoptimizerserviceState,
+    region: &str,
+    account_id: &str,
+    now: f64,
+) -> Vec<(EcsServiceCandidate, ECSServiceRecommendation)> {
     if !store.enrollment.is_opted_in() {
         return Vec::new();
     }
@@ -201,9 +241,78 @@ pub fn analysed_ecs_services<Eng: Send + Sync + 'static>(
     ecs_candidate_preferences(store, &mut candidates);
     let observations = observations.lock();
     candidates
-        .iter()
-        .filter_map(|candidate| ecs_service_recommendation(candidate, &observations, now).ok())
+        .into_iter()
+        .filter_map(|candidate| {
+            let recommendation = ecs_service_recommendation(&candidate, &observations, now).ok()?;
+            Some((candidate, recommendation))
+        })
         .collect()
+}
+
+/// One analysed Amazon ECS service as a row of the findings catalog, i.e. as a summary of the
+/// account's Amazon ECS services aggregates it.
+///
+/// Every figure is the one the recommendation itself reports — the finding, the reason codes
+/// behind it and the performance risk of the current configuration — and the two monthly costs
+/// are what the service's tasks bill at the current task size and at the recommended one
+/// ([`fargate_monthly_cost`], the one Fargate price computation this analysis reports money
+/// from), which are the same two figures the recommendation option's savings opportunity is the
+/// difference of. So a summary's count, saving and percentage cannot disagree with the
+/// recommendation reported for the same service. An `ECSServiceRecommendation` infers no
+/// workload type and describes no database, so the row carries neither.
+fn ecs_analysed_resource(
+    candidate: &EcsServiceCandidate,
+    recommendation: &ECSServiceRecommendation,
+) -> AnalysedResource {
+    // How many tasks the service keeps running: the multiplier between what ONE task of a size
+    // costs per month and what the SERVICE does.
+    let tasks = candidate
+        .config
+        .as_ref()
+        .map(|config| config.desired_tasks)
+        .unwrap_or_default();
+    let current = recommendation.current_service_configuration.as_ref();
+    let current_cpu = current
+        .and_then(|configuration| configuration.cpu)
+        .unwrap_or_default();
+    let current_memory = current
+        .and_then(|configuration| configuration.memory)
+        .unwrap_or_default();
+    // The recommended task size: the option the analysis reached, which is the current size
+    // itself for a service it would not resize.
+    let option = recommendation
+        .service_recommendation_options
+        .iter()
+        .flatten()
+        .next();
+    let option_cpu = option.and_then(|option| option.cpu).unwrap_or(current_cpu);
+    let option_memory = option
+        .and_then(|option| option.memory)
+        .unwrap_or(current_memory);
+    AnalysedResource {
+        account_id: candidate.reference.account_id.clone(),
+        resource_type: SOURCE_TYPE_ECS_SERVICE.to_string(),
+        // A row records a resource's REGION-FREE identity ([`AnalysedResource::arn_in`]), which
+        // for an Amazon ECS service is the cluster that hosts it and its own name.
+        arn_service: ECS_ARN_NAMESPACE.to_string(),
+        arn_resource: format!(
+            "{ECS_SERVICE_RESOURCE_KIND}/{}/{}",
+            candidate.reference.cluster, candidate.reference.service
+        ),
+        finding: recommendation.finding.clone().unwrap_or_default(),
+        finding_reason_codes: recommendation
+            .finding_reason_codes
+            .clone()
+            .unwrap_or_default(),
+        current_performance_risk: recommendation
+            .current_performance_risk
+            .clone()
+            .unwrap_or_default(),
+        current_monthly_cost: fargate_monthly_cost(current_cpu, current_memory, tasks),
+        recommended_monthly_cost: fargate_monthly_cost(option_cpu, option_memory, tasks),
+        inferred_workload_types: Vec::new(),
+        rds_database: None,
+    }
 }
 
 /// The recommendation for one Amazon ECS service, or why the analysis produced none for it.

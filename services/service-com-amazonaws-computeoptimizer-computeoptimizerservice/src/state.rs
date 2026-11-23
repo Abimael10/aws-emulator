@@ -3667,100 +3667,45 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 /// part): Compute Optimizer is regional, so the region a reported ARN names is the region
 /// of the endpoint the request addressed ([`AnalysedResource::arn_in`]).
 ///
-/// The Amazon Aurora and RDS DATABASE rows are not here: a database is a DB instance the
-/// account owns, so those rows are projected from the Amazon RDS inventory and the
-/// utilization published for it when a read asks for them
-/// ([`rds_inventory::analysed_databases`]).
+/// A resource type whose analysis this service computes from ANOTHER service's inventory has
+/// no row here at all: an Amazon Aurora or RDS database, an Amazon EBS volume, a Lambda
+/// function version and an Amazon ECS service are resources the account owns elsewhere, so
+/// those rows are projected from the inventory that holds them and the utilization published
+/// for them when a read asks for them ([`rds_inventory::analysed_databases`],
+/// [`ebs_inventory::analysed_volumes`], [`lambda_inventory::analysed_functions`] and
+/// [`ecs_recommendations::analysed_ecs_service_resources`]) rather than seeded here, which is
+/// what keeps a summary of such a group counting exactly what its reader reports.
 fn seed_analysed_resources() -> Vec<AnalysedResource> {
-    let account = ::engine::emulator_account_id();
-    let row = |resource_type: &str,
-               arn_service: &str,
-               arn_resource: &str,
-               finding: &str,
-               finding_reason_codes: &[&str],
-               current_performance_risk: &str,
-               current_monthly_cost: f64,
-               recommended_monthly_cost: f64,
-               inferred_workload_types: &[&str]| AnalysedResource {
-        account_id: account.to_string(),
-        resource_type: resource_type.to_string(),
-        arn_service: arn_service.to_string(),
-        arn_resource: arn_resource.to_string(),
-        finding: finding.to_string(),
-        finding_reason_codes: finding_reason_codes
-            .iter()
-            .map(|code| (*code).to_string())
-            .collect(),
-        current_performance_risk: current_performance_risk.to_string(),
-        current_monthly_cost,
-        recommended_monthly_cost,
-        inferred_workload_types: inferred_workload_types
-            .iter()
-            .map(|workload| (*workload).to_string())
-            .collect(),
-        // Set below for the rows analysed as a database; every other resource type has no
-        // database configuration to record.
-        rds_database: None,
-    };
-
-    vec![
-        row(
-            SOURCE_TYPE_ECS_SERVICE,
-            "ecs",
-            "service/payments/checkout",
-            FINDING_OVERPROVISIONED,
-            &[METRIC_REASON_MEMORY_OVERPROVISIONED],
-            PERFORMANCE_RISK_VERY_LOW,
-            120.0,
-            80.0,
-            &[],
-        ),
-        // No row here is analysed as an Amazon Aurora or RDS database: those rows are the
-        // account's OWN DB instances, projected from the Amazon RDS inventory that holds them
-        // and the utilization published for them at the moment of the read
-        // ([`rds_inventory::analysed_databases`]), so an account that owns no DB instance has
-        // no database recommendation rather than one resident in this crate.
-    ]
-    .into_iter()
     // The Amazon EC2 instance rows are the SAME observation an instance reader reports,
     // projected onto the findings row ([`ObservedInstance::to_analysed_resource`]) rather
     // than stated a second time here, so a summary of the account's instances counts
     // exactly the instances that reader reports and agrees with it on each one's finding,
     // risk and cost.
-    .chain(
-        observed_instances()
-            .iter()
-            .map(ObservedInstance::to_analysed_resource),
-    )
-    // The Auto Scaling group rows are the SAME analysis
-    // `GetAutoScalingGroupRecommendations` reports, projected onto the findings row
-    // ([`AnalyzedAutoScalingGroup::to_analysed_resource`]) rather than stated a second
-    // time here, so a summary of the account's Auto Scaling groups counts exactly the
-    // groups that reader reports and agrees with it on each one's finding, risk and cost.
-    .chain(
-        seed_auto_scaling_group_analyses()
-            .iter()
-            .map(AnalyzedAutoScalingGroup::to_analysed_resource),
-    )
-    // The Amazon EBS volume rows are not here either: a volume is one the account OWNS, so
-    // those rows are projected from the Amazon EC2 inventory that holds it and the utilization
-    // published for it when a read asks for them ([`ebs_inventory::analysed_volumes`]).
-    // The Lambda function rows are not here for the same reason: a function is one AWS Lambda
-    // holds for the account, so those rows are projected from that inventory, the utilization
-    // published for it and the run reports its invocations left
-    // ([`lambda_inventory::analysed_functions`]).
-    // The commercial software license rows are the SAME observation
-    // `GetLicenseRecommendations` reports, projected the same way
-    // ([`ObservedLicensedInstance::to_analysed_resource`]), so a summary of the account's
-    // licenses counts exactly the licenses that reader reports and agrees with it on each
-    // one's finding, whichever of the three `LicenseFinding` classifications that reader
-    // reports for it.
-    .chain(
-        observed_licensed_instances()
-            .iter()
-            .map(ObservedLicensedInstance::to_analysed_resource),
-    )
-    .collect()
+    observed_instances()
+        .iter()
+        .map(ObservedInstance::to_analysed_resource)
+        // The Auto Scaling group rows are the SAME analysis
+        // `GetAutoScalingGroupRecommendations` reports, projected onto the findings row
+        // ([`AnalyzedAutoScalingGroup::to_analysed_resource`]) rather than stated a second
+        // time here, so a summary of the account's Auto Scaling groups counts exactly the
+        // groups that reader reports and agrees with it on each one's finding, risk and cost.
+        .chain(
+            seed_auto_scaling_group_analyses()
+                .iter()
+                .map(AnalyzedAutoScalingGroup::to_analysed_resource),
+        )
+        // The commercial software license rows are the SAME observation
+        // `GetLicenseRecommendations` reports, projected the same way
+        // ([`ObservedLicensedInstance::to_analysed_resource`]), so a summary of the account's
+        // licenses counts exactly the licenses that reader reports and agrees with it on each
+        // one's finding, whichever of the three `LicenseFinding` classifications that reader
+        // reports for it.
+        .chain(
+            observed_licensed_instances()
+                .iter()
+                .map(ObservedLicensedInstance::to_analysed_resource),
+        )
+        .collect()
 }
 
 /// The `FindingReasonCode` values (`crate::ops::types::FINDING_REASON_CODE_VALUES`) — the

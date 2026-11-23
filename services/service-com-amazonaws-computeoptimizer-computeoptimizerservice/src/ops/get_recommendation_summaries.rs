@@ -328,6 +328,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .iter()
         .filter_map(|function| function.to_analysed_resource(&function_look_back_period))
         .collect();
+        // The Amazon ECS services the account holds an analysis for, by the crate's one rule for
+        // it ([`crate::state::analysed_ecs_service_resources`], the projection of the one sweep
+        // `GetECSServiceRecommendations` reports from): a summary of the account's Amazon ECS
+        // services counts exactly the services that reader reports, at the findings it reports
+        // for them, so the two cannot disagree about how many there are or about any one's
+        // finding, risk or cost. The services are the ones of the region the request was signed
+        // for, which is the region that reader analyses.
+        let ecs_services: Vec<crate::state::AnalysedResource> =
+            crate::state::analysed_ecs_service_resources(
+                &*self.engine,
+                &guard,
+                &crate::state::request_region(ctx),
+                &account_id,
+                crate::state::now_secs(),
+            );
         // The records a caller can read, grouped by resource type: the rightsizing catalog
         // and the idle analysis. A caller sees either only once the analysis its enrollment
         // started is due
@@ -352,6 +367,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         analysed.insert(
             crate::state::SOURCE_TYPE_LAMBDA_FUNCTION,
             functions.iter().collect(),
+        );
+        // The Amazon ECS service rows are the analysed services above, for the same reason: a
+        // service is one the account's Amazon ECS inventory holds, so the catalog records none.
+        analysed.insert(
+            crate::state::SOURCE_TYPE_ECS_SERVICE,
+            ecs_services.iter().collect(),
         );
         let idle = guard.idle_analyses_by_source_type(&account_id);
         // One summary per resource type this service TRACKS — every value of the
