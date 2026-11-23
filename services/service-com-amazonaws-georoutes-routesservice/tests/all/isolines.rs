@@ -18,11 +18,20 @@
 //! * the granularity asked for is what decides how many points a boundary carries;
 //! * the area is measured from, and the snapped point reported for, whichever of `Origin`
 //!   and `Destination` the request set — and a request that sets neither, or both, or
-//!   thresholds of two types, is refused by the member and the rule it broke.
+//!   thresholds of two types, is refused by the member and the rule it broke;
+//! * that snapped point is a point of the ROAD NETWORK: the place on the road nearest the
+//!   submitted anchor, carried at the precision the network's geometry is measured to, so
+//!   moving the anchor across its road reports the same point of the network and only moves
+//!   it further off.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The network's own parameters — the grid spacing, how sparsely its numbered roads and its
+// footpaths sit, and the precision its geometry carries — are the copies
+// `all/road_graph_metrics.rs` keeps of `src/state.rs`, read from there rather than kept a
+// second time here.
+use crate::road_graph_metrics::{FOOTPATH_EVERY, POLYLINE_PRECISION, ROAD_SPACING_DEG, TRUNK_EVERY};
 use crate::routing::{great_circle_m, int, position, post, routes_service, ROUTES};
 
 /// The path `CalculateIsolines` is bound to.
@@ -32,6 +41,9 @@ const ISOLINES: &str = "/v2/isolines";
 const GOOD: [f64; 2] = [-123.1, 49.28];
 /// A second one, on a different landmass.
 const SEATTLE: [f64; 2] = [-122.3321, 47.6062];
+/// A third one, in the southern hemisphere, where a degree of longitude is a different
+/// number of metres again.
+const SYDNEY: [f64; 2] = [151.2093, -33.8688];
 /// The middle of the North Pacific: no territory is mapped there, so no road network exists
 /// to reach anything from.
 const PACIFIC: [f64; 2] = [-140.0, 40.0];
@@ -1068,5 +1080,329 @@ async fn the_answer_reports_the_time_the_request_pinned_the_calculation_to() {
             "case {case:?}: the request named no arrival, so none is reported, got {:?}",
             answer["ArrivalTime"]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The point on the road network the area was measured from
+// ---------------------------------------------------------------------------
+
+/// Which way a road of the network runs. The roads of this grid run north-south or
+/// east-west, and which of the two a position matched onto one lies on decides WHICH of its
+/// coordinates is the road's own and which is measured along the road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Orientation {
+    /// North-south: the road sits at a whole number of grid steps of longitude.
+    Meridian,
+    /// East-west: the road sits at a whole number of grid steps of latitude.
+    Parallel,
+}
+
+impl Orientation {
+    /// The orientation of the roads that CROSS the roads of this one.
+    fn crossing(self) -> Self {
+        match self {
+            Self::Meridian => Self::Parallel,
+            Self::Parallel => Self::Meridian,
+        }
+    }
+
+    /// The coordinate the roads of this orientation sit at a whole number of grid steps of:
+    /// a match onto one of them puts the submitted position at that road's own value here.
+    fn across(self) -> usize {
+        match self {
+            Self::Meridian => 0,
+            Self::Parallel => 1,
+        }
+    }
+
+    /// The coordinate measured ALONG such a road, which a match onto it leaves where the
+    /// caller put it — a road running north-south passes through every latitude.
+    fn along(self) -> usize {
+        self.crossing().across()
+    }
+}
+
+/// Whether `mode` may travel the road of `orientation` at grid index `index`, by the
+/// network's own rule (`class_of` / `allows_of` in `src/state.rs`): a road at a multiple of
+/// [`TRUNK_EVERY`] is numbered and controlled-access, so it carries no pedestrian, and every
+/// [`FOOTPATH_EVERY`]th meridian the numbered classes leave over is a footpath, which
+/// carries nothing else.
+fn road_allows(orientation: Orientation, index: i64, mode: &str) -> bool {
+    let numbered = index.rem_euclid(TRUNK_EVERY) == 0;
+    let footpath = orientation == Orientation::Meridian && !numbered && index.rem_euclid(FOOTPATH_EVERY) == 0;
+    if mode == "Pedestrian" {
+        !numbered
+    } else {
+        !footpath
+    }
+}
+
+/// The grid index nearest `coordinate` whose road of `orientation` `mode` may travel: the
+/// road a position there is matched onto, since a road the mode may not use is no candidate
+/// for it.
+fn usable_index(orientation: Orientation, coordinate: f64, mode: &str) -> i64 {
+    let nearest = (coordinate / ROAD_SPACING_DEG).round() as i64;
+    (0..FOOTPATH_EVERY)
+        .flat_map(|step| [nearest + step, nearest - step])
+        .find(|index| road_allows(orientation, *index, mode))
+        .unwrap_or(nearest)
+}
+
+/// A position near `city` sitting `across` grid steps away from a road of `orientation` that
+/// `mode` may travel, and `along` grid steps from the nearest road crossing it.
+///
+/// A row says where a point sits RELATIVE TO THE NETWORK rather than naming a coordinate, so
+/// no row depends on the arithmetic of one place: keep `across` the smaller of the two
+/// offsets in metres and the road named is the one the network puts nearest the point.
+fn anchor_near(city: [f64; 2], orientation: Orientation, mode: &str, across: f64, along: f64) -> [f64; 2] {
+    let mut anchor = [0.0_f64; 2];
+    anchor[orientation.across()] = road_coordinate(orientation, city[orientation.across()], mode) + across * ROAD_SPACING_DEG;
+    let crossing = orientation.crossing();
+    anchor[orientation.along()] = road_coordinate(crossing, city[orientation.along()], mode) + along * ROAD_SPACING_DEG;
+    anchor
+}
+
+/// The coordinate the road of `orientation` nearest `coordinate` that `mode` may travel sits
+/// at.
+fn road_coordinate(orientation: Orientation, coordinate: f64, mode: &str) -> f64 {
+    usable_index(orientation, coordinate, mode) as f64 * ROAD_SPACING_DEG
+}
+
+/// The point of the network a position matched onto the road of `orientation` nearest it
+/// lands on: the ROAD's own coordinate across it, the SUBMITTED coordinate along it, both at
+/// the precision the network's geometry is carried to.
+fn expected_match(anchor: [f64; 2], orientation: Orientation, mode: &str) -> [f64; 2] {
+    let mut matched = anchor;
+    matched[orientation.across()] = road_coordinate(orientation, anchor[orientation.across()], mode);
+    [
+        round_to(matched[0], POLYLINE_PRECISION),
+        round_to(matched[1], POLYLINE_PRECISION),
+    ]
+}
+
+/// `coordinate` rounded to `digits` decimal places.
+fn round_to(coordinate: f64, digits: i32) -> f64 {
+    let scale = 10_f64.powi(digits);
+    (coordinate * scale).round() / scale
+}
+
+/// The snapped point `CalculateIsolines` reports for an anchor submitted under
+/// `anchor_member`. The threshold is the smallest area worth computing, since what is read
+/// here is the anchor and not the ring.
+async fn snapped_anchor(
+    router: &MultiServiceRouter,
+    case: &str,
+    anchor_member: &str,
+    anchor: [f64; 2],
+    mode: &str,
+) -> [f64; 2] {
+    let mut body = isoline_request(anchor_member, anchor, Kind::Distance, &[500]);
+    body["TravelMode"] = json!(mode);
+    let (status, answer, _) = post(router, ISOLINES, &body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: an anchor on the network must be served, got {status} with {answer:?}"
+    );
+    let reported = if anchor_member == "Origin" {
+        "SnappedOrigin"
+    } else {
+        "SnappedDestination"
+    };
+    position(&answer[reported], case)
+}
+
+/// One row of [`the_snapped_anchor_is_the_point_of_the_road_network_nearest_the_anchor`]: the
+/// case name, the city, the orientation of the road the point matches onto, the travel mode,
+/// the member the anchor is submitted under, and how far across that road and along it the
+/// point sits, in grid steps.
+type AnchorCase = (
+    &'static str,
+    [f64; 2],
+    Orientation,
+    &'static str,
+    &'static str,
+    f64,
+    f64,
+);
+
+/// `SnappedOrigin` / `SnappedDestination` is "the actual point on the road network used for
+/// calculations, which may differ from the requested origin if Origin was not directly on a
+/// road" (`smithy_query(query="operation",operation="CalculateIsolines")`), so the point
+/// reported is a point of THE NETWORK: the matched road's own coordinate across the road and
+/// the submitted coordinate along it, carried at the precision the network's geometry is
+/// measured to rather than quantized to the coarser grid a caller writes a coordinate on.
+///
+/// Rows differ along what the rule generalises over: which orientation of road the point
+/// matches onto, how far across it it sits (standing on the carriageway, a couple of metres
+/// off it, a quarter of a block off it), the travel mode — which decides which roads are
+/// candidates at all — the city and the hemisphere, and whether the anchor was submitted as
+/// an origin or as a destination.
+#[tokio::test]
+async fn the_snapped_anchor_is_the_point_of_the_road_network_nearest_the_anchor() {
+    let router = routes_service();
+    // The across offset is the smaller of the two in metres in every row, so the road named
+    // is the nearest one; the along offset carries digits finer than a caller's grid, which
+    // is what the reported coordinate must keep.
+    let cases: [AnchorCase; 8] = [
+        ("a car just off a meridian street", GOOD, Orientation::Meridian, "Car", "Origin", 0.0603, 0.4601),
+        ("a truck just off a parallel street", SEATTLE, Orientation::Parallel, "Truck", "Origin", -0.0807, 0.4603),
+        (
+            "a scooter a quarter of a block off a meridian street",
+            SEATTLE,
+            Orientation::Meridian,
+            "Scooter",
+            "Origin",
+            0.2501,
+            0.4607,
+        ),
+        (
+            "a pedestrian just off a parallel street, southern hemisphere",
+            SYDNEY,
+            Orientation::Parallel,
+            "Pedestrian",
+            "Destination",
+            0.1103,
+            0.4409,
+        ),
+        (
+            "a destination just off a meridian street, southern hemisphere",
+            SYDNEY,
+            Orientation::Meridian,
+            "Car",
+            "Destination",
+            -0.1507,
+            0.4601,
+        ),
+        ("a car already on a meridian street", GOOD, Orientation::Meridian, "Car", "Origin", 0.0, 0.4603),
+        (
+            "a destination already on a parallel street",
+            SYDNEY,
+            Orientation::Parallel,
+            "Truck",
+            "Destination",
+            0.0,
+            0.4607,
+        ),
+        (
+            "a pedestrian already on a meridian road",
+            SEATTLE,
+            Orientation::Meridian,
+            "Pedestrian",
+            "Origin",
+            0.0,
+            0.4409,
+        ),
+    ];
+
+    for (case, city, orientation, mode, member, across, along) in cases {
+        let anchor = anchor_near(city, orientation, mode, across, along);
+        let matched = snapped_anchor(&router, case, member, anchor, mode).await;
+        let expected = expected_match(anchor, orientation, mode);
+
+        assert!(
+            (matched[0] - expected[0]).abs() < 1e-6 && (matched[1] - expected[1]).abs() < 1e-6,
+            "case {case:?}: the anchor {anchor:?} is matched onto the network at {expected:?}, \
+             got {matched:?}"
+        );
+        // The reported point lies ON a road: its coordinate across the road it matched onto
+        // is a whole number of grid steps, which the caller's own coordinate is not.
+        let steps = matched[orientation.across()] / ROAD_SPACING_DEG;
+        assert!(
+            (steps - steps.round()).abs() * ROAD_SPACING_DEG < 1e-6,
+            "case {case:?}: a matched point is a point of the network, so its {orientation:?} \
+             coordinate is a whole number of the {ROAD_SPACING_DEG} grid steps, got {matched:?}"
+        );
+        // Along the road there was nothing to match, so the caller's own coordinate is kept
+        // — at the precision the network's geometry carries, never quantized to the
+        // ten-thousandth of a degree a caller writes a coordinate in.
+        let submitted = anchor[orientation.along()];
+        let reported = matched[orientation.along()];
+        assert!(
+            (reported - round_to(submitted, POLYLINE_PRECISION)).abs() < 1e-6,
+            "case {case:?}: the coordinate along the matched road is the submitted \
+             {submitted} at the network's own precision, got {reported}"
+        );
+        let quantized = round_to(submitted, 4);
+        assert!(
+            (reported - quantized).abs() > 1e-6,
+            "case {case:?}: the coordinate along the matched road keeps the precision of the \
+             computed point, so it is not the submitted coordinate quantized to {quantized}, \
+             got {reported}"
+        );
+        // What the match MOVED the point by: the distance to the road it matched onto, and
+        // nothing at all for a point already on the carriageway.
+        let moved = great_circle_m(anchor, matched);
+        let to_the_road = great_circle_m(anchor, expected);
+        assert!(
+            (moved - to_the_road).abs() < 0.2,
+            "case {case:?}: the match moved the point onto its road, {to_the_road:.2} m away, \
+             got {moved:.2} m"
+        );
+        assert_eq!(
+            moved > 0.5,
+            across.abs() > 0.01,
+            "case {case:?}: a point off the carriageway is moved onto it and one already on it \
+             is not, got {moved:.2} m for a point {across} grid steps across its road"
+        );
+    }
+}
+
+/// A match is onto the ROAD, so moving the submitted anchor ACROSS its road reports THE SAME
+/// point of the network and only moves it further: the reported position is read off the
+/// network's geometry rather than being a rendering of the coordinate the caller submitted
+/// across the road, which is the whole of what tells a client whether its own position was
+/// on a road.
+///
+/// Rows differ along the orientation of the road matched onto, the travel mode, the city and
+/// hemisphere, and which anchor member the point was submitted under; the probes within a row
+/// stay inside the half-step where that road is the nearest one, so every probe of a row
+/// matches the same road.
+#[tokio::test]
+async fn a_point_moved_across_its_road_matches_the_same_point_of_the_network() {
+    let router = routes_service();
+    // case, city, the orientation of the road the points match onto, travel mode, the member
+    // the anchor is submitted under.
+    let cases: [(&str, [f64; 2], Orientation, &str, &str); 4] = [
+        ("across a meridian street", GOOD, Orientation::Meridian, "Car", "Origin"),
+        ("across a parallel street", SEATTLE, Orientation::Parallel, "Truck", "Origin"),
+        (
+            "across a meridian road on foot, southern hemisphere",
+            SYDNEY,
+            Orientation::Meridian,
+            "Pedestrian",
+            "Destination",
+        ),
+        ("across a parallel street by scooter", GOOD, Orientation::Parallel, "Scooter", "Destination"),
+    ];
+    // Fractions of a grid step across the road: standing on it, a couple of metres off it,
+    // and a tenth of a block off it.
+    let offsets = [0.0_f64, 0.05, 0.12];
+
+    for (case, city, orientation, mode, member) in cases {
+        let mut probes: Vec<(f64, [f64; 2], f64)> = Vec::new();
+        for across in offsets {
+            let anchor = anchor_near(city, orientation, mode, across, 0.4603);
+            let matched = snapped_anchor(&router, case, member, anchor, mode).await;
+            probes.push((across, matched, great_circle_m(anchor, matched)));
+        }
+
+        let (_, first, _) = probes[0];
+        for (across, matched, moved) in &probes {
+            assert!(
+                (matched[0] - first[0]).abs() < 1e-6 && (matched[1] - first[1]).abs() < 1e-6,
+                "case {case:?}: a point {across} grid steps across the road matches the same \
+                 point of it, {first:?}, got {matched:?} {moved:.2} m away"
+            );
+        }
+        for pair in probes.windows(2) {
+            let ((nearer, _, moved_less), (further, _, moved_more)) = (pair[0], pair[1]);
+            assert!(
+                moved_more > moved_less + 0.5,
+                "case {case:?}: a point {further} grid steps across its road is further from it \
+                 than one {nearer} steps across, so the match moves it further, got \
+                 {moved_more:.2} m against {moved_less:.2} m"
+            );
+        }
     }
 }

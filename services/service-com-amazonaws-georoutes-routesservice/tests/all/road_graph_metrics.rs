@@ -57,6 +57,17 @@ pub(crate) const KPH_TO_MPS: f64 = 1_000.0 / 3_600.0;
 /// (`POSITION_PRECISION`): this API expresses a `Position` to a ten-millionth of a degree.
 pub(crate) const POSITION_PRECISION: i32 = 7;
 
+/// Decimal digits of a coordinate the network's own geometry carries, as `src/state.rs`
+/// holds it (`POLYLINE_PRECISION`): a point READ OFF the network — the place a submitted
+/// position matched onto a road, a vertex of a road's shape — is carried to a millionth of a
+/// degree, about a tenth of a metre.
+pub(crate) const POLYLINE_PRECISION: i32 = 6;
+
+/// Every [`FOOTPATH_EVERY`]th meridian road the numbered classes leave over is a footpath,
+/// as `src/state.rs` holds it (`FOOTPATH_EVERY`): pedestrians only, so no vehicle of this
+/// network is ever matched onto one.
+pub(crate) const FOOTPATH_EVERY: i64 = 10;
+
 /// Seconds given up at one at-grade junction of a road of each class, as `src/state.rs`
 /// holds them (`MOTORWAY_JUNCTION_DELAY_S`, `TRUNK_JUNCTION_DELAY_S`,
 /// `STREET_JUNCTION_DELAY_S`): a motorway's crossings are grade-separated, a trunk road has
@@ -359,7 +370,10 @@ async fn the_matrix_cell_and_the_direct_route_report_the_same_traversal() {
 /// holds it (`TRUNK_EVERY`). It is also the spacing of the ACCESS POINTS travel joins and
 /// leaves the numbered network at (`access_spacing_m` in `src/state/road_graph.rs`): a
 /// numbered road is joined where it meets another of them, not wherever a street crosses it.
-const TRUNK_EVERY: i64 = 100;
+///
+/// Every road at a multiple of it is numbered and controlled-access, so it is also what says
+/// which roads carry no pedestrian (`class_of`/`allows_of` in `src/state.rs`).
+pub(crate) const TRUNK_EVERY: i64 = 100;
 
 /// Metres per degree of latitude, as `src/state.rs` holds it (`METRES_PER_DEGREE_LAT`).
 const METRES_PER_DEGREE_LAT: f64 = 110_574.0;
