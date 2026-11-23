@@ -131,6 +131,11 @@ pub mod management_events;
 /// a member rest on, pinned here rather than restated as a second refusal of this front door.
 pub mod required_boolean_parameters;
 
+/// How this front door reads the value of every boolean request parameter — as the flag it is,
+/// at every depth of the parameter list — which is the reader
+/// [`Ec2QueryEnvelope::deserialize_input`] hands the framework's walk.
+pub mod boolean_parameters;
+
 /// How this front door words the refusals the FRAMEWORK gives for the rules the MODEL declares
 /// — an absent `@required` member, a value outside a declared catalog or `@range` — in EC2's
 /// own vocabulary: the choice [`Service::override_refusal`] makes, and the input shape it is
@@ -583,12 +588,18 @@ impl ServerProtocol for Ec2QueryEnvelope {
         request: &'a RtRequest,
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
-        // EC2 reads a value of a modelled enum, and the value of every BOOLEAN parameter,
-        // without regard to ASCII case, so a request that spells one of them in another case
-        // is SERVED rather than refused — and the parameters a handler would have refused it
-        // for are reached. The body is rewritten here, in the one place this service reads a
-        // request, so the reading is the same for every operation; a request that carries no
-        // such value is handed to the framework's own reader untouched ([`recased_body`]).
+        // EC2 reads a value of a modelled enum without regard to ASCII case, so a request that
+        // spells one in another case is SERVED rather than refused — and the parameters a
+        // handler would have refused it for are reached. The body is rewritten here, in the one
+        // place this service reads a request, so the reading is the same for every operation; a
+        // request that carries no such value is handed to the framework's own reader untouched
+        // ([`recased_body`]).
+        //
+        // The value of every BOOLEAN parameter is read that way too — at every depth of the
+        // parameter list, and as the FLAG it is — by the reader this service hands the
+        // framework's walk ([`boolean_parameters::Flags`]), rather than by that rewrite: a key
+        // naming a position inside a member does not resolve to the member's TYPE from the
+        // input schema, and the type is what decides whether a value is a boolean at all.
         //
         // This is also where the input shape being read is recorded, for the one refusal EC2
         // words per operation rather than per value ([`parameter_refusals`]): the one place
@@ -599,9 +610,12 @@ impl ServerProtocol for Ec2QueryEnvelope {
             .bytes()
             .and_then(|body| recased_body(body, input_schema))
         {
-            return Ok(Box::new(QueryShapeDeserializer::new(&rewritten, true)));
+            let read: Box<dyn ShapeDeserializer> =
+                Box::new(QueryShapeDeserializer::new(&rewritten, true));
+            return Ok(Box::new(boolean_parameters::Flags::over(read)));
         }
-        self.inner.deserialize_input(request, input_schema)
+        let read = self.inner.deserialize_input(request, input_schema)?;
+        Ok(Box::new(boolean_parameters::Flags::over(read)))
     }
 
     fn serialize_output(
@@ -700,13 +714,13 @@ impl ServerProtocol for Ec2QueryEnvelope {
 /// a free-text member whose value happens to read like one (a tag value, a name) is never
 /// touched.
 ///
-/// A BOOLEAN member is read that way too, and for EVERY operation rather than per recorded
-/// member: the recorded traffic has EC2 serving a request whose boolean parameter spells its
-/// value in another ASCII case, answering the dry-run verdict for a `DryRun` spelled that way
-/// rather than refusing the body as unreadable. So the two spellings an ec2Query request
-/// writes a boolean in are matched without regard to case and re-spelled as the wire writes
-/// them ([`wire_boolean_spelling`]). A value that is no boolean in any case is still left
-/// exactly as the request sent it, for the framework's reader to refuse as before.
+/// A BOOLEAN member's value is read without regard to case as well, and NOT here: a boolean is
+/// read where the model's TYPE of the position is known, so that reading reaches one the request
+/// writes inside a structure or an element of a list exactly as it reaches one the request
+/// writes on its own ([`boolean_parameters::Flags`], which this service hands the framework's
+/// walk). A key naming a nested position does not resolve to the member's type from the input
+/// schema at all ([`member_at`]), which is why the two halves of the one rule cannot both live
+/// in a rewrite of the body.
 ///
 /// The body is form-urlencoded (`<key>=<value>&…`), and a pair is rewritten only when its
 /// value needs no decoding to match a declared one — every value of this table is a bare
@@ -743,66 +757,11 @@ fn recased_body(body: &[u8], input_schema: &Schema) -> Option<Vec<u8>> {
 /// without regard to ASCII case and the value spells one of that member's values in another
 /// case; `None` leaves the pair exactly as the request sent it.
 fn declared_spelling(input_schema: &Schema, key: &str, value: &str) -> Option<&'static str> {
-    if let Some(spelled) = wire_boolean_spelling(input_schema, key, value) {
-        return Some(spelled);
-    }
     // The input shape being read, which is what the enum table is keyed by beside the member
     // name.
     let shape = input_schema.shape_id().shape_name();
     let member = member_at(input_schema, key)?;
     crate::state::declared_enum_spelling(shape, member, value)
-}
-
-/// The two spellings an ec2Query request writes a Smithy `boolean` in, which is how the
-/// framework's reader reads one back.
-const WIRE_BOOLEANS: [&str; 2] = ["true", "false"];
-
-/// The spelling the wire writes the boolean `key` carries, when `key` names a BOOLEAN member
-/// of `input_schema` and the value the request sent is not already spelled that way; `None`
-/// when the key names no boolean member, when the value is already spelled as the wire writes
-/// it, or when it carries an escape, which the framework's reader decodes and this reading
-/// does not.
-///
-/// EC2 reads such a parameter as the FLAG it is rather than refusing a request for the way its
-/// value is written: a value that spells `true` in any ASCII case sets the flag, and every
-/// other value — another spelling of `false`, a digit, a word, an empty value — leaves it
-/// unset. That is the reading the recorded traffic shows (EC2 answering the dry-run verdict
-/// for a `DryRun` spelled in another case rather than refusing the body as unreadable), and
-/// the one a client that sends a flag the service cannot read as `true` is answered under:
-/// the request is SERVED, and the parameters a handler would refuse it for are reached.
-fn wire_boolean_spelling(
-    input_schema: &Schema,
-    key: &str,
-    value: &str,
-) -> Option<&'static str> {
-    if !names_boolean_member(input_schema, key) {
-        return None;
-    }
-    // An escaped value is left exactly as the request sent it, for the framework's reader to
-    // decode and read as before — the same line [`recased_body`] draws for every value.
-    if value.contains('%') || value.contains('+') {
-        return None;
-    }
-    let spelled = if value.eq_ignore_ascii_case(WIRE_BOOLEANS[0]) {
-        WIRE_BOOLEANS[0]
-    } else {
-        WIRE_BOOLEANS[1]
-    };
-    (spelled != value).then_some(spelled)
-}
-
-/// Does `key` name a member of `input_schema` whose target is a `boolean`?
-///
-/// A boolean holds no value within itself, so such a key is the member's own name alone — its
-/// `@xmlName` or its member name, without regard to ASCII case ([`member_is_named`]) — and a
-/// key carrying any further segment positions a value inside some other member. A member
-/// schema carries its own kind rather than the shape it targets ([`member_at`]), so a boolean
-/// nested in a structure is not reachable from here and is left to the framework's reader.
-fn names_boolean_member(input_schema: &Schema, key: &str) -> bool {
-    !key.contains('.')
-        && input_schema.members().iter().any(|member| {
-            member_is_named(member, key) && matches!(member.shape_type(), ShapeType::Boolean)
-        })
 }
 
 /// The MEMBER NAME a request key names, or `None` when the key names no member of

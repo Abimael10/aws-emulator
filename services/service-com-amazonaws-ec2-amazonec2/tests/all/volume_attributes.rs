@@ -53,12 +53,13 @@ const MALFORMED_VOLUME: &str = "vol-not-an-id";
 /// one a handler chose.
 const BOUNDARY_CONSTRAINT_CODE: &str = "ValidationError";
 
-/// The error code the request walk answers for a form field it cannot read as the member's
-/// type — here an `AutoEnableIO.Value` that carries no boolean. ec2Query has no way to
-/// send the `AutoEnableIO` structure with its `Value` omitted (a member with no value is a
-/// field with an empty value, which is refused here), so the handler's second
-/// `MissingParameter` guard is defensive only; this row pins what the wire really answers.
-const MALFORMED_INPUT: &str = "MalformedInput";
+// An `AutoEnableIO.Value` carrying no text is NOT a refusal: this service reads a boolean
+// parameter's value as the FLAG it is at every depth of the parameter list, so a value that
+// spells no boolean leaves the attribute unset instead of refusing the body
+// (`super::nested_boolean_parameter_case`, which owns that reading). ec2Query has no way to
+// send the `AutoEnableIO` structure with its `Value` omitted — a member with no value is a
+// field with an empty value — so the handler's `MissingParameter` guard for an absent one is
+// defensive only.
 
 fn emulator() -> MultiServiceRouter {
     super::ec2_query::emulator().0
@@ -441,7 +442,7 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
     // The two rows that name an attribute outside the model's `VolumeAttributeName` enum
     // expect [`BOUNDARY_CONSTRAINT_CODE`]: a modelled constraint is refused by the
     // centralized request walk (deserialize -> validate -> handle), before the handler runs.
-    let cases: [(&str, &str, Vec<Param>, u16, &str); 13] = [
+    let cases: [(&str, &str, Vec<Param>, u16, &str); 12] = [
         (
             "an attribute the model does not declare",
             "DescribeVolumeAttribute",
@@ -504,13 +505,6 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
             vec![param("VolumeId", &volume_id)],
             400,
             ec2::state::MISSING_PARAMETER,
-        ),
-        (
-            "a modification whose attribute carries an empty value",
-            "ModifyVolumeAttribute",
-            vec![param("VolumeId", &volume_id), param("AutoEnableIO.Value", "")],
-            400,
-            MALFORMED_INPUT,
         ),
         (
             "a dry run of a describe that would have succeeded",
