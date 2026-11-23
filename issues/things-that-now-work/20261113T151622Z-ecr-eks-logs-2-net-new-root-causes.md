@@ -41,3 +41,8 @@ Cause 1: kubernetes.client.exceptions.ApiException: (405) Reason: Method Not All
 
 ## Steps to Reproduce
 Cause 1: create a cluster (Fargate profile variant), reach its API endpoint with an authenticated kubernetes client, create namespace aws-observability, then POST a ConfigMap (e.g. aws-logging) into it -> 405 MethodNotAllowed instead of 201. Cause 2: on a reachable cluster, create a pod referencing a private ECR image and read the pod back (GET /api/v1/namespaces/<ns>/pods/<name>) -> the returned object has no spec.containers, so a typed client raises.
+
+## Resolution
+Both causes are served: the core/v1 configmaps collection serves the create and answers it with the stored object, and a Pod carries the whole admitted spec — its container list included — on the create, the read and the listing. The rule behind them (a collection serves every verb the server's own `/api/v1` resource list advertises for it, 405 only for one it does not; the object a create answers with is the object stored, carrying the members its kind requires) is pinned by `services/service-com-amazonaws-eks-awswesleyfrontend/tests/all/kubernetes_core_api_verbs.rs`, beside `tests/all/kubernetes_pod_and_config_map_objects.rs`.
+
+The six checks listed above still fail, on later steps that are NOT these two causes and that other issues own: a pod matched by an ACTIVE Fargate profile never leaving Pending and the kubelet's pull events (20261114T130859Z-ecr-eks-logs-2-net-new-root-causes-b62cb4.md), and STS `AssumeRoleWithWebIdentity` refusing an EKS-issued service-account token (20261120T190252Z-ecr-eks-logs-sts-assumerolewithwebidentity-never-accepts-an.md). Re-replay these trace ids alongside those issues.
