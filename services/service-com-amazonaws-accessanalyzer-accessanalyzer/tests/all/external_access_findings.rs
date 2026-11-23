@@ -1068,6 +1068,332 @@ async fn an_archived_finding_resolves_when_its_access_is_removed() {
     }
 }
 
+/// What each of an analyzer's findings reports, reduced to the pair an archive is about: the
+/// resource the finding is about and the status the analyzer reports for it, ordered by
+/// resource so two analyzers are compared row by row.
+async fn statuses_by_resource(
+    case: &str,
+    emulator: &Emulator,
+    analyzer: &str,
+) -> Vec<(String, String)> {
+    findings_by_resource(case, emulator, analyzer)
+        .await
+        .iter()
+        .map(|finding| (text(finding, "resource"), text(finding, "status")))
+        .collect()
+}
+
+/// The statuses an analyzer must report once the findings about `archived` are archived and
+/// every other finding of the fixture is still active.
+fn expected_statuses(fixture: &ArchiveFixture, archived: &[String]) -> Vec<(String, String)> {
+    fixture
+        .resources()
+        .into_iter()
+        .map(|resource| {
+            let status = if archived.contains(&resource) {
+                STATUS_ARCHIVED
+            } else {
+                STATUS_ACTIVE
+            };
+            (resource, status.to_string())
+        })
+        .collect()
+}
+
+/// The second analyzer the scoping case applies a rule to. It is of the `ORGANIZATION`
+/// family because the account may hold only ONE `ACCOUNT` analyzer, and both families report
+/// external access.
+const PEER_ANALYZER: &str = "archive-peer-analyzer";
+
+/// One step of the scoping case: whose rule is applied in it, and what each of the two
+/// analyzers must report archived once it has been.
+struct ScopeStep {
+    step: &'static str,
+    /// The ARN of the analyzer whose rule this step applies, or `None` for the step before
+    /// any rule has been applied at all.
+    applied_to: Option<String>,
+    /// The resources whose findings the FIRST analyzer must then report archived.
+    first_archived: Vec<String>,
+    /// The resources whose findings the PEER analyzer must then report archived.
+    peer_archived: Vec<String>,
+}
+
+/// RULE: an archive is recorded on the ledger of the analyzer the apply NAMES, so every
+/// analyzer reports the statuses of its OWN findings: applying one analyzer's rule archives
+/// only the findings that analyzer reports, and every other analyzer reporting the same
+/// access keeps reporting it active until its own rule is applied.
+#[tokio::test]
+async fn an_apply_archives_only_the_findings_of_the_analyzer_it_names() {
+    let case = "two analyzers over the same resources";
+    let emulator = Emulator::new();
+    let fixture = archive_fixture(case, &emulator).await;
+    let peer = emulator.analyzer(case, PEER_ANALYZER, "ORGANIZATION").await;
+
+    // Each analyzer carries a rule of its own, selecting a different part of the same
+    // findings: the roles for the first, the bucket for the second.
+    emulator
+        .create_archive_rule(
+            case,
+            ARCHIVE_ANALYZER,
+            ARCHIVE_RULE,
+            json!({"resourceType": {"eq": ["AWS::IAM::Role"]}}),
+        )
+        .await;
+    emulator
+        .create_archive_rule(
+            case,
+            PEER_ANALYZER,
+            ARCHIVE_RULE,
+            json!({"resource": {"eq": [fixture.bucket]}}),
+        )
+        .await;
+
+    let roles = vec![
+        fixture.public_role.clone(),
+        fixture.peer_role.clone(),
+        fixture.org_role.clone(),
+    ];
+    let bucket = vec![fixture.bucket.clone()];
+    let steps = vec![
+        ScopeStep {
+            step: "before either rule is applied",
+            applied_to: None,
+            first_archived: Vec::new(),
+            peer_archived: Vec::new(),
+        },
+        ScopeStep {
+            step: "the first analyzer's rule applied",
+            applied_to: Some(fixture.analyzer.clone()),
+            first_archived: roles.clone(),
+            peer_archived: Vec::new(),
+        },
+        ScopeStep {
+            step: "the peer analyzer's rule applied",
+            applied_to: Some(peer.clone()),
+            first_archived: roles.clone(),
+            peer_archived: bucket.clone(),
+        },
+    ];
+
+    for ScopeStep {
+        step,
+        applied_to,
+        first_archived,
+        peer_archived,
+    } in &steps
+    {
+        if let Some(analyzer_arn) = applied_to {
+            let applied = emulator.apply_archive_rule(analyzer_arn, ARCHIVE_RULE).await;
+            assert_eq!(
+                applied.status, 200,
+                "case {step:?}: the apply must answer 200, got {applied:?}"
+            );
+        }
+        for (whose, analyzer_arn, archived) in [
+            (
+                "the first analyzer",
+                fixture.analyzer.as_str(),
+                first_archived,
+            ),
+            ("the peer analyzer", peer.as_str(), peer_archived),
+        ] {
+            let reported = statuses_by_resource(step, &emulator, analyzer_arn).await;
+            let expected = expected_statuses(&fixture, archived);
+            assert_eq!(
+                reported, expected,
+                "case {step:?}: {whose} must report {expected:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a member outside one of this operation's modelled constraints is refused with
+/// `ValidationException` (HTTP 400) naming that member, and a refused apply archives nothing;
+/// a value ON a published bound reaches the handler, which answers for what the request
+/// names rather than for its shape.
+///
+/// The constraints are this operation's own, from
+/// `smithy_query(query="operation",operation="ApplyArchiveRule")`: `analyzerArn` is required
+/// with the pattern `^[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:analyzer/.{1,255}$`, and `ruleName` is
+/// required with `len 1..255` and the pattern `^[A-Za-z][A-Za-z0-9_.-]*$`. The rows differ
+/// along which member is at fault, HOW it breaks its constraint (not an ARN, another
+/// resource type, each published length bound and one past it, a leading digit, a space, the
+/// member omitted altogether) and which values sit exactly on a bound.
+#[tokio::test]
+async fn an_apply_outside_the_modelled_constraints_is_refused_and_archives_nothing() {
+    let case = "constrained apply members";
+    let emulator = Emulator::new();
+    let fixture = archive_fixture(case, &emulator).await;
+    // A rule that selects every finding: it exists throughout the table, so no row is
+    // refused for naming a rule that is missing, and the apply at the end proves the
+    // refusals left the ledger untouched.
+    emulator
+        .create_archive_rule(
+            case,
+            ARCHIVE_ANALYZER,
+            ARCHIVE_RULE,
+            json!({"status": {"eq": [STATUS_ACTIVE]}}),
+        )
+        .await;
+
+    let own = own_account();
+    let analyzer_arn = |resource: &str| {
+        format!("arn:aws:access-analyzer:{REGION}:{own}:analyzer/{resource}")
+    };
+    let at_max_name = format!("n{}", "x".repeat(254));
+    let past_max_name = format!("n{}", "x".repeat(255));
+    let live = fixture.analyzer.clone();
+
+    // (case, the request body, the expected status, the expected error code, the member the
+    // refusal must name — in its `fieldList` or in its message, whichever the refusal that
+    // row raises carries the member in)
+    let rows: Vec<(&str, Value, u16, &str, Option<&str>)> = vec![
+        (
+            "an analyzer name at the 255-character maximum, which the pattern admits",
+            json!({"analyzerArn": analyzer_arn(&"a".repeat(255)), "ruleName": ARCHIVE_RULE}),
+            404,
+            "ResourceNotFoundException",
+            None,
+        ),
+        (
+            "an analyzer name one character past that maximum",
+            json!({"analyzerArn": analyzer_arn(&"a".repeat(256)), "ruleName": ARCHIVE_RULE}),
+            400,
+            "ValidationException",
+            Some("analyzerArn"),
+        ),
+        (
+            "an empty analyzer name, below the 1-character minimum",
+            json!({"analyzerArn": analyzer_arn(""), "ruleName": ARCHIVE_RULE}),
+            400,
+            "ValidationException",
+            Some("analyzerArn"),
+        ),
+        (
+            "an ARN of another resource type of this service",
+            json!({
+                "analyzerArn":
+                    format!("arn:aws:access-analyzer:{REGION}:{own}:archive-rule/{ARCHIVE_RULE}"),
+                "ruleName": ARCHIVE_RULE,
+            }),
+            400,
+            "ValidationException",
+            Some("analyzerArn"),
+        ),
+        (
+            "an analyzerArn that is not an ARN at all",
+            json!({"analyzerArn": "not-an-arn", "ruleName": ARCHIVE_RULE}),
+            400,
+            "ValidationException",
+            Some("analyzerArn"),
+        ),
+        (
+            "no analyzerArn at all, though the member is required",
+            json!({"ruleName": ARCHIVE_RULE}),
+            400,
+            "ValidationException",
+            Some("analyzerArn"),
+        ),
+        (
+            "a rule name of the minimum length, which the pattern admits",
+            json!({"analyzerArn": live, "ruleName": "z"}),
+            404,
+            "ResourceNotFoundException",
+            None,
+        ),
+        (
+            "a rule name at the 255-character maximum",
+            json!({"analyzerArn": live, "ruleName": at_max_name}),
+            404,
+            "ResourceNotFoundException",
+            None,
+        ),
+        (
+            "a rule name using every character class the pattern allows",
+            json!({"analyzerArn": live, "ruleName": "Rule.name-9_x"}),
+            404,
+            "ResourceNotFoundException",
+            None,
+        ),
+        (
+            "a rule name one character past the 255-character maximum",
+            json!({"analyzerArn": live, "ruleName": past_max_name}),
+            400,
+            "ValidationException",
+            Some("ruleName"),
+        ),
+        (
+            "an empty rule name, below the 1-character minimum",
+            json!({"analyzerArn": live, "ruleName": ""}),
+            400,
+            "ValidationException",
+            Some("ruleName"),
+        ),
+        (
+            "a rule name the pattern rejects (leading digit)",
+            json!({"analyzerArn": live, "ruleName": "1rule"}),
+            400,
+            "ValidationException",
+            Some("ruleName"),
+        ),
+        (
+            "a rule name the pattern rejects (a space)",
+            json!({"analyzerArn": live, "ruleName": "rule name"}),
+            400,
+            "ValidationException",
+            Some("ruleName"),
+        ),
+        (
+            "no ruleName at all, though the member is required",
+            json!({"analyzerArn": live}),
+            400,
+            "ValidationException",
+            Some("ruleName"),
+        ),
+    ];
+
+    for (row, body, status, code, field) in &rows {
+        let reply = emulator.apply(body.clone()).await;
+        assert_eq!(
+            (reply.status, reply.code()),
+            (*status, *code),
+            "case {row:?}: expected HTTP {status} {code}, got {reply:?}"
+        );
+        if let Some(field) = field {
+            // The member a client has to correct is named in the refusal — in the
+            // `fieldList` the modelled shape carries it in, or in the message itself.
+            let named = reply.field_name() == *field || reply.message().contains(field);
+            assert!(
+                named,
+                "case {row:?}: the refusal must name {field:?}, got {reply:?}"
+            );
+        }
+        // A refused apply archives nothing, though a rule selecting every finding is
+        // stored on the analyzer the row names.
+        let reported = statuses_by_resource(row, &emulator, &fixture.analyzer).await;
+        assert_eq!(
+            reported,
+            expected_statuses(&fixture, &[]),
+            "case {row:?}: a refused apply must archive no finding, got {reported:?}"
+        );
+    }
+
+    // The ledger the refusals left alone is the one a well-formed apply writes to.
+    let applied = emulator
+        .apply_archive_rule(&fixture.analyzer, ARCHIVE_RULE)
+        .await;
+    assert_eq!(
+        applied.status, 200,
+        "case {case:?}: the apply after the refused rows must answer 200, got {applied:?}"
+    );
+    let reported = statuses_by_resource(case, &emulator, &fixture.analyzer).await;
+    assert_eq!(
+        reported,
+        expected_statuses(&fixture, &fixture.resources()),
+        "case {case:?}: the rule selects every finding, got {reported:?}"
+    );
+}
+
 /// RULE: the findings of an external access analyzer are the external access the account's
 /// own resource-based policies grant.
 ///
