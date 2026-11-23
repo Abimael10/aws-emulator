@@ -1515,6 +1515,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             ));
         }
 
+        // A cache behaviour ATTACHES resources CloudFront holds apart from the distribution —
+        // a cache policy, an origin request policy, a response headers policy, a real-time log
+        // configuration, a field-level encryption configuration — so a configuration naming
+        // one that does not exist describes a behaviour the service could not serve, and is
+        // refused with that kind's `NoSuch…` before any distribution is created carrying the
+        // dangling reference.
+        if let Some(refusal) = unresolved_config_reference(self, &config) {
+            return Err(CreateRefusal::ConfigMember(refusal));
+        }
+
         // An origin reaches a private bucket EITHER with the credentials of an origin
         // access control OR as an origin access identity, never both: a configuration whose
         // origin names both says nothing about which signs it, so it is refused before any

@@ -170,6 +170,46 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 /// The code a refusal carries for a declaration that states none of a required property.
 const MISSING_PROPERTY: &str = "InvalidRequest";
 
+/// The error codes CloudFront answers for a resource a cache behaviour ATTACHES by identifier
+/// and this account holds none of: the cache, origin request and response headers policies,
+/// the real-time log configuration and the field-level encryption configuration.
+///
+/// Exactly the five a behaviour attaches, and no wider: none of them is the resource the
+/// provider manages — each is something the TEMPLATE named — so a refusal carrying one of
+/// these codes reports a fault in the declaration ([`handler_error_class`]). A code outside
+/// this list keeps the class it falls in on its own, because no recording shows this
+/// provider's classification of one.
+const UNRESOLVED_REFERENCE_CODES: &[&str] = &[
+    "NoSuchCachePolicy",
+    "NoSuchOriginRequestPolicy",
+    "NoSuchResponseHeadersPolicy",
+    "NoSuchRealtimeLogConfig",
+    "NoSuchFieldLevelEncryptionConfig",
+];
+
+/// Which `HandlerErrorCode` class a CloudFront provider puts a refusal carrying `code` in —
+/// see [`super::Owner::handler_error_class`].
+///
+/// A `NoSuch…` naming a resource the DECLARATION REFERENCES ([`UNRESOLVED_REFERENCE_CODES`])
+/// is reported under the plugin's class for a refused REQUEST rather than under its
+/// not-found class: the provider addressed no such resource, the template named it, so what
+/// the refusal says is that the declaration asked for something that is not there — a failure
+/// no retry of the same template clears, which is what a client branches on. The recorded
+/// `ResourceStatusReason` of an `AWS::CloudFront::Distribution` whose `DefaultCacheBehavior`
+/// names a cache policy that does not exist closes `HandlerErrorCode: InvalidRequest` (in the
+/// behavioral corpus `simparity-behavioral-aws-v1`, check
+/// `cloudfront.deploy-cloudfront-1-distribution-nonexistent-cache-policy-rejected-rolls-back`).
+///
+/// Every other refusal keeps the class its own code falls in, so a call that ADDRESSES a
+/// distribution or an origin access control this account does not hold
+/// ([`NO_SUCH_DISTRIBUTION`], [`NO_SUCH_ORIGIN_ACCESS_CONTROL`]) is still the not-found class.
+pub(crate) fn handler_error_class(code: &str, classified: &'static str) -> &'static str {
+    if UNRESOLVED_REFERENCE_CODES.contains(&code) {
+        return super::HANDLER_ERROR_INVALID_REQUEST;
+    }
+    classified
+}
+
 /// The status CloudFront reports a distribution in while a configuration is still
 /// propagating to the edge locations (`Distribution$Status`), which is the state a deletion
 /// of one is still in progress in.

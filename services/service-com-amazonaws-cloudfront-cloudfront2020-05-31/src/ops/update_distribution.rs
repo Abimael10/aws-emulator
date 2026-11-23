@@ -705,6 +705,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
+            // The same rule the create path applies: a cache behaviour attaches resources
+            // CloudFront holds apart from the distribution, so an update cannot leave a
+            // distribution attaching a policy, a real-time log configuration or a field-level
+            // encryption configuration that is not there either.
+            if let Some(refusal) =
+                crate::state::unresolved_config_reference(&store, &input.distribution_config)
+            {
+                return Err(member_refusal(refusal));
+            }
+
             // A distribution's caller reference identifies it for its whole life, so an
             // update that renames it is not a modification CloudFront allows. The fixed
             // sentence the DISTRIBUTION surface states that rule in, naming no value from

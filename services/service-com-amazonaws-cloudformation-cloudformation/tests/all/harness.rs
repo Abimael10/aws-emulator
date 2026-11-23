@@ -1078,3 +1078,73 @@ pub async fn get_template(
     }
     call(router, "GetTemplate", &members).await
 }
+
+// ---------------------------------------------------------------------------
+// Reading a resource back from AMAZON CLOUDFRONT, the service that owns it
+// ---------------------------------------------------------------------------
+
+/// The API version every CloudFront route is under, from the HTTP bindings its model declares
+/// (`GET /2020-05-31/cache-policy/{Id}/config`).
+pub const CLOUDFRONT_API_VERSION: &str = "2020-05-31";
+
+/// The host a CloudFront request is addressed to: that service's own published host.
+pub const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
+
+/// One CloudFront request, over the restXml wire that service speaks, answered with the HTTP
+/// status and the XML body.
+///
+/// HERE rather than in one suite, because more than one asks it: a cache policy, a real-time
+/// log configuration and the distribution that attaches them live in Amazon CloudFront, so
+/// every suite that reads one back goes through that service's own wire, signed for
+/// `cloudfront`.
+pub async fn cloudfront(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+) -> (u16, String) {
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/cloudfront/aws4_request, \
+         SignedHeaders=host, Signature=0123456789abcdef"
+    );
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{CLOUDFRONT_HOST}{path}"))
+        .header("host", CLOUDFRONT_HOST)
+        .header("authorization", authorization)
+        .body(bytes::Bytes::new())
+        .expect("a well-formed CloudFront request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(&response.into_body()).to_string();
+    (status, body)
+}
+
+/// The physical resource id the stack reports for one logical id — the identifier the OWNING
+/// service minted, which is what a read of that resource is addressed by.
+///
+/// Shared for the reason [`cloudfront`] is: every suite that reads a declared resource back
+/// from its owning service needs the id the stack published for it.
+pub async fn physical_resource_id(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    logical_id: &str,
+) -> String {
+    let (code, body) = call(
+        router,
+        "DescribeStackResource",
+        &[
+            member("StackName", stack),
+            member("LogicalResourceId", logical_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DescribeStackResource({stack}, {logical_id}) must answer 200, \
+         got {code} {body}"
+    );
+    xml_text(&body, "PhysicalResourceId").unwrap_or_else(|| {
+        panic!("case {case:?}: expected a physical resource id for {logical_id}, got {body}")
+    })
+}

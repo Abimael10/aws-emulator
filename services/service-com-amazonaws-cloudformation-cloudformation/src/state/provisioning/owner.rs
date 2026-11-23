@@ -1923,6 +1923,13 @@ impl Owner {
             {
                 super::HANDLER_ERROR_ALREADY_EXISTS
             }
+            // Amazon CloudFront's providers classify a refusal naming a resource the
+            // DECLARATION REFERENCES themselves, because that is a fault in the template
+            // rather than a resource the provider addressed and did not find
+            // ([`cloudfront_resources::handler_error_class`]).
+            Self::CloudFrontResource(_) => {
+                cloudfront_resources::handler_error_class(code, classified)
+            }
             // Every other provider here reports the class the error code itself falls in.
             _ => classified,
         }

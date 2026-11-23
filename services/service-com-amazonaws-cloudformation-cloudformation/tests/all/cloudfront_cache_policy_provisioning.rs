@@ -33,18 +33,13 @@ use std::collections::BTreeSet;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::settled_stack_status;
+use crate::harness::{
+    cloudfront, physical_resource_id, settled_stack_status, CLOUDFRONT_API_VERSION,
+};
 use crate::stack_lifecycle::{
     call, create_stack, member, router, xml_blocks, xml_text, xml_texts, REGION,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
-
-/// The API version every CloudFront route is under, from the HTTP bindings its model
-/// declares (`GET /2020-05-31/cache-policy/{Id}/config`).
-const CLOUDFRONT_API_VERSION: &str = "2020-05-31";
-
-/// The host a CloudFront request is addressed to: that service's own published host.
-const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
 
 /// The `DefaultTTL` CloudFront supplies for a configuration that states none:
 /// `CachePolicyConfig$DefaultTTL`, "The default value for this field is 86400 seconds (one
@@ -63,30 +58,6 @@ const DOCUMENTED_MAX_TTL: i64 = 31_536_000;
 // ---------------------------------------------------------------------------
 // Calling the two services
 // ---------------------------------------------------------------------------
-
-/// One CloudFront request, over the restXml wire that service speaks, answered with the HTTP
-/// status and the XML body.
-///
-/// The ONE CloudFront caller of this suite: a cache policy, and the distribution that names
-/// it, live in Amazon CloudFront, so every read of one goes through that service's own wire
-/// here, signed for `cloudfront`.
-async fn cloudfront(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, String) {
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/cloudfront/aws4_request, \
-         SignedHeaders=host, Signature=0123456789abcdef"
-    );
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{CLOUDFRONT_HOST}{path}"))
-        .header("host", CLOUDFRONT_HOST)
-        .header("authorization", authorization)
-        .body(bytes::Bytes::new())
-        .expect("a well-formed CloudFront request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8_lossy(&response.into_body()).to_string();
-    (status, body)
-}
 
 /// `GET /2020-05-31/cache-policy/{Id}/config`.
 async fn get_cache_policy_config(router: &MultiServiceRouter, id: &str) -> (u16, String) {
@@ -116,32 +87,6 @@ async fn get_distribution_config(router: &MultiServiceRouter, id: &str) -> (u16,
         &format!("/{CLOUDFRONT_API_VERSION}/distribution/{id}/config"),
     )
     .await
-}
-
-/// The physical resource id the stack reports for one logical id.
-async fn physical_id(
-    router: &MultiServiceRouter,
-    case: &str,
-    stack: &str,
-    logical_id: &str,
-) -> String {
-    let (code, body) = call(
-        router,
-        "DescribeStackResource",
-        &[
-            member("StackName", stack),
-            member("LogicalResourceId", logical_id),
-        ],
-    )
-    .await;
-    assert_eq!(
-        code, 200,
-        "case {case:?}: DescribeStackResource({stack}, {logical_id}) must answer 200, \
-         got {code} {body}"
-    );
-    xml_text(&body, "PhysicalResourceId").unwrap_or_else(|| {
-        panic!("case {case:?}: expected a physical resource id for {logical_id}, got {body}")
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +377,7 @@ async fn declared_cache_policies_are_readable_in_cloudfront_under_the_reported_p
             "case {case:?}: the stack must reach CREATE_COMPLETE, got {settled:?}"
         );
 
-        let id = physical_id(&router, case, declared.stack, "Policy").await;
+        let id = physical_resource_id(&router, case, declared.stack, "Policy").await;
         assert!(
             ids.insert(id.clone()),
             "case {case:?}: every policy must get an identifier of its own, {id} was \
@@ -604,8 +549,8 @@ async fn a_declared_cache_policy_is_referenceable_and_updates_in_place() {
         "case {case:?}: the stack must reach CREATE_COMPLETE, got {settled:?}"
     );
 
-    let policy_id = physical_id(&router, case, stack, "Policy").await;
-    let distribution_id = physical_id(&router, case, stack, "Cdn").await;
+    let policy_id = physical_resource_id(&router, case, stack, "Policy").await;
+    let distribution_id = physical_resource_id(&router, case, stack, "Cdn").await;
     let (code, config) = get_cache_policy_config(&router, &policy_id).await;
     assert_eq!(
         code, 200,
@@ -648,7 +593,7 @@ async fn a_declared_cache_policy_is_referenceable_and_updates_in_place() {
         "case {case:?}: the stack must reach UPDATE_COMPLETE, got {settled:?}"
     );
 
-    let updated_id = physical_id(&router, case, stack, "Policy").await;
+    let updated_id = physical_resource_id(&router, case, stack, "Policy").await;
     assert_eq!(
         updated_id, policy_id,
         "case {case:?}: an in-place update must keep the policy's id, got {updated_id}"

@@ -93,6 +93,23 @@ pub enum ConfigMemberRefusal {
     /// `NoSuchOrigin` (HTTP 404): a cache behaviour targets an origin the configuration does
     /// not carry.
     NoSuchOrigin(crate::ops::types::NoSuchOrigin),
+    /// `NoSuchCachePolicy` (HTTP 404): a cache behaviour attaches a cache policy no readable
+    /// policy answers to (see [`unresolved_config_reference`]).
+    NoSuchCachePolicy(crate::ops::types::NoSuchCachePolicy),
+    /// `NoSuchOriginRequestPolicy` (HTTP 404): a cache behaviour attaches an origin request
+    /// policy no readable policy answers to (see [`unresolved_config_reference`]).
+    NoSuchOriginRequestPolicy(crate::ops::types::NoSuchOriginRequestPolicy),
+    /// `NoSuchResponseHeadersPolicy` (HTTP 404): a cache behaviour attaches a response
+    /// headers policy no readable policy answers to (see [`unresolved_config_reference`]).
+    NoSuchResponseHeadersPolicy(crate::ops::types::NoSuchResponseHeadersPolicy),
+    /// `NoSuchRealtimeLogConfig` (HTTP 404): a cache behaviour sends its logs through a
+    /// real-time log configuration ARN the account holds none for (see
+    /// [`unresolved_config_reference`]).
+    NoSuchRealtimeLogConfig(crate::ops::types::NoSuchRealtimeLogConfig),
+    /// `NoSuchFieldLevelEncryptionConfig` (HTTP 404): a cache behaviour encrypts fields under
+    /// a field-level encryption configuration the account does not hold (see
+    /// [`unresolved_config_reference`]).
+    NoSuchFieldLevelEncryptionConfig(crate::ops::types::NoSuchFieldLevelEncryptionConfig),
     /// `TrustedKeyGroupDoesNotExist` (HTTP 400): a behaviour trusts a key group the account
     /// does not hold.
     TrustedKeyGroupDoesNotExist(crate::ops::types::TrustedKeyGroupDoesNotExist),
@@ -559,6 +576,94 @@ pub fn absent_trusted_key_group<'c>(
         .find(|id| store.key_group(id).is_none())
 }
 
+/// The reference ONE cache behaviour of `config` makes to a resource of another kind that is
+/// not there, as the modelled refusal that reference earns — or `None` when every reference
+/// every behaviour of the configuration makes resolves.
+///
+/// A cache behaviour ATTACHES resources CloudFront holds apart from the distribution:
+/// `CachePolicyId` is "the unique identifier of the cache policy that is attached to this
+/// cache behavior", and `OriginRequestPolicyId`, `ResponseHeadersPolicyId`,
+/// `RealtimeLogConfigArn` and `FieldLevelEncryptionId` each name one of their own kind the
+/// same way. None of them is part of the configuration, so a behaviour naming one that does
+/// not exist describes something CloudFront could not serve — which is why every operation
+/// that writes a whole `DistributionConfig` declares a `NoSuch…` error per kind, and why each
+/// reference is resolved on the way IN, before anything is stored.
+///
+/// Resolved against the same records the resource's own read answers from — the account's and
+/// the ones AWS published, through the `readable_…` lookups — so a stored behaviour can never
+/// attach something a `Get…` would answer `NoSuch…` for. The mirror of the in-use rules that
+/// keep an attached resource from being deleted
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`] and
+/// its siblings): the two together are why no stored behaviour attaches a resource that is
+/// gone.
+///
+/// The behaviours are walked in the order [`behavior_members`] reports them and each
+/// behaviour's references in the order the two behaviour shapes declare them, so a
+/// configuration carrying several unresolved references is always refused with the same one.
+/// An absent or EMPTY member attaches nothing ([`attached_identifier`]).
+pub fn unresolved_config_reference(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    config: &DistributionConfig,
+) -> Option<ConfigMemberRefusal> {
+    behavior_members(config)
+        .into_iter()
+        .find_map(|behavior| behavior.unresolved_reference(store))
+}
+
+/// The identifier a reference member of a cache behaviour carries, or `None` when the member
+/// attaches nothing.
+///
+/// An absent member and an EMPTY one are the same thing — [`resolve_distribution_config`]
+/// stores the empty string for a behaviour that attached no field-level encryption
+/// configuration, exactly as it does for an origin that named no origin access control
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unknown_origin_access_control`]) — so
+/// neither is a reference and neither resolves to anything.
+fn attached_identifier(member: Option<&str>) -> Option<&str> {
+    member.filter(|identifier| !identifier.is_empty())
+}
+
+impl BehaviorMembers<'_> {
+    /// The first reference THIS behaviour makes that `store` holds nothing for, as the
+    /// modelled refusal it earns ([`unresolved_config_reference`] states the rule).
+    fn unresolved_reference(
+        &self,
+        store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    ) -> Option<ConfigMemberRefusal> {
+        let [field_level_encryption, realtime_log_config, cache_policy, origin_request_policy, response_headers_policy] =
+            self.attached.map(attached_identifier);
+        if field_level_encryption
+            .is_some_and(|id| store.field_level_encryption_config(id).is_none())
+        {
+            return Some(ConfigMemberRefusal::NoSuchFieldLevelEncryptionConfig(
+                no_such_field_level_encryption_config(),
+            ));
+        }
+        if realtime_log_config.is_some_and(|arn| store.realtime_log_config_by_arn(arn).is_none()) {
+            return Some(ConfigMemberRefusal::NoSuchRealtimeLogConfig(
+                no_such_realtime_log_config(),
+            ));
+        }
+        if cache_policy.is_some_and(|id| store.readable_cache_policy(id).is_none()) {
+            return Some(ConfigMemberRefusal::NoSuchCachePolicy(no_such_cache_policy()));
+        }
+        if origin_request_policy
+            .is_some_and(|id| store.readable_origin_request_policy(id).is_none())
+        {
+            return Some(ConfigMemberRefusal::NoSuchOriginRequestPolicy(
+                no_such_origin_request_policy(),
+            ));
+        }
+        if response_headers_policy
+            .is_some_and(|id| store.readable_response_headers_policy(id).is_none())
+        {
+            return Some(ConfigMemberRefusal::NoSuchResponseHeadersPolicy(
+                no_such_response_headers_policy(),
+            ));
+        }
+        None
+    }
+}
+
 /// The modelled `TrustedKeyGroupDoesNotExist` (HTTP 400) for a behaviour trusting a key group
 /// the account does not hold.
 pub fn trusted_key_group_does_not_exist() -> crate::ops::types::TrustedKeyGroupDoesNotExist {
@@ -581,6 +686,11 @@ struct BehaviorMembers<'a> {
     ttls: [Option<i64>; 3],
     /// The key groups whose public keys the behaviour trusts, where it states any.
     trusted_key_groups: Option<&'a TrustedKeyGroups>,
+    /// The five resources of ANOTHER kind the behaviour attaches by identifier, in the order
+    /// the two behaviour shapes declare them: `FieldLevelEncryptionId`,
+    /// `RealtimeLogConfigArn`, `CachePolicyId`, `OriginRequestPolicyId` and
+    /// `ResponseHeadersPolicyId` ([`unresolved_config_reference`] resolves them).
+    attached: [Option<&'a str>; 5],
 }
 
 impl<'a> From<&'a DefaultCacheBehavior> for BehaviorMembers<'a> {
@@ -590,6 +700,13 @@ impl<'a> From<&'a DefaultCacheBehavior> for BehaviorMembers<'a> {
             forwarded_values: behavior.forwarded_values.as_ref(),
             ttls: [behavior.min_ttl, behavior.default_ttl, behavior.max_ttl],
             trusted_key_groups: behavior.trusted_key_groups.as_ref(),
+            attached: [
+                behavior.field_level_encryption_id.as_deref(),
+                behavior.realtime_log_config_arn.as_deref(),
+                behavior.cache_policy_id.as_deref(),
+                behavior.origin_request_policy_id.as_deref(),
+                behavior.response_headers_policy_id.as_deref(),
+            ],
         }
     }
 }
@@ -601,6 +718,13 @@ impl<'a> From<&'a CacheBehavior> for BehaviorMembers<'a> {
             forwarded_values: behavior.forwarded_values.as_ref(),
             ttls: [behavior.min_ttl, behavior.default_ttl, behavior.max_ttl],
             trusted_key_groups: behavior.trusted_key_groups.as_ref(),
+            attached: [
+                behavior.field_level_encryption_id.as_deref(),
+                behavior.realtime_log_config_arn.as_deref(),
+                behavior.cache_policy_id.as_deref(),
+                behavior.origin_request_policy_id.as_deref(),
+                behavior.response_headers_policy_id.as_deref(),
+            ],
         }
     }
 }
@@ -802,6 +926,21 @@ macro_rules! config_member_error {
             }
             $crate::state::ConfigMemberRefusal::NoSuchOrigin(error) => {
                 $error::NoSuchOrigin(error)
+            }
+            $crate::state::ConfigMemberRefusal::NoSuchCachePolicy(error) => {
+                $error::NoSuchCachePolicy(error)
+            }
+            $crate::state::ConfigMemberRefusal::NoSuchOriginRequestPolicy(error) => {
+                $error::NoSuchOriginRequestPolicy(error)
+            }
+            $crate::state::ConfigMemberRefusal::NoSuchResponseHeadersPolicy(error) => {
+                $error::NoSuchResponseHeadersPolicy(error)
+            }
+            $crate::state::ConfigMemberRefusal::NoSuchRealtimeLogConfig(error) => {
+                $error::NoSuchRealtimeLogConfig(error)
+            }
+            $crate::state::ConfigMemberRefusal::NoSuchFieldLevelEncryptionConfig(error) => {
+                $error::NoSuchFieldLevelEncryptionConfig(error)
             }
             $crate::state::ConfigMemberRefusal::TrustedKeyGroupDoesNotExist(error) => {
                 $error::TrustedKeyGroupDoesNotExist(error)

@@ -167,6 +167,20 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // whose reason reads `<the service's sentence> (Service: CleanRoomsMl, Status Code: 400,
     // Request ID: …) (SDK Attempt Count: …)` with `HandlerErrorCode: InvalidRequest`).
     ("cleanrooms-ml", "CleanRoomsMl", SdkDiagnostic::Attempts),
+    // Amazon CloudFront's SDK names it by that model's own `sdkId` (`CloudFront`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::CloudFront::Distribution` whose `DefaultCacheBehavior` names a cache policy that
+    // does not exist carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudfront.deploy-cloudfront-1-distribution-nonexistent-cache-policy-rejected-rolls-back`,
+    // whose reason quotes the service's sentence followed by the SDK's envelope for the 404 —
+    // `(Service: CloudFront, Status Code: 404, Request ID: …)` — with
+    // `HandlerErrorCode: InvalidRequest`, the class that type's provider puts a refusal naming a
+    // resource the DECLARATION references in ([`cloudfront_resources::handler_error_class`]).
+    // Every type this emulator provisions over this signing name is that service's
+    // ([`provisioning::cloudfront_resources`] and the modules beside it).
+    ("cloudfront", "CloudFront", SdkDiagnostic::Attempts),
     // AWS CodePipeline's SDK names it by that model's own `sdkId` (`CodePipeline`,
     // `smithy_query(query="service_info")` on that service's model), which is also the
     // `cloudFormationName` the type names of its resources carry. The shape is the
