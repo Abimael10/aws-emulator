@@ -43,7 +43,11 @@
 //!   logging — so the `Enabled` the API requires is written from whether the declaration
 //!   names a bucket;
 //! * `CallerReference` is required by the API and published by neither type, so
-//!   CloudFormation supplies one ([`caller_reference`]).
+//!   CloudFormation supplies one ([`caller_reference`]);
+//! * a member the API demands of the document while the resource type publishes the property
+//!   as optional — the configuration's `Comment` and `PriceClass`, a custom origin's two
+//!   ports — is sent at the value the resource behaves by without it, because the handler is
+//!   what states it ([`supplied_config_member`], [`DEFAULT_CUSTOM_ORIGIN_PORTS`]).
 //!
 //! Everything else is passed through under the name the template wrote, which is the name
 //! the API takes. WHICH names are judged here is exactly two levels: a property the TYPE does
@@ -226,6 +230,47 @@ const DISTRIBUTION_CONFIG_MEMBERS: &[&str] = &[
     "ConnectionFunctionAssociation",
     "CacheTagConfig",
 ];
+
+/// The `ConnectionMode` a MULTI-TENANT distribution declares: the mode that says the
+/// distribution serves the tenants bound to it rather than traffic of its own
+/// (`DistributionConfig$ConnectionMode`, "whether the connection mode is through a standard
+/// distribution (direct) or a multi-tenant distribution with distribution tenants
+/// (tenant-only)").
+///
+/// Which members a configuration may carry follows from it, so it is what decides whether a
+/// member only a standard distribution has is supplied at all
+/// ([`supplied_config_member`]).
+const TENANT_ONLY_CONNECTION_MODE: &str = "tenant-only";
+
+/// The member a declaration describes a MULTI-TENANT distribution's tenants with, which is the
+/// second signal that a configuration is a multi-tenant one
+/// ([`declares_a_multi_tenant_distribution`]): `TenantConfig` "only supports multi-tenant
+/// distributions. You can't specify this field for standard distributions"
+/// (`smithy_query(query="shape",shape="DistributionConfig")`).
+const TENANT_CONFIG_MEMBER: &str = "TenantConfig";
+
+/// The price class a distribution serves under when its configuration states none:
+/// `PriceClass_All`, the value whose documented behaviour is the one a configuration without
+/// the member gets — "If you specify `PriceClass_All`, CloudFront responds to requests for
+/// your objects from all CloudFront edge locations"
+/// (`smithy_query(query="doc",shape="DistributionConfig",member="PriceClass")`), which is
+/// what CloudFront does for a distribution that chose no class.
+const DEFAULT_PRICE_CLASS: &str = "PriceClass_All";
+
+/// The two ports a CUSTOM ORIGIN is reached on when its declaration names neither: the
+/// defaults CloudFront's own model documents for them — `CustomOriginConfig$HTTPPort` "The
+/// default value is `80`" and `$HTTPSPort` "The default value is `443`"
+/// (`smithy_query(query="doc",shape="CustomOriginConfig",member="HTTPPort")`) — while both
+/// members are `@required` on the wire
+/// (`smithy_query(query="shape",shape="CustomOriginConfig")`), so the handler is what supplies
+/// them for a template that states only the protocol policy.
+///
+/// The OWNING service reads the same two documented values for the ports an origin
+/// configuration may name at all (its own `DEFAULT_ORIGIN_PORTS`, in
+/// `services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/state/configuration.rs`);
+/// they are restated here because nothing of that crate's state is reachable from this one, and
+/// each doc names the other so the two cannot drift silently.
+const DEFAULT_CUSTOM_ORIGIN_PORTS: &[(&str, &str)] = &[("HTTPPort", "80"), ("HTTPSPort", "443")];
 
 /// The members `OriginAccessControlConfig` publishes, in the order that shape declares them.
 /// The template spells each one identically.
@@ -752,9 +797,10 @@ fn distribution_config_document(
 /// that shape declares them.
 ///
 /// `CallerReference` comes first, as the shape declares it, and is CloudFormation's to
-/// supply ([`caller_reference`]). `Comment` is REQUIRED by the API and optional in a
-/// template, so a declaration that states none sends the empty comment rather than leaving
-/// the member out of a document the service would refuse.
+/// supply ([`caller_reference`]). A member the API demands of the document that the resource
+/// type publishes as optional is supplied here too, at the value the resource behaves by when
+/// a template states none ([`supplied_config_member`]), rather than left out of a document
+/// the service would refuse.
 fn distribution_config_members(
     properties: &Value,
     resource: &StoredResource,
@@ -775,14 +821,66 @@ fn distribution_config_members(
     let mut rendered = xml_leaf("CallerReference", &caller_reference(resource, propagated));
     for member in DISTRIBUTION_CONFIG_MEMBERS {
         let Some(value) = declared.get(*member).filter(|value| !value.is_null()) else {
-            if *member == "Comment" {
-                rendered.push_str(&xml_leaf("Comment", ""));
+            if let Some(supplied) = supplied_config_member(member, declared) {
+                rendered.push_str(&xml_leaf(api_member(member), supplied));
             }
             continue;
         };
         rendered.push_str(&rendered_member(member, value, declared, "DistributionConfig"));
     }
     Ok(rendered)
+}
+
+/// The value CloudFormation itself puts in the document for a `DistributionConfig` member the
+/// declaration states none of, or `None` for a member a configuration is complete without.
+///
+/// A resource type publishes a property as OPTIONAL where the resource behaves a documented
+/// way without it, while the API the handler calls demands the member — so the handler, not
+/// the template author, is what states that documented value. Two members of this
+/// configuration are such a member:
+///
+/// * `Comment` is `@required` on the wire and optional in a template, so a declaration that
+///   describes the distribution with no comment sends the empty one;
+/// * `PriceClass` is what the API demands of a configuration being WRITTEN — an update
+///   submits the configuration whole, so a member the resource carries and the document
+///   leaves out is refused rather than defaulted (`IllegalUpdate`, "Price class is missing
+///   for the resource") — and a distribution that chose no class serves from all edge
+///   locations ([`DEFAULT_PRICE_CLASS`]). It "only supports standard distributions. You
+///   can't specify this field for multi-tenant distributions", so it is supplied for exactly
+///   the configurations that serve traffic of their own and a `tenant-only` one is complete
+///   without it.
+fn supplied_config_member(member: &str, declared: &Map<String, Value>) -> Option<&'static str> {
+    match member {
+        "Comment" => Some(""),
+        "PriceClass" if !declares_a_multi_tenant_distribution(declared) => {
+            Some(DEFAULT_PRICE_CLASS)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the declared configuration is a MULTI-TENANT distribution's, read as the service
+/// that owns the rule reads it: its `ConnectionMode` is [`TENANT_ONLY_CONNECTION_MODE`], OR it
+/// describes tenants at all ([`TENANT_CONFIG_MEMBER`]).
+///
+/// Both signals, because CloudFront itself decides tenancy from both (its own
+/// `is_multi_tenant`, in
+/// `services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/state`) and refuses a
+/// member only a standard distribution has on every configuration that reads as multi-tenant:
+/// a declaration carrying a `TenantConfig` and no mode is such a configuration, so supplying
+/// it a price class would turn a deployment that CloudFront takes into one it refuses.
+///
+/// A configuration that states neither is a standard distribution's — "the connection mode is
+/// through a standard distribution (direct)" is what CloudFront gives one that chose none.
+fn declares_a_multi_tenant_distribution(declared: &Map<String, Value>) -> bool {
+    let tenant_only = declared
+        .get("ConnectionMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode == TENANT_ONLY_CONNECTION_MODE);
+    tenant_only
+        || declared
+            .get(TENANT_CONFIG_MEMBER)
+            .is_some_and(|value| !value.is_null())
 }
 
 /// The `OriginAccessControlConfig` document a create or an update of an origin access
@@ -860,9 +958,11 @@ fn rendered_member(member: &str, value: &Value, siblings: &Map<String, Value>, o
 /// The members of one declared STRUCTURE, in the order the declaration wrote them. `owner` is
 /// the member name that structure is written under.
 ///
-/// Two structures carry a member the API does not take from a template, and both are
+/// Three structures carry a member the API does not take from a template, and all of them are
 /// written here:
 ///
+/// * a `CustomOriginConfig` has two `@required` PORTS a template may leave out, each with a
+///   documented default ([`DEFAULT_CUSTOM_ORIGIN_PORTS`]);
 /// * a template's `Logging` has no `Enabled` member — "if you don't want to enable logging …
 ///   specify `false` for `Enabled`, and specify empty `Bucket` and `Prefix` elements"
 ///   (`LoggingConfig$Enabled`), so declaring a bucket to log into IS enabling logging and
@@ -871,6 +971,16 @@ fn rendered_member(member: &str, value: &Value, siblings: &Map<String, Value>, o
 ///   into the restriction itself ([`ListShape::IntoTheParent`]).
 fn rendered_structure(owner: &str, members: &Map<String, Value>) -> String {
     let mut rendered = String::new();
+    // A custom origin's two PORTS are `@required` on the wire and optional in a template,
+    // which documents the default each of them has: the handler states that default for a
+    // declaration that named only the protocol policy ([`DEFAULT_CUSTOM_ORIGIN_PORTS`]).
+    if owner == "CustomOriginConfig" {
+        for (member, default) in DEFAULT_CUSTOM_ORIGIN_PORTS {
+            if members.get(*member).filter(|value| !value.is_null()).is_none() {
+                rendered.push_str(&xml_leaf(member, default));
+            }
+        }
+    }
     if owner == "Logging" && !members.contains_key("Enabled") {
         let enabled = members
             .get("Bucket")
