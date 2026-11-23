@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNotebook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNotebook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNotebook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The CONTENT of a notebook, replaced where it is stored: the update writes the ipynb
+//! document the request carried over the one the notebook's
+//! [`crate::state::NotebookRecord`] holds and moves its `LastModifiedTime` to the instant of
+//! that write, so `ExportNotebook` and `GetNotebookMetadata` answer out of the same record
+//! afterwards. Nothing that identifies the notebook changes — its id, its name and the
+//! workgroup it lives in are not members of this request. A notebook a session is still
+//! serving is written through THAT session, which is what `SessionId` names, and an id no
+//! create or import minted names no notebook whose content could be replaced.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +149,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNotebook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNotebookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNotebook"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("Athena state is not reachable on this engine"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "Updates the contents of a Spark notebook": the content belongs to the notebook
+        // the `NotebookId` names, so an id no create or import minted names nothing whose
+        // content could be replaced — the one refusal every operation of this service that
+        // addresses ONE notebook states for that miss.
+        let Some(record) = store.notebooks.notebook(&input.notebook_id) else {
+            return Err(UpdateNotebookError::invalid_request(
+                crate::state::ERROR_CODE_NOTEBOOK_NOT_FOUND,
+                crate::state::notebook_not_found(&input.notebook_id),
+            ));
+        };
+
+        // `ClientRequestToken` is "a unique case-sensitive string used to ensure the request
+        // ... is idempotent (executes only once)", so a repeat under the token the stored
+        // content already stands under writes nothing further: the notebook keeps the
+        // instant of that one write rather than being modified again. The same token
+        // carrying OTHER content describes another update, which is what this service's
+        // `ClientRequestToken` refusal reports.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if record.last_update_token.as_deref() == Some(token) {
+                if record.payload != input.payload {
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                    ));
+                }
+                return Ok(UpdateNotebookOutput {});
+            }
+        }
+
+        // `SessionId` is "the active notebook session ID. Required if the notebook has an
+        // active session": while a session serves the notebook, the content is written
+        // through that session, so a request naming one names a session this account holds
+        // that is still running and was started in THIS notebook, and a request naming none
+        // can be performed only on a notebook no session is serving.
+        match input.session_id.as_deref() {
+            Some(session_id) => {
+                let serves_this_notebook = store.sessions.session(session_id).is_some_and(|session| {
+                    session.is_active_at(now)
+                        && session.notebook_id.as_deref() == Some(input.notebook_id.as_str())
+                });
+                if !serves_this_notebook {
+                    // The id names no session this service will write a notebook through:
+                    // one it holds no record of, one whose resources are no longer running,
+                    // or one serving another notebook. The one refusal every
+                    // session-addressed request of this service states for that.
+                    return Err(crate::state::session_not_authorized());
+                }
+            }
+            None => {
+                if !store
+                    .sessions
+                    .notebook_sessions_at(&input.notebook_id, now)
+                    .is_empty()
+                {
+                    return Err(invalid_request(
+                        crate::state::NOTEBOOK_SESSION_ID_REQUIRED,
+                    ));
+                }
+            }
+        }
+
+        // The new content REPLACES what the notebook held, so what this emulator keeps is
+        // weighed against the same budget a create or an import is weighed against, less the
+        // content this notebook is about to stop holding.
+        if store
+            .notebooks
+            .would_exceed_capacity_replacing(&input.notebook_id, input.payload.len())
+        {
+            return Err(invalid_request(crate::state::notebook_capacity_exhausted()));
+        }
+
+        let Some(record) = store.notebooks.notebook_mut(&input.notebook_id) else {
+            // Unreachable: the notebook was read above under this same guard, which nothing
+            // else can take in between.
+            return Err(internal("the notebook to update is no longer stored"));
+        };
+        record.write_payload(
+            input.payload,
+            // "The notebook content type. Currently, the only valid type is IPYNB", which
+            // the boundary has already refused every other spelling of: the type of the
+            // content the notebook now holds is the type this request wrote it as.
+            input.r#type,
+            input.client_request_token,
+            now,
+        );
+
+        // "Updates the contents of a Spark notebook" and reports nothing back: what the
+        // update wrote is read through `ExportNotebook` and `GetNotebookMetadata`.
+        Ok(UpdateNotebookOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Each refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> UpdateNotebookError {
+    UpdateNotebookError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
+}
+
+/// The operation's own server error (HTTP 500): "Indicates a platform issue, which may be
+/// due to a transient condition or outage."
+///
+/// What this operation answers when the store it writes cannot be reached at all — a
+/// condition of the emulator rather than of the request, so it is not stated as a bad one.
+fn internal(message: impl Into<String>) -> UpdateNotebookError {
+    UpdateNotebookErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.into()),
+    })
+    .into()
 }

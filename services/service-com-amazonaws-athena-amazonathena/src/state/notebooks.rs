@@ -9,6 +9,12 @@
 //! through the same registry, for the one notebook whose content no request carried: the
 //! empty ipynb document ([`EMPTY_IPYNB`]) it creates in the workgroup.
 //!
+//! `UpdateNotebook` replaces the content of a record that is already there
+//! ([`NotebookRecord::write_payload`]) rather than writing a second notebook: the id the
+//! notebook was minted under, its name and the workgroup it lives in are not what an update
+//! of the contents carries, so a read after an update reports the same notebook holding the
+//! new document.
+//!
 //! A notebook has no lifecycle the clock owes: Athena answers a create or an import with
 //! the notebook already readable, so the record is stored complete and no read has to
 //! materialise a pending transition.
@@ -95,6 +101,15 @@ pub struct NotebookRecord {
     /// `NotebookMetadata$LastModifiedTime`. The creation instant until something updates
     /// the notebook.
     pub last_modified_at: SystemTime,
+    /// The `ClientRequestToken` the last update of this notebook's content carried, when it
+    /// carried one.
+    ///
+    /// What makes that update "idempotent (executes only once)": a request arriving again
+    /// under the token the content already stands under writes nothing further, so the
+    /// notebook keeps the instant of the ONE write it was changed by. `None` on a notebook
+    /// nothing has updated, and on one whose last update carried no token — a write nothing
+    /// identifies cannot be recognised as a repeat.
+    pub last_update_token: Option<String>,
 }
 
 impl NotebookRecord {
@@ -108,6 +123,27 @@ impl NotebookRecord {
             r#type: Some(self.notebook_type.clone()),
             last_modified_time: Some(reported_time(self.last_modified_at)),
         }
+    }
+
+    /// Replace the notebook's CONTENT with `payload` of type `notebook_type` as of `now`,
+    /// remembering `token` as the request that wrote it.
+    ///
+    /// The one place a stored notebook's content changes, so the content and the instant it
+    /// was last modified at move together and no read can report new content under the
+    /// instant of an earlier write. Everything that identifies the notebook — its id, its
+    /// name, the workgroup it lives in and when it was created — is left as it was: an
+    /// update of the contents carries none of them.
+    pub fn write_payload(
+        &mut self,
+        payload: String,
+        notebook_type: String,
+        token: Option<String>,
+        now: SystemTime,
+    ) {
+        self.payload = payload;
+        self.notebook_type = notebook_type;
+        self.last_modified_at = now;
+        self.last_update_token = token;
     }
 }
 
@@ -133,6 +169,15 @@ impl NotebookRegistry {
     /// The notebook `id` names, or `None` when this account holds none.
     pub fn notebook(&self, id: &str) -> Option<&NotebookRecord> {
         self.notebooks.get(id)
+    }
+
+    /// The same notebook, for a caller that is going to write its content (an update).
+    ///
+    /// The byte budget below is weighed by that caller first
+    /// ([`Self::would_exceed_capacity_replacing`]), because a replacement changes how much
+    /// content the registry holds without changing how many notebooks it holds.
+    pub fn notebook_mut(&mut self, id: &str) -> Option<&mut NotebookRecord> {
+        self.notebooks.get_mut(id)
     }
 
     /// The notebook a `ClientRequestToken` already minted, if it did.
@@ -207,6 +252,20 @@ impl NotebookRegistry {
     pub fn would_exceed_capacity(&self, payload_bytes: usize) -> bool {
         self.len() >= MAX_NOTEBOOKS
             || self.stored_bytes().saturating_add(payload_bytes) > MAX_NOTEBOOK_BYTES_TOTAL
+    }
+
+    /// Whether storing `payload_bytes` as the content of the notebook `id`, IN PLACE of the
+    /// content it holds, would pass the byte budget.
+    ///
+    /// Only the byte budget: a replacement stores no further notebook, so the count bound
+    /// [`MAX_NOTEBOOKS`] has nothing to say about it, and the content this notebook stops
+    /// holding is no longer held once the new content is written.
+    pub fn would_exceed_capacity_replacing(&self, id: &str, payload_bytes: usize) -> bool {
+        let held = self.notebook(id).map_or(0, |record| record.payload.len());
+        self.stored_bytes()
+            .saturating_sub(held)
+            .saturating_add(payload_bytes)
+            > MAX_NOTEBOOK_BYTES_TOTAL
     }
 
     /// Store `record`, under `token` when the request carried one.
@@ -330,6 +389,17 @@ pub fn notebook_name_exists(work_group: &str, name: &str) -> String {
 /// carries no name, no id and no value from the request, and reads the same whichever
 /// workgroup — a named SQL one or the account's default — the request pointed at.
 pub const WORK_GROUP_ENGINE_VERSION_NOT_SPARK: &str = "Workgroup EngineVersion is not Spark.";
+
+/// The message an update of a notebook a session is still serving, that names no session, is
+/// refused with.
+///
+/// The requirement `UpdateNotebookInput$SessionId` states: "The active notebook session ID.
+/// Required if the notebook has an active session." While a session serves the notebook, the
+/// content is written through THAT session, so a request naming none names nothing to write
+/// it through. Fixed text: the requirement is about the notebook having a session at all, so
+/// the sentence carries no id from the request or from the state.
+pub const NOTEBOOK_SESSION_ID_REQUIRED: &str =
+    "SessionId is required if the notebook has an active session.";
 
 /// The message an import that names neither source, or both, is refused with.
 ///
