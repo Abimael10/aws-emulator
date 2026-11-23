@@ -58,7 +58,13 @@
 //! instance of a component type, while an entry that PATCHES a stored component
 //! may leave the member out and keep the id the component has), a component of
 //! an ABSTRACT component type
-//! ([`crate::state::abstract_component_type_violation`]), a property
+//! ([`crate::state::abstract_component_type_violation`]), a component — at any
+//! path — that would leave the entity holding a second component of one
+//! SINGLETON component type, the member that says whether "an entity can have
+//! more than one component of this type"
+//! ([`crate::state::singleton_component_type_violation`], the multiplicity rule
+//! `CreateEntity` applies to the record it writes, asked of the whole patched
+//! record), a property
 //! definition left with no `dataType` — neither its own nor one inherited from
 //! the component type its holder instantiates
 //! ([`crate::state::Workspace::component_property_definition_needs_data_type`]),
@@ -349,6 +355,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.entity_id,
                 parent_entity_update,
             )?;
+        }
+
+        // A SINGLETON component type is one an entity holds at most one
+        // component of ("whether an entity can have more than one component of
+        // this type"), so a patch that would leave this entity holding a second
+        // component of one is refused — the multiplicity rule
+        // `CreateEntity` applies to the record it writes
+        // (`crate::state::singleton_component_type_violation`), asked of the
+        // whole patched record so the components an earlier call stored count
+        // too, and against the record as it STOOD so a type some later
+        // `UpdateComponentType` declared a singleton while this entity already
+        // held several components of it is not this call's to refuse.
+        if let Some(message) =
+            crate::state::singleton_component_type_violation(workspace, &updated, Some(stored))
+        {
+            return Err(validation(message));
         }
 
         // The emulator's declared ceilings on ONE entity's contents, checked

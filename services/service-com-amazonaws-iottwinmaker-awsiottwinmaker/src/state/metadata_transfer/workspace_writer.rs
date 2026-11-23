@@ -429,6 +429,14 @@ fn write_entity(
         // Where the entity came from; see [`write_component_type`].
         sync_source: sync_source.map(str::to_string),
     };
+    if let Some(message) = singleton_component_type_violation(workspace, &record, None) {
+        // A SINGLETON component type is one an entity holds at most one
+        // component of, so an entry describing a second component of one
+        // describes no entity this workspace could hold — the multiplicity rule
+        // the control plane's writers apply to the record they store.
+        report.failed(ENTRY_KIND_ENTITY, entity_id, message);
+        return;
+    }
     if let Some(message) = entity_contents_over_ceiling(&record) {
         report.failed(ENTRY_KIND_ENTITY, entity_id, message);
         return;

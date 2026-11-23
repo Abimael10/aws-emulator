@@ -2433,6 +2433,98 @@ pub fn abstract_component_type_violation(
         .then(|| abstract_component_type_message(component_type_id))
 }
 
+/// Why a second component of the component type `component_type_id` cannot be
+/// created, as the message a `ValidationException` carries: the component type
+/// is a SINGLETON, so one entity holds at most one component of it. Built from
+/// the request — it names the component type the call asked for more than once
+/// — so a caller is told which one to change, exactly as
+/// [`abstract_component_type_message`] names the one it refused.
+pub fn singleton_component_type_message(component_type_id: &str) -> String {
+    format!(
+        "Singleton ComponentType {component_type_id} can not be used for creating more than one \
+         component in an entity"
+    )
+}
+
+/// How many components `entity` would hold of each SINGLETON component type of
+/// `workspace`, keyed by component type id and holding only the types at least
+/// one component instantiates.
+///
+/// A component type whose `isSingleton` is set is one that "specifies whether an
+/// entity can have more than one component of this type" (the member's own
+/// documentation, carried by [`ComponentType::is_singleton`]), so an entity
+/// holds at most ONE component of such a type and every further component of it
+/// is one too many.
+///
+/// Counted over every component the entity holds at every path
+/// ([`Entity::components_at_every_path`]), top-level and composite alike: a
+/// composite component instantiates a component type of its own and `GetEntity`
+/// and `ListComponents` both report it as a component of the entity, so it is
+/// one of the components the entity "has" — the same reach the abstractness
+/// rule has over an entity's components.
+///
+/// A component type the workspace does not hold is left out, for the reason
+/// [`abstract_component_type_violation`] leaves one alone: a real workspace
+/// carries more built-in component types than this emulator models, and nothing
+/// is known about the multiplicity of one that is not stored.
+fn singleton_component_counts(workspace: &Workspace, entity: &Entity) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for component in entity.components_at_every_path() {
+        let Some(component_type_id) = component.component_type_id() else {
+            continue;
+        };
+        let is_singleton = workspace
+            .component_types
+            .get(component_type_id)
+            .is_some_and(|component_type| component_type.is_singleton);
+        if is_singleton {
+            *counts.entry(component_type_id.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Why the components `entity` would hold cannot be written — `None` when they
+/// can — as the message a `ValidationException` carries: one of them is a
+/// further component of a SINGLETON component type the entity already holds one
+/// of ([`singleton_component_counts`], [`singleton_component_type_message`]).
+///
+/// Asked of the RECORD a writer is about to store rather than of the request it
+/// was built from, so the components an earlier call already stored count
+/// towards the multiplicity exactly as the ones this call adds, and so one rule
+/// answers a create, a patch and a transferred metadata document alike — the
+/// reason [`abstract_component_type_violation`] is shared by every writer of an
+/// entity's components.
+///
+/// `stored` is the record as it stood BEFORE this write, and `None` for a writer
+/// that is bringing the entity into being. The refusal is about what THIS call
+/// adds: a call is refused when it would leave the entity holding more
+/// components of a singleton type than it already held, and more than one.
+/// `isSingleton` is a member of the component type rather than of the entity, so
+/// an `UpdateComponentType` can declare a type a singleton while entities
+/// already hold several components of it; a patch that leaves such an entity's
+/// count where it was — or lowers it — is therefore accepted, since refusing it
+/// would leave that entity unpatchable, the reading `UpdateEntity` already gives
+/// a property definition an earlier write left stranded.
+///
+/// The component types are walked in id order, so which one a refusal names
+/// never depends on a map's iteration order.
+pub fn singleton_component_type_violation(
+    workspace: &Workspace,
+    entity: &Entity,
+    stored: Option<&Entity>,
+) -> Option<String> {
+    let before = stored
+        .map(|stored| singleton_component_counts(workspace, stored))
+        .unwrap_or_default();
+    singleton_component_counts(workspace, entity)
+        .into_iter()
+        .find(|(component_type_id, count)| {
+            *count > 1 && *count > before.get(component_type_id).copied().unwrap_or_default()
+        })
+        .map(|(component_type_id, _)| singleton_component_type_message(&component_type_id))
+}
+
 /// The id prefix the service's own BUILT-IN component types carry.
 ///
 /// IoT TwinMaker publishes the component types it ships under the reserved

@@ -7,7 +7,7 @@
 //! terminal `ACTIVE` state, which is the state recorded traffic reads a
 //! just-created entity back in.
 //!
-//! Eleven refusals this handler owns, each a `ValidationException` (the model
+//! Twelve refusals this handler owns, each a `ValidationException` (the model
 //! declares no `ResourceNotFoundException` for `CreateEntity`):
 //!
 //! * `tags` names a key in the reserved `aws:` namespace
@@ -58,6 +58,13 @@
 //!   has no way to serve the values of a property it declares, so it is
 //!   extended rather than instantiated, and a component of one is refused
 //!   BEFORE anything is stored;
+//! * two components — top-level or composite, at any path — instantiate one
+//!   component type the workspace holds and that type is a SINGLETON
+//!   ([`crate::state::ComponentType::is_singleton`]): the member says whether
+//!   "an entity can have more than one component of this type", so an entity
+//!   holds at most one component of such a type and the whole request is
+//!   refused BEFORE anything is stored
+//!   ([`crate::state::singleton_component_type_violation`]);
 //! * a requested property GROUP of a component — top-level or composite —
 //!   carries a `groupType` outside the modelled `GroupType` value list (the
 //!   boundary answers that one on the wire too), or names in `propertyNames` a
@@ -548,6 +555,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sync_source: None,
         };
         let created_state = entity.state.clone();
+
+        // A SINGLETON component type is one an entity holds at most one
+        // component of ("whether an entity can have more than one component of
+        // this type"), so a create carrying a second component of one is
+        // refused before anything is stored — the component-type-level
+        // multiplicity rule beside the abstractness rule above
+        // (`crate::state::singleton_component_type_violation`), asked of the
+        // record this create would store so one pass covers the top-level
+        // components and the composite ones alike. Nothing is stored yet, so
+        // the call brings every component it counts into being.
+        if let Some(message) =
+            crate::state::singleton_component_type_violation(workspace, &entity, None)
+        {
+            return Err(validation(message).into());
+        }
 
         // The emulator's declared ceilings on ONE entity's contents
         // (`crate::state::entity_contents_over_ceiling`), applied to the record

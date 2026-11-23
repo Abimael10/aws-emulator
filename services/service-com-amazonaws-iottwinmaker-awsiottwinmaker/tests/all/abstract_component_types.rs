@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Abstract component types, end to end over HTTP.
+//! Abstract component types and SINGLETON ones, end to end over HTTP.
 //!
 //! Every case drives the real request path — `MultiServiceRouter::dispatch`, the
 //! same entry the served emulator uses — so a route, a label, a status code and
 //! a serialized body are all exercised, not just a handler body.
 //!
-//! The RULE under test: a component type that declares an externally stored
+//! Two rules a component TYPE decides for the components that instantiate it,
+//! which is why they share a suite.
+//!
+//! The first: a component type that declares an externally stored
 //! property and carries no data connector that could read or write one — its
 //! own or an inherited one — has no way to serve that property's values, so it
 //! is ABSTRACT: `GetComponentType` reports `isAbstract` true for it, and a
@@ -19,6 +22,17 @@
 //! property or the connector is the type's own or inherited, and how many
 //! properties the type declares — because those are the dimensions the rule
 //! ranges over; the time-series row is the one recorded traffic observed.
+//!
+//! The second: a component type created or updated with `isSingleton` is one
+//! whose member says whether "an entity can have more than one component of
+//! this type", so an entity holds at most ONE component of such a type and a
+//! write that would leave it holding a further one is refused with the same
+//! modelled 400 `ValidationException` before anything is stored. Those rows
+//! differ along how many components of the type one request carries, whether
+//! they are the entity's own top-level components or composite components below
+//! them, which writer carries them (`CreateEntity`, `UpdateEntity`'s
+//! `componentUpdates` and `compositeComponentUpdates`) and whether the type is a
+//! singleton at all.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
@@ -486,4 +500,657 @@ async fn a_patch_that_changes_the_connector_changes_abstractness() {
             "case {case:?}: expected HTTP {expected} from CreateEntity, got {created:?}"
         );
     }
+}
+
+/// A component type created with `isSingleton` true, so an entity holds at most
+/// one component of it.
+const SINGLETON: &str = "com.example.singleton.motor";
+/// The same shape declared with `isSingleton` false: an entity holds as many
+/// components of it as it likes.
+const MULTIPLE: &str = "com.example.plain.sensor";
+/// A singleton component type a holder DECLARES as a composite component type,
+/// so an entity reaches a component of it BELOW one of its own components.
+const SINGLETON_LEAF: &str = "com.example.singleton.leaf";
+/// The holder whose `compositeComponentTypes` name the leaves the composite rows
+/// address.
+const HOLDER: &str = "com.example.singleton.holder";
+/// A `componentTypeId` the workspace holds no component type under: nothing is
+/// known about the multiplicity of one that is not stored, so components of it
+/// are not counted.
+const UNHELD_TYPE: &str = "com.example.not.in.this.workspace";
+
+/// The refusal AWS builds from the request for a further component of a
+/// singleton component type: it names the component type the call asked for,
+/// exactly as the abstractness refusal above names the one it refused.
+fn singleton_refusal(component_type_id: &str) -> String {
+    format!(
+        "Singleton ComponentType {component_type_id} can not be used for creating more than one \
+         component in an entity"
+    )
+}
+
+/// The workspace with the singleton, non-singleton and holder component types
+/// the singleton rows instantiate, each read back through `GetComponentType` so
+/// the rule's INPUT — the flag the create declared — is pinned before anything
+/// is asked of it.
+async fn with_singleton_types() -> Emulator {
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator.create_workspace(WORKSPACE).await.status,
+        200,
+        "the workspace every singleton case works in must exist"
+    );
+    // (componentTypeId, the create body, the `isSingleton` a read must report).
+    let component_types = [
+        (
+            SINGLETON,
+            json!({
+                "isSingleton": true,
+                "propertyDefinitions": {"rpm": {"dataType": {"type": "DOUBLE"}}},
+            }),
+            true,
+        ),
+        (
+            MULTIPLE,
+            json!({
+                "isSingleton": false,
+                "propertyDefinitions": {"Label": {"dataType": {"type": "STRING"}}},
+            }),
+            false,
+        ),
+        (SINGLETON_LEAF, json!({"isSingleton": true}), true),
+        (
+            HOLDER,
+            json!({
+                "compositeComponentTypes": {
+                    "leafA": {"componentTypeId": SINGLETON_LEAF},
+                    "leafB": {"componentTypeId": SINGLETON_LEAF},
+                    "motorLeaf": {"componentTypeId": SINGLETON},
+                    "sensorLeafA": {"componentTypeId": MULTIPLE},
+                    "sensorLeafB": {"componentTypeId": MULTIPLE},
+                },
+            }),
+            false,
+        ),
+    ];
+    for (component_type_id, body, is_singleton) in component_types {
+        let created = emulator
+            .create_component_type(WORKSPACE, component_type_id, body)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {component_type_id:?}: expected 200 from CreateComponentType, got {created:?}"
+        );
+        let read = emulator
+            .get_component_type(WORKSPACE, component_type_id)
+            .await;
+        assert_eq!(
+            read.member("isSingleton").as_bool(),
+            Some(is_singleton),
+            "case {component_type_id:?}: expected isSingleton {is_singleton}, got {read:?}"
+        );
+    }
+    emulator
+}
+
+/// The `componentTypeId` a read-back entity reports at `component_path`: a
+/// top-level component's own, or the one of the composite component a single
+/// segment below it.
+fn component_type_at_path(entity: &Resp, component_path: &str) -> Option<String> {
+    let (component_name, composite_name) = match component_path.split_once('/') {
+        Some((component_name, composite_name)) => (component_name, Some(composite_name)),
+        None => (component_path, None),
+    };
+    let component = &entity.member("components")[component_name];
+    let reported = match composite_name {
+        None => &component["componentTypeId"],
+        Some(composite_name) => {
+            &component["compositeComponents"][composite_name]["componentTypeId"]
+        }
+    };
+    reported.as_str().map(str::to_string)
+}
+
+/// Assert the entity `entity_id` holds exactly the (path, componentTypeId) pairs
+/// `expected` names, and nothing at the paths it does not.
+async fn assert_components(emulator: &Emulator, case: &str, entity_id: &str, expected: &[(&str, &str)]) {
+    let read = emulator.get_entity(WORKSPACE, entity_id).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case:?}: expected 200 from GetEntity, got {read:?}"
+    );
+    for (component_path, component_type_id) in expected {
+        assert_eq!(
+            component_type_at_path(&read, component_path).as_deref(),
+            Some(*component_type_id),
+            "case {case:?}: expected {component_path} to instantiate {component_type_id}, \
+             got {read:?}"
+        );
+    }
+    let held = read
+        .member("components")
+        .as_object()
+        .map(|components| components.len())
+        .unwrap_or_default();
+    let expected_top_level = expected
+        .iter()
+        .filter(|(component_path, _)| !component_path.contains('/'))
+        .count();
+    assert_eq!(
+        held, expected_top_level,
+        "case {case:?}: expected {expected_top_level} top-level components, got {read:?}"
+    );
+}
+
+/// RULE: an entity holds at most ONE component of a singleton component type —
+/// counted over every component it holds, top-level and composite alike — so a
+/// create carrying a further one is refused with a `ValidationException` and
+/// nothing is stored, while any number of components of a non-singleton type is
+/// accepted.
+#[tokio::test]
+async fn a_create_cannot_give_one_entity_two_components_of_a_singleton_type() {
+    let emulator = with_singleton_types().await;
+
+    // (case, which is also the entityId; the `components`; the
+    // `compositeComponents`; the component type a refusal names; the
+    // (path, componentTypeId) pairs an accepted entity reads back).
+    let rows = vec![
+        (
+            "oneSingletonComponent",
+            json!({"motorA": {"componentTypeId": SINGLETON}}),
+            json!({}),
+            None,
+            vec![("motorA", SINGLETON)],
+        ),
+        (
+            // The reported shape: two top-level components naming one
+            // singleton component type.
+            "twoSingletonComponents",
+            json!({
+                "motorA": {"componentTypeId": SINGLETON},
+                "motorB": {"componentTypeId": SINGLETON},
+            }),
+            json!({}),
+            Some(SINGLETON),
+            vec![],
+        ),
+        (
+            "threeSingletonComponents",
+            json!({
+                "motorA": {"componentTypeId": SINGLETON},
+                "motorB": {"componentTypeId": SINGLETON},
+                "motorC": {"componentTypeId": SINGLETON},
+            }),
+            json!({}),
+            Some(SINGLETON),
+            vec![],
+        ),
+        (
+            // The same multiplicity against a type whose flag is false.
+            "twoComponentsOfANonSingletonType",
+            json!({
+                "sensorA": {"componentTypeId": MULTIPLE},
+                "sensorB": {"componentTypeId": MULTIPLE},
+            }),
+            json!({}),
+            None,
+            vec![("sensorA", MULTIPLE), ("sensorB", MULTIPLE)],
+        ),
+        (
+            // One of each: the singleton's own count is what decides.
+            "oneSingletonBesideTwoOfANonSingletonType",
+            json!({
+                "motorA": {"componentTypeId": SINGLETON},
+                "sensorA": {"componentTypeId": MULTIPLE},
+                "sensorB": {"componentTypeId": MULTIPLE},
+            }),
+            json!({}),
+            None,
+            vec![
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            // Two COMPOSITE components of one singleton type, below one holder.
+            "twoCompositesOfOneSingletonTypeUnderOneHolder",
+            json!({"holder": {"componentTypeId": HOLDER}}),
+            json!({"holder/leafA": {}, "holder/leafB": {}}),
+            Some(SINGLETON_LEAF),
+            vec![],
+        ),
+        (
+            // One composite each below two different holders: they are both
+            // components of the same entity.
+            "compositesOfOneSingletonTypeUnderTwoHolders",
+            json!({
+                "holderA": {"componentTypeId": HOLDER},
+                "holderB": {"componentTypeId": HOLDER},
+            }),
+            json!({"holderA/leafA": {}, "holderB/leafA": {}}),
+            Some(SINGLETON_LEAF),
+            vec![],
+        ),
+        (
+            "oneCompositeOfASingletonType",
+            json!({"holder": {"componentTypeId": HOLDER}}),
+            json!({"holder/leafA": {}}),
+            None,
+            vec![("holder", HOLDER), ("holder/leafA", SINGLETON_LEAF)],
+        ),
+        (
+            // A top-level component and a composite one of the SAME singleton
+            // type: the count is over every path.
+            "aTopLevelComponentAndACompositeOfOneSingletonType",
+            json!({
+                "motorA": {"componentTypeId": SINGLETON},
+                "holder": {"componentTypeId": HOLDER},
+            }),
+            json!({"holder/motorLeaf": {}}),
+            Some(SINGLETON),
+            vec![],
+        ),
+        (
+            "twoCompositesOfANonSingletonType",
+            json!({"holder": {"componentTypeId": HOLDER}}),
+            json!({"holder/sensorLeafA": {}, "holder/sensorLeafB": {}}),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("holder/sensorLeafB", MULTIPLE),
+            ],
+        ),
+        (
+            // A component type the workspace does not hold: the rule knows
+            // nothing about its multiplicity, so both components are stored.
+            "twoComponentsOfAnUnheldType",
+            json!({
+                "unheldA": {"componentTypeId": UNHELD_TYPE},
+                "unheldB": {"componentTypeId": UNHELD_TYPE},
+            }),
+            json!({}),
+            None,
+            vec![("unheldA", UNHELD_TYPE), ("unheldB", UNHELD_TYPE)],
+        ),
+    ];
+
+    for (case, components, composite_components, refused, read_back) in rows {
+        let created = emulator
+            .create_entity(
+                WORKSPACE,
+                json!({
+                    "entityId": case,
+                    "entityName": case,
+                    "components": components,
+                    "compositeComponents": composite_components,
+                }),
+            )
+            .await;
+        match refused {
+            Some(component_type_id) => {
+                assert_eq!(
+                    (created.status, created.error_type.as_deref()),
+                    (400, Some("ValidationException")),
+                    "case {case:?}: a further component of a singleton type must be refused, \
+                     got {created:?}"
+                );
+                assert_eq!(
+                    message(&created),
+                    singleton_refusal(component_type_id),
+                    "case {case:?}: expected the refusal to name the component type, \
+                     got {created:?}"
+                );
+                let read = emulator.get_entity(WORKSPACE, case).await;
+                assert_eq!(
+                    read.status, 404,
+                    "case {case:?}: a refused create must persist no entity, got {read:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?}: expected 200 from CreateEntity, got {created:?}"
+                );
+                assert_components(&emulator, case, case, &read_back).await;
+            }
+        }
+    }
+}
+
+/// RULE: the multiplicity is decided over the RECORD a write would leave
+/// behind, so a patch is refused exactly when it would raise the entity's count
+/// of components of a singleton type past one — whichever writer carries it —
+/// and a refused patch leaves the stored entity as it was.
+#[tokio::test]
+async fn a_patch_cannot_give_one_entity_two_components_of_a_singleton_type() {
+    let emulator = with_singleton_types().await;
+    let entity_id = "pump";
+    let created = emulator
+        .create_entity(
+            WORKSPACE,
+            json!({
+                "entityId": entity_id,
+                "entityName": "Pump",
+                "components": {"motorA": {"componentTypeId": SINGLETON}},
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the entity under patch must be created, got {created:?}"
+    );
+
+    // (case, the patch, the component type a refusal names, the
+    // (path, componentTypeId) pairs the entity holds AFTERWARDS). Applied in
+    // order to the one entity, so every row is decided against what its
+    // predecessors left stored.
+    let rows = vec![
+        (
+            "secondComponentOfTheSingleton",
+            json!({
+                "componentUpdates": {
+                    "motorB": {"componentTypeId": SINGLETON, "updateType": "CREATE"},
+                },
+            }),
+            Some(SINGLETON),
+            vec![("motorA", SINGLETON)],
+        ),
+        (
+            // An entry naming no `updateType` creates what the entity does not
+            // hold, so it is held to the same rule.
+            "secondComponentWithNoUpdateType",
+            json!({"componentUpdates": {"motorB": {"componentTypeId": SINGLETON}}}),
+            Some(SINGLETON),
+            vec![("motorA", SINGLETON)],
+        ),
+        (
+            "componentOfANonSingletonType",
+            json!({
+                "componentUpdates": {
+                    "sensorA": {"componentTypeId": MULTIPLE, "updateType": "CREATE"},
+                },
+            }),
+            None,
+            vec![("motorA", SINGLETON), ("sensorA", MULTIPLE)],
+        ),
+        (
+            "secondComponentOfANonSingletonType",
+            json!({"componentUpdates": {"sensorB": {"componentTypeId": MULTIPLE}}}),
+            None,
+            vec![
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            // No component is added: a STORED component is re-pointed onto the
+            // singleton type the entity already holds one of.
+            "anExistingComponentRepointedOntoTheSingleton",
+            json!({
+                "componentUpdates": {
+                    "sensorB": {"componentTypeId": SINGLETON, "updateType": "UPDATE"},
+                },
+            }),
+            Some(SINGLETON),
+            vec![
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            // A patch of the singleton component itself leaves the count where
+            // it was, so it is accepted.
+            "aPatchOfTheSingletonComponentItself",
+            json!({
+                "componentUpdates": {
+                    "motorA": {"description": "the only motor", "updateType": "UPDATE"},
+                },
+            }),
+            None,
+            vec![
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            "theHolderTheCompositeRowsHangOff",
+            json!({
+                "componentUpdates": {
+                    "holder": {"componentTypeId": HOLDER, "updateType": "CREATE"},
+                },
+            }),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            // A COMPOSITE component of the singleton type the entity already
+            // holds a top-level component of.
+            "aCompositeOfTheSingletonBesideIt",
+            json!({"compositeComponentUpdates": {"holder/motorLeaf": {"updateType": "CREATE"}}}),
+            Some(SINGLETON),
+            vec![
+                ("holder", HOLDER),
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            "aCompositeOfANonSingletonType",
+            json!({
+                "compositeComponentUpdates": {"holder/sensorLeafA": {"updateType": "CREATE"}},
+            }),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            "aCompositeOfASingletonLeaf",
+            json!({"compositeComponentUpdates": {"holder/leafA": {"updateType": "CREATE"}}}),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("holder/leafA", SINGLETON_LEAF),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            "aSecondCompositeOfThatSingletonLeaf",
+            json!({"compositeComponentUpdates": {"holder/leafB": {"updateType": "CREATE"}}}),
+            Some(SINGLETON_LEAF),
+            vec![
+                ("holder", HOLDER),
+                ("holder/leafA", SINGLETON_LEAF),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("motorA", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            // The count is what the record holds, not what it ever held: once
+            // the singleton component is gone another one is accepted.
+            "theSingletonComponentRemoved",
+            json!({"componentUpdates": {"motorA": {"updateType": "DELETE"}}}),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("holder/leafA", SINGLETON_LEAF),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+        (
+            "aSingletonComponentAgainOnceTheFirstIsGone",
+            json!({
+                "componentUpdates": {
+                    "motorB": {"componentTypeId": SINGLETON, "updateType": "CREATE"},
+                },
+            }),
+            None,
+            vec![
+                ("holder", HOLDER),
+                ("holder/leafA", SINGLETON_LEAF),
+                ("holder/sensorLeafA", MULTIPLE),
+                ("motorB", SINGLETON),
+                ("sensorA", MULTIPLE),
+                ("sensorB", MULTIPLE),
+            ],
+        ),
+    ];
+
+    for (case, patch, refused, held) in rows {
+        let updated = emulator.update_entity(WORKSPACE, entity_id, patch).await;
+        match refused {
+            Some(component_type_id) => {
+                assert_eq!(
+                    (updated.status, updated.error_type.as_deref()),
+                    (400, Some("ValidationException")),
+                    "case {case:?}: a further component of a singleton type must be refused, \
+                     got {updated:?}"
+                );
+                assert_eq!(
+                    message(&updated),
+                    singleton_refusal(component_type_id),
+                    "case {case:?}: expected the refusal to name the component type, \
+                     got {updated:?}"
+                );
+            }
+            None => assert_eq!(
+                updated.status, 200,
+                "case {case:?}: expected 200 from UpdateEntity, got {updated:?}"
+            ),
+        }
+        assert_components(&emulator, case, entity_id, &held).await;
+    }
+}
+
+/// RULE: `isSingleton` is a member of the component TYPE, so a patch may
+/// declare a type a singleton while an entity already holds several components
+/// of it: that entity stays readable and patchable, and only a write that would
+/// raise its count further — or a new entity over the bound — is refused.
+#[tokio::test]
+async fn a_type_declared_a_singleton_later_still_lets_its_entities_be_patched() {
+    let emulator = with_singleton_types().await;
+    let entity_id = "twinMotors";
+    let created = emulator
+        .create_entity(
+            WORKSPACE,
+            json!({
+                "entityId": entity_id,
+                "entityName": "Twin motors",
+                "components": {
+                    "motorA": {"componentTypeId": MULTIPLE},
+                    "motorB": {"componentTypeId": MULTIPLE},
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "two components of a non-singleton type must be accepted, got {created:?}"
+    );
+
+    let patched = emulator
+        .update_component_type(WORKSPACE, MULTIPLE, json!({"isSingleton": true}))
+        .await;
+    assert_eq!(
+        patched.status, 200,
+        "the component type must take the flag, got {patched:?}"
+    );
+    let read = emulator.get_component_type(WORKSPACE, MULTIPLE).await;
+    assert_eq!(
+        read.member("isSingleton").as_bool(),
+        Some(true),
+        "the patched component type must report isSingleton true, got {read:?}"
+    );
+
+    // The entity the flag was not declared for still holds — and reports — both
+    // components.
+    assert_components(
+        &emulator,
+        "afterTheFlagWasDeclared",
+        entity_id,
+        &[("motorA", MULTIPLE), ("motorB", MULTIPLE)],
+    )
+    .await;
+
+    // A patch that leaves the count where it is is accepted.
+    let described = emulator
+        .update_entity(WORKSPACE, entity_id, json!({"description": "two motors"}))
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "an unrelated patch of an already-oversubscribed entity must be accepted, \
+         got {described:?}"
+    );
+
+    // A write that would raise it is refused, on this entity and on a new one.
+    let third = emulator
+        .update_entity(
+            WORKSPACE,
+            entity_id,
+            json!({
+                "componentUpdates": {
+                    "motorC": {"componentTypeId": MULTIPLE, "updateType": "CREATE"},
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        (third.status, third.error_type.as_deref()),
+        (400, Some("ValidationException")),
+        "a further component of the now-singleton type must be refused, got {third:?}"
+    );
+    assert_eq!(
+        message(&third),
+        singleton_refusal(MULTIPLE),
+        "expected the refusal to name the component type, got {third:?}"
+    );
+
+    let fresh = emulator
+        .create_entity(
+            WORKSPACE,
+            json!({
+                "entityId": "freshTwinMotors",
+                "entityName": "Fresh twin motors",
+                "components": {
+                    "motorA": {"componentTypeId": MULTIPLE},
+                    "motorB": {"componentTypeId": MULTIPLE},
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        (fresh.status, fresh.error_type.as_deref()),
+        (400, Some("ValidationException")),
+        "a new entity with two components of the now-singleton type must be refused, \
+         got {fresh:?}"
+    );
+    assert_components(
+        &emulator,
+        "theEntityIsUnchanged",
+        entity_id,
+        &[("motorA", MULTIPLE), ("motorB", MULTIPLE)],
+    )
+    .await;
 }
