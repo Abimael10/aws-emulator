@@ -17,7 +17,16 @@ use super::*;
 /// describes the job straight after creating it still observes `InProgress` with the
 /// secondary status of a job whose work has not started, and one that keeps polling observes
 /// each stage of the work in turn before the terminal status.
-pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(2);
+///
+/// It is a span a POLLER can land inside: a client watches a training job by describing it
+/// every few seconds to every few tens of seconds (the lifecycle it was written against takes
+/// minutes on AWS), so a stage that is in effect for less than one such interval is a stage no
+/// client ever observes, and the whole of a job's work has to stay inside ONE such interval or
+/// a client waiting for the terminal status pays a second one. The span is therefore the whole
+/// of this crate's band for a clock-owed transition rather than its floor, and the stage that
+/// runs the CONTAINER is in effect for as long as that container's own work took besides
+/// ([`MAX_REVEALED_CONTAINER_WORK`]).
+pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(4);
 
 /// How long after `CreateTrainingJob` the clock owes the job's move out of `InProgress`
 /// into its terminal status.
@@ -29,6 +38,23 @@ pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(2);
 /// so a caller that waits this long (as `aws sagemaker wait training-job-completed-or-stopped`
 /// does) observes a terminal status and a waiter terminates.
 pub const TRAINING_JOB_ENDS_AFTER: Duration = TRAINING_JOB_PHASE_SPAN.saturating_mul(4);
+
+/// The most of a container's own stated work the clock REVEALS a job over, on top of the span
+/// each stage of the work is given ([`TRAINING_JOB_PHASE_SPAN`]).
+///
+/// A training job's work takes as long as its algorithm container works for, so the stage that
+/// TRAINS is in effect for the time that container's program stated its work took
+/// ([`crate::state::ContainerOutcome::took`]) — which is what keeps the stage observable to a
+/// client polling a job whose container really works for a while, instead of a lifecycle that
+/// is over before the first poll.
+///
+/// THIS CEILING IS THE EMULATOR'S: the schedule is read against this host's own clock, so a
+/// program stating hours of work would leave the job non-terminal for hours and no waiter would
+/// terminate — and a client waiting for the terminal status pays a whole poll interval for every
+/// interval the work outlasts. Past it the work is still COUNTED in full — the job's own
+/// runtime, and what its `StoppingCondition` is measured against, is the whole stated time
+/// ([`TrainingJob::reported_runtime`]) — and only how much of it the clock reveals is bounded.
+pub const MAX_REVEALED_CONTAINER_WORK: Duration = Duration::from_secs(12);
 
 /// When the clock owes the stage that FOLLOWS `stages_before` stages of work which the
 /// accepting call performed server-side and reported at `reported_at`.
@@ -247,6 +273,25 @@ pub struct TrainingJob {
     pub final_metrics: Vec<crate::ops::types::MetricData>,
     /// When the clock owes this job its move out of `InProgress`.
     pub ends_at: SystemTime,
+    /// How long the job's WORK took in the RUN's own time: the time its container's program
+    /// stated its own work took ([`crate::state::TrainingRunOutcome::took`]), recorded by
+    /// [`Self::record_run`] and zero for a job whose run performed no container program.
+    ///
+    /// The clock reveals the stages of that work over this host's time, compressed and bounded
+    /// ([`MAX_REVEALED_CONTAINER_WORK`]); this is the quantity the job REPORTS its own runtime
+    /// from ([`Self::reported_runtime`]) and the one `StoppingCondition$MaxRuntimeInSeconds` is
+    /// measured against, because that cap bounds the container's work rather than how fast this
+    /// emulator reveals it.
+    pub work_took: Duration,
+    /// The instant the clock MATERIALISED this job's terminal status, for a job that has
+    /// reached one: the end of the schedule the stages were laid out over, which is what the
+    /// history reports as the end of the last stage the job was in. `None` while the job is
+    /// still running.
+    ///
+    /// Kept beside `training_end_time`, which is the instant the job's own work ENDED in the
+    /// run's own time and so is the later of the two for a job whose container stated more work
+    /// than the clock reveals.
+    pub settled_at: Option<SystemTime>,
     /// The `SecondaryStatus` stages this job's work passes through, in order and each with
     /// the instant the job enters it: `Starting` from the create, then the stages the run
     /// reported ([`crate::state::TrainingRunOutcome::phases`]), laid out over the span the
@@ -340,6 +385,9 @@ impl TrainingJob {
             model_artifacts: None,
             final_metrics: Vec::new(),
             ends_at: now + TRAINING_JOB_ENDS_AFTER,
+            // Filled in by the job's run, which is what states how long its container worked.
+            work_took: Duration::ZERO,
+            settled_at: None,
             // The job is accepted in `Starting` and enters the stages of its work as its run
             // reports them ([`Self::record_run`]).
             phases: vec![TrainingPhase {
@@ -381,7 +429,7 @@ impl TrainingJob {
     /// terms, in the order the run went through them, so a caller polling a running job
     /// observes `Downloading`, `Training` and `Uploading` before the terminal status and
     /// never a stage out of order. A job cut short by `StoppingCondition$MaxRuntimeInSeconds`
-    /// ([`Self::max_runtime_exceeded_at`]) ends where that cap falls instead.
+    /// ([`Self::exceeded_runtime_cap`]) ends on that cap instead.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
@@ -390,7 +438,7 @@ impl TrainingJob {
             TRAINING_STATUS_STOPPING if now >= self.ends_at => {
                 self.status = TRAINING_STATUS_STOPPED.to_string();
                 self.secondary_status = Some(TRAINING_SECONDARY_STATUS_STOPPED.to_string());
-                self.close_out();
+                self.close_out(self.ends_at, self.ends_at);
                 true
             }
             // Already terminal, or a transient status whose move is not due: nothing is owed
@@ -402,23 +450,33 @@ impl TrainingJob {
     /// [`Self::settle_status`] for a job that is still running: the stages of its work the
     /// clock has made due, and then the terminal status it ends in.
     fn settle_running(&mut self, now: SystemTime) -> bool {
-        // When the work ends: where the request's runtime cap falls when it falls inside the
-        // run, and otherwise the end of the run itself.
-        let capped_at = self.max_runtime_exceeded_at();
-        let ends_at = capped_at.unwrap_or(self.ends_at);
+        // The cap the request asked for, when the job's work does not fit inside it.
+        let cap = self.exceeded_runtime_cap();
+        // When the clock MATERIALISES the end: the end of the schedule the stages were laid
+        // out over, and never later than the instant the cap itself falls at — a job the cap
+        // ends is ended there whatever the rest of its schedule said.
+        let due_at = match cap.and_then(|cap| self.creation_time.checked_add(cap)) {
+            Some(capped_at) => self.ends_at.min(capped_at),
+            None => self.ends_at,
+        };
         // Nothing is revealed past the end of the work, so the stage the job is in when it
         // ends is the last one the history reports before the terminal status.
-        let moved = self.enter_phases_due(now.min(ends_at));
-        if now < ends_at {
+        let moved = self.enter_phases_due(now.min(due_at));
+        if now < due_at {
             return moved;
         }
-        match capped_at {
+        // When the job's work ENDED, in the run's own time: at the cap for a job the cap cut
+        // short — "if the job does not complete during this time, SageMaker ends the job", so
+        // the job is granted the runtime it asked for and no more — and otherwise after the
+        // runtime the work itself took.
+        let ran_for = cap.unwrap_or_else(|| self.reported_runtime());
+        match cap {
             // "The job stopped because it exceeded the maximum allowed runtime"
             // (`DescribeTrainingJob$SecondaryStatus`, under the primary status `Stopped`).
             // Whatever the abandoned run reported is not revealed as the job's own outcome,
             // the same way a caller's stop does not reveal it.
             Some(_) => {
-                self.ends_at = ends_at;
+                self.ends_at = due_at;
                 self.status = TRAINING_STATUS_STOPPED.to_string();
                 self.secondary_status =
                     Some(TRAINING_SECONDARY_STATUS_MAX_RUNTIME_EXCEEDED.to_string());
@@ -445,7 +503,12 @@ impl TrainingJob {
                 None => return moved,
             },
         }
-        self.close_out();
+        let ended_at = self
+            .creation_time
+            .checked_add(ran_for)
+            .unwrap_or(due_at)
+            .max(due_at);
+        self.close_out(ended_at, due_at);
         true
     }
 
@@ -468,46 +531,72 @@ impl TrainingJob {
         moved
     }
 
-    /// The instants a job that ends carries: its work began once the job was accepted and is
-    /// over by the instant the clock ends it, which is the span the describe reports.
-    fn close_out(&mut self) {
+    /// The instants a job that ends carries: its work began once the job was accepted, it ENDED
+    /// at `ended_at` — the instant its own work was over, in the run's own time — and the clock
+    /// materialised that at `settled_at`, which is where the history closes the last stage the
+    /// job was in.
+    fn close_out(&mut self, ended_at: SystemTime, settled_at: SystemTime) {
         self.training_start_time = Some(self.creation_time);
-        self.last_modified_time = self.ends_at;
-        self.training_end_time = Some(self.ends_at);
+        self.last_modified_time = settled_at;
+        self.settled_at = Some(settled_at);
+        self.training_end_time = Some(ended_at);
     }
 
-    /// Where `StoppingCondition$MaxRuntimeInSeconds` cuts this job's work short, and `None`
-    /// when the work is over before the cap it asked for.
+    /// How long this job's work RAN for, as the job reports it: the time its container's
+    /// program stated its own work took, and never less than the span the clock laid the stages
+    /// of that work out over.
     ///
-    /// "The maximum length of time, in seconds, that a training job … can run … SageMaker
-    /// ends the job" (`StoppingCondition$MaxRuntimeInSeconds`): the cap is measured from the
-    /// instant the job was created against the span the clock gives its work, so a job whose
-    /// work does not fit inside the cap is ended at the cap instead of finishing.
-    fn max_runtime_exceeded_at(&self) -> Option<SystemTime> {
+    /// The container's work is performed in process and spends none of this host's clock on a
+    /// wait it asks for ([`crate::state::ContainerOutcome::took`]), so the runtime a job
+    /// reports is the runtime its own work STATED — the quantity
+    /// `DescribeTrainingJob$TrainingTimeInSeconds` describes and
+    /// `StoppingCondition$MaxRuntimeInSeconds` bounds — rather than how fast this emulator got
+    /// through revealing it.
+    #[must_use]
+    pub fn reported_runtime(&self) -> Duration {
+        let revealed = self
+            .ends_at
+            .duration_since(self.creation_time)
+            .unwrap_or(Duration::ZERO);
+        self.work_took.max(revealed)
+    }
+
+    /// The runtime cap `StoppingCondition$MaxRuntimeInSeconds` states, when this job's work does
+    /// not fit inside it, and `None` for a job that asked for none or whose work fits.
+    ///
+    /// "The maximum length of time, in seconds, that a training job … can run. If the job does
+    /// not complete during this time, SageMaker ends the job"
+    /// (`StoppingCondition$MaxRuntimeInSeconds`): the cap bounds the job's own RUNTIME
+    /// ([`Self::reported_runtime`]) — the work its container did — so a job whose work does not
+    /// fit inside it is ended on the cap instead of finishing.
+    fn exceeded_runtime_cap(&self) -> Option<Duration> {
         let seconds = self
             .request
             .stopping_condition
             .as_ref()?
             .max_runtime_in_seconds?;
         let cap = Duration::from_secs(u64::try_from(seconds).ok()?);
-        let at = self.creation_time.checked_add(cap)?;
-        (at < self.ends_at).then_some(at)
+        (cap < self.reported_runtime()).then_some(cap)
     }
 
     /// Record what the job's RUN reported, `at` the instant it reported.
     ///
     /// The stages the run went through ([`crate::state::TrainingRunOutcome::phases`]) and the
     /// terminal status that follows them are laid out from the instant the run REPORTED
-    /// ([`stage_due_after`]), each owed [`TRAINING_JOB_PHASE_SPAN`] after the one before it:
-    /// the run is performed inside the create that accepted the job, so a schedule measured
-    /// from the creation instant is already spent by the time that create answers whenever the
-    /// work took longer than one span, and the job's first observation would be its terminal
-    /// one. Measured from the report, a caller that describes the job as soon as its create
-    /// answers observes `InProgress` with no stage of the work begun, and one that keeps
-    /// polling observes `Downloading`, `Training` and `Uploading` in the order the run
-    /// performed them before the terminal status — however long the work itself took.
+    /// ([`stage_due_after`]), each owed [`TRAINING_JOB_PHASE_SPAN`] after the one before it —
+    /// and the stage that runs the CONTAINER owed the time that container's own work took
+    /// besides ([`MAX_REVEALED_CONTAINER_WORK`]): the run is performed inside the create that
+    /// accepted the job, so a schedule measured from the creation instant is already spent by
+    /// the time that create answers whenever the work took longer than one span, and the job's
+    /// first observation would be its terminal one. Measured from the report, a caller that
+    /// describes the job as soon as its create answers observes `InProgress` with no stage of
+    /// the work begun, and one that keeps polling observes `Downloading`, `Training` and
+    /// `Uploading` in the order the run performed them before the terminal status — however
+    /// long the work itself took.
     ///
-    /// The status the clock then materialises is always the one the run produced.
+    /// The status the clock then materialises is always the one the run produced, and how long
+    /// the job REPORTS its work having taken is what that work stated
+    /// ([`Self::reported_runtime`]).
     ///
     /// A job the caller has already asked to stop keeps the due instant that stop set: the
     /// terminal status it is waiting for is `Stopped`, which does not depend on what the
@@ -515,14 +604,26 @@ impl TrainingJob {
     pub fn record_run(&mut self, outcome: crate::state::TrainingRunOutcome, at: SystemTime) {
         let mut outcome = outcome;
         if self.status == TRAINING_STATUS_IN_PROGRESS {
-            let reached = outcome.phases();
-            for (index, status) in reached.iter().enumerate() {
+            self.work_took = outcome.took();
+            // The stage that TRAINS is the one the container's own work happens in, so it is in
+            // effect for as long as that work took, bounded by how much of it the clock reveals
+            // ([`MAX_REVEALED_CONTAINER_WORK`]): a job whose container really works for a while
+            // is observable in that stage for about as long, and one whose program asked for no
+            // time of its own passes through every stage in a span each.
+            let working = self.work_took.min(MAX_REVEALED_CONTAINER_WORK);
+            let mut starts_at = at;
+            for status in outcome.phases() {
+                // Each stage begins once the one before it has had its own span.
+                starts_at = stage_due_after(starts_at, TRAINING_JOB_PHASE_SPAN, 0);
                 self.phases.push(TrainingPhase {
                     status: status.clone(),
-                    starts_at: stage_due_after(at, TRAINING_JOB_PHASE_SPAN, index),
+                    starts_at,
                 });
+                if status == TRAINING_SECONDARY_STATUS_TRAINING {
+                    starts_at = starts_at.checked_add(working).unwrap_or(starts_at);
+                }
             }
-            self.ends_at = stage_due_after(at, TRAINING_JOB_PHASE_SPAN, reached.len());
+            self.ends_at = stage_due_after(starts_at, TRAINING_JOB_PHASE_SPAN, 0);
             // What the run produced is held here until the stage that uploads it falls due;
             // a job the caller has already asked to stop holds nothing, because that stop
             // abandons the run.
@@ -748,10 +849,12 @@ impl TrainingJob {
     /// not left is open-ended.
     pub fn secondary_status_transitions(&self) -> Vec<SecondaryStatusTransition> {
         let entered = &self.phases[..self.entered.min(self.phases.len())];
-        // When the job left the last stage it entered: the instant its work ended once it
-        // has, and the instant the stop was recorded while one is in flight.
+        // When the job left the last stage it entered: the instant the clock materialised its
+        // terminal status once it has one, and the instant the stop was recorded while one is
+        // in flight. The windows the history reports are the ones the stages were REVEALED
+        // over, so each of them ends where a poller would have found the next one.
         let left_last = self
-            .training_end_time
+            .settled_at
             .or_else(|| self.is_stopping().then_some(self.last_modified_time));
         let mut transitions: Vec<SecondaryStatusTransition> = entered
             .iter()
@@ -1373,6 +1476,10 @@ mod tests {
             model_artifacts: None,
             final_metrics: Vec::new(),
             ends_at: created + TRAINING_JOB_ENDS_AFTER,
+            // This fixture's run has not reported, so no container work is stated for it and
+            // nothing has settled it.
+            work_took: Duration::ZERO,
+            settled_at: None,
             phases: vec![TrainingPhase {
                 status: TRAINING_SECONDARY_STATUS_STARTING.to_string(),
                 starts_at: created,
@@ -1437,6 +1544,7 @@ mod tests {
                         phases: Vec::new(),
                         artifact: None,
                         checkpoints: Vec::new(),
+                        took: Duration::ZERO,
                     }
                 } else {
                     crate::state::TrainingRunOutcome::failed("ClientError: the probe's reason")
@@ -1478,6 +1586,7 @@ mod tests {
                 phases: Vec::new(),
                 artifact: None,
                 checkpoints: Vec::new(),
+                took: Duration::ZERO,
             },
             reported_at,
         );
@@ -1560,6 +1669,7 @@ mod tests {
                     phases: reached.clone(),
                     artifact: None,
                     checkpoints: Vec::new(),
+                    took: Duration::ZERO,
                 },
                 reported_at,
             );
@@ -1673,6 +1783,7 @@ mod tests {
                         archive: vec![1, 2, 3],
                     }),
                     checkpoints: Vec::new(),
+                    took: Duration::ZERO,
                 },
                 reported_at,
             );
@@ -1756,6 +1867,7 @@ mod tests {
                         archive: vec![1, 2, 3],
                     }),
                     checkpoints: Vec::new(),
+                    took: Duration::ZERO,
                 },
                 reported_at,
             );

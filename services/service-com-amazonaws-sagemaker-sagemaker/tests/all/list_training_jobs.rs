@@ -140,6 +140,12 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
         model_artifacts: None,
         final_metrics: Vec::new(),
         ends_at: at(modified),
+        // A seeded row's run never reported, so no container work is stated for it; a row
+        // seeded in a terminal status was settled where the clock left it.
+        work_took: std::time::Duration::ZERO,
+        settled_at: TERMINAL_STATUSES
+            .contains(&status)
+            .then(|| at(modified)),
         // The stage the row is seeded in, which is the one its `SecondaryStatus` names: a
         // row is stored where the clock has already left it, so nothing more is due.
         phases: vec![service_com_amazonaws_sagemaker_sagemaker::state::TrainingPhase {

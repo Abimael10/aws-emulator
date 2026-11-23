@@ -366,9 +366,12 @@ fn default_job_type_rejects(member: &str) -> String {
 ///   rather than accepted with a member nothing can honour.
 /// * `RecommendationJobInputConfig$ModelPackageVersionArn` is "the Amazon Resource Name
 ///   (ARN) of a versioned model package" and `$ModelName` is "the name of the created
-///   model": they are the two ways one request names the model under test, so a request
-///   must name exactly one of them — with neither there is nothing to benchmark, and with
-///   both the model under test is ambiguous.
+///   model": they are the two ways one request names the model TO DEPLOY for a test, so a
+///   request may not carry both — the model under test would be ambiguous. A request that
+///   carries neither names the model through the endpoint it benchmarks instead
+///   (`$Endpoints`, "existing customer endpoints on which to run an Inference Recommender
+///   job": the model under test is the one already deployed behind it), so only a request
+///   with neither a model reference NOR an endpoint to benchmark identifies nothing at all.
 /// * `RecommendationJobInputConfig$JobDurationInSeconds`: "Specifies the maximum duration
 ///   of the job, in seconds. The maximum value is 18,000 seconds." The model bounds the
 ///   member only from below (`range 1..`), so the ceiling is refused here.
@@ -396,10 +399,19 @@ fn validate_request(
                  but both were given.",
             ));
         }
-        (None, None) => {
+        // A job that names an EXISTING endpoint benchmarks the model already deployed behind
+        // it, so it needs no model reference of its own; one that names neither has nothing
+        // under test at all.
+        (None, None)
+            if config
+                .endpoints
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty() =>
+        {
             return Err(refuse(
-                "InputConfig must specify exactly one of ModelPackageVersionArn or ModelName, \
-                 but neither was given.",
+                "InputConfig must specify ModelPackageVersionArn or ModelName, or an endpoint \
+                 to benchmark through Endpoints, but none was given.",
             ));
         }
         _ => {}

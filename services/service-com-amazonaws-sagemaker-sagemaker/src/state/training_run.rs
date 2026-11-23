@@ -185,6 +185,12 @@ pub enum TrainingRunOutcome {
         /// the TRAINING stage that publishes them, and empty for a job that asked for none.
         /// Taken out of the outcome the same way the artifact is.
         checkpoints: Vec<super::PendingArtifact>,
+        /// How long the job's CONTAINER work took, on the run's own clock: the time the
+        /// declared container program stated its own work took
+        /// ([`crate::state::ContainerOutcome::took`]), and zero for a run that performed no
+        /// container program or one that asked for no time of its own. It is what the job's
+        /// runtime is measured against ([`super::TrainingJob::record_run`]).
+        took: Duration,
     },
     /// The run did not finish, and this is the condition that stopped it — the job's
     /// `FailureReason`.
@@ -193,6 +199,9 @@ pub enum TrainingRunOutcome {
         /// The stages the run had got through when the condition stopped it, so the job's
         /// history says WHERE its work failed (see [`TrainingRunOutcome::phases`]).
         phases: Vec<String>,
+        /// How long the container's work took before the condition stopped the run, on the
+        /// same clock the completed variant's own member is read on.
+        took: Duration,
     },
 }
 
@@ -207,6 +216,18 @@ impl TrainingRunOutcome {
     /// `FailureReason` length (0..1024).
     #[must_use]
     pub fn failed_in(phases: Vec<String>, reason: impl Into<String>) -> Self {
+        Self::failed_in_after(phases, reason, Duration::ZERO)
+    }
+
+    /// [`Self::failed_in`] for a run whose CONTAINER had already spent `took` of its own work
+    /// when the condition stopped it, so the job's runtime still counts the work its container
+    /// did ([`TrainingRunOutcome::Completed`]'s own member).
+    #[must_use]
+    pub fn failed_in_after(
+        phases: Vec<String>,
+        reason: impl Into<String>,
+        took: Duration,
+    ) -> Self {
         let reason: String = reason.into();
         let bounded = match reason.char_indices().nth(1024) {
             Some((at, _)) => reason[..at].to_string(),
@@ -215,6 +236,7 @@ impl TrainingRunOutcome {
         Self::Failed {
             reason: bounded,
             phases,
+            took,
         }
     }
 
@@ -229,6 +251,15 @@ impl TrainingRunOutcome {
     pub fn phases(&self) -> &[String] {
         match self {
             Self::Completed { phases, .. } | Self::Failed { phases, .. } => phases,
+        }
+    }
+
+    /// How long the job's CONTAINER work took, on the run's own clock (see the `took` member of
+    /// either variant).
+    #[must_use]
+    pub fn took(&self) -> Duration {
+        match self {
+            Self::Completed { took, .. } | Self::Failed { took, .. } => *took,
         }
     }
 }
@@ -658,7 +689,7 @@ pub async fn run_training_job(
             match outcome {
                 Some(outcome) => {
                     if let Some(reason) = outcome.failure_reason() {
-                        return TrainingRunOutcome::failed_in(phases, reason);
+                        return TrainingRunOutcome::failed_in_after(phases, reason, outcome.took());
                     }
                     container = Some(outcome);
                 }
@@ -671,6 +702,14 @@ pub async fn run_training_job(
             }
         }
     }
+
+    // How long the container's own work took, which every outcome from here on reports: the
+    // work was performed whatever the legs after it come to, and the job's runtime is measured
+    // against it ([`super::TrainingJob::record_run`]).
+    let took = container
+        .as_ref()
+        .map(crate::state::ContainerOutcome::took)
+        .unwrap_or_default();
 
     // Fitting a model and measuring it are synchronous, CPU-bound work with no await of
     // their own, so they go to the blocking pool and the worker serving this request is
@@ -708,7 +747,11 @@ pub async fn run_training_job(
     })
     .await;
     let Ok((model, final_metrics)) = fit_and_measure else {
-        return TrainingRunOutcome::failed_in(phases, crate::state::INTERNAL_FAILURE_REASON);
+        return TrainingRunOutcome::failed_in_after(
+            phases,
+            crate::state::INTERNAL_FAILURE_REASON,
+            took,
+        );
     };
 
     // "CheckpointConfig - Contains information about the output location for managed spot
@@ -717,7 +760,7 @@ pub async fn run_training_job(
     // the model artifacts. A job that asked for none has none to write.
     let checkpoints = match checkpoint_objects(request, &model, &algorithm, container.as_ref()) {
         Ok(checkpoints) => checkpoints,
-        Err(reason) => return TrainingRunOutcome::failed_in(phases, reason),
+        Err(reason) => return TrainingRunOutcome::failed_in_after(phases, reason, took),
     };
     for checkpoint in &checkpoints {
         // The write is authorized the way every write a job's work makes is: the destination
@@ -733,9 +776,10 @@ pub async fn run_training_job(
         )
         .await
         {
-            return TrainingRunOutcome::failed_in(
+            return TrainingRunOutcome::failed_in_after(
                 phases,
                 checkpoint_upload_failed(&checkpoint.location.uri(), &access_denied_detail()),
+                took,
             );
         }
     }
@@ -755,9 +799,10 @@ pub async fn run_training_job(
         .unwrap_or_default();
     let entries: Vec<(String, Vec<u8>)> = if written.is_empty() {
         let Ok(body) = ::serde_json::to_vec_pretty(&document) else {
-            return TrainingRunOutcome::failed_in(
+            return TrainingRunOutcome::failed_in_after(
                 phases,
                 model_upload_failed(&artifact.uri(), ARCHIVE_NOT_BUILT),
+                took,
             );
         };
         vec![(algorithm.model_file().to_string(), body)]
@@ -768,9 +813,10 @@ pub async fn run_training_job(
             .collect()
     };
     let Ok(archive) = model_archive(&entries) else {
-        return TrainingRunOutcome::failed_in(
+        return TrainingRunOutcome::failed_in_after(
             phases,
             model_upload_failed(&artifact.uri(), ARCHIVE_NOT_BUILT),
+            took,
         );
     };
     if object_write_is_unauthorized(
@@ -783,9 +829,10 @@ pub async fn run_training_job(
     )
     .await
     {
-        return TrainingRunOutcome::failed_in(
+        return TrainingRunOutcome::failed_in_after(
             phases,
             model_upload_failed(&artifact.uri(), &access_denied_detail()),
+            took,
         );
     }
     // The archive is PRODUCED here and PUBLISHED at the stage that uploads it, which the
@@ -802,6 +849,9 @@ pub async fn run_training_job(
             archive,
         }),
         checkpoints,
+        // The time the job's own container program stated its work took, which is the runtime
+        // the job's `StoppingCondition` is measured against.
+        took,
     }
 }
 

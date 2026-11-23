@@ -105,31 +105,43 @@ pub const CONTAINER_PROGRAM_SLOT_WAIT: Duration = Duration::from_secs(20);
 
 /// The longest ONE container program may run in the RUN'S OWN time.
 ///
-/// CHOSEN, not an AWS duration (a real training container runs for as long as its
-/// `StoppingCondition` allows): it is a span of the RUN's own time, read against a clock the
-/// run itself drives ([`CONTAINER_PROGRAM_CLOCK_TICK`]), so what a job comes to rest in is the
-/// same on an idle host and on a loaded one. What the run may take of THIS host is bounded
-/// beside it ([`CONTAINER_PROGRAM_HOST_CEILING`]).
-pub const CONTAINER_PROGRAM_RUN_CEILING: Duration = Duration::from_secs(10);
+/// A training container runs for as long as its job's `StoppingCondition` allows it to —
+/// `StoppingCondition$MaxRuntimeInSeconds` documents "the maximum value is 28 days"
+/// ([`super::MAX_CONTAINER_STATED_SECONDS`]) — and this is a span of the RUN's own time, read
+/// against a clock the run itself drives ([`CONTAINER_PROGRAM_CLOCK_TICK`]) and spent by the
+/// run's own doings rather than by this host's speed. So it is that same ceiling: a program may
+/// state as much work as a job's cap may allow, and what it states is comparable with any cap
+/// the model admits rather than cut off by a span of this emulator's choosing. What the run may
+/// take of THIS host is bounded beside it ([`CONTAINER_PROGRAM_HOST_CEILING`]), and how much it
+/// may DO by the step budget ([`MAX_CONTAINER_PROGRAM_STEPS`]).
+pub const CONTAINER_PROGRAM_RUN_CEILING: Duration =
+    Duration::from_secs(super::MAX_CONTAINER_STATED_SECONDS);
+
+/// The span of the RUN's own time that sizes what one run may take of THIS HOST
+/// ([`CONTAINER_PROGRAM_HOST_CEILING`]).
+///
+/// CHOSEN: the run's own clock spends none of this host's time, so the host ceiling cannot be
+/// derived from the ceiling above — a program is allowed to STATE far more work than this
+/// process may spend performing it.
+const CONTAINER_PROGRAM_HOST_SPAN: Duration = Duration::from_secs(10);
 
 /// How far ONE reading of a run's clock moves it.
 ///
-/// The span above is spent by what the RUN does, and a traced event is one of those. The tick
-/// is sized so that the whole step budget ([`MAX_CONTAINER_PROGRAM_STEPS`]) spends well under
-/// that span, which is what leaves a program that computes without end to be answered by the
-/// step budget — a count of its OWN work — rather than by a clock.
+/// The run's own clock is spent by what the RUN does, and a traced event is one of those. The
+/// tick is sized so that the whole step budget ([`MAX_CONTAINER_PROGRAM_STEPS`]) spends a tiny
+/// share of the span the run is given, which is what leaves a program that computes without end
+/// to be answered by that budget — a count of its OWN work — rather than by a clock.
 pub const CONTAINER_PROGRAM_CLOCK_TICK: Duration = Duration::from_nanos(100);
 
 /// How much of THIS HOST's own time ONE run may take, past which the engine stops it whatever
 /// its own clock reads.
 ///
-/// CHOSEN: the span above is the RUN's own time, so it bounds no CPU of this host — a program
-/// spending traced events, or sitting in one long native call that delivers none, would hold a
-/// thread of this process for as long as the host took over it. This is the bound that stops
-/// it, read from this host's own clock at every traced event and from the host's own watch over
-/// the run.
+/// CHOSEN: the run's own clock bounds no CPU of this host — a program spending traced events, or
+/// sitting in one long native call that delivers none, would hold a thread of this process for
+/// as long as the host took over it. This is the bound that stops it, read from this host's own
+/// clock at every traced event and from the host's own watch over the run.
 pub const CONTAINER_PROGRAM_HOST_CEILING: Duration = INIT_PHASE_LIMIT
-    .saturating_add(CONTAINER_PROGRAM_RUN_CEILING)
+    .saturating_add(CONTAINER_PROGRAM_HOST_SPAN)
     .saturating_mul(2);
 
 /// How long the engine's own stop is given to land, once the host ceiling has latched it.
@@ -442,7 +454,8 @@ fn run_event(
 fn read_outcome(completion: &python::Completion) -> ContainerOutcome {
     match completion {
         // The entry module REPORTS what the program came to: the status it exited with, what it
-        // wrote on its two console streams, and the files it left behind.
+        // wrote on its two console streams, the time its own work stated it took, and the files
+        // it left behind.
         python::Completion::Returned(answered) => reported_run(answered),
         // Nothing here asks for a streaming answer, and the entry module answers one value, so a
         // run that produced one is a run nothing can be read from.
@@ -519,8 +532,23 @@ fn reported_run(answered: &str) -> ContainerOutcome {
             files
         })
         .unwrap_or_default();
+    // How long the program's own work STATED it took: the time it asked to spend, which this
+    // run spends on the run's own clock and none of this host's (the entry module counts it, in
+    // the program's own terms). Bounded like every other container's statement of its work
+    // ([`super::MAX_CONTAINER_STATED_SECONDS`]), so a program cannot state an unbounded runtime
+    // for the job it belongs to.
+    let took = document
+        .get("statedSeconds")
+        .and_then(::serde_json::Value::as_f64)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .and_then(|seconds| ::std::time::Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or_default()
+        .min(::std::time::Duration::from_secs(
+            super::MAX_CONTAINER_STATED_SECONDS,
+        ));
     ContainerOutcome::Performed {
         status,
+        took,
         error_tail,
         files,
     }
@@ -545,6 +573,7 @@ import io
 import os
 import posixpath
 import sys
+import time
 import traceback
 
 try:
@@ -560,6 +589,41 @@ except ImportError:
 _WORKING_DIRECTORY = "/"
 # What the interpreter writes and exits with when the file it was given to run is not there.
 _NO_SUCH_FILE_STATUS = 2
+
+
+class _Worked(object):
+    """How much WORK the program states its own work took: the seconds it asks to spend.
+
+    A container's program states the time its work takes by asking to spend it, and this run
+    spends none of the host's clock on such a wait — the interpreter's own wait is charged to the
+    run's own clock instead — so the time the program asks for IS the time it states its work
+    took, which is what the job this container belongs to reports and measures its runtime cap
+    against. Counted here, in the program's own terms; the wait itself is still the one the
+    engine bounds, which this only delegates to."""
+
+    def __init__(self):
+        self.seconds = 0.0
+
+    def asked(self, seconds):
+        try:
+            asked = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if asked > 0.0 and asked == asked and asked != float("inf"):
+            self.seconds += asked
+
+
+_worked = _Worked()
+
+
+def _count_waits(waiting=time.sleep):
+    """Count what the program asks to wait for, and wait it out the way it would anyway."""
+
+    def sleep(seconds):
+        _worked.asked(seconds)
+        return waiting(seconds)
+
+    time.sleep = sleep
 
 
 class _Console:
@@ -862,6 +926,7 @@ def _files_of(event):
 def run(event, context):
     storage = _Storage(_files_of(event), _WORKING_DIRECTORY)
     _install(storage)
+    _count_waits()
     limit = event["streamCharacters"]
     out = _Console(limit)
     err = _Console(limit)
@@ -927,6 +992,7 @@ def run(event, context):
         "stderr": err.text(),
         "errorType": error_type,
         "errorMessage": error_message,
+        "statedSeconds": _worked.seconds,
         "files": files,
     }
 "#;
@@ -1087,6 +1153,7 @@ mod tests {
                 status,
                 error_tail,
                 files,
+                ..
             } = &outcome
             else {
                 panic!("case {case:?}: expected the program to be performed, got {outcome:?}");

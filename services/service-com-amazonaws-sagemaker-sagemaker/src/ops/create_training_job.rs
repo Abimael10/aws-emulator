@@ -45,9 +45,11 @@
 //! over, and the checkpoints it produced from the stage that TRAINS, which this call arms for
 //! the instants the clock owes them ([`crate::state::publish_when_due`]), so a client that
 //! polls `SecondaryStatus` to decide when the artifact exists never finds it before the job
-//! says so. A job whose `StoppingCondition.MaxRuntimeInSeconds` falls inside the span of its
-//! work is ended at that cap instead, with the `Stopped`/`MaxRuntimeExceeded` pair the model
-//! groups together.
+//! says so. The stage that runs the CONTAINER is in effect for as long as that container's own
+//! program stated its work took, so a job whose container really works for a while is
+//! observable in it for about as long; a job whose `StoppingCondition.MaxRuntimeInSeconds`
+//! falls inside the runtime that work took is ended on that cap instead, with the
+//! `Stopped`/`MaxRuntimeExceeded` pair the model groups together.
 //!
 //! ## Shape of an operation
 //!

@@ -117,6 +117,17 @@ pub const MAX_PROGRAM_WORDS: usize = 200;
 /// See [`MAX_PROGRAM_WORDS`].
 pub const MAX_PROGRAM_WORD_BYTES: usize = 4 * 1024;
 
+/// How many seconds of its own work ONE container program may state
+/// ([`ContainerOutcome::took`]).
+///
+/// A job's container works for as long as the job's own `StoppingCondition` allows it to, and
+/// `StoppingCondition$MaxRuntimeInSeconds` documents "the maximum value is 28 days" — so a
+/// program may state up to that much work, and the runtime a job reports and its cap is
+/// measured against ([`crate::state::TrainingJob::reported_runtime`]) is the whole of what its
+/// container asked for rather than a number clamped below the caps the model admits. Nothing
+/// waits for it: the time is the program's own statement, performed in no host time at all.
+pub const MAX_CONTAINER_STATED_SECONDS: u64 = 28 * 24 * 60 * 60;
+
 /// What one container's program did, or the fact that nothing was performed for it.
 #[derive(Debug, Clone)]
 pub enum ContainerOutcome {
@@ -125,6 +136,17 @@ pub enum ContainerOutcome {
     Performed {
         /// The exit status of the program, as the session performed it.
         status: i32,
+        /// How long the program's own work TOOK, on the run's own clock: the time it ASKED to
+        /// spend — its `sleep` commands for a shell program
+        /// ([`::service_common::posix_shell_session::ShellSession::slept`]), and its own waits
+        /// for a Python one, counted by the entry module the interpreter runs it through
+        /// ([`super::container_python`]). Neither engine spends this host's clock on a wait a
+        /// program asks for, so the time a container's work took is the time the program STATED
+        /// it took — which is what
+        /// the job's own runtime is measured against
+        /// ([`crate::state::TrainingJob::record_run`]). Zero for a program that asked for
+        /// none.
+        took: ::std::time::Duration,
         /// The last line the program wrote on standard error, empty when it wrote none — the
         /// `<stderr tail>` [`algorithm_error`] reports.
         error_tail: String,
@@ -150,6 +172,16 @@ impl ContainerOutcome {
     #[must_use]
     pub fn performed(&self) -> bool {
         matches!(self, Self::Performed { .. })
+    }
+
+    /// How long the container's work took, on the run's own clock (see the `took` member).
+    /// Zero for a program nothing performed: no work was done, so none took any time.
+    #[must_use]
+    pub fn took(&self) -> ::std::time::Duration {
+        match self {
+            Self::Performed { took, .. } => *took,
+            Self::NotPerformed { .. } => ::std::time::Duration::ZERO,
+        }
     }
 
     /// Why the job this outcome belongs to FAILED, and `None` for a program that exited zero.
@@ -348,6 +380,12 @@ pub fn run_container_program(
             lines: MAX_CONTAINER_OUTPUT_LINES,
             line_bytes: MAX_CONTAINER_OUTPUT_LINE_BYTES,
         }),
+        bounds: ::service_common::posix_shell_session::Bounds {
+            // How much WORK the program may state it did, which a training container states by
+            // taking that time ([`MAX_CONTAINER_STATED_SECONDS`]).
+            sleep_seconds: MAX_CONTAINER_STATED_SECONDS,
+            ..::service_common::posix_shell_session::Bounds::default()
+        },
         ..::service_common::posix_shell_session::SessionConfig::default()
     };
     // The container has storage of its own — the ML storage volume the job's inputs are
@@ -371,6 +409,10 @@ pub fn run_container_program(
     let status = session.exit_status().unwrap_or(status);
     ContainerOutcome::Performed {
         status,
+        // The time the program's own commands stated they took: the session performs them in
+        // process and spends none of this host's clock on a wait one asks for, so what a
+        // `sleep` states is the time the program took.
+        took: session.slept(),
         error_tail: session.errors().last().cloned().unwrap_or_default(),
         // What the program left in the container's storage, which is where a training job's
         // own outputs are: the artifacts it wrote to the model directory and the checkpoints
