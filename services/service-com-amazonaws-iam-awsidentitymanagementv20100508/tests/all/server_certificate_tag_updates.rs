@@ -26,13 +26,17 @@
 //!
 //! The suites are tables whose rows differ along what the rule generalises over: the held
 //! tag count, the number of calls, whether a supplied key is new or held, the case of a
-//! key, keys repeated inside one request, the certificate's path, the case the addressed
-//! name is spelled in, the alphabet and the published length bounds of `tagKeyType`
-//! (1..128) and `tagValueType` (0..256), and the published per-resource tag quota.
+//! key, the certificate's path, the case the addressed name is spelled in, the alphabet
+//! and the published length bounds of `tagKeyType` (1..128) and `tagValueType` (0..256),
+//! and the published per-resource tag quota. A list naming one key TWICE is refused rather
+//! than merged, which `tests/all/supplied_tag_lists.rs` states for every operation taking
+//! a tag list.
 
 use std::collections::BTreeMap;
 
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::MAX_TAGS_PER_ENTITY;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
+    MAX_TAGS_PER_ENTITY, TAG_LIMIT_EXCEEDED_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::identity_policy_enforcement::{principal, statement};
@@ -255,13 +259,6 @@ async fn tagging_merges_its_tags_into_the_persisted_set() {
             initial: tags(&[("Env", "prod")]),
             calls: vec![tags(&[("env", "dev"), ("ENV", "test")])],
             expected: tags(&[("Env", "prod"), ("env", "dev"), ("ENV", "test")]),
-        },
-        MergeCase {
-            name: "a key repeated inside one request settles on its last value",
-            path: None,
-            initial: Vec::new(),
-            calls: vec![tags(&[("dup", "first"), ("dup", "last")])],
-            expected: tags(&[("dup", "last")]),
         },
         MergeCase {
             name: "a value at the published minimum length",
@@ -491,13 +488,12 @@ async fn the_tag_bound_is_taken_against_the_merged_set() {
             "LimitExceeded",
             "case {case:?}: expected the modelled awsQuery code, got {body}"
         );
-        // The message names the limit the request exceeded and the certificate it was
-        // taken against.
+        // The over-quota refusal is AWS's fixed sentence for the class, which names
+        // neither the certificate nor the quota's figure.
         assert_eq!(
             element(&body, "Message"),
-            format!("Cannot assign more than {bound} tags to IAM server certificate {name}"),
-            "case {case:?}: expected the refusal to name the quota and the certificate, \
-             got {body}"
+            TAG_LIMIT_EXCEEDED_MESSAGE,
+            "case {case:?}: expected {TAG_LIMIT_EXCEEDED_MESSAGE:?}, got {body}"
         );
 
         // Nothing of the refused request was stored.

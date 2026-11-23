@@ -26,8 +26,10 @@
 //!
 //! The suites are tables whose rows differ along what the rule generalises over: the
 //! held tag count, the number of calls, whether a key is new or held, the case of a
-//! key, the policy's path, repeated keys inside one request, and the published length
-//! bounds of `tagKeyType` (1..128) and `tagValueType` (0..256).
+//! key, the policy's path, and the published length bounds of `tagKeyType` (1..128)
+//! and `tagValueType` (0..256). A list naming one key TWICE is refused rather than
+//! merged, which `tests/all/supplied_tag_lists.rs` states for every operation taking a
+//! tag list.
 
 use std::collections::BTreeMap;
 
@@ -172,13 +174,6 @@ async fn tag_policy_merges_its_tags_into_the_stored_set() {
             initial: tags(&[("Env", "prod")]),
             calls: vec![tags(&[("env", "dev"), ("ENV", "test")])],
             expected: tags(&[("Env", "prod"), ("env", "dev"), ("ENV", "test")]),
-        },
-        MergeCase {
-            name: "a key repeated inside one request settles on its last value",
-            path: None,
-            initial: Vec::new(),
-            calls: vec![tags(&[("dup", "first"), ("dup", "last")])],
-            expected: tags(&[("dup", "last")]),
         },
         MergeCase {
             name: "a value at the published minimum length",

@@ -1777,6 +1777,16 @@ pub fn is_aws_managed_policy_arn(arn: &str) -> bool {
     parse_policy_arn(arn).is_some_and(|parsed| parsed.account == AWS_MANAGED_POLICY_ACCOUNT)
 }
 
+/// What IAM answers a TAG call addressed to a policy outside the account's own policy
+/// domain with — an ARN in AWS's own managed-policy namespace
+/// ([`is_aws_managed_policy_arn`]).
+///
+/// Entirely fixed text: the sentence states that the DOMAIN the addressed policy lives in
+/// does not support tags at all, so it names neither the policy nor the tags the request
+/// carried, and it is the same sentence whether the request was adding tags or removing
+/// them — what it reports is a fact about the domain, not about the call.
+pub const POLICY_TAGS_UNSUPPORTED_DOMAIN: &str = "Tags not supported for policies in this domain";
+
 /// The catalog entry published under the friendly name `policy_name`, whatever path
 /// AWS files it under, or `None` when the catalog carries no policy of that name.
 ///

@@ -17,6 +17,9 @@
 //! * a pass code is a ONE-TIME password, so a pair that has already synchronised the device
 //!   does not synchronise it a second time — which is what resolves two simultaneous resyncs
 //!   of one device into one success and one refusal;
+//! * both modelled outcomes are ANSWERED by the call that made them, one after the other, in
+//!   the sequence a client drives: a refusal leaves nothing pending and the success that
+//!   follows it needs no wall-clock span to have passed;
 //! * what the request ADDRESSES has to exist and be that user's: a user the account does not
 //!   hold, a serial it holds no device under, and a device another user (or nobody) holds are
 //!   all the entity that does not exist, refused HTTP 404 `NoSuchEntity`.
@@ -375,6 +378,67 @@ async fn the_pair_that_synchronised_a_device_does_not_synchronise_it_again() {
         "case {case:?}: expected the device synchronised through step {}, got {:?}",
         later + 1,
         synchronized_step(&engine, &serial_number)
+    );
+}
+
+/// RULE: both modelled outcomes of a resynchronisation are ANSWERED, one after the other,
+/// in the sequence a client drives: a wrong pair earns the modelled refusal and a pair the
+/// device emits now is served — each answered by the call that made it, with nothing left
+/// pending, and the device stays its user's across both.
+///
+/// The whole operation contract in one sequence, because what a client sees is the SEQUENCE:
+/// the refusal does not leave the next call unanswerable, and the success does not depend on
+/// any wall-clock span having passed first.
+#[tokio::test]
+async fn the_refusal_and_the_success_are_each_answered_in_one_sequence() {
+    let case = "the contract sequence";
+    let router = router();
+    given_user(&router, USER).await;
+    let (serial_number, seed) = given_enabled_device(&router, case, USER, "sequence-device").await;
+
+    // A pair of this device's codes from an unrelated instant: valid six-digit codes that no
+    // step of the resynchronisation span emits, so the refusal is about the codes alone.
+    let step = current_step(SystemTime::now());
+    let stale = step.saturating_add(500);
+    let (wrong_first, wrong_second) = (pass_code(&seed, stale), pass_code(&seed, stale + 1));
+    let (status, refused) = resync(
+        &router,
+        USER,
+        &serial_number,
+        (&wrong_first, &wrong_second),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (403, "InvalidAuthenticationCode".to_string()),
+        "case {case:?}: expected the modelled refusal, got {status}: {refused}"
+    );
+    assert_eq!(
+        element(&refused, "Message"),
+        INVALID_AUTHENTICATION_CODE,
+        "case {case:?}: expected {INVALID_AUTHENTICATION_CODE:?}, got {:?}",
+        element(&refused, "Message")
+    );
+
+    // And the very next call, presenting the pair the device emits now, is served — the
+    // refusal left nothing behind that a later caller has to wait out.
+    let step = current_step(SystemTime::now());
+    let (first, second) = (pass_code(&seed, step), pass_code(&seed, step + 1));
+    let (status, served) = resync(&router, USER, &serial_number, (&first, &second)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the resynchronisation to be served, got {status}: {served}"
+    );
+
+    // Across both answers the device is still the user's.
+    let listed = assigned_devices(&router, case).await;
+    assert_eq!(
+        (
+            elements(&listed, "SerialNumber"),
+            element(&listed, "UserName")
+        ),
+        (vec![serial_number.clone()], USER.to_string()),
+        "case {case:?}: expected the device to stay the user's, got {listed}"
     );
 }
 

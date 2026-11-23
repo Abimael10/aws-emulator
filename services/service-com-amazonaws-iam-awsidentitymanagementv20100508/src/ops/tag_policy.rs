@@ -219,33 +219,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
-        // "invalid … value … for an input parameter". Checked through the one
-        // definition of that rule in `crate::state`, the same one `CreatePolicy` uses,
-        // and checked before anything is written: "if any one of the tags is invalid
-        // … then the entire request fails".
-        if crate::state::has_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str())) {
+        // "If any one of the tags is invalid … then the entire request fails": the whole
+        // supplied list is judged before anything is read or written, through the one
+        // validation of a tag list this crate holds (`crate::state::supplied_tags`), which
+        // every operation taking a `Tags` list shares with `CreatePolicy` — a key carrying
+        // the prefix AWS reserves and a list naming one key twice are both an "invalid …
+        // value … supplied for an input parameter".
+        if let Some(refusal) =
+            crate::state::supplied_tag_refusal(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
             return Err(TagPolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                    message: Some(refusal.to_string()),
                 },
             )
             .into());
         }
 
-        // This operation "adds one or more tags to an IAM customer managed policy":
-        // an ARN in AWS's own managed-policy namespace names a policy AWS owns and an
-        // account cannot change, so such an ARN is an out-of-range value for this
-        // parameter rather than a missing entity. The refusal does not depend on
-        // whether this emulator's catalog carries that entry, because no entry of it
-        // could be tagged either.
+        // This operation "adds one or more tags to an IAM customer managed policy": an ARN
+        // in AWS's own managed-policy namespace names a policy AWS owns and an account
+        // cannot change, so such an ARN is an out-of-range value for this parameter rather
+        // than a missing entity. The refusal does not depend on whether this emulator's
+        // catalog carries that entry, because no entry of it could be tagged either. The
+        // sentence is the fixed one IAM states for the class — it names the DOMAIN the
+        // addressed policy lives in rather than the policy, and so quotes nothing of the
+        // request back.
         if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
             return Err(TagPolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "Policy {} is an AWS managed policy, which cannot be tagged.",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::POLICY_TAGS_UNSUPPORTED_DOMAIN.to_string()),
                 },
             )
             .into());
@@ -296,11 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(merged) = crate::state::merge_tags(held.policy.tags.as_ref(), input.tags) else {
             return Err(TagPolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Cannot assign more than {} tags to IAM policy {}",
-                        crate::state::MAX_TAGS_PER_ENTITY,
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::TAG_LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());

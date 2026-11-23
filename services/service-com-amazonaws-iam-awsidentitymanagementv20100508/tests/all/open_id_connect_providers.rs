@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::DUPLICATE_TAG_KEY_MESSAGE;
+
 use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
@@ -655,10 +657,11 @@ async fn a_reserved_tag_key_is_refused_and_creates_nothing() {
     }
 }
 
-/// A tag key repeated inside one request settles on its LAST value — one tag, not two —
-/// the rule every tag call in this service follows.
+/// A tag key named twice in ONE request is refused and nothing is created — the rule every
+/// operation of this service taking a tag list follows
+/// (`tests/all/supplied_tag_lists.rs` states it across those operations).
 #[tokio::test]
-async fn a_repeated_tag_key_settles_on_its_last_value() {
+async fn a_repeated_tag_key_is_refused_and_creates_nothing() {
     let router = router();
     let case = ProviderCase {
         url: "https://repeat-tags.example.org",
@@ -667,28 +670,29 @@ async fn a_repeated_tag_key_settles_on_its_last_value() {
         tags: vec![("env", "dev"), ("team", "platform"), ("env", "prod")],
     };
     let params = case.params();
-    let (status, created) = call(&router, "CreateOpenIDConnectProvider", &borrowed(&params)).await;
-    assert_eq!(status, 200, "the create must succeed, got {status}: {created}");
-
-    let expected: BTreeMap<String, String> = [("env", "prod"), ("team", "platform")]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    let read_params = vec![param(
-        "OpenIDConnectProviderArn",
-        &element(&created, "OpenIDConnectProviderArn"),
-    )];
-    let (status, read) = call(&router, "GetOpenIDConnectProvider", &borrowed(&read_params)).await;
-    assert_eq!(status, 200, "the read must succeed, got {status}: {read}");
+    let (status, refused) = call(&router, "CreateOpenIDConnectProvider", &borrowed(&params)).await;
     assert_eq!(
-        reported_tags(&read),
-        expected,
-        "a repeated key must settle on its last value, got {read}"
+        status, 400,
+        "expected the repeated key to be refused, got {status}: {refused}"
     );
     assert_eq!(
-        elements(&read, "Key"),
-        vec!["env".to_string(), "team".to_string()],
-        "the read must report one tag per key, sorted by key, got {read}"
+        error_code(&refused),
+        "InvalidInput",
+        "expected the modelled awsQuery code, got {refused}"
+    );
+    assert_eq!(
+        element(&refused, "Message"),
+        DUPLICATE_TAG_KEY_MESSAGE,
+        "expected {DUPLICATE_TAG_KEY_MESSAGE:?}, got {refused}"
+    );
+
+    // Nothing of the refused request was stored: the account holds no provider under that
+    // URL, so the listing reports none.
+    let (status, listed) = call(&router, "ListOpenIDConnectProviders", &[]).await;
+    assert_eq!(status, 200, "the listing must be served, got {status}: {listed}");
+    assert!(
+        elements(&listed, "Arn").is_empty(),
+        "a refused create must persist nothing, got {listed}"
     );
 }
 

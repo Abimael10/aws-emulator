@@ -26,10 +26,11 @@
 //! this crate.
 //!
 //! The suites are tables whose rows differ along what the rule generalises over: the held
-//! tag count, the number of calls, whether a key is new or held, the case of a key, keys
-//! repeated inside one request, how many keys one untag names, the alphabet and the
-//! published length bounds of `tagKeyType` (1..128) and `tagValueType` (0..256), and the
-//! published per-resource tag quota.
+//! tag count, the number of calls, whether a key is new or held, the case of a key, how
+//! many keys one untag names, the alphabet and the published length bounds of `tagKeyType`
+//! (1..128) and `tagValueType` (0..256), and the published per-resource tag quota. A tag
+//! list naming one key TWICE is refused rather than merged, which
+//! `tests/all/supplied_tag_lists.rs` states for every operation taking a tag list.
 
 use std::collections::BTreeMap;
 
@@ -240,12 +241,6 @@ async fn tagging_merges_its_tags_into_the_persisted_set() {
             initial: tags(&[("Env", "prod")]),
             calls: vec![tags(&[("env", "dev"), ("ENV", "test")])],
             expected: tags(&[("Env", "prod"), ("env", "dev"), ("ENV", "test")]),
-        },
-        MergeCase {
-            name: "a key repeated inside one request settles on its last value",
-            initial: Vec::new(),
-            calls: vec![tags(&[("dup", "first"), ("dup", "last")])],
-            expected: tags(&[("dup", "last")]),
         },
         MergeCase {
             name: "a value at the published minimum length",

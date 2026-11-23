@@ -45,6 +45,7 @@ pub mod service_specific_credential_mint;
 pub mod simulated_decisions;
 pub mod ssh_public_keys;
 pub mod statement_positions;
+pub mod supplied_tags;
 /// The temporary credentials this account has minted and what their CLASS decides: which
 /// kind of credential an access key id names, read by this service's own gate.
 pub mod temporary_credentials;
@@ -81,6 +82,7 @@ pub use role_templates::*;
 pub use service_specific_credential_mint::*;
 pub use ssh_public_keys::*;
 pub use statement_positions::*;
+pub use supplied_tags::*;
 pub use temporary_credentials::*;
 pub use trust_policy::*;
 pub use trust_policy_identity_principals::*;
@@ -4424,9 +4426,9 @@ fn held_tags(held: Option<&Vec<Tag>>) -> &[Tag] {
 /// (`TagRole`), so a supplied key REPLACES the held value in place — the held
 /// order is preserved and only a key the entity does not hold yet is appended.
 /// Keys compare exactly: "tag keys and values are case sensitive" ("Tagging IAM
-/// resources", IAM User Guide), so two spellings of one word are two tags. A key
-/// repeated inside one request settles on its LAST value, the same way a second
-/// call would overwrite the first.
+/// resources", IAM User Guide), so two spellings of one word are two tags. A list
+/// naming one key twice never reaches here: it is refused before anything is read
+/// or written ([`supplied_tags::has_duplicate_tag_key`]).
 ///
 /// The merged set is what the bound is taken against, so re-tagging a held key is
 /// never refused however many tags the entity already carries.

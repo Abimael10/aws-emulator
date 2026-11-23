@@ -31,6 +31,8 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::TAG_LIMIT_EXCEEDED_MESSAGE;
+
 use crate::identity_policy_enforcement::{principal, statement};
 use crate::role_lifecycle::{param, reported_tags};
 use crate::user_lifecycle::{
@@ -1167,11 +1169,8 @@ async fn an_invalid_tag_or_a_set_past_the_bound_stores_nothing() {
     );
     assert_eq!(
         element(&body, "Message"),
-        format!(
-            "Cannot assign more than {MAX_TAGS_PER_RESOURCE} tags to IAM virtual MFA \
-             device {serial_number}"
-        ),
-        "expected the refusal to name the bound and the device: {body}"
+        TAG_LIMIT_EXCEEDED_MESSAGE,
+        "expected {TAG_LIMIT_EXCEEDED_MESSAGE:?}, got {body}"
     );
     let (after, _) = persisted_tags(&router, "past the bound", &serial_number).await;
     assert_eq!(

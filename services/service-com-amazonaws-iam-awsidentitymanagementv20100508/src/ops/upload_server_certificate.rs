@@ -285,23 +285,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::invalid_entity_path());
         }
 
-        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
-        // "invalid … value … for an input parameter" — and "if any one of the tags is
-        // invalid or if you exceed the allowed maximum number of tags, then the entire
-        // request fails and the resource is not created" (`$Tags`), which is why this is
-        // checked before anything is written.
+        // "If any one of the tags is invalid or if you exceed the allowed maximum number of
+        // tags, then the entire request fails and the resource is not created" (`$Tags`), so
+        // the whole supplied list is judged before anything is written, through the one
+        // validation of a tag list this crate holds (`crate::state::supplied_tags`), which
+        // every `Tag*` and `Create*` call shares.
         let supplied_tags = input.tags.unwrap_or_default();
-        if crate::state::has_reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str())) {
+        if let Some(refusal) =
+            crate::state::supplied_tag_refusal(supplied_tags.iter().map(|tag| tag.key.as_str()))
+        {
             return Err(UploadServerCertificateErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                    message: Some(refusal.to_string()),
                 },
             )
             .into());
         }
-        // A key repeated inside one request settles on its LAST value, the rule every tag
-        // call in this service follows, and the certificate's tags are held sorted by key
-        // because "the returned list of tags is sorted by tag key" (`$Tags`).
+        // The certificate's tags are held sorted by key, because "the returned list of tags
+        // is sorted by tag key" (`$Tags`).
         let Some(mut tags) = crate::state::merge_tags(None, supplied_tags) else {
             return Err(UploadServerCertificateErrorModeled::LimitExceededException(
                 LimitExceededException {

@@ -203,14 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot change, so such an ARN is an out-of-range value for this parameter
         // rather than a missing entity. The refusal does not depend on whether this
         // emulator's catalog carries that entry, because no entry of it could carry a
-        // tag the account is able to remove either.
+        // tag the account is able to remove either. The sentence is the fixed one IAM
+        // states for the class, which is about the DOMAIN the addressed policy lives in
+        // and so is the same whether the call was adding tags or removing them.
         if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
             return Err(UntagPolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "Policy {} is an AWS managed policy, which cannot be untagged.",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::POLICY_TAGS_UNSUPPORTED_DOMAIN.to_string()),
                 },
             )
             .into());

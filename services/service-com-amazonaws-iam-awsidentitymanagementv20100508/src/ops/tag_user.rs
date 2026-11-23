@@ -198,15 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
-        // "invalid … value … for an input parameter". Checked through the one
-        // definition of that rule in `crate::state`, which every tag operation in
-        // this crate shares, and checked before anything is written: "if any one of
-        // the tags is invalid … then the entire request fails".
-        if crate::state::has_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str())) {
+        // "If any one of the tags is invalid … then the entire request fails": the whole
+        // supplied list is judged before anything is read or written, through the one
+        // validation of a tag list this crate holds (`crate::state::supplied_tags`), which
+        // every operation taking a `Tags` list shares with `CreateUser` — a key carrying
+        // the prefix AWS reserves and a list naming one key twice are both an "invalid …
+        // value … supplied for an input parameter".
+        if let Some(refusal) =
+            crate::state::supplied_tag_refusal(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
             return Err(TagUserErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                    message: Some(refusal.to_string()),
                 },
             )
             .into());
@@ -262,11 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(merged) = crate::state::merge_tags(user.tags.as_ref(), input.tags) else {
             return Err(TagUserErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Cannot assign more than {} tags to IAM user {}",
-                        crate::state::MAX_TAGS_PER_ENTITY,
-                        user.user_name
-                    )),
+                    message: Some(crate::state::TAG_LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());

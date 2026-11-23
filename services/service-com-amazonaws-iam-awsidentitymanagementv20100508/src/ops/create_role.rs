@@ -283,13 +283,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
-        // "invalid … value … for an input parameter".
+        // "If any one of the tags is invalid … then the entire request fails": the whole
+        // supplied list is judged before anything is created, through the one validation of
+        // a tag list this crate holds (`crate::state::supplied_tags`), which every `Tag*`
+        // and `Create*` call in this crate shares.
         let tags = input.tags.filter(|tags| !tags.is_empty());
-        if crate::state::has_reserved_tag_key(tags.iter().flatten().map(|tag| tag.key.as_str())) {
+        if let Some(refusal) =
+            crate::state::supplied_tag_refusal(tags.iter().flatten().map(|tag| tag.key.as_str()))
+        {
             return Err(CreateRoleErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                    message: Some(refusal.to_string()),
                 },
             )
             .into());
